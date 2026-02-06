@@ -46,6 +46,9 @@ jobs:
       - name: Check CUDA availability
         run: nvidia-smi
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
