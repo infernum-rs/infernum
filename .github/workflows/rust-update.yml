@@ -13,6 +13,9 @@ permissions:
 jobs:
   check-rust-update:
     runs-on: ubuntu-latest
+    outputs:
+      update_needed: ${{ steps.check.outputs.update_needed }}
+      latest_version: ${{ steps.latest.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +51,7 @@ jobs:
           cat rust-toolchain.toml
 
       - name: Create Pull Request
+        id: create-pr
         if: steps.check.outputs.update_needed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
@@ -65,3 +69,32 @@ jobs:
           labels: |
             rust-update
             automation
+
+  # Run CI checks on the new Rust version
+  # This is needed because PRs created by GITHUB_TOKEN don't trigger other workflows
+  check:
+    needs: check-rust-update
+    if: needs.check-rust-update.outputs.update_needed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: rust-update-${{ needs.check-rust-update.outputs.latest_version }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check with Clippy (pedantic)
+        run: cargo clippy -- -W clippy::pedantic
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests (no CUDA)
+        run: cargo test --all
