@@ -55,47 +55,50 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cuda-toolkit
-          key: cuda-toolkit-12-6-ubuntu2404-v4
+          key: cuda-toolkit-12-6-ubuntu2404-v5
 
       - name: Install CUDA toolkit
         if: steps.cache-cuda.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
-          # Install CUDA toolkit AND cuBLAS (separate package)
           sudo apt-get install -y cuda-toolkit-12-6 libcublas-12-6 libcublas-dev-12-6
           mkdir -p ~/cuda-toolkit
-          # Copy entire CUDA installation (includes cuBLAS in targets/x86_64-linux/lib/)
           cp -a /usr/local/cuda-12.6/* ~/cuda-toolkit/
-          # Debug: show what cuBLAS files we have
-          echo "=== cuBLAS files in cache ==="
-          find ~/cuda-toolkit -name "*cublas*" -type f 2>/dev/null | head -10
 
       - name: Restore CUDA toolkit from cache
         if: steps.cache-cuda.outputs.cache-hit == 'true'
         run: |
-          # Create target directory and copy with correct permissions
           sudo mkdir -p /usr/local/cuda-12.6
           sudo cp -a ~/cuda-toolkit/* /usr/local/cuda-12.6/
-          # Fix permissions (cache may have been created by different user)
           sudo chmod -R a+rX /usr/local/cuda-12.6/
-          # Verify cuBLAS files are present
-          echo "=== cuBLAS files in targets lib ==="
-          ls -la /usr/local/cuda-12.6/targets/x86_64-linux/lib/ | grep -E "libcublas" || echo "ERROR: No cuBLAS files found!"
           sudo ldconfig
 
       - name: Set CUDA environment
         run: |
           echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
-          # Include both lib64 and targets lib path for cuBLAS
           CUDA_LIB="/usr/local/cuda-12.6/lib64"
           CUDA_TARGETS_LIB="/usr/local/cuda-12.6/targets/x86_64-linux/lib"
           echo "LD_LIBRARY_PATH=${CUDA_LIB}:${CUDA_TARGETS_LIB}:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           sudo ldconfig ${CUDA_LIB} ${CUDA_TARGETS_LIB}
 
-      - name: Install rustup (toolchain from rust-toolchain.toml)
+      - name: Cache Rust toolchain
+        id: cache-rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin
+          key: rust-toolchain-${{ hashFiles('rust-toolchain.toml') }}
+
+      - name: Install rustup
+        if: steps.cache-rust.outputs.cache-hit != 'true'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Set up Rust PATH
+        if: steps.cache-rust.outputs.cache-hit == 'true'
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -111,15 +114,3 @@ jobs:
 
       - name: Run CUDA tests
         run: cargo test --features cuda
-
-      # Optional: smoke test with a real model
-      # Uncomment and set LLAMA_MODEL_PATH secret to enable
-      # - name: Run generation example
-      #   env:
-      #     LLAMA_MODEL_PATH: ${{ secrets.LLAMA_MODEL_PATH }}
-      #   if: ${{ env.LLAMA_MODEL_PATH != '' }}
-      #   run: |
-      #     cargo run --example generate --features cuda -- \
-      #       --model "$LLAMA_MODEL_PATH" \
-      #       --max-tokens 10 \
-      #       "Hello"
