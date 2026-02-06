@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "infernum",
+]
+resolver = "2"
