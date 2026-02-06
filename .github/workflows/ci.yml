@@ -78,14 +78,17 @@ jobs:
           ls -la ~/cuda-toolkit/ || echo "Directory does not exist or is empty"
           echo "=== cuBLAS files in cache directory ==="
           find ~/cuda-toolkit -name "*cublas*" 2>/dev/null | head -10 || echo "No cuBLAS files found in cache"
-          echo "=== All .so files in cache ==="
-          find ~/cuda-toolkit -name "*.so*" -type f 2>/dev/null | head -20 || echo "No .so files found"
           # Now copy
           sudo mkdir -p /usr/local/cuda-12.6
-          sudo cp -a ~/cuda-toolkit/* /usr/local/cuda-12.6/
-          # Debug: verify cuBLAS files restored
-          echo "=== cuBLAS files after restore ==="
-          find /usr/local/cuda-12.6 -name "*cublas*" -type f 2>/dev/null | head -10
+          echo "=== Copying files ==="
+          sudo cp -av ~/cuda-toolkit/* /usr/local/cuda-12.6/ 2>&1 | tail -20
+          # Debug: verify structure after copy
+          echo "=== Top level directories after restore ==="
+          ls -la /usr/local/cuda-12.6/
+          echo "=== targets/x86_64-linux/lib after restore ==="
+          ls -la /usr/local/cuda-12.6/targets/x86_64-linux/lib/ 2>/dev/null | grep cublas || echo "No cublas in targets lib"
+          echo "=== lib64 after restore ==="  
+          ls -la /usr/local/cuda-12.6/lib64/ 2>/dev/null | grep cublas || echo "No cublas in lib64"
           sudo ldconfig
 
       - name: Set CUDA environment
