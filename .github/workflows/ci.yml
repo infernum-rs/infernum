@@ -46,8 +46,10 @@ jobs:
       - name: Check CUDA availability
         run: nvidia-smi
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Cache cargo registry
         uses: actions/cache@v4
