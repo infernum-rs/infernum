@@ -70,13 +70,16 @@ jobs:
         run: |
           sudo mkdir -p /usr/local/cuda-12.6
           sudo cp -a ~/cuda-toolkit/* /usr/local/cuda-12.6/
-          sudo ldconfig
 
       - name: Set CUDA environment
         run: |
           echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
-          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-          sudo ldconfig /usr/local/cuda-12.6/lib64
+          # Find all lib directories and add them to LD_LIBRARY_PATH
+          CUDA_LIB_PATHS=$(find /usr/local/cuda-12.6 -name "*.so*" -type f -exec dirname {} \; 2>/dev/null | sort -u | tr '\n' ':')
+          echo "LD_LIBRARY_PATH=${CUDA_LIB_PATHS}$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          # Debug: show where libcublas is
+          find /usr/local/cuda-12.6 -name "*cublas*" -type f 2>/dev/null || echo "No cublas found in cuda-12.6"
+          ls -la /usr/local/cuda-12.6/lib64/ 2>/dev/null | head -20 || echo "No lib64 directory"
 
       - name: Install rustup (toolchain from rust-toolchain.toml)
         run: |
