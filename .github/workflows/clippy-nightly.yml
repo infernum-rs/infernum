@@ -29,17 +29,3 @@ jobs:
 
       - name: Run Clippy nightly (pedantic)
         run: cargo +nightly clippy -- -W clippy::pedantic
-
-      - name: Notify on failure
-        if: failure()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issue = await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Clippy nightly failed on ${new Date().toISOString().split('T')[0]}`,
-              body: `The nightly Clippy check has failed.\n\nSee the [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`,
-              labels: ['clippy', 'automation']
-            });
-            console.log(`Created issue #${issue.data.number}`);
