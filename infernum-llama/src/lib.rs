@@ -1,4 +1,4 @@
-//! Llama model implementation
+//! Llama model implementation for Infernum
 
 mod config;
 #[cfg(feature = "cuda")]

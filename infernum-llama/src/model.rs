@@ -2,12 +2,13 @@
 
 use std::path::Path;
 
-use crate::cuda::ops::{apply_rope, attention, matmul, precompute_rope_cache, rms_norm, silu_mul};
-use crate::cuda::{CudaContext, CudaTensor};
-use crate::llama::LlamaConfig;
-use crate::tensor::Tensor;
-use crate::weights::{SafeTensorsLoader, WeightLoader};
-use crate::Result;
+use infernum::cuda::ops::{apply_rope, attention, matmul, precompute_rope_cache, rms_norm, silu_mul};
+use infernum::cuda::{CudaContext, CudaTensor};
+use infernum::tensor::Tensor;
+use infernum::weights::{SafeTensorsLoader, WeightLoader};
+use infernum::Result;
+
+use crate::LlamaConfig;
 
 /// Weights for a single Llama attention layer
 struct LlamaAttentionWeights {

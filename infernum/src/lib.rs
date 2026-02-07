@@ -10,7 +10,6 @@
 pub mod cuda;
 pub mod dtype;
 pub mod error;
-pub mod llama;
 pub mod tensor;
 pub mod tokenizer;
 pub mod weights;
@@ -19,5 +18,4 @@ pub mod weights;
 pub use cuda::CudaTensor;
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use llama::LlamaConfig;
 pub use tensor::Tensor;

@@ -293,6 +293,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "infernum-llama"
+version = "0.1.0"
+dependencies = [
+ "infernum",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

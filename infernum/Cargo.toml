@@ -34,7 +34,3 @@ bytemuck = { version = "1.14", features = ["derive"] }
 
 [dev-dependencies]
 approx = "0.5"
-
-[[example]]
-name = "generate"
-required-features = ["cuda"]

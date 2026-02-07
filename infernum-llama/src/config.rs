@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::Result;
+use infernum::Result;
 
 /// Configuration for Llama models
 ///
