@@ -1,5 +1,11 @@
 //! Llama model implementation
 
+#![allow(
+    clippy::struct_field_names, // _proj suffix is conventional for Llama weights
+    clippy::no_effect_underscore_binding,
+    clippy::doc_markdown // tensor shape docs trigger false positives
+)]
+
 use std::path::Path;
 
 use infernum::cuda::ops::{apply_rope, attention, matmul, precompute_rope_cache, rms_norm, silu_mul};
@@ -85,23 +91,23 @@ impl LlamaModel {
         // Load transformer layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let prefix = format!("model.layers.{}", i);
+            let prefix = format!("model.layers.{i}");
 
             let layer = LlamaLayerWeights {
                 input_layernorm: loader
-                    .load_f32(ctx, &format!("{}.input_layernorm.weight", prefix))?,
+                    .load_f32(ctx, &format!("{prefix}.input_layernorm.weight"))?,
                 attention: LlamaAttentionWeights {
-                    q_proj: loader.load_f32(ctx, &format!("{}.self_attn.q_proj.weight", prefix))?,
-                    k_proj: loader.load_f32(ctx, &format!("{}.self_attn.k_proj.weight", prefix))?,
-                    v_proj: loader.load_f32(ctx, &format!("{}.self_attn.v_proj.weight", prefix))?,
-                    o_proj: loader.load_f32(ctx, &format!("{}.self_attn.o_proj.weight", prefix))?,
+                    q_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.q_proj.weight"))?,
+                    k_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.k_proj.weight"))?,
+                    v_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.v_proj.weight"))?,
+                    o_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.o_proj.weight"))?,
                 },
                 post_attention_layernorm: loader
-                    .load_f32(ctx, &format!("{}.post_attention_layernorm.weight", prefix))?,
+                    .load_f32(ctx, &format!("{prefix}.post_attention_layernorm.weight"))?,
                 mlp: LlamaMlpWeights {
-                    gate_proj: loader.load_f32(ctx, &format!("{}.mlp.gate_proj.weight", prefix))?,
-                    up_proj: loader.load_f32(ctx, &format!("{}.mlp.up_proj.weight", prefix))?,
-                    down_proj: loader.load_f32(ctx, &format!("{}.mlp.down_proj.weight", prefix))?,
+                    gate_proj: loader.load_f32(ctx, &format!("{prefix}.mlp.gate_proj.weight"))?,
+                    up_proj: loader.load_f32(ctx, &format!("{prefix}.mlp.up_proj.weight"))?,
+                    down_proj: loader.load_f32(ctx, &format!("{prefix}.mlp.down_proj.weight"))?,
                 },
             };
 
@@ -276,6 +282,7 @@ impl LlamaModel {
     }
 
     /// Forward pass through MLP (SwiGLU)
+    #[allow(clippy::unused_self)] // Will use self.config when adding intermediate_size check
     fn forward_mlp(
         &self,
         hidden: &CudaTensor<f32>,

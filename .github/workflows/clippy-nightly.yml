@@ -28,4 +28,4 @@ jobs:
           key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run Clippy nightly (pedantic)
-        run: cargo +nightly clippy -- -W clippy::pedantic
+        run: cargo +nightly clippy --all --all-features -- -W clippy::pedantic -D warnings

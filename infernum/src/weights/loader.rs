@@ -1,5 +1,7 @@
 //! Weight loader trait and utilities
 
+#![allow(clippy::missing_errors_doc)]
+
 #[cfg(feature = "cuda")]
 use crate::cuda::{CudaContext, CudaTensor};
 #[cfg(feature = "cuda")]

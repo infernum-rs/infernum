@@ -1,5 +1,13 @@
 //! SiLU (Swish) activation function
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::doc_markdown,
+    clippy::missing_panics_doc,
+    clippy::manual_div_ceil
+)]
+
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;

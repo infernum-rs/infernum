@@ -1,5 +1,13 @@
 //! Rotary Positional Embeddings (RoPE)
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::doc_markdown,
+    clippy::missing_panics_doc
+)]
+
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::{CudaContext, CudaTensor};

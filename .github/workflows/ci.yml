@@ -29,8 +29,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Check with Clippy (pedantic)
-        run: cargo clippy -- -W clippy::pedantic
+      - name: Check with Clippy (pedantic, deny warnings)
+        run: cargo clippy --all --all-features -- -W clippy::pedantic -D warnings
 
       - name: Check formatting
         run: cargo fmt --all -- --check

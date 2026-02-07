@@ -1,4 +1,10 @@
-//! SafeTensors file loading with memory mapping
+//! `SafeTensors` file loading with memory mapping
+
+#![allow(
+    clippy::doc_markdown,
+    clippy::implicit_clone,
+    clippy::redundant_closure_for_method_calls
+)]
 
 use memmap2::Mmap;
 use safetensors::tensor::SafeTensors;
@@ -65,7 +71,7 @@ impl SafeTensorsLoader {
                 let data_len = data.len();
 
                 tensors.insert(
-                    name.to_string(),
+                    name.to_owned(),
                     TensorMeta {
                         file_idx,
                         shape,
@@ -95,13 +101,13 @@ impl SafeTensorsLoader {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "safetensors").unwrap_or(false))
+            .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
             .collect();
 
         if paths.is_empty() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("No .safetensors files found in {:?}", dir),
+                format!("No .safetensors files found in {}", dir.display()),
             )));
         }
 
@@ -185,7 +191,7 @@ fn safetensors_dtype_to_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::F32 => Ok(DType::F32),
         safetensors::Dtype::F16 => Ok(DType::F16),
         safetensors::Dtype::BF16 => Ok(DType::BF16),
-        other => Err(Error::UnsupportedDtype(format!("{:?}", other))),
+        other => Err(Error::UnsupportedDtype(format!("{other:?}"))),
     }
 }
 

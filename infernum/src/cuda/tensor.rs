@@ -1,5 +1,7 @@
 //! CUDA tensor implementation
 
+#![allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr, ValidAsZeroBits};
 
 use crate::cuda::CudaContext;

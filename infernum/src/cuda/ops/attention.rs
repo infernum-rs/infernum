@@ -1,5 +1,17 @@
 //! Attention operation
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::missing_panics_doc,
+    clippy::range_plus_one,
+    clippy::no_effect_underscore_binding,
+    clippy::manual_div_ceil
+)]
+
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use super::matmul;

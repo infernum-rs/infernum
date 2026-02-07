@@ -1,5 +1,13 @@
 //! Matrix multiplication using cuBLAS
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::many_single_char_names,
+    clippy::missing_panics_doc,
+    clippy::uninlined_format_args
+)]
+
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::DeviceRepr;
 
