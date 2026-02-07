@@ -8,7 +8,9 @@
 
 use std::path::Path;
 
-use infernum::cuda::ops::{apply_rope, attention, matmul, precompute_rope_cache, rms_norm, silu_mul};
+use infernum::cuda::ops::{
+    apply_rope, attention, matmul, precompute_rope_cache, rms_norm, silu_mul,
+};
 use infernum::cuda::{CudaContext, CudaTensor};
 use infernum::tensor::Tensor;
 use infernum::weights::{SafeTensorsLoader, WeightLoader};
