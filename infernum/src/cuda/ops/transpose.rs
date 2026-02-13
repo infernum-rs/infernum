@@ -324,8 +324,7 @@ mod tests {
         let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
         let tensor = CudaTensor::from_slice(&ctx, &[2, 3, 4], &data).unwrap();
 
-        let roundtrip =
-            transpose_012_to_102(&transpose_012_to_102(&tensor).unwrap()).unwrap();
+        let roundtrip = transpose_012_to_102(&transpose_012_to_102(&tensor).unwrap()).unwrap();
 
         assert_eq!(roundtrip.shape(), &[2, 3, 4]);
         assert_eq!(roundtrip.to_vec().unwrap(), data);
@@ -338,8 +337,7 @@ mod tests {
         let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
         let tensor = CudaTensor::from_slice(&ctx, &[2, 3, 4], &data).unwrap();
 
-        let roundtrip =
-            transpose_last_two(&transpose_last_two(&tensor).unwrap()).unwrap();
+        let roundtrip = transpose_last_two(&transpose_last_two(&tensor).unwrap()).unwrap();
 
         assert_eq!(roundtrip.shape(), &[2, 3, 4]);
         assert_eq!(roundtrip.to_vec().unwrap(), data);

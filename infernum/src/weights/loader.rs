@@ -120,10 +120,7 @@ mod tests {
             "model.embed_tokens.weight"
         );
 
-        assert_eq!(
-            mapper.unmap_llama_name("norm.weight"),
-            "model.norm.weight"
-        );
+        assert_eq!(mapper.unmap_llama_name("norm.weight"), "model.norm.weight");
     }
 
     #[test]
