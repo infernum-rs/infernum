@@ -9,7 +9,8 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    apply_rope, attention, matmul, precompute_rope_cache, rms_norm, silu_mul,
+    add, apply_rope, attention, embedding_gather, matmul, precompute_rope_cache, repeat_kv,
+    rms_norm, silu_mul, transpose_2d,
 };
 use infernum::cuda::{CudaContext, CudaTensor};
 use infernum::tensor::Tensor;
@@ -184,21 +185,7 @@ impl LlamaModel {
 
     /// Embed token IDs
     fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
-        let seq_len = input_ids.len();
-        let hidden_size = self.config.hidden_size;
-
-        // Gather embeddings (done on CPU for simplicity)
-        let embed_data = self.embed_tokens.to_vec()?;
-        let mut output_data = vec![0.0_f32; seq_len * hidden_size];
-
-        for (pos, &token_id) in input_ids.iter().enumerate() {
-            let src_start = (token_id as usize) * hidden_size;
-            let dst_start = pos * hidden_size;
-            output_data[dst_start..dst_start + hidden_size]
-                .copy_from_slice(&embed_data[src_start..src_start + hidden_size]);
-        }
-
-        CudaTensor::from_slice(&self.ctx, &[seq_len, hidden_size], &output_data)
+        embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
     }
 
     /// Forward pass through a single transformer layer
@@ -218,7 +205,7 @@ impl LlamaModel {
         let attn_output = self.forward_attention(&normed, &layer.attention)?;
 
         // Residual connection
-        let hidden = add_tensors(hidden, &attn_output)?;
+        let hidden = add(hidden, &attn_output)?;
 
         // Pre-MLP RMS norm
         let normed = rms_norm(
@@ -231,7 +218,7 @@ impl LlamaModel {
         let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
 
         // Residual connection
-        add_tensors(&hidden, &mlp_output)
+        add(&hidden, &mlp_output)
     }
 
     /// Forward pass through attention
@@ -334,120 +321,39 @@ fn linear(input: &CudaTensor<f32>, weight: &CudaTensor<f32>) -> Result<CudaTenso
     matmul(input, &weight_t)
 }
 
-/// Transpose a 2D tensor
-fn transpose_2d(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
-    let shape = tensor.shape();
-    assert_eq!(shape.len(), 2);
-
-    let rows = shape[0];
-    let cols = shape[1];
-
-    let data = tensor.to_vec()?;
-    let mut output_data = vec![0.0_f32; rows * cols];
-
-    for i in 0..rows {
-        for j in 0..cols {
-            output_data[j * rows + i] = data[i * cols + j];
-        }
-    }
-
-    CudaTensor::from_slice(tensor.context(), &[cols, rows], &output_data)
-}
-
-/// Add two tensors element-wise
-fn add_tensors(a: &CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
-    assert_eq!(a.shape(), b.shape(), "Shapes must match for addition");
-
-    let a_data = a.to_vec()?;
-    let b_data = b.to_vec()?;
-
-    let output_data: Vec<f32> = a_data
-        .iter()
-        .zip(b_data.iter())
-        .map(|(x, y)| x + y)
-        .collect();
-
-    CudaTensor::from_slice(a.context(), a.shape(), &output_data)
-}
-
-/// Repeat KV heads for grouped-query attention
-fn repeat_kv(tensor: &CudaTensor<f32>, num_repeats: usize) -> Result<CudaTensor<f32>> {
-    if num_repeats == 1 {
-        return Ok(tensor.clone());
-    }
-
-    let shape = tensor.shape();
-    let seq_len = shape[0];
-    let num_kv_heads = shape[1];
-    let head_dim = shape[2];
-
-    let new_num_heads = num_kv_heads * num_repeats;
-    let output_shape = [seq_len, new_num_heads, head_dim];
-
-    let data = tensor.to_vec()?;
-    let mut output_data = vec![0.0_f32; seq_len * new_num_heads * head_dim];
-
-    for s in 0..seq_len {
-        for kv_head in 0..num_kv_heads {
-            for repeat in 0..num_repeats {
-                let new_head = kv_head * num_repeats + repeat;
-                for d in 0..head_dim {
-                    let src_idx = s * num_kv_heads * head_dim + kv_head * head_dim + d;
-                    let dst_idx = s * new_num_heads * head_dim + new_head * head_dim + d;
-                    output_data[dst_idx] = data[src_idx];
-                }
-            }
-        }
-    }
-
-    CudaTensor::from_slice(tensor.context(), &output_shape, &output_data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_transpose_2d() {
+    fn test_linear() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
 
-        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let tensor = CudaTensor::from_slice(&ctx, &[2, 3], &data).unwrap();
-
-        let transposed = transpose_2d(&tensor).unwrap();
-
-        assert_eq!(transposed.shape(), &[3, 2]);
-
-        let result = transposed.to_vec().unwrap();
-        assert_eq!(result, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-    }
-
-    #[test]
-    fn test_repeat_kv() {
-        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-
-        // (seq=2, num_kv_heads=2, head_dim=3)
-        let data: Vec<f32> = vec![
-            1.0, 2.0, 3.0, // seq=0, head=0
-            4.0, 5.0, 6.0, // seq=0, head=1
-            7.0, 8.0, 9.0, // seq=1, head=0
-            10.0, 11.0, 12.0, // seq=1, head=1
+        // input: (2, 3), weight: (4, 3) -> output: (2, 4)
+        let input_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weight_data: Vec<f32> = vec![
+            1.0, 0.0, 0.0, // row 0: picks dim 0
+            0.0, 1.0, 0.0, // row 1: picks dim 1
+            0.0, 0.0, 1.0, // row 2: picks dim 2
+            1.0, 1.0, 1.0, // row 3: sum
         ];
 
-        let tensor = CudaTensor::from_slice(&ctx, &[2, 2, 3], &data).unwrap();
+        let input = CudaTensor::from_slice(&ctx, &[2, 3], &input_data).unwrap();
+        let weight = CudaTensor::from_slice(&ctx, &[4, 3], &weight_data).unwrap();
 
-        let repeated = repeat_kv(&tensor, 2).unwrap();
+        let output = linear(&input, &weight).unwrap();
 
-        assert_eq!(repeated.shape(), &[2, 4, 3]);
+        assert_eq!(output.shape(), &[2, 4]);
 
-        let result = repeated.to_vec().unwrap();
-
-        // Each KV head should be repeated twice
-        // head 0 -> heads 0, 1
-        // head 1 -> heads 2, 3
-        assert_eq!(result[0..3], [1.0, 2.0, 3.0]); // seq=0, head=0
-        assert_eq!(result[3..6], [1.0, 2.0, 3.0]); // seq=0, head=1 (repeat of head 0)
-        assert_eq!(result[6..9], [4.0, 5.0, 6.0]); // seq=0, head=2 (original head 1)
-        assert_eq!(result[9..12], [4.0, 5.0, 6.0]); // seq=0, head=3 (repeat of head 1)
+        let result = output.to_vec().unwrap();
+        // row 0: [1, 2, 3, 6], row 1: [4, 5, 6, 15]
+        assert!((result[0] - 1.0).abs() < 1e-4);
+        assert!((result[1] - 2.0).abs() < 1e-4);
+        assert!((result[2] - 3.0).abs() < 1e-4);
+        assert!((result[3] - 6.0).abs() < 1e-4);
+        assert!((result[4] - 4.0).abs() < 1e-4);
+        assert!((result[5] - 5.0).abs() < 1e-4);
+        assert!((result[6] - 6.0).abs() < 1e-4);
+        assert!((result[7] - 15.0).abs() < 1e-4);
     }
 }

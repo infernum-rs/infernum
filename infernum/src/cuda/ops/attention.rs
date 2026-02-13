@@ -32,6 +32,81 @@ extern "C" __global__ void scale_f32(
 }
 "#;
 
+const CAUSAL_SOFTMAX_BATCHED_KERNEL: &str = r#"
+#define INFINITY __int_as_float(0x7f800000)
+
+// Causal softmax over (batch, seq_q, seq_k) attention scores.
+// One block per (batch, query) row. Causal mask: allow k <= query_idx.
+// Layout: input/output are (batch * seq * seq) contiguous, row-major.
+extern "C" __global__ void causal_softmax_batched_f32(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    const int batch,
+    const int seq
+) {
+    const int row_idx = blockIdx.x;  // which (batch, query) pair
+    const int batch_idx = row_idx / seq;
+    const int query_idx = row_idx % seq;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float shared[];
+
+    const int row_offset = (batch_idx * seq + query_idx) * seq;
+    const float* row_input = input + row_offset;
+    float* row_output = output + row_offset;
+
+    const int max_valid_k = query_idx + 1;
+
+    // Step 1: Find max over valid positions
+    float local_max = -INFINITY;
+    for (int i = tid; i < max_valid_k; i += blockDim.x) {
+        local_max = fmaxf(local_max, row_input[i]);
+    }
+
+    shared[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    float max_val = shared[0];
+    __syncthreads();
+
+    // Step 2: Compute exp and sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < seq; i += blockDim.x) {
+        if (i < max_valid_k) {
+            float exp_val = expf(row_input[i] - max_val);
+            row_output[i] = exp_val;
+            local_sum += exp_val;
+        } else {
+            row_output[i] = 0.0f;
+        }
+    }
+
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float sum_val = shared[0];
+
+    // Step 3: Normalize
+    for (int i = tid; i < max_valid_k; i += blockDim.x) {
+        row_output[i] /= sum_val;
+    }
+}
+"#;
+
 /// Naive attention without KV cache
 ///
 /// Computes: softmax(Q @ K^T / sqrt(d_k)) @ V
@@ -87,17 +162,13 @@ pub fn attention(
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     // Reshape for batched matmul: (num_heads, seq_len, head_dim)
-    // Q: (seq, heads, dim) -> (heads, seq, dim)
-    // K: (seq, heads, dim) -> (heads, seq, dim) -> transpose to (heads, dim, seq)
-    // V: (seq, heads, dim) -> (heads, seq, dim)
+    // Q/K/V: (seq, heads, dim) -> (heads, seq, dim)
+    let q_transposed = super::transpose_012_to_102(q)?;
+    let k_transposed = super::transpose_012_to_102(k)?;
+    let v_transposed = super::transpose_012_to_102(v)?;
 
-    // For simplicity, we'll transpose in memory
-    let q_transposed = transpose_012_to_102(q)?;
-    let k_transposed = transpose_012_to_102(k)?;
-    let v_transposed = transpose_012_to_102(v)?;
-
-    // K^T for Q @ K^T
-    let k_t = transpose_last_two(&k_transposed)?;
+    // K^T for Q @ K^T: (heads, seq, dim) -> (heads, dim, seq)
+    let k_t = super::transpose_last_two(&k_transposed)?;
 
     // Compute attention scores: (heads, seq, dim) @ (heads, dim, seq) -> (heads, seq, seq)
     let mut scores = matmul(&q_transposed, &k_t)?;
@@ -116,64 +187,7 @@ pub fn attention(
     let output_transposed = matmul(&probs, &v_transposed)?;
 
     // Transpose back: (heads, seq, dim) -> (seq, heads, dim)
-    transpose_012_to_102(&output_transposed)
-}
-
-/// Transpose tensor from (a, b, c) to (b, a, c)
-fn transpose_012_to_102(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
-    let shape = input.shape();
-    assert_eq!(shape.len(), 3);
-
-    let a = shape[0];
-    let b = shape[1];
-    let c = shape[2];
-
-    let output_shape = [b, a, c];
-
-    // This is inefficient but correct - copy element by element
-    // A proper implementation would use a CUDA kernel
-    let input_data = input.to_vec()?;
-    let mut output_data = vec![0.0_f32; a * b * c];
-
-    for i in 0..a {
-        for j in 0..b {
-            for k in 0..c {
-                let src_idx = i * b * c + j * c + k;
-                let dst_idx = j * a * c + i * c + k;
-                output_data[dst_idx] = input_data[src_idx];
-            }
-        }
-    }
-
-    let output = CudaTensor::from_slice(input.context(), &output_shape, &output_data)?;
-    Ok(output)
-}
-
-/// Transpose last two dimensions: (a, b, c) -> (a, c, b)
-fn transpose_last_two(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
-    let shape = input.shape();
-    assert_eq!(shape.len(), 3);
-
-    let a = shape[0];
-    let b = shape[1];
-    let c = shape[2];
-
-    let output_shape = [a, c, b];
-
-    let input_data = input.to_vec()?;
-    let mut output_data = vec![0.0_f32; a * b * c];
-
-    for i in 0..a {
-        for j in 0..b {
-            for k in 0..c {
-                let src_idx = i * b * c + j * c + k;
-                let dst_idx = i * c * b + k * b + j;
-                output_data[dst_idx] = input_data[src_idx];
-            }
-        }
-    }
-
-    CudaTensor::from_slice(input.context(), &output_shape, &output_data)
+    super::transpose_012_to_102(&output_transposed)
 }
 
 /// Scale tensor in place
@@ -220,44 +234,51 @@ fn softmax_batched(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 }
 
 /// Causal softmax for attention
-/// Input: (batch, seq, seq), applies causal mask
+/// Input: (batch, seq, seq), applies causal mask entirely on GPU
 fn causal_softmax(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     let shape = scores.shape();
     let batch = shape[0];
     let seq = shape[1];
 
-    // Apply mask and softmax row by row
-    let scores_data = scores.to_vec()?;
-    let mut probs_data = vec![0.0_f32; batch * seq * seq];
+    // One block per (batch, query) row
+    let num_rows = batch * seq;
 
-    for b in 0..batch {
-        for q in 0..seq {
-            let row_start = b * seq * seq + q * seq;
-            let _row_end = row_start + seq;
+    let mut output = unsafe { CudaTensor::<f32>::uninit(scores.context(), shape)? };
 
-            // Find max (for stability) over valid positions
-            let max_val = scores_data[row_start..row_start + q + 1]
-                .iter()
-                .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let device = scores.context().device();
 
-            // Compute exp and sum for valid positions
-            let mut sum = 0.0_f32;
-            for k in 0..=q {
-                let exp_val = (scores_data[row_start + k] - max_val).exp();
-                probs_data[row_start + k] = exp_val;
-                sum += exp_val;
-            }
-
-            // Normalize
-            for k in 0..=q {
-                probs_data[row_start + k] /= sum;
-            }
-
-            // Masked positions stay at 0
-        }
+    let module_name = "causal_softmax_batched";
+    if !device.has_func(module_name, "causal_softmax_batched_f32") {
+        let ptx = cudarc::nvrtc::safe::compile_ptx(CAUSAL_SOFTMAX_BATCHED_KERNEL)?;
+        device.load_ptx(ptx, module_name, &["causal_softmax_batched_f32"])?;
     }
 
-    CudaTensor::from_slice(scores.context(), shape, &probs_data)
+    let func = device
+        .get_func(module_name, "causal_softmax_batched_f32")
+        .unwrap();
+
+    let block_size = 256_usize.min(seq.next_power_of_two());
+    let shared_mem = block_size * std::mem::size_of::<f32>();
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_rows as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                scores.cuda_slice(),
+                batch as i32,
+                seq as i32,
+            ),
+        )?;
+    }
+
+    Ok(output)
 }
 
 #[cfg(test)]
