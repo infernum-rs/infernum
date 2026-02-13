@@ -1,6 +1,7 @@
 //! Operations (kernels) for tensor computations
 
 mod add;
+mod argmax;
 mod attention;
 mod embed;
 mod matmul;
@@ -12,6 +13,7 @@ mod softmax;
 mod transpose;
 
 pub use add::add;
+pub use argmax::argmax_last;
 pub use attention::attention;
 pub use embed::embedding_gather;
 pub use matmul::matmul;

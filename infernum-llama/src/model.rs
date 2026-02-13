@@ -9,9 +9,15 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add, apply_rope, attention, embedding_gather, matmul, precompute_rope_cache, repeat_kv,
-    rms_norm, silu_mul, transpose_2d,
+    add, apply_rope, argmax_last, attention, embedding_gather, matmul, precompute_rope_cache,
+    repeat_kv, rms_norm, silu_mul, transpose_2d,
 };
+
+/// Transpose a weight matrix once, for use in pre-transposed linear projections.
+/// (out_features, in_features) -> (in_features, out_features)
+fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+    transpose_2d(weight)
+}
 use infernum::cuda::{CudaContext, CudaTensor};
 use infernum::tensor::Tensor;
 use infernum::weights::{SafeTensorsLoader, WeightLoader};
@@ -19,7 +25,7 @@ use infernum::Result;
 
 use crate::LlamaConfig;
 
-/// Weights for a single Llama attention layer
+/// Weights for a single Llama attention layer (stored pre-transposed for efficient matmul)
 struct LlamaAttentionWeights {
     q_proj: CudaTensor<f32>,
     k_proj: CudaTensor<f32>,
@@ -27,7 +33,7 @@ struct LlamaAttentionWeights {
     o_proj: CudaTensor<f32>,
 }
 
-/// Weights for a single Llama MLP layer
+/// Weights for a single Llama MLP layer (stored pre-transposed for efficient matmul)
 struct LlamaMlpWeights {
     gate_proj: CudaTensor<f32>,
     up_proj: CudaTensor<f32>,
@@ -100,17 +106,31 @@ impl LlamaModel {
                 input_layernorm: loader
                     .load_f32(ctx, &format!("{prefix}.input_layernorm.weight"))?,
                 attention: LlamaAttentionWeights {
-                    q_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.q_proj.weight"))?,
-                    k_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.k_proj.weight"))?,
-                    v_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.v_proj.weight"))?,
-                    o_proj: loader.load_f32(ctx, &format!("{prefix}.self_attn.o_proj.weight"))?,
+                    q_proj: pretranspose_weight(
+                        &loader.load_f32(ctx, &format!("{prefix}.self_attn.q_proj.weight"))?,
+                    )?,
+                    k_proj: pretranspose_weight(
+                        &loader.load_f32(ctx, &format!("{prefix}.self_attn.k_proj.weight"))?,
+                    )?,
+                    v_proj: pretranspose_weight(
+                        &loader.load_f32(ctx, &format!("{prefix}.self_attn.v_proj.weight"))?,
+                    )?,
+                    o_proj: pretranspose_weight(
+                        &loader.load_f32(ctx, &format!("{prefix}.self_attn.o_proj.weight"))?,
+                    )?,
                 },
                 post_attention_layernorm: loader
                     .load_f32(ctx, &format!("{prefix}.post_attention_layernorm.weight"))?,
                 mlp: LlamaMlpWeights {
-                    gate_proj: loader.load_f32(ctx, &format!("{prefix}.mlp.gate_proj.weight"))?,
-                    up_proj: loader.load_f32(ctx, &format!("{prefix}.mlp.up_proj.weight"))?,
-                    down_proj: loader.load_f32(ctx, &format!("{prefix}.mlp.down_proj.weight"))?,
+                    gate_proj: pretranspose_weight(
+                        &loader.load_f32(ctx, &format!("{prefix}.mlp.gate_proj.weight"))?,
+                    )?,
+                    up_proj: pretranspose_weight(
+                        &loader.load_f32(ctx, &format!("{prefix}.mlp.up_proj.weight"))?,
+                    )?,
+                    down_proj: pretranspose_weight(
+                        &loader.load_f32(ctx, &format!("{prefix}.mlp.down_proj.weight"))?,
+                    )?,
                 },
             };
 
@@ -120,11 +140,11 @@ impl LlamaModel {
         // Load final norm
         let norm = loader.load_f32(ctx, "model.norm.weight")?;
 
-        // Load or tie lm_head
+        // Load or tie lm_head (pre-transposed for efficient linear projection)
         let lm_head = if config.tie_word_embeddings {
-            embed_tokens.clone()
+            pretranspose_weight(&embed_tokens)?
         } else {
-            loader.load_f32(ctx, "lm_head.weight")?
+            pretranspose_weight(&loader.load_f32(ctx, "lm_head.weight")?)?
         };
 
         // Precompute RoPE cache
@@ -181,6 +201,53 @@ impl LlamaModel {
         let logits = self.lm_head_forward(&hidden)?;
 
         Ok(logits)
+    }
+
+    /// Greedy autoregressive generation
+    ///
+    /// Runs the model forward repeatedly, selecting the highest-probability
+    /// token at each step via argmax. Stops when `max_new_tokens` are produced
+    /// or the EOS token is emitted.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Prompt token IDs
+    /// * `max_new_tokens` - Maximum number of tokens to generate
+    /// * `eos_token_id` - Optional EOS token ID to stop generation early
+    ///
+    /// # Returns
+    /// The full token sequence (prompt + generated tokens)
+    ///
+    /// # Errors
+    /// Returns an error if a forward pass fails
+    pub fn generate(
+        &self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) -> Result<Vec<u32>> {
+        let mut tokens = input_ids.to_vec();
+
+        for _ in 0..max_new_tokens {
+            let logits = self.forward(&tokens)?;
+
+            // logits: (seq_len, vocab_size) — extract last row via reshape
+            let seq_len = logits.shape()[0];
+            let vocab_size = logits.shape()[1];
+            let last_logits = logits.reshape(&[seq_len, vocab_size]);
+
+            // Argmax on GPU over the full (seq_len, vocab_size) matrix,
+            // then take only the last row's result
+            let all_argmax = argmax_last(&last_logits)?;
+            let next_token = all_argmax[seq_len - 1];
+
+            if eos_token_id == Some(next_token) {
+                break;
+            }
+
+            tokens.push(next_token);
+        }
+
+        Ok(tokens)
     }
 
     /// Embed token IDs
@@ -297,28 +364,13 @@ impl LlamaModel {
     }
 }
 
-/// Linear projection: output = input @ weight^T
+/// Linear projection: output = input @ weight
+/// Weights must be stored pre-transposed as (in_features, out_features).
 /// input: (seq_len, in_features)
-/// weight: (out_features, in_features)
+/// weight: (in_features, out_features)
 /// output: (seq_len, out_features)
 fn linear(input: &CudaTensor<f32>, weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
-    let input_shape = input.shape();
-    let weight_shape = weight.shape();
-
-    let _seq_len = input_shape[0];
-    let in_features = input_shape[1];
-    let _out_features = weight_shape[0];
-
-    assert_eq!(
-        weight_shape[1], in_features,
-        "Weight in_features doesn't match input"
-    );
-
-    // Transpose weight: (out_features, in_features) -> (in_features, out_features)
-    let weight_t = transpose_2d(weight)?;
-
-    // Matmul: (seq_len, in_features) @ (in_features, out_features) -> (seq_len, out_features)
-    matmul(input, &weight_t)
+    matmul(input, weight)
 }
 
 #[cfg(test)]
@@ -329,17 +381,18 @@ mod tests {
     fn test_linear() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
 
-        // input: (2, 3), weight: (4, 3) -> output: (2, 4)
+        // input: (2, 3), weight pre-transposed: (3, 4) -> output: (2, 4)
         let input_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // Columns correspond to output features:
+        // col 0: picks dim 0, col 1: picks dim 1, col 2: picks dim 2, col 3: sum
         let weight_data: Vec<f32> = vec![
-            1.0, 0.0, 0.0, // row 0: picks dim 0
-            0.0, 1.0, 0.0, // row 1: picks dim 1
-            0.0, 0.0, 1.0, // row 2: picks dim 2
-            1.0, 1.0, 1.0, // row 3: sum
+            1.0, 0.0, 0.0, 1.0, // row 0
+            0.0, 1.0, 0.0, 1.0, // row 1
+            0.0, 0.0, 1.0, 1.0, // row 2
         ];
 
         let input = CudaTensor::from_slice(&ctx, &[2, 3], &input_data).unwrap();
-        let weight = CudaTensor::from_slice(&ctx, &[4, 3], &weight_data).unwrap();
+        let weight = CudaTensor::from_slice(&ctx, &[3, 4], &weight_data).unwrap();
 
         let output = linear(&input, &weight).unwrap();
 

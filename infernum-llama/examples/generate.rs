@@ -7,7 +7,6 @@ use std::env;
 use std::io::{self, Write};
 
 use infernum::cuda::CudaContext;
-use infernum::tensor::Tensor;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::Result;
 use infernum_llama::LlamaModel;
@@ -37,43 +36,23 @@ fn main() -> Result<()> {
     );
 
     // Encode prompt
-    let mut tokens = tokenizer.encode(&prompt, true)?;
-    println!("Prompt: \"{}\" ({} tokens)", prompt, tokens.len());
+    let tokens = tokenizer.encode(&prompt, true)?;
+    let prompt_len = tokens.len();
+    println!("Prompt: \"{}\" ({} tokens)", prompt, prompt_len);
 
-    // Print prompt
+    // Generate
+    let output_tokens = model.generate(&tokens, max_tokens, Some(tokenizer.eos_token_id()))?;
+
+    // Decode and print the generated part
     print!("{}", prompt);
-    io::stdout().flush()?;
-
-    // Generate tokens
-    for _ in 0..max_tokens {
-        // Forward pass
-        let logits = model.forward(&tokens)?;
-
-        // Get logits for last position: (seq_len, vocab_size) -> (vocab_size,)
-        let logits_data = logits.to_vec()?;
-        let seq_len = logits.shape()[0];
-        let vocab_size = logits.shape()[1];
-        let last_logits = &logits_data[(seq_len - 1) * vocab_size..];
-
-        // Greedy decoding: argmax
-        let next_token = argmax(last_logits);
-
-        // Check for EOS
-        if tokenizer.is_eos(next_token) {
-            break;
-        }
-
-        // Decode and print
-        let text = tokenizer.decode_token(next_token)?;
+    for &tok in &output_tokens[prompt_len..] {
+        let text = tokenizer.decode_token(tok)?;
         print!("{}", text);
         io::stdout().flush()?;
-
-        // Append to sequence
-        tokens.push(next_token);
     }
 
     println!();
-    println!("Generated {} tokens total", tokens.len());
+    println!("Generated {} tokens total", output_tokens.len());
 
     Ok(())
 }
@@ -133,18 +112,4 @@ fn print_usage() {
     eprintln!();
     eprintln!("Example:");
     eprintln!("  cargo run --example generate -- -m /path/to/llama \"Hello, world!\"");
-}
-
-fn argmax(slice: &[f32]) -> u32 {
-    let mut max_idx = 0;
-    let mut max_val = f32::NEG_INFINITY;
-
-    for (i, &val) in slice.iter().enumerate() {
-        if val > max_val {
-            max_val = val;
-            max_idx = i;
-        }
-    }
-
-    max_idx as u32
 }

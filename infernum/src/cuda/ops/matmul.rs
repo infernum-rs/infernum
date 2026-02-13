@@ -8,7 +8,7 @@
     clippy::uninlined_format_args
 )]
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::DeviceRepr;
 
 use crate::cuda::CudaTensor;
@@ -103,6 +103,8 @@ where
 }
 
 /// Batched 3D matrix multiplication: (B, M, K) @ (B, K, N) -> (B, M, N)
+///
+/// Uses `gemm_strided_batched` for a single cuBLAS call across all batches.
 fn matmul_batched<T>(a: &CudaTensor<T>, b: &CudaTensor<T>) -> Result<CudaTensor<T>>
 where
     T: TensorDType + DeviceRepr + GemmScalar + Default,
@@ -119,21 +121,12 @@ where
     assert_eq!(batch, b_shape[0], "Batch dimensions must match");
     assert_eq!(k, b_shape[1], "Inner dimensions must match");
 
-    // For batched matmul, we iterate over batch dimension
-    // (A more efficient implementation would use cublasGemmBatched or cublasGemmStridedBatched)
     let c_shape = [batch, m, n];
     let mut c = unsafe { CudaTensor::<T>::uninit(a.context(), &c_shape)? };
 
-    // Flatten and process as a single large matmul
-    // A: (batch*m, k), B: (k, n) broadcast -> C: (batch*m, n) -> reshape to (batch, m, n)
-    // This is a simplification; proper batched GEMM would be more efficient
-
-    for i in 0..batch {
-        let a_offset = i * m * k;
-        let b_offset = i * k * n;
-        let c_offset = i * m * n;
-
-        let cfg = GemmConfig {
+    // cuBLAS uses column-major, so we compute C^T = B^T @ A^T per batch
+    let cfg = StridedBatchedConfig {
+        gemm: GemmConfig {
             transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
             transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
             m: n as i32,
@@ -144,17 +137,20 @@ where
             ldb: k as i32,
             beta: T::ZERO,
             ldc: n as i32,
-        };
+        },
+        batch_size: batch as i32,
+        stride_a: (k * n) as i64,
+        stride_b: (m * k) as i64,
+        stride_c: (m * n) as i64,
+    };
 
-        unsafe {
-            let a_slice = a.cuda_slice().slice(a_offset..a_offset + m * k);
-            let b_slice = b.cuda_slice().slice(b_offset..b_offset + k * n);
-            let mut c_slice = c.cuda_slice_mut().slice_mut(c_offset..c_offset + m * n);
-
-            a.context()
-                .blas()
-                .gemm(cfg, &b_slice, &a_slice, &mut c_slice)?;
-        }
+    unsafe {
+        a.context().blas().gemm_strided_batched(
+            cfg,
+            b.cuda_slice(),
+            a.cuda_slice(),
+            c.cuda_slice_mut(),
+        )?;
     }
 
     Ok(c)
