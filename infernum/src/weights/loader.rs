@@ -105,4 +105,71 @@ mod tests {
 
         assert_eq!(mapper.map_llama_name("model.norm.weight"), "norm.weight");
     }
+
+    #[test]
+    fn test_weight_name_unmap() {
+        let mapper = WeightNameMapper::new("");
+
+        assert_eq!(
+            mapper.unmap_llama_name("layers.0.attention.q_proj.weight"),
+            "model.layers.0.self_attn.q_proj.weight"
+        );
+
+        assert_eq!(
+            mapper.unmap_llama_name("embed_tokens.weight"),
+            "model.embed_tokens.weight"
+        );
+
+        assert_eq!(
+            mapper.unmap_llama_name("norm.weight"),
+            "model.norm.weight"
+        );
+    }
+
+    #[test]
+    fn test_weight_name_roundtrip() {
+        let mapper = WeightNameMapper::new("");
+
+        let original = "model.layers.5.self_attn.v_proj.weight";
+        let mapped = mapper.map_llama_name(original);
+        let unmapped = mapper.unmap_llama_name(&mapped);
+
+        assert_eq!(unmapped, original);
+    }
+
+    #[test]
+    fn test_weight_name_with_prefix() {
+        let mapper = WeightNameMapper::new("llama");
+
+        assert_eq!(
+            mapper.map_llama_name("model.layers.0.self_attn.q_proj.weight"),
+            "llama.layers.0.attention.q_proj.weight"
+        );
+
+        assert_eq!(
+            mapper.map_llama_name("model.norm.weight"),
+            "llama.norm.weight"
+        );
+    }
+
+    #[test]
+    fn test_weight_name_unmap_with_prefix() {
+        let mapper = WeightNameMapper::new("llama");
+
+        assert_eq!(
+            mapper.unmap_llama_name("llama.layers.0.attention.q_proj.weight"),
+            "model.layers.0.self_attn.q_proj.weight"
+        );
+    }
+
+    #[test]
+    fn test_weight_name_no_model_prefix() {
+        let mapper = WeightNameMapper::new("");
+
+        // Input without "model." prefix should still work
+        assert_eq!(
+            mapper.map_llama_name("layers.0.self_attn.q_proj.weight"),
+            "layers.0.attention.q_proj.weight"
+        );
+    }
 }

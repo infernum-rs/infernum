@@ -144,4 +144,97 @@ mod tests {
         assert_eq!(config.num_kv_heads(), 8);
         assert_eq!(config.num_heads_per_kv(), 4);
     }
+
+    #[test]
+    fn test_config_all_defaults() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.max_position_embeddings, 2048);
+        assert_eq!(config.rms_norm_eps, 1e-5);
+        assert_eq!(config.rope_theta, 10000.0);
+        assert!(!config.tie_word_embeddings);
+        assert_eq!(config.bos_token_id, 1);
+        assert_eq!(config.eos_token_id, 2);
+    }
+
+    #[test]
+    fn test_config_tie_word_embeddings() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "intermediate_size": 5632,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 32,
+            "tie_word_embeddings": true
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert!(config.tie_word_embeddings);
+    }
+
+    #[test]
+    fn test_config_head_dim() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.head_dim(), 128);
+    }
+
+    #[test]
+    fn test_config_from_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("infernum_test_config.json");
+
+        let json = r#"{
+            "vocab_size": 128256,
+            "hidden_size": 2048,
+            "intermediate_size": 8192,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "rope_theta": 500000.0
+        }"#;
+
+        std::fs::write(&path, json).unwrap();
+
+        let config = LlamaConfig::from_file(&path).unwrap();
+        assert_eq!(config.vocab_size, 128256);
+        assert_eq!(config.rope_theta, 500000.0);
+        assert_eq!(config.num_kv_heads(), 8);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_config_from_file_missing() {
+        let result = LlamaConfig::from_file("/nonexistent/path/config.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_from_invalid_json() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("infernum_test_bad_config.json");
+
+        std::fs::write(&path, "not json at all").unwrap();
+
+        let result = LlamaConfig::from_file(&path);
+        assert!(result.is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
 }

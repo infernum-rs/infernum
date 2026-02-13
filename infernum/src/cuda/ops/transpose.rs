@@ -303,4 +303,45 @@ mod tests {
         // src(0, 1, 0) = 4.0 -> dst(0, 0, 1) = result[1]
         assert_eq!(result[1], 4.0);
     }
+
+    #[test]
+    fn test_transpose_2d_roundtrip() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        let tensor = CudaTensor::from_slice(&ctx, &[3, 4], &data).unwrap();
+
+        let roundtrip = transpose_2d(&transpose_2d(&tensor).unwrap()).unwrap();
+
+        assert_eq!(roundtrip.shape(), &[3, 4]);
+        assert_eq!(roundtrip.to_vec().unwrap(), data);
+    }
+
+    #[test]
+    fn test_transpose_012_to_102_roundtrip() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
+        let tensor = CudaTensor::from_slice(&ctx, &[2, 3, 4], &data).unwrap();
+
+        let roundtrip =
+            transpose_012_to_102(&transpose_012_to_102(&tensor).unwrap()).unwrap();
+
+        assert_eq!(roundtrip.shape(), &[2, 3, 4]);
+        assert_eq!(roundtrip.to_vec().unwrap(), data);
+    }
+
+    #[test]
+    fn test_transpose_last_two_roundtrip() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
+        let tensor = CudaTensor::from_slice(&ctx, &[2, 3, 4], &data).unwrap();
+
+        let roundtrip =
+            transpose_last_two(&transpose_last_two(&tensor).unwrap()).unwrap();
+
+        assert_eq!(roundtrip.shape(), &[2, 3, 4]);
+        assert_eq!(roundtrip.to_vec().unwrap(), data);
+    }
 }

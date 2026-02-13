@@ -48,3 +48,32 @@ impl CudaContext {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_context_creation() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        // Verify device and blas handles are accessible
+        let _ = ctx.device();
+        let _ = ctx.blas();
+    }
+
+    #[test]
+    fn test_context_clone() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let ctx2 = ctx.clone();
+
+        // Both should reference the same device
+        assert!(std::sync::Arc::ptr_eq(ctx.device(), ctx2.device()));
+        assert!(std::sync::Arc::ptr_eq(ctx.blas(), ctx2.blas()));
+    }
+
+    #[test]
+    fn test_context_synchronize() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        ctx.synchronize().expect("Synchronize should succeed");
+    }
+}

@@ -322,4 +322,59 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_softmax_causal_masks_future() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // 2 heads, 4 key positions, query at position 1 (can attend to k=0,1)
+        let input_data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, // head 0
+            0.5, 0.5, 0.5, 0.5, // head 1
+        ];
+        let input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
+
+        let output = softmax_causal(&input, 1, 0).unwrap();
+        let result = output.to_vec().unwrap();
+
+        // Positions 2 and 3 should be masked (zero)
+        for head in 0..2 {
+            assert!(
+                result[head * 4 + 2].abs() < 1e-6,
+                "Head {head} position 2 should be masked"
+            );
+            assert!(
+                result[head * 4 + 3].abs() < 1e-6,
+                "Head {head} position 3 should be masked"
+            );
+
+            // Valid positions should sum to 1
+            let sum: f32 = result[head * 4..head * 4 + 2].iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "Head {head} valid positions sum to {sum} instead of 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_softmax_causal_first_position() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // query_idx=0: can only attend to position 0
+        let input_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, 3], &input_data).unwrap();
+
+        let output = softmax_causal(&input, 0, 0).unwrap();
+        let result = output.to_vec().unwrap();
+
+        // Only position 0 is valid -> softmax of single element = 1.0
+        assert!(
+            (result[0] - 1.0).abs() < 1e-5,
+            "Position 0 should be 1.0, got {}",
+            result[0]
+        );
+        assert!(result[1].abs() < 1e-6);
+        assert!(result[2].abs() < 1e-6);
+    }
 }

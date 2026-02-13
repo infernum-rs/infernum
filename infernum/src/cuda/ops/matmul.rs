@@ -219,4 +219,90 @@ mod tests {
         let expected: Vec<f32> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0];
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn test_matmul_batched_3d() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // Batch=2, A: (2,1,2), B: (2,2,1) -> C: (2,1,1)
+        // Batch 0: [1,2] @ [[3],[4]] = [11]
+        // Batch 1: [5,6] @ [[7],[8]] = [83]
+        let a_data: Vec<f32> = vec![1.0, 2.0, 5.0, 6.0];
+        let b_data: Vec<f32> = vec![3.0, 4.0, 7.0, 8.0];
+
+        let a = CudaTensor::from_slice(&ctx, &[2, 1, 2], &a_data).unwrap();
+        let b = CudaTensor::from_slice(&ctx, &[2, 2, 1], &b_data).unwrap();
+
+        let c = matmul(&a, &b).unwrap();
+
+        assert_eq!(c.shape(), &[2, 1, 1]);
+
+        let result = c.to_vec().unwrap();
+        assert!((result[0] - 11.0).abs() < 1e-4);
+        assert!((result[1] - 83.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_matmul_3d_times_2d_broadcast() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // A: (2, 2, 3), B: (3, 2) -> C: (2, 2, 2)
+        // B is broadcast across the batch dimension
+        let a_data: Vec<f32> = vec![
+            1.0, 0.0, 0.0, // batch 0, row 0
+            0.0, 1.0, 0.0, // batch 0, row 1
+            0.0, 0.0, 1.0, // batch 1, row 0
+            1.0, 1.0, 0.0, // batch 1, row 1
+        ];
+        let b_data: Vec<f32> = vec![
+            1.0, 2.0, // col 0, col 1 of row 0
+            3.0, 4.0, // col 0, col 1 of row 1
+            5.0, 6.0, // col 0, col 1 of row 2
+        ];
+
+        let a = CudaTensor::from_slice(&ctx, &[2, 2, 3], &a_data).unwrap();
+        let b = CudaTensor::from_slice(&ctx, &[3, 2], &b_data).unwrap();
+
+        let c = matmul(&a, &b).unwrap();
+
+        assert_eq!(c.shape(), &[2, 2, 2]);
+
+        let result = c.to_vec().unwrap();
+        // batch 0 row 0: [1,0,0]@B = [1,2]
+        // batch 0 row 1: [0,1,0]@B = [3,4]
+        // batch 1 row 0: [0,0,1]@B = [5,6]
+        // batch 1 row 1: [1,1,0]@B = [4,6]
+        assert!((result[0] - 1.0).abs() < 1e-4);
+        assert!((result[1] - 2.0).abs() < 1e-4);
+        assert!((result[2] - 3.0).abs() < 1e-4);
+        assert!((result[3] - 4.0).abs() < 1e-4);
+        assert!((result[4] - 5.0).abs() < 1e-4);
+        assert!((result[5] - 6.0).abs() < 1e-4);
+        assert!((result[6] - 4.0).abs() < 1e-4);
+        assert!((result[7] - 6.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_matmul_identity() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // A @ I = A
+        let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let identity: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+        let a = CudaTensor::from_slice(&ctx, &[2, 3], &a_data).unwrap();
+        let i = CudaTensor::from_slice(&ctx, &[3, 3], &identity).unwrap();
+
+        let c = matmul(&a, &i).unwrap();
+
+        assert_eq!(c.shape(), &[2, 3]);
+
+        let result = c.to_vec().unwrap();
+        for (idx, (&got, &exp)) in result.iter().zip(a_data.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "Mismatch at {idx}: {got} vs {exp}"
+            );
+        }
+    }
 }
