@@ -10,7 +10,7 @@ use std::path::Path;
 
 use infernum::cuda::ops::{
     add, apply_rope, argmax_last, attention, embedding_gather, matmul, precompute_rope_cache,
-    repeat_kv, rms_norm, silu_mul, transpose_2d,
+    repeat_kv, rms_norm, sample_top_p, silu_mul, transpose_2d,
 };
 
 /// Transpose a weight matrix once, for use in pre-transposed linear projections.
@@ -46,6 +46,28 @@ struct LlamaLayerWeights {
     attention: LlamaAttentionWeights,
     post_attention_layernorm: CudaTensor<f32>,
     mlp: LlamaMlpWeights,
+}
+
+/// Parameters for nucleus (top-p) sampling
+#[derive(Debug, Clone)]
+pub struct SamplingParams {
+    /// Temperature for logit scaling (higher = more random). Must be > 0.
+    pub temperature: f32,
+    /// Nucleus probability threshold in (0, 1]. Only tokens within the top-p
+    /// cumulative probability mass are considered.
+    pub top_p: f32,
+    /// Seed for the PRNG. Same seed + same input → same output.
+    pub seed: u64,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.7,
+            top_p: 0.9,
+            seed: 42,
+        }
+    }
 }
 
 /// Complete Llama model
@@ -239,6 +261,53 @@ impl LlamaModel {
             // then take only the last row's result
             let all_argmax = argmax_last(&last_logits)?;
             let next_token = all_argmax[seq_len - 1];
+
+            if eos_token_id == Some(next_token) {
+                break;
+            }
+
+            tokens.push(next_token);
+        }
+
+        Ok(tokens)
+    }
+
+    /// Autoregressive generation with nucleus (top-p) sampling
+    ///
+    /// Like [`generate`](Self::generate), but selects each token by sampling
+    /// from the nucleus of the probability distribution rather than taking
+    /// the argmax.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Prompt token IDs
+    /// * `max_new_tokens` - Maximum number of tokens to generate
+    /// * `eos_token_id` - Optional EOS token ID to stop generation early
+    /// * `params` - Sampling parameters (temperature, top-p)
+    ///
+    /// # Returns
+    /// The full token sequence (prompt + generated tokens)
+    ///
+    /// # Errors
+    /// Returns an error if a forward pass fails
+    pub fn generate_sampled(
+        &self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        params: &SamplingParams,
+    ) -> Result<Vec<u32>> {
+        let mut tokens = input_ids.to_vec();
+        let mut rng_state = params.seed;
+
+        for _ in 0..max_new_tokens {
+            let logits = self.forward(&tokens)?;
+
+            // Advance the RNG state so each step gets a different sample
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+
+            let next_token = sample_top_p(&logits, params.temperature, params.top_p, rng_state)?;
 
             if eos_token_id == Some(next_token) {
                 break;

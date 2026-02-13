@@ -6,4 +6,4 @@ mod model;
 
 pub use config::LlamaConfig;
 #[cfg(feature = "cuda")]
-pub use model::LlamaModel;
+pub use model::{LlamaModel, SamplingParams};
