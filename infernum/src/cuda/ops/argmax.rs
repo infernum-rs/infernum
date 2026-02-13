@@ -102,7 +102,7 @@ fn argmax_last_gpu(
 
     let func = device.get_func(module_name, "argmax_last_f32").unwrap();
 
-    let block_size = 256.min(row_size);
+    let block_size = 256.min(row_size.next_power_of_two());
     let shared_mem = block_size * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
 
     let cfg = LaunchConfig {
