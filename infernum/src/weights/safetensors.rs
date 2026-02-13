@@ -155,6 +155,11 @@ impl WeightLoader for SafeTensorsLoader {
                 let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
                 bf16_slice.iter().map(|x| x.to_f32()).collect()
             }
+            DType::U32 => {
+                return Err(Error::UnsupportedDtype(
+                    "cannot convert U32 weights to f32".to_string(),
+                ));
+            }
         };
 
         CudaTensor::from_slice(ctx, &meta.shape, &f32_data)

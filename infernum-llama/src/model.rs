@@ -376,6 +376,8 @@ fn linear(input: &CudaTensor<f32>, weight: &CudaTensor<f32>) -> Result<CudaTenso
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infernum::dtype::DType;
+    use std::collections::HashMap;
 
     #[test]
     fn test_linear() {
@@ -408,5 +410,259 @@ mod tests {
         assert!((result[5] - 5.0).abs() < 1e-4);
         assert!((result[6] - 6.0).abs() < 1e-4);
         assert!((result[7] - 15.0).abs() < 1e-4);
+    }
+
+    // --- End-to-end tests with a tiny model ---
+
+    /// Deterministic pseudo-random f32 in [-scale, scale] for reproducible test weights
+    fn pseudo_random_weights(n: usize, scale: f32) -> Vec<f32> {
+        let mut values = Vec::with_capacity(n);
+        let mut state: u64 = 42;
+        for _ in 0..n {
+            // xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let f = (state as f32) / (u64::MAX as f32); // [0, 1)
+            values.push((f * 2.0 - 1.0) * scale);
+        }
+        values
+    }
+
+    /// Mock weight loader that stores pre-built tensors by name
+    struct MockWeightLoader {
+        tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
+    }
+
+    impl MockWeightLoader {
+        fn new() -> Self {
+            Self {
+                tensors: HashMap::new(),
+            }
+        }
+
+        fn add(&mut self, name: &str, shape: &[usize], data: Vec<f32>) {
+            self.tensors
+                .insert(name.to_string(), (shape.to_vec(), data));
+        }
+    }
+
+    impl WeightLoader for MockWeightLoader {
+        fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>> {
+            let (shape, data) = self
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("MockWeightLoader: tensor not found: {name}"));
+            CudaTensor::from_slice(ctx, shape, data)
+        }
+
+        fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
+            Ok(self.tensors.get(name).unwrap().0.clone())
+        }
+
+        fn get_dtype(&self, _name: &str) -> Result<DType> {
+            Ok(DType::F32)
+        }
+
+        fn tensor_names(&self) -> Vec<String> {
+            self.tensors.keys().cloned().collect()
+        }
+
+        fn contains(&self, name: &str) -> bool {
+            self.tensors.contains_key(name)
+        }
+    }
+
+    /// Build a tiny LlamaConfig for testing
+    fn tiny_config() -> LlamaConfig {
+        LlamaConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            bos_token_id: 1,
+            eos_token_id: 2,
+        }
+    }
+
+    /// Build a MockWeightLoader with random weights matching the tiny config
+    fn tiny_weight_loader(config: &LlamaConfig) -> MockWeightLoader {
+        let h = config.hidden_size;
+        let inter = config.intermediate_size;
+        let vocab = config.vocab_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads();
+        let head_dim = config.head_dim();
+        let scale = 0.02;
+
+        let mut loader = MockWeightLoader::new();
+        let mut seed_offset: usize = 0;
+
+        let mut rand = |n: usize| -> Vec<f32> {
+            seed_offset += 1;
+            let mut vals = pseudo_random_weights(n, scale);
+            // Rotate by seed_offset to get different values per tensor
+            vals.rotate_left(seed_offset % n.max(1));
+            vals
+        };
+
+        // Embeddings
+        loader.add("model.embed_tokens.weight", &[vocab, h], rand(vocab * h));
+
+        // Layer 0
+        let prefix = "model.layers.0";
+        loader.add(
+            &format!("{prefix}.input_layernorm.weight"),
+            &[h],
+            vec![1.0; h],
+        );
+        loader.add(
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[num_heads * head_dim, h],
+            rand(num_heads * head_dim * h),
+        );
+        loader.add(
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            &[num_kv_heads * head_dim, h],
+            rand(num_kv_heads * head_dim * h),
+        );
+        loader.add(
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            &[num_kv_heads * head_dim, h],
+            rand(num_kv_heads * head_dim * h),
+        );
+        loader.add(
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            &[h, num_heads * head_dim],
+            rand(h * num_heads * head_dim),
+        );
+        loader.add(
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &[h],
+            vec![1.0; h],
+        );
+        loader.add(
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            &[inter, h],
+            rand(inter * h),
+        );
+        loader.add(
+            &format!("{prefix}.mlp.up_proj.weight"),
+            &[inter, h],
+            rand(inter * h),
+        );
+        loader.add(
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &[h, inter],
+            rand(h * inter),
+        );
+
+        // Final norm
+        loader.add("model.norm.weight", &[h], vec![1.0; h]);
+
+        // lm_head
+        loader.add("lm_head.weight", &[vocab, h], rand(vocab * h));
+
+        loader
+    }
+
+    fn build_tiny_model(ctx: &CudaContext) -> LlamaModel {
+        let config = tiny_config();
+        let loader = tiny_weight_loader(&config);
+        LlamaModel::load_weights(ctx, config, &loader).expect("Failed to build tiny model")
+    }
+
+    #[test]
+    fn test_forward_output_shape() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+
+        let input_ids: Vec<u32> = vec![1, 5, 10];
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+
+        // logits should be (seq_len, vocab_size)
+        assert_eq!(logits.shape(), &[3, 64]);
+    }
+
+    #[test]
+    fn test_forward_single_token() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+
+        let logits = model.forward(&[0]).expect("Forward pass failed");
+        assert_eq!(logits.shape(), &[1, 64]);
+
+        // Logits should be finite
+        let data = logits.to_vec().unwrap();
+        assert!(
+            data.iter().all(|x| x.is_finite()),
+            "Logits contain non-finite values"
+        );
+    }
+
+    #[test]
+    fn test_forward_deterministic() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+
+        let input_ids: Vec<u32> = vec![1, 5, 10];
+        let logits1 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+        let logits2 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+
+        for (i, (a, b)) in logits1.iter().zip(logits2.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "Non-deterministic at index {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_respects_max_tokens() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+
+        let prompt = vec![1_u32, 5, 10];
+        let max_new = 4;
+        let tokens = model.generate(&prompt, max_new, None).unwrap();
+
+        // Should produce at most prompt_len + max_new_tokens
+        assert!(tokens.len() <= prompt.len() + max_new);
+        assert!(
+            tokens.len() > prompt.len(),
+            "Should generate at least 1 token"
+        );
+        // Prompt should be preserved
+        assert_eq!(&tokens[..prompt.len()], &prompt);
+    }
+
+    #[test]
+    fn test_generate_stops_on_eos() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+
+        // Run generate with a very large max_new_tokens but EOS set to a
+        // token that the model is likely to produce with random weights
+        let prompt = vec![1_u32];
+        let result_no_eos = model.generate(&prompt, 5, None).unwrap();
+
+        // The generated tokens should not include the EOS token if we set it
+        // to one that was actually produced
+        if result_no_eos.len() > 1 {
+            let first_generated = result_no_eos[1];
+            let result_with_eos = model.generate(&prompt, 100, Some(first_generated)).unwrap();
+            // Should stop immediately since the first generated token == EOS
+            assert_eq!(
+                result_with_eos.len(),
+                prompt.len(),
+                "Should stop before appending the EOS token"
+            );
+        }
     }
 }
