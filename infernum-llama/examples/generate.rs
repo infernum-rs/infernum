@@ -2,7 +2,8 @@
 //!
 //! Usage:
 //!   cargo run --example generate --features cuda -- --model /path/to/llama "Hello"
-//!   cargo run --example generate --features cuda -- --model /path/to/llama --temperature 0.8 --top-p 0.9 "Hello"
+//!   cargo run --example generate --features cuda -- --model /path/to/llama --greedy "Hello"
+//!   cargo run --example generate --features cuda -- --model /path/to/llama -t 0.8 -p 0.95 "Hello"
 
 use std::env;
 use std::io::{self, Write};
@@ -44,15 +45,15 @@ fn main() -> Result<()> {
     let eos = Some(tokenizer.eos_token_id());
 
     // Generate
-    let output_tokens = if let Some(params) = &cli.sampling {
-        println!(
-            "Sampling: temperature={}, top_p={}, seed={}",
-            params.temperature, params.top_p, params.seed
-        );
-        model.generate_sampled(&tokens, cli.max_tokens, eos, params)?
-    } else {
+    let output_tokens = if cli.greedy {
         println!("Decoding: greedy (argmax)");
         model.generate(&tokens, cli.max_tokens, eos)?
+    } else {
+        println!(
+            "Sampling: temperature={}, top_p={}, seed={}",
+            cli.sampling.temperature, cli.sampling.top_p, cli.sampling.seed
+        );
+        model.generate_sampled(&tokens, cli.max_tokens, eos, &cli.sampling)?
     };
 
     // Decode and print the generated part
@@ -73,13 +74,15 @@ struct CliArgs {
     model_path: String,
     prompt: String,
     max_tokens: usize,
-    sampling: Option<SamplingParams>,
+    greedy: bool,
+    sampling: SamplingParams,
 }
 
 fn parse_args(args: &[String]) -> CliArgs {
     let mut model_path = String::new();
     let mut prompt = String::new();
     let mut max_tokens = 100;
+    let mut greedy = false;
     let mut temperature: Option<f32> = None;
     let mut top_p: Option<f32> = None;
     let mut seed: Option<u64> = None;
@@ -117,6 +120,9 @@ fn parse_args(args: &[String]) -> CliArgs {
                     seed = Some(args[i].parse().unwrap_or(42));
                 }
             }
+            "--greedy" => {
+                greedy = true;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -138,22 +144,18 @@ fn parse_args(args: &[String]) -> CliArgs {
         prompt = "Hello".to_string();
     }
 
-    // Enable sampling if any sampling flag was provided
-    let sampling = if temperature.is_some() || top_p.is_some() || seed.is_some() {
-        let defaults = SamplingParams::default();
-        Some(SamplingParams {
-            temperature: temperature.unwrap_or(defaults.temperature),
-            top_p: top_p.unwrap_or(defaults.top_p),
-            seed: seed.unwrap_or(defaults.seed),
-        })
-    } else {
-        None
+    let defaults = SamplingParams::default();
+    let sampling = SamplingParams {
+        temperature: temperature.unwrap_or(defaults.temperature),
+        top_p: top_p.unwrap_or(defaults.top_p),
+        seed: seed.unwrap_or(defaults.seed),
     };
 
     CliArgs {
         model_path,
         prompt,
         max_tokens,
+        greedy,
         sampling,
     }
 }
@@ -164,18 +166,20 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  -m, --model <PATH>       Path to model directory (default: $LLAMA_MODEL_PATH or models/llama-3.2-1b)");
     eprintln!("  -n, --max-tokens <N>     Maximum tokens to generate (default: 100)");
-    eprintln!("  -t, --temperature <F>    Sampling temperature (default: 0.7, enables sampling)");
-    eprintln!(
-        "  -p, --top-p <F>          Nucleus sampling threshold (default: 0.9, enables sampling)"
-    );
-    eprintln!("  -s, --seed <N>           RNG seed for sampling (default: 42, enables sampling)");
+    eprintln!("  -t, --temperature <F>    Sampling temperature (default: 0.7)");
+    eprintln!("  -p, --top-p <F>          Nucleus sampling threshold (default: 0.9)");
+    eprintln!("  -s, --seed <N>           RNG seed for sampling (default: 42)");
+    eprintln!("      --greedy             Use greedy (argmax) decoding instead of sampling");
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
-    eprintln!("Without --temperature/--top-p/--seed, uses greedy (argmax) decoding.");
+    eprintln!("Uses nucleus sampling by default. Pass --greedy for deterministic argmax.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!(
         "  cargo run --example generate --features cuda -- -m /path/to/model \"Hello, world!\""
+    );
+    eprintln!(
+        "  cargo run --example generate --features cuda -- -m /path/to/model --greedy \"Hello\""
     );
     eprintln!("  cargo run --example generate --features cuda -- -m /path/to/model -t 0.8 -p 0.95 \"Once upon a time\"");
 }
