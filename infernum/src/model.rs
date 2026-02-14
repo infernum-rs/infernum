@@ -35,16 +35,22 @@ pub trait Model {
     /// Full forward pass (no KV cache, recomputes everything).
     ///
     /// # Arguments
-    /// * `input_ids` - Token IDs of shape (seq_len,)
+    /// * `input_ids` - Token IDs of shape (`seq_len`,)
     ///
     /// # Returns
-    /// Logits tensor of shape (seq_len, vocab_size)
+    /// Logits tensor of shape (`seq_len`, `vocab_size`)
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
     fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>>;
 
     /// Forward pass with KV cache (prefill phase).
     ///
     /// Processes all input tokens, populating the KV cache, and returns
-    /// logits for the **last** token only: shape (1, vocab_size).
+    /// logits for the **last** token only: shape (1, `vocab_size`).
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
     fn forward_with_kv_cache(
         &self,
         input_ids: &[u32],
@@ -53,6 +59,9 @@ pub trait Model {
 
     /// Forward pass for a single token with KV cache (decode phase).
     ///
-    /// Appends the token's KV to the cache and returns logits of shape (1, vocab_size).
+    /// Appends the token's KV to the cache and returns logits of shape (1, `vocab_size`).
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
     fn forward_next_token(&self, token_id: u32, kv_cache: &mut KvCache) -> Result<CudaTensor<f32>>;
 }
