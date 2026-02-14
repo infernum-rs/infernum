@@ -304,6 +304,47 @@ impl WeightLoader for GgufLoader {
                 let f16_slice: &[half::f16] = bytemuck::cast_slice(raw);
                 f16_slice.iter().map(|x| x.to_f32()).collect()
             }
+            DType::Q8_0 => {
+                // Block layout: [f16 scale (2 bytes) | 32 × i8 quants (32 bytes)] = 34 bytes
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes();
+                let total_bytes = num_blocks * block_bytes;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                let mut out = Vec::with_capacity(numel);
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * block_bytes;
+                    let scale = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
+                    for j in 0..QUANTIZATION_BLOCK_SIZE {
+                        let q = raw[bs + 2 + j] as i8;
+                        out.push(f32::from(q) * scale);
+                    }
+                }
+                out
+            }
+            DType::Q4_0 => {
+                // Block layout: [f16 scale (2 bytes) | 16 packed bytes (32 values)] = 18 bytes
+                // Each byte packs 2 values: low nibble = even index, high nibble = odd index
+                // Unsigned [0,15] centered at 8 → signed [-8, 7]
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes();
+                let total_bytes = num_blocks * block_bytes;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                let mut out = Vec::with_capacity(numel);
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * block_bytes;
+                    let scale = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
+                    for j in 0..QUANTIZATION_BLOCK_SIZE / 2 {
+                        let byte = raw[bs + 2 + j];
+                        let lo = i32::from(byte & 0x0F) - 8;
+                        let hi = i32::from(byte >> 4) - 8;
+                        out.push(lo as f32 * scale);
+                        out.push(hi as f32 * scale);
+                    }
+                }
+                out
+            }
             other => {
                 return Err(Error::UnsupportedDtype(format!(
                     "Cannot load '{name}' as f32: dtype is {other} (use load_quantized instead)"
@@ -541,6 +582,24 @@ mod test_helpers {
                 .push((name.to_string(), shape.to_vec(), GGML_TYPE_Q8_0, bytes));
         }
 
+        /// Add a Q4_0 tensor. `blocks` is a sequence of (scale_f16, packed_bytes).
+        /// Each packed byte holds two 4-bit unsigned values: low nibble = even, high = odd.
+        pub fn add_tensor_q4(
+            &mut self,
+            name: &str,
+            shape: &[usize],
+            blocks: &[(half::f16, Vec<u8>)],
+        ) {
+            let mut bytes = Vec::new();
+            for (scale, packed) in blocks {
+                assert_eq!(packed.len(), QUANTIZATION_BLOCK_SIZE / 2);
+                bytes.extend_from_slice(&scale.to_le_bytes());
+                bytes.extend_from_slice(packed);
+            }
+            self.tensors
+                .push((name.to_string(), shape.to_vec(), GGML_TYPE_Q4_0, bytes));
+        }
+
         /// Build the GGUF file into a byte vector and write to a temp file.
         pub fn build_to_file(&self, path: &std::path::Path) {
             let mut buf = Vec::new();
@@ -743,6 +802,65 @@ mod tests {
 
         let result = loader.load_f32(&ctx, "nonexistent");
         assert!(result.is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_gguf_load_f32_from_q8() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let path = test_gguf_path();
+
+        // Block: scale=2.0, quants=[1,2,3,...,32]
+        // Expected dequantized: [2.0, 4.0, 6.0, ..., 64.0]
+        let scale = half::f16::from_f32(2.0);
+        let quants: Vec<i8> = (1..=QUANTIZATION_BLOCK_SIZE as i8).collect();
+        let expected: Vec<f32> = quants.iter().map(|&q| f32::from(q) * 2.0).collect();
+
+        let mut builder = GgufBuilder::new();
+        builder.add_tensor_q8("embed", &[1, 32], &[(scale, quants)]);
+        builder.build_to_file(&path);
+
+        let loader = GgufLoader::from_file(&path).unwrap();
+        let tensor = loader.load_f32(&ctx, "embed").unwrap();
+
+        assert_eq!(tensor.shape(), &[1, 32]);
+        let result = tensor.to_vec().unwrap();
+        for (got, want) in result.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 0.01, "got {got}, want {want}");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_gguf_load_f32_from_q4() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let path = test_gguf_path();
+
+        // Block: scale=1.0, all nibbles = 8+3 = 11 (lo) and 8-2 = 6 (hi)
+        // Packed byte: (6 << 4) | 11 = 0x6B
+        // Dequantized: lo → (11-8)*1.0 = 3.0, hi → (6-8)*1.0 = -2.0
+        let scale = half::f16::from_f32(1.0);
+        let packed = vec![0x6Bu8; QUANTIZATION_BLOCK_SIZE / 2];
+        let mut expected = Vec::with_capacity(QUANTIZATION_BLOCK_SIZE);
+        for _ in 0..QUANTIZATION_BLOCK_SIZE / 2 {
+            expected.push(3.0_f32);
+            expected.push(-2.0_f32);
+        }
+
+        let mut builder = GgufBuilder::new();
+        builder.add_tensor_q4("embed", &[1, 32], &[(scale, packed)]);
+        builder.build_to_file(&path);
+
+        let loader = GgufLoader::from_file(&path).unwrap();
+        let tensor = loader.load_f32(&ctx, "embed").unwrap();
+
+        assert_eq!(tensor.shape(), &[1, 32]);
+        let result = tensor.to_vec().unwrap();
+        for (got, want) in result.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 0.01, "got {got}, want {want}");
+        }
 
         std::fs::remove_file(&path).ok();
     }
