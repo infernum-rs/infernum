@@ -15,7 +15,7 @@ mod transpose;
 
 pub use add::add;
 pub use argmax::argmax_last;
-pub use attention::attention;
+pub use attention::{attention, attention_kv};
 pub use embed::embedding_gather;
 pub use matmul::matmul;
 pub use repeat_kv::repeat_kv;

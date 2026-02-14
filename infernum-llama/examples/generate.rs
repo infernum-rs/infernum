@@ -12,11 +12,10 @@ use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::Result;
 use infernum_llama::{LlamaModel, SamplingParams};
+use infernum_runtime::Runtime;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-
-    // Parse arguments
     let cli = parse_args(&args);
 
     println!("Loading model from: {}", cli.model_path);
@@ -37,32 +36,30 @@ fn main() -> Result<()> {
         model.config().hidden_size
     );
 
-    // Encode prompt
-    let tokens = tokenizer.encode(&cli.prompt, true)?;
-    let prompt_len = tokens.len();
-    println!("Prompt: \"{}\" ({} tokens)", cli.prompt, prompt_len);
-
-    let eos = Some(tokenizer.eos_token_id());
+    // Create runtime
+    let runtime = Runtime::new(ctx, model, tokenizer);
 
     // Generate
-    let output_tokens = if cli.greedy {
-        println!("Decoding: greedy (argmax)");
-        model.generate(&tokens, cli.max_tokens, eos)?
+    let params = if cli.greedy {
+        None
     } else {
-        println!(
-            "Sampling: temperature={}, top_p={}, seed={}",
-            cli.sampling.temperature, cli.sampling.top_p, cli.sampling.seed
-        );
-        model.generate_sampled(&tokens, cli.max_tokens, eos, &cli.sampling)?
+        Some(&cli.sampling)
     };
 
-    // Decode and print the generated part
-    print!("{}", cli.prompt);
-    for &tok in &output_tokens[prompt_len..] {
-        let text = tokenizer.decode_token(tok)?;
-        print!("{}", text);
-        io::stdout().flush()?;
+    if !cli.greedy {
+        let s = params.unwrap();
+        println!(
+            "Sampling: temperature={}, top_p={}, seed={}",
+            s.temperature, s.top_p, s.seed
+        );
+    } else {
+        println!("Decoding: greedy (argmax)");
     }
+
+    print!("{}", cli.prompt);
+    io::stdout().flush()?;
+
+    let output_tokens = runtime.generate_streaming(&cli.prompt, cli.max_tokens, params)?;
 
     println!();
     println!("Generated {} tokens total", output_tokens.len());
@@ -172,7 +169,8 @@ fn print_usage() {
     eprintln!("      --greedy             Use greedy (argmax) decoding instead of sampling");
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
-    eprintln!("Uses nucleus sampling by default. Pass --greedy for deterministic argmax.");
+    eprintln!("Uses KV cache and nucleus sampling by default.");
+    eprintln!("Pass --greedy for deterministic argmax.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!(

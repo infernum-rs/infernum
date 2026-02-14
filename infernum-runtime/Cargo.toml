@@ -1,0 +1,11 @@
+[package]
+name = "infernum-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+cuda = ["infernum/cuda"]
+
+[dependencies]
+infernum = { path = "../infernum" }

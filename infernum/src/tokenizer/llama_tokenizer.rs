@@ -116,6 +116,24 @@ impl LlamaTokenizer {
     }
 }
 
+impl super::Tokenizer for LlamaTokenizer {
+    fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
+        self.encode(text, add_bos)
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String> {
+        self.decode(ids)
+    }
+
+    fn decode_token(&self, id: u32) -> Result<String> {
+        self.decode_token(id)
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        self.eos_token_id()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests require a tokenizer file, so we skip them in CI
