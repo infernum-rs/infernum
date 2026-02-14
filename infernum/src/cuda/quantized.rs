@@ -13,7 +13,7 @@
 use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::cuda::CudaContext;
-use crate::dtype::{DType, QUANTIZATION_BLOCK_SIZE};
+use crate::dtype::{DType, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE};
 use crate::Result;
 
 /// A tensor stored in a quantized format on the GPU.
@@ -68,7 +68,14 @@ impl QuantizedTensor {
 
         let numel: usize = shape.iter().product();
 
-        if dtype.is_block_quantized() {
+        if dtype == DType::Q6_K {
+            assert_eq!(
+                numel % Q6_K_BLOCK_ELEMENTS,
+                0,
+                "Number of elements ({numel}) must be divisible by Q6_K block size ({Q6_K_BLOCK_ELEMENTS})"
+            );
+            // Q6_K stores packed super-blocks in data, no separate scales
+        } else if dtype.is_block_quantized() {
             assert_eq!(
                 numel % QUANTIZATION_BLOCK_SIZE,
                 0,
@@ -148,7 +155,10 @@ impl QuantizedTensor {
             self.dtype.is_block_quantized(),
             "num_blocks() only valid for block-quantized types"
         );
-        self.numel() / QUANTIZATION_BLOCK_SIZE
+        match self.dtype {
+            DType::Q6_K => self.numel() / Q6_K_BLOCK_ELEMENTS,
+            _ => self.numel() / QUANTIZATION_BLOCK_SIZE,
+        }
     }
 
     /// Raw device pointer to quantized data
@@ -180,6 +190,7 @@ impl QuantizedTensor {
         let expected = match dtype {
             DType::Q8_0 | DType::F8E4M3 => numel, // 1 byte per element
             DType::Q4_0 => numel / 2,             // 0.5 bytes per element (packed)
+            DType::Q6_K => (numel / Q6_K_BLOCK_ELEMENTS) * Q6_K_BLOCK_SIZE_BYTES,
             _ => unreachable!(),
         };
         assert_eq!(
@@ -202,6 +213,10 @@ impl QuantizedTensor {
             DType::Q4_0 => {
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 numel / 2 + num_blocks * 2 // packed data + scales
+            }
+            DType::Q6_K => {
+                let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
+                num_blocks * Q6_K_BLOCK_SIZE_BYTES // packed super-blocks
             }
             DType::F8E4M3 => numel, // 1 byte per element, no scales
             _ => unreachable!(),

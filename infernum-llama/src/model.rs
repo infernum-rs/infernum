@@ -138,7 +138,7 @@ impl LlamaModel {
         config: LlamaConfig,
         loader: &GgufLoader,
     ) -> Result<Self> {
-        /// Load a linear weight — quantized if the tensor is Q8_0/Q4_0/F8E4M3,
+        /// Load a linear weight — quantized if the tensor uses a quantized dtype,
         /// otherwise f32 (pre-transposed).
         fn load_linear(ctx: &CudaContext, loader: &GgufLoader, name: &str) -> Result<LinearWeight> {
             let dtype = loader.get_dtype(name)?;

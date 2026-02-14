@@ -5,8 +5,15 @@ use std::fmt;
 /// Default block size for block-quantized formats (`Q8_0`, `Q4_0`)
 pub const QUANTIZATION_BLOCK_SIZE: usize = 32;
 
+/// Super-block size for K-quant formats (`Q6_K`)
+pub const Q6_K_BLOCK_ELEMENTS: usize = 256;
+
+/// Byte size of one `Q6_K` super-block: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210
+pub const Q6_K_BLOCK_SIZE_BYTES: usize = 210;
+
 /// Supported data types for tensors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)] // GGML K-quant names use underscores (Q6_K, Q4_K, etc.)
 pub enum DType {
     /// 32-bit floating point
     F32,
@@ -20,6 +27,8 @@ pub enum DType {
     Q8_0,
     /// 4-bit block-quantized integer (block size 32, one f16 scale per block)
     Q4_0,
+    /// 6-bit K-quant (super-block of 256 elements, 210 bytes per block)
+    Q6_K,
     /// 8-bit floating point (E4M3 format: 4 exponent, 3 mantissa bits)
     F8E4M3,
 }
@@ -36,7 +45,7 @@ impl DType {
             Self::F32 | Self::U32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::F8E4M3 => 1,
-            Self::Q8_0 | Self::Q4_0 => panic!(
+            Self::Q8_0 | Self::Q4_0 | Self::Q6_K => panic!(
                 "Block-quantized types have no fixed per-element size; use block_size_in_bytes()"
             ),
         }
@@ -56,6 +65,8 @@ impl DType {
             Self::Q8_0 => QUANTIZATION_BLOCK_SIZE + 2,
             // 32 int4 values packed into 16 bytes + 1 f16 scale
             Self::Q4_0 => QUANTIZATION_BLOCK_SIZE / 2 + 2,
+            // 256 elements: 128 (ql) + 64 (qh) + 16 (scales) + 2 (f16 d) = 210
+            Self::Q6_K => Q6_K_BLOCK_SIZE_BYTES,
             _ => panic!("block_size_in_bytes() is only valid for block-quantized types"),
         }
     }
@@ -63,13 +74,13 @@ impl DType {
     /// Whether this dtype is a quantized format
     #[must_use]
     pub const fn is_quantized(self) -> bool {
-        matches!(self, Self::Q8_0 | Self::Q4_0 | Self::F8E4M3)
+        matches!(self, Self::Q8_0 | Self::Q4_0 | Self::Q6_K | Self::F8E4M3)
     }
 
     /// Whether this dtype is a block-quantized format (has scale factors)
     #[must_use]
     pub const fn is_block_quantized(self) -> bool {
-        matches!(self, Self::Q8_0 | Self::Q4_0)
+        matches!(self, Self::Q8_0 | Self::Q4_0 | Self::Q6_K)
     }
 
     /// Convert from safetensors dtype string
@@ -94,6 +105,7 @@ impl fmt::Display for DType {
             Self::U32 => write!(f, "u32"),
             Self::Q8_0 => write!(f, "q8_0"),
             Self::Q4_0 => write!(f, "q4_0"),
+            Self::Q6_K => write!(f, "q6_k"),
             Self::F8E4M3 => write!(f, "f8e4m3"),
         }
     }
@@ -152,6 +164,8 @@ mod tests {
         assert_eq!(DType::Q8_0.block_size_in_bytes(), 34);
         // Q4_0: 16 bytes (32 int4 values) + 2 bytes f16 scale = 18
         assert_eq!(DType::Q4_0.block_size_in_bytes(), 18);
+        // Q6_K: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210 for 256 elements
+        assert_eq!(DType::Q6_K.block_size_in_bytes(), 210);
     }
 
     #[test]
@@ -162,6 +176,7 @@ mod tests {
         assert!(!DType::U32.is_quantized());
         assert!(DType::Q8_0.is_quantized());
         assert!(DType::Q4_0.is_quantized());
+        assert!(DType::Q6_K.is_quantized());
         assert!(DType::F8E4M3.is_quantized());
     }
 
@@ -171,6 +186,7 @@ mod tests {
         assert!(!DType::F8E4M3.is_block_quantized());
         assert!(DType::Q8_0.is_block_quantized());
         assert!(DType::Q4_0.is_block_quantized());
+        assert!(DType::Q6_K.is_block_quantized());
     }
 
     #[test]
@@ -191,6 +207,7 @@ mod tests {
         assert_eq!(format!("{}", DType::U32), "u32");
         assert_eq!(format!("{}", DType::Q8_0), "q8_0");
         assert_eq!(format!("{}", DType::Q4_0), "q4_0");
+        assert_eq!(format!("{}", DType::Q6_K), "q6_k");
         assert_eq!(format!("{}", DType::F8E4M3), "f8e4m3");
     }
 

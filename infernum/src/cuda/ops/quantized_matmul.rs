@@ -16,7 +16,7 @@ use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::quantized::QuantizedTensor;
 use crate::cuda::CudaTensor;
-use crate::dtype::DType;
+use crate::dtype::{DType, Q6_K_BLOCK_ELEMENTS};
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -170,6 +170,63 @@ extern "C" __global__ void matmul_fp8_f32(
 
     output[m * N + n] = acc;
 }
+
+// Q6_K matmul: super-block of 256 elements, 210 bytes each
+// Layout per super-block: ql[128] | qh[64] | scales[16] | d(f16)
+//   ql: lower 4 bits of each 6-bit value, 2 per byte (low/high nibble)
+//   qh: upper 2 bits of each 6-bit value, 4 per byte (2-bit fields)
+//   scales: i8 sub-block scale, one per 16 elements
+//   d: f16 super-block scale factor
+//
+// data pointer: packed super-blocks, contiguous for all N rows
+// Each row of N has (K / 256) super-blocks × 210 bytes
+extern "C" __global__ void matmul_q6k_f32(
+    float*       __restrict__ output,
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ weight_data,
+    const int M,
+    const int N,
+    const int K
+) {
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M || n >= N) return;
+
+    const int blocks_per_row = K / 256;
+    const int block_bytes = 210;
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int sb_offset = (n * blocks_per_row + b) * block_bytes;
+        const unsigned char* ql     = weight_data + sb_offset;
+        const unsigned char* qh     = weight_data + sb_offset + 128;
+        const signed char*   scales = (const signed char*)(weight_data + sb_offset + 128 + 64);
+        float d = f16_to_f32(*(const unsigned short*)(weight_data + sb_offset + 128 + 64 + 16));
+
+        int base_k = b * 256;
+        const float* in_ptr = input + m * K + base_k;
+
+        for (int idx = 0; idx < 256; ++idx) {
+            // Lower 4 bits from ql
+            unsigned char ql_byte = ql[idx / 2];
+            int ql_val = (idx % 2 == 0) ? (ql_byte & 0x0F) : (ql_byte >> 4);
+
+            // Upper 2 bits from qh
+            unsigned char qh_byte = qh[idx / 4];
+            int qh_shift = (idx % 4) * 2;
+            int qh_val = (qh_byte >> qh_shift) & 0x03;
+
+            // Combine to 6-bit [0,63], center to signed [-32,31]
+            int q = (ql_val | (qh_val << 4)) - 32;
+
+            float sc = (float)scales[idx / 16];
+            float w = d * sc * (float)q;
+            acc += in_ptr[idx] * w;
+        }
+    }
+
+    output[m * N + n] = acc;
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -239,7 +296,12 @@ fn quantized_matmul_2d(
         device.load_ptx(
             ptx,
             module_name,
-            &["matmul_q8_f32", "matmul_q4_f32", "matmul_fp8_f32"],
+            &[
+                "matmul_q8_f32",
+                "matmul_q4_f32",
+                "matmul_fp8_f32",
+                "matmul_q6k_f32",
+            ],
         )?;
     }
 
@@ -291,6 +353,27 @@ fn quantized_matmul_2d(
         }
         DType::F8E4M3 => {
             let func = device.get_func(module_name, "matmul_fp8_f32").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        input.cuda_slice(),
+                        weight.data_slice(),
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::Q6_K => {
+            assert_eq!(
+                k % Q6_K_BLOCK_ELEMENTS,
+                0,
+                "K ({k}) must be divisible by Q6_K block size ({Q6_K_BLOCK_ELEMENTS})"
+            );
+            let func = device.get_func(module_name, "matmul_q6k_f32").unwrap();
             unsafe {
                 func.launch(
                     cfg,
@@ -418,6 +501,83 @@ fn f32_to_fp8_e4m3(value: f32) -> u8 {
     }
 
     (sign << 7) | (exp_4 << 3) | mant_3
+}
+
+/// Quantize an f32 slice to Q6_K format on the host.
+/// Returns packed super-block bytes (210 bytes per 256-element super-block).
+/// Each element is quantized to 6 bits (range [-32, 31]) with per-16-element
+/// sub-block i8 scales and a per-super-block f16 scale factor.
+#[cfg(test)]
+fn quantize_q6k_host(values: &[f32]) -> Vec<u8> {
+    use crate::dtype::{Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES};
+
+    assert_eq!(values.len() % Q6_K_BLOCK_ELEMENTS, 0);
+    let num_blocks = values.len() / Q6_K_BLOCK_ELEMENTS;
+    let mut out = Vec::with_capacity(num_blocks * Q6_K_BLOCK_SIZE_BYTES);
+
+    for block in values.chunks(Q6_K_BLOCK_ELEMENTS) {
+        // Compute sub-block scales (16 sub-blocks of 16 elements each)
+        let mut sub_scales = [0.0_f32; 16];
+        for (sb, chunk) in block.chunks(16).enumerate() {
+            let max_abs = chunk.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+            sub_scales[sb] = if max_abs == 0.0 { 1.0 } else { max_abs / 31.0 };
+        }
+
+        // Super-block scale = max of sub-block scales
+        let d = sub_scales.iter().fold(0.0_f32, |a, &b| a.max(b));
+        let d = if d == 0.0 { 1.0 } else { d };
+        let inv_d = 1.0 / d;
+
+        // Quantize sub-block scales to i8: sc_i8 = round(sub_scale / d * 127)
+        // clamp to fit i8, but in practice these should be positive and < 128
+        let mut sc_i8 = [0_i8; 16];
+        for (i, &s) in sub_scales.iter().enumerate() {
+            sc_i8[i] = (s * inv_d * 127.0).round().clamp(-128.0, 127.0) as i8;
+        }
+
+        // Quantize each element to 6-bit [0, 63] (stored as unsigned, centered at 32)
+        let mut q6 = [0_u8; Q6_K_BLOCK_ELEMENTS];
+        for (idx, &v) in block.iter().enumerate() {
+            let sb = idx / 16;
+            let effective_scale = d * (sc_i8[sb] as f32) / 127.0;
+            let q = if effective_scale.abs() < 1e-10 {
+                0
+            } else {
+                (v / effective_scale).round().clamp(-32.0, 31.0) as i32 + 32
+            };
+            q6[idx] = q as u8;
+        }
+
+        // Pack into super-block: ql[128] | qh[64] | scales[16] | d(f16)
+        let mut ql = [0_u8; 128];
+        let mut qh = [0_u8; 64];
+
+        for idx in 0..Q6_K_BLOCK_ELEMENTS {
+            let val = q6[idx];
+            let lo4 = val & 0x0F;
+            let hi2 = (val >> 4) & 0x03;
+
+            // Pack lower 4 bits: 2 per byte
+            if idx % 2 == 0 {
+                ql[idx / 2] |= lo4;
+            } else {
+                ql[idx / 2] |= lo4 << 4;
+            }
+
+            // Pack upper 2 bits: 4 per byte
+            let qh_shift = (idx % 4) * 2;
+            qh[idx / 4] |= hi2 << qh_shift;
+        }
+
+        out.extend_from_slice(&ql);
+        out.extend_from_slice(&qh);
+        for &s in &sc_i8 {
+            out.push(s as u8);
+        }
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -649,6 +809,99 @@ mod tests {
                     "Non-zero {v} should produce non-zero encoding"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_matmul_q6k_basic() {
+        use crate::dtype::Q6_K_BLOCK_ELEMENTS;
+
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = Q6_K_BLOCK_ELEMENTS; // 256
+        let m = 1;
+        let n = 1;
+
+        // input: all 1.0 → output = sum of dequantized weights
+        let input_data = vec![1.0_f32; k];
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        // weight: constant 2.0
+        let w_data = vec![2.0_f32; k];
+        let q_data = quantize_q6k_host(&w_data);
+        let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q6_K, &q_data, &[]).unwrap();
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+
+        // Expected: 256 * 2.0 = 512.0 (Q6_K has multi-level quantization so allow more error)
+        let expected = 512.0_f32;
+        assert!(
+            (result[0] - expected).abs() < expected * 0.15,
+            "Q6_K result: {} vs expected ~{}",
+            result[0],
+            expected
+        );
+    }
+
+    #[test]
+    fn test_matmul_q6k_matches_f32() {
+        use crate::dtype::Q6_K_BLOCK_ELEMENTS;
+
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 2;
+        let k = Q6_K_BLOCK_ELEMENTS; // 256
+        let n = 4;
+
+        // Pseudo-random input and weights
+        let mut state: u64 = 54321;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        // Compute f32 reference: input @ w^T
+        let mut expected = vec![0.0_f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0_f32;
+                for i in 0..k {
+                    acc += input_data[row * k + i] * w_data[col * k + i];
+                }
+                expected[row * n + col] = acc;
+            }
+        }
+
+        // Quantized
+        let q_data = quantize_q6k_host(&w_data);
+        let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q6_K, &q_data, &[]).unwrap();
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+
+        // Q6_K has multi-level quantization so allow more error than Q8
+        for i in 0..m * n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.15,
+                "Q6_K mismatch at [{}, {}]: got {} expected {} (rel_err={:.4})",
+                i / n,
+                i % n,
+                result[i],
+                expected[i],
+                rel_err
+            );
         }
     }
 }

@@ -160,7 +160,7 @@ impl WeightLoader for SafeTensorsLoader {
                     "cannot convert U32 weights to f32".to_string(),
                 ));
             }
-            DType::Q8_0 | DType::Q4_0 | DType::F8E4M3 => {
+            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::F8E4M3 => {
                 return Err(Error::UnsupportedDtype(format!(
                     "cannot load quantized dtype {} from SafeTensors (use GGUF instead)",
                     meta.dtype

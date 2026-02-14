@@ -23,7 +23,7 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
-use crate::dtype::{DType, QUANTIZATION_BLOCK_SIZE};
+use crate::dtype::{DType, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE};
 use crate::weights::WeightLoader;
 use crate::{Error, Result};
 
@@ -39,6 +39,7 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q6_K: u32 = 14;
 
 // ---------------------------------------------------------------------------
 // GGUF metadata value types
@@ -267,7 +268,17 @@ impl GgufLoader {
                 let raw = &self.mmap[data_start..data_start + numel];
                 QuantizedTensor::from_raw(ctx, &info.shape, dtype, raw, &[])
             }
-            _ => unreachable!(),
+            DType::Q6_K => {
+                let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
+                let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+                // Store packed super-blocks directly — kernel reads them as-is
+                QuantizedTensor::from_raw(ctx, &info.shape, dtype, raw, &[])
+            }
+            other => Err(Error::UnsupportedDtype(format!(
+                "Tensor '{name}' is {other}, which is not supported by load_quantized \
+                 (use load_f32 to dequantize instead)"
+            ))),
         }
     }
 
@@ -339,8 +350,57 @@ impl WeightLoader for GgufLoader {
                         let byte = raw[bs + 2 + j];
                         let lo = i32::from(byte & 0x0F) - 8;
                         let hi = i32::from(byte >> 4) - 8;
-                        out.push(lo as f32 * scale);
-                        out.push(hi as f32 * scale);
+                        #[allow(clippy::cast_precision_loss)] // lo/hi ∈ [-8, 7], no precision loss
+                        {
+                            out.push(lo as f32 * scale);
+                            out.push(hi as f32 * scale);
+                        }
+                    }
+                }
+                out
+            }
+            DType::Q6_K => {
+                // Super-block of 256 elements, 210 bytes:
+                //   ql[128]   — lower 4 bits of each value (2 per byte)
+                //   qh[64]    — upper 2 bits of each value (4 per byte)
+                //   scales[16] — i8 sub-block scale (one per 16 elements)
+                //   d (f16)   — super-block scale factor
+                let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
+                let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                let mut out = Vec::with_capacity(numel);
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * Q6_K_BLOCK_SIZE_BYTES;
+                    let ql = &raw[bs..bs + 128];
+                    let qh = &raw[bs + 128..bs + 128 + 64];
+                    let scales = &raw[bs + 128 + 64..bs + 128 + 64 + 16];
+                    let d = half::f16::from_le_bytes([
+                        raw[bs + 128 + 64 + 16],
+                        raw[bs + 128 + 64 + 17],
+                    ])
+                    .to_f32();
+
+                    for idx in 0..Q6_K_BLOCK_ELEMENTS {
+                        // Extract lower 4 bits from ql
+                        let ql_byte = ql[idx / 2];
+                        let ql_val = if idx % 2 == 0 {
+                            u32::from(ql_byte & 0x0F)
+                        } else {
+                            u32::from(ql_byte >> 4)
+                        };
+
+                        // Extract upper 2 bits from qh
+                        let qh_byte = qh[idx / 4];
+                        let qh_shift = (idx % 4) * 2;
+                        let qh_val = u32::from((qh_byte >> qh_shift) & 0x03);
+
+                        // Combine to 6-bit value and center: [0, 63] → [-32, 31]
+                        let q = (ql_val | (qh_val << 4)) as i32 - 32;
+
+                        let sc = f32::from(scales[idx / 16] as i8);
+                        #[allow(clippy::cast_precision_loss)] // q ∈ [-32, 31], no precision loss
+                        out.push(d * sc * q as f32);
                     }
                 }
                 out
@@ -505,6 +565,7 @@ fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
         GGML_TYPE_F16 => Ok(DType::F16),
         GGML_TYPE_Q8_0 => Ok(DType::Q8_0),
         GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
+        GGML_TYPE_Q6_K => Ok(DType::Q6_K),
         other => Err(Error::UnsupportedDtype(format!(
             "Unsupported GGML tensor type: {other}"
         ))),
@@ -598,6 +659,23 @@ mod test_helpers {
             }
             self.tensors
                 .push((name.to_string(), shape.to_vec(), GGML_TYPE_Q4_0, bytes));
+        }
+
+        /// Add a Q6_K tensor from raw block bytes (210 bytes per 256-element super-block).
+        pub fn add_tensor_q6k_raw(&mut self, name: &str, shape: &[usize], raw_blocks: &[u8]) {
+            let numel: usize = shape.iter().product();
+            let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
+            assert_eq!(
+                raw_blocks.len(),
+                num_blocks * Q6_K_BLOCK_SIZE_BYTES,
+                "Q6_K raw data size mismatch"
+            );
+            self.tensors.push((
+                name.to_string(),
+                shape.to_vec(),
+                GGML_TYPE_Q6_K,
+                raw_blocks.to_vec(),
+            ));
         }
 
         /// Build the GGUF file into a byte vector and write to a temp file.
@@ -860,6 +938,72 @@ mod tests {
         let result = tensor.to_vec().unwrap();
         for (got, want) in result.iter().zip(expected.iter()) {
             assert!((got - want).abs() < 0.01, "got {got}, want {want}");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_gguf_load_f32_from_q6k() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let path = test_gguf_path();
+
+        // Build a single Q6_K super-block (256 elements, 210 bytes)
+        // Layout: ql[128] | qh[64] | scales[16] | d(f16)
+        //
+        // We set all quantized values to the same 6-bit value and verify dequantization.
+        // Choose: ql nibble = 5, qh bits = 1 → combined = 5 | (1 << 4) = 21
+        // Signed: 21 - 32 = -11
+        // Scale for all sub-blocks: 2
+        // Super-block d: 0.5
+        // Expected dequantized value: 0.5 * 2.0 * (-11.0) = -11.0
+
+        let mut block = vec![0u8; Q6_K_BLOCK_SIZE_BYTES];
+
+        // ql[128]: each byte packs two 4-bit values.
+        // For even indices: low nibble = 5; for odd indices: high nibble = 5.
+        // So each byte = (5 << 4) | 5 = 0x55
+        for b in &mut block[..128] {
+            *b = 0x55;
+        }
+
+        // qh[64]: each byte packs four 2-bit values.
+        // We want qh bits = 1 for each element.
+        // Four 2-bit values of 1 packed: 0b01_01_01_01 = 0x55
+        for b in &mut block[128..128 + 64] {
+            *b = 0x55;
+        }
+
+        // scales[16]: i8 value of 2 for each sub-block
+        for b in &mut block[128 + 64..128 + 64 + 16] {
+            *b = 2_i8 as u8;
+        }
+
+        // d: f16 value of 0.5
+        let d_bytes = half::f16::from_f32(0.5).to_le_bytes();
+        block[128 + 64 + 16] = d_bytes[0];
+        block[128 + 64 + 17] = d_bytes[1];
+
+        let mut builder = GgufBuilder::new();
+        builder.add_tensor_q6k_raw("q6k_weight", &[1, Q6_K_BLOCK_ELEMENTS], &block);
+        builder.build_to_file(&path);
+
+        let loader = GgufLoader::from_file(&path).unwrap();
+
+        assert_eq!(loader.get_dtype("q6k_weight").unwrap(), DType::Q6_K);
+
+        let tensor = loader.load_f32(&ctx, "q6k_weight").unwrap();
+        assert_eq!(tensor.shape(), &[1, Q6_K_BLOCK_ELEMENTS]);
+
+        let result = tensor.to_vec().unwrap();
+        assert_eq!(result.len(), Q6_K_BLOCK_ELEMENTS);
+
+        let expected = -11.0_f32; // d=0.5, scale=2, q=(21-32)=-11 → 0.5*2*(-11) = -11
+        for (i, &val) in result.iter().enumerate() {
+            assert!(
+                (val - expected).abs() < 0.1,
+                "Element {i}: got {val}, expected {expected}"
+            );
         }
 
         std::fs::remove_file(&path).ok();
