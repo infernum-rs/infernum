@@ -10,7 +10,7 @@ use std::path::Path;
 
 use infernum::cuda::ops::{
     add, apply_rope, argmax_last, attention, embedding_gather, matmul, precompute_rope_cache,
-    repeat_kv, rms_norm, sample_top_p, silu_mul, transpose_2d,
+    quantized_matmul, repeat_kv, rms_norm, sample_top_p, silu_mul, transpose_2d,
 };
 
 /// Transpose a weight matrix once, for use in pre-transposed linear projections.
@@ -18,26 +18,35 @@ use infernum::cuda::ops::{
 fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     transpose_2d(weight)
 }
-use infernum::cuda::{CudaContext, CudaTensor};
+use infernum::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use infernum::tensor::Tensor;
-use infernum::weights::{SafeTensorsLoader, WeightLoader};
+use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 use infernum::Result;
 
 use crate::LlamaConfig;
 
-/// Weights for a single Llama attention layer (stored pre-transposed for efficient matmul)
-struct LlamaAttentionWeights {
-    q_proj: CudaTensor<f32>,
-    k_proj: CudaTensor<f32>,
-    v_proj: CudaTensor<f32>,
-    o_proj: CudaTensor<f32>,
+/// A linear layer weight that is either an f32 matrix (pre-transposed for
+/// standard matmul) or a quantized tensor (dequantized on-the-fly in the kernel).
+enum LinearWeight {
+    /// Pre-transposed f32 weight: shape (in_features, out_features)
+    F32(CudaTensor<f32>),
+    /// Quantized weight: shape (out_features, in_features) — transposed inside kernel
+    Quantized(QuantizedTensor),
 }
 
-/// Weights for a single Llama MLP layer (stored pre-transposed for efficient matmul)
+/// Weights for a single Llama attention layer
+struct LlamaAttentionWeights {
+    q_proj: LinearWeight,
+    k_proj: LinearWeight,
+    v_proj: LinearWeight,
+    o_proj: LinearWeight,
+}
+
+/// Weights for a single Llama MLP layer
 struct LlamaMlpWeights {
-    gate_proj: CudaTensor<f32>,
-    up_proj: CudaTensor<f32>,
-    down_proj: CudaTensor<f32>,
+    gate_proj: LinearWeight,
+    up_proj: LinearWeight,
+    down_proj: LinearWeight,
 }
 
 /// Weights for a single Llama decoder layer
@@ -85,7 +94,7 @@ pub struct LlamaModel {
     norm: CudaTensor<f32>,
 
     // Output projection (may be tied to embed_tokens)
-    lm_head: CudaTensor<f32>,
+    lm_head: LinearWeight,
 
     // RoPE caches
     cos_cache: CudaTensor<f32>,
@@ -110,6 +119,106 @@ impl LlamaModel {
         Self::load_weights(ctx, config, &loader)
     }
 
+    /// Load a Llama model from a GGUF file containing quantized weights
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be parsed or weights fail to load
+    pub fn from_gguf(ctx: &CudaContext, gguf_path: impl AsRef<Path>) -> Result<Self> {
+        let loader = GgufLoader::from_file(gguf_path)?;
+
+        // Extract config from GGUF metadata
+        let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+
+        Self::load_weights_gguf(ctx, config, &loader)
+    }
+
+    /// Load model weights from a GGUF loader, using quantized weights where available
+    fn load_weights_gguf(
+        ctx: &CudaContext,
+        config: LlamaConfig,
+        loader: &GgufLoader,
+    ) -> Result<Self> {
+        /// Load a linear weight — quantized if the tensor is Q8_0/Q4_0/F8E4M3,
+        /// otherwise f32 (pre-transposed).
+        fn load_linear(ctx: &CudaContext, loader: &GgufLoader, name: &str) -> Result<LinearWeight> {
+            let dtype = loader.get_dtype(name)?;
+            if dtype.is_quantized() {
+                Ok(LinearWeight::Quantized(loader.load_quantized(ctx, name)?))
+            } else {
+                Ok(LinearWeight::F32(pretranspose_weight(
+                    &loader.load_f32(ctx, name)?,
+                )?))
+            }
+        }
+
+        // Embeddings (always f32/f16)
+        let embed_tokens = loader.load_f32(ctx, "token_embd.weight")?;
+
+        // Transformer layers
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("blk.{i}");
+
+            let layer = LlamaLayerWeights {
+                input_layernorm: loader.load_f32(ctx, &format!("{prefix}.attn_norm.weight"))?,
+                attention: LlamaAttentionWeights {
+                    q_proj: load_linear(ctx, loader, &format!("{prefix}.attn_q.weight"))?,
+                    k_proj: load_linear(ctx, loader, &format!("{prefix}.attn_k.weight"))?,
+                    v_proj: load_linear(ctx, loader, &format!("{prefix}.attn_v.weight"))?,
+                    o_proj: load_linear(ctx, loader, &format!("{prefix}.attn_output.weight"))?,
+                },
+                post_attention_layernorm: loader
+                    .load_f32(ctx, &format!("{prefix}.ffn_norm.weight"))?,
+                mlp: LlamaMlpWeights {
+                    gate_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_gate.weight"))?,
+                    up_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_up.weight"))?,
+                    down_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_down.weight"))?,
+                },
+            };
+
+            layers.push(layer);
+        }
+
+        // Final norm
+        let norm = loader.load_f32(ctx, "output_norm.weight")?;
+
+        // Output head
+        let lm_head = if config.tie_word_embeddings {
+            LinearWeight::F32(pretranspose_weight(&embed_tokens)?)
+        } else if loader.contains("output.weight") {
+            let dtype = loader.get_dtype("output.weight")?;
+            if dtype.is_quantized() {
+                LinearWeight::Quantized(loader.load_quantized(ctx, "output.weight")?)
+            } else {
+                LinearWeight::F32(pretranspose_weight(
+                    &loader.load_f32(ctx, "output.weight")?,
+                )?)
+            }
+        } else {
+            // Fallback: tie to embeddings
+            LinearWeight::F32(pretranspose_weight(&embed_tokens)?)
+        };
+
+        // Precompute RoPE cache
+        let (cos_cache, sin_cache) = precompute_rope_cache(
+            ctx,
+            config.max_position_embeddings,
+            config.head_dim(),
+            config.rope_theta,
+        )?;
+
+        Ok(Self {
+            config,
+            ctx: ctx.clone(),
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+        })
+    }
+
     /// Load model weights from a weight loader
     fn load_weights(
         ctx: &CudaContext,
@@ -128,31 +237,31 @@ impl LlamaModel {
                 input_layernorm: loader
                     .load_f32(ctx, &format!("{prefix}.input_layernorm.weight"))?,
                 attention: LlamaAttentionWeights {
-                    q_proj: pretranspose_weight(
+                    q_proj: LinearWeight::F32(pretranspose_weight(
                         &loader.load_f32(ctx, &format!("{prefix}.self_attn.q_proj.weight"))?,
-                    )?,
-                    k_proj: pretranspose_weight(
+                    )?),
+                    k_proj: LinearWeight::F32(pretranspose_weight(
                         &loader.load_f32(ctx, &format!("{prefix}.self_attn.k_proj.weight"))?,
-                    )?,
-                    v_proj: pretranspose_weight(
+                    )?),
+                    v_proj: LinearWeight::F32(pretranspose_weight(
                         &loader.load_f32(ctx, &format!("{prefix}.self_attn.v_proj.weight"))?,
-                    )?,
-                    o_proj: pretranspose_weight(
+                    )?),
+                    o_proj: LinearWeight::F32(pretranspose_weight(
                         &loader.load_f32(ctx, &format!("{prefix}.self_attn.o_proj.weight"))?,
-                    )?,
+                    )?),
                 },
                 post_attention_layernorm: loader
                     .load_f32(ctx, &format!("{prefix}.post_attention_layernorm.weight"))?,
                 mlp: LlamaMlpWeights {
-                    gate_proj: pretranspose_weight(
+                    gate_proj: LinearWeight::F32(pretranspose_weight(
                         &loader.load_f32(ctx, &format!("{prefix}.mlp.gate_proj.weight"))?,
-                    )?,
-                    up_proj: pretranspose_weight(
+                    )?),
+                    up_proj: LinearWeight::F32(pretranspose_weight(
                         &loader.load_f32(ctx, &format!("{prefix}.mlp.up_proj.weight"))?,
-                    )?,
-                    down_proj: pretranspose_weight(
+                    )?),
+                    down_proj: LinearWeight::F32(pretranspose_weight(
                         &loader.load_f32(ctx, &format!("{prefix}.mlp.down_proj.weight"))?,
-                    )?,
+                    )?),
                 },
             };
 
@@ -164,9 +273,11 @@ impl LlamaModel {
 
         // Load or tie lm_head (pre-transposed for efficient linear projection)
         let lm_head = if config.tie_word_embeddings {
-            pretranspose_weight(&embed_tokens)?
+            LinearWeight::F32(pretranspose_weight(&embed_tokens)?)
         } else {
-            pretranspose_weight(&loader.load_f32(ctx, "lm_head.weight")?)?
+            LinearWeight::F32(pretranspose_weight(
+                &loader.load_f32(ctx, "lm_head.weight")?,
+            )?)
         };
 
         // Precompute RoPE cache
@@ -434,12 +545,14 @@ impl LlamaModel {
 }
 
 /// Linear projection: output = input @ weight
-/// Weights must be stored pre-transposed as (in_features, out_features).
-/// input: (seq_len, in_features)
-/// weight: (in_features, out_features)
-/// output: (seq_len, out_features)
-fn linear(input: &CudaTensor<f32>, weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
-    matmul(input, weight)
+///
+/// For `F32` weights: pre-transposed as (in_features, out_features), uses standard matmul.
+/// For `Quantized` weights: stored as (out_features, in_features), dequantized on-the-fly.
+fn linear(input: &CudaTensor<f32>, weight: &LinearWeight) -> Result<CudaTensor<f32>> {
+    match weight {
+        LinearWeight::F32(w) => matmul(input, w),
+        LinearWeight::Quantized(w) => quantized_matmul(input, w),
+    }
 }
 
 #[cfg(test)]
@@ -463,7 +576,8 @@ mod tests {
         ];
 
         let input = CudaTensor::from_slice(&ctx, &[2, 3], &input_data).unwrap();
-        let weight = CudaTensor::from_slice(&ctx, &[3, 4], &weight_data).unwrap();
+        let weight =
+            LinearWeight::F32(CudaTensor::from_slice(&ctx, &[3, 4], &weight_data).unwrap());
 
         let output = linear(&input, &weight).unwrap();
 

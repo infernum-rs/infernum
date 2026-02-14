@@ -1,8 +1,11 @@
 //! Llama model configuration
 
-use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
+use serde::Deserialize;
+
+use infernum::weights::GgufValue;
 use infernum::Result;
 
 /// Configuration for Llama models
@@ -83,6 +86,65 @@ impl LlamaConfig {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Build a `LlamaConfig` from GGUF metadata key-value pairs.
+    ///
+    /// GGUF metadata uses keys like `llama.embedding_length`, `llama.block_count`, etc.
+    ///
+    /// # Errors
+    /// Returns an error if required metadata keys are missing.
+    pub fn from_gguf_metadata(metadata: &HashMap<String, GgufValue>) -> Result<Self> {
+        let get_usize = |key: &str| -> Result<usize> {
+            metadata
+                .get(key)
+                .and_then(GgufValue::as_usize)
+                .ok_or_else(|| {
+                    infernum::Error::InvalidShape(format!("Missing GGUF metadata: {key}"))
+                })
+        };
+
+        let get_f32 = |key: &str, default: f32| -> f32 {
+            metadata
+                .get(key)
+                .and_then(GgufValue::as_f32)
+                .unwrap_or(default)
+        };
+
+        let hidden_size = get_usize("llama.embedding_length")?;
+        let num_attention_heads = get_usize("llama.attention.head_count")?;
+
+        let num_key_value_heads = metadata
+            .get("llama.attention.head_count_kv")
+            .and_then(GgufValue::as_usize);
+
+        Ok(Self {
+            vocab_size: get_usize("llama.vocab_size")
+                .or_else(|_| get_usize("tokenizer.ggml.tokens_count"))
+                .unwrap_or(32000),
+            hidden_size,
+            intermediate_size: get_usize("llama.feed_forward_length")?,
+            num_hidden_layers: get_usize("llama.block_count")?,
+            num_attention_heads,
+            num_key_value_heads,
+            max_position_embeddings: get_usize("llama.context_length").unwrap_or(2048),
+            rms_norm_eps: get_f32("llama.attention.layer_norm_rms_epsilon", 1e-5),
+            rope_theta: get_f32("llama.rope.freq_base", 10000.0),
+            tie_word_embeddings: metadata
+                .get("llama.tie_word_embeddings")
+                .and_then(GgufValue::as_bool)
+                .unwrap_or(false),
+            #[allow(clippy::cast_possible_truncation)] // token IDs always fit in u32
+            bos_token_id: metadata
+                .get("tokenizer.ggml.bos_token_id")
+                .and_then(GgufValue::as_usize)
+                .unwrap_or(1) as u32,
+            #[allow(clippy::cast_possible_truncation)] // token IDs always fit in u32
+            eos_token_id: metadata
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(GgufValue::as_usize)
+                .unwrap_or(2) as u32,
+        })
     }
 
     /// Get the number of key-value heads (for grouped-query attention)

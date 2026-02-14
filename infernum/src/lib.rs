@@ -16,6 +16,10 @@ pub mod weights;
 
 #[cfg(feature = "cuda")]
 pub use cuda::CudaTensor;
-pub use dtype::DType;
+#[cfg(feature = "cuda")]
+pub use cuda::QuantizedTensor;
+pub use dtype::{DType, QUANTIZATION_BLOCK_SIZE};
 pub use error::{Error, Result};
 pub use tensor::Tensor;
+#[cfg(feature = "cuda")]
+pub use weights::GgufLoader;
