@@ -564,7 +564,7 @@ mod test_helpers {
 
             // Tensor descriptors — compute offsets
             let header_end_pos = self.compute_header_size(&buf, self.tensors.len());
-            let data_start = (header_end_pos + 31) & !31; // align to 32
+            let _data_start = (header_end_pos + 31) & !31; // align to 32
 
             let mut current_offset: u64 = 0;
             let mut tensor_data_blobs = Vec::new();
@@ -620,6 +620,7 @@ mod tests {
     use super::test_helpers::GgufBuilder;
     use super::*;
     use crate::cuda::CudaContext;
+    use crate::tensor::Tensor;
 
     fn test_gguf_path() -> std::path::PathBuf {
         let dir = std::env::temp_dir();
