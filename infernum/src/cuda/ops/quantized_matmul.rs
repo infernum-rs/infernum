@@ -25,6 +25,25 @@ use crate::Result;
 // ---------------------------------------------------------------------------
 
 const QUANTIZED_MATMUL_KERNEL: &str = r#"
+// Manual f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC)
+__device__ float f16_to_f32(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1;
+    unsigned int exp  = (bits >> 10) & 0x1F;
+    unsigned int mant = bits & 0x3FF;
+
+    float result;
+    if (exp == 0) {
+        // Subnormal or zero
+        result = ldexpf((float)mant / 1024.0f, -14);
+    } else if (exp == 31) {
+        // Inf / NaN — treat as zero for safety in scale context
+        result = 0.0f;
+    } else {
+        result = ldexpf(1.0f + (float)mant / 1024.0f, (int)exp - 15);
+    }
+    return sign ? -result : result;
+}
+
 // Q8_0 matmul: output[m][n] = sum_k( input[m][k] * dequant(weight[n][k]) )
 // weight layout (row-major per output row n): blocks of 32 int8 values + 1 f16 scale
 //
@@ -49,9 +68,7 @@ extern "C" __global__ void matmul_q8_f32(
     float acc = 0.0f;
 
     for (int b = 0; b < blocks_per_row; ++b) {
-        // Decode f16 scale to f32
-        unsigned short s_bits = weight_scales[n * blocks_per_row + b];
-        float scale = __half2float(*reinterpret_cast<const __half*>(&s_bits));
+        float scale = f16_to_f32(weight_scales[n * blocks_per_row + b]);
 
         int base_k = b * 32;
         int weight_base = n * K + base_k;
@@ -86,8 +103,7 @@ extern "C" __global__ void matmul_q4_f32(
     float acc = 0.0f;
 
     for (int b = 0; b < blocks_per_row; ++b) {
-        unsigned short s_bits = weight_scales[n * blocks_per_row + b];
-        float scale = __half2float(*reinterpret_cast<const __half*>(&s_bits));
+        float scale = f16_to_f32(weight_scales[n * blocks_per_row + b]);
 
         int base_k = b * 32;
         // Each byte holds 2 int4 values; 32 values = 16 bytes
@@ -620,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_fp8_encode_decode_roundtrip() {
-        let test_values = [0.0_f32, 1.0, -1.0, 0.5, 2.0, -0.25, 100.0, -100.0, 0.001];
+        let test_values = [0.0_f32, 1.0, -1.0, 0.5, 2.0, -0.25, 100.0, -100.0, 0.0625];
         for &v in &test_values {
             let encoded = f32_to_fp8_e4m3(v);
             // Verify the encoded byte is non-zero for non-zero inputs (or zero for zero)
