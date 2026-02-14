@@ -88,11 +88,13 @@ fn sample_from_logits(logits: &[f32], temperature: f32, top_p: f32, rng_seed: u6
     // Re-normalise within the nucleus
     let nucleus_sum: f32 = nucleus.iter().map(|&(_, p)| p).sum();
 
-    // Sample using a lightweight xorshift PRNG
+    // Sample using a lightweight xorshift64 PRNG (multiple rounds for quality)
     let mut state = rng_seed.wrapping_add(1); // avoid zero state
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
+    for _ in 0..4 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+    }
     let u = (state as f32) / (u64::MAX as f32); // uniform in [0, 1)
 
     let mut acc = 0.0_f32;
