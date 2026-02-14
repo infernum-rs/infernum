@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "infernum",
+    "infernum-llama",
 ]
 resolver = "2"

@@ -1,0 +1,17 @@
+[package]
+name = "infernum-llama"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+cuda = ["infernum/cuda"]
+
+[dependencies]
+infernum = { path = "../infernum" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[[example]]
+name = "generate"
+required-features = ["cuda"]

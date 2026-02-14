@@ -2,11 +2,65 @@ name: Rust Update Check
 
 on:
   schedule:
+    # Run daily at 7:00 UTC
     - cron: '0 7 * * *'
-  workflow_dispatch:
+  workflow_dispatch:  # Allow manual trigger
 
 jobs:
-  placeholder:
+  check-rust-update:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Placeholder - real workflow on feature branch"
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Get current Rust version
+        id: current
+        run: |
+          CURRENT=$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$CURRENT" >> $GITHUB_OUTPUT
+          echo "Current version: $CURRENT"
+
+      - name: Get latest stable Rust version
+        id: latest
+        run: |
+          LATEST=$(curl -sSf https://static.rust-lang.org/dist/channel-rust-stable.toml | awk '/^\[pkg\.rust\]/{getline; print}' | sed 's/version = "\([0-9.]*\).*/\1/')
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest stable version: $LATEST"
+
+      - name: Check if update needed
+        id: check
+        run: |
+          if [ "${{ steps.current.outputs.version }}" != "${{ steps.latest.outputs.version }}" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "Update available: ${{ steps.current.outputs.version }} -> ${{ steps.latest.outputs.version }}"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "Already on latest stable"
+          fi
+
+      - name: Update rust-toolchain.toml
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          sed -i 's/channel = ".*"/channel = "${{ steps.latest.outputs.version }}"/' rust-toolchain.toml
+          cat rust-toolchain.toml
+
+      - name: Create Pull Request
+        if: steps.check.outputs.update_needed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.PAT }}
+          commit-message: "chore: update Rust to ${{ steps.latest.outputs.version }}"
+          title: "chore: update Rust to ${{ steps.latest.outputs.version }}"
+          body: |
+            This PR updates the Rust toolchain from `${{ steps.current.outputs.version }}` to `${{ steps.latest.outputs.version }}`.
+
+            **Release notes:** https://blog.rust-lang.org/
+
+            ---
+            *This PR was automatically created by the Rust Update workflow.*
+          branch: rust-update-${{ steps.latest.outputs.version }}
+          base: main
+          labels: |
+            rust-update
+            automation
