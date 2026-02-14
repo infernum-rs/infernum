@@ -1,17 +1,58 @@
 //! Text generation example using Llama
 //!
 //! Usage:
-//!   cargo run --example generate --features cuda -- --model /path/to/llama "Hello"
-//!   cargo run --example generate --features cuda -- --model /path/to/llama --greedy "Hello"
-//!   cargo run --example generate --features cuda -- --model /path/to/llama -t 0.8 -p 0.95 "Hello"
+//!   # SafeTensors directory:
+//!   cargo run --example generate --features cuda -- -m /path/to/llama "Hello"
+//!   # GGUF file:
+//!   cargo run --example generate --features cuda -- -m model.gguf "Hello"
+//!   # Greedy decoding:
+//!   cargo run --example generate --features cuda -- -m model.gguf --greedy "Hello"
+//!   # Custom sampling:
+//!   cargo run --example generate --features cuda -- -m model.gguf -t 0.8 -p 0.95 "Hello"
 
 use std::env;
 use std::io::{self, Write};
 
 use infernum::cuda::CudaContext;
-use infernum::tokenizer::LlamaTokenizer;
+use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Result;
 use infernum_llama::{LlamaModel, SamplingParams};
+
+/// Abstraction over tokenizer backends so we can use either one.
+enum Tokenizer {
+    HuggingFace(LlamaTokenizer),
+    Gguf(GgufTokenizer),
+}
+
+impl Tokenizer {
+    fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
+        match self {
+            Self::HuggingFace(t) => t.encode(text, add_bos),
+            Self::Gguf(t) => t.encode(text, add_bos),
+        }
+    }
+
+    fn decode_token(&self, id: u32) -> Result<String> {
+        match self {
+            Self::HuggingFace(t) => t.decode_token(id),
+            Self::Gguf(t) => t.decode_token(id),
+        }
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        match self {
+            Self::HuggingFace(t) => t.eos_token_id(),
+            Self::Gguf(t) => t.eos_token_id(),
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::HuggingFace(t) => t.vocab_size(),
+            Self::Gguf(t) => t.vocab_size(),
+        }
+    }
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -19,22 +60,31 @@ fn main() -> Result<()> {
     // Parse arguments
     let cli = parse_args(&args);
 
+    let is_gguf = cli.model_path.ends_with(".gguf");
+
     println!("Loading model from: {}", cli.model_path);
 
     // Initialize CUDA
     let ctx = CudaContext::new(0)?;
     println!("CUDA context initialized");
 
-    // Load tokenizer
-    let tokenizer = LlamaTokenizer::from_pretrained(&cli.model_path)?;
-    println!("Tokenizer loaded (vocab size: {})", tokenizer.vocab_size());
+    // Load model + tokenizer based on file type
+    let (model, tokenizer) = if is_gguf {
+        let model = LlamaModel::from_gguf(&ctx, &cli.model_path)?;
+        let gguf_loader = infernum::GgufLoader::from_file(&cli.model_path)?;
+        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(gguf_loader.metadata())?);
+        (model, tokenizer)
+    } else {
+        let model = LlamaModel::from_pretrained(&ctx, &cli.model_path)?;
+        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model_path)?);
+        (model, tokenizer)
+    };
 
-    // Load model
-    let model = LlamaModel::from_pretrained(&ctx, &cli.model_path)?;
     println!(
-        "Model loaded ({} layers, {} hidden)",
+        "Model loaded ({} layers, {} hidden, vocab {})",
         model.config().num_hidden_layers,
-        model.config().hidden_size
+        model.config().hidden_size,
+        tokenizer.vocab_size(),
     );
 
     // Encode prompt
@@ -127,8 +177,17 @@ fn parse_args(args: &[String]) -> CliArgs {
                 print_usage();
                 std::process::exit(0);
             }
-            arg if !arg.starts_with('-') && prompt.is_empty() => {
-                prompt = arg.to_string();
+            arg if !arg.starts_with('-') => {
+                // First non-flag positional: if it looks like a model path
+                // (ends in .gguf or is a directory path), treat it as model.
+                // Otherwise treat it as the prompt.
+                if model_path.is_empty()
+                    && (arg.ends_with(".gguf") || std::path::Path::new(arg).is_dir())
+                {
+                    model_path = arg.to_string();
+                } else if prompt.is_empty() {
+                    prompt = arg.to_string();
+                }
             }
             _ => {}
         }
@@ -161,10 +220,14 @@ fn parse_args(args: &[String]) -> CliArgs {
 }
 
 fn print_usage() {
-    eprintln!("Usage: generate [OPTIONS] [PROMPT]");
+    eprintln!("Usage: generate [OPTIONS] [MODEL_PATH] [PROMPT]");
+    eprintln!();
+    eprintln!("Arguments:");
+    eprintln!("  [MODEL_PATH]             Path to model directory or .gguf file");
+    eprintln!("  [PROMPT]                 Text prompt (default: \"Hello\")");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  -m, --model <PATH>       Path to model directory (default: $LLAMA_MODEL_PATH or models/llama-3.2-1b)");
+    eprintln!("  -m, --model <PATH>       Path to model directory or .gguf file");
     eprintln!("  -n, --max-tokens <N>     Maximum tokens to generate (default: 100)");
     eprintln!("  -t, --temperature <F>    Sampling temperature (default: 0.7)");
     eprintln!("  -p, --top-p <F>          Nucleus sampling threshold (default: 0.9)");
@@ -172,14 +235,15 @@ fn print_usage() {
     eprintln!("      --greedy             Use greedy (argmax) decoding instead of sampling");
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
-    eprintln!("Uses nucleus sampling by default. Pass --greedy for deterministic argmax.");
+    eprintln!("Automatically detects .gguf files and loads tokenizer from GGUF metadata.");
+    eprintln!("For SafeTensors directories, expects tokenizer.json alongside the weights.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!(
-        "  cargo run --example generate --features cuda -- -m /path/to/model \"Hello, world!\""
+        "  cargo run --example generate --features cuda -- model.Q4_0.gguf \"Hello, world!\""
     );
     eprintln!(
         "  cargo run --example generate --features cuda -- -m /path/to/model --greedy \"Hello\""
     );
-    eprintln!("  cargo run --example generate --features cuda -- -m /path/to/model -t 0.8 -p 0.95 \"Once upon a time\"");
+    eprintln!("  cargo run --example generate --features cuda -- -m model.gguf -t 0.8 -p 0.95 \"Once upon a time\"");
 }
