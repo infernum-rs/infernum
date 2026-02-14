@@ -1,11 +1,9 @@
 //! Llama model configuration
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
 
-use infernum::weights::GgufValue;
 use infernum::Result;
 
 /// Configuration for Llama models
@@ -94,7 +92,12 @@ impl LlamaConfig {
     ///
     /// # Errors
     /// Returns an error if required metadata keys are missing.
-    pub fn from_gguf_metadata(metadata: &HashMap<String, GgufValue>) -> Result<Self> {
+    #[cfg(feature = "cuda")]
+    pub fn from_gguf_metadata(
+        metadata: &std::collections::HashMap<String, infernum::weights::GgufValue>,
+    ) -> Result<Self> {
+        use infernum::weights::GgufValue;
+
         let get_usize = |key: &str| -> Result<usize> {
             metadata
                 .get(key)
