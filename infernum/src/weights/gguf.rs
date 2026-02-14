@@ -182,6 +182,9 @@ impl GgufLoader {
             for _ in 0..n_dims {
                 shape.push(read_u64(&mut cursor)? as usize);
             }
+            // GGUF stores dimensions in column-major order (ne[0] = innermost),
+            // reverse to our row-major convention (first dim = outermost).
+            shape.reverse();
             let ggml_type = read_u32(&mut cursor)?;
             let offset = read_u64(&mut cursor)?;
 
@@ -712,8 +715,8 @@ mod test_helpers {
                 buf.extend_from_slice(name.as_bytes());
                 // n_dims
                 buf.extend_from_slice(&(shape.len() as u32).to_le_bytes());
-                // dims
-                for &d in shape {
+                // dims — reverse to GGUF column-major order
+                for &d in shape.iter().rev() {
                     buf.extend_from_slice(&(d as u64).to_le_bytes());
                 }
                 // type
