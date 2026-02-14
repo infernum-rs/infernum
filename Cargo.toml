@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "infernum",
+    "infernum-examples",
     "infernum-llama",
     "infernum-runtime",
 ]

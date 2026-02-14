@@ -1,0 +1,18 @@
+[package]
+name = "infernum-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-runtime/cuda"]
+
+[dependencies]
+infernum = { path = "../infernum" }
+infernum-llama = { path = "../infernum-llama" }
+infernum-runtime = { path = "../infernum-runtime" }
+
+[[example]]
+name = "generate"
+required-features = ["cuda"]
