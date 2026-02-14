@@ -275,15 +275,11 @@ impl KvCache {
         let numel = len * self.num_kv_heads * self.head_dim;
         let shape = [len, self.num_kv_heads, self.head_dim];
 
-        let flat = tensor.reshape(&[self.max_seq_len * self.num_kv_heads * self.head_dim]);
-
         let mut out = unsafe { CudaTensor::<f32>::uninit(&self.ctx, &shape)? };
 
         let device = self.ctx.device();
-        // dtod_copy copies min(src.len, dst.len) — dst has `numel` elements,
-        // so it copies exactly `numel`.
-        device.dtod_copy(flat.cuda_slice(), out.cuda_slice_mut())?;
-        let _ = numel; // used implicitly via shape -> uninit allocation size
+        let src = tensor.cuda_slice().slice(0..numel);
+        device.dtod_copy(&src, out.cuda_slice_mut())?;
 
         Ok(out)
     }
