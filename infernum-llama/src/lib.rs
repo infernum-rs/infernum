@@ -5,5 +5,6 @@ mod config;
 mod model;
 
 pub use config::LlamaConfig;
+pub use infernum::SamplingParams;
 #[cfg(feature = "cuda")]
-pub use model::{LlamaModel, SamplingParams};
+pub use model::LlamaModel;

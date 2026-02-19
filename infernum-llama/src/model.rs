@@ -9,9 +9,11 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add, apply_rope, argmax_last, attention, embedding_gather, matmul, precompute_rope_cache,
-    quantized_matmul, repeat_kv, rms_norm, sample_top_p, silu_mul, transpose_2d,
+    add, apply_rope, argmax_last, attention, attention_kv, embedding_gather, matmul,
+    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, sample_top_p, silu_mul,
+    transpose_2d,
 };
+use infernum::KvCache;
 
 /// Transpose a weight matrix once, for use in pre-transposed linear projections.
 /// (out_features, in_features) -> (in_features, out_features)
@@ -85,27 +87,7 @@ struct LlamaLayerWeights {
     mlp: LlamaMlpWeights,
 }
 
-/// Parameters for nucleus (top-p) sampling
-#[derive(Debug, Clone)]
-pub struct SamplingParams {
-    /// Temperature for logit scaling (higher = more random). Must be > 0.
-    pub temperature: f32,
-    /// Nucleus probability threshold in (0, 1]. Only tokens within the top-p
-    /// cumulative probability mass are considered.
-    pub top_p: f32,
-    /// Seed for the PRNG. Same seed + same input → same output.
-    pub seed: u64,
-}
-
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self {
-            temperature: 0.7,
-            top_p: 0.9,
-            seed: 42,
-        }
-    }
-}
+use infernum::SamplingParams;
 
 /// Complete Llama model
 pub struct LlamaModel {
@@ -502,6 +484,276 @@ impl LlamaModel {
         Ok(tokens)
     }
 
+    /// Greedy generation with KV cache (efficient O(n) per step)
+    ///
+    /// # Arguments
+    /// * `input_ids` - Prompt token IDs
+    /// * `max_new_tokens` - Maximum number of tokens to generate
+    /// * `eos_token_id` - Optional EOS token ID to stop generation early
+    /// * `kv_cache` - Mutable reference to a pre-allocated KV cache
+    ///
+    /// # Returns
+    /// The full token sequence (prompt + generated tokens)
+    ///
+    /// # Errors
+    /// Returns an error if a forward pass fails
+    pub fn generate_with_kv_cache(
+        &self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        kv_cache: &mut KvCache,
+    ) -> Result<Vec<u32>> {
+        let mut tokens = input_ids.to_vec();
+
+        // Prefill: process entire prompt
+        let logits = self.forward_with_kv_cache(input_ids, kv_cache)?;
+
+        // logits: (1, vocab_size)
+        let all_argmax = argmax_last(&logits)?;
+        let mut next_token = all_argmax[0];
+
+        if eos_token_id == Some(next_token) {
+            return Ok(tokens);
+        }
+        tokens.push(next_token);
+
+        // Decode: one token at a time
+        for _ in 1..max_new_tokens {
+            let logits = self.forward_next_token(next_token, kv_cache)?;
+
+            let all_argmax = argmax_last(&logits)?;
+            next_token = all_argmax[0];
+
+            if eos_token_id == Some(next_token) {
+                break;
+            }
+
+            tokens.push(next_token);
+        }
+
+        Ok(tokens)
+    }
+
+    /// Generation with KV cache and nucleus (top-p) sampling
+    ///
+    /// # Arguments
+    /// * `input_ids` - Prompt token IDs
+    /// * `max_new_tokens` - Maximum number of tokens to generate
+    /// * `eos_token_id` - Optional EOS token ID to stop generation early
+    /// * `params` - Sampling parameters (temperature, top-p)
+    /// * `kv_cache` - Mutable reference to a pre-allocated KV cache
+    ///
+    /// # Returns
+    /// The full token sequence (prompt + generated tokens)
+    ///
+    /// # Errors
+    /// Returns an error if a forward pass fails
+    pub fn generate_sampled_with_kv_cache(
+        &self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        params: &SamplingParams,
+        kv_cache: &mut KvCache,
+    ) -> Result<Vec<u32>> {
+        let mut tokens = input_ids.to_vec();
+        let mut rng_state = params.seed;
+
+        // Prefill
+        let logits = self.forward_with_kv_cache(input_ids, kv_cache)?;
+
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+
+        let next_token = sample_top_p(&logits, params.temperature, params.top_p, rng_state)?;
+
+        if eos_token_id == Some(next_token) {
+            return Ok(tokens);
+        }
+        tokens.push(next_token);
+        let mut last_token = next_token;
+
+        // Decode
+        for _ in 1..max_new_tokens {
+            let logits = self.forward_next_token(last_token, kv_cache)?;
+
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+
+            let next_token = sample_top_p(&logits, params.temperature, params.top_p, rng_state)?;
+
+            if eos_token_id == Some(next_token) {
+                break;
+            }
+
+            tokens.push(next_token);
+            last_token = next_token;
+        }
+
+        Ok(tokens)
+    }
+
+    /// Forward pass with KV cache (prefill phase)
+    ///
+    /// Processes the full prompt, populating the KV cache for each layer,
+    /// and returns logits for the **last** token only: shape `(1, vocab_size)`.
+    ///
+    /// After this call, `kv_cache.current_len()` equals `input_ids.len()`.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_with_kv_cache(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut KvCache,
+    ) -> Result<CudaTensor<f32>> {
+        let seq_len = input_ids.len();
+        let position_offset = kv_cache.current_len();
+
+        // Embed tokens: (seq_len,) -> (seq_len, hidden_size)
+        let mut hidden = self.embed(input_ids)?;
+
+        // Run through transformer layers
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
+        }
+
+        // Advance KV cache position (once after all layers)
+        kv_cache.advance(seq_len);
+
+        // Final layer norm
+        hidden = rms_norm(&hidden, &self.norm, self.config.rms_norm_eps)?;
+
+        // Extract last hidden state, then project to vocab logits
+        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
+        self.lm_head_forward(&last_hidden)
+    }
+
+    /// Forward pass for a single token with KV cache (decode phase)
+    ///
+    /// Processes one new token, appending its KV to the cache, and returns
+    /// logits of shape `(1, vocab_size)`.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_next_token(
+        &self,
+        token_id: u32,
+        kv_cache: &mut KvCache,
+    ) -> Result<CudaTensor<f32>> {
+        self.forward_with_kv_cache(&[token_id], kv_cache)
+    }
+
+    /// Forward pass through a single transformer layer using KV cache
+    fn forward_layer_kv(
+        &self,
+        hidden: &CudaTensor<f32>,
+        layer: &LlamaLayerWeights,
+        layer_idx: usize,
+        kv_cache: &mut KvCache,
+        position_offset: usize,
+    ) -> Result<CudaTensor<f32>> {
+        // Pre-attention RMS norm
+        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+        // Self-attention with KV cache
+        let attn_output = self.forward_attention_kv(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            kv_cache,
+            position_offset,
+        )?;
+
+        // Residual connection
+        let hidden = add(hidden, &attn_output)?;
+
+        // Pre-MLP RMS norm
+        let normed = rms_norm(
+            &hidden,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        // MLP
+        let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
+
+        // Residual connection
+        add(&hidden, &mlp_output)
+    }
+
+    /// Forward pass through attention with KV cache
+    fn forward_attention_kv(
+        &self,
+        hidden: &CudaTensor<f32>,
+        weights: &LlamaAttentionWeights,
+        layer_idx: usize,
+        kv_cache: &mut KvCache,
+        position_offset: usize,
+    ) -> Result<CudaTensor<f32>> {
+        let seq_len = hidden.shape()[0];
+        let hidden_size = self.config.hidden_size;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_kv_heads();
+        let head_dim = self.config.head_dim();
+
+        // Project Q, K, V
+        let q = linear(hidden, &weights.q_proj)?;
+        let k = linear(hidden, &weights.k_proj)?;
+        let v = linear(hidden, &weights.v_proj)?;
+
+        // Reshape: (seq_len, num_heads * head_dim) -> (seq_len, num_heads, head_dim)
+        let q = q.reshape(&[seq_len, num_heads, head_dim]);
+        let k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
+        let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
+
+        // Apply RoPE with position offset
+        let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, position_offset)?;
+        let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, position_offset)?;
+
+        // Compute attention using KV cache (handles GQA repeat internally)
+        let attn_output = attention_kv(&q, kv_cache, layer_idx, &k, &v)?;
+
+        // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
+        let attn_output = attn_output.reshape(&[seq_len, hidden_size]);
+
+        // Output projection
+        linear(&attn_output, &weights.o_proj)
+    }
+
+    /// Extract the last row from a (seq_len, hidden_size) tensor
+    fn extract_last_row(
+        &self,
+        hidden: &CudaTensor<f32>,
+        seq_len: usize,
+    ) -> Result<CudaTensor<f32>> {
+        if seq_len == 1 {
+            return Ok(hidden.reshape(&[1, self.config.hidden_size]));
+        }
+        // hidden is already (seq_len, hidden_size) after final norm
+        // We need the last row as (1, hidden_size)
+        let hidden_size = hidden.shape()[1];
+        let flat = hidden.reshape(&[seq_len * hidden_size]);
+        let mut out = unsafe { CudaTensor::<f32>::uninit(&self.ctx, &[1, hidden_size])? };
+        // Copy last hidden_size elements
+        // We can't easily sub-slice with dtod_copy. Use a simple copy kernel.
+        // Actually, we have the hidden states before lm_head. Let me rethink.
+        // The cleanest approach: don't call lm_head on full logits, instead
+        // extract last hidden BEFORE lm_head.
+        // But we already computed lm_head above... Let's use a different approach.
+        // We'll use a CUDA offset copy.
+        let device = self.ctx.device();
+        let src = flat.cuda_slice();
+        let last_offset = (seq_len - 1) * hidden_size;
+        // cudarc CudaSlice supports slice() for sub-slicing
+        let src_sub = src.slice(last_offset..seq_len * hidden_size);
+        device.dtod_copy(&src_sub, out.cuda_slice_mut())?;
+        Ok(out)
+    }
+
     /// Embed token IDs
     fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
         embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
@@ -612,6 +864,35 @@ impl LlamaModel {
         // lm_head: (vocab_size, hidden_size)
         // output: (seq_len, vocab_size)
         linear(hidden, &self.lm_head)
+    }
+}
+
+impl infernum::Model for LlamaModel {
+    fn config(&self) -> infernum::ModelConfig {
+        let config = self.config();
+        infernum::ModelConfig {
+            num_layers: config.num_hidden_layers,
+            max_seq_len: config.max_position_embeddings,
+            num_kv_heads: config.num_kv_heads(),
+            head_dim: config.head_dim(),
+            eos_token_id: config.eos_token_id,
+        }
+    }
+
+    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
+        self.forward(input_ids)
+    }
+
+    fn forward_with_kv_cache(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut KvCache,
+    ) -> Result<CudaTensor<f32>> {
+        self.forward_with_kv_cache(input_ids, kv_cache)
+    }
+
+    fn forward_next_token(&self, token_id: u32, kv_cache: &mut KvCache) -> Result<CudaTensor<f32>> {
+        self.forward_next_token(token_id, kv_cache)
     }
 }
 
@@ -918,5 +1199,124 @@ mod tests {
                 "Should stop before appending the EOS token"
             );
         }
+    }
+
+    #[test]
+    fn test_forward_with_kv_cache_output_shape() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+        let config = tiny_config();
+
+        let mut kv_cache = KvCache::new(
+            &ctx,
+            config.num_hidden_layers,
+            config.max_position_embeddings,
+            config.num_kv_heads(),
+            config.head_dim(),
+        )
+        .unwrap();
+
+        let input_ids: Vec<u32> = vec![1, 5, 10];
+        let logits = model
+            .forward_with_kv_cache(&input_ids, &mut kv_cache)
+            .expect("Forward with KV cache failed");
+
+        // Returns (1, vocab_size) — logits for last token only
+        assert_eq!(logits.shape(), &[1, config.vocab_size]);
+        assert_eq!(kv_cache.current_len(), input_ids.len());
+    }
+
+    #[test]
+    fn test_forward_next_token_output_shape() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+        let config = tiny_config();
+
+        let mut kv_cache = KvCache::new(
+            &ctx,
+            config.num_hidden_layers,
+            config.max_position_embeddings,
+            config.num_kv_heads(),
+            config.head_dim(),
+        )
+        .unwrap();
+
+        // Prefill
+        let prompt: Vec<u32> = vec![1, 5, 10];
+        model.forward_with_kv_cache(&prompt, &mut kv_cache).unwrap();
+
+        // Decode one token
+        let logits = model
+            .forward_next_token(42, &mut kv_cache)
+            .expect("Forward next token failed");
+
+        assert_eq!(logits.shape(), &[1, config.vocab_size]);
+        assert_eq!(kv_cache.current_len(), prompt.len() + 1);
+    }
+
+    #[test]
+    fn test_kv_cache_reset_reuse() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+        let config = tiny_config();
+
+        let mut kv_cache = KvCache::new(
+            &ctx,
+            config.num_hidden_layers,
+            config.max_position_embeddings,
+            config.num_kv_heads(),
+            config.head_dim(),
+        )
+        .unwrap();
+
+        // First sequence
+        let prompt1: Vec<u32> = vec![1, 5, 10];
+        model
+            .forward_with_kv_cache(&prompt1, &mut kv_cache)
+            .unwrap();
+        assert_eq!(kv_cache.current_len(), 3);
+
+        // Reset and process a different sequence
+        kv_cache.reset();
+        assert_eq!(kv_cache.current_len(), 0);
+
+        let prompt2: Vec<u32> = vec![2, 3];
+        let logits = model
+            .forward_with_kv_cache(&prompt2, &mut kv_cache)
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, config.vocab_size]);
+        assert_eq!(kv_cache.current_len(), 2);
+    }
+
+    #[test]
+    fn test_kv_cache_generate_matches_naive_generate() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_model(&ctx);
+        let config = tiny_config();
+
+        let prompt: Vec<u32> = vec![1, 5, 10];
+        let max_new = 5;
+
+        // Greedy generate without KV cache (recomputes full sequence each step)
+        let tokens_naive = model.generate(&prompt, max_new, None).unwrap();
+
+        // Greedy generate with KV cache
+        let mut kv_cache = KvCache::new(
+            &ctx,
+            config.num_hidden_layers,
+            config.max_position_embeddings,
+            config.num_kv_heads(),
+            config.head_dim(),
+        )
+        .unwrap();
+        let tokens_kv = model
+            .generate_with_kv_cache(&prompt, max_new, None, &mut kv_cache)
+            .unwrap();
+
+        // Both should produce the exact same token sequence
+        assert_eq!(
+            tokens_naive, tokens_kv,
+            "KV-cache generate should match naive generate"
+        );
     }
 }

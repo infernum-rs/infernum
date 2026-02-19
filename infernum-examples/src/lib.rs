@@ -1,0 +1,1 @@
+//! Example binaries for Infernum
