@@ -9,8 +9,8 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add, add_inplace, apply_rope, attention, attention_kv, embedding_gather, matmul,
-    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, silu_mul,
+    add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, embedding_gather, matmul,
+    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
     transpose_2d,
 };
 use infernum::KvCache;
@@ -460,12 +460,10 @@ impl LlamaModel {
             position_offset,
         )?;
 
-        // Residual connection (in-place: hidden += attn_output)
-        let mut hidden = add(hidden, &attn_output)?;
-
-        // Pre-MLP RMS norm
-        let normed = rms_norm(
-            &hidden,
+        // Residual add + pre-MLP RMS norm (fused in release builds)
+        let (mut hidden, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
         )?;
@@ -567,12 +565,10 @@ impl LlamaModel {
         // Self-attention
         let attn_output = self.forward_attention(&normed, &layer.attention)?;
 
-        // Residual connection
-        let mut hidden = add(hidden, &attn_output)?;
-
-        // Pre-MLP RMS norm
-        let normed = rms_norm(
-            &hidden,
+        // Residual add + pre-MLP RMS norm (fused in release builds)
+        let (mut hidden, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
         )?;
@@ -645,8 +641,8 @@ impl LlamaModel {
         let gate = linear(hidden, &weights.gate_proj)?;
         let up = linear(hidden, &weights.up_proj)?;
 
-        // Fused SiLU + multiply
-        let intermediate = silu_mul(&gate, &up)?;
+        // SwiGLU activation (fused in release builds)
+        let intermediate = swiglu(&gate, &up)?;
 
         // Down projection
         linear(&intermediate, &weights.down_proj)

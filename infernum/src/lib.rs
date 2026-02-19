@@ -6,10 +6,14 @@
 //!
 //! - `cuda` - Enable CUDA GPU support (requires CUDA toolkit)
 
+// Allow proc macros to use `::infernum::` paths from within this crate.
+extern crate self as infernum;
+
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dtype;
 pub mod error;
+pub mod fusion;
 pub mod model;
 pub mod sampling;
 pub mod tensor;
