@@ -1,9 +1,13 @@
 //! Weight loading utilities
 
+#[cfg(feature = "cuda")]
+mod gguf;
 mod loader;
 #[cfg(feature = "cuda")]
 mod safetensors;
 
+#[cfg(feature = "cuda")]
+pub use gguf::{GgufLoader, GgufValue};
 #[cfg(feature = "cuda")]
 pub use loader::WeightLoader;
 pub use loader::WeightNameMapper;

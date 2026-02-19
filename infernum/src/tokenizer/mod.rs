@@ -2,9 +2,13 @@
 //!
 //! Defines the [`Tokenizer`] trait and concrete implementations.
 
+#[cfg(feature = "cuda")]
+mod gguf_tokenizer;
 mod llama_tokenizer;
 
 use crate::Result;
+#[cfg(feature = "cuda")]
+pub use gguf_tokenizer::GgufTokenizer;
 
 pub use llama_tokenizer::LlamaTokenizer;
 

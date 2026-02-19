@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use crate::cuda::{CudaContext, CudaTensor};
+use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use crate::dtype::DType;
 use crate::weights::WeightLoader;
 use crate::{Error, Result};
@@ -160,9 +160,31 @@ impl WeightLoader for SafeTensorsLoader {
                     "cannot convert U32 weights to f32".to_string(),
                 ));
             }
+            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::F8E4M3 => {
+                return Err(Error::UnsupportedDtype(format!(
+                    "cannot load quantized dtype {} from SafeTensors (use GGUF instead)",
+                    meta.dtype
+                )));
+            }
         };
 
         CudaTensor::from_slice(ctx, &meta.shape, &f32_data)
+    }
+
+    fn load_quantized(&self, ctx: &CudaContext, name: &str) -> Result<QuantizedTensor> {
+        let meta = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+
+        let data = self.get_tensor_data(name)?;
+
+        match meta.dtype {
+            DType::F8E4M3 => QuantizedTensor::from_raw(ctx, &meta.shape, DType::F8E4M3, data, &[]),
+            other => Err(Error::UnsupportedDtype(format!(
+                "load_quantized not supported for dtype {other}"
+            ))),
+        }
     }
 
     fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
@@ -196,6 +218,7 @@ fn safetensors_dtype_to_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::F32 => Ok(DType::F32),
         safetensors::Dtype::F16 => Ok(DType::F16),
         safetensors::Dtype::BF16 => Ok(DType::BF16),
+        safetensors::Dtype::F8_E4M3 => Ok(DType::F8E4M3),
         other => Err(Error::UnsupportedDtype(format!("{other:?}"))),
     }
 }
