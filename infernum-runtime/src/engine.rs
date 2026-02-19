@@ -134,12 +134,14 @@ impl<M: Model> Engine<M> {
         self.kv_cache.reset();
         let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
+        let sampling = options.sampling.as_ref();
 
         // Prefill: process entire prompt
         let logits = self
             .model
             .forward_with_kv_cache(input_ids, &mut self.kv_cache)?;
-        let mut next_token = select_token(&logits, options.sampling.as_ref(), &mut rng_state)?;
+        let recent = recent_token_window(&tokens, sampling);
+        let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
         if options.eos_token_id == Some(next_token) {
             return Ok(tokens);
@@ -151,7 +153,8 @@ impl<M: Model> Engine<M> {
             let logits = self
                 .model
                 .forward_next_token(next_token, &mut self.kv_cache)?;
-            next_token = select_token(&logits, options.sampling.as_ref(), &mut rng_state)?;
+            let recent = recent_token_window(&tokens, sampling);
+            next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
             if options.eos_token_id == Some(next_token) {
                 break;
@@ -166,10 +169,12 @@ impl<M: Model> Engine<M> {
     fn generate_naive(&self, input_ids: &[u32], options: &GenerateOptions) -> Result<Vec<u32>> {
         let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
+        let sampling = options.sampling.as_ref();
 
         for _ in 0..options.max_new_tokens {
             let logits = self.model.forward(&tokens)?;
-            let next_token = select_token(&logits, options.sampling.as_ref(), &mut rng_state)?;
+            let recent = recent_token_window(&tokens, sampling);
+            let next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
             if options.eos_token_id == Some(next_token) {
                 break;
@@ -188,17 +193,21 @@ impl<M: Model> Engine<M> {
         tx: &mpsc::Sender<Result<u32>>,
     ) -> Result<()> {
         self.kv_cache.reset();
+        let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
+        let sampling = options.sampling.as_ref();
 
         // Prefill
         let logits = self
             .model
             .forward_with_kv_cache(input_ids, &mut self.kv_cache)?;
-        let mut next_token = select_token(&logits, options.sampling.as_ref(), &mut rng_state)?;
+        let recent = recent_token_window(&tokens, sampling);
+        let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
         if options.eos_token_id == Some(next_token) {
             return Ok(());
         }
+        tokens.push(next_token);
         if tx.send(Ok(next_token)).is_err() {
             return Ok(());
         }
@@ -208,11 +217,13 @@ impl<M: Model> Engine<M> {
             let logits = self
                 .model
                 .forward_next_token(next_token, &mut self.kv_cache)?;
-            next_token = select_token(&logits, options.sampling.as_ref(), &mut rng_state)?;
+            let recent = recent_token_window(&tokens, sampling);
+            next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
             if options.eos_token_id == Some(next_token) {
                 break;
             }
+            tokens.push(next_token);
             if tx.send(Ok(next_token)).is_err() {
                 break;
             }
@@ -230,10 +241,12 @@ impl<M: Model> Engine<M> {
     ) -> Result<()> {
         let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
+        let sampling = options.sampling.as_ref();
 
         for _ in 0..options.max_new_tokens {
             let logits = self.model.forward(&tokens)?;
-            let next_token = select_token(&logits, options.sampling.as_ref(), &mut rng_state)?;
+            let recent = recent_token_window(&tokens, sampling);
+            let next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
             if options.eos_token_id == Some(next_token) {
                 break;
@@ -253,13 +266,28 @@ fn select_token(
     logits: &CudaTensor<f32>,
     sampling: Option<&SamplingParams>,
     rng_state: &mut Option<u64>,
+    recent_tokens: &[u32],
 ) -> Result<u32> {
     if let (Some(params), Some(state)) = (sampling, rng_state) {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        sample_top_p(logits, params.temperature, params.top_p, *state)
+        sample_top_p(
+            logits,
+            params.temperature,
+            params.top_p,
+            *state,
+            params.repetition_penalty,
+            recent_tokens,
+        )
     } else {
         argmax_last_scalar(logits)
     }
+}
+
+/// Extract the recent token window for repetition penalty.
+fn recent_token_window<'a>(tokens: &'a [u32], sampling: Option<&SamplingParams>) -> &'a [u32] {
+    let window = sampling.map_or(0, |s| s.repetition_penalty_window);
+    let start = tokens.len().saturating_sub(window);
+    &tokens[start..]
 }

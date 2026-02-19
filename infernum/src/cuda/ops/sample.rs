@@ -17,16 +17,19 @@ use crate::Result;
 /// Sample a token from logits using nucleus (top-p) sampling with temperature.
 ///
 /// 1. Extract the last row of the `(seq_len, vocab_size)` logits matrix.
-/// 2. Divide by `temperature` (higher → more random).
-/// 3. Sort descending, compute cumulative softmax.
-/// 4. Mask out tokens whose cumulative probability exceeds `top_p`.
-/// 5. Re-normalise and sample from the remaining distribution.
+/// 2. Apply repetition penalty to tokens in `recent_tokens`.
+/// 3. Divide by `temperature` (higher → more random).
+/// 4. Sort descending, compute cumulative softmax.
+/// 5. Mask out tokens whose cumulative probability exceeds `top_p`.
+/// 6. Re-normalise and sample from the remaining distribution.
 ///
 /// # Arguments
 /// * `logits` - 2D tensor of shape `(seq_len, vocab_size)`
 /// * `temperature` - Scaling factor (must be > 0)
 /// * `top_p` - Nucleus probability threshold in `(0, 1]`
 /// * `rng_seed` - Seed for the lightweight xorshift PRNG
+/// * `repetition_penalty` - Penalty factor for recent tokens (1.0 = disabled)
+/// * `recent_tokens` - Token IDs in the recent context window
 ///
 /// # Errors
 /// Returns an error if the GPU → CPU transfer fails.
@@ -35,6 +38,8 @@ pub fn sample_top_p(
     temperature: f32,
     top_p: f32,
     rng_seed: u64,
+    repetition_penalty: f32,
+    recent_tokens: &[u32],
 ) -> Result<u32> {
     assert!(
         logits.shape().len() == 2,
@@ -54,16 +59,45 @@ pub fn sample_top_p(
         .slice(last_row_offset..seq_len * vocab_size);
     let last_row = logits.context().device().dtoh_sync_copy(&last_row_gpu)?;
 
-    Ok(sample_from_logits(&last_row, temperature, top_p, rng_seed))
+    Ok(sample_from_logits(
+        &last_row,
+        temperature,
+        top_p,
+        rng_seed,
+        repetition_penalty,
+        recent_tokens,
+    ))
 }
 
 /// Pure-CPU sampling from a single row of logits (no GPU dependency).
 /// Useful for testing and as the inner implementation.
-fn sample_from_logits(logits: &[f32], temperature: f32, top_p: f32, rng_seed: u64) -> u32 {
+fn sample_from_logits(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    rng_seed: u64,
+    repetition_penalty: f32,
+    recent_tokens: &[u32],
+) -> u32 {
     let n = logits.len();
 
+    // Apply repetition penalty (CTRL paper): penalise recently seen tokens
+    let mut penalised = logits.to_vec();
+    if (repetition_penalty - 1.0).abs() > f32::EPSILON {
+        for &tok in recent_tokens {
+            let idx = tok as usize;
+            if idx < n {
+                if penalised[idx] > 0.0 {
+                    penalised[idx] /= repetition_penalty;
+                } else {
+                    penalised[idx] *= repetition_penalty;
+                }
+            }
+        }
+    }
+
     // Apply temperature
-    let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature).collect();
+    let scaled: Vec<f32> = penalised.iter().map(|&v| v / temperature).collect();
 
     // Stable softmax: subtract max, then exp
     let max_val = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -120,8 +154,8 @@ mod tests {
     fn test_sample_deterministic_with_seed() {
         // With a fixed seed, sampling should be deterministic
         let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let t1 = sample_from_logits(&logits, 1.0, 1.0, 42);
-        let t2 = sample_from_logits(&logits, 1.0, 1.0, 42);
+        let t1 = sample_from_logits(&logits, 1.0, 1.0, 42, 1.0, &[]);
+        let t2 = sample_from_logits(&logits, 1.0, 1.0, 42, 1.0, &[]);
         assert_eq!(t1, t2);
     }
 
@@ -130,7 +164,7 @@ mod tests {
         // Very low temperature should almost always pick the highest-logit token
         let logits = vec![0.0, 0.0, 10.0, 0.0, 0.0];
         for seed in 0..100 {
-            let token = sample_from_logits(&logits, 0.1, 1.0, seed);
+            let token = sample_from_logits(&logits, 0.1, 1.0, seed, 1.0, &[]);
             assert_eq!(token, 2, "Low temperature should pick argmax (seed={seed})");
         }
     }
@@ -141,7 +175,7 @@ mod tests {
         let logits = vec![10.0, 0.0, 0.0, 0.0];
         // With top_p = 0.5, the nucleus should contain only index 0
         for seed in 0..100 {
-            let token = sample_from_logits(&logits, 1.0, 0.5, seed);
+            let token = sample_from_logits(&logits, 1.0, 0.5, seed, 1.0, &[]);
             assert_eq!(
                 token, 0,
                 "top_p=0.5 should restrict to dominant token (seed={seed})"
@@ -155,7 +189,7 @@ mod tests {
         let logits = vec![1.0, 1.0, 1.0, 1.0]; // uniform
         let mut seen = std::collections::HashSet::new();
         for seed in 0..1000 {
-            seen.insert(sample_from_logits(&logits, 1.0, 1.0, seed));
+            seen.insert(sample_from_logits(&logits, 1.0, 1.0, seed, 1.0, &[]));
         }
         assert!(
             seen.len() > 1,
@@ -166,8 +200,59 @@ mod tests {
     #[test]
     fn test_sample_returns_valid_index() {
         let logits = vec![1.0; 49152]; // typical vocab size
-        let token = sample_from_logits(&logits, 1.0, 0.9, 12345);
+        let token = sample_from_logits(&logits, 1.0, 0.9, 12345, 1.0, &[]);
         assert!((token as usize) < logits.len());
+    }
+
+    #[test]
+    fn test_repetition_penalty_suppresses_repeated_token() {
+        // Token 2 has the highest logit; penalise it so a different token wins
+        let logits = vec![5.0, 5.0, 5.5, 5.0];
+        // Without penalty, low temperature should pick token 2
+        for seed in 0..100 {
+            let token = sample_from_logits(&logits, 0.1, 1.0, seed, 1.0, &[]);
+            assert_eq!(token, 2);
+        }
+        // With strong penalty on token 2, it should no longer be picked
+        for seed in 0..100 {
+            let token = sample_from_logits(&logits, 0.1, 1.0, seed, 100.0, &[2]);
+            assert_ne!(
+                token, 2,
+                "Penalised token should not be selected (seed={seed})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_repetition_penalty_one_is_noop() {
+        // penalty=1.0 should produce identical results to no penalty
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let without = sample_from_logits(&logits, 1.0, 1.0, 42, 1.0, &[]);
+        let with = sample_from_logits(&logits, 1.0, 1.0, 42, 1.0, &[0, 1, 2, 3, 4]);
+        assert_eq!(without, with);
+    }
+
+    #[test]
+    fn test_repetition_penalty_negative_logits() {
+        // For negative logits, penalty multiplies (making them more negative)
+        let logits = vec![-1.0, -2.0, 2.0, -1.0];
+        // Penalise token 2 moderately — it still wins (2.0/2.0=1.0 vs -1.0)
+        let token = sample_from_logits(&logits, 0.1, 1.0, 42, 2.0, &[2]);
+        assert_eq!(token, 2);
+
+        // Penalise token 2 enough that its logit drops below the others
+        // 2.0 / 10.0 = 0.2, which is above -1.0 but with temp=1.0 the gap is small
+        // 2.0 / 100.0 = 0.02, still above -1.0 at low temp...
+        // Use closer logits: [1.9, 1.8, 2.0, 1.9] with penalty on token 2
+        let logits = vec![1.9, 1.8, 2.0, 1.9];
+        // 2.0 / 5.0 = 0.4, far below 1.9 → token 2 should lose
+        for seed in 0..100 {
+            let token = sample_from_logits(&logits, 0.1, 1.0, seed, 5.0, &[2]);
+            assert_ne!(
+                token, 2,
+                "Penalised token should not be selected (seed={seed})"
+            );
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -185,8 +270,27 @@ mod tests {
             ];
             let logits = CudaTensor::from_slice(&ctx, &[2, 4], &data).unwrap();
 
-            let token = sample_top_p(&logits, 0.1, 1.0, 42).unwrap();
+            let token = sample_top_p(&logits, 0.1, 1.0, 42, 1.0, &[]).unwrap();
             assert_eq!(token, 2);
+        }
+
+        #[test]
+        fn test_sample_top_p_gpu_with_repetition_penalty() {
+            let ctx = CudaContext::new(0).expect("CUDA context");
+
+            let data: Vec<f32> = vec![
+                0.0, 0.0, 10.0, 0.0, // row 0
+                5.0, 5.0, 5.5, 5.0, // row 1 (last row picked)
+            ];
+            let logits = CudaTensor::from_slice(&ctx, &[2, 4], &data).unwrap();
+
+            // Without penalty, token 2 wins
+            let token = sample_top_p(&logits, 0.1, 1.0, 42, 1.0, &[]).unwrap();
+            assert_eq!(token, 2);
+
+            // With strong penalty on token 2, a different token wins
+            let token = sample_top_p(&logits, 0.1, 1.0, 42, 100.0, &[2]).unwrap();
+            assert_ne!(token, 2);
         }
     }
 }

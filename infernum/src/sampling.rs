@@ -10,6 +10,13 @@ pub struct SamplingParams {
     pub top_p: f32,
     /// Seed for the PRNG. Same seed + same input → same output.
     pub seed: u64,
+    /// Repetition penalty factor (CTRL paper). Values > 1.0 penalise tokens
+    /// that have already appeared in the recent context window. A value of
+    /// 1.0 disables the penalty entirely.
+    pub repetition_penalty: f32,
+    /// Number of recent tokens to consider for repetition penalty. Only the
+    /// last `repetition_penalty_window` tokens are checked.
+    pub repetition_penalty_window: usize,
 }
 
 impl Default for SamplingParams {
@@ -18,6 +25,8 @@ impl Default for SamplingParams {
             temperature: 0.7,
             top_p: 0.9,
             seed: 42,
+            repetition_penalty: 1.0,
+            repetition_penalty_window: 64,
         }
     }
 }
