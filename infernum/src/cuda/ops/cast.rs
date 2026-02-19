@@ -40,7 +40,7 @@ pub fn cast_f32_to_bf16(input: &CudaTensor<f32>) -> Result<CudaTensor<half::bf16
     let func = device.get_func("cast", "cast_f32_to_bf16").unwrap();
 
     let block_size = 256;
-    let grid_size = (n + block_size - 1) / block_size;
+    let grid_size = n.div_ceil(block_size);
 
     let cfg = LaunchConfig {
         grid_dim: (grid_size as u32, 1, 1),
@@ -72,7 +72,7 @@ pub fn cast_bf16_to_f32(input: &CudaTensor<half::bf16>) -> Result<CudaTensor<f32
     let func = device.get_func("cast", "cast_bf16_to_f32").unwrap();
 
     let block_size = 256;
-    let grid_size = (n + block_size - 1) / block_size;
+    let grid_size = n.div_ceil(block_size);
 
     let cfg = LaunchConfig {
         grid_dim: (grid_size as u32, 1, 1),
