@@ -116,9 +116,11 @@ impl KvCache {
         let shape = [max_seq_len, num_kv_heads, head_dim];
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
+            // SAFETY: KV cache tracks current_len and only accesses valid (written) positions.
+            // Uninitialized memory beyond current_len is never read.
             layers.push(LayerBuffer {
-                k: CudaTensor::zeros(ctx, &shape)?,
-                v: CudaTensor::zeros(ctx, &shape)?,
+                k: unsafe { CudaTensor::uninit(ctx, &shape)? },
+                v: unsafe { CudaTensor::uninit(ctx, &shape)? },
             });
         }
 
