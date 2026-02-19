@@ -152,7 +152,8 @@ pub fn fused_attention_decode(
         .unwrap();
 
     let block_size = 256_usize.min(total_len.next_power_of_two());
-    let shared_mem = (head_dim + block_size) * std::mem::size_of::<f32>();
+    // Shared memory: Q (head_dim) + cached weights (total_len) + reduction scratch (block_size)
+    let shared_mem = (head_dim + total_len + block_size) * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
         grid_dim: (num_heads as u32, 1, 1),
