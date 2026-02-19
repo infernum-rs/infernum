@@ -9,6 +9,7 @@ default = []
 cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-runtime/cuda"]
 
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
 infernum = { path = "../infernum" }
 infernum-llama = { path = "../infernum-llama" }
 infernum-runtime = { path = "../infernum-runtime" }
