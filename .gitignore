@@ -12,6 +12,3 @@ models/
 
 # Ephemeral planning docs
 ephemeral-docs/
-
-# Git worktrees
-worktrees/

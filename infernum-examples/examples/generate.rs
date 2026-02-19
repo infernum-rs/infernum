@@ -17,10 +17,10 @@ use clap::Parser;
 
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
-use infernum::Result;
 use infernum::Tokenizer as _;
-use infernum_llama::{LlamaModel, SamplingParams};
-use infernum_runtime::Runtime;
+use infernum::{GenerateOptions, Result, SamplingParams};
+use infernum_llama::LlamaModel;
+use infernum_runtime::{Engine, Runtime};
 
 /// Text generation with Llama models
 ///
@@ -143,27 +143,37 @@ fn main() -> Result<()> {
         tokenizer.vocab_size(),
     );
 
-    let sampling = SamplingParams {
-        temperature: cli.temperature,
-        top_p: cli.top_p,
-        seed: cli.seed,
+    // Build generation options
+    let options = GenerateOptions {
+        max_new_tokens: cli.max_tokens,
+        eos_token_id: None, // Runtime fills from model config
+        sampling: if cli.greedy {
+            None
+        } else {
+            Some(SamplingParams {
+                temperature: cli.temperature,
+                top_p: cli.top_p,
+                seed: cli.seed,
+            })
+        },
+        use_kv_cache: !cli.no_kv_cache,
     };
 
     // Print decoding strategy
-    if !cli.greedy {
+    if let Some(ref params) = options.sampling {
         println!(
             "Sampling: temperature={}, top_p={}, seed={}",
-            sampling.temperature, sampling.top_p, sampling.seed
+            params.temperature, params.top_p, params.seed
         );
     } else {
         println!("Decoding: greedy (argmax)");
     }
     println!(
         "KV cache: {}",
-        if cli.no_kv_cache {
-            "disabled"
-        } else {
+        if options.use_kv_cache {
             "enabled"
+        } else {
+            "disabled"
         }
     );
 
@@ -172,19 +182,18 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
 
-    let (output_tokens, prompt_len) = if cli.no_kv_cache {
-        // Naive generation: recompute full sequence each step (no KV cache)
+    let (output_tokens, prompt_len) = if !options.use_kv_cache {
+        // Naive generation: use Engine directly for non-KV-cached path
+        let mut engine = Engine::new(&ctx, model)?;
         let input_ids = tokenizer.encode(&cli.prompt, true)?;
         let prompt_len = input_ids.len();
-        let eos = Some(tokenizer.eos_token_id());
 
-        let tokens = if cli.greedy {
-            model.generate(&input_ids, cli.max_tokens, eos)?
-        } else {
-            model.generate_sampled(&input_ids, cli.max_tokens, eos, &sampling)?
-        };
+        let mut opts = options.clone();
+        opts.eos_token_id = Some(tokenizer.eos_token_id());
 
-        // Stream output tokens
+        let tokens = engine.generate(&input_ids, &opts)?;
+
+        // Print output tokens
         for &tok in &tokens[prompt_len..] {
             let text = tokenizer.decode_token(tok)?;
             print!("{text}");
@@ -193,13 +202,10 @@ fn main() -> Result<()> {
 
         (tokens, prompt_len)
     } else {
-        // KV-cached generation via Runtime
+        // KV-cached streaming via Runtime
         let mut runtime = Runtime::new(&ctx, model, tokenizer)?;
-
-        let params = if cli.greedy { None } else { Some(&sampling) };
-
         let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
-        let tokens = runtime.generate_streaming(&cli.prompt, cli.max_tokens, params)?;
+        let tokens = runtime.generate_stream(&cli.prompt, &options)?;
         (tokens, prompt_len)
     };
 

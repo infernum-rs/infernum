@@ -9,9 +9,8 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add, apply_rope, argmax_last, attention, attention_kv, embedding_gather, matmul,
-    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, sample_top_p, silu_mul,
-    transpose_2d,
+    add, apply_rope, attention, attention_kv, embedding_gather, matmul, precompute_rope_cache,
+    quantized_matmul, repeat_kv, rms_norm, silu_mul, transpose_2d,
 };
 use infernum::KvCache;
 
@@ -86,8 +85,6 @@ struct LlamaLayerWeights {
     post_attention_layernorm: CudaTensor<f32>,
     mlp: LlamaMlpWeights,
 }
-
-use infernum::SamplingParams;
 
 /// Complete Llama model
 pub struct LlamaModel {
@@ -388,212 +385,6 @@ impl LlamaModel {
         let logits = self.lm_head_forward(&hidden)?;
 
         Ok(logits)
-    }
-
-    /// Greedy autoregressive generation
-    ///
-    /// Runs the model forward repeatedly, selecting the highest-probability
-    /// token at each step via argmax. Stops when `max_new_tokens` are produced
-    /// or the EOS token is emitted.
-    ///
-    /// # Arguments
-    /// * `input_ids` - Prompt token IDs
-    /// * `max_new_tokens` - Maximum number of tokens to generate
-    /// * `eos_token_id` - Optional EOS token ID to stop generation early
-    ///
-    /// # Returns
-    /// The full token sequence (prompt + generated tokens)
-    ///
-    /// # Errors
-    /// Returns an error if a forward pass fails
-    pub fn generate(
-        &self,
-        input_ids: &[u32],
-        max_new_tokens: usize,
-        eos_token_id: Option<u32>,
-    ) -> Result<Vec<u32>> {
-        let mut tokens = input_ids.to_vec();
-
-        for _ in 0..max_new_tokens {
-            let logits = self.forward(&tokens)?;
-
-            // logits: (seq_len, vocab_size) — extract last row via reshape
-            let seq_len = logits.shape()[0];
-            let vocab_size = logits.shape()[1];
-            let last_logits = logits.reshape(&[seq_len, vocab_size]);
-
-            // Argmax on GPU over the full (seq_len, vocab_size) matrix,
-            // then take only the last row's result
-            let all_argmax = argmax_last(&last_logits)?;
-            let next_token = all_argmax[seq_len - 1];
-
-            if eos_token_id == Some(next_token) {
-                break;
-            }
-
-            tokens.push(next_token);
-        }
-
-        Ok(tokens)
-    }
-
-    /// Autoregressive generation with nucleus (top-p) sampling
-    ///
-    /// Like [`generate`](Self::generate), but selects each token by sampling
-    /// from the nucleus of the probability distribution rather than taking
-    /// the argmax.
-    ///
-    /// # Arguments
-    /// * `input_ids` - Prompt token IDs
-    /// * `max_new_tokens` - Maximum number of tokens to generate
-    /// * `eos_token_id` - Optional EOS token ID to stop generation early
-    /// * `params` - Sampling parameters (temperature, top-p)
-    ///
-    /// # Returns
-    /// The full token sequence (prompt + generated tokens)
-    ///
-    /// # Errors
-    /// Returns an error if a forward pass fails
-    pub fn generate_sampled(
-        &self,
-        input_ids: &[u32],
-        max_new_tokens: usize,
-        eos_token_id: Option<u32>,
-        params: &SamplingParams,
-    ) -> Result<Vec<u32>> {
-        let mut tokens = input_ids.to_vec();
-        let mut rng_state = params.seed;
-
-        for _ in 0..max_new_tokens {
-            let logits = self.forward(&tokens)?;
-
-            // Advance the RNG state so each step gets a different sample
-            rng_state ^= rng_state << 13;
-            rng_state ^= rng_state >> 7;
-            rng_state ^= rng_state << 17;
-
-            let next_token = sample_top_p(&logits, params.temperature, params.top_p, rng_state)?;
-
-            if eos_token_id == Some(next_token) {
-                break;
-            }
-
-            tokens.push(next_token);
-        }
-
-        Ok(tokens)
-    }
-
-    /// Greedy generation with KV cache (efficient O(n) per step)
-    ///
-    /// # Arguments
-    /// * `input_ids` - Prompt token IDs
-    /// * `max_new_tokens` - Maximum number of tokens to generate
-    /// * `eos_token_id` - Optional EOS token ID to stop generation early
-    /// * `kv_cache` - Mutable reference to a pre-allocated KV cache
-    ///
-    /// # Returns
-    /// The full token sequence (prompt + generated tokens)
-    ///
-    /// # Errors
-    /// Returns an error if a forward pass fails
-    pub fn generate_with_kv_cache(
-        &self,
-        input_ids: &[u32],
-        max_new_tokens: usize,
-        eos_token_id: Option<u32>,
-        kv_cache: &mut KvCache,
-    ) -> Result<Vec<u32>> {
-        let mut tokens = input_ids.to_vec();
-
-        // Prefill: process entire prompt
-        let logits = self.forward_with_kv_cache(input_ids, kv_cache)?;
-
-        // logits: (1, vocab_size)
-        let all_argmax = argmax_last(&logits)?;
-        let mut next_token = all_argmax[0];
-
-        if eos_token_id == Some(next_token) {
-            return Ok(tokens);
-        }
-        tokens.push(next_token);
-
-        // Decode: one token at a time
-        for _ in 1..max_new_tokens {
-            let logits = self.forward_next_token(next_token, kv_cache)?;
-
-            let all_argmax = argmax_last(&logits)?;
-            next_token = all_argmax[0];
-
-            if eos_token_id == Some(next_token) {
-                break;
-            }
-
-            tokens.push(next_token);
-        }
-
-        Ok(tokens)
-    }
-
-    /// Generation with KV cache and nucleus (top-p) sampling
-    ///
-    /// # Arguments
-    /// * `input_ids` - Prompt token IDs
-    /// * `max_new_tokens` - Maximum number of tokens to generate
-    /// * `eos_token_id` - Optional EOS token ID to stop generation early
-    /// * `params` - Sampling parameters (temperature, top-p)
-    /// * `kv_cache` - Mutable reference to a pre-allocated KV cache
-    ///
-    /// # Returns
-    /// The full token sequence (prompt + generated tokens)
-    ///
-    /// # Errors
-    /// Returns an error if a forward pass fails
-    pub fn generate_sampled_with_kv_cache(
-        &self,
-        input_ids: &[u32],
-        max_new_tokens: usize,
-        eos_token_id: Option<u32>,
-        params: &SamplingParams,
-        kv_cache: &mut KvCache,
-    ) -> Result<Vec<u32>> {
-        let mut tokens = input_ids.to_vec();
-        let mut rng_state = params.seed;
-
-        // Prefill
-        let logits = self.forward_with_kv_cache(input_ids, kv_cache)?;
-
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-
-        let next_token = sample_top_p(&logits, params.temperature, params.top_p, rng_state)?;
-
-        if eos_token_id == Some(next_token) {
-            return Ok(tokens);
-        }
-        tokens.push(next_token);
-        let mut last_token = next_token;
-
-        // Decode
-        for _ in 1..max_new_tokens {
-            let logits = self.forward_next_token(last_token, kv_cache)?;
-
-            rng_state ^= rng_state << 13;
-            rng_state ^= rng_state >> 7;
-            rng_state ^= rng_state << 17;
-
-            let next_token = sample_top_p(&logits, params.temperature, params.top_p, rng_state)?;
-
-            if eos_token_id == Some(next_token) {
-                break;
-            }
-
-            tokens.push(next_token);
-            last_token = next_token;
-        }
-
-        Ok(tokens)
     }
 
     /// Forward pass with KV cache (prefill phase)
@@ -1158,14 +949,24 @@ mod tests {
         }
     }
 
+    fn build_tiny_engine(ctx: &CudaContext) -> infernum_runtime::Engine<LlamaModel> {
+        let model = build_tiny_model(ctx);
+        infernum_runtime::Engine::new(ctx, model).expect("Failed to build engine")
+    }
+
     #[test]
     fn test_generate_respects_max_tokens() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let model = build_tiny_model(&ctx);
+        let mut engine = build_tiny_engine(&ctx);
 
         let prompt = vec![1_u32, 5, 10];
         let max_new = 4;
-        let tokens = model.generate(&prompt, max_new, None).unwrap();
+        let options = infernum::GenerateOptions {
+            max_new_tokens: max_new,
+            use_kv_cache: false,
+            ..Default::default()
+        };
+        let tokens = engine.generate(&prompt, &options).unwrap();
 
         // Should produce at most prompt_len + max_new_tokens
         assert!(tokens.len() <= prompt.len() + max_new);
@@ -1180,18 +981,29 @@ mod tests {
     #[test]
     fn test_generate_stops_on_eos() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let model = build_tiny_model(&ctx);
+        let mut engine = build_tiny_engine(&ctx);
 
         // Run generate with a very large max_new_tokens but EOS set to a
         // token that the model is likely to produce with random weights
         let prompt = vec![1_u32];
-        let result_no_eos = model.generate(&prompt, 5, None).unwrap();
+        let options_no_eos = infernum::GenerateOptions {
+            max_new_tokens: 5,
+            use_kv_cache: false,
+            ..Default::default()
+        };
+        let result_no_eos = engine.generate(&prompt, &options_no_eos).unwrap();
 
         // The generated tokens should not include the EOS token if we set it
         // to one that was actually produced
         if result_no_eos.len() > 1 {
             let first_generated = result_no_eos[1];
-            let result_with_eos = model.generate(&prompt, 100, Some(first_generated)).unwrap();
+            let options_with_eos = infernum::GenerateOptions {
+                max_new_tokens: 100,
+                eos_token_id: Some(first_generated),
+                use_kv_cache: false,
+                ..Default::default()
+            };
+            let result_with_eos = engine.generate(&prompt, &options_with_eos).unwrap();
             // Should stop immediately since the first generated token == EOS
             assert_eq!(
                 result_with_eos.len(),
@@ -1291,27 +1103,26 @@ mod tests {
     #[test]
     fn test_kv_cache_generate_matches_naive_generate() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let model = build_tiny_model(&ctx);
-        let config = tiny_config();
+        let mut engine = build_tiny_engine(&ctx);
 
         let prompt: Vec<u32> = vec![1, 5, 10];
         let max_new = 5;
 
         // Greedy generate without KV cache (recomputes full sequence each step)
-        let tokens_naive = model.generate(&prompt, max_new, None).unwrap();
+        let naive_options = infernum::GenerateOptions {
+            max_new_tokens: max_new,
+            use_kv_cache: false,
+            ..Default::default()
+        };
+        let tokens_naive = engine.generate(&prompt, &naive_options).unwrap();
 
         // Greedy generate with KV cache
-        let mut kv_cache = KvCache::new(
-            &ctx,
-            config.num_hidden_layers,
-            config.max_position_embeddings,
-            config.num_kv_heads(),
-            config.head_dim(),
-        )
-        .unwrap();
-        let tokens_kv = model
-            .generate_with_kv_cache(&prompt, max_new, None, &mut kv_cache)
-            .unwrap();
+        let kv_options = infernum::GenerateOptions {
+            max_new_tokens: max_new,
+            use_kv_cache: true,
+            ..Default::default()
+        };
+        let tokens_kv = engine.generate(&prompt, &kv_options).unwrap();
 
         // Both should produce the exact same token sequence
         assert_eq!(
