@@ -17,6 +17,10 @@ pub enum Error {
     CuBlas(#[from] cudarc::cublas::result::CublasError),
 
     #[cfg(feature = "cuda")]
+    #[error("cuBLASLt error: {0}")]
+    CuBlasLt(#[from] cudarc::cublaslt::result::CublasError),
+
+    #[cfg(feature = "cuda")]
     #[error("NVRTC error: {0}")]
     Nvrtc(#[from] cudarc::nvrtc::result::NvrtcError),
 
