@@ -9,3 +9,6 @@ __pycache__/
 # Large files / artifacts
 models/
 *.deb
+
+# Ephemeral planning docs
+ephemeral-docs/

@@ -105,3 +105,4 @@ The GitHub Actions CI pipeline runs on every push/PR to `main`:
 ### Documentation
 
 - Design document: `docs/initial-plan.md` (comprehensive architecture and roadmap)
+- Short-term / ephemeral planning documents go in `ephemeral-docs/` (gitignored)
