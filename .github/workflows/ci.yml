@@ -113,4 +113,4 @@ jobs:
         run: cargo build --features cuda
 
       - name: Run CUDA tests
-        run: cargo test --features cuda
+        run: cargo test --features cuda -- --test-threads=1

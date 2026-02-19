@@ -1,3 +1,11 @@
 target/
 .idea/
 *.iml
+
+# Python
+.venv/
+__pycache__/
+
+# Large files / artifacts
+models/
+*.deb
