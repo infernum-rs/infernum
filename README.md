@@ -19,6 +19,7 @@ See `docs/initial-plan.md` for the full design document and `docs/phase1-plan.md
 
 - **Tensor Foundation**: `CudaTensor` with GPU memory management and host/device transfers
 - **Core Ops**: MatMul (cuBLAS), RMSNorm, RoPE, SiLU, Softmax, Attention
+- **Block Fusion**: `define_block!`/`define_fusion!` macros for automatic kernel fusion with feature-flag control
 - **Weight Loading**: SafeTensors with memory-mapped loading
 - **Llama Model**: Full Llama 3.2 architecture with GQA support
 - **Tokenizer**: HuggingFace tokenizers integration
@@ -73,6 +74,25 @@ Options:
   -m, --model <PATH>       Path to model directory
   -n, --max-tokens <N>     Maximum tokens to generate (default: 100)
   -h, --help               Show help message
+```
+
+### Block Fusion Example
+
+The fusion framework lets you define blocks with decomposed implementations and
+register optimized fused replacements. See `docs/fusion.md` for a full guide.
+
+```bash
+# Debug build — always uses decomposed path
+cargo run --example fusion_example
+
+# Release build — uses fused kernels after fusion::init()
+cargo run --example fusion_example --release
+
+# Force fused even in debug
+cargo run --example fusion_example --features force-fuse
+
+# Force decomposed even in release
+cargo run --example fusion_example --features no-fuse --release
 ```
 
 ## Architecture

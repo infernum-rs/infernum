@@ -38,6 +38,12 @@ jobs:
       - name: Run tests (no CUDA)
         run: cargo test --all
 
+      - name: Run tests (force-fuse)
+        run: cargo test --all --features force-fuse
+
+      - name: Run tests (no-fuse)
+        run: cargo test --all --features no-fuse
+
   # GPU tests using GitHub's hosted GPU runners
   # Requires GitHub Team or Enterprise Cloud plan
   # See: https://github.blog/changelog/2024-07-08-github-actions-gpu-hosted-runners-are-now-generally-available/
