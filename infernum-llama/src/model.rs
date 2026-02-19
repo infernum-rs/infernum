@@ -9,9 +9,9 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, embedding_gather, matmul,
-    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
-    transpose_2d,
+    add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, cast_bf16_to_f32,
+    cast_f32_to_bf16, embedding_gather, matmul, precompute_rope_cache, quantized_matmul, repeat_kv,
+    rms_norm, rms_norm_inplace, swiglu, transpose_2d,
 };
 use infernum::KvCache;
 
@@ -19,6 +19,29 @@ use infernum::KvCache;
 /// (out_features, in_features) -> (in_features, out_features)
 fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     transpose_2d(weight)
+}
+
+/// Transpose a bf16 weight matrix on the CPU, then upload to GPU.
+///
+/// The CUDA transpose kernel only supports f32, so we do this on the host.
+/// This is a one-time cost at model load, not on the hot path.
+/// (out_features, in_features) -> (in_features, out_features)
+fn pretranspose_weight_bf16(weight: &CudaTensor<half::bf16>) -> Result<CudaTensor<half::bf16>> {
+    let shape = weight.shape();
+    assert_eq!(shape.len(), 2, "Expected 2D tensor for pretranspose");
+    let rows = shape[0];
+    let cols = shape[1];
+
+    let data = weight.to_vec()?;
+    let mut transposed = vec![half::bf16::ZERO; data.len()];
+
+    for r in 0..rows {
+        for c in 0..cols {
+            transposed[c * rows + r] = data[r * cols + c];
+        }
+    }
+
+    CudaTensor::from_slice(weight.context(), &[cols, rows], &transposed)
 }
 
 /// Reverse the llama.cpp Q/K weight permutation for f32 tensors.
@@ -49,6 +72,7 @@ fn unpermute_f32(weight: &CudaTensor<f32>, n_head: usize) -> Result<CudaTensor<f
     CudaTensor::from_slice(weight.context(), &[n_rows, n_cols], &out)
 }
 use infernum::cuda::{CudaContext, CudaTensor, QuantizedTensor};
+use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 use infernum::Result;
@@ -60,6 +84,9 @@ use crate::LlamaConfig;
 enum LinearWeight {
     /// Pre-transposed f32 weight: shape (in_features, out_features)
     F32(CudaTensor<f32>),
+    /// Pre-transposed bf16 weight: shape (in_features, out_features)
+    /// Activations are cast f32→bf16 before GEMM and bf16→f32 after.
+    BF16(CudaTensor<half::bf16>),
     /// Quantized weight: shape (out_features, in_features) — transposed inside kernel
     Quantized(QuantizedTensor),
 }
@@ -264,6 +291,7 @@ impl LlamaModel {
         loader: &impl WeightLoader,
     ) -> Result<Self> {
         /// Load a linear weight — quantized if the tensor uses a quantized dtype,
+        /// bf16 if stored as BF16/F16 (keeping half-precision on GPU),
         /// otherwise f32 (pre-transposed). For FP8 weights, also loads the
         /// companion `weight_scale` tensor if present.
         fn load_linear(
@@ -286,6 +314,10 @@ impl LlamaModel {
                 }
 
                 Ok(LinearWeight::Quantized(qt))
+            } else if dtype == DType::BF16 || dtype == DType::F16 {
+                Ok(LinearWeight::BF16(pretranspose_weight_bf16(
+                    &loader.load_bf16(ctx, name)?,
+                )?))
             } else {
                 Ok(LinearWeight::F32(pretranspose_weight(
                     &loader.load_f32(ctx, name)?,
@@ -693,6 +725,11 @@ impl infernum::Model for LlamaModel {
 fn linear(input: &CudaTensor<f32>, weight: &LinearWeight) -> Result<CudaTensor<f32>> {
     match weight {
         LinearWeight::F32(w) => matmul(input, w),
+        LinearWeight::BF16(w) => {
+            let input_bf16 = cast_f32_to_bf16(input)?;
+            let output_bf16 = matmul(&input_bf16, w)?;
+            cast_bf16_to_f32(&output_bf16)
+        }
         LinearWeight::Quantized(w) => quantized_matmul(input, w),
     }
 }
@@ -735,6 +772,47 @@ mod tests {
         assert!((result[5] - 5.0).abs() < 1e-4);
         assert!((result[6] - 6.0).abs() < 1e-4);
         assert!((result[7] - 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_linear_bf16() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // input: (2, 3), weight pre-transposed: (3, 4) -> output: (2, 4)
+        let input_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weight_data: Vec<half::bf16> = vec![
+            half::bf16::from_f32(1.0),
+            half::bf16::from_f32(0.0),
+            half::bf16::from_f32(0.0),
+            half::bf16::from_f32(1.0),
+            half::bf16::from_f32(0.0),
+            half::bf16::from_f32(1.0),
+            half::bf16::from_f32(0.0),
+            half::bf16::from_f32(1.0),
+            half::bf16::from_f32(0.0),
+            half::bf16::from_f32(0.0),
+            half::bf16::from_f32(1.0),
+            half::bf16::from_f32(1.0),
+        ];
+
+        let input = CudaTensor::from_slice(&ctx, &[2, 3], &input_data).unwrap();
+        let weight =
+            LinearWeight::BF16(CudaTensor::from_slice(&ctx, &[3, 4], &weight_data).unwrap());
+
+        let output = linear(&input, &weight).unwrap();
+
+        assert_eq!(output.shape(), &[2, 4]);
+
+        let result = output.to_vec().unwrap();
+        // Same expected results as f32 test: row 0: [1, 2, 3, 6], row 1: [4, 5, 6, 15]
+        assert!((result[0] - 1.0).abs() < 0.1);
+        assert!((result[1] - 2.0).abs() < 0.1);
+        assert!((result[2] - 3.0).abs() < 0.1);
+        assert!((result[3] - 6.0).abs() < 0.1);
+        assert!((result[4] - 4.0).abs() < 0.1);
+        assert!((result[5] - 5.0).abs() < 0.1);
+        assert!((result[6] - 6.0).abs() < 0.1);
+        assert!((result[7] - 15.0).abs() < 0.2);
     }
 
     // --- End-to-end tests with a tiny model ---

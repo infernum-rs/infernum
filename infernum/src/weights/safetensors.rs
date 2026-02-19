@@ -171,6 +171,41 @@ impl WeightLoader for SafeTensorsLoader {
         CudaTensor::from_slice(ctx, &meta.shape, &f32_data)
     }
 
+    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::bf16>> {
+        let meta = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+
+        let data = self.get_tensor_data(name)?;
+
+        let bf16_data: Vec<half::bf16> = match meta.dtype {
+            DType::BF16 => {
+                // Zero-conversion: reinterpret bytes as bf16 directly
+                let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
+                bf16_slice.to_vec()
+            }
+            DType::F16 => {
+                let f16_slice: &[half::f16] = bytemuck::cast_slice(data);
+                f16_slice
+                    .iter()
+                    .map(|x| half::bf16::from_f32(x.to_f32()))
+                    .collect()
+            }
+            DType::F32 => {
+                let f32_slice: &[f32] = bytemuck::cast_slice(data);
+                f32_slice.iter().map(|x| half::bf16::from_f32(*x)).collect()
+            }
+            other => {
+                return Err(Error::UnsupportedDtype(format!(
+                    "cannot load dtype {other} as bf16"
+                )));
+            }
+        };
+
+        CudaTensor::from_slice(ctx, &meta.shape, &bf16_data)
+    }
+
     fn load_quantized(&self, ctx: &CudaContext, name: &str) -> Result<QuantizedTensor> {
         let meta = self
             .tensors
