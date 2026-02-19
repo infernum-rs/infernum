@@ -20,17 +20,17 @@ use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/add_rmsnorm.ptx"));
 
-/// Residual add followed by RMS normalization.
-///
-/// Computes `sum = residual + x` and `normed = rmsnorm(sum, weight, eps)`.
-/// Returns `(sum, normed)`.
-///
-/// The decomposed version calls `add` then `rms_norm`. When fusion is
-/// active (release builds by default), a single CUDA kernel handles both.
-///
-/// # Errors
-/// Returns an error if the operation fails.
 infernum_macros::define_block! {
+    /// Residual add followed by RMS normalization.
+    ///
+    /// Computes `sum = residual + x` and `normed = rmsnorm(sum, weight, eps)`.
+    /// Returns `(sum, normed)`.
+    ///
+    /// The decomposed version calls `add` then `rms_norm`. When fusion is
+    /// active (release builds by default), a single CUDA kernel handles both.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_rmsnorm(
         residual: &CudaTensor<f32>,
         x: &CudaTensor<f32>,

@@ -113,31 +113,31 @@ pub fn attention(
     super::transpose_012_to_102(&output_transposed)
 }
 
-/// Attention with KV cache for incremental decoding
-///
-/// Appends `k_new` and `v_new` to the cache for `layer_idx`, then computes
-/// attention of `q` against all cached keys and values (including the newly
-/// appended ones).
-///
-/// Does **not** call `kv_cache.advance()` — the caller must do that once
-/// after all layers have been processed.
-///
-/// For single-token decode (`new_seq_len == 1`), no causal mask is needed.
-/// For multi-token prefill, a causal mask is applied with the correct offset.
-///
-/// # Arguments
-/// * `q` - Query tensor of shape `(new_seq_len, num_heads, head_dim)`
-/// * `kv_cache` - Mutable reference to the KV cache
-/// * `layer_idx` - Which transformer layer
-/// * `k_new` - New key tensor of shape `(new_seq_len, num_kv_heads, head_dim)`
-/// * `v_new` - New value tensor of shape `(new_seq_len, num_kv_heads, head_dim)`
-///
-/// # Returns
-/// Output tensor of shape `(new_seq_len, num_heads, head_dim)`
-///
-/// # Errors
-/// Returns an error if the operation fails
 infernum_macros::define_block! {
+    /// Attention with KV cache for incremental decoding
+    ///
+    /// Appends `k_new` and `v_new` to the cache for `layer_idx`, then computes
+    /// attention of `q` against all cached keys and values (including the newly
+    /// appended ones).
+    ///
+    /// Does **not** call `kv_cache.advance()` — the caller must do that once
+    /// after all layers have been processed.
+    ///
+    /// For single-token decode (`new_seq_len == 1`), no causal mask is needed.
+    /// For multi-token prefill, a causal mask is applied with the correct offset.
+    ///
+    /// # Arguments
+    /// * `q` - Query tensor of shape `(new_seq_len, num_heads, head_dim)`
+    /// * `kv_cache` - Mutable reference to the KV cache
+    /// * `layer_idx` - Which transformer layer
+    /// * `k_new` - New key tensor of shape `(new_seq_len, num_kv_heads, head_dim)`
+    /// * `v_new` - New value tensor of shape `(new_seq_len, num_kv_heads, head_dim)`
+    ///
+    /// # Returns
+    /// Output tensor of shape `(new_seq_len, num_heads, head_dim)`
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails
     pub fn attention_kv(
         q: &CudaTensor<f32>,
         kv_cache: &mut crate::cuda::KvCache,

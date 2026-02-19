@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add, add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, embedding_gather, matmul,
+    add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, embedding_gather, matmul,
     precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
     transpose_2d,
 };

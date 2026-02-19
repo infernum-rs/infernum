@@ -14,15 +14,15 @@
 use crate::cuda::CudaTensor;
 use crate::Result;
 
-/// SwiGLU activation: `silu(gate) * up`
-///
-/// The decomposed version calls `silu` then `mul`. When fusion is active
-/// (release builds by default), the existing `silu_mul` fused kernel
-/// handles both in a single pass.
-///
-/// # Errors
-/// Returns an error if the operation fails.
 infernum_macros::define_block! {
+    /// SwiGLU activation: `silu(gate) * up`
+    ///
+    /// The decomposed version calls `silu` then `mul`. When fusion is active
+    /// (release builds by default), the existing `silu_mul` fused kernel
+    /// handles both in a single pass.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn swiglu(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
         let activated = super::silu(gate)?;
         super::mul(&activated, up)

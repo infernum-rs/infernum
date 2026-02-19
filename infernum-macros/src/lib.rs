@@ -40,6 +40,7 @@ fn fused_static_name(fn_name: &Ident) -> Ident {
 pub fn define_block(input: TokenStream) -> TokenStream {
     let func = parse_macro_input!(input as ItemFn);
 
+    let attrs = &func.attrs;
     let vis = &func.vis;
     let sig = &func.sig;
     let body = &func.block;
@@ -92,6 +93,7 @@ pub fn define_block(input: TokenStream) -> TokenStream {
             ::std::sync::OnceLock::new();
 
         // Dispatcher: checks for fused replacement, falls back to decomposed
+        #(#attrs)*
         #vis #sig {
             // no-fuse: always decomposed
             if cfg!(feature = "no-fuse") {
