@@ -25,11 +25,18 @@ enum Tokenizer {
     Gguf(GgufTokenizer),
 }
 
-impl Tokenizer {
+impl infernum::Tokenizer for Tokenizer {
     fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         match self {
             Self::HuggingFace(t) => t.encode(text, add_bos),
             Self::Gguf(t) => t.encode(text, add_bos),
+        }
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String> {
+        match self {
+            Self::HuggingFace(t) => t.decode(ids),
+            Self::Gguf(t) => t.decode(ids),
         }
     }
 
@@ -46,7 +53,9 @@ impl Tokenizer {
             Self::Gguf(t) => t.eos_token_id(),
         }
     }
+}
 
+impl Tokenizer {
     fn vocab_size(&self) -> usize {
         match self {
             Self::HuggingFace(t) => t.vocab_size(),

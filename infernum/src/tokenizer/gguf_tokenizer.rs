@@ -343,6 +343,24 @@ impl GgufTokenizer {
     }
 }
 
+impl super::Tokenizer for GgufTokenizer {
+    fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
+        self.encode(text, add_bos)
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String> {
+        self.decode(ids)
+    }
+
+    fn decode_token(&self, id: u32) -> Result<String> {
+        self.decode_token(id)
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        self.eos_token_id()
+    }
+}
+
 /// Decode a SentencePiece token string to raw bytes.
 ///
 /// Handles byte-fallback tokens like `<0x0A>` and the space placeholder
