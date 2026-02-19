@@ -278,6 +278,34 @@ pub fn fused_attention_prefill(
     Ok(output)
 }
 
+// Register the fused attention as a replacement for the decomposed attention_kv block.
+infernum_macros::define_fusion! {
+    block: super::ATTENTION_KV_FUSED,
+    fn attention_kv_fused(
+        q: &CudaTensor<f32>,
+        kv_cache: &mut crate::cuda::KvCache,
+        layer_idx: usize,
+        k_new: &CudaTensor<f32>,
+        v_new: &CudaTensor<f32>,
+    ) -> crate::Result<CudaTensor<f32>> {
+        let q_shape = q.shape();
+        let new_seq_len = q_shape[0];
+
+        // Append new K/V to cache (writes at current_len offset, does NOT advance)
+        kv_cache.append(layer_idx, k_new, v_new)?;
+
+        // Retrieve full cached K/V including the just-appended tokens
+        let total_len = kv_cache.current_len() + new_seq_len;
+        let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
+
+        if new_seq_len == 1 {
+            fused_attention_decode(q, &k_full, &v_full)
+        } else {
+            fused_attention_prefill(q, &k_full, &v_full, kv_cache.current_len())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

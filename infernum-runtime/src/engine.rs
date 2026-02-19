@@ -27,6 +27,7 @@ impl<M: Model> Engine<M> {
     /// # Errors
     /// Returns an error if KV cache allocation fails.
     pub fn new(ctx: &CudaContext, model: M) -> Result<Self> {
+        infernum::fusion::init();
         let model_config = model.config();
         let kv_cache = KvCache::new(
             ctx,

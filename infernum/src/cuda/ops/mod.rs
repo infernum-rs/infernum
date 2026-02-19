@@ -1,6 +1,7 @@
 //! Operations (kernels) for tensor computations
 
 mod add;
+mod add_rmsnorm;
 mod argmax;
 mod attention;
 mod embed;
@@ -16,8 +17,9 @@ mod softmax;
 mod transpose;
 
 pub use add::{add, add_inplace};
+pub use add_rmsnorm::{add_rmsnorm, ADD_RMSNORM_FUSED};
 pub use argmax::{argmax_last, argmax_last_scalar};
-pub use attention::{attention, attention_kv};
+pub use attention::{attention, attention_kv, ATTENTION_KV_FUSED};
 pub use embed::embedding_gather;
 pub use fused_attention::{fused_attention_decode, fused_attention_prefill};
 pub use matmul::matmul;
