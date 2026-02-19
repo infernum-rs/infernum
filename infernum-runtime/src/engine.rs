@@ -14,19 +14,29 @@ use infernum::{Model, ModelConfig, Result, SamplingParams};
 /// and sampling logic. Does not know about text — that is the Runtime's job.
 pub struct Engine<M: Model> {
     model: M,
-    ctx: CudaContext,
     model_config: ModelConfig,
+    kv_cache: KvCache,
 }
 
 impl<M: Model> Engine<M> {
     /// Create a new engine wrapping the given model.
-    pub fn new(ctx: CudaContext, model: M) -> Self {
+    ///
+    /// # Errors
+    /// Returns an error if KV cache allocation fails.
+    pub fn new(ctx: &CudaContext, model: M) -> Result<Self> {
         let model_config = model.config();
-        Self {
-            model,
+        let kv_cache = KvCache::new(
             ctx,
+            model_config.num_layers,
+            model_config.max_seq_len,
+            model_config.num_kv_heads,
+            model_config.head_dim,
+        )?;
+        Ok(Self {
+            model,
             model_config,
-        }
+            kv_cache,
+        })
     }
 
     /// Get a reference to the underlying model.
@@ -54,16 +64,18 @@ impl<M: Model> Engine<M> {
     /// # Errors
     /// Returns an error if a forward pass fails.
     pub fn generate(
-        &self,
+        &mut self,
         input_ids: &[u32],
         max_new_tokens: usize,
         eos_token_id: Option<u32>,
     ) -> Result<Vec<u32>> {
+        self.kv_cache.reset();
         let mut tokens = input_ids.to_vec();
-        let mut kv_cache = self.allocate_kv_cache()?;
 
         // Prefill: process entire prompt
-        let logits = self.model.forward_with_kv_cache(input_ids, &mut kv_cache)?;
+        let logits = self
+            .model
+            .forward_with_kv_cache(input_ids, &mut self.kv_cache)?;
         let all_argmax = argmax_last(&logits)?;
         let mut next_token = all_argmax[0];
 
@@ -74,7 +86,9 @@ impl<M: Model> Engine<M> {
 
         // Decode: one token at a time
         for _ in 1..max_new_tokens {
-            let logits = self.model.forward_next_token(next_token, &mut kv_cache)?;
+            let logits = self
+                .model
+                .forward_next_token(next_token, &mut self.kv_cache)?;
             let all_argmax = argmax_last(&logits)?;
             next_token = all_argmax[0];
 
@@ -101,18 +115,20 @@ impl<M: Model> Engine<M> {
     /// # Errors
     /// Returns an error if a forward pass fails.
     pub fn generate_sampled(
-        &self,
+        &mut self,
         input_ids: &[u32],
         max_new_tokens: usize,
         eos_token_id: Option<u32>,
         params: &SamplingParams,
     ) -> Result<Vec<u32>> {
+        self.kv_cache.reset();
         let mut tokens = input_ids.to_vec();
-        let mut kv_cache = self.allocate_kv_cache()?;
         let mut rng_state = params.seed;
 
         // Prefill
-        let logits = self.model.forward_with_kv_cache(input_ids, &mut kv_cache)?;
+        let logits = self
+            .model
+            .forward_with_kv_cache(input_ids, &mut self.kv_cache)?;
 
         rng_state ^= rng_state << 13;
         rng_state ^= rng_state >> 7;
@@ -128,7 +144,9 @@ impl<M: Model> Engine<M> {
 
         // Decode
         for _ in 1..max_new_tokens {
-            let logits = self.model.forward_next_token(last_token, &mut kv_cache)?;
+            let logits = self
+                .model
+                .forward_next_token(last_token, &mut self.kv_cache)?;
 
             rng_state ^= rng_state << 13;
             rng_state ^= rng_state >> 7;
@@ -144,16 +162,5 @@ impl<M: Model> Engine<M> {
         }
 
         Ok(tokens)
-    }
-
-    /// Allocate a fresh KV cache for this model.
-    fn allocate_kv_cache(&self) -> Result<KvCache> {
-        KvCache::new(
-            &self.ctx,
-            self.model_config.num_layers,
-            self.model_config.max_seq_len,
-            self.model_config.num_kv_heads,
-            self.model_config.head_dim,
-        )
     }
 }

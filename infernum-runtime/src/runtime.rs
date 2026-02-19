@@ -21,9 +21,12 @@ pub struct Runtime<M: Model, T: Tokenizer> {
 
 impl<M: Model, T: Tokenizer> Runtime<M, T> {
     /// Create a new runtime from a CUDA context, model, and tokenizer.
-    pub fn new(ctx: CudaContext, model: M, tokenizer: T) -> Self {
-        let engine = Engine::new(ctx, model);
-        Self { engine, tokenizer }
+    ///
+    /// # Errors
+    /// Returns an error if KV cache allocation fails.
+    pub fn new(ctx: &CudaContext, model: M, tokenizer: T) -> Result<Self> {
+        let engine = Engine::new(ctx, model)?;
+        Ok(Self { engine, tokenizer })
     }
 
     /// Get a reference to the underlying engine.
@@ -49,7 +52,7 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
     ///
     /// # Errors
     /// Returns an error if tokenization or generation fails.
-    pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
+    pub fn generate(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
         let input_ids = self.tokenizer.encode(prompt, true)?;
         let eos = Some(self.engine.model_config().eos_token_id);
         let output_ids = self.engine.generate(&input_ids, max_new_tokens, eos)?;
@@ -69,7 +72,7 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
     /// # Errors
     /// Returns an error if tokenization or generation fails.
     pub fn generate_sampled(
-        &self,
+        &mut self,
         prompt: &str,
         max_new_tokens: usize,
         params: &SamplingParams,
@@ -95,7 +98,7 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
     /// # Errors
     /// Returns an error if tokenization or generation fails.
     pub fn generate_streaming(
-        &self,
+        &mut self,
         prompt: &str,
         max_new_tokens: usize,
         params: Option<&SamplingParams>,

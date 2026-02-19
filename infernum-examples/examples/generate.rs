@@ -194,7 +194,7 @@ fn main() -> Result<()> {
         (tokens, prompt_len)
     } else {
         // KV-cached generation via Runtime
-        let runtime = Runtime::new(ctx, model, tokenizer);
+        let mut runtime = Runtime::new(&ctx, model, tokenizer)?;
 
         let params = if cli.greedy { None } else { Some(&sampling) };
 
