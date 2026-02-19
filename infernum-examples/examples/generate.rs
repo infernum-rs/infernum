@@ -66,6 +66,14 @@ struct Cli {
     /// RNG seed for sampling
     #[arg(short, long, default_value_t = 42)]
     seed: u64,
+
+    /// Repetition penalty factor (1.0 = disabled, >1.0 penalises repeated tokens)
+    #[arg(short = 'r', long, default_value_t = 1.1)]
+    repetition_penalty: f32,
+
+    /// Number of recent tokens to consider for repetition penalty
+    #[arg(long, default_value_t = 64)]
+    repetition_penalty_window: usize,
 }
 
 /// Abstraction over tokenizer backends so we can use either one.
@@ -154,6 +162,8 @@ fn main() -> Result<()> {
                 temperature: cli.temperature,
                 top_p: cli.top_p,
                 seed: cli.seed,
+                repetition_penalty: cli.repetition_penalty,
+                repetition_penalty_window: cli.repetition_penalty_window,
             })
         },
         use_kv_cache: !cli.no_kv_cache,
@@ -162,8 +172,12 @@ fn main() -> Result<()> {
     // Print decoding strategy
     if let Some(ref params) = options.sampling {
         println!(
-            "Sampling: temperature={}, top_p={}, seed={}",
-            params.temperature, params.top_p, params.seed
+            "Sampling: temperature={}, top_p={}, seed={}, repetition_penalty={} (window={})",
+            params.temperature,
+            params.top_p,
+            params.seed,
+            params.repetition_penalty,
+            params.repetition_penalty_window,
         );
     } else {
         println!("Decoding: greedy (argmax)");
