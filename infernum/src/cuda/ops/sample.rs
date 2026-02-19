@@ -47,11 +47,14 @@ pub fn sample_top_p(
     let seq_len = logits.shape()[0];
     let vocab_size = logits.shape()[1];
 
-    // Pull entire logits to CPU and take the last row
-    let all_logits = logits.to_vec()?;
-    let last_row = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
+    // Copy only the last row from GPU to CPU
+    let last_row_offset = (seq_len - 1) * vocab_size;
+    let last_row_gpu = logits
+        .cuda_slice()
+        .slice(last_row_offset..seq_len * vocab_size);
+    let last_row = logits.context().device().dtoh_sync_copy(&last_row_gpu)?;
 
-    Ok(sample_from_logits(last_row, temperature, top_p, rng_seed))
+    Ok(sample_from_logits(&last_row, temperature, top_p, rng_seed))
 }
 
 /// Pure-CPU sampling from a single row of logits (no GPU dependency).

@@ -7,7 +7,7 @@
 use std::sync::mpsc;
 use std::thread;
 
-use infernum::cuda::ops::{argmax_last, sample_top_p};
+use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
 use infernum::cuda::{CudaContext, KvCache};
 use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams};
 
@@ -260,7 +260,6 @@ fn select_token(
         *state ^= *state << 17;
         sample_top_p(logits, params.temperature, params.top_p, *state)
     } else {
-        let all_argmax = argmax_last(logits)?;
-        Ok(all_argmax[all_argmax.len() - 1])
+        argmax_last_scalar(logits)
     }
 }
