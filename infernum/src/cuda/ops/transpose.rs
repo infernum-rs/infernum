@@ -14,75 +14,13 @@ use crate::cuda::CudaTensor;
 use crate::tensor::Tensor;
 use crate::Result;
 
-const TRANSPOSE_KERNEL: &str = r#"
-// Transpose 2D: (rows, cols) -> (cols, rows)
-extern "C" __global__ void transpose_2d_f32(
-    float* __restrict__ output,
-    const float* __restrict__ input,
-    const int rows,
-    const int cols
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = rows * cols;
-    if (idx < total) {
-        const int r = idx / cols;
-        const int c = idx % cols;
-        output[c * rows + r] = input[r * cols + c];
-    }
-}
-
-// Transpose 3D: (a, b, c) -> (b, a, c)
-// Swaps the first two dimensions
-extern "C" __global__ void transpose_012_to_102_f32(
-    float* __restrict__ output,
-    const float* __restrict__ input,
-    const int dim_a,
-    const int dim_b,
-    const int dim_c
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = dim_a * dim_b * dim_c;
-    if (idx < total) {
-        const int i = idx / (dim_b * dim_c);
-        const int remainder = idx % (dim_b * dim_c);
-        const int j = remainder / dim_c;
-        const int k = remainder % dim_c;
-
-        // src: (i, j, k) -> dst: (j, i, k)
-        const int dst_idx = j * dim_a * dim_c + i * dim_c + k;
-        output[dst_idx] = input[idx];
-    }
-}
-
-// Transpose last two dims of 3D: (a, b, c) -> (a, c, b)
-extern "C" __global__ void transpose_last_two_f32(
-    float* __restrict__ output,
-    const float* __restrict__ input,
-    const int dim_a,
-    const int dim_b,
-    const int dim_c
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = dim_a * dim_b * dim_c;
-    if (idx < total) {
-        const int i = idx / (dim_b * dim_c);
-        const int remainder = idx % (dim_b * dim_c);
-        const int j = remainder / dim_c;
-        const int k = remainder % dim_c;
-
-        // src: (i, j, k) -> dst: (i, k, j)
-        const int dst_idx = i * dim_c * dim_b + k * dim_b + j;
-        output[dst_idx] = input[idx];
-    }
-}
-"#;
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/transpose.ptx"));
 
 fn ensure_transpose_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "transpose";
     if !device.has_func(module_name, "transpose_2d_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(TRANSPOSE_KERNEL)?;
         device.load_ptx(
-            ptx,
+            cudarc::nvrtc::Ptx::from_src(PTX),
             module_name,
             &[
                 "transpose_2d_f32",

@@ -14,30 +14,7 @@ use crate::cuda::CudaTensor;
 use crate::tensor::Tensor;
 use crate::Result;
 
-const REPEAT_KV_KERNEL: &str = r#"
-extern "C" __global__ void repeat_kv_f32(
-    float* __restrict__ output,
-    const float* __restrict__ input,
-    const int seq_len,
-    const int num_kv_heads,
-    const int num_repeats,
-    const int head_dim
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int new_num_heads = num_kv_heads * num_repeats;
-    const int total = seq_len * new_num_heads * head_dim;
-    if (idx < total) {
-        const int s = idx / (new_num_heads * head_dim);
-        const int remainder = idx % (new_num_heads * head_dim);
-        const int new_head = remainder / head_dim;
-        const int d = remainder % head_dim;
-
-        const int kv_head = new_head / num_repeats;
-        const int src_idx = s * num_kv_heads * head_dim + kv_head * head_dim + d;
-        output[idx] = input[src_idx];
-    }
-}
-"#;
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/repeat_kv.ptx"));
 
 /// Repeat KV heads for grouped-query attention, entirely on GPU
 ///
@@ -70,11 +47,13 @@ pub fn repeat_kv(tensor: &CudaTensor<f32>, num_repeats: usize) -> Result<CudaTen
 
     let device = tensor.context().device();
 
-    // Compile kernel
     let module_name = "repeat_kv";
     if !device.has_func(module_name, "repeat_kv_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(REPEAT_KV_KERNEL)?;
-        device.load_ptx(ptx, module_name, &["repeat_kv_f32"])?;
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &["repeat_kv_f32"],
+        )?;
     }
 
     let func = device.get_func(module_name, "repeat_kv_f32").unwrap();

@@ -14,46 +14,7 @@ use crate::cuda::CudaTensor;
 use crate::tensor::Tensor;
 use crate::Result;
 
-const SILU_KERNEL: &str = r#"
-extern "C" __global__ void silu_f32(
-    float* __restrict__ output,
-    const float* __restrict__ input,
-    const int n
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float x = input[idx];
-        output[idx] = x / (1.0f + expf(-x));
-    }
-}
-
-extern "C" __global__ void silu_inplace_f32(
-    float* __restrict__ data,
-    const int n
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float x = data[idx];
-        data[idx] = x / (1.0f + expf(-x));
-    }
-}
-
-// SiLU with elementwise multiplication: output = silu(a) * b
-// Used in SwiGLU: silu(gate) * up
-extern "C" __global__ void silu_mul_f32(
-    float* __restrict__ output,
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    const int n
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float x = gate[idx];
-        float silu_x = x / (1.0f + expf(-x));
-        output[idx] = silu_x * up[idx];
-    }
-}
-"#;
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/silu.ptx"));
 
 /// Apply SiLU (Swish) activation: output = x * sigmoid(x)
 ///
@@ -67,12 +28,10 @@ pub fn silu(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 
     let device = input.context().device();
 
-    // Compile kernel
     let module_name = "silu";
     if !device.has_func(module_name, "silu_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(SILU_KERNEL)?;
         device.load_ptx(
-            ptx,
+            cudarc::nvrtc::Ptx::from_src(PTX),
             module_name,
             &["silu_f32", "silu_inplace_f32", "silu_mul_f32"],
         )?;
@@ -107,12 +66,10 @@ pub fn silu_inplace(input: &mut CudaTensor<f32>) -> Result<()> {
     let n = input.numel();
     let device = input.context().device();
 
-    // Compile kernel
     let module_name = "silu";
     if !device.has_func(module_name, "silu_inplace_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(SILU_KERNEL)?;
         device.load_ptx(
-            ptx,
+            cudarc::nvrtc::Ptx::from_src(PTX),
             module_name,
             &["silu_f32", "silu_inplace_f32", "silu_mul_f32"],
         )?;
@@ -150,12 +107,10 @@ pub fn silu_mul(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTens
 
     let device = gate.context().device();
 
-    // Compile kernel
     let module_name = "silu";
     if !device.has_func(module_name, "silu_mul_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(SILU_KERNEL)?;
         device.load_ptx(
-            ptx,
+            cudarc::nvrtc::Ptx::from_src(PTX),
             module_name,
             &["silu_f32", "silu_inplace_f32", "silu_mul_f32"],
         )?;

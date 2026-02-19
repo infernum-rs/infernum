@@ -14,23 +14,7 @@ use crate::cuda::{CudaContext, CudaTensor};
 use crate::tensor::Tensor;
 use crate::Result;
 
-const EMBED_KERNEL: &str = r#"
-extern "C" __global__ void embedding_gather_f32(
-    float* __restrict__ output,
-    const float* __restrict__ embed_table,
-    const unsigned int* __restrict__ input_ids,
-    const int seq_len,
-    const int hidden_size
-) {
-    const int pos = blockIdx.x;
-    const int dim = blockIdx.y * blockDim.x + threadIdx.x;
-
-    if (pos < seq_len && dim < hidden_size) {
-        unsigned int token_id = input_ids[pos];
-        output[pos * hidden_size + dim] = embed_table[token_id * hidden_size + dim];
-    }
-}
-"#;
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/embed.ptx"));
 
 /// Gather embeddings from an embedding table using token IDs, entirely on GPU
 ///
@@ -60,11 +44,13 @@ pub fn embedding_gather(
 
     let device = ctx.device();
 
-    // Compile kernel
     let module_name = "embed";
     if !device.has_func(module_name, "embedding_gather_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(EMBED_KERNEL)?;
-        device.load_ptx(ptx, module_name, &["embedding_gather_f32"])?;
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &["embedding_gather_f32"],
+        )?;
     }
 
     let func = device

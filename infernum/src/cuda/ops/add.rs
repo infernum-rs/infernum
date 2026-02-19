@@ -14,30 +14,7 @@ use crate::cuda::CudaTensor;
 use crate::tensor::Tensor;
 use crate::Result;
 
-const ADD_KERNEL: &str = r#"
-extern "C" __global__ void add_f32(
-    float* __restrict__ output,
-    const float* __restrict__ a,
-    const float* __restrict__ b,
-    const int n
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        output[idx] = a[idx] + b[idx];
-    }
-}
-
-extern "C" __global__ void add_inplace_f32(
-    float* __restrict__ a,
-    const float* __restrict__ b,
-    const int n
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        a[idx] += b[idx];
-    }
-}
-"#;
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/add.ptx"));
 
 /// Add two tensors element-wise on GPU: output = a + b
 ///
@@ -55,11 +32,13 @@ pub fn add(a: &CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<CudaTensor<f32>> 
 
     let device = a.context().device();
 
-    // Compile kernel
     let module_name = "add";
     if !device.has_func(module_name, "add_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(ADD_KERNEL)?;
-        device.load_ptx(ptx, module_name, &["add_f32", "add_inplace_f32"])?;
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &["add_f32", "add_inplace_f32"],
+        )?;
     }
 
     let func = device.get_func(module_name, "add_f32").unwrap();
@@ -100,11 +79,13 @@ pub fn add_inplace(a: &mut CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<()> {
     let n = a.numel();
     let device = a.context().device();
 
-    // Compile kernel
     let module_name = "add";
     if !device.has_func(module_name, "add_inplace_f32") {
-        let ptx = cudarc::nvrtc::safe::compile_ptx(ADD_KERNEL)?;
-        device.load_ptx(ptx, module_name, &["add_f32", "add_inplace_f32"])?;
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &["add_f32", "add_inplace_f32"],
+        )?;
     }
 
     let func = device.get_func(module_name, "add_inplace_f32").unwrap();
