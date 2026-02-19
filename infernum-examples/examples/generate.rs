@@ -12,9 +12,11 @@
 
 use std::env;
 use std::io::{self, Write};
+use std::time::Instant;
 
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
+use infernum::Tokenizer as _;
 use infernum::Result;
 use infernum_llama::{LlamaModel, SamplingParams};
 use infernum_runtime::Runtime;
@@ -95,33 +97,70 @@ fn main() -> Result<()> {
         tokenizer.vocab_size(),
     );
 
-    // Create runtime
-    let runtime = Runtime::new(ctx, model, tokenizer);
-
-    // Generate
-    let params = if cli.greedy {
-        None
-    } else {
-        Some(&cli.sampling)
-    };
-
+    // Print decoding strategy
     if !cli.greedy {
-        let s = params.unwrap();
         println!(
             "Sampling: temperature={}, top_p={}, seed={}",
-            s.temperature, s.top_p, s.seed
+            cli.sampling.temperature, cli.sampling.top_p, cli.sampling.seed
         );
     } else {
         println!("Decoding: greedy (argmax)");
     }
+    println!(
+        "KV cache: {}",
+        if cli.no_kv_cache { "disabled" } else { "enabled" }
+    );
 
     print!("{}", cli.prompt);
     io::stdout().flush()?;
 
-    let output_tokens = runtime.generate_streaming(&cli.prompt, cli.max_tokens, params)?;
+    let start = Instant::now();
+
+    let (output_tokens, prompt_len) = if cli.no_kv_cache {
+        // Naive generation: recompute full sequence each step (no KV cache)
+        let input_ids = tokenizer.encode(&cli.prompt, true)?;
+        let prompt_len = input_ids.len();
+        let eos = Some(tokenizer.eos_token_id());
+
+        let tokens = if cli.greedy {
+            model.generate(&input_ids, cli.max_tokens, eos)?
+        } else {
+            model.generate_sampled(&input_ids, cli.max_tokens, eos, &cli.sampling)?
+        };
+
+        // Stream output tokens
+        for &tok in &tokens[prompt_len..] {
+            let text = tokenizer.decode_token(tok)?;
+            print!("{text}");
+            io::stdout().flush()?;
+        }
+
+        (tokens, prompt_len)
+    } else {
+        // KV-cached generation via Runtime
+        let runtime = Runtime::new(ctx, model, tokenizer);
+
+        let params = if cli.greedy {
+            None
+        } else {
+            Some(&cli.sampling)
+        };
+
+        let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
+        let tokens = runtime.generate_streaming(&cli.prompt, cli.max_tokens, params)?;
+        (tokens, prompt_len)
+    };
+
+    let elapsed = start.elapsed();
+    let generated = output_tokens.len() - prompt_len;
 
     println!();
-    println!("Generated {} tokens total", output_tokens.len());
+    println!(
+        "Generated {} tokens in {:.2}s ({:.1} tokens/sec)",
+        generated,
+        elapsed.as_secs_f64(),
+        generated as f64 / elapsed.as_secs_f64()
+    );
 
     Ok(())
 }
@@ -131,6 +170,7 @@ struct CliArgs {
     prompt: String,
     max_tokens: usize,
     greedy: bool,
+    no_kv_cache: bool,
     sampling: SamplingParams,
 }
 
@@ -139,6 +179,7 @@ fn parse_args(args: &[String]) -> CliArgs {
     let mut prompt = String::new();
     let mut max_tokens = 100;
     let mut greedy = false;
+    let mut no_kv_cache = false;
     let mut temperature: Option<f32> = None;
     let mut top_p: Option<f32> = None;
     let mut seed: Option<u64> = None;
@@ -178,6 +219,9 @@ fn parse_args(args: &[String]) -> CliArgs {
             }
             "--greedy" => {
                 greedy = true;
+            }
+            "--no-kv-cache" => {
+                no_kv_cache = true;
             }
             "--help" | "-h" => {
                 print_usage();
@@ -221,6 +265,7 @@ fn parse_args(args: &[String]) -> CliArgs {
         prompt,
         max_tokens,
         greedy,
+        no_kv_cache,
         sampling,
     }
 }
@@ -239,6 +284,7 @@ fn print_usage() {
     eprintln!("  -p, --top-p <F>          Nucleus sampling threshold (default: 0.9)");
     eprintln!("  -s, --seed <N>           RNG seed for sampling (default: 42)");
     eprintln!("      --greedy             Use greedy (argmax) decoding instead of sampling");
+    eprintln!("      --no-kv-cache        Disable KV cache (recompute full sequence each step)");
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
     eprintln!("Automatically detects .gguf files and loads tokenizer from GGUF metadata.");
