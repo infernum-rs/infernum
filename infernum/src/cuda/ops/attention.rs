@@ -107,6 +107,7 @@ extern "C" __global__ void causal_softmax_batched_f32(
 }
 "#;
 
+#[allow(dead_code)]
 const CAUSAL_SOFTMAX_OFFSET_KERNEL: &str = r#"
 #define INFINITY __int_as_float(0x7f800000)
 
@@ -306,8 +307,6 @@ pub fn attention_kv(
     );
 
     let new_seq_len = q_shape[0];
-    let num_heads = q_shape[1];
-    let head_dim = q_shape[2];
 
     // Append new K/V to cache (writes at current_len offset, does NOT advance)
     kv_cache.append(layer_idx, k_new, v_new)?;
@@ -317,48 +316,13 @@ pub fn attention_kv(
     let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
     // k_full, v_full: (total_len, num_kv_heads, head_dim)
 
-    // GQA: expand KV heads to match Q heads if necessary
-    let num_kv_heads = k_full.shape()[1];
-    let (k_expanded, v_expanded) = if num_kv_heads < num_heads {
-        let num_repeats = num_heads / num_kv_heads;
-        (
-            super::repeat_kv(&k_full, num_repeats)?,
-            super::repeat_kv(&v_full, num_repeats)?,
-        )
+    // Fused kernels handle GQA, scaling, softmax, and output in a single
+    // kernel launch — no transposes, repeat_kv, or intermediate allocations.
+    if new_seq_len == 1 {
+        super::fused_attention_decode(q, &k_full, &v_full)
     } else {
-        (k_full, v_full)
-    };
-    // k_expanded, v_expanded: (total_len, num_heads, head_dim)
-
-    let scale = 1.0 / (head_dim as f32).sqrt();
-
-    // Transpose to (num_heads, seq, head_dim) for batched matmul
-    let q_t = super::transpose_012_to_102(q)?; // (heads, new_seq, dim)
-    let k_t = super::transpose_012_to_102(&k_expanded)?; // (heads, total, dim)
-    let v_t = super::transpose_012_to_102(&v_expanded)?; // (heads, total, dim)
-
-    // K^T: (heads, dim, total)
-    let k_tt = super::transpose_last_two(&k_t)?;
-
-    // Scores: (heads, new_seq, dim) @ (heads, dim, total) -> (heads, new_seq, total)
-    let mut scores = matmul(&q_t, &k_tt)?;
-    scale_inplace(&mut scores, scale)?;
-
-    // Apply softmax (with causal mask for prefill, without for decode)
-    let probs = if new_seq_len == 1 {
-        // Single-token decode: attend to all past + current, no mask needed
-        softmax_batched(&scores)?
-    } else {
-        // Prefill: need causal mask with offset so that query position i
-        // can attend to key positions [0..cache_offset + i + 1]
-        causal_softmax_with_offset(&scores, kv_cache.current_len())?
-    };
-
-    // Output: (heads, new_seq, total) @ (heads, total, dim) -> (heads, new_seq, dim)
-    let output_transposed = matmul(&probs, &v_t)?;
-
-    // Transpose back: (heads, new_seq, dim) -> (new_seq, heads, dim)
-    super::transpose_012_to_102(&output_transposed)
+        super::fused_attention_prefill(q, &k_full, &v_full, kv_cache.current_len())
+    }
 }
 
 /// Scale tensor in place
@@ -453,8 +417,12 @@ fn causal_softmax(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     Ok(output)
 }
 
-/// Causal softmax with position offset for KV-cache prefill
-/// Input: (batch, seq_q, seq_k), query position i can attend to key [0..offset + i + 1]
+/// Causal softmax with position offset for KV-cache prefill.
+///
+/// Input: `(batch, seq_q, seq_k)` — query position `i` attends to key `[0..offset + i + 1)`.
+// TODO(optimizer): Once `define_block!` + fusion rules land, this becomes an internal
+// op composed automatically within the decomposed attention block.
+#[allow(dead_code)]
 fn causal_softmax_with_offset(scores: &CudaTensor<f32>, offset: usize) -> Result<CudaTensor<f32>> {
     let shape = scores.shape();
     let batch = shape[0];
@@ -500,6 +468,92 @@ fn causal_softmax_with_offset(scores: &CudaTensor<f32>, offset: usize) -> Result
     }
 
     Ok(output)
+}
+
+/// Decomposed attention with KV cache — readable, composable implementation.
+///
+/// This is the explicit op-by-op version of `attention_kv`: transpose, repeat_kv,
+/// matmul, scale, softmax, matmul, transpose. It produces identical results to the
+/// fused kernels used in `attention_kv` but with more intermediate allocations and
+/// kernel launches.
+///
+/// Kept as the readable "source of truth" for how attention works. When the
+/// `define_block!` macro + graph optimizer lands (see `docs/initial-plan.md`,
+/// Phase 3), this becomes the body of the attention block definition, and the fused
+/// kernels in `fused_attention.rs` become fusion rules that the optimizer
+/// auto-substitutes. Until then, `attention_kv` calls the fused kernels directly.
+// TODO(optimizer): Convert to a `define_block!` definition. The optimizer should
+// recognize the [Transpose, RepeatKV, MatMul, Scale, Softmax, MatMul, Transpose]
+// pattern and replace it with `fused_attention_decode` / `fused_attention_prefill`.
+#[allow(dead_code)]
+fn attention_kv_decomposed(
+    q: &CudaTensor<f32>,
+    kv_cache: &mut crate::cuda::KvCache,
+    layer_idx: usize,
+    k_new: &CudaTensor<f32>,
+    v_new: &CudaTensor<f32>,
+) -> Result<CudaTensor<f32>> {
+    let q_shape = q.shape();
+    assert_eq!(
+        q_shape.len(),
+        3,
+        "Q must be 3D: (new_seq, num_heads, head_dim)"
+    );
+
+    let new_seq_len = q_shape[0];
+    let num_heads = q_shape[1];
+    let head_dim = q_shape[2];
+
+    // Append new K/V to cache (writes at current_len offset, does NOT advance)
+    kv_cache.append(layer_idx, k_new, v_new)?;
+
+    // Retrieve full cached K/V including the just-appended tokens
+    let total_len = kv_cache.current_len() + new_seq_len;
+    let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
+    // k_full, v_full: (total_len, num_kv_heads, head_dim)
+
+    // GQA: expand KV heads to match Q heads if necessary
+    let num_kv_heads = k_full.shape()[1];
+    let (k_expanded, v_expanded) = if num_kv_heads < num_heads {
+        let num_repeats = num_heads / num_kv_heads;
+        (
+            super::repeat_kv(&k_full, num_repeats)?,
+            super::repeat_kv(&v_full, num_repeats)?,
+        )
+    } else {
+        (k_full, v_full)
+    };
+    // k_expanded, v_expanded: (total_len, num_heads, head_dim)
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // Transpose to (num_heads, seq, head_dim) for batched matmul
+    let q_t = super::transpose_012_to_102(q)?; // (heads, new_seq, dim)
+    let k_t = super::transpose_012_to_102(&k_expanded)?; // (heads, total, dim)
+    let v_t = super::transpose_012_to_102(&v_expanded)?; // (heads, total, dim)
+
+    // K^T: (heads, dim, total)
+    let k_tt = super::transpose_last_two(&k_t)?;
+
+    // Scores: (heads, new_seq, dim) @ (heads, dim, total) -> (heads, new_seq, total)
+    let mut scores = matmul(&q_t, &k_tt)?;
+    scale_inplace(&mut scores, scale)?;
+
+    // Apply softmax (with causal mask for prefill, without for decode)
+    let probs = if new_seq_len == 1 {
+        // Single-token decode: attend to all past + current, no mask needed
+        softmax_batched(&scores)?
+    } else {
+        // Prefill: need causal mask with offset so that query position i
+        // can attend to key positions [0..cache_offset + i + 1]
+        causal_softmax_with_offset(&scores, kv_cache.current_len())?
+    };
+
+    // Output: (heads, new_seq, total) @ (heads, total, dim) -> (heads, new_seq, dim)
+    let output_transposed = matmul(&probs, &v_t)?;
+
+    // Transpose back: (heads, new_seq, dim) -> (new_seq, heads, dim)
+    super::transpose_012_to_102(&output_transposed)
 }
 
 #[cfg(test)]
