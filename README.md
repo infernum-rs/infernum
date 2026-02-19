@@ -13,7 +13,7 @@ A Rust-based LLM inference server designed to be researcher-friendly, type-safe,
 
 Phase 1 implementation complete - single GPU Llama inference.
 
-See `docs/initial-plan.md` for the full design document and `docs/phase1-plan.md` for Phase 1 details.
+See `docs/plan.md` for the design document and roadmap.
 
 ## Features
 
