@@ -99,6 +99,43 @@ pub fn silu(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     Ok(output)
 }
 
+/// Apply SiLU (Swish) activation in place: x = x * sigmoid(x)
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn silu_inplace(input: &mut CudaTensor<f32>) -> Result<()> {
+    let n = input.numel();
+    let device = input.context().device();
+
+    // Compile kernel
+    let module_name = "silu";
+    if !device.has_func(module_name, "silu_inplace_f32") {
+        let ptx = cudarc::nvrtc::safe::compile_ptx(SILU_KERNEL)?;
+        device.load_ptx(
+            ptx,
+            module_name,
+            &["silu_f32", "silu_inplace_f32", "silu_mul_f32"],
+        )?;
+    }
+
+    let func = device.get_func(module_name, "silu_inplace_f32").unwrap();
+
+    let block_size = 256;
+    let grid_size = (n + block_size - 1) / block_size;
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(cfg, (input.cuda_slice_mut(), n as i32))?;
+    }
+
+    Ok(())
+}
+
 /// Fused SiLU + multiply for SwiGLU: output = silu(gate) * up
 ///
 /// # Errors
@@ -166,6 +203,28 @@ mod tests {
         let result = output.to_vec().unwrap();
 
         // SiLU(x) = x * sigmoid(x)
+        for (i, &x) in input_data.iter().enumerate() {
+            let expected = x / (1.0 + (-x).exp());
+            assert!(
+                (result[i] - expected).abs() < 1e-5,
+                "Mismatch at {}: {} vs {}",
+                i,
+                result[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_silu_inplace() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let input_data: Vec<f32> = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
+        let mut input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
+
+        silu_inplace(&mut input).unwrap();
+        let result = input.to_vec().unwrap();
+
         for (i, &x) in input_data.iter().enumerate() {
             let expected = x / (1.0 + (-x).exp());
             assert!(

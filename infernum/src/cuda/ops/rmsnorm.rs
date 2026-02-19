@@ -54,6 +54,42 @@ extern "C" __global__ void rmsnorm_f32(
         row_output[i] = row_input[i] * rms * weight[i];
     }
 }
+
+extern "C" __global__ void rmsnorm_inplace_f32(
+    float* __restrict__ data,
+    const float* __restrict__ weight,
+    const int hidden_size,
+    const float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    float* row_data = data + row * hidden_size;
+    
+    extern __shared__ float shared[];
+    
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden_size; i += blockDim.x) {
+        float val = row_data[i];
+        local_sum += val * val;
+    }
+    
+    shared[tid] = local_sum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float rms = rsqrtf(shared[0] / (float)hidden_size + eps);
+    
+    for (int i = tid; i < hidden_size; i += blockDim.x) {
+        row_data[i] = row_data[i] * rms * weight[i];
+    }
+}
 "#;
 
 /// Apply RMS normalization: output = (x / rms(x)) * weight
@@ -92,7 +128,7 @@ pub fn rms_norm(
     let module_name = "rmsnorm";
     if !device.has_func(module_name, "rmsnorm_f32") {
         let ptx = cudarc::nvrtc::safe::compile_ptx(RMSNORM_KERNEL)?;
-        device.load_ptx(ptx, module_name, &["rmsnorm_f32"])?;
+        device.load_ptx(ptx, module_name, &["rmsnorm_f32", "rmsnorm_inplace_f32"])?;
     }
 
     let func = device.get_func(module_name, "rmsnorm_f32").unwrap();
@@ -120,6 +156,69 @@ pub fn rms_norm(
     }
 
     Ok(output)
+}
+
+/// Apply RMS normalization in place: data = (data / rms(data)) * weight
+///
+/// where rms(x) = sqrt(mean(x^2) + eps)
+///
+/// # Arguments
+/// * `input` - Input tensor of shape (batch, seq_len, hidden) or (seq_len, hidden), modified in place
+/// * `weight` - Weight tensor of shape (hidden,)
+/// * `eps` - Small epsilon for numerical stability
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn rms_norm_inplace(
+    input: &mut CudaTensor<f32>,
+    weight: &CudaTensor<f32>,
+    eps: f32,
+) -> Result<()> {
+    let shape = input.shape();
+    let hidden_size = *shape
+        .last()
+        .expect("Input must have at least one dimension");
+    let num_rows: usize = shape[..shape.len() - 1].iter().product();
+
+    assert_eq!(
+        weight.shape(),
+        &[hidden_size],
+        "Weight shape must match hidden dimension"
+    );
+
+    let device = input.context().device();
+
+    // Compile kernel
+    let module_name = "rmsnorm";
+    if !device.has_func(module_name, "rmsnorm_inplace_f32") {
+        let ptx = cudarc::nvrtc::safe::compile_ptx(RMSNORM_KERNEL)?;
+        device.load_ptx(ptx, module_name, &["rmsnorm_f32", "rmsnorm_inplace_f32"])?;
+    }
+
+    let func = device.get_func(module_name, "rmsnorm_inplace_f32").unwrap();
+
+    let block_size = 256.min(hidden_size);
+    let shared_mem = block_size * std::mem::size_of::<f32>();
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_rows as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                input.cuda_slice_mut(),
+                &weight.cuda_slice(),
+                hidden_size as i32,
+                eps,
+            ),
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -157,6 +256,35 @@ mod tests {
                 i,
                 val,
                 expected0[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_rmsnorm_inplace() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let input_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 0.5, 1.0, 1.5, 2.0];
+        let weight_data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+
+        // Compute expected result with out-of-place version
+        let input_ref = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
+        let weight = CudaTensor::from_slice(&ctx, &[4], &weight_data).unwrap();
+        let expected = rms_norm(&input_ref, &weight, 1e-6)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+
+        // Compute with in-place version
+        let mut input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
+        rms_norm_inplace(&mut input, &weight, 1e-6).unwrap();
+
+        let result = input.to_vec().unwrap();
+
+        for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-4,
+                "Mismatch at index {i}: {got} vs {exp}"
             );
         }
     }
