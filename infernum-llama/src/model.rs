@@ -10,7 +10,7 @@ use std::path::Path;
 
 use infernum::cuda::ops::{
     add, add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, embedding_gather, matmul,
-    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, silu_mul,
+    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
     transpose_2d,
 };
 use infernum::KvCache;
@@ -641,8 +641,8 @@ impl LlamaModel {
         let gate = linear(hidden, &weights.gate_proj)?;
         let up = linear(hidden, &weights.up_proj)?;
 
-        // Fused SiLU + multiply
-        let intermediate = silu_mul(&gate, &up)?;
+        // SwiGLU activation (fused in release builds)
+        let intermediate = swiglu(&gate, &up)?;
 
         // Down projection
         linear(&intermediate, &weights.down_proj)

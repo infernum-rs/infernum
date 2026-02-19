@@ -189,7 +189,15 @@ Just make sure:
 |-------|---------------|-------------|----------|
 | `attention_kv` | transpose → repeat_kv → matmul → scale → softmax → matmul → transpose | `fused_attention_decode` / `fused_attention_prefill` | `ops/attention.rs` + `ops/fused_attention.rs` |
 | `add_rmsnorm` | `add` → `rms_norm` | `add_rmsnorm_f32` | `ops/add_rmsnorm.rs` |
-| `swiglu` | `silu` → `mul` | `silu_mul_f32` | `ops/silu.rs` |
+| `swiglu` | `silu` → `mul` | `silu_mul_f32` | `ops/swiglu.rs` |
+
+### Not a fusion: QKV projection
+
+Fusing the three Q/K/V linear projections into a single matmul requires
+concatenated weight matrices at load time — a weight layout change, not a
+kernel substitution. This is a model-level optimization (involving
+`LinearWeight`, weight loading, and reshape logic), not a candidate for
+`define_block!`/`define_fusion!`.
 
 ---
 
