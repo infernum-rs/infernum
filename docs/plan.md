@@ -61,11 +61,10 @@ The tensor type encodes what hardware data lives on. Different hardware = differ
 
 ```
 CudaTensor      → NVIDIA GPU
-MetalTensor     → Apple Silicon  
-Parallel<T>     → Distributed across multiple GPUs (wraps another tensor type)
+MetalTensor     → Apple Silicon
 ```
 
-The `Parallel<T>` wrapper is how we handle tensor parallelism — an op that takes `Parallel<CudaTensor>` must handle multi-GPU communication. An op that only takes `CudaTensor` can't be used in a TP setup (compiler error).
+Multi-GPU tensor parallelism is handled at runtime, not in the type system. Each GPU runs the same model code with its own `CudaTensor` weights (sharded at load time), and synchronizes via an `NcclCommunicator` passed to the model.
 
 ### Ops as Traits
 
@@ -154,22 +153,25 @@ See `docs/fusion.md` for a guide on adding fused ops.
 
 ### The Approach
 
-Wrap the tensor type: `Parallel<CudaTensor>` contains:
-- The local shard on this GPU
-- TP rank and size
-- NCCL communicator for all-reduce
+Runtime tensor parallelism: each GPU gets a full model instance with sharded
+weights and an NCCL communicator. The model code is nearly identical to
+single-GPU — the only additions are 2 `all_reduce_sum` calls per layer.
 
-### Type Safety
+- `ShardConfig { rank, world_size }` tells weight loading which slice to take
+- `NcclCommunicator` provides all-reduce for row-parallel layer outputs
+- Column-parallel layers (Q/K/V, gate, up) split the output dimension — no sync
+- Row-parallel layers (O, down) split the input dimension — need all-reduce
 
-Ops that support TP implement for `Parallel<T>`. Ops that don't only implement for `T`.
+### Why Not `Parallel<T>`?
 
-If you try to build a model with TP using an op that doesn't support it, the compiler catches the type mismatch.
+An earlier design proposed a `Parallel<T>` tensor wrapper to catch missing
+all-reduces at compile time. In practice, there are only 2 sync points per
+layer, making this hard to miss. The type-level approach would force generic
+plumbing through the entire model or require duplicating single/multi-GPU code
+paths, without meaningful safety benefit. The runtime approach (used by vLLM,
+TensorRT-LLM, and every other major project) is simpler and sufficient.
 
-### vLLM's Approach (for reference)
-
-vLLM uses special parallel linear layers (ColumnParallelLinear, RowParallelLinear) baked into model definitions. Parallelism is a runtime config (`tensor_parallel_size=4`), not a type parameter.
-
-For Infernum, we're encoding it in the type system for stronger guarantees, but this is a design choice that could be revisited.
+See `ephemeral-docs/multi-gpu-design.md` for detailed implementation design.
 
 ---
 
@@ -348,11 +350,11 @@ See `docs/phase2-plan.md` for detailed design.
 
 Scale to models that don't fit on a single GPU.
 
-- `Parallel<T>` tensor wrapper encoding TP rank/size in the type
-- NCCL integration for all-reduce / all-gather
-- Parallel linear layers (column-parallel, row-parallel)
-- Sharded weight loading (load directly to target GPU, no host buffering)
-- Parallel-aware ops: ops that don't support TP won't compile with `Parallel<T>`
+- NCCL bindings (`NcclCommunicator`: all-reduce, all-gather)
+- `ShardConfig` (rank, world_size) for weight slicing
+- Sharded weight loading (column/row slicing in SafeTensors loader)
+- Model changes: sharded constructors + 2 all-reduce calls per layer
+- Multi-threaded Engine: N model replicas running in lockstep
 
 **Milestone**: 70B-class model running across multiple GPUs.
 
@@ -409,7 +411,7 @@ OpenAI-compatible API for production serving.
 |----------|--------|-----------|
 | Language | Rust | Macros, type safety, performance, no GIL |
 | Tensor typing | Hardware in type | Prevent mixing at compile time |
-| TP approach | `Parallel<T>` wrapper | Type-safe multi-GPU |
+| TP approach | Runtime (NCCL + `ShardConfig`) | Simple, proven, 2 sync points per layer |
 | Op granularity | Traits per operation | Swappable implementations |
 | Graph optimization | Macro-based | Code is source of truth, graph derived |
 | Tokenization | In core crate | Trait in `infernum`, consumed by runtime |
@@ -421,7 +423,6 @@ OpenAI-compatible API for production serving.
 
 ## What This Document Doesn't Cover (Needs Elaboration)
 
-- NCCL setup for multi-GPU
 - PagedAttention implementation details
 - Speculative decoding
 - Memory management details for large-scale serving

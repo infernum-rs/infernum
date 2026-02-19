@@ -24,7 +24,7 @@ Server  → HTTP, OpenAI-compatible API
 ```
 
 Key design patterns:
-- **Tensor as a Trait**: Hardware is encoded in the type (e.g., `CudaTensor`, `MetalTensor`, `Parallel<T>` for multi-GPU)
+- **Tensor as a Trait**: Hardware is encoded in the type (e.g., `CudaTensor`, `MetalTensor`). Multi-GPU uses runtime TP with NCCL.
 - **Ops as Traits**: Each operation is a trait with different implementations for different hardware/algorithms
 - **Macro-based Graph Optimization**: `define_block!` macros generate both executable code and graph representation for fusion
 
@@ -99,7 +99,7 @@ The GitHub Actions CI pipeline runs on every push/PR to `main`:
 
 - Code is always the source of truth; graphs are derived from it
 - Tensors from different hardware are different types (compile-time safety)
-- Ops that don't support tensor parallelism won't compile with `Parallel<T>` (type system enforcement)
+- Multi-GPU tensor parallelism via runtime NCCL all-reduce (2 sync points per transformer layer)
 - Prefer composition through blocks; fusion happens at the optimization layer
 
 ### Documentation
