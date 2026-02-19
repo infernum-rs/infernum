@@ -85,7 +85,7 @@ pub fn embedding_gather(
             cfg,
             (
                 output.cuda_slice_mut(),
-                embed_table.cuda_slice(),
+                &embed_table.cuda_slice(),
                 &ids_gpu,
                 seq_len as i32,
                 hidden_size as i32,

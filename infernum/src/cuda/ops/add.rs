@@ -67,8 +67,8 @@ pub fn add(a: &CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<CudaTensor<f32>> 
             cfg,
             (
                 output.cuda_slice_mut(),
-                a.cuda_slice(),
-                b.cuda_slice(),
+                &a.cuda_slice(),
+                &b.cuda_slice(),
                 n as i32,
             ),
         )?;

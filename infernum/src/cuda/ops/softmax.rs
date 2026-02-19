@@ -187,7 +187,11 @@ pub fn softmax(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     unsafe {
         func.launch(
             cfg,
-            (output.cuda_slice_mut(), input.cuda_slice(), row_size as i32),
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                row_size as i32,
+            ),
         )?;
     }
 
@@ -243,7 +247,7 @@ pub fn softmax_causal(
             cfg,
             (
                 output.cuda_slice_mut(),
-                input.cuda_slice(),
+                &input.cuda_slice(),
                 row_size as i32,
                 query_idx as i32,
                 position_offset as i32,

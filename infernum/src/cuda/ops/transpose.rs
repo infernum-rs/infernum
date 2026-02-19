@@ -128,7 +128,7 @@ pub fn transpose_2d(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
             cfg,
             (
                 output.cuda_slice_mut(),
-                tensor.cuda_slice(),
+                &tensor.cuda_slice(),
                 rows as i32,
                 cols as i32,
             ),
@@ -175,7 +175,7 @@ pub fn transpose_012_to_102(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>>
             cfg,
             (
                 output.cuda_slice_mut(),
-                tensor.cuda_slice(),
+                &tensor.cuda_slice(),
                 a as i32,
                 b as i32,
                 c as i32,
@@ -223,7 +223,7 @@ pub fn transpose_last_two(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
             cfg,
             (
                 output.cuda_slice_mut(),
-                tensor.cuda_slice(),
+                &tensor.cuda_slice(),
                 a as i32,
                 b as i32,
                 c as i32,

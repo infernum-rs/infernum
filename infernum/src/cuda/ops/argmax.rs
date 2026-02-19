@@ -114,7 +114,11 @@ fn argmax_last_gpu(
     unsafe {
         func.launch(
             cfg,
-            (output.cuda_slice_mut(), input.cuda_slice(), row_size as i32),
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                row_size as i32,
+            ),
         )?;
     }
 

@@ -90,7 +90,10 @@ pub fn silu(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     };
 
     unsafe {
-        func.launch(cfg, (output.cuda_slice_mut(), input.cuda_slice(), n as i32))?;
+        func.launch(
+            cfg,
+            (output.cuda_slice_mut(), &input.cuda_slice(), n as i32),
+        )?;
     }
 
     Ok(output)
@@ -137,8 +140,8 @@ pub fn silu_mul(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTens
             cfg,
             (
                 output.cuda_slice_mut(),
-                gate.cuda_slice(),
-                up.cuda_slice(),
+                &gate.cuda_slice(),
+                &up.cuda_slice(),
                 n as i32,
             ),
         )?;

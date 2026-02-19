@@ -314,7 +314,7 @@ pub fn attention_kv(
 
     // Retrieve full cached K/V including the just-appended tokens
     let total_len = kv_cache.current_len() + new_seq_len;
-    let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len)?;
+    let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
     // k_full, v_full: (total_len, num_kv_heads, head_dim)
 
     // GQA: expand KV heads to match Q heads if necessary
@@ -443,7 +443,7 @@ fn causal_softmax(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
             cfg,
             (
                 output.cuda_slice_mut(),
-                scores.cuda_slice(),
+                &scores.cuda_slice(),
                 batch as i32,
                 seq as i32,
             ),
@@ -490,7 +490,7 @@ fn causal_softmax_with_offset(scores: &CudaTensor<f32>, offset: usize) -> Result
             cfg,
             (
                 output.cuda_slice_mut(),
-                scores.cuda_slice(),
+                &scores.cuda_slice(),
                 batch as i32,
                 seq_q as i32,
                 seq_k as i32,

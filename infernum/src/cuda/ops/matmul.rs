@@ -96,7 +96,7 @@ where
     unsafe {
         a.context()
             .blas()
-            .gemm(cfg, b.cuda_slice(), a.cuda_slice(), c.cuda_slice_mut())?;
+            .gemm(cfg, &b.cuda_slice(), &a.cuda_slice(), c.cuda_slice_mut())?;
     }
 
     Ok(c)
@@ -147,8 +147,8 @@ where
     unsafe {
         a.context().blas().gemm_strided_batched(
             cfg,
-            b.cuda_slice(),
-            a.cuda_slice(),
+            &b.cuda_slice(),
+            &a.cuda_slice(),
             c.cuda_slice_mut(),
         )?;
     }

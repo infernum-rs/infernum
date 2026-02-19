@@ -402,7 +402,7 @@ fn quantize_activations_to_fp8(
         };
         let func = device.get_func(module_name, "absmax_f32").unwrap();
         unsafe {
-            func.launch(cfg, (input.cuda_slice(), &mut max_bits, numel as i32))?;
+            func.launch(cfg, (&input.cuda_slice(), &mut max_bits, numel as i32))?;
         }
     }
 
@@ -422,7 +422,7 @@ fn quantize_activations_to_fp8(
             func.launch(
                 cfg,
                 (
-                    input.cuda_slice(),
+                    &input.cuda_slice(),
                     &mut act_fp8,
                     &max_bits,
                     &mut d_inv_scale,
@@ -681,7 +681,7 @@ fn quantized_matmul_2d(
                     cfg,
                     (
                         output.cuda_slice_mut(),
-                        input.cuda_slice(),
+                        &input.cuda_slice(),
                         weight.data_slice(),
                         weight.scales_slice(),
                         m as i32,
@@ -698,7 +698,7 @@ fn quantized_matmul_2d(
                     cfg,
                     (
                         output.cuda_slice_mut(),
-                        input.cuda_slice(),
+                        &input.cuda_slice(),
                         weight.data_slice(),
                         weight.scales_slice(),
                         m as i32,
@@ -719,7 +719,7 @@ fn quantized_matmul_2d(
                     cfg,
                     (
                         output.cuda_slice_mut(),
-                        input.cuda_slice(),
+                        &input.cuda_slice(),
                         weight.data_slice(),
                         weight.weight_scale(),
                         m as i32,
@@ -741,7 +741,7 @@ fn quantized_matmul_2d(
                     cfg,
                     (
                         output.cuda_slice_mut(),
-                        input.cuda_slice(),
+                        &input.cuda_slice(),
                         weight.data_slice(),
                         m as i32,
                         n as i32,

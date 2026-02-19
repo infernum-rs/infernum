@@ -48,7 +48,7 @@ extern "C" __global__ void repeat_kv_f32(
 /// Returns an error if the operation fails
 pub fn repeat_kv(tensor: &CudaTensor<f32>, num_repeats: usize) -> Result<CudaTensor<f32>> {
     if num_repeats == 1 {
-        return Ok(tensor.clone());
+        return Ok(tensor.reshape(tensor.shape()));
     }
 
     let shape = tensor.shape();
@@ -93,7 +93,7 @@ pub fn repeat_kv(tensor: &CudaTensor<f32>, num_repeats: usize) -> Result<CudaTen
             cfg,
             (
                 output.cuda_slice_mut(),
-                tensor.cuda_slice(),
+                &tensor.cuda_slice(),
                 seq_len as i32,
                 num_kv_heads as i32,
                 num_repeats as i32,
