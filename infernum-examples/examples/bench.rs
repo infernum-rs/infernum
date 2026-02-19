@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use infernum::cuda::CudaContext;
-use infernum::{GenerateOptions, Model};
+use infernum::GenerateOptions;
 use infernum_llama::LlamaModel;
 use infernum_runtime::Engine;
 
