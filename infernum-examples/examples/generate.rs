@@ -17,8 +17,8 @@ use clap::Parser;
 
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
-use infernum::Tokenizer as _;
 use infernum::Result;
+use infernum::Tokenizer as _;
 use infernum_llama::{LlamaModel, SamplingParams};
 use infernum_runtime::Runtime;
 
@@ -31,7 +31,12 @@ use infernum_runtime::Runtime;
 #[command(name = "generate")]
 struct Cli {
     /// Path to model directory or .gguf file
-    #[arg(short, long, env = "LLAMA_MODEL_PATH", default_value = "models/llama-3.2-1b")]
+    #[arg(
+        short,
+        long,
+        env = "LLAMA_MODEL_PATH",
+        default_value = "models/llama-3.2-1b"
+    )]
     model: String,
 
     /// Text prompt
@@ -155,7 +160,11 @@ fn main() -> Result<()> {
     }
     println!(
         "KV cache: {}",
-        if cli.no_kv_cache { "disabled" } else { "enabled" }
+        if cli.no_kv_cache {
+            "disabled"
+        } else {
+            "enabled"
+        }
     );
 
     print!("{}", cli.prompt);
@@ -187,11 +196,7 @@ fn main() -> Result<()> {
         // KV-cached generation via Runtime
         let runtime = Runtime::new(ctx, model, tokenizer);
 
-        let params = if cli.greedy {
-            None
-        } else {
-            Some(&sampling)
-        };
+        let params = if cli.greedy { None } else { Some(&sampling) };
 
         let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
         let tokens = runtime.generate_streaming(&cli.prompt, cli.max_tokens, params)?;
