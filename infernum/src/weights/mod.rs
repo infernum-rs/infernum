@@ -10,6 +10,5 @@ mod safetensors;
 pub use gguf::{GgufLoader, GgufValue};
 #[cfg(feature = "cuda")]
 pub use loader::WeightLoader;
-pub use loader::WeightNameMapper;
 #[cfg(feature = "cuda")]
 pub use safetensors::SafeTensorsLoader;
