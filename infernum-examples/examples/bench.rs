@@ -1,6 +1,8 @@
 //! Minimal benchmark for infernum decode throughput
 //! Measures raw forward_next_token performance (no tokenizer decode needed)
 
+#![cfg(feature = "cuda")]
+
 use std::time::Instant;
 
 use infernum::cuda::CudaContext;
