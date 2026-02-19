@@ -110,7 +110,10 @@ jobs:
           key: ${{ runner.os }}-gpu-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Triton
-        run: pip install triton
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install triton
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
 
       - name: Check with Clippy (CUDA, pedantic, deny warnings)
         run: cargo clippy --all --features cuda -- -W clippy::pedantic -D warnings
