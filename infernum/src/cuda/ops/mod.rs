@@ -15,7 +15,7 @@ mod softmax;
 mod transpose;
 
 pub use add::add;
-pub use argmax::argmax_last;
+pub use argmax::{argmax_last, argmax_last_scalar};
 pub use attention::{attention, attention_kv};
 pub use embed::embedding_gather;
 pub use matmul::matmul;
