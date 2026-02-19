@@ -43,8 +43,9 @@ def get_target(arch_override=None):
         from triton.runtime import driver
         return driver.active.get_current_target()
     except RuntimeError:
-        # No GPU visible at build time — use sm_80 (Ampere) as a safe baseline
-        return GPUTarget(backend="cuda", arch=80, warp_size=32)
+        # No GPU visible at build time — use sm_75 (Turing/T4) as a safe baseline.
+        # PTX for sm_75 runs on sm_75 and above (forward compatible).
+        return GPUTarget(backend="cuda", arch=75, warp_size=32)
 
 
 def main():
