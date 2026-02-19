@@ -284,7 +284,7 @@ impl LlamaModel {
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
                     let scale_val = scale_tensor.to_vec()?;
-                    qt.set_weight_scale(scale_val[0]);
+                    qt.set_weight_scale(ctx, scale_val[0])?;
                 }
 
                 Ok(LinearWeight::Quantized(qt))

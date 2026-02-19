@@ -1,8 +1,9 @@
 //! CUDA context management
 
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::CudaDevice;
-use std::sync::Arc;
+use cudarc::cublaslt::CudaBlasLT;
+use cudarc::driver::{CudaDevice, CudaSlice};
+use std::sync::{Arc, Mutex};
 
 use crate::Result;
 
@@ -11,6 +12,11 @@ use crate::Result;
 pub struct CudaContext {
     device: Arc<CudaDevice>,
     blas: Arc<CudaBlas>,
+    blas_lt: Arc<CudaBlasLT>,
+    /// Cached cuBLASLt workspace buffer (lazily allocated)
+    fp8_workspace: Arc<Mutex<Option<CudaSlice<u8>>>>,
+    /// Cached compute capability (major, minor)
+    compute_capability: (i32, i32),
 }
 
 impl CudaContext {
@@ -21,9 +27,25 @@ impl CudaContext {
     pub fn new(ordinal: usize) -> Result<Self> {
         let device = CudaDevice::new(ordinal)?;
         let blas = CudaBlas::new(device.clone())?;
+        let blas_lt = CudaBlasLT::new(device.clone())?;
+
+        let major = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+            .unwrap_or(0);
+        let minor = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            )
+            .unwrap_or(0);
+
         Ok(Self {
             device,
             blas: Arc::new(blas),
+            blas_lt: Arc::new(blas_lt),
+            fp8_workspace: Arc::new(Mutex::new(None)),
+            compute_capability: (major, minor),
         })
     }
 
@@ -37,6 +59,45 @@ impl CudaContext {
     #[must_use]
     pub fn blas(&self) -> &Arc<CudaBlas> {
         &self.blas
+    }
+
+    /// Get a reference to the cuBLASLt handle
+    #[must_use]
+    pub fn blas_lt(&self) -> &Arc<CudaBlasLT> {
+        &self.blas_lt
+    }
+
+    /// Compute capability as (major, minor)
+    #[must_use]
+    pub fn compute_capability(&self) -> (i32, i32) {
+        self.compute_capability
+    }
+
+    /// Whether the GPU supports FP8 tensor cores (Ada `sm_89`+ or Hopper `sm_90`+)
+    #[must_use]
+    pub fn supports_fp8_tensor_cores(&self) -> bool {
+        let (major, minor) = self.compute_capability;
+        major > 8 || (major == 8 && minor >= 9)
+    }
+
+    /// Get or allocate the cuBLASLt workspace buffer for FP8 operations.
+    ///
+    /// The workspace is allocated once and reused across all FP8 matmul calls.
+    /// Size: 32 MiB for Hopper (`sm_90`+), 4 MiB for Ada (`sm_89`).
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    ///
+    /// # Errors
+    /// Returns an error if GPU allocation fails.
+    pub fn fp8_workspace(&self) -> Result<std::sync::MutexGuard<'_, Option<CudaSlice<u8>>>> {
+        let mut guard = self.fp8_workspace.lock().unwrap();
+        if guard.is_none() {
+            let (major, _) = self.compute_capability;
+            let ws_size: usize = if major >= 9 { 33_554_432 } else { 4_194_304 };
+            *guard = Some(unsafe { self.device.alloc::<u8>(ws_size)? });
+        }
+        Ok(guard)
     }
 
     /// Synchronize the CUDA device (wait for all operations to complete)
@@ -69,6 +130,18 @@ mod tests {
         // Both should reference the same device
         assert!(std::sync::Arc::ptr_eq(ctx.device(), ctx2.device()));
         assert!(std::sync::Arc::ptr_eq(ctx.blas(), ctx2.blas()));
+        assert!(std::sync::Arc::ptr_eq(ctx.blas_lt(), ctx2.blas_lt()));
+        assert!(std::sync::Arc::ptr_eq(
+            &ctx.fp8_workspace,
+            &ctx2.fp8_workspace,
+        ));
+    }
+
+    #[test]
+    fn test_compute_capability() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let (major, _minor) = ctx.compute_capability();
+        assert!(major > 0, "GPU should have a valid compute capability");
     }
 
     #[test]

@@ -39,6 +39,8 @@ pub struct QuantizedTensor {
     dtype: DType,
     /// Per-tensor scale factor (used by FP8 dynamic quantization; 1.0 for block-quantized)
     weight_scale: f32,
+    /// Cached device-side weight scale (lazily allocated, avoids per-matmul host→device copies)
+    d_weight_scale: Option<CudaSlice<f32>>,
 }
 
 impl QuantizedTensor {
@@ -104,6 +106,7 @@ impl QuantizedTensor {
             shape: shape.to_vec(),
             dtype,
             weight_scale: 1.0,
+            d_weight_scale: None,
         })
     }
 
@@ -128,6 +131,7 @@ impl QuantizedTensor {
             shape: shape.to_vec(),
             dtype,
             weight_scale: 1.0,
+            d_weight_scale: None,
         }
     }
 
@@ -149,9 +153,20 @@ impl QuantizedTensor {
         self.weight_scale
     }
 
-    /// Set the per-tensor scale factor
-    pub fn set_weight_scale(&mut self, scale: f32) {
+    /// Set the per-tensor scale factor and upload it to the GPU.
+    ///
+    /// # Errors
+    /// Returns an error if GPU allocation fails.
+    pub fn set_weight_scale(&mut self, ctx: &CudaContext, scale: f32) -> Result<()> {
         self.weight_scale = scale;
+        self.d_weight_scale = Some(ctx.device().htod_sync_copy(&[scale])?);
+        Ok(())
+    }
+
+    /// Get the cached device-side weight scale buffer, if set.
+    #[must_use]
+    pub fn d_weight_scale(&self) -> Option<&CudaSlice<f32>> {
+        self.d_weight_scale.as_ref()
     }
 
     /// Total number of logical elements
