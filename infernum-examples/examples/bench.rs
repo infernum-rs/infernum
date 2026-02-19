@@ -9,14 +9,25 @@ use infernum_llama::LlamaModel;
 use infernum_runtime::Engine;
 
 fn main() -> infernum::Result<()> {
-    let model_path = std::env::args().nth(1).expect("Usage: bench <model_path>");
-    let n_gen: usize = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "128".to_string())
-        .parse()
-        .unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let use_pool = args.iter().any(|a| a == "--pool");
+    let positional: Vec<&str> = args[1..]
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.as_str())
+        .collect();
+    let model_path = positional
+        .first()
+        .expect("Usage: bench <model_path> [n_tokens] [--pool]");
+    let n_gen: usize = positional.get(1).unwrap_or(&"128").parse().unwrap();
 
-    let ctx = CudaContext::new(0)?;
+    let mut ctx = CudaContext::new(0)?;
+    if use_pool {
+        ctx.enable_buffer_pool();
+        eprintln!("Buffer pool: ENABLED");
+    } else {
+        eprintln!("Buffer pool: disabled");
+    }
 
     let is_gguf = model_path.ends_with(".gguf");
     let model = if is_gguf {
@@ -66,6 +77,15 @@ fn main() -> infernum::Result<()> {
         elapsed.as_secs_f64(),
         tok_s,
     );
+
+    if let Some(pool) = ctx.buffer_pool() {
+        eprintln!(
+            "Pool stats: {} hits, {} misses, {:.1} MB cached",
+            pool.hits(),
+            pool.misses(),
+            pool.free_bytes() as f64 / (1024.0 * 1024.0),
+        );
+    }
 
     Ok(())
 }

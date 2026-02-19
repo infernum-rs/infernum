@@ -21,6 +21,8 @@ pub mod tokenizer;
 pub mod weights;
 
 #[cfg(feature = "cuda")]
+pub use cuda::BufferPool;
+#[cfg(feature = "cuda")]
 pub use cuda::QuantizedTensor;
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaTensor, KvCache};
