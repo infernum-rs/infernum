@@ -26,6 +26,17 @@ extern "C" __global__ void add_f32(
         output[idx] = a[idx] + b[idx];
     }
 }
+
+extern "C" __global__ void add_inplace_f32(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        a[idx] += b[idx];
+    }
+}
 "#;
 
 /// Add two tensors element-wise on GPU: output = a + b
@@ -48,7 +59,7 @@ pub fn add(a: &CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<CudaTensor<f32>> 
     let module_name = "add";
     if !device.has_func(module_name, "add_f32") {
         let ptx = cudarc::nvrtc::safe::compile_ptx(ADD_KERNEL)?;
-        device.load_ptx(ptx, module_name, &["add_f32"])?;
+        device.load_ptx(ptx, module_name, &["add_f32", "add_inplace_f32"])?;
     }
 
     let func = device.get_func(module_name, "add_f32").unwrap();
@@ -75,6 +86,43 @@ pub fn add(a: &CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<CudaTensor<f32>> 
     }
 
     Ok(output)
+}
+
+/// Add tensor `b` into `a` in place on GPU: a += b
+///
+/// Both tensors must have the same shape.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn add_inplace(a: &mut CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<()> {
+    assert_eq!(a.shape(), b.shape(), "Shapes must match for addition");
+
+    let n = a.numel();
+    let device = a.context().device();
+
+    // Compile kernel
+    let module_name = "add";
+    if !device.has_func(module_name, "add_inplace_f32") {
+        let ptx = cudarc::nvrtc::safe::compile_ptx(ADD_KERNEL)?;
+        device.load_ptx(ptx, module_name, &["add_f32", "add_inplace_f32"])?;
+    }
+
+    let func = device.get_func(module_name, "add_inplace_f32").unwrap();
+
+    let block_size = 256;
+    let grid_size = (n + block_size - 1) / block_size;
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(cfg, (a.cuda_slice_mut(), &b.cuda_slice(), n as i32))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -120,5 +168,23 @@ mod tests {
                 "Mismatch at {i}"
             );
         }
+    }
+
+    #[test]
+    fn test_add_inplace() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+
+        let mut a = CudaTensor::from_slice(&ctx, &[2, 3], &a_data).unwrap();
+        let b = CudaTensor::from_slice(&ctx, &[2, 3], &b_data).unwrap();
+
+        add_inplace(&mut a, &b).unwrap();
+
+        assert_eq!(a.shape(), &[2, 3]);
+
+        let result = a.to_vec().unwrap();
+        assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
     }
 }

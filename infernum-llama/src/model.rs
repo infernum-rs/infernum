@@ -9,8 +9,9 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add, apply_rope, attention, attention_kv, embedding_gather, matmul, precompute_rope_cache,
-    quantized_matmul, repeat_kv, rms_norm, silu_mul, transpose_2d,
+    add, add_inplace, apply_rope, attention, attention_kv, embedding_gather, matmul,
+    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, silu_mul,
+    transpose_2d,
 };
 use infernum::KvCache;
 
@@ -378,8 +379,8 @@ impl LlamaModel {
             hidden = self.forward_layer(&hidden, layer)?;
         }
 
-        // Final layer norm
-        hidden = rms_norm(&hidden, &self.norm, self.config.rms_norm_eps)?;
+        // Final layer norm (in-place: hidden is consumed)
+        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         // Project to vocabulary: (seq_len, hidden_size) @ (vocab_size, hidden_size)^T -> (seq_len, vocab_size)
         let logits = self.lm_head_forward(&hidden)?;
@@ -415,8 +416,8 @@ impl LlamaModel {
         // Advance KV cache position (once after all layers)
         kv_cache.advance(seq_len);
 
-        // Final layer norm
-        hidden = rms_norm(&hidden, &self.norm, self.config.rms_norm_eps)?;
+        // Final layer norm (in-place: hidden is consumed)
+        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         // Extract last hidden state, then project to vocab logits
         let last_hidden = self.extract_last_row(&hidden, seq_len)?;
@@ -459,8 +460,8 @@ impl LlamaModel {
             position_offset,
         )?;
 
-        // Residual connection
-        let hidden = add(hidden, &attn_output)?;
+        // Residual connection (in-place: hidden += attn_output)
+        let mut hidden = add(hidden, &attn_output)?;
 
         // Pre-MLP RMS norm
         let normed = rms_norm(
@@ -472,8 +473,9 @@ impl LlamaModel {
         // MLP
         let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
 
-        // Residual connection
-        add(&hidden, &mlp_output)
+        // Residual connection (in-place: hidden += mlp_output)
+        add_inplace(&mut hidden, &mlp_output)?;
+        Ok(hidden)
     }
 
     /// Forward pass through attention with KV cache
@@ -566,7 +568,7 @@ impl LlamaModel {
         let attn_output = self.forward_attention(&normed, &layer.attention)?;
 
         // Residual connection
-        let hidden = add(hidden, &attn_output)?;
+        let mut hidden = add(hidden, &attn_output)?;
 
         // Pre-MLP RMS norm
         let normed = rms_norm(
@@ -578,8 +580,9 @@ impl LlamaModel {
         // MLP
         let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
 
-        // Residual connection
-        add(&hidden, &mlp_output)
+        // Residual connection (in-place: hidden += mlp_output)
+        add_inplace(&mut hidden, &mlp_output)?;
+        Ok(hidden)
     }
 
     /// Forward pass through attention
