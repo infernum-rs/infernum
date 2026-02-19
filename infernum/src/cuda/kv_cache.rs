@@ -106,7 +106,7 @@ fn launch_append(
             cfg,
             (
                 cache.cuda_slice_mut(),
-                new_data.cuda_slice(),
+                &new_data.cuda_slice(),
                 current_len as i32,
                 max_seq_len as i32,
                 num_kv_heads as i32,
@@ -227,34 +227,27 @@ impl KvCache {
 
     /// Get the cached K and V slices for a given layer, up to the current length.
     ///
-    /// Returns tensors of shape `(current_len, num_kv_heads, head_dim)`.
-    /// These are *copies* — the cache retains ownership of its buffers.
+    /// Returns zero-copy views of shape `(current_len, num_kv_heads, head_dim)`
+    /// that share GPU memory with the cache buffers.
     ///
     /// # Panics
     /// Panics if `current_len` is 0 (no data appended yet).
-    ///
-    /// # Errors
-    /// Returns an error if the GPU copy fails.
-    pub fn get(&self, layer_idx: usize) -> Result<(CudaTensor<f32>, CudaTensor<f32>)> {
+    #[must_use]
+    pub fn get(&self, layer_idx: usize) -> (CudaTensor<f32>, CudaTensor<f32>) {
         assert!(self.current_len > 0, "KV cache is empty");
         self.get_up_to(layer_idx, self.current_len)
     }
 
     /// Get cached K and V slices for a given layer, up to `len` rows.
     ///
+    /// Returns zero-copy views that share GPU memory with the cache buffers.
     /// This is useful when tokens have been appended but `advance()` has not
     /// yet been called (e.g., inside `attention_kv`).
     ///
     /// # Panics
     /// Panics if `len` is 0 or exceeds `max_seq_len`.
-    ///
-    /// # Errors
-    /// Returns an error if the GPU copy fails.
-    pub fn get_up_to(
-        &self,
-        layer_idx: usize,
-        len: usize,
-    ) -> Result<(CudaTensor<f32>, CudaTensor<f32>)> {
+    #[must_use]
+    pub fn get_up_to(&self, layer_idx: usize, len: usize) -> (CudaTensor<f32>, CudaTensor<f32>) {
         assert!(len > 0, "requested length must be > 0");
         assert!(
             len <= self.max_seq_len,
@@ -262,26 +255,18 @@ impl KvCache {
         );
 
         let buf = &self.layers[layer_idx];
-        let k_slice = self.slice_to_len(&buf.k, len)?;
-        let v_slice = self.slice_to_len(&buf.v, len)?;
-        Ok((k_slice, v_slice))
+        let k_slice = self.slice_to_len(&buf.k, len);
+        let v_slice = self.slice_to_len(&buf.v, len);
+        (k_slice, v_slice)
     }
 
-    /// Extract the first `len` rows from a `(max_seq_len, heads, dim)` buffer.
+    /// Zero-copy view of the first `len` rows from a `(max_seq_len, heads, dim)` buffer.
     ///
-    /// Both the source and destination are contiguous, so this is a single
-    /// device-to-device copy of the leading `len * heads * dim` elements.
-    fn slice_to_len(&self, tensor: &CudaTensor<f32>, len: usize) -> Result<CudaTensor<f32>> {
-        let numel = len * self.num_kv_heads * self.head_dim;
+    /// Returns a `CudaTensor` that shares the same GPU allocation as the cache
+    /// buffer — no allocation or copy occurs.
+    fn slice_to_len(&self, tensor: &CudaTensor<f32>, len: usize) -> CudaTensor<f32> {
         let shape = [len, self.num_kv_heads, self.head_dim];
-
-        let mut out = unsafe { CudaTensor::<f32>::uninit(&self.ctx, &shape)? };
-
-        let device = self.ctx.device();
-        let src = tensor.cuda_slice().slice(0..numel);
-        device.dtod_copy(&src, out.cuda_slice_mut())?;
-
-        Ok(out)
+        tensor.slice_view(0, &shape)
     }
 
     /// Reset the cache for reuse with a new sequence (no reallocation).
@@ -343,7 +328,7 @@ mod tests {
 
         assert_eq!(cache.current_len(), 1);
 
-        let (k_out, v_out) = cache.get(0).unwrap();
+        let (k_out, v_out) = cache.get(0);
         assert_eq!(k_out.shape(), &[1, num_kv_heads, head_dim]);
         assert_eq!(v_out.shape(), &[1, num_kv_heads, head_dim]);
 
@@ -377,7 +362,7 @@ mod tests {
 
         assert_eq!(cache.current_len(), 3);
 
-        let (k_out, v_out) = cache.get(0).unwrap();
+        let (k_out, v_out) = cache.get(0);
         assert_eq!(k_out.shape(), &[3, num_kv_heads, head_dim]);
 
         let k_result = k_out.to_vec().unwrap();
@@ -407,7 +392,7 @@ mod tests {
 
         assert_eq!(cache.current_len(), 2);
 
-        let (k_out, v_out) = cache.get(0).unwrap();
+        let (k_out, v_out) = cache.get(0);
         assert_eq!(k_out.shape(), &[2, 1, 2]);
 
         let k_result = k_out.to_vec().unwrap();
@@ -448,8 +433,8 @@ mod tests {
         cache.append(1, &k1, &v1).unwrap();
         cache.advance(1);
 
-        let (k_out_0, _) = cache.get(0).unwrap();
-        let (k_out_1, _) = cache.get(1).unwrap();
+        let (k_out_0, _) = cache.get(0);
+        let (k_out_1, _) = cache.get(1);
 
         assert_eq!(k_out_0.to_vec().unwrap(), vec![1.0, 2.0]);
         assert_eq!(k_out_1.to_vec().unwrap(), vec![5.0, 6.0]);

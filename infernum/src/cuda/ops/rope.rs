@@ -148,9 +148,9 @@ pub fn apply_rope(
             cfg,
             (
                 output.cuda_slice_mut(),
-                input.cuda_slice(),
-                cos_cache.cuda_slice(),
-                sin_cache.cuda_slice(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
                 seq_len as i32,
                 num_heads as i32,
                 head_dim as i32,

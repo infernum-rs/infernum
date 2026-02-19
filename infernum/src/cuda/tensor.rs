@@ -2,7 +2,11 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
 
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr, ValidAsZeroBits};
+use std::sync::Arc;
+
+use cudarc::driver::{
+    CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice, ValidAsZeroBits,
+};
 
 use crate::cuda::CudaContext;
 use crate::dtype::{DType, TensorDType};
@@ -11,10 +15,18 @@ use crate::Result;
 
 /// A tensor stored on a CUDA GPU
 ///
-/// The tensor owns its GPU memory and is parameterized by the element type.
-/// This ensures type safety: you cannot accidentally mix f32 and f16 tensors.
+/// The tensor owns its GPU memory via `Arc`, enabling zero-copy reshape and
+/// sub-slice views. The element type is encoded in the type parameter,
+/// preventing accidental mixing of f32 and f16 tensors.
+///
+/// Multiple `CudaTensor`s may share the same underlying GPU allocation
+/// (e.g. after `reshape()`). Mutable access (`cuda_slice_mut()`) uses
+/// copy-on-write: it clones the buffer only when it is shared.
 pub struct CudaTensor<T: TensorDType> {
-    data: CudaSlice<T>,
+    data: Arc<CudaSlice<T>>,
+    /// Byte offset into `data` where this tensor's elements begin.
+    /// Measured in number of `T` elements, not bytes.
+    offset: usize,
     shape: Vec<usize>,
     ctx: CudaContext,
 }
@@ -37,7 +49,8 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
 
         let data = ctx.device().htod_sync_copy(data)?;
         Ok(Self {
-            data,
+            data: Arc::new(data),
+            offset: 0,
             shape: shape.to_vec(),
             ctx: ctx.clone(),
         })
@@ -54,7 +67,8 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
         let numel: usize = shape.iter().product();
         let data = ctx.device().alloc::<T>(numel)?;
         Ok(Self {
-            data,
+            data: Arc::new(data),
+            offset: 0,
             shape: shape.to_vec(),
             ctx: ctx.clone(),
         })
@@ -71,7 +85,8 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
         let numel: usize = shape.iter().product();
         let data = ctx.device().alloc_zeros::<T>(numel)?;
         Ok(Self {
-            data,
+            data: Arc::new(data),
+            offset: 0,
             shape: shape.to_vec(),
             ctx: ctx.clone(),
         })
@@ -82,7 +97,8 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
     /// # Errors
     /// Returns an error if the device-to-host copy fails
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        let data = self.ctx.device().dtoh_sync_copy(&self.data)?;
+        let view = self.data.slice(self.offset..self.offset + self.numel());
+        let data = self.ctx.device().dtoh_sync_copy(&view)?;
         Ok(data)
     }
 
@@ -95,28 +111,46 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
     /// Get a raw device pointer to the tensor data
     #[must_use]
     pub fn as_ptr(&self) -> *const T {
-        *self.data.device_ptr() as *const T
+        let view = self.data.slice(self.offset..self.offset + self.numel());
+        *view.device_ptr() as *const T
     }
 
     /// Get a mutable raw device pointer to the tensor data
+    ///
+    /// If the underlying buffer is shared, this will copy-on-write first.
     #[must_use]
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        *self.data.device_ptr_mut() as *mut T
+        self.ensure_exclusive_ownership();
+        let data =
+            Arc::get_mut(&mut self.data).expect("ensure_exclusive_ownership guarantees unique Arc");
+        *data.device_ptr_mut() as *mut T
     }
 
-    /// Get the underlying CUDA slice
+    /// Get the underlying CUDA slice for this tensor's region.
+    ///
+    /// When the tensor has no offset and covers the full allocation, returns
+    /// a reference to the underlying `CudaSlice` directly (zero-cost).
+    /// When there is an offset (sub-slice view), returns a `CudaView` which
+    /// is also zero-cost but borrows from the allocation.
     #[must_use]
-    pub fn cuda_slice(&self) -> &CudaSlice<T> {
-        &self.data
+    pub fn cuda_slice(&self) -> cudarc::driver::CudaView<'_, T> {
+        self.data.slice(self.offset..self.offset + self.numel())
     }
 
-    /// Get a mutable reference to the underlying CUDA slice
-    #[must_use]
+    /// Get a mutable reference to the underlying CUDA slice.
+    ///
+    /// If the underlying buffer is shared or is a sub-slice view, this will
+    /// copy-on-write first (compact into a fresh, exclusively-owned allocation).
+    /// After this call, `offset` is guaranteed to be 0 and the `Arc` is unique.
     pub fn cuda_slice_mut(&mut self) -> &mut CudaSlice<T> {
-        &mut self.data
+        self.ensure_exclusive_ownership();
+        Arc::get_mut(&mut self.data).expect("ensure_exclusive_ownership guarantees unique Arc")
     }
 
-    /// Reshape the tensor (returns a new tensor with the same data but different shape)
+    /// Reshape the tensor to a new shape with the same number of elements.
+    ///
+    /// This is a zero-copy operation — the returned tensor shares the same
+    /// GPU memory via `Arc`.
     ///
     /// # Panics
     /// Panics if the new shape has a different number of elements
@@ -133,19 +167,76 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
         );
 
         Self {
-            data: self.data.clone(),
+            data: Arc::clone(&self.data),
+            offset: self.offset,
             shape: new_shape.to_vec(),
             ctx: self.ctx.clone(),
+        }
+    }
+
+    /// Create a zero-copy sub-slice view of this tensor.
+    ///
+    /// The returned tensor shares the same GPU allocation and starts at
+    /// element `offset_elems` with the given `shape`.
+    ///
+    /// # Panics
+    /// Panics if `offset_elems + numel(shape)` exceeds the backing allocation.
+    #[must_use]
+    pub fn slice_view(&self, offset_elems: usize, shape: &[usize]) -> Self {
+        let numel: usize = shape.iter().product();
+        let new_offset = self.offset + offset_elems;
+        assert!(
+            new_offset + numel <= self.data.len(),
+            "slice_view out of bounds: offset {} + numel {} > allocation {}",
+            new_offset,
+            numel,
+            self.data.len(),
+        );
+
+        Self {
+            data: Arc::clone(&self.data),
+            offset: new_offset,
+            shape: shape.to_vec(),
+            ctx: self.ctx.clone(),
+        }
+    }
+
+    /// If the Arc is shared or we have a non-zero offset, compact into a
+    /// fresh, exclusively-owned allocation containing only our elements.
+    fn ensure_exclusive_ownership(&mut self) {
+        let is_shared = Arc::strong_count(&self.data) > 1;
+        let has_offset = self.offset != 0;
+        let is_partial = self.numel() < self.data.len();
+
+        if is_shared || has_offset || is_partial {
+            let numel = self.numel();
+            let view = self.data.slice(self.offset..self.offset + numel);
+            let mut new_data = unsafe { self.ctx.device().alloc::<T>(numel) }
+                .expect("GPU allocation failed during copy-on-write");
+            self.ctx
+                .device()
+                .dtod_copy(&view, &mut new_data)
+                .expect("dtod_copy failed during copy-on-write");
+            self.data = Arc::new(new_data);
+            self.offset = 0;
         }
     }
 }
 
 impl<T: TensorDType + DeviceRepr> Clone for CudaTensor<T> {
     fn clone(&self) -> Self {
-        // Clone creates a new allocation with copied data
-        let data = self.data.clone();
+        // Clone creates a new allocation with copied data (real GPU copy)
+        let numel = self.numel();
+        let view = self.data.slice(self.offset..self.offset + numel);
+        let mut new_data = unsafe { self.ctx.device().alloc::<T>(numel) }
+            .expect("GPU allocation failed during clone");
+        self.ctx
+            .device()
+            .dtod_copy(&view, &mut new_data)
+            .expect("dtod_copy failed during clone");
         Self {
-            data,
+            data: Arc::new(new_data),
+            offset: 0,
             shape: self.shape.clone(),
             ctx: self.ctx.clone(),
         }

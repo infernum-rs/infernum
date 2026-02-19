@@ -111,8 +111,8 @@ pub fn rms_norm(
             cfg,
             (
                 output.cuda_slice_mut(),
-                input.cuda_slice(),
-                weight.cuda_slice(),
+                &input.cuda_slice(),
+                &weight.cuda_slice(),
                 hidden_size as i32,
                 eps,
             ),
