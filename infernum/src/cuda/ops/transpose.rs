@@ -24,6 +24,7 @@ fn ensure_transpose_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) 
             module_name,
             &[
                 "transpose_2d_f32",
+                "transpose_2d_bf16",
                 "transpose_012_to_102_f32",
                 "transpose_last_two_f32",
             ],
@@ -51,6 +52,50 @@ pub fn transpose_2d(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     ensure_transpose_kernel(device)?;
 
     let func = device.get_func("transpose", "transpose_2d_f32").unwrap();
+
+    let block_size = 256;
+    let grid_size = (n + block_size - 1) / block_size;
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &tensor.cuda_slice(),
+                rows as i32,
+                cols as i32,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
+/// Transpose a 2D bf16 tensor: (rows, cols) -> (cols, rows)
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn transpose_2d_bf16(tensor: &CudaTensor<half::bf16>) -> Result<CudaTensor<half::bf16>> {
+    let shape = tensor.shape();
+    assert_eq!(shape.len(), 2, "Expected 2D tensor");
+
+    let rows = shape[0];
+    let cols = shape[1];
+    let n = rows * cols;
+
+    let output_shape = [cols, rows];
+    let mut output = unsafe { CudaTensor::<half::bf16>::uninit(tensor.context(), &output_shape)? };
+
+    let device = tensor.context().device();
+    ensure_transpose_kernel(device)?;
+
+    let func = device.get_func("transpose", "transpose_2d_bf16").unwrap();
 
     let block_size = 256;
     let grid_size = (n + block_size - 1) / block_size;
@@ -278,6 +323,41 @@ mod tests {
         let roundtrip = transpose_last_two(&transpose_last_two(&tensor).unwrap()).unwrap();
 
         assert_eq!(roundtrip.shape(), &[2, 3, 4]);
+        assert_eq!(roundtrip.to_vec().unwrap(), data);
+    }
+
+    #[test]
+    fn test_transpose_2d_bf16() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let data: Vec<half::bf16> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect();
+        let tensor = CudaTensor::from_slice(&ctx, &[2, 3], &data).unwrap();
+
+        let transposed = transpose_2d_bf16(&tensor).unwrap();
+
+        assert_eq!(transposed.shape(), &[3, 2]);
+
+        let result = transposed.to_vec().unwrap();
+        let expected: Vec<half::bf16> = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_transpose_2d_bf16_roundtrip() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let data: Vec<half::bf16> = (0..12).map(|x| half::bf16::from_f32(x as f32)).collect();
+        let tensor = CudaTensor::from_slice(&ctx, &[3, 4], &data).unwrap();
+
+        let roundtrip = transpose_2d_bf16(&transpose_2d_bf16(&tensor).unwrap()).unwrap();
+
+        assert_eq!(roundtrip.shape(), &[3, 4]);
         assert_eq!(roundtrip.to_vec().unwrap(), data);
     }
 }

@@ -8,8 +8,9 @@
     clippy::uninlined_format_args
 )]
 
+use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
-use cudarc::driver::DeviceRepr;
+use cudarc::driver::{DevicePtr, DevicePtrMut, DeviceRepr};
 
 use crate::cuda::CudaTensor;
 use crate::dtype::TensorDType;
@@ -150,6 +151,93 @@ where
             &b.cuda_slice(),
             &a.cuda_slice(),
             c.cuda_slice_mut(),
+        )?;
+    }
+
+    Ok(c)
+}
+
+/// Mixed-precision matrix multiplication: bf16 inputs, f32 output.
+///
+/// Uses `cublasGemmEx` directly to avoid the output bf16→f32 cast.
+/// Supports 2D and 3D×2D (broadcast B across batch dimension).
+///
+/// # Errors
+/// Returns an error if shapes are incompatible or cuBLAS operation fails
+pub fn matmul_bf16_f32(
+    a: &CudaTensor<half::bf16>,
+    b: &CudaTensor<half::bf16>,
+) -> Result<CudaTensor<f32>> {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+
+    match (a_shape.len(), b_shape.len()) {
+        (2, 2) => matmul_bf16_f32_2d(a, b),
+        (3, 2) => {
+            let batch = a_shape[0];
+            let m = a_shape[1];
+            let k = a_shape[2];
+            let n = b_shape[1];
+            assert_eq!(b_shape[0], k, "Inner dimensions must match");
+            let a_2d = a.reshape(&[batch * m, k]);
+            let c_2d = matmul_bf16_f32_2d(&a_2d, b)?;
+            let c = c_2d.reshape(&[batch, m, n]);
+            Ok(c)
+        }
+        _ => panic!(
+            "Unsupported matmul_bf16_f32 shapes: {:?} @ {:?}",
+            a_shape, b_shape
+        ),
+    }
+}
+
+/// 2D mixed-precision matmul: bf16 inputs, f32 output
+fn matmul_bf16_f32_2d(
+    a: &CudaTensor<half::bf16>,
+    b: &CudaTensor<half::bf16>,
+) -> Result<CudaTensor<f32>> {
+    use cudarc::cublas::{result, sys};
+
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let n = b_shape[1];
+
+    assert_eq!(
+        k, b_shape[0],
+        "Inner dimensions must match: {} vs {}",
+        k, b_shape[0]
+    );
+
+    let mut c = unsafe { CudaTensor::<f32>::uninit(a.context(), &[m, n])? };
+
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+
+    // cuBLAS uses column-major: compute C^T = B^T @ A^T
+    unsafe {
+        result::gemm_ex(
+            *a.context().blas().handle(),
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            (&alpha) as *const f32 as *const _,
+            *b.cuda_slice().device_ptr() as *const _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            n as i32,
+            *a.cuda_slice().device_ptr() as *const _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            k as i32,
+            (&beta) as *const f32 as *const _,
+            *c.cuda_slice_mut().device_ptr_mut() as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            n as i32,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
         )?;
     }
 
@@ -299,6 +387,36 @@ mod tests {
                 (got - exp).abs() < 1e-5,
                 "Mismatch at {idx}: {got} vs {exp}"
             );
+        }
+    }
+
+    #[test]
+    fn test_matmul_bf16_f32_mixed() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // A: 2x3 (bf16), B: 3x4 (bf16) -> C: 2x4 (f32)
+        let a_data: Vec<half::bf16> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .map(|&x| half::bf16::from_f32(x))
+            .collect();
+        let b_data: Vec<half::bf16> = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]
+        .iter()
+        .map(|&x| half::bf16::from_f32(x))
+        .collect();
+
+        let a = CudaTensor::from_slice(&ctx, &[2, 3], &a_data).unwrap();
+        let b = CudaTensor::from_slice(&ctx, &[3, 4], &b_data).unwrap();
+
+        let c = matmul_bf16_f32(&a, &b).unwrap();
+
+        assert_eq!(c.shape(), &[2, 4]);
+
+        let result: Vec<f32> = c.to_vec().unwrap();
+        let expected: Vec<f32> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0];
+        for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!((got - exp).abs() < 0.5, "Mismatch at {i}: {got} vs {exp}");
         }
     }
 }

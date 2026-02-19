@@ -9,9 +9,9 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, cast_bf16_to_f32,
-    cast_f32_to_bf16, embedding_gather, matmul, precompute_rope_cache, quantized_matmul, repeat_kv,
-    rms_norm, rms_norm_inplace, swiglu, transpose_2d,
+    add_inplace, add_rmsnorm, apply_rope, attention, attention_kv, cast_f32_to_bf16,
+    embedding_gather, matmul, matmul_bf16_f32, precompute_rope_cache, quantized_matmul, repeat_kv,
+    rms_norm, rms_norm_inplace, swiglu, transpose_2d, transpose_2d_bf16,
 };
 use infernum::KvCache;
 
@@ -22,26 +22,10 @@ fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 }
 
 /// Transpose a bf16 weight matrix on the CPU, then upload to GPU.
-///
-/// The CUDA transpose kernel only supports f32, so we do this on the host.
-/// This is a one-time cost at model load, not on the hot path.
+/// Transpose a bf16 weight matrix once, for use in pre-transposed linear projections.
 /// (out_features, in_features) -> (in_features, out_features)
 fn pretranspose_weight_bf16(weight: &CudaTensor<half::bf16>) -> Result<CudaTensor<half::bf16>> {
-    let shape = weight.shape();
-    assert_eq!(shape.len(), 2, "Expected 2D tensor for pretranspose");
-    let rows = shape[0];
-    let cols = shape[1];
-
-    let data = weight.to_vec()?;
-    let mut transposed = vec![half::bf16::ZERO; data.len()];
-
-    for r in 0..rows {
-        for c in 0..cols {
-            transposed[c * rows + r] = data[r * cols + c];
-        }
-    }
-
-    CudaTensor::from_slice(weight.context(), &[cols, rows], &transposed)
+    transpose_2d_bf16(weight)
 }
 
 /// Reverse the llama.cpp Q/K weight permutation for f32 tensors.
@@ -358,8 +342,17 @@ impl LlamaModel {
         let norm = loader.load_f32(ctx, "model.norm.weight")?;
 
         // Load or tie lm_head
+        // When tied, we need to check if the original embedding is BF16 and use that
+        // for the lm_head to get bf16 matmul performance
         let lm_head = if config.tie_word_embeddings {
-            LinearWeight::F32(pretranspose_weight(&embed_tokens)?)
+            let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+            if embed_dtype == DType::BF16 || embed_dtype == DType::F16 {
+                // Load a bf16 copy for lm_head to use bf16 matmul
+                let embed_bf16 = loader.load_bf16(ctx, "model.embed_tokens.weight")?;
+                LinearWeight::BF16(pretranspose_weight_bf16(&embed_bf16)?)
+            } else {
+                LinearWeight::F32(pretranspose_weight(&embed_tokens)?)
+            }
         } else {
             load_linear(ctx, loader, "lm_head.weight")?
         };
@@ -727,8 +720,7 @@ fn linear(input: &CudaTensor<f32>, weight: &LinearWeight) -> Result<CudaTensor<f
         LinearWeight::F32(w) => matmul(input, w),
         LinearWeight::BF16(w) => {
             let input_bf16 = cast_f32_to_bf16(input)?;
-            let output_bf16 = matmul(&input_bf16, w)?;
-            cast_bf16_to_f32(&output_bf16)
+            matmul_bf16_f32(&input_bf16, w)
         }
         LinearWeight::Quantized(w) => quantized_matmul(input, w),
     }
