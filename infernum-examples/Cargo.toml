@@ -3,17 +3,27 @@ name = "infernum-examples"
 version = "0.1.0"
 edition = "2021"
 publish = false
+build = "build.rs"
 
 [features]
 default = []
-cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-runtime/cuda"]
+cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-runtime/cuda", "cudarc"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
+cudarc = { version = "0.12", features = ["f16", "cuda-12060"], optional = true }
 infernum = { path = "../infernum" }
 infernum-llama = { path = "../infernum-llama" }
 infernum-runtime = { path = "../infernum-runtime" }
 
 [[example]]
 name = "generate"
+required-features = ["cuda"]
+
+[[example]]
+name = "custom_cuda_op"
+required-features = ["cuda"]
+
+[[example]]
+name = "custom_triton_op"
 required-features = ["cuda"]
