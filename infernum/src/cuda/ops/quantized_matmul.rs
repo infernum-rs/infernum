@@ -131,10 +131,12 @@ extern "C" __global__ void matmul_q4_f32(
 
 // FP8 E4M3 matmul: each weight byte is an fp8 value (no block structure)
 // Manual decode: sign(1) | exponent(4) | mantissa(3), bias=7
+// weight_scale: per-tensor scale factor (from dynamic quantization)
 extern "C" __global__ void matmul_fp8_f32(
     float*       __restrict__ output,
     const float* __restrict__ input,
     const unsigned char* __restrict__ weight_data,
+    const float weight_scale,
     const int M,
     const int N,
     const int K
@@ -173,7 +175,7 @@ extern "C" __global__ void matmul_fp8_f32(
         acc += in_ptr[k] * w;
     }
 
-    output[m * N + n] = acc;
+    output[m * N + n] = acc * weight_scale;
 }
 
 // Q6_K matmul: super-block of 256 elements, 210 bytes each
@@ -307,6 +309,7 @@ pub fn quantized_matmul(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn quantized_matmul_2d(
     input: &CudaTensor<f32>,
     weight: &QuantizedTensor,
@@ -388,6 +391,7 @@ fn quantized_matmul_2d(
                         output.cuda_slice_mut(),
                         input.cuda_slice(),
                         weight.data_slice(),
+                        weight.weight_scale(),
                         m as i32,
                         n as i32,
                         k as i32,

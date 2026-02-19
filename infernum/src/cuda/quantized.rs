@@ -37,6 +37,8 @@ pub struct QuantizedTensor {
     shape: Vec<usize>,
     /// Quantization format
     dtype: DType,
+    /// Per-tensor scale factor (used by FP8 dynamic quantization; 1.0 for block-quantized)
+    weight_scale: f32,
 }
 
 impl QuantizedTensor {
@@ -101,6 +103,7 @@ impl QuantizedTensor {
             scales: gpu_scales,
             shape: shape.to_vec(),
             dtype,
+            weight_scale: 1.0,
         })
     }
 
@@ -124,6 +127,7 @@ impl QuantizedTensor {
             scales,
             shape: shape.to_vec(),
             dtype,
+            weight_scale: 1.0,
         }
     }
 
@@ -137,6 +141,17 @@ impl QuantizedTensor {
     #[must_use]
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Per-tensor scale factor (FP8 dynamic quantization)
+    #[must_use]
+    pub fn weight_scale(&self) -> f32 {
+        self.weight_scale
+    }
+
+    /// Set the per-tensor scale factor
+    pub fn set_weight_scale(&mut self, scale: f32) {
+        self.weight_scale = scale;
     }
 
     /// Total number of logical elements
