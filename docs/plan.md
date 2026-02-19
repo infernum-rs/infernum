@@ -344,19 +344,7 @@ See `docs/phase2-plan.md` for detailed design.
 
 **Milestone**: Fused kernels match or beat naive implementations in benchmarks.
 
-### Phase 4: More Model Architectures
-
-Broaden model support beyond Llama.
-
-- **Qwen** (`infernum-qwen`): Qwen 2/2.5 family
-- **Phi** (`infernum-phi`): Phi-3/4 family
-- **Mistral** (`infernum-mistral`): Mistral/Mixtral family
-- Factor out shared patterns (transformer blocks, weight mapping) to reduce per-model boilerplate
-- Chat templates per model family
-
-**Milestone**: At least two additional model families running end to end.
-
-### Phase 5: Multi-GPU / Tensor Parallelism
+### Phase 4: Multi-GPU / Tensor Parallelism
 
 Scale to models that don't fit on a single GPU.
 
@@ -367,6 +355,18 @@ Scale to models that don't fit on a single GPU.
 - Parallel-aware ops: ops that don't support TP won't compile with `Parallel<T>`
 
 **Milestone**: 70B-class model running across multiple GPUs.
+
+### Phase 5: More Model Architectures
+
+Broaden model support beyond Llama.
+
+- **Qwen** (`infernum-qwen`): Qwen 2/2.5 family
+- **Phi** (`infernum-phi`): Phi-3/4 family
+- **Mistral** (`infernum-mistral`): Mistral/Mixtral family
+- Factor out shared patterns (transformer blocks, weight mapping) to reduce per-model boilerplate
+- Chat templates per model family
+
+**Milestone**: At least two additional model families running end to end.
 
 ### Phase 6: Inflight Batching
 
