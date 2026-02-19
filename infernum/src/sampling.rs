@@ -21,3 +21,31 @@ impl Default for SamplingParams {
         }
     }
 }
+
+/// Options for text generation.
+///
+/// Controls the generation loop: how many tokens to produce, when to stop,
+/// whether to use greedy or sampled decoding, and whether to use KV cache.
+#[derive(Debug, Clone)]
+pub struct GenerateOptions {
+    /// Maximum number of new tokens to generate.
+    pub max_new_tokens: usize,
+    /// Optional EOS token ID to stop generation early.
+    pub eos_token_id: Option<u32>,
+    /// Sampling parameters. `None` means greedy (argmax) decoding.
+    pub sampling: Option<SamplingParams>,
+    /// Whether to use the KV cache for efficient generation.
+    /// When `false`, recomputes the full sequence at each step.
+    pub use_kv_cache: bool,
+}
+
+impl Default for GenerateOptions {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 100,
+            eos_token_id: None,
+            sampling: None,
+            use_kv_cache: true,
+        }
+    }
+}

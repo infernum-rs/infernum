@@ -6,7 +6,7 @@
 use std::io::{self, Write};
 
 use infernum::cuda::CudaContext;
-use infernum::{Model, Result, SamplingParams, Tokenizer};
+use infernum::{GenerateOptions, Model, Result, Tokenizer};
 
 use crate::Engine;
 
@@ -41,47 +41,21 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
         &self.tokenizer
     }
 
-    /// Generate text using greedy decoding.
+    /// Generate text, blocking until complete.
     ///
     /// # Arguments
     /// * `prompt` - Input text
-    /// * `max_new_tokens` - Maximum number of tokens to generate
+    /// * `options` - Generation options (sampling, max tokens, KV cache, etc.)
     ///
     /// # Returns
     /// The generated text (prompt + completion)
     ///
     /// # Errors
     /// Returns an error if tokenization or generation fails.
-    pub fn generate(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
+    pub fn generate(&mut self, prompt: &str, options: &GenerateOptions) -> Result<String> {
         let input_ids = self.tokenizer.encode(prompt, true)?;
-        let eos = Some(self.engine.model_config().eos_token_id);
-        let output_ids = self.engine.generate(&input_ids, max_new_tokens, eos)?;
-        self.tokenizer.decode(&output_ids)
-    }
-
-    /// Generate text using nucleus (top-p) sampling.
-    ///
-    /// # Arguments
-    /// * `prompt` - Input text
-    /// * `max_new_tokens` - Maximum number of tokens to generate
-    /// * `params` - Sampling parameters
-    ///
-    /// # Returns
-    /// The generated text (prompt + completion)
-    ///
-    /// # Errors
-    /// Returns an error if tokenization or generation fails.
-    pub fn generate_sampled(
-        &mut self,
-        prompt: &str,
-        max_new_tokens: usize,
-        params: &SamplingParams,
-    ) -> Result<String> {
-        let input_ids = self.tokenizer.encode(prompt, true)?;
-        let eos = Some(self.engine.model_config().eos_token_id);
-        let output_ids = self
-            .engine
-            .generate_sampled(&input_ids, max_new_tokens, eos, params)?;
+        let options = self.fill_eos(options);
+        let output_ids = self.engine.generate(&input_ids, &options)?;
         self.tokenizer.decode(&output_ids)
     }
 
@@ -89,38 +63,43 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
     ///
     /// # Arguments
     /// * `prompt` - Input text
-    /// * `max_new_tokens` - Maximum number of tokens to generate
-    /// * `params` - Optional sampling parameters (greedy if `None`)
+    /// * `options` - Generation options (sampling, max tokens, KV cache, etc.)
     ///
     /// # Returns
     /// The full generated token sequence (prompt + completion)
     ///
     /// # Errors
     /// Returns an error if tokenization or generation fails.
-    pub fn generate_streaming(
-        &mut self,
-        prompt: &str,
-        max_new_tokens: usize,
-        params: Option<&SamplingParams>,
-    ) -> Result<Vec<u32>> {
+    pub fn generate_stream(&mut self, prompt: &str, options: &GenerateOptions) -> Result<Vec<u32>>
+    where
+        M: Send,
+    {
         let input_ids = self.tokenizer.encode(prompt, true)?;
-        let eos = Some(self.engine.model_config().eos_token_id);
+        let options = self.fill_eos(options);
+        let tokenizer = &self.tokenizer;
 
-        let output_ids = if let Some(params) = params {
-            self.engine
-                .generate_sampled(&input_ids, max_new_tokens, eos, params)?
-        } else {
-            self.engine.generate(&input_ids, max_new_tokens, eos)?
-        };
+        self.engine.generate_stream(&input_ids, &options, |rx| {
+            let mut tokens = input_ids.clone();
 
-        // Stream the newly generated tokens
-        let prompt_len = input_ids.len();
-        for &tok in &output_ids[prompt_len..] {
-            let text = self.tokenizer.decode_token(tok)?;
-            print!("{text}");
-            io::stdout().flush()?;
+            for token_result in rx {
+                let token = token_result?;
+                tokens.push(token);
+                let text = tokenizer.decode_token(token)?;
+                print!("{text}");
+                io::stdout().flush()?;
+            }
+
+            Ok::<Vec<u32>, infernum::Error>(tokens)
+        })
+    }
+
+    /// Clone options with EOS token filled from model config if not set.
+    fn fill_eos(&self, options: &GenerateOptions) -> GenerateOptions {
+        if options.eos_token_id.is_some() {
+            return options.clone();
         }
-
-        Ok(output_ids)
+        let mut options = options.clone();
+        options.eos_token_id = Some(self.engine.model_config().eos_token_id);
+        options
     }
 }

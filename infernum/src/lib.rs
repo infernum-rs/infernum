@@ -25,7 +25,7 @@ pub use error::{Error, Result};
 #[cfg(feature = "cuda")]
 pub use model::Model;
 pub use model::ModelConfig;
-pub use sampling::SamplingParams;
+pub use sampling::{GenerateOptions, SamplingParams};
 pub use tensor::Tensor;
 #[cfg(feature = "cuda")]
 pub use tokenizer::GgufTokenizer;
