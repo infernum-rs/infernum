@@ -117,3 +117,15 @@ jobs:
 
       - name: Run CUDA tests
         run: cargo test --features cuda -- --test-threads=1
+
+      - name: Install Triton
+        run: pip install triton
+
+      - name: Build examples
+        run: cargo build --features cuda --examples
+
+      - name: Run custom_cuda_op example
+        run: cargo run --example custom_cuda_op --features cuda
+
+      - name: Run custom_triton_op example
+        run: cargo run --example custom_triton_op --features cuda
