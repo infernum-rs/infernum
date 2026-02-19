@@ -21,6 +21,10 @@ name = "generate"
 required-features = ["cuda"]
 
 [[example]]
+name = "bench"
+required-features = ["cuda"]
+
+[[example]]
 name = "custom_cuda_op"
 required-features = ["cuda"]
 
