@@ -31,16 +31,18 @@ impl LlamaTokenizer {
             )));
         };
 
-        // Get special token IDs (defaults for Llama 3)
+        // Get special token IDs (defaults for Llama 3 / SmolLM2)
         let bos_token_id = tokenizer
             .token_to_id("<|begin_of_text|>")
             .or_else(|| tokenizer.token_to_id("<s>"))
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>")) // SmolLM2
             .unwrap_or(1);
 
         let eos_token_id = tokenizer
             .token_to_id("<|end_of_text|>")
             .or_else(|| tokenizer.token_to_id("<|eot_id|>"))
             .or_else(|| tokenizer.token_to_id("</s>"))
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>")) // SmolLM2
             .unwrap_or(2);
 
         Ok(Self {

@@ -18,6 +18,34 @@ use infernum::cuda::ops::{
 fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     transpose_2d(weight)
 }
+
+/// Reverse the llama.cpp Q/K weight permutation for f32 tensors.
+///
+/// GGUF files interleave each head's rows: `[h0, h_half, h1, h_{half+1}, ...]`.
+/// This restores the HuggingFace sequential-half layout: `[h0..h_{half-1}, h_half..h_{dim-1}]`.
+fn unpermute_f32(weight: &CudaTensor<f32>, n_head: usize) -> Result<CudaTensor<f32>> {
+    let shape = weight.shape();
+    let n_rows = shape[0];
+    let n_cols = shape[1];
+    let head_dim = n_rows / n_head;
+    let half_dim = head_dim / 2;
+
+    let data = weight.to_vec()?;
+    let mut out = vec![0.0_f32; data.len()];
+
+    for h in 0..n_head {
+        for i in 0..half_dim {
+            let src0 = (h * head_dim + 2 * i) * n_cols;
+            let src1 = (h * head_dim + 2 * i + 1) * n_cols;
+            let dst0 = (h * head_dim + i) * n_cols;
+            let dst1 = (h * head_dim + i + half_dim) * n_cols;
+            out[dst0..dst0 + n_cols].copy_from_slice(&data[src0..src0 + n_cols]);
+            out[dst1..dst1 + n_cols].copy_from_slice(&data[src1..src1 + n_cols]);
+        }
+    }
+
+    CudaTensor::from_slice(weight.context(), &[n_rows, n_cols], &out)
+}
 use infernum::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use infernum::tensor::Tensor;
 use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
@@ -151,6 +179,26 @@ impl LlamaModel {
             }
         }
 
+        /// Load a Q/K projection weight, reversing the llama.cpp interleaved
+        /// permutation so that infernum's sequential half-half RoPE is correct.
+        fn load_linear_unpermute(
+            ctx: &CudaContext,
+            loader: &GgufLoader,
+            name: &str,
+            n_head: usize,
+        ) -> Result<LinearWeight> {
+            let dtype = loader.get_dtype(name)?;
+            if dtype.is_quantized() {
+                Ok(LinearWeight::Quantized(
+                    loader.load_quantized_unpermute(ctx, name, n_head)?,
+                ))
+            } else {
+                let tensor = loader.load_f32(ctx, name)?;
+                let unpermuted = unpermute_f32(&tensor, n_head)?;
+                Ok(LinearWeight::F32(pretranspose_weight(&unpermuted)?))
+            }
+        }
+
         // Embeddings (always f32/f16)
         let embed_tokens = loader.load_f32(ctx, "token_embd.weight")?;
 
@@ -162,8 +210,18 @@ impl LlamaModel {
             let layer = LlamaLayerWeights {
                 input_layernorm: loader.load_f32(ctx, &format!("{prefix}.attn_norm.weight"))?,
                 attention: LlamaAttentionWeights {
-                    q_proj: load_linear(ctx, loader, &format!("{prefix}.attn_q.weight"))?,
-                    k_proj: load_linear(ctx, loader, &format!("{prefix}.attn_k.weight"))?,
+                    q_proj: load_linear_unpermute(
+                        ctx,
+                        loader,
+                        &format!("{prefix}.attn_q.weight"),
+                        config.num_attention_heads,
+                    )?,
+                    k_proj: load_linear_unpermute(
+                        ctx,
+                        loader,
+                        &format!("{prefix}.attn_k.weight"),
+                        config.num_kv_heads(),
+                    )?,
                     v_proj: load_linear(ctx, loader, &format!("{prefix}.attn_v.weight"))?,
                     o_proj: load_linear(ctx, loader, &format!("{prefix}.attn_output.weight"))?,
                 },
@@ -323,8 +381,8 @@ impl LlamaModel {
         let mut hidden = self.embed(input_ids)?;
 
         // Run through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer(&hidden, layer, layer_idx)?;
+        for layer in &self.layers {
+            hidden = self.forward_layer(&hidden, layer)?;
         }
 
         // Final layer norm
@@ -440,7 +498,6 @@ impl LlamaModel {
         &self,
         hidden: &CudaTensor<f32>,
         layer: &LlamaLayerWeights,
-        _layer_idx: usize,
     ) -> Result<CudaTensor<f32>> {
         let _seq_len = hidden.shape()[0];
         let _hidden_size = self.config.hidden_size;

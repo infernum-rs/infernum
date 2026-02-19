@@ -36,7 +36,8 @@ impl GgufTokenizer {
     ///
     /// Expects the following keys:
     /// - `tokenizer.ggml.tokens` — array of token strings
-    /// - `tokenizer.ggml.scores` — array of f32 merge priorities
+    /// - `tokenizer.ggml.scores` — array of f32 merge priorities (for Unigram)
+    /// - `tokenizer.ggml.merges` — array of "left right" merge strings (for BPE)
     /// - `tokenizer.ggml.bos_token_id` — BOS token ID
     /// - `tokenizer.ggml.eos_token_id` — EOS token ID
     ///
@@ -65,7 +66,94 @@ impl GgufTokenizer {
 
         let vocab_size = token_strings.len();
 
-        // Extract scores (optional — default to 0.0 if missing)
+        // Build vocab: decode SentencePiece-style escaped bytes (e.g. <0x0A> for newline)
+        let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(vocab_size);
+        let mut token_to_id: HashMap<Vec<u8>, u32> = HashMap::with_capacity(vocab_size);
+
+        for (id, token_str) in token_strings.iter().enumerate() {
+            let bytes = decode_token_str(token_str);
+            // Use insert() to prefer later tokens over earlier ones.
+            // This ensures we use the actual character token (e.g., ',')
+            // instead of byte-fallback tokens (e.g., '<0x2C>') which appear earlier.
+            token_to_id.insert(bytes.clone(), id as u32);
+            vocab.push(bytes);
+        }
+
+        // Build merge table from explicit merges if available (BPE tokenizers)
+        // Otherwise fall back to score-based inference (Unigram tokenizers)
+        let merge_scores: HashMap<(u32, u32), f32> =
+            if let Some(GgufValue::Array(merges_arr)) = metadata.get("tokenizer.ggml.merges") {
+                Self::build_merge_table_from_explicit_merges(merges_arr, &token_to_id)?
+            } else {
+                Self::build_merge_table_from_scores(metadata, &vocab, &token_to_id, vocab_size)
+            };
+
+        let bos_token_id = metadata
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(GgufValue::as_usize)
+            .unwrap_or(1) as u32;
+
+        let eos_token_id = metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(GgufValue::as_usize)
+            .unwrap_or(2) as u32;
+
+        Ok(Self {
+            vocab,
+            token_to_id,
+            merge_scores,
+            bos_token_id,
+            eos_token_id,
+        })
+    }
+
+    /// Build merge table from explicit BPE merges.
+    /// Each merge is "left right" format. Earlier merges have higher priority.
+    fn build_merge_table_from_explicit_merges(
+        merges_arr: &[GgufValue],
+        token_to_id: &HashMap<Vec<u8>, u32>,
+    ) -> Result<HashMap<(u32, u32), f32>> {
+        let mut merge_scores: HashMap<(u32, u32), f32> = HashMap::new();
+        let total_merges = merges_arr.len();
+
+        for (rank, merge_val) in merges_arr.iter().enumerate() {
+            let merge_str = merge_val
+                .as_str()
+                .ok_or_else(|| Error::Tokenizer("Merge is not a string".into()))?;
+
+            // Split by single space to get left and right tokens
+            if let Some(space_idx) = merge_str.find(' ') {
+                let left_str = &merge_str[..space_idx];
+                let right_str = &merge_str[space_idx + 1..];
+
+                let left_bytes = decode_token_str(left_str);
+                let right_bytes = decode_token_str(right_str);
+
+                if let (Some(&left_id), Some(&right_id)) =
+                    (token_to_id.get(&left_bytes), token_to_id.get(&right_bytes))
+                {
+                    // Higher priority (lower rank) gets higher score.
+                    // BPE merge tables can have 60k+ entries, but f32 has enough
+                    // precision for ranking purposes.
+                    #[allow(clippy::cast_precision_loss)]
+                    let score = (total_merges - rank) as f32;
+                    merge_scores.insert((left_id, right_id), score);
+                }
+            }
+        }
+
+        Ok(merge_scores)
+    }
+
+    /// Build merge table from token scores (for Unigram tokenizers).
+    /// For every pair of tokens that concatenate to a known token,
+    /// record the merge with the score of the result token.
+    fn build_merge_table_from_scores(
+        metadata: &HashMap<String, GgufValue>,
+        vocab: &[Vec<u8>],
+        token_to_id: &HashMap<Vec<u8>, u32>,
+        vocab_size: usize,
+    ) -> HashMap<(u32, u32), f32> {
         let scores: Vec<f32> =
             if let Some(GgufValue::Array(arr)) = metadata.get("tokenizer.ggml.scores") {
                 arr.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect()
@@ -73,20 +161,6 @@ impl GgufTokenizer {
                 vec![0.0; vocab_size]
             };
 
-        // Build vocab: decode SentencePiece-style escaped bytes (e.g. <0x0A> for newline)
-        let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(vocab_size);
-        let mut token_to_id: HashMap<Vec<u8>, u32> = HashMap::with_capacity(vocab_size);
-
-        for (id, token_str) in token_strings.iter().enumerate() {
-            let bytes = decode_token_str(token_str);
-            token_to_id.entry(bytes.clone()).or_insert(id as u32);
-            vocab.push(bytes);
-        }
-
-        // Build merge table: for every pair of tokens that concatenate to a
-        // known token, record the merge with the score of the result token.
-        // This is how SentencePiece BPE works — the score of the merged token
-        // determines merge priority.
         let mut merge_scores: HashMap<(u32, u32), f32> = HashMap::new();
 
         for (merged_id, merged_bytes) in vocab.iter().enumerate() {
@@ -111,23 +185,7 @@ impl GgufTokenizer {
             }
         }
 
-        let bos_token_id = metadata
-            .get("tokenizer.ggml.bos_token_id")
-            .and_then(GgufValue::as_usize)
-            .unwrap_or(1) as u32;
-
-        let eos_token_id = metadata
-            .get("tokenizer.ggml.eos_token_id")
-            .and_then(GgufValue::as_usize)
-            .unwrap_or(2) as u32;
-
-        Ok(Self {
-            vocab,
-            token_to_id,
-            merge_scores,
-            bos_token_id,
-            eos_token_id,
-        })
+        merge_scores
     }
 
     /// Encode text into token IDs using BPE.
@@ -152,27 +210,41 @@ impl GgufTokenizer {
             return Ok(ids);
         }
 
-        // SentencePiece convention: prepend space (▁ = U+2581 = 0xE2 0x96 0x81)
-        let sp_text = format!("\u{2581}{text}");
-        let bytes = sp_text.as_bytes();
+        // SentencePiece convention: prepend ▁ and replace spaces with ▁
+        // "The meaning" → "▁The▁meaning"
+        let sp_text = format!("\u{2581}{}", text.replace(' ', "\u{2581}"));
 
-        // Start with one token per byte (using byte-fallback tokens like <0xAB>)
-        let mut tokens: Vec<u32> = bytes
-            .iter()
-            .map(|&b| {
-                // Try single byte first
-                if let Some(&id) = self.token_to_id.get(&[b][..]) {
-                    Ok(id)
-                } else {
-                    // Byte-fallback: <0xHH>
-                    let hex_token = format!("<0x{b:02X}>");
-                    self.token_to_id
-                        .get(hex_token.as_bytes())
-                        .copied()
-                        .ok_or_else(|| Error::Tokenizer(format!("No token for byte 0x{b:02x}")))
+        // Initialize with character-level tokens (not byte-level)
+        // For each character, check if it exists as a token.
+        // If not, fall back to byte-fallback tokens for each byte of the character.
+        let mut tokens: Vec<u32> = Vec::new();
+        for ch in sp_text.chars() {
+            let char_bytes = ch.to_string();
+            let char_bytes = char_bytes.as_bytes();
+
+            if let Some(&id) = self.token_to_id.get(char_bytes) {
+                // Character exists as a token
+                tokens.push(id);
+            } else {
+                // Fall back to byte-level encoding for this character
+                for &b in char_bytes {
+                    if let Some(&id) = self.token_to_id.get(&[b][..]) {
+                        tokens.push(id);
+                    } else {
+                        // Byte-fallback: <0xHH>
+                        let hex_token = format!("<0x{b:02X}>");
+                        let id = self
+                            .token_to_id
+                            .get(hex_token.as_bytes())
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::Tokenizer(format!("No token for byte 0x{b:02x}"))
+                            })?;
+                        tokens.push(id);
+                    }
                 }
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }
+        }
 
         // BPE merge loop: repeatedly merge the pair with the highest score
         loop {
@@ -296,6 +368,16 @@ mod tests {
         bos: u32,
         eos: u32,
     ) -> HashMap<String, GgufValue> {
+        make_metadata_with_merges(tokens, scores, bos, eos, &[])
+    }
+
+    fn make_metadata_with_merges(
+        tokens: &[&str],
+        scores: &[f32],
+        bos: u32,
+        eos: u32,
+        merges: &[&str],
+    ) -> HashMap<String, GgufValue> {
         let mut m = HashMap::new();
         m.insert(
             "tokenizer.ggml.tokens".into(),
@@ -312,6 +394,17 @@ mod tests {
         );
         m.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::U32(bos));
         m.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(eos));
+        if !merges.is_empty() {
+            m.insert(
+                "tokenizer.ggml.merges".into(),
+                GgufValue::Array(
+                    merges
+                        .iter()
+                        .map(|s| GgufValue::String((*s).into()))
+                        .collect(),
+                ),
+            );
+        }
         m
     }
 
@@ -333,48 +426,46 @@ mod tests {
 
     #[test]
     fn test_basic_encoding() {
-        // Minimal vocab: bytes + some merged tokens
+        // Minimal vocab with explicit BPE merges
         // ▁ = U+2581 = [0xE2, 0x96, 0x81]
         let tokens = &[
             "<unk>",         // 0
             "<s>",           // 1 (BOS)
             "</s>",          // 2 (EOS)
-            "\u{2581}h",     // 3 — merged "▁h"
-            "e",             // 4
-            "l",             // 5
-            "o",             // 6
-            "\u{2581}",      // 7 — space placeholder
-            "h",             // 8
+            "\u{2581}",      // 3 — space placeholder
+            "h",             // 4
+            "e",             // 5
+            "l",             // 6
+            "o",             // 7
+            "\u{2581}h",     // 8 — merged "▁h"
             "ll",            // 9 — merged "ll"
             "llo",           // 10 — merged "llo"
-            "\u{2581}hello", // 11 — full merge
+            "ello",          // 11 — merged "ello"
+            "\u{2581}hello", // 12 — full merge
         ];
-        // Higher score = merge first
-        let scores: &[f32] = &[
-            0.0,   // <unk>
-            0.0,   // <s>
-            0.0,   // </s>
-            -1.0,  // ▁h
-            -10.0, // e
-            -10.0, // l
-            -10.0, // o
-            -5.0,  // ▁
-            -10.0, // h
-            -2.0,  // ll
-            -1.5,  // llo
-            -0.5,  // ▁hello
+        let scores: &[f32] = &[0.0; 13]; // Scores not used when merges are explicit
+
+        // BPE merge order (earlier = higher priority)
+        let merges = &[
+            "\u{2581}h ello", // merge to ▁hello (token 12)
+            "l l",            // merge to ll (token 9)
+            "ll o",           // merge to llo (token 10)
+            "e llo",          // merge to ello (token 11)
+            "\u{2581} h",     // merge to ▁h (token 8)
         ];
 
-        let meta = make_metadata(tokens, scores, 1, 2);
+        let meta = make_metadata_with_merges(tokens, scores, 1, 2, merges);
         let tok = GgufTokenizer::from_gguf_metadata(&meta).unwrap();
 
-        // "hello" -> with ▁ prepended: "▁hello" -> should merge to token 11
+        // "hello" -> prepend ▁ -> "▁hello"
+        // Initial tokens: ▁(3), h(4), e(5), l(6), l(6), o(7)
+        // Merges: l+l→ll, ll+o→llo, e+llo→ello, ▁h+ello→▁hello
         let ids = tok.encode("hello", false).unwrap();
-        assert_eq!(ids, vec![11]); // single token "▁hello"
+        assert_eq!(ids, vec![12]); // single token "▁hello"
 
         // With BOS
         let ids_bos = tok.encode("hello", true).unwrap();
-        assert_eq!(ids_bos, vec![1, 11]);
+        assert_eq!(ids_bos, vec![1, 12]);
     }
 
     #[test]

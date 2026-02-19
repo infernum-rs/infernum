@@ -285,6 +285,121 @@ impl GgufLoader {
         }
     }
 
+    /// Load a quantized tensor and reverse the llama.cpp Q/K weight permutation.
+    ///
+    /// GGUF files produced by `convert-hf-to-gguf.py` permute Q and K projection
+    /// weights so that the interleaved RoPE convention used by llama.cpp produces
+    /// correct results. Infernum uses the sequential half-half RoPE convention
+    /// (matching HuggingFace), so we must reverse the permutation on load.
+    ///
+    /// The permutation interleaves the first and second halves of each head's
+    /// rows: `(n_head, 2, half_dim, in_features)` → swapaxes(1,2) →
+    /// `(n_head, half_dim, 2, in_features)`. This method applies the inverse.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found, has an unsupported type,
+    /// or GPU allocation fails.
+    pub fn load_quantized_unpermute(
+        &self,
+        ctx: &CudaContext,
+        name: &str,
+        n_head: usize,
+    ) -> Result<QuantizedTensor> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
+
+        if !dtype.is_quantized() {
+            return Err(Error::UnsupportedDtype(format!(
+                "Tensor '{name}' is {dtype}, not a quantized type"
+            )));
+        }
+
+        let data_start = self.tensor_data_offset + info.offset as usize;
+        let numel: usize = info.shape.iter().product();
+
+        // shape is [out_features, in_features] after GGUF→row-major conversion
+        let n_rows = info.shape[0];
+        let n_cols = info.shape[1];
+        let head_dim = n_rows / n_head;
+        let half_dim = head_dim / 2;
+
+        match dtype {
+            DType::Q8_0 | DType::Q4_0 => {
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes();
+                let total_bytes = num_blocks * block_bytes;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                // Compute per-row byte count in the raw (interleaved) format
+                let blocks_per_row = n_cols / QUANTIZATION_BLOCK_SIZE;
+                let row_bytes = blocks_per_row * block_bytes;
+
+                // Un-permute rows: GGUF interleaved → HuggingFace sequential halves
+                // GGUF row (within a head) at position `2*i` → HF row `i`
+                // GGUF row (within a head) at position `2*i+1` → HF row `i + half_dim`
+                let mut unpermuted = vec![0u8; total_bytes];
+                for h in 0..n_head {
+                    for i in 0..half_dim {
+                        let src0 = (h * head_dim + 2 * i) * row_bytes;
+                        let src1 = (h * head_dim + 2 * i + 1) * row_bytes;
+                        let dst0 = (h * head_dim + i) * row_bytes;
+                        let dst1 = (h * head_dim + i + half_dim) * row_bytes;
+                        unpermuted[dst0..dst0 + row_bytes]
+                            .copy_from_slice(&raw[src0..src0 + row_bytes]);
+                        unpermuted[dst1..dst1 + row_bytes]
+                            .copy_from_slice(&raw[src1..src1 + row_bytes]);
+                    }
+                }
+
+                // Split into separate data and scales arrays (same as load_quantized)
+                let quant_bytes_per_block = block_bytes - 2;
+                let mut data_buf = Vec::with_capacity(num_blocks * quant_bytes_per_block);
+                let mut scales_buf = Vec::with_capacity(num_blocks * 2);
+
+                for block_idx in 0..num_blocks {
+                    let block_start = block_idx * block_bytes;
+                    scales_buf.extend_from_slice(&unpermuted[block_start..block_start + 2]);
+                    data_buf
+                        .extend_from_slice(&unpermuted[block_start + 2..block_start + block_bytes]);
+                }
+
+                QuantizedTensor::from_raw(ctx, &info.shape, dtype, &data_buf, &scales_buf)
+            }
+            DType::Q6_K => {
+                let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
+                let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                // Un-permute rows for Q6_K super-blocks
+                let blocks_per_row = n_cols / Q6_K_BLOCK_ELEMENTS;
+                let row_bytes = blocks_per_row * Q6_K_BLOCK_SIZE_BYTES;
+
+                let mut unpermuted = vec![0u8; total_bytes];
+                for h in 0..n_head {
+                    for i in 0..half_dim {
+                        let src0 = (h * head_dim + 2 * i) * row_bytes;
+                        let src1 = (h * head_dim + 2 * i + 1) * row_bytes;
+                        let dst0 = (h * head_dim + i) * row_bytes;
+                        let dst1 = (h * head_dim + i + half_dim) * row_bytes;
+                        unpermuted[dst0..dst0 + row_bytes]
+                            .copy_from_slice(&raw[src0..src0 + row_bytes]);
+                        unpermuted[dst1..dst1 + row_bytes]
+                            .copy_from_slice(&raw[src1..src1 + row_bytes]);
+                    }
+                }
+
+                QuantizedTensor::from_raw(ctx, &info.shape, dtype, &unpermuted, &[])
+            }
+            other => Err(Error::UnsupportedDtype(format!(
+                "Tensor '{name}' is {other}, which is not supported by load_quantized_unpermute"
+            ))),
+        }
+    }
+
     /// Get the dtype of a tensor in the file
     fn tensor_dtype(&self, name: &str) -> Result<DType> {
         let info = self
@@ -338,36 +453,43 @@ impl WeightLoader for GgufLoader {
             }
             DType::Q4_0 => {
                 // Block layout: [f16 scale (2 bytes) | 16 packed bytes (32 values)] = 18 bytes
-                // Each byte packs 2 values: low nibble = even index, high nibble = odd index
+                // GGML Q4_0 packing (interleaved):
+                //   byte[j] holds element j (low nibble) and element j+16 (high nibble)
                 // Unsigned [0,15] centered at 8 → signed [-8, 7]
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 let block_bytes = dtype.block_size_in_bytes();
                 let total_bytes = num_blocks * block_bytes;
                 let raw = &self.mmap[data_start..data_start + total_bytes];
 
-                let mut out = Vec::with_capacity(numel);
+                let mut out = vec![0.0; numel];
                 for block_idx in 0..num_blocks {
                     let bs = block_idx * block_bytes;
                     let scale = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
+
+                    let block_out_start = block_idx * QUANTIZATION_BLOCK_SIZE;
+
+                    #[allow(clippy::cast_precision_loss)] // values in [-8, 7]
                     for j in 0..QUANTIZATION_BLOCK_SIZE / 2 {
                         let byte = raw[bs + 2 + j];
                         let lo = i32::from(byte & 0x0F) - 8;
                         let hi = i32::from(byte >> 4) - 8;
-                        #[allow(clippy::cast_precision_loss)] // lo/hi ∈ [-8, 7], no precision loss
-                        {
-                            out.push(lo as f32 * scale);
-                            out.push(hi as f32 * scale);
-                        }
+
+                        out[block_out_start + j] = lo as f32 * scale;
+                        out[block_out_start + j + 16] = hi as f32 * scale;
                     }
                 }
                 out
             }
             DType::Q6_K => {
                 // Super-block of 256 elements, 210 bytes:
-                //   ql[128]   — lower 4 bits of each value (2 per byte)
-                //   qh[64]    — upper 2 bits of each value (4 per byte)
+                //   ql[128]   — lower 4 bits of each value (2 per byte, interleaved)
+                //   qh[64]    — upper 2 bits of each value (4 per byte, interleaved)
                 //   scales[16] — i8 sub-block scale (one per 16 elements)
                 //   d (f16)   — super-block scale factor
+                //
+                // The layout matches ggml's block_q6_K with interleaved nibble/bit packing:
+                // Elements are organized into 16 sub-blocks of 16 elements each.
+                // ql and qh are accessed using the ggml interleaved layout.
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
                 let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
                 let raw = &self.mmap[data_start..data_start + total_bytes];
@@ -384,24 +506,56 @@ impl WeightLoader for GgufLoader {
                     ])
                     .to_f32();
 
-                    for idx in 0..Q6_K_BLOCK_ELEMENTS {
-                        // Extract lower 4 bits from ql
-                        let ql_byte = ql[idx / 2];
-                        let ql_val = if idx % 2 == 0 {
+                    for elem in 0..Q6_K_BLOCK_ELEMENTS {
+                        // Map element index to ql/qh byte positions using ggml's interleaved layout
+                        // The data flows through: (128,) -> (2,1,64) -> shift -> (2,2,64) -> (8,32)
+                        // Then: (8,32) combined with qh -> (16,16) for 16 sub-blocks of 16 elements
+                        let sb = elem / 16; // sub-block 0-15
+                        let sb_elem = elem % 16; // element within sub-block 0-15
+                        let flat_idx = sb * 16 + sb_elem;
+                        let row8 = flat_idx / 32; // 0-7
+                        let col32 = flat_idx % 32; // 0-31
+
+                        // ql layout after reshape to (8,32):
+                        // row 0: bytes 0-31 low nibbles
+                        // row 1: bytes 32-63 low nibbles
+                        // row 2: bytes 0-31 high nibbles
+                        // row 3: bytes 32-63 high nibbles
+                        // row 4: bytes 64-95 low nibbles
+                        // row 5: bytes 96-127 low nibbles
+                        // row 6: bytes 64-95 high nibbles
+                        // row 7: bytes 96-127 high nibbles
+                        let ql_half = row8 / 4; // 0 for rows 0-3, 1 for rows 4-7
+                        let ql_nibble_sel = (row8 % 4) / 2; // 0 for rows 0-1,4-5 (low), 1 for 2-3,6-7 (high)
+                        let ql_offset = (row8 % 4) % 2; // 0 for even rows in group, 1 for odd
+                        let ql_byte_idx = ql_half * 64 + ql_offset * 32 + col32;
+                        let ql_byte = ql[ql_byte_idx];
+                        let ql_val = if ql_nibble_sel == 0 {
                             u32::from(ql_byte & 0x0F)
                         } else {
                             u32::from(ql_byte >> 4)
                         };
 
-                        // Extract upper 2 bits from qh
-                        let qh_byte = qh[idx / 4];
-                        let qh_shift = (idx % 4) * 2;
+                        // qh layout: (64,) -> (2,1,32) -> shift -> (2,4,32) -> (8,32)
+                        // row 0: bytes 0-31 bits 0-1
+                        // row 1: bytes 0-31 bits 2-3
+                        // row 2: bytes 0-31 bits 4-5
+                        // row 3: bytes 0-31 bits 6-7
+                        // row 4: bytes 32-63 bits 0-1
+                        // row 5: bytes 32-63 bits 2-3
+                        // row 6: bytes 32-63 bits 4-5
+                        // row 7: bytes 32-63 bits 6-7
+                        let qh_half = row8 / 4; // 0 or 1 (selects 32-byte half)
+                        let qh_shift_sel = row8 % 4; // 0,1,2,3 -> shift 0,2,4,6
+                        let qh_byte_idx = qh_half * 32 + col32;
+                        let qh_byte = qh[qh_byte_idx];
+                        let qh_shift = qh_shift_sel * 2;
                         let qh_val = u32::from((qh_byte >> qh_shift) & 0x03);
 
                         // Combine to 6-bit value and center: [0, 63] → [-32, 31]
                         let q = (ql_val | (qh_val << 4)) as i32 - 32;
 
-                        let sc = f32::from(scales[idx / 16] as i8);
+                        let sc = f32::from(scales[sb] as i8);
                         #[allow(clippy::cast_precision_loss)] // q ∈ [-32, 31], no precision loss
                         out.push(d * sc * q as f32);
                     }
@@ -647,7 +801,7 @@ mod test_helpers {
         }
 
         /// Add a Q4_0 tensor. `blocks` is a sequence of (scale_f16, packed_bytes).
-        /// Each packed byte holds two 4-bit unsigned values: low nibble = even, high = odd.
+        /// GGML packing: byte[j] has element j in low nibble, element j+16 in high nibble.
         pub fn add_tensor_q4(
             &mut self,
             name: &str,
@@ -921,12 +1075,17 @@ mod tests {
 
         // Block: scale=1.0, all nibbles = 8+3 = 11 (lo) and 8-2 = 6 (hi)
         // Packed byte: (6 << 4) | 11 = 0x6B
-        // Dequantized: lo → (11-8)*1.0 = 3.0, hi → (6-8)*1.0 = -2.0
+        // GGML packing: byte[j] has element j in low nibble, element j+16 in high nibble
+        // Dequantized: elements 0-15 → (11-8)*1.0 = 3.0, elements 16-31 → (6-8)*1.0 = -2.0
         let scale = half::f16::from_f32(1.0);
         let packed = vec![0x6Bu8; QUANTIZATION_BLOCK_SIZE / 2];
         let mut expected = Vec::with_capacity(QUANTIZATION_BLOCK_SIZE);
+        // First half (elements 0-15): low nibbles → 3.0
         for _ in 0..QUANTIZATION_BLOCK_SIZE / 2 {
             expected.push(3.0_f32);
+        }
+        // Second half (elements 16-31): high nibbles → -2.0
+        for _ in 0..QUANTIZATION_BLOCK_SIZE / 2 {
             expected.push(-2.0_f32);
         }
 
@@ -1006,6 +1165,69 @@ mod tests {
             assert!(
                 (val - expected).abs() < 0.1,
                 "Element {i}: got {val}, expected {expected}"
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Test that GGUF Q4_0 load_quantized + quantized_matmul matches load_f32 + regular matmul.
+    #[test]
+    fn test_gguf_q4_quantized_matmul_matches_dequantized() {
+        use crate::cuda::ops::{matmul, quantized_matmul};
+
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let path = test_gguf_path();
+
+        // Create a Q4_0 weight with varying values using GGML packing
+        // Weight shape: (2, 32) = 2 output features, 32 input features
+        // That's 2 blocks total, 1 block per row
+        let scale1 = half::f16::from_f32(1.0);
+        let scale2 = half::f16::from_f32(0.5);
+
+        // Block 1: elements 0-15 = 1.0, elements 16-31 = 2.0
+        // Q values (unsigned): 1.0 → round(1.0/1.0) + 8 = 9, 2.0 → round(2.0/1.0) + 8 = 10
+        // Packed: byte[j] = (10 << 4) | 9 = 0xA9
+        let packed1 = vec![0xA9u8; 16];
+
+        // Block 2: elements 0-15 = 0.5, elements 16-31 = -0.5
+        // Q values: 0.5/0.5 + 8 = 9, -0.5/0.5 + 8 = 7
+        // Packed: byte[j] = (7 << 4) | 9 = 0x79
+        let packed2 = vec![0x79u8; 16];
+
+        let mut builder = GgufBuilder::new();
+        builder.add_tensor_q4("weight", &[2, 32], &[(scale1, packed1), (scale2, packed2)]);
+        builder.build_to_file(&path);
+
+        let loader = GgufLoader::from_file(&path).unwrap();
+
+        // Load both ways
+        let weight_f32 = loader.load_f32(&ctx, "weight").unwrap();
+        let weight_q4 = loader.load_quantized(&ctx, "weight").unwrap();
+
+        // Create input: all 1.0s
+        let input_data = vec![1.0_f32; 32];
+        let input = CudaTensor::from_slice(&ctx, &[1, 32], &input_data).unwrap();
+
+        // Compute matmul both ways
+        // For f32: need to transpose weight first
+        let weight_f32_t = crate::cuda::ops::transpose_2d(&weight_f32).unwrap();
+        let result_f32 = matmul(&input, &weight_f32_t).unwrap();
+        let result_q4 = quantized_matmul(&input, &weight_q4).unwrap();
+
+        let out_f32 = result_f32.to_vec().unwrap();
+        let out_q4 = result_q4.to_vec().unwrap();
+
+        // Check they match within quantization error
+        for (i, (&f32_val, &q4_val)) in out_f32.iter().zip(out_q4.iter()).enumerate() {
+            let rel_err = if f32_val.abs() > 1e-6 {
+                (f32_val - q4_val).abs() / f32_val.abs()
+            } else {
+                (f32_val - q4_val).abs()
+            };
+            assert!(
+                rel_err < 0.1,
+                "Mismatch at output[{i}]: f32={f32_val}, q4={q4_val}, rel_err={rel_err}"
             );
         }
 
