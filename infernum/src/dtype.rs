@@ -111,54 +111,26 @@ impl fmt::Display for DType {
     }
 }
 
-/// Re-export of `half::f16` for convenience
-pub type F16 = half::f16;
-
-/// Re-export of `half::bf16` for convenience
-pub type BF16 = half::bf16;
-
 /// Trait for types that can be used as tensor elements
 pub trait TensorDType: Copy + Clone + Default + Send + Sync + 'static {
     /// The corresponding `DType` enum value
     const DTYPE: DType;
-
-    /// Convert an `f32` value to this dtype.
-    ///
-    /// Used by generic code that computes values in f32 (e.g. `RoPE` cache)
-    /// and needs to store them in the model's native dtype.
-    fn from_f32(v: f32) -> Self;
 }
 
 impl TensorDType for f32 {
     const DTYPE: DType = DType::F32;
-
-    fn from_f32(v: f32) -> Self {
-        v
-    }
 }
 
 impl TensorDType for half::f16 {
     const DTYPE: DType = DType::F16;
-
-    fn from_f32(v: f32) -> Self {
-        Self::from_f32(v)
-    }
 }
 
 impl TensorDType for half::bf16 {
     const DTYPE: DType = DType::BF16;
-
-    fn from_f32(v: f32) -> Self {
-        Self::from_f32(v)
-    }
 }
 
 impl TensorDType for u32 {
     const DTYPE: DType = DType::U32;
-
-    fn from_f32(_v: f32) -> Self {
-        panic!("u32 does not support from_f32 conversion")
-    }
 }
 
 #[cfg(test)]

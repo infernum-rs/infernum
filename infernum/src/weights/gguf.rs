@@ -40,7 +40,6 @@ const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_Q6_K: u32 = 14;
-const GGML_TYPE_BF16: u32 = 30;
 
 // ---------------------------------------------------------------------------
 // GGUF metadata value types
@@ -573,94 +572,6 @@ impl WeightLoader for GgufLoader {
         CudaTensor::from_slice(ctx, &info.shape, &f32_data)
     }
 
-    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::f16>> {
-        let info = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
-
-        let dtype = ggml_type_to_dtype(info.ggml_type)?;
-        let data_start = self.tensor_data_offset + info.offset as usize;
-        let numel: usize = info.shape.iter().product();
-
-        let f16_data: Vec<half::f16> = match dtype {
-            DType::F16 => {
-                // Direct load - no conversion needed
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                bytemuck::cast_slice(raw).to_vec()
-            }
-            DType::F32 => {
-                // Convert F32 -> F16
-                let byte_len = numel * 4;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let f32_slice: &[f32] = bytemuck::cast_slice(raw);
-                f32_slice.iter().map(|&x| half::f16::from_f32(x)).collect()
-            }
-            DType::BF16 => {
-                // Convert BF16 -> F16
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let bf16_slice: &[half::bf16] = bytemuck::cast_slice(raw);
-                bf16_slice
-                    .iter()
-                    .map(|x| half::f16::from_f32(x.to_f32()))
-                    .collect()
-            }
-            other => {
-                return Err(Error::UnsupportedDtype(format!(
-                    "Cannot load '{name}' as f16: dtype is {other}"
-                )));
-            }
-        };
-
-        CudaTensor::from_slice(ctx, &info.shape, &f16_data)
-    }
-
-    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::bf16>> {
-        let info = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
-
-        let dtype = ggml_type_to_dtype(info.ggml_type)?;
-        let data_start = self.tensor_data_offset + info.offset as usize;
-        let numel: usize = info.shape.iter().product();
-
-        let bf16_data: Vec<half::bf16> = match dtype {
-            DType::BF16 => {
-                // Direct load - no conversion needed
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                bytemuck::cast_slice(raw).to_vec()
-            }
-            DType::F32 => {
-                // Convert F32 -> BF16
-                let byte_len = numel * 4;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let f32_slice: &[f32] = bytemuck::cast_slice(raw);
-                f32_slice.iter().map(|&x| half::bf16::from_f32(x)).collect()
-            }
-            DType::F16 => {
-                // Convert F16 -> BF16
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let f16_slice: &[half::f16] = bytemuck::cast_slice(raw);
-                f16_slice
-                    .iter()
-                    .map(|x| half::bf16::from_f32(x.to_f32()))
-                    .collect()
-            }
-            other => {
-                return Err(Error::UnsupportedDtype(format!(
-                    "Cannot load '{name}' as bf16: dtype is {other}"
-                )));
-            }
-        };
-
-        CudaTensor::from_slice(ctx, &info.shape, &bf16_data)
-    }
-
     fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
         let info = self
             .tensors
@@ -809,7 +720,6 @@ fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
     match ggml_type {
         GGML_TYPE_F32 => Ok(DType::F32),
         GGML_TYPE_F16 => Ok(DType::F16),
-        GGML_TYPE_BF16 => Ok(DType::BF16),
         GGML_TYPE_Q8_0 => Ok(DType::Q8_0),
         GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
         GGML_TYPE_Q6_K => Ok(DType::Q6_K),

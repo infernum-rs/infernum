@@ -1,6 +1,3 @@
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-
 extern "C" __global__ void rope_f32(
     float* __restrict__ output,
     const float* __restrict__ input,
@@ -39,70 +36,4 @@ extern "C" __global__ void rope_f32(
     
     output[idx0] = x0 * cos_val - x1 * sin_val;
     output[idx1] = x0 * sin_val + x1 * cos_val;
-}
-
-extern "C" __global__ void rope_f16(
-    __half* __restrict__ output,
-    const __half* __restrict__ input,
-    const __half* __restrict__ cos_cache,
-    const __half* __restrict__ sin_cache,
-    const int seq_len,
-    const int num_heads,
-    const int head_dim,
-    const int position_offset
-) {
-    const int seq_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
-    const int pair_idx = threadIdx.x;
-    
-    if (pair_idx >= head_dim / 2) return;
-    
-    const int pos = position_offset + seq_idx;
-    const int half_dim = head_dim / 2;
-    const int base_idx = (seq_idx * num_heads + head_idx) * head_dim;
-    const int idx0 = base_idx + pair_idx;
-    const int idx1 = base_idx + pair_idx + half_dim;
-    const int cache_idx = pos * (head_dim / 2) + pair_idx;
-    
-    // Compute in F32 for precision
-    float cos_val = __half2float(cos_cache[cache_idx]);
-    float sin_val = __half2float(sin_cache[cache_idx]);
-    float x0 = __half2float(input[idx0]);
-    float x1 = __half2float(input[idx1]);
-    
-    output[idx0] = __float2half(x0 * cos_val - x1 * sin_val);
-    output[idx1] = __float2half(x0 * sin_val + x1 * cos_val);
-}
-
-extern "C" __global__ void rope_bf16(
-    __nv_bfloat16* __restrict__ output,
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_bfloat16* __restrict__ cos_cache,
-    const __nv_bfloat16* __restrict__ sin_cache,
-    const int seq_len,
-    const int num_heads,
-    const int head_dim,
-    const int position_offset
-) {
-    const int seq_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
-    const int pair_idx = threadIdx.x;
-    
-    if (pair_idx >= head_dim / 2) return;
-    
-    const int pos = position_offset + seq_idx;
-    const int half_dim = head_dim / 2;
-    const int base_idx = (seq_idx * num_heads + head_idx) * head_dim;
-    const int idx0 = base_idx + pair_idx;
-    const int idx1 = base_idx + pair_idx + half_dim;
-    const int cache_idx = pos * (head_dim / 2) + pair_idx;
-    
-    // Compute in F32 for precision
-    float cos_val = __bfloat162float(cos_cache[cache_idx]);
-    float sin_val = __bfloat162float(sin_cache[cache_idx]);
-    float x0 = __bfloat162float(input[idx0]);
-    float x1 = __bfloat162float(input[idx1]);
-    
-    output[idx0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
-    output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
 }

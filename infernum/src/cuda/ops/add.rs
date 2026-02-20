@@ -11,55 +11,37 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/add.ptx"));
-const KERNEL_NAMES: &[&str] = &[
-    "add_f32",
-    "add_inplace_f32",
-    "add_f16",
-    "add_inplace_f16",
-    "add_bf16",
-    "add_inplace_bf16",
-];
 
-/// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for add: {type_name}")
-    }
-}
-
-/// Add two tensors element-wise (generic version)
-fn add_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+/// Add two tensors element-wise on GPU: output = a + b
+///
+/// Both tensors must have the same shape.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn add(a: &CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     assert_eq!(a.shape(), b.shape(), "Shapes must match for addition");
 
     let shape = a.shape();
     let n = a.numel();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(a.context(), shape)? };
+    let mut output = unsafe { CudaTensor::<f32>::uninit(a.context(), shape)? };
 
     let device = a.context().device();
-    let kernel_name = format!("add_{}", kernel_suffix::<T>());
 
     let module_name = "add";
-    if !device.has_func(module_name, &kernel_name) {
-        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+    if !device.has_func(module_name, "add_f32") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &["add_f32", "add_inplace_f32"],
+        )?;
     }
 
-    let func = device.get_func(module_name, &kernel_name).unwrap();
+    let func = device.get_func(module_name, "add_f32").unwrap();
 
     let block_size = 256;
     let grid_size = (n + block_size - 1) / block_size;
@@ -85,23 +67,28 @@ fn add_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(output)
 }
 
-/// Add tensor `b` into `a` in place (generic version)
-fn add_inplace_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &mut CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<()> {
+/// Add tensor `b` into `a` in place on GPU: a += b
+///
+/// Both tensors must have the same shape.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn add_inplace(a: &mut CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<()> {
     assert_eq!(a.shape(), b.shape(), "Shapes must match for addition");
 
     let n = a.numel();
     let device = a.context().device();
-    let kernel_name = format!("add_inplace_{}", kernel_suffix::<T>());
 
     let module_name = "add";
-    if !device.has_func(module_name, &kernel_name) {
-        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+    if !device.has_func(module_name, "add_inplace_f32") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &["add_f32", "add_inplace_f32"],
+        )?;
     }
 
-    let func = device.get_func(module_name, &kernel_name).unwrap();
+    let func = device.get_func(module_name, "add_inplace_f32").unwrap();
 
     let block_size = 256;
     let grid_size = (n + block_size - 1) / block_size;
@@ -117,34 +104,6 @@ fn add_inplace_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
     }
 
     Ok(())
-}
-
-/// Add two tensors element-wise on GPU: output = a + b
-///
-/// Supports F32, F16, and BF16 tensor types.
-/// Both tensors must have the same shape.
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn add<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
-    add_generic(a, b)
-}
-
-/// Add tensor `b` into `a` in place on GPU: a += b
-///
-/// Supports F32, F16, and BF16 tensor types.
-/// Both tensors must have the same shape.
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn add_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &mut CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<()> {
-    add_inplace_generic(a, b)
 }
 
 #[cfg(test)]

@@ -15,7 +15,6 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -32,12 +31,12 @@ infernum_macros::define_block! {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn add_rmsnorm<T: TensorDType + cudarc::driver::DeviceRepr>(
-        residual: &CudaTensor<T>,
-        x: &CudaTensor<T>,
-        weight: &CudaTensor<T>,
+    pub fn add_rmsnorm(
+        residual: &CudaTensor<f32>,
+        x: &CudaTensor<f32>,
+        weight: &CudaTensor<f32>,
         eps: f32,
-    ) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+    ) -> Result<(CudaTensor<f32>, CudaTensor<f32>)> {
         let sum = super::add(residual, x)?;
         let normed = super::rms_norm(&sum, weight, eps)?;
         Ok((sum, normed))
@@ -45,7 +44,7 @@ infernum_macros::define_block! {
 }
 
 infernum_macros::define_fusion! {
-    name: "add_rmsnorm",
+    block: ADD_RMSNORM_FUSED,
     fn add_rmsnorm_fused(
         residual: &CudaTensor<f32>,
         x: &CudaTensor<f32>,

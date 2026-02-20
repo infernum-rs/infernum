@@ -11,55 +11,51 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::{CudaContext, CudaTensor};
-use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/embed.ptx"));
-const KERNEL_NAMES: &[&str] = &[
-    "embedding_gather_f32",
-    "embedding_gather_f16",
-    "embedding_gather_bf16",
-];
 
-/// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for embed: {type_name}")
-    }
-}
-
-/// Gather embeddings (generic version)
-fn embedding_gather_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
+/// Gather embeddings from an embedding table using token IDs, entirely on GPU
+///
+/// # Arguments
+/// * `ctx` - CUDA context
+/// * `embed_table` - Embedding weight table of shape (vocab_size, hidden_size)
+/// * `input_ids` - Token IDs as a host slice of length seq_len
+///
+/// # Returns
+/// Output tensor of shape (seq_len, hidden_size)
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn embedding_gather(
     ctx: &CudaContext,
-    embed_table: &CudaTensor<T>,
+    embed_table: &CudaTensor<f32>,
     input_ids: &[u32],
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor<f32>> {
     let hidden_size = embed_table.shape()[1];
     let seq_len = input_ids.len();
 
     let output_shape = [seq_len, hidden_size];
-    let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
+    let mut output = unsafe { CudaTensor::<f32>::uninit(ctx, &output_shape)? };
 
     // Copy input_ids to GPU
     let ids_gpu = ctx.device().htod_sync_copy(input_ids)?;
 
     let device = ctx.device();
-    let kernel_name = format!("embedding_gather_{}", kernel_suffix::<T>());
 
     let module_name = "embed";
-    if !device.has_func(module_name, &kernel_name) {
-        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+    if !device.has_func(module_name, "embedding_gather_f32") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &["embedding_gather_f32"],
+        )?;
     }
 
-    let func = device.get_func(module_name, &kernel_name).unwrap();
+    let func = device
+        .get_func(module_name, "embedding_gather_f32")
+        .unwrap();
 
     let block_size = 256;
     let grid_y = (hidden_size + block_size - 1) / block_size;
@@ -84,28 +80,6 @@ fn embedding_gather_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
     }
 
     Ok(output)
-}
-
-/// Gather embeddings from an embedding table using token IDs, entirely on GPU
-///
-/// Supports F32, F16, and BF16 tensor types.
-///
-/// # Arguments
-/// * `ctx` - CUDA context
-/// * `embed_table` - Embedding weight table of shape (vocab_size, hidden_size)
-/// * `input_ids` - Token IDs as a host slice of length seq_len
-///
-/// # Returns
-/// Output tensor of shape (seq_len, hidden_size)
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn embedding_gather<T: TensorDType + cudarc::driver::DeviceRepr>(
-    ctx: &CudaContext,
-    embed_table: &CudaTensor<T>,
-    input_ids: &[u32],
-) -> Result<CudaTensor<T>> {
-    embedding_gather_generic(ctx, embed_table, input_ids)
 }
 
 #[cfg(test)]

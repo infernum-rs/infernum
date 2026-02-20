@@ -3,8 +3,8 @@
 //! This example shows how `define_block!` and `define_fusion!` work together:
 //!
 //! 1. A "block" wraps a function into a decomposed implementation + dispatcher
-//! 2. A "fusion" registers an optimized replacement into a global registry
-//! 3. `fusion::init()` runs all deferred registrations
+//! 2. A "fusion" registers an optimized replacement
+//! 3. `fusion::init()` activates all registered fusions
 //!
 //! Run with:
 //!   cargo run --example fusion_example
@@ -20,7 +20,8 @@ use infernum::fusion;
 //
 // `define_block!` generates:
 //   - `add_and_double_decomposed(a, b)` — the original body
-//   - `add_and_double(a, b)` — dispatcher that checks fusion registry
+//   - `ADD_AND_DOUBLE_FUSED` — OnceLock static for the fused replacement
+//   - `add_and_double(a, b)` — dispatcher that checks for fusion
 infernum_macros::define_block! {
     /// Add two numbers and double the result.
     fn add_and_double(a: i32, b: i32) -> i32 {
@@ -31,10 +32,10 @@ infernum_macros::define_block! {
 
 // --- Step 2: Define a fusion ---
 //
-// `define_fusion!` registers an optimized implementation into the global
-// fusion registry, keyed by block name + function pointer type.
+// `define_fusion!` registers an optimized implementation that replaces
+// the decomposed version. The `block:` path points to the OnceLock static.
 infernum_macros::define_fusion! {
-    name: "add_and_double",
+    block: ADD_AND_DOUBLE_FUSED,
     fn add_and_double_fused(a: i32, b: i32) -> i32 {
         // In a real fusion, this would be a single CUDA kernel instead of
         // two separate ops. Here we just mark it so we can tell which path ran.
@@ -49,13 +50,21 @@ fn main() {
     // Before init: fused replacement is not yet registered
     println!("=== Before fusion::init() ===");
     println!("add_and_double({a}, {b}) = {}", add_and_double(a, b));
+    println!(
+        "  (static populated: {})",
+        ADD_AND_DOUBLE_FUSED.get().is_some()
+    );
 
-    // Initialize the fusion registry — runs all inventory-collected registrations
+    // Initialize the fusion registry — populates all OnceLock statics
     fusion::init();
 
     println!(
         "
 === After fusion::init() ==="
+    );
+    println!(
+        "  (static populated: {})",
+        ADD_AND_DOUBLE_FUSED.get().is_some()
     );
     println!("add_and_double({a}, {b}) = {}", add_and_double(a, b));
 

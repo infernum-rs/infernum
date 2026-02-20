@@ -11,26 +11,10 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/mul.ptx"));
-const KERNEL_NAMES: &[&str] = &["mul_f32", "mul_f16", "mul_bf16"];
-
-/// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for mul: {type_name}")
-    }
-}
 
 /// Multiply two tensors element-wise on GPU: output = a * b
 ///
@@ -38,26 +22,22 @@ fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn mul<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn mul(a: &CudaTensor<f32>, b: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     assert_eq!(a.shape(), b.shape(), "Shapes must match for multiplication");
 
     let shape = a.shape();
     let n = a.numel();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(a.context(), shape)? };
+    let mut output = unsafe { CudaTensor::<f32>::uninit(a.context(), shape)? };
 
     let device = a.context().device();
-    let kernel_name = format!("mul_{}", kernel_suffix::<T>());
 
     let module_name = "mul";
-    if !device.has_func(module_name, &kernel_name) {
-        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+    if !device.has_func(module_name, "mul_f32") {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, &["mul_f32"])?;
     }
 
-    let func = device.get_func(module_name, &kernel_name).unwrap();
+    let func = device.get_func(module_name, "mul_f32").unwrap();
 
     let block_size = 256;
     let grid_size = (n + block_size - 1) / block_size;

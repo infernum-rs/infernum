@@ -1,42 +1,44 @@
 //! Minimal benchmark for infernum decode throughput
 //! Measures raw forward_next_token performance (no tokenizer decode needed)
-//!
-//! Usage:
-//!   cargo run --release --example bench --features cuda -- models/llama-3.2-1b 256
-//!   cargo run --release --example bench --features cuda -- --dtype bf16 models/llama-3.2-1b 256
 
 use std::time::Instant;
-
-use clap::Parser;
 
 use infernum::cuda::CudaContext;
 use infernum::{GenerateOptions, Model};
 use infernum_llama::LlamaModel;
 use infernum_runtime::Engine;
 
-#[derive(Parser)]
-#[command(name = "bench")]
-struct Cli {
-    /// Path to model directory or .gguf file
-    model: String,
+fn main() -> infernum::Result<()> {
+    let model_path = std::env::args().nth(1).expect("Usage: bench <model_path>");
+    let n_gen: usize = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "128".to_string())
+        .parse()
+        .unwrap();
 
-    /// Number of tokens to generate
-    #[arg(default_value_t = 128)]
-    n_gen: usize,
+    let ctx = CudaContext::new(0)?;
 
-    /// Compute dtype: f32 or bf16 (only for SafeTensors models)
-    #[arg(long, default_value = "f32")]
-    dtype: String,
-}
+    let is_gguf = model_path.ends_with(".gguf");
+    let model = if is_gguf {
+        LlamaModel::from_gguf(&ctx, &model_path)?
+    } else {
+        LlamaModel::from_pretrained(&ctx, &model_path)?
+    };
 
-fn bench_model<M: Model>(model: M, ctx: &CudaContext, n_gen: usize) -> infernum::Result<()> {
-    let mut engine = Engine::new(ctx, model)?;
+    eprintln!(
+        "Model loaded ({} layers, {} hidden)",
+        model.config().num_hidden_layers,
+        model.config().hidden_size,
+    );
 
+    let mut engine = Engine::new(&ctx, model)?;
+
+    // Use simple numeric prompt tokens that are always valid
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let options = GenerateOptions {
         max_new_tokens: n_gen,
-        eos_token_id: None,
-        sampling: None,
+        eos_token_id: None, // don't stop early
+        sampling: None,     // greedy
         use_kv_cache: true,
     };
 
@@ -66,37 +68,4 @@ fn bench_model<M: Model>(model: M, ctx: &CudaContext, n_gen: usize) -> infernum:
     );
 
     Ok(())
-}
-
-fn main() -> infernum::Result<()> {
-    let cli = Cli::parse();
-    let ctx = CudaContext::new(0)?;
-    let is_gguf = cli.model.ends_with(".gguf");
-
-    match cli.dtype.as_str() {
-        "f32" => {
-            let model = if is_gguf {
-                LlamaModel::from_gguf(&ctx, &cli.model)?
-            } else {
-                LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?
-            };
-            eprintln!(
-                "Model loaded: {} layers, {} hidden, dtype=f32",
-                model.config().num_hidden_layers,
-                model.config().hidden_size,
-            );
-            bench_model(model, &ctx, cli.n_gen)
-        }
-        "bf16" => {
-            assert!(!is_gguf, "bf16 dtype is only supported for SafeTensors models");
-            let model = LlamaModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
-            eprintln!(
-                "Model loaded: {} layers, {} hidden, dtype=bf16",
-                model.config().num_hidden_layers,
-                model.config().hidden_size,
-            );
-            bench_model(model, &ctx, cli.n_gen)
-        }
-        other => panic!("Unsupported dtype: {other}. Use f32 or bf16."),
-    }
 }

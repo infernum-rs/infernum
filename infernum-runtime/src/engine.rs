@@ -18,7 +18,7 @@ use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, Sampling
 pub struct Engine<M: Model> {
     model: M,
     model_config: ModelConfig,
-    kv_cache: KvCache<M::CacheDtype>,
+    kv_cache: KvCache,
 }
 
 impl<M: Model> Engine<M> {

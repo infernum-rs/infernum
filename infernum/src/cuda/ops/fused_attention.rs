@@ -20,23 +20,8 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
-
-/// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for fused_attention: {type_name}")
-    }
-}
 
 /// Fused decode attention kernel.
 ///
@@ -81,43 +66,25 @@ const FUSED_PREFILL_PTX: &str = include_str!(concat!(
     "/kernels/fused_prefill_attention.ptx"
 ));
 
-const FUSED_DECODE_KERNEL_NAMES: &[&str] = &[
-    "fused_decode_attention_f32",
-    "fused_decode_attention_f16",
-    "fused_decode_attention_bf16",
-];
-
-const FUSED_PREFILL_KERNEL_NAMES: &[&str] = &[
-    "fused_prefill_attention_f32",
-    "fused_prefill_attention_f16",
-    "fused_prefill_attention_bf16",
-];
-
-fn ensure_fused_decode_kernel<T: cudarc::driver::DeviceRepr>(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-) -> Result<()> {
+fn ensure_fused_decode_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "fused_decode_attention";
-    let kernel_name = format!("fused_decode_attention_{}", kernel_suffix::<T>());
-    if !device.has_func(module_name, &kernel_name) {
+    if !device.has_func(module_name, "fused_decode_attention_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(FUSED_DECODE_PTX),
             module_name,
-            FUSED_DECODE_KERNEL_NAMES,
+            &["fused_decode_attention_f32"],
         )?;
     }
     Ok(())
 }
 
-fn ensure_fused_prefill_kernel<T: cudarc::driver::DeviceRepr>(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-) -> Result<()> {
+fn ensure_fused_prefill_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "fused_prefill_attention";
-    let kernel_name = format!("fused_prefill_attention_{}", kernel_suffix::<T>());
-    if !device.has_func(module_name, &kernel_name) {
+    if !device.has_func(module_name, "fused_prefill_attention_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(FUSED_PREFILL_PTX),
             module_name,
-            FUSED_PREFILL_KERNEL_NAMES,
+            &["fused_prefill_attention_f32"],
         )?;
     }
     Ok(())
@@ -139,11 +106,11 @@ fn ensure_fused_prefill_kernel<T: cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
-pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
-    q: &CudaTensor<T>,
-    k: &CudaTensor<T>,
-    v: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn fused_attention_decode(
+    q: &CudaTensor<f32>,
+    k: &CudaTensor<f32>,
+    v: &CudaTensor<f32>,
+) -> Result<CudaTensor<f32>> {
     let q_shape = q.shape();
     let k_shape = k.shape();
     let v_shape = v.shape();
@@ -175,18 +142,16 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     let scale = 1.0 / (head_dim as f32).sqrt();
     let output_shape = [1, num_heads, head_dim];
-    let mut output = unsafe { CudaTensor::<T>::uninit(q.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::<f32>::uninit(q.context(), &output_shape)? };
 
     let device = q.context().device();
-    ensure_fused_decode_kernel::<T>(device)?;
+    ensure_fused_decode_kernel(device)?;
 
-    let kernel_name = format!("fused_decode_attention_{}", kernel_suffix::<T>());
     let func = device
-        .get_func("fused_decode_attention", &kernel_name)
+        .get_func("fused_decode_attention", "fused_decode_attention_f32")
         .unwrap();
 
     let block_size = 256_usize.min(total_len.next_power_of_two());
-    // Shared memory uses f32 for accumulation regardless of input dtype
     let shared_mem = (head_dim + block_size) * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
@@ -232,12 +197,12 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
-pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
-    q: &CudaTensor<T>,
-    k: &CudaTensor<T>,
-    v: &CudaTensor<T>,
+pub fn fused_attention_prefill(
+    q: &CudaTensor<f32>,
+    k: &CudaTensor<f32>,
+    v: &CudaTensor<f32>,
     offset: usize,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor<f32>> {
     let q_shape = q.shape();
     let k_shape = k.shape();
     let v_shape = v.shape();
@@ -273,14 +238,13 @@ pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     let scale = 1.0 / (head_dim as f32).sqrt();
     let output_shape = [seq_q, num_heads, head_dim];
-    let mut output = unsafe { CudaTensor::<T>::uninit(q.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::<f32>::uninit(q.context(), &output_shape)? };
 
     let device = q.context().device();
-    ensure_fused_prefill_kernel::<T>(device)?;
+    ensure_fused_prefill_kernel(device)?;
 
-    let kernel_name = format!("fused_prefill_attention_{}", kernel_suffix::<T>());
     let func = device
-        .get_func("fused_prefill_attention", &kernel_name)
+        .get_func("fused_prefill_attention", "fused_prefill_attention_f32")
         .unwrap();
 
     let block_size = 256_usize.min(total_len.next_power_of_two());
@@ -316,7 +280,7 @@ pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
 
 // Register the fused attention as a replacement for the decomposed attention_kv block.
 infernum_macros::define_fusion! {
-    name: "attention_kv",
+    block: super::ATTENTION_KV_FUSED,
     fn attention_kv_fused(
         q: &CudaTensor<f32>,
         kv_cache: &mut crate::cuda::KvCache,

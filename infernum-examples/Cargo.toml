@@ -27,7 +27,3 @@ required-features = ["cuda"]
 [[example]]
 name = "custom_triton_op"
 required-features = ["cuda"]
-
-[[example]]
-name = "bench"
-required-features = ["cuda"]

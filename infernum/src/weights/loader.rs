@@ -8,8 +8,6 @@ use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use crate::dtype::DType;
 #[cfg(feature = "cuda")]
 use crate::{Error, Result};
-#[cfg(feature = "cuda")]
-use half::{bf16, f16};
 
 /// Trait for loading model weights from various formats
 #[cfg(feature = "cuda")]
@@ -22,18 +20,6 @@ pub trait WeightLoader {
     /// # Errors
     /// Returns an error if the tensor is not found or loading fails
     fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>>;
-
-    /// Load a tensor by name as f16 (no conversion if already f16)
-    ///
-    /// # Errors
-    /// Returns an error if the tensor is not found or loading fails
-    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f16>>;
-
-    /// Load a tensor by name as bf16 (no conversion if already bf16)
-    ///
-    /// # Errors
-    /// Returns an error if the tensor is not found or loading fails
-    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<bf16>>;
 
     /// Load a tensor as a quantized tensor (FP8, `Q8_0`, etc.)
     ///
