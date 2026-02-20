@@ -17,6 +17,8 @@ use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
+
+
 /// Perform matrix multiplication: C = A @ B
 ///
 /// Supports 2D matrices and batched 3D tensors.
@@ -58,6 +60,9 @@ where
 }
 
 /// 2D matrix multiplication: (M, K) @ (K, N) -> (M, N)
+///
+/// When M=1, uses a direct `gemm_ex` call with `CUBLAS_GEMM_DEFAULT_TENSOR_OP`
+/// to ensure cuBLAS selects a GEMV-class kernel instead of a tile-based GEMM.
 fn matmul_2d<T>(a: &CudaTensor<T>, b: &CudaTensor<T>) -> Result<CudaTensor<T>>
 where
     T: TensorDType + DeviceRepr + GemmScalar + Default,
@@ -244,7 +249,7 @@ fn matmul_bf16_f32_2d(
     Ok(c)
 }
 
-/// Trait for GEMM scalar values (alpha/beta coefficients)
+/// Trait for GEMM scalar values (alpha/beta coefficients).
 pub trait GemmScalar {
     /// The multiplicative identity (1.0)
     const ONE: Self;
