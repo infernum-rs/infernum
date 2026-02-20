@@ -1,16 +1,8 @@
-// Branchless f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC).
-// Uses bit manipulation instead of ldexpf; subnormals are flushed to zero
-// which is safe for quantization scale factors (always normal floats).
+// f16 → f32 using PTX cvt instruction (single HW instruction on sm_70+,
+// avoids cuda_fp16.h dependency while being more efficient than bit tricks).
 __device__ float f16_to_f32(unsigned short bits) {
-    unsigned int sign = (bits & 0x8000u) << 16;
-    unsigned int exp  = (bits >> 10) & 0x1Fu;
-    unsigned int mant = bits & 0x3FFu;
-    // Zero/subnormal (exp==0) or inf/NaN (exp==31): treated as zero for scales
-    unsigned int is_normal = (exp != 0u && exp != 31u) ? 0xFFFFFFFFu : 0u;
-    unsigned int f32_bits = sign | ((exp + 112u) << 23) | (mant << 13);
-    f32_bits &= is_normal;
     float result;
-    memcpy(&result, &f32_bits, 4);
+    asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(bits));
     return result;
 }
 
