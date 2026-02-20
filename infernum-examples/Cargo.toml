@@ -26,6 +26,10 @@ name = "generate_parallel"
 required-features = ["nccl"]
 
 [[example]]
+name = "verify_parallel"
+required-features = ["nccl"]
+
+[[example]]
 name = "bench"
 required-features = ["cuda"]
 
