@@ -129,6 +129,154 @@ impl SafeTensorsLoader {
     }
 }
 
+impl SafeTensorsLoader {
+    /// Load a GPTQ-quantized linear layer from SafeTensors.
+    ///
+    /// Expects tensors named `{prefix}.qweight`, `{prefix}.scales`, `{prefix}.qzeros`.
+    ///
+    /// GPTQ layout:
+    /// - `qweight`: `[in_features/8, out_features]` as int32 (8 INT4 values per int32)
+    /// - `scales`:  `[in_features/group_size, out_features]` as f16
+    /// - `qzeros`:  `[in_features/group_size, out_features/8]` as int32
+    ///
+    /// # Errors
+    /// Returns an error if any required tensor is missing or GPU allocation fails.
+    ///
+    /// # Panics
+    /// Panics if the scales or qzeros shapes are inconsistent with the qweight shape
+    /// and group size.
+    pub fn load_gptq_linear(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        let qweight_name = format!("{prefix}.qweight");
+        let scales_name = format!("{prefix}.scales");
+        let qzeros_name = format!("{prefix}.qzeros");
+
+        let qweight_meta = self
+            .tensors
+            .get(&qweight_name)
+            .ok_or_else(|| Error::WeightNotFound(qweight_name.clone()))?;
+        let scales_meta = self
+            .tensors
+            .get(&scales_name)
+            .ok_or_else(|| Error::WeightNotFound(scales_name.clone()))?;
+        let qzeros_meta = self
+            .tensors
+            .get(&qzeros_name)
+            .ok_or_else(|| Error::WeightNotFound(qzeros_name.clone()))?;
+
+        let qweight_data = self.get_tensor_data(&qweight_name)?;
+        let scales_data = self.get_tensor_data(&scales_name)?;
+        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
+
+        // Derive logical shape: [in_features, out_features]
+        let in_features = qweight_meta.shape[0] * 8; // unpacked from int32
+        let out_features = qweight_meta.shape[1];
+
+        // Validate scales shape
+        let expected_num_groups = in_features / group_size;
+        assert_eq!(
+            scales_meta.shape,
+            vec![expected_num_groups, out_features],
+            "GPTQ scales shape mismatch: expected [{expected_num_groups}, {out_features}], got {:?}",
+            scales_meta.shape
+        );
+        assert_eq!(
+            qzeros_meta.shape,
+            vec![expected_num_groups, out_features / 8],
+            "GPTQ qzeros shape mismatch: expected [{expected_num_groups}, {}], got {:?}",
+            out_features / 8,
+            qzeros_meta.shape
+        );
+
+        QuantizedTensor::from_gptq_raw(
+            ctx,
+            &[in_features, out_features],
+            DType::GPTQ_INT4,
+            qweight_data,
+            scales_data,
+            qzeros_data,
+            group_size,
+        )
+    }
+
+    /// Load an AWQ-quantized linear layer from SafeTensors.
+    ///
+    /// Expects tensors named `{prefix}.qweight`, `{prefix}.scales`, `{prefix}.qzeros`.
+    ///
+    /// AWQ layout (transposed packing axis vs GPTQ):
+    /// - `qweight`: `[in_features, out_features/8]` as int32 (8 INT4 values per int32)
+    /// - `scales`:  `[in_features/group_size, out_features]` as f16
+    /// - `qzeros`:  `[in_features/group_size, out_features/8]` as int32
+    ///
+    /// # Errors
+    /// Returns an error if any required tensor is missing or GPU allocation fails.
+    ///
+    /// # Panics
+    /// Panics if the scales or qzeros shapes are inconsistent with the qweight shape
+    /// and group size.
+    pub fn load_awq_linear(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        let qweight_name = format!("{prefix}.qweight");
+        let scales_name = format!("{prefix}.scales");
+        let qzeros_name = format!("{prefix}.qzeros");
+
+        let qweight_meta = self
+            .tensors
+            .get(&qweight_name)
+            .ok_or_else(|| Error::WeightNotFound(qweight_name.clone()))?;
+        let scales_meta = self
+            .tensors
+            .get(&scales_name)
+            .ok_or_else(|| Error::WeightNotFound(scales_name.clone()))?;
+        let qzeros_meta = self
+            .tensors
+            .get(&qzeros_name)
+            .ok_or_else(|| Error::WeightNotFound(qzeros_name.clone()))?;
+
+        let qweight_data = self.get_tensor_data(&qweight_name)?;
+        let scales_data = self.get_tensor_data(&scales_name)?;
+        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
+
+        // Derive logical shape: [in_features, out_features]
+        let in_features = qweight_meta.shape[0];
+        let out_features = qweight_meta.shape[1] * 8; // unpacked from int32
+
+        // Validate scales shape
+        let expected_num_groups = in_features / group_size;
+        assert_eq!(
+            scales_meta.shape,
+            vec![expected_num_groups, out_features],
+            "AWQ scales shape mismatch: expected [{expected_num_groups}, {out_features}], got {:?}",
+            scales_meta.shape
+        );
+        assert_eq!(
+            qzeros_meta.shape,
+            vec![expected_num_groups, out_features / 8],
+            "AWQ qzeros shape mismatch: expected [{expected_num_groups}, {}], got {:?}",
+            out_features / 8,
+            qzeros_meta.shape
+        );
+
+        QuantizedTensor::from_gptq_raw(
+            ctx,
+            &[in_features, out_features],
+            DType::AWQ_INT4,
+            qweight_data,
+            scales_data,
+            qzeros_data,
+            group_size,
+        )
+    }
+}
+
 impl WeightLoader for SafeTensorsLoader {
     fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>> {
         let meta = self
