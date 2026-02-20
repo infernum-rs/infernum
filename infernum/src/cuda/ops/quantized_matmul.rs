@@ -42,6 +42,9 @@ const FP8_QUANTIZE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/f
 /// Quantize f32 activations to FP8 E4M3 on-the-fly, returning the
 /// quantized buffer and a device-side inverse scale factor (for cuBLASLt).
 ///
+/// Uses a single fused kernel that computes absmax and quantizes in one launch,
+/// eliminating the overhead of a separate absmax kernel call.
+///
 /// Everything runs on the GPU — no CPU↔GPU synchronization.
 fn quantize_activations_to_fp8(
     ctx: &CudaContext,
@@ -51,54 +54,50 @@ fn quantize_activations_to_fp8(
     let device = ctx.device();
 
     let module_name = "fp8_quantize";
-    if !device.has_func(module_name, "absmax_f32") {
+    if !device.has_func(module_name, "fused_absmax_quantize_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(FP8_QUANTIZE_PTX),
             module_name,
-            &["absmax_f32", "quantize_f32_to_fp8"],
+            &[
+                "absmax_f32",
+                "quantize_f32_to_fp8",
+                "fused_absmax_quantize_f32",
+            ],
         )?;
     }
 
-    // Pass 1: find absmax (result stays on device)
-    let mut max_bits = device.htod_sync_copy(&[0_u32])?;
-    {
-        let threads = 256;
-        let blocks = ((numel + threads - 1) / threads).min(1024);
-        let cfg = LaunchConfig {
-            grid_dim: (blocks as u32, 1, 1),
-            block_dim: (threads as u32, 1, 1),
-            shared_mem_bytes: (threads * std::mem::size_of::<u32>()) as u32,
-        };
-        let func = device.get_func(module_name, "absmax_f32").unwrap();
-        unsafe {
-            func.launch(cfg, (&input.cuda_slice(), &mut max_bits, numel as i32))?;
-        }
-    }
-
-    // Pass 2: compute scale on-device, write inv_scale to device buffer, quantize
+    let mut max_bits = device.alloc_zeros::<u32>(1)?;
+    let mut block_counter = device.alloc_zeros::<u32>(1)?;
     let mut act_fp8 = unsafe { device.alloc::<u8>(numel)? };
     let mut d_inv_scale = unsafe { device.alloc::<f32>(1)? };
-    {
-        let threads = 256;
-        let blocks = (numel + threads - 1) / threads;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks as u32, 1, 1),
-            block_dim: (threads as u32, 1, 1),
-            shared_mem_bytes: std::mem::size_of::<f32>() as u32,
-        };
-        let func = device.get_func(module_name, "quantize_f32_to_fp8").unwrap();
-        unsafe {
-            func.launch(
-                cfg,
-                (
-                    &input.cuda_slice(),
-                    &mut act_fp8,
-                    &max_bits,
-                    &mut d_inv_scale,
-                    numel as i32,
-                ),
-            )?;
-        }
+
+    let threads = 256;
+    let blocks = ((numel + threads - 1) / threads).min(1024);
+    let num_warps = threads / 32;
+    let shared_mem = num_warps * std::mem::size_of::<f32>();
+
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    let func = device
+        .get_func(module_name, "fused_absmax_quantize_f32")
+        .unwrap();
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                &input.cuda_slice(),
+                &mut act_fp8,
+                &mut max_bits,
+                &mut d_inv_scale,
+                &mut block_counter,
+                numel as i32,
+            ),
+        )?;
     }
 
     Ok((act_fp8, d_inv_scale))
