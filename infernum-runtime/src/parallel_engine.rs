@@ -263,3 +263,112 @@ fn recent_token_window<'a>(tokens: &'a [u32], sampling: Option<&SamplingParams>)
     let start = tokens.len().saturating_sub(window);
     &tokens[start..]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- collect_rank0 ----
+
+    #[test]
+    fn test_collect_rank0_returns_first_result() {
+        let result: Result<i32> = thread::scope(|s| {
+            let handles = vec![s.spawn(|| Ok(10)), s.spawn(|| Ok(20)), s.spawn(|| Ok(30))];
+            collect_rank0(handles)
+        });
+        assert_eq!(result.unwrap(), 10);
+    }
+
+    #[test]
+    fn test_collect_rank0_single_handle() {
+        let result: Result<&str> = thread::scope(|s| {
+            let handles = vec![s.spawn(|| Ok("hello"))];
+            collect_rank0(handles)
+        });
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_collect_rank0_propagates_rank0_error() {
+        let result: Result<i32> = thread::scope(|s| {
+            let handles = vec![
+                s.spawn(|| Err(infernum::Error::InvalidShape("rank0 failed".into()))),
+                s.spawn(|| Ok(20)),
+            ];
+            collect_rank0(handles)
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "no rank 0")]
+    fn test_collect_rank0_panics_on_empty() {
+        let _: Result<i32> = thread::scope(|s| {
+            let handles: Vec<thread::ScopedJoinHandle<'_, Result<i32>>> = vec![];
+            collect_rank0(handles)
+        });
+    }
+
+    // ---- recent_token_window ----
+
+    #[test]
+    fn test_recent_token_window_no_sampling() {
+        let tokens = [1, 2, 3, 4, 5];
+        let window = recent_token_window(&tokens, None);
+        assert!(window.is_empty());
+    }
+
+    #[test]
+    fn test_recent_token_window_zero_window() {
+        let tokens = [1, 2, 3];
+        let sampling = SamplingParams {
+            repetition_penalty_window: 0,
+            ..default_sampling()
+        };
+        let window = recent_token_window(&tokens, Some(&sampling));
+        assert!(window.is_empty());
+    }
+
+    #[test]
+    fn test_recent_token_window_partial() {
+        let tokens = [10, 20, 30, 40, 50];
+        let sampling = SamplingParams {
+            repetition_penalty_window: 3,
+            ..default_sampling()
+        };
+        let window = recent_token_window(&tokens, Some(&sampling));
+        assert_eq!(window, &[30, 40, 50]);
+    }
+
+    #[test]
+    fn test_recent_token_window_larger_than_tokens() {
+        let tokens = [1, 2];
+        let sampling = SamplingParams {
+            repetition_penalty_window: 100,
+            ..default_sampling()
+        };
+        let window = recent_token_window(&tokens, Some(&sampling));
+        assert_eq!(window, &[1, 2]);
+    }
+
+    #[test]
+    fn test_recent_token_window_exact_match() {
+        let tokens = [1, 2, 3];
+        let sampling = SamplingParams {
+            repetition_penalty_window: 3,
+            ..default_sampling()
+        };
+        let window = recent_token_window(&tokens, Some(&sampling));
+        assert_eq!(window, &[1, 2, 3]);
+    }
+
+    fn default_sampling() -> SamplingParams {
+        SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed: 42,
+            repetition_penalty: 1.0,
+            repetition_penalty_window: 0,
+        }
+    }
+}
