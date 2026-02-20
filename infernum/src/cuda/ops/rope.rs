@@ -11,10 +11,12 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::{CudaContext, CudaTensor};
+use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/rope.ptx"));
+const KERNEL_NAMES: &[&str] = &["rope_f32", "rope_f16", "rope_bf16"];
 
 /// Precompute cosine and sine caches for RoPE
 ///
@@ -55,22 +57,27 @@ pub fn precompute_rope_cache(
     Ok((cos_cache, sin_cache))
 }
 
-/// Apply rotary positional embeddings to Q and K tensors
-///
-/// # Arguments
-/// * `input` - Input tensor of shape (seq_len, num_heads, head_dim)
-/// * `cos_cache` - Precomputed cos cache of shape (max_seq_len, head_dim/2)
-/// * `sin_cache` - Precomputed sin cache of shape (max_seq_len, head_dim/2)
-/// * `position_offset` - Starting position (for incremental decoding)
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn apply_rope(
-    input: &CudaTensor<f32>,
-    cos_cache: &CudaTensor<f32>,
-    sin_cache: &CudaTensor<f32>,
+/// Kernel name suffix for dtype
+fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
+    let type_name = std::any::type_name::<T>();
+    if type_name.contains("f32") {
+        "f32"
+    } else if type_name.contains("f16") && !type_name.contains("bf16") {
+        "f16"
+    } else if type_name.contains("bf16") {
+        "bf16"
+    } else {
+        panic!("Unsupported dtype for rope: {type_name}")
+    }
+}
+
+/// Apply rotary positional embeddings (generic version)
+fn apply_rope_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
     position_offset: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor<T>> {
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -84,20 +91,17 @@ pub fn apply_rope(
 
     assert_eq!(head_dim % 2, 0, "head_dim must be even");
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
 
     let device = input.context().device();
+    let kernel_name = format!("rope_{}", kernel_suffix::<T>());
 
     let module_name = "rope";
-    if !device.has_func(module_name, "rope_f32") {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            &["rope_f32"],
-        )?;
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
     }
 
-    let func = device.get_func(module_name, "rope_f32").unwrap();
+    let func = device.get_func(module_name, &kernel_name).unwrap();
 
     let cfg = LaunchConfig {
         grid_dim: (seq_len as u32, num_heads as u32, 1),
@@ -122,6 +126,27 @@ pub fn apply_rope(
     }
 
     Ok(output)
+}
+
+/// Apply rotary positional embeddings to Q and K tensors
+///
+/// Supports F32, F16, and BF16 tensor types.
+///
+/// # Arguments
+/// * `input` - Input tensor of shape (seq_len, num_heads, head_dim)
+/// * `cos_cache` - Precomputed cos cache of shape (max_seq_len, head_dim/2)
+/// * `sin_cache` - Precomputed sin cache of shape (max_seq_len, head_dim/2)
+/// * `position_offset` - Starting position (for incremental decoding)
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn apply_rope<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    position_offset: usize,
+) -> Result<CudaTensor<T>> {
+    apply_rope_generic(input, cos_cache, sin_cache, position_offset)
 }
 
 #[cfg(test)]
