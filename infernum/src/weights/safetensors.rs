@@ -160,9 +160,14 @@ impl WeightLoader for SafeTensorsLoader {
                     "cannot convert U32 weights to f32".to_string(),
                 ));
             }
-            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::F8E4M3 => {
+            DType::Q8_0
+            | DType::Q4_0
+            | DType::Q6_K
+            | DType::F8E4M3
+            | DType::GPTQ_INT4
+            | DType::AWQ_INT4 => {
                 return Err(Error::UnsupportedDtype(format!(
-                    "cannot load quantized dtype {} from SafeTensors (use GGUF instead)",
+                    "cannot load quantized dtype {} as f32",
                     meta.dtype
                 )));
             }
@@ -291,6 +296,8 @@ fn safetensors_dtype_to_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::F16 => Ok(DType::F16),
         safetensors::Dtype::BF16 => Ok(DType::BF16),
         safetensors::Dtype::F8_E4M3 => Ok(DType::F8E4M3),
+        // GPTQ/AWQ store qweight and qzeros as int32
+        safetensors::Dtype::I32 => Ok(DType::U32),
         other => Err(Error::UnsupportedDtype(format!("{other:?}"))),
     }
 }
@@ -312,6 +319,10 @@ mod tests {
         assert!(matches!(
             safetensors_dtype_to_dtype(safetensors::Dtype::BF16),
             Ok(DType::BF16)
+        ));
+        assert!(matches!(
+            safetensors_dtype_to_dtype(safetensors::Dtype::I32),
+            Ok(DType::U32)
         ));
     }
 }

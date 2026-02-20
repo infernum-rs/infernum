@@ -1883,6 +1883,7 @@ mod tests {
             tie_word_embeddings: false,
             bos_token_id: 1,
             eos_token_id: 2,
+            quantization_config: None,
         }
     }
 

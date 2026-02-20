@@ -6,6 +6,31 @@ use serde::Deserialize;
 
 use infernum::Result;
 
+/// Quantization configuration parsed from `config.json`
+///
+/// Present in GPTQ and AWQ quantized models under the `quantization_config` key.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuantizationConfig {
+    /// Quantization method: `"gptq"` or `"awq"`
+    pub quant_method: String,
+
+    /// Number of bits per weight (typically 4)
+    #[serde(default = "default_quant_bits")]
+    pub bits: u32,
+
+    /// Number of elements per quantization group (typically 128)
+    #[serde(default = "default_group_size")]
+    pub group_size: usize,
+}
+
+fn default_quant_bits() -> u32 {
+    4
+}
+
+fn default_group_size() -> usize {
+    128
+}
+
 /// Configuration for Llama models
 ///
 /// Parsed from the model's `config.json` file
@@ -56,6 +81,10 @@ pub struct LlamaConfig {
         deserialize_with = "deserialize_single_or_first"
     )]
     pub eos_token_id: u32,
+
+    /// Quantization configuration (present for GPTQ/AWQ models)
+    #[serde(default)]
+    pub quantization_config: Option<QuantizationConfig>,
 }
 
 /// Deserialize a field that may be a single `u32` or an array of `u32`.
@@ -172,6 +201,7 @@ impl LlamaConfig {
                 .get("tokenizer.ggml.eos_token_id")
                 .and_then(GgufValue::as_usize)
                 .unwrap_or(2) as u32,
+            quantization_config: None,
         })
     }
 
@@ -307,6 +337,81 @@ mod tests {
         assert_eq!(config.num_kv_heads(), 8);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_config_gptq_quantization() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "quantization_config": {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128
+            }
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        let qc = config.quantization_config.unwrap();
+        assert_eq!(qc.quant_method, "gptq");
+        assert_eq!(qc.bits, 4);
+        assert_eq!(qc.group_size, 128);
+    }
+
+    #[test]
+    fn test_config_awq_quantization() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "quantization_config": {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128
+            }
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        let qc = config.quantization_config.unwrap();
+        assert_eq!(qc.quant_method, "awq");
+    }
+
+    #[test]
+    fn test_config_no_quantization() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert!(config.quantization_config.is_none());
+    }
+
+    #[test]
+    fn test_config_quantization_defaults() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "quantization_config": {
+                "quant_method": "gptq"
+            }
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        let qc = config.quantization_config.unwrap();
+        assert_eq!(qc.bits, 4);
+        assert_eq!(qc.group_size, 128);
     }
 
     #[test]

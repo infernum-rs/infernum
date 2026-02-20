@@ -4,6 +4,6 @@ mod config;
 #[cfg(feature = "cuda")]
 mod model;
 
-pub use config::LlamaConfig;
+pub use config::{LlamaConfig, QuantizationConfig};
 #[cfg(feature = "cuda")]
 pub use model::LlamaModel;
