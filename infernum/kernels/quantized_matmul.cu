@@ -399,17 +399,15 @@ extern "C" __global__ void quantize_f32_to_q8_1(
 }
 
 // -----------------------------------------------------------------------
-// dp4a GEMV kernels: use __dp4a with Q8_1 quantized activations
+// dp4a GEMV kernels: warp-parallel K-splitting with dp4a
 // -----------------------------------------------------------------------
-// Same 1D block layout as the f32-activation GEMV (GEMV_BLOCK threads per
-// CUDA block, one output element per thread), but the inner loop uses dp4a
-// to compute dot(int8x4_weight, int8x4_activation) in a single instruction.
+// One warp (32 threads) per output row. Each thread processes a subset of
+// the K-dimension quant blocks, then a warp shuffle reduction sums the
+// partial f32 accumulators. This parallelizes the K-loop 32-way.
 //
-// This gives ~4× compute throughput vs scalar f32 multiply-add, and reduces
-// activation bandwidth by 4× (int8 vs f32).
+// Launch config: grid = (N, 1, 1), block = (32, 1, 1), shared_mem = 0.
 
-// Q8_0 × Q8_1 dp4a GEMV
-// result[n] = sum_b( d_w[b] * d_a[b] * dp4a_sum(w_int8, a_int8) )
+// Q8_0 × Q8_1 dp4a GEMV (warp-parallel)
 extern "C" __global__ void gemv_q8_q8_dp4a(
     float*              __restrict__ output,
     const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
@@ -419,13 +417,15 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
     const int N,
     const int K
 ) {
-    const int n = blockIdx.x * GEMV_BLOCK + threadIdx.x;
+    const int n = blockIdx.x;
     if (n >= N) return;
 
+    const int tid = threadIdx.x;           // lane within warp [0..31]
     const int blocks_per_row = K / 32;
     float acc = 0.0f;
 
-    for (int b = 0; b < blocks_per_row; b++) {
+    // Each thread handles blocks: tid, tid+32, tid+64, ...
+    for (int b = tid; b < blocks_per_row; b += 32) {
         float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
         float d_a = act_scales[b];
 
@@ -433,7 +433,6 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
         const signed char* w_ptr = weight_data + n * K + base_k;
         const signed char* a_ptr = act_data + base_k;
 
-        // 32 elements = 8 dp4a calls (4 int8 elements each)
         int sumi = 0;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -446,16 +445,18 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
         acc += d_w * d_a * (float)sumi;
     }
 
-    output[n] = acc;
+    // Warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (tid == 0) {
+        output[n] = acc;
+    }
 }
 
-// Q4_0 × Q8_1 dp4a GEMV (with zero-point correction)
-// For Q4_0, each nibble value is unsigned [0,15] and needs -8 offset.
-// Using dp4a, we defer the subtraction:
-//   dot(w_unsigned, a) = dp4a(w_nibbles_as_uint8, a_int8)
-//   correction = 8 * sum(a_qs) per block
-//   result[n] = sum_b( d_w[b] * (d_a[b] * dp4a_sum - 8 * s_a[b]) )
-// where s_a[b] = d_a[b] * sum(a_qs[b]) is precomputed in quantization.
+// Q4_0 × Q8_1 dp4a GEMV (warp-parallel, with zero-point correction)
 extern "C" __global__ void gemv_q4_q8_dp4a(
     float*              __restrict__ output,
     const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
@@ -466,50 +467,48 @@ extern "C" __global__ void gemv_q4_q8_dp4a(
     const int N,
     const int K
 ) {
-    const int n = blockIdx.x * GEMV_BLOCK + threadIdx.x;
+    const int n = blockIdx.x;
     if (n >= N) return;
 
+    const int tid = threadIdx.x;
     const int blocks_per_row = K / 32;
     float acc = 0.0f;
 
-    for (int b = 0; b < blocks_per_row; b++) {
+    for (int b = tid; b < blocks_per_row; b += 32) {
         float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
         float d_a = act_scales[b];
-        float s_a = act_sums[b];  // = d_a * sum(a_qs)
+        float s_a = act_sums[b];
 
-        int base_k = b * 32;
         const unsigned char* w_ptr = weight_data + n * (K / 2) + b * 16;
-        const signed char* a_ptr = act_data + base_k;
+        const signed char* a_ptr = act_data + b * 32;
 
-        // Process 16 bytes of weight data (32 nibbles) against 32 int8 activations.
-        // Low nibbles correspond to elements [0..15], high to [16..31].
         int sumi = 0;
         #pragma unroll
         for (int i = 0; i < 4; i++) {
             unsigned int w4;
             memcpy(&w4, w_ptr + i * 4, 4);
 
-            // Extract low nibbles as bytes (elements i*4..i*4+3)
             int lo = (int)(w4 & 0x0F0F0F0Fu);
-            // Extract high nibbles as bytes (elements i*4+16..i*4+19)
             int hi = (int)((w4 >> 4) & 0x0F0F0F0Fu);
 
-            // Load activation int8x4 for corresponding positions
             int a_lo, a_hi;
             memcpy(&a_lo, a_ptr + i * 4, 4);
             memcpy(&a_hi, a_ptr + 16 + i * 4, 4);
 
-            // dp4a(int,int,int): treats both as int8x4. Nibble values [0,15]
-            // fit in signed int8, so dp4a gives the correct dot product.
             sumi = __dp4a(lo, a_lo, sumi);
             sumi = __dp4a(hi, a_hi, sumi);
         }
 
-        // sumi = sum(w_unsigned * a_qs), need to subtract 8 * sum(a_qs) for zero-point
-        // d_a * sumi = d_a * sum(w_unsigned * a_qs)
-        // correction: 8 * d_a * sum(a_qs) = 8 * s_a
         acc += d_w * (d_a * (float)sumi - 8.0f * s_a);
     }
 
-    output[n] = acc;
+    // Warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (tid == 0) {
+        output[n] = acc;
+    }
 }

@@ -330,8 +330,6 @@ fn quantized_gemv(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor<f32>> {
-    const GEMV_BLOCK: u32 = 16;
-
     let ctx = input.context();
     let device = ctx.device();
 
@@ -342,10 +340,10 @@ fn quantized_gemv(
 
     let module_name = "quantized_matmul";
 
-    let grid_x = (n as u32 + GEMV_BLOCK - 1) / GEMV_BLOCK;
+    // One warp (32 threads) per output row, K-split across lanes
     let cfg = LaunchConfig {
-        grid_dim: (grid_x, 1, 1),
-        block_dim: (GEMV_BLOCK, 1, 1),
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
 
