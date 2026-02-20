@@ -958,7 +958,10 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
 
         // input: (2, 3), weight pre-transposed: (3, 4) -> output: (2, 4)
-        let input_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let input_data: Vec<half::bf16> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect();
         let weight_data: Vec<half::bf16> = vec![
             half::bf16::from_f32(1.0),
             half::bf16::from_f32(0.0),
@@ -976,13 +979,18 @@ mod tests {
 
         let input = CudaTensor::from_slice(&ctx, &[2, 3], &input_data).unwrap();
         let weight =
-            LinearWeight::BF16(CudaTensor::from_slice(&ctx, &[3, 4], &weight_data).unwrap());
+            LinearWeight::Dense(CudaTensor::from_slice(&ctx, &[3, 4], &weight_data).unwrap());
 
         let output = linear(&input, &weight).unwrap();
 
         assert_eq!(output.shape(), &[2, 4]);
 
-        let result = output.to_vec().unwrap();
+        let result: Vec<f32> = output
+            .to_vec()
+            .unwrap()
+            .into_iter()
+            .map(half::bf16::to_f32)
+            .collect();
         // Same expected results as f32 test: row 0: [1, 2, 3, 6], row 1: [4, 5, 6, 15]
         assert!((result[0] - 1.0).abs() < 0.1);
         assert!((result[1] - 2.0).abs() < 0.1);
