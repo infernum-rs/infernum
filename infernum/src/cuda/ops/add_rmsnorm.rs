@@ -76,8 +76,9 @@ pub fn add_rmsnorm<T: TensorDType + cudarc::driver::DeviceRepr>(
     let func = device.get_func(module_name, &kernel_name).unwrap();
 
     let block_size = 256.min(hidden_size);
-    // Shared memory for block reduction (always f32 accumulators)
-    let shared_mem = block_size * std::mem::size_of::<f32>();
+    // Shared memory for warp-level reduction: one float per warp
+    let num_warps = block_size.div_ceil(32);
+    let shared_mem = num_warps * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
         grid_dim: (num_rows as u32, 1, 1),
