@@ -228,10 +228,7 @@ mod tests {
 
         let r1 = shard_tensor_on_host(&tensor, &shard(1, 2), ShardStrategy::Column).unwrap();
         assert_eq!(r1.shape(), &[2, 3]);
-        assert_eq!(
-            r1.to_vec().unwrap(),
-            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
-        );
+        assert_eq!(r1.to_vec().unwrap(), vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
     }
 
     #[test]
@@ -251,10 +248,7 @@ mod tests {
 
         let r1 = shard_tensor_on_host(&tensor, &shard(1, 2), ShardStrategy::Row).unwrap();
         assert_eq!(r1.shape(), &[3, 2]);
-        assert_eq!(
-            r1.to_vec().unwrap(),
-            vec![3.0, 4.0, 7.0, 8.0, 11.0, 12.0]
-        );
+        assert_eq!(r1.to_vec().unwrap(), vec![3.0, 4.0, 7.0, 8.0, 11.0, 12.0]);
     }
 
     #[test]
@@ -291,10 +285,7 @@ mod tests {
                 shard_tensor_on_host(&tensor, &shard(rank, 4), ShardStrategy::Column).unwrap();
             assert_eq!(result.shape(), &[2, 2]);
             let start = rank * 4;
-            assert_eq!(
-                result.to_vec().unwrap(),
-                data[start..start + 4].to_vec()
-            );
+            assert_eq!(result.to_vec().unwrap(), data[start..start + 4].to_vec());
         }
     }
 
