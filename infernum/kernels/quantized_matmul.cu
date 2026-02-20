@@ -1,20 +1,17 @@
-// Manual f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC)
+// Branchless f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC).
+// Uses bit manipulation instead of ldexpf; subnormals are flushed to zero
+// which is safe for quantization scale factors (always normal floats).
 __device__ float f16_to_f32(unsigned short bits) {
-    unsigned int sign = (bits >> 15) & 0x1;
-    unsigned int exp  = (bits >> 10) & 0x1F;
-    unsigned int mant = bits & 0x3FF;
-
+    unsigned int sign = (bits & 0x8000u) << 16;
+    unsigned int exp  = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    // Zero/subnormal (exp==0) or inf/NaN (exp==31): treated as zero for scales
+    unsigned int is_normal = (exp != 0u && exp != 31u) ? 0xFFFFFFFFu : 0u;
+    unsigned int f32_bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    f32_bits &= is_normal;
     float result;
-    if (exp == 0) {
-        // Subnormal or zero
-        result = ldexpf((float)mant / 1024.0f, -14);
-    } else if (exp == 31) {
-        // Inf / NaN — treat as zero for safety in scale context
-        result = 0.0f;
-    } else {
-        result = ldexpf(1.0f + (float)mant / 1024.0f, (int)exp - 15);
-    }
-    return sign ? -result : result;
+    memcpy(&result, &f32_bits, 4);
+    return result;
 }
 
 // Q8_0 matmul: output[m][n] = sum_k( input[m][k] * dequant(weight[n][k]) )
@@ -229,4 +226,113 @@ extern "C" __global__ void matmul_q6k_f32(
     }
 
     output[m * N + n] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// GEMV kernels: specialized for M=1 decode
+// ---------------------------------------------------------------------------
+//
+// One thread per output element (same principle as the GEMM kernel with M=1,
+// but using a 1D block layout to avoid wasting 15/16 of threads).
+//
+// Block: (GEMV_BLOCK, 1) threads     Grid: (ceil(N / GEMV_BLOCK), 1)
+// Each thread loops over all K/32 quant blocks sequentially, maximizing
+// instruction-level parallelism and sequential memory access for weights.
+// Input vector is small (fits in L2 cache) and is broadcast to all threads.
+
+#define GEMV_BLOCK 16
+
+// Q8_0 GEMV: output[n] = dot(input[K], dequant(weight[n, K]))
+extern "C" __global__ void gemv_q8_f32(
+    float*              __restrict__ output,
+    const float*        __restrict__ input,
+    const signed char*  __restrict__ weight_data,
+    const unsigned short* __restrict__ weight_scales,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x * GEMV_BLOCK + threadIdx.x;
+    if (n >= N) return;
+
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        float scale = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        int base_k = b * 32;
+        const signed char* w_ptr = weight_data + n * K + base_k;
+        const float* in_ptr = input + base_k;
+
+        float block_acc = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int w4;
+            memcpy(&w4, w_ptr + i * 4, 4);
+            const signed char* w4b = (const signed char*)&w4;
+
+            float4 in4;
+            memcpy(&in4, in_ptr + i * 4, 16);
+
+            block_acc += w4b[0] * in4.x + w4b[1] * in4.y +
+                         w4b[2] * in4.z + w4b[3] * in4.w;
+        }
+
+        acc += scale * block_acc;
+    }
+
+    output[n] = acc;
+}
+
+// Q4_0 GEMV: output[n] = dot(input[K], dequant(weight[n, K]))
+// GGML Q4_0 packing: byte[j] has element j (low nibble), element j+16 (high nibble)
+extern "C" __global__ void gemv_q4_f32(
+    float*              __restrict__ output,
+    const float*        __restrict__ input,
+    const unsigned char* __restrict__ weight_data,
+    const unsigned short* __restrict__ weight_scales,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x * GEMV_BLOCK + threadIdx.x;
+    if (n >= N) return;
+
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        float scale = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        int base_k = b * 32;
+        const unsigned char* w_ptr = weight_data + n * (K / 2) + b * 16;
+        const float* in_ptr = input + base_k;
+
+        float block_acc = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            unsigned int w4;
+            memcpy(&w4, w_ptr + i * 4, 4);
+            const unsigned char* w4b = (const unsigned char*)&w4;
+
+            float4 in_lo;
+            memcpy(&in_lo, in_ptr + i * 4, 16);
+
+            float4 in_hi;
+            memcpy(&in_hi, in_ptr + 16 + i * 4, 16);
+
+            block_acc += ((int)(w4b[0] & 0x0F) - 8) * in_lo.x;
+            block_acc += ((int)(w4b[1] & 0x0F) - 8) * in_lo.y;
+            block_acc += ((int)(w4b[2] & 0x0F) - 8) * in_lo.z;
+            block_acc += ((int)(w4b[3] & 0x0F) - 8) * in_lo.w;
+
+            block_acc += ((int)(w4b[0] >> 4) - 8) * in_hi.x;
+            block_acc += ((int)(w4b[1] >> 4) - 8) * in_hi.y;
+            block_acc += ((int)(w4b[2] >> 4) - 8) * in_hi.z;
+            block_acc += ((int)(w4b[3] >> 4) - 8) * in_hi.w;
+        }
+
+        acc += scale * block_acc;
+    }
+
+    output[n] = acc;
 }

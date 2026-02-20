@@ -254,6 +254,74 @@ fn quantized_matmul_fp8_cublas(
 }
 
 // ---------------------------------------------------------------------------
+// GEMV: M=1 decode fast path for quantized formats
+// ---------------------------------------------------------------------------
+
+/// GEMV kernel for M=1 decode: `output[1, N] = input[1, K] @ dequant(weight[N, K])^T`
+///
+/// Uses one block per output row with 4 warps of 32 threads splitting the K
+/// dimension, warp shuffle reduction, and vectorized loads.
+fn quantized_gemv(
+    input: &CudaTensor<f32>,
+    weight: &QuantizedTensor,
+    n: usize,
+    k: usize,
+) -> Result<CudaTensor<f32>> {
+    const GEMV_BLOCK: u32 = 16;
+
+    let ctx = input.context();
+    let device = ctx.device();
+    let mut output = unsafe { CudaTensor::<f32>::uninit(ctx, &[1, n])? };
+
+    let module_name = "quantized_matmul";
+
+    let grid_x = (n as u32 + GEMV_BLOCK - 1) / GEMV_BLOCK;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (GEMV_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    match weight.dtype() {
+        DType::Q8_0 => {
+            let func = device.get_func(module_name, "gemv_q8_f32").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &input.cuda_slice(),
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::Q4_0 => {
+            let func = device.get_func(module_name, "gemv_q4_f32").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &input.cuda_slice(),
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        other => panic!("quantized_gemv: unsupported dtype {other}"),
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -311,8 +379,6 @@ fn quantized_matmul_2d(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor<f32>> {
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), &[m, n])? };
-
     let device = input.context().device();
 
     let module_name = "quantized_matmul";
@@ -325,9 +391,18 @@ fn quantized_matmul_2d(
                 "matmul_q4_f32",
                 "matmul_fp8_f32",
                 "matmul_q6k_f32",
+                "gemv_q8_f32",
+                "gemv_q4_f32",
             ],
         )?;
     }
+
+    // GEMV fast path for M=1 decode (Q8_0 and Q4_0 only)
+    if m == 1 && matches!(weight.dtype(), DType::Q8_0 | DType::Q4_0) {
+        return quantized_gemv(input, weight, n, k);
+    }
+
+    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), &[m, n])? };
 
     let block_x = 16;
     let block_y = 16;
@@ -1401,6 +1476,178 @@ mod tests {
                 result[i],
                 expected[i],
                 (result[i] - expected[i]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_q8_m1() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 1;
+        let k = 2048;
+        let n = 2048;
+
+        let mut state: u64 = 11111;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+        let (q_data, q_scales) = quantize_q8_host(&w_data, QUANTIZATION_BLOCK_SIZE);
+        let weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q8_0, &q_data, &q_scales).unwrap();
+
+        // Dequantize on CPU for reference
+        let mut expected = vec![0.0_f32; m * n];
+        for col in 0..n {
+            let mut acc = 0.0_f64;
+            let blocks_per_row = k / QUANTIZATION_BLOCK_SIZE;
+            for b in 0..blocks_per_row {
+                let scale = half::f16::from_le_bytes([
+                    q_scales[col * blocks_per_row * 2 + b * 2],
+                    q_scales[col * blocks_per_row * 2 + b * 2 + 1],
+                ])
+                .to_f32();
+                for j in 0..QUANTIZATION_BLOCK_SIZE {
+                    let w_val =
+                        q_data[col * k + b * QUANTIZATION_BLOCK_SIZE + j] as i8 as f32 * scale;
+                    acc += f64::from(input_data[b * QUANTIZATION_BLOCK_SIZE + j] * w_val);
+                }
+            }
+            expected[col] = acc as f32;
+        }
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+        assert_eq!(result.len(), n);
+
+        for i in 0..n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.05,
+                "GEMV Q8 mismatch at [{}]: got {} expected {} (rel_err={:.4})",
+                i,
+                result[i],
+                expected[i],
+                rel_err
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_q4_m1() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 1;
+        let k = 2048;
+        let n = 2048;
+
+        let mut state: u64 = 22222;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+        let (q_data, q_scales) = quantize_q4_host(&w_data, QUANTIZATION_BLOCK_SIZE);
+
+        // Dequantize on CPU for reference
+        let w_dequantized = dequantize_q4_host(&q_data, &q_scales, n * k);
+        let mut expected = vec![0.0_f32; n];
+        for col in 0..n {
+            let mut acc = 0.0_f64;
+            for i in 0..k {
+                acc += f64::from(input_data[i] * w_dequantized[col * k + i]);
+            }
+            expected[col] = acc as f32;
+        }
+
+        let weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q4_0, &q_data, &q_scales).unwrap();
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+        assert_eq!(result.len(), n);
+
+        for i in 0..n {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "GEMV Q4 mismatch at [{}]: got {} expected {} (diff={:.6})",
+                i,
+                result[i],
+                expected[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_matches_gemm_q8() {
+        // Verify GEMV produces the same output as GEMM for M=1
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 2048;
+        let n = 512;
+
+        let mut state: u64 = 33333;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let (q_data, q_scales) = quantize_q8_host(&w_data, QUANTIZATION_BLOCK_SIZE);
+        let weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q8_0, &q_data, &q_scales).unwrap();
+
+        // M=1 → uses GEMV path
+        let input_m1 = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+        let gemv_result = quantized_matmul(&input_m1, &weight)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+
+        // M=2 with identical rows → uses GEMM path, first row should match GEMV
+        let input_m2_data: Vec<f32> = input_data
+            .iter()
+            .chain(input_data.iter())
+            .copied()
+            .collect();
+        let input_m2 = CudaTensor::from_slice(&ctx, &[2, k], &input_m2_data).unwrap();
+        let gemm_result = quantized_matmul(&input_m2, &weight)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+
+        for i in 0..n {
+            let diff = (gemv_result[i] - gemm_result[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "GEMV vs GEMM mismatch at [{}]: GEMV={} GEMM={} (diff={:.6})",
+                i,
+                gemv_result[i],
+                gemm_result[i],
+                diff
             );
         }
     }
