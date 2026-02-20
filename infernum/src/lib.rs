@@ -28,8 +28,12 @@ pub use cuda::CudaGraph;
 pub use cuda::QuantizedTensor;
 #[cfg(feature = "cuda")]
 pub use cuda::SeqPosition;
+#[cfg(feature = "nccl")]
+pub use cuda::{nccl::NcclId, NcclCommunicator, NcclType};
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaTensor, KvCache};
+#[cfg(feature = "cuda")]
+pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
 pub use dtype::{DType, QUANTIZATION_BLOCK_SIZE};
 pub use error::{Error, Result};
 #[cfg(feature = "cuda")]

@@ -3,7 +3,8 @@
 #![allow(
     clippy::struct_field_names, // _proj suffix is conventional for Llama weights
     clippy::no_effect_underscore_binding,
-    clippy::doc_markdown // tensor shape docs trigger false positives
+    clippy::doc_markdown, // tensor shape docs trigger false positives
+    unused_mut // variables are conditionally mutated via cfg(feature = "nccl")
 )]
 
 use std::path::Path;
@@ -16,11 +17,38 @@ use infernum::cuda::ops::{
     transpose_2d, GemmScalar,
 };
 use infernum::cuda::{
-    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, QuantizedTensor,
-    ValidAsZeroBits,
+    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, QuantizedTensor,
+    ShardConfig, ShardStrategy, ValidAsZeroBits,
 };
+#[cfg(feature = "nccl")]
+use infernum::cuda::{NcclCommunicator, NcclType};
 use infernum::dtype::TensorDType;
 use infernum::tensor::Tensor;
+
+/// When NCCL is enabled, `MaybeNcclType` is `NcclType` — only types that
+/// support NCCL all-reduce satisfy it. When NCCL is disabled, it's a blanket
+/// trait so all tensor types work without NCCL-specific bounds.
+#[cfg(feature = "nccl")]
+trait MaybeNcclType: NcclType {}
+#[cfg(feature = "nccl")]
+impl<T: NcclType> MaybeNcclType for T {}
+
+#[cfg(not(feature = "nccl"))]
+trait MaybeNcclType {}
+#[cfg(not(feature = "nccl"))]
+impl<T> MaybeNcclType for T {}
+
+#[cfg(feature = "nccl")]
+fn nccl_all_reduce<T>(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor<T>) -> Result<()>
+where
+    T: TensorDType + DeviceRepr + ValidAsZeroBits + NcclType,
+{
+    if let Some(comm) = comm {
+        comm.all_reduce_sum_inplace(tensor)?;
+    }
+    Ok(())
+}
+
 use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 use infernum::KvCache;
 use infernum::Result;
@@ -264,6 +292,10 @@ struct LlamaLayerWeights<T: TensorDType> {
 pub struct LlamaModel<T: TensorDType> {
     config: LlamaConfig,
     ctx: CudaContext,
+    gpu_config: GpuConfig,
+
+    #[cfg(feature = "nccl")]
+    nccl_comm: Option<NcclCommunicator>,
 
     // Embeddings
     embed_tokens: CudaTensor<T>,
@@ -284,7 +316,7 @@ pub struct LlamaModel<T: TensorDType> {
 
 impl<T> LlamaModel<T>
 where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits,
+    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
     CudaBlas: Gemm<T>,
 {
     /// Load a Llama model from a directory containing SafeTensors and config.json
@@ -490,6 +522,9 @@ where
         Ok(Self {
             config,
             ctx: ctx.clone(),
+            gpu_config: GpuConfig::Single,
+            #[cfg(feature = "nccl")]
+            nccl_comm: None,
             embed_tokens,
             layers,
             norm,
@@ -658,8 +693,11 @@ where
         // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
         let attn_output = attn_output.reshape(&[seq_len, hidden_size]);
 
-        // Output projection
-        linear(&attn_output, &weights.o_proj)
+        // Output projection (row-parallel in TP: needs all-reduce)
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// Extract the last row from a (seq_len, hidden_size) tensor
@@ -831,7 +869,10 @@ where
         )?;
 
         let attn_output = attn_output.reshape(&[1, hidden_size]);
-        linear(&attn_output, &weights.o_proj)
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// Forward pass through MLP (SwiGLU)
@@ -869,8 +910,11 @@ where
         // SwiGLU activation
         let intermediate = swiglu(&gate, &up)?;
 
-        // Down projection
-        linear(&intermediate, &weights.down_proj)
+        // Down projection (row-parallel in TP: needs all-reduce)
+        let mut out = linear(&intermediate, &weights.down_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// Project hidden states to vocabulary logits (always f32)
@@ -1051,6 +1095,9 @@ impl LlamaModel<f32> {
         Ok(Self {
             config,
             ctx: ctx.clone(),
+            gpu_config: GpuConfig::Single,
+            #[cfg(feature = "nccl")]
+            nccl_comm: None,
             embed_tokens,
             layers,
             norm,
@@ -1171,14 +1218,17 @@ impl LlamaModel<f32> {
         // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
         let attn_output = attn_output.reshape(&[seq_len, hidden_size]);
 
-        // Output projection
-        linear(&attn_output, &weights.o_proj)
+        // Output projection (row-parallel in TP: needs all-reduce)
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 }
 
 impl<T> infernum::Model for LlamaModel<T>
 where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits,
+    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
     CudaBlas: Gemm<T>,
 {
     type CacheDtype = T;
@@ -1230,7 +1280,9 @@ where
 
             let attn_output = fused_attention_prefill(&q, &k, &v, 0)?;
             let attn_output = attn_output.reshape(&[seq_len, hidden_size]);
-            let attn_output = linear(&attn_output, &layer.attention.o_proj)?;
+            let mut attn_output = linear(&attn_output, &layer.attention.o_proj)?;
+            #[cfg(feature = "nccl")]
+            nccl_all_reduce(self.nccl_comm.as_ref(), &mut attn_output)?;
 
             let (mut h, normed) = add_rmsnorm(
                 &hidden,
