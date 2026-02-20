@@ -188,3 +188,148 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests {
+    use super::*;
+    use crate::tensor::Tensor;
+
+    fn shard(rank: usize, world_size: usize) -> ShardConfig {
+        ShardConfig { rank, world_size }
+    }
+
+    #[test]
+    fn test_replicate_returns_same_data() {
+        let ctx = CudaContext::new(0).unwrap();
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let tensor = CudaTensor::from_slice(&ctx, &[2, 3], &data).unwrap();
+
+        let result = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Replicate).unwrap();
+        assert_eq!(result.shape(), &[2, 3]);
+        assert_eq!(result.to_vec().unwrap(), data);
+    }
+
+    #[test]
+    fn test_column_shard_2_gpus() {
+        let ctx = CudaContext::new(0).unwrap();
+        // 4x3 matrix
+        let data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, // row 0
+            4.0, 5.0, 6.0, // row 1
+            7.0, 8.0, 9.0, // row 2
+            10.0, 11.0, 12.0, // row 3
+        ];
+        let tensor = CudaTensor::from_slice(&ctx, &[4, 3], &data).unwrap();
+
+        let r0 = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Column).unwrap();
+        assert_eq!(r0.shape(), &[2, 3]);
+        assert_eq!(r0.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let r1 = shard_tensor_on_host(&tensor, &shard(1, 2), ShardStrategy::Column).unwrap();
+        assert_eq!(r1.shape(), &[2, 3]);
+        assert_eq!(
+            r1.to_vec().unwrap(),
+            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn test_row_shard_2_gpus() {
+        let ctx = CudaContext::new(0).unwrap();
+        // 3x4 matrix
+        let data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, // row 0
+            5.0, 6.0, 7.0, 8.0, // row 1
+            9.0, 10.0, 11.0, 12.0, // row 2
+        ];
+        let tensor = CudaTensor::from_slice(&ctx, &[3, 4], &data).unwrap();
+
+        let r0 = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Row).unwrap();
+        assert_eq!(r0.shape(), &[3, 2]);
+        assert_eq!(r0.to_vec().unwrap(), vec![1.0, 2.0, 5.0, 6.0, 9.0, 10.0]);
+
+        let r1 = shard_tensor_on_host(&tensor, &shard(1, 2), ShardStrategy::Row).unwrap();
+        assert_eq!(r1.shape(), &[3, 2]);
+        assert_eq!(
+            r1.to_vec().unwrap(),
+            vec![3.0, 4.0, 7.0, 8.0, 11.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn test_column_shard_single_gpu() {
+        let ctx = CudaContext::new(0).unwrap();
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let tensor = CudaTensor::from_slice(&ctx, &[2, 3], &data).unwrap();
+
+        let result = shard_tensor_on_host(&tensor, &shard(0, 1), ShardStrategy::Column).unwrap();
+        assert_eq!(result.shape(), &[2, 3]);
+        assert_eq!(result.to_vec().unwrap(), data);
+    }
+
+    #[test]
+    fn test_row_shard_single_gpu() {
+        let ctx = CudaContext::new(0).unwrap();
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let tensor = CudaTensor::from_slice(&ctx, &[2, 3], &data).unwrap();
+
+        let result = shard_tensor_on_host(&tensor, &shard(0, 1), ShardStrategy::Row).unwrap();
+        assert_eq!(result.shape(), &[2, 3]);
+        assert_eq!(result.to_vec().unwrap(), data);
+    }
+
+    #[test]
+    fn test_column_shard_4_gpus() {
+        let ctx = CudaContext::new(0).unwrap();
+        // 8x2 matrix — 8 rows split among 4 GPUs → 2 rows each
+        let data: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+        let tensor = CudaTensor::from_slice(&ctx, &[8, 2], &data).unwrap();
+
+        for rank in 0..4 {
+            let result =
+                shard_tensor_on_host(&tensor, &shard(rank, 4), ShardStrategy::Column).unwrap();
+            assert_eq!(result.shape(), &[2, 2]);
+            let start = rank * 4;
+            assert_eq!(
+                result.to_vec().unwrap(),
+                data[start..start + 4].to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn test_row_shard_4_gpus() {
+        let ctx = CudaContext::new(0).unwrap();
+        // 2x8 matrix — 8 cols split among 4 GPUs → 2 cols each
+        let data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // row 0
+            9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, // row 1
+        ];
+        let tensor = CudaTensor::from_slice(&ctx, &[2, 8], &data).unwrap();
+
+        let r0 = shard_tensor_on_host(&tensor, &shard(0, 4), ShardStrategy::Row).unwrap();
+        assert_eq!(r0.shape(), &[2, 2]);
+        assert_eq!(r0.to_vec().unwrap(), vec![1.0, 2.0, 9.0, 10.0]);
+
+        let r3 = shard_tensor_on_host(&tensor, &shard(3, 4), ShardStrategy::Row).unwrap();
+        assert_eq!(r3.shape(), &[2, 2]);
+        assert_eq!(r3.to_vec().unwrap(), vec![7.0, 8.0, 15.0, 16.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Column shard requires a 2D tensor")]
+    fn test_column_shard_rejects_1d() {
+        let ctx = CudaContext::new(0).unwrap();
+        let tensor = CudaTensor::from_slice(&ctx, &[6], &[1.0f32; 6]).unwrap();
+        let _ = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Column);
+    }
+
+    #[test]
+    #[should_panic(expected = "Row shard requires a 2D tensor")]
+    fn test_row_shard_rejects_1d() {
+        let ctx = CudaContext::new(0).unwrap();
+        let tensor = CudaTensor::from_slice(&ctx, &[6], &[1.0f32; 6]).unwrap();
+        let _ = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Row);
+    }
+}
