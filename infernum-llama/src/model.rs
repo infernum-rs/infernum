@@ -10,8 +10,8 @@ use std::path::Path;
 
 use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, attention, cast_to_f32, embedding_gather, matmul,
-    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
-    transpose_2d, GemmScalar,
+    matmul_bf16_f32, precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm,
+    rms_norm_inplace, swiglu, transpose_2d, GemmScalar,
 };
 use infernum::cuda::ops::{fused_attention_decode, fused_attention_prefill};
 use infernum::cuda::{
@@ -82,6 +82,34 @@ fn split_gate_up<T: TensorDType + DeviceRepr + Default>(
     let gate = CudaTensor::from_slice(fused.context(), &[seq_len, intermediate_size], &gate_data)?;
     let up = CudaTensor::from_slice(fused.context(), &[seq_len, intermediate_size], &up_data)?;
     Ok((gate, up))
+}
+
+/// Split a `(seq_len, 2 * kv_dim)` tensor into two `(seq_len, kv_dim)` tensors
+/// (K and V) by deinterleaving rows.
+///
+/// Each row of the input is `[k(kv_dim), v(kv_dim)]`.
+/// Uses a host roundtrip — only called during prefill, not the hot decode path.
+fn split_kv<T: TensorDType + DeviceRepr + Default>(
+    fused: &CudaTensor<T>,
+    kv_dim: usize,
+) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+    let seq_len = fused.shape()[0];
+    let data = fused.to_vec()?;
+    let stride = 2 * kv_dim;
+
+    let mut k_data = vec![T::default(); seq_len * kv_dim];
+    let mut v_data = vec![T::default(); seq_len * kv_dim];
+
+    for row in 0..seq_len {
+        k_data[row * kv_dim..(row + 1) * kv_dim]
+            .copy_from_slice(&data[row * stride..row * stride + kv_dim]);
+        v_data[row * kv_dim..(row + 1) * kv_dim]
+            .copy_from_slice(&data[row * stride + kv_dim..(row + 1) * stride]);
+    }
+
+    let k = CudaTensor::from_slice(fused.context(), &[seq_len, kv_dim], &k_data)?;
+    let v = CudaTensor::from_slice(fused.context(), &[seq_len, kv_dim], &v_data)?;
+    Ok((k, v))
 }
 
 /// Reverse the llama.cpp Q/K weight permutation for f32 tensors.
@@ -170,11 +198,25 @@ enum LinearWeight<T: TensorDType> {
     Quantized(QuantizedTensor),
 }
 
+/// K+V projection storage: fused for dense weights, separate for quantized.
+enum KvProjWeight<T: TensorDType> {
+    /// K and V weights concatenated into a single (hidden, 2*kv_dim) dense
+    /// tensor. After matmul the output columns split as `[k(kv_dim), v(kv_dim)]`.
+    Fused {
+        weight: CudaTensor<T>,
+        kv_dim: usize,
+    },
+    /// Separate K and V projections (used for quantized weights).
+    Separate {
+        k_proj: Box<LinearWeight<T>>,
+        v_proj: Box<LinearWeight<T>>,
+    },
+}
+
 /// Weights for a single Llama attention layer
 struct LlamaAttentionWeights<T: TensorDType> {
     q_proj: LinearWeight<T>,
-    k_proj: LinearWeight<T>,
-    v_proj: LinearWeight<T>,
+    kv_proj: KvProjWeight<T>,
     o_proj: LinearWeight<T>,
 }
 
@@ -335,27 +377,42 @@ where
                     ctx,
                     &format!("{prefix}.input_layernorm.weight"),
                 )?,
-                attention: LlamaAttentionWeights {
-                    q_proj: load_linear::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.self_attn.q_proj.weight"),
-                    )?,
-                    k_proj: load_linear::<T>(
+                attention: {
+                    let k = load_linear::<T>(
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.k_proj.weight"),
-                    )?,
-                    v_proj: load_linear::<T>(
+                    )?;
+                    let v = load_linear::<T>(
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.v_proj.weight"),
-                    )?,
-                    o_proj: load_linear::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.self_attn.o_proj.weight"),
-                    )?,
+                    )?;
+                    let kv_proj = match (k, v) {
+                        (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
+                            KvProjWeight::Fused {
+                                kv_dim: config.num_kv_heads() * config.head_dim(),
+                                weight: concat_weights(&k_w, &v_w)?,
+                            }
+                        }
+                        (k, v) => KvProjWeight::Separate {
+                            k_proj: Box::new(k),
+                            v_proj: Box::new(v),
+                        },
+                    };
+                    LlamaAttentionWeights {
+                        q_proj: load_linear::<T>(
+                            ctx,
+                            loader,
+                            &format!("{prefix}.self_attn.q_proj.weight"),
+                        )?,
+                        kv_proj,
+                        o_proj: load_linear::<T>(
+                            ctx,
+                            loader,
+                            &format!("{prefix}.self_attn.o_proj.weight"),
+                        )?,
+                    }
                 },
                 post_attention_layernorm: load_typed::<T>(
                     loader,
@@ -555,8 +612,23 @@ where
 
         // Project Q, K, V
         let q = linear(hidden, &weights.q_proj)?;
-        let k = linear(hidden, &weights.k_proj)?;
-        let v = linear(hidden, &weights.v_proj)?;
+        let (k, v) = match &weights.kv_proj {
+            KvProjWeight::Fused { weight, kv_dim } => {
+                let kv = matmul(hidden, weight)?;
+                if seq_len == 1 {
+                    let k = kv.slice_view(0, &[1, *kv_dim]);
+                    let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
+                    (k, v)
+                } else {
+                    split_kv(&kv, *kv_dim)?
+                }
+            }
+            KvProjWeight::Separate { k_proj, v_proj } => {
+                let k = linear(hidden, k_proj)?;
+                let v = linear(hidden, v_proj)?;
+                (k, v)
+            }
+        };
 
         // Reshape: (seq_len, num_heads * head_dim) -> (seq_len, num_heads, head_dim)
         let q = q.reshape(&[seq_len, num_heads, head_dim]);
@@ -650,6 +722,17 @@ where
 
     /// Project hidden states to vocabulary logits (always f32)
     fn lm_head_forward(&self, hidden: &CudaTensor<T>) -> Result<CudaTensor<f32>> {
+        // bf16 + dense weight: use mixed-precision matmul to skip the cast kernel
+        if T::DTYPE == infernum::dtype::DType::BF16 {
+            if let LinearWeight::Dense(w) = &self.lm_head {
+                // Zero-copy reinterpret via slice_view (shared Arc, no GPU copy)
+                let h_bf16: CudaTensor<half::bf16> =
+                    unsafe { hidden.slice_view(0, hidden.shape()).reinterpret() };
+                let w_bf16: CudaTensor<half::bf16> =
+                    unsafe { w.slice_view(0, w.shape()).reinterpret() };
+                return matmul_bf16_f32(&h_bf16, &w_bf16);
+            }
+        }
         let logits_t = linear(hidden, &self.lm_head)?;
         cast_to_f32(&logits_t)
     }
@@ -724,21 +807,36 @@ impl LlamaModel<f32> {
 
             let layer = LlamaLayerWeights {
                 input_layernorm: loader.load_f32(ctx, &format!("{prefix}.attn_norm.weight"))?,
-                attention: LlamaAttentionWeights {
-                    q_proj: load_linear_unpermute(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.attn_q.weight"),
-                        config.num_attention_heads,
-                    )?,
-                    k_proj: load_linear_unpermute(
+                attention: {
+                    let k = load_linear_unpermute(
                         ctx,
                         loader,
                         &format!("{prefix}.attn_k.weight"),
                         config.num_kv_heads(),
-                    )?,
-                    v_proj: load_linear(ctx, loader, &format!("{prefix}.attn_v.weight"))?,
-                    o_proj: load_linear(ctx, loader, &format!("{prefix}.attn_output.weight"))?,
+                    )?;
+                    let v = load_linear(ctx, loader, &format!("{prefix}.attn_v.weight"))?;
+                    let kv_proj = match (k, v) {
+                        (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
+                            KvProjWeight::Fused {
+                                kv_dim: config.num_kv_heads() * config.head_dim(),
+                                weight: concat_weights(&k_w, &v_w)?,
+                            }
+                        }
+                        (k, v) => KvProjWeight::Separate {
+                            k_proj: Box::new(k),
+                            v_proj: Box::new(v),
+                        },
+                    };
+                    LlamaAttentionWeights {
+                        q_proj: load_linear_unpermute(
+                            ctx,
+                            loader,
+                            &format!("{prefix}.attn_q.weight"),
+                            config.num_attention_heads,
+                        )?,
+                        kv_proj,
+                        o_proj: load_linear(ctx, loader, &format!("{prefix}.attn_output.weight"))?,
+                    }
                 },
                 post_attention_layernorm: loader
                     .load_f32(ctx, &format!("{prefix}.ffn_norm.weight"))?,
@@ -880,8 +978,17 @@ impl LlamaModel<f32> {
 
         // Project Q, K, V
         let q = linear(hidden, &weights.q_proj)?;
-        let k = linear(hidden, &weights.k_proj)?;
-        let v = linear(hidden, &weights.v_proj)?;
+        let (k, v) = match &weights.kv_proj {
+            KvProjWeight::Fused { weight, kv_dim } => {
+                let kv = matmul(hidden, weight)?;
+                split_kv(&kv, *kv_dim)?
+            }
+            KvProjWeight::Separate { k_proj, v_proj } => {
+                let k = linear(hidden, k_proj)?;
+                let v = linear(hidden, v_proj)?;
+                (k, v)
+            }
+        };
 
         // Reshape for attention: (seq_len, num_heads, head_dim)
         let q = q.reshape(&[seq_len, num_heads, head_dim]);
@@ -945,8 +1052,17 @@ where
             let hidden_size = self.config.hidden_size;
 
             let q = linear(&normed, &layer.attention.q_proj)?;
-            let k = linear(&normed, &layer.attention.k_proj)?;
-            let v = linear(&normed, &layer.attention.v_proj)?;
+            let (k, v) = match &layer.attention.kv_proj {
+                KvProjWeight::Fused { weight, kv_dim } => {
+                    let kv = matmul(&normed, weight)?;
+                    split_kv(&kv, *kv_dim)?
+                }
+                KvProjWeight::Separate { k_proj, v_proj } => {
+                    let k = linear(&normed, k_proj)?;
+                    let v = linear(&normed, v_proj)?;
+                    (k, v)
+                }
+            };
 
             let q = q.reshape(&[seq_len, num_heads, head_dim]);
             let k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
