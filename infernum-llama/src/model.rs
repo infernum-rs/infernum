@@ -31,6 +31,59 @@ fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     transpose_2d(weight)
 }
 
+/// Concatenate two pre-transposed dense weight matrices along the column
+/// (output features) dimension: `(K, N1)` + `(K, N2)` → `(K, N1+N2)`.
+///
+/// Both matrices must share the same first dimension (in_features).
+fn concat_weights<T: TensorDType + DeviceRepr + Default>(
+    a: &CudaTensor<T>,
+    b: &CudaTensor<T>,
+) -> Result<CudaTensor<T>> {
+    let k = a.shape()[0];
+    assert_eq!(k, b.shape()[0], "concat_weights: K dimension mismatch");
+    let n1 = a.shape()[1];
+    let n2 = b.shape()[1];
+
+    let a_data = a.to_vec()?;
+    let b_data = b.to_vec()?;
+    let mut out = vec![T::default(); k * (n1 + n2)];
+    for row in 0..k {
+        out[row * (n1 + n2)..row * (n1 + n2) + n1]
+            .copy_from_slice(&a_data[row * n1..(row + 1) * n1]);
+        out[row * (n1 + n2) + n1..row * (n1 + n2) + n1 + n2]
+            .copy_from_slice(&b_data[row * n2..(row + 1) * n2]);
+    }
+    CudaTensor::from_slice(a.context(), &[k, n1 + n2], &out)
+}
+
+/// Split a `(seq_len, 2 * intermediate)` tensor into two `(seq_len, intermediate)`
+/// tensors (gate and up) by deinterleaving rows.
+///
+/// Each row of the input is `[gate(intermediate), up(intermediate)]`.
+/// Uses a host roundtrip — only called during prefill, not the hot decode path.
+fn split_gate_up<T: TensorDType + DeviceRepr + Default>(
+    fused: &CudaTensor<T>,
+    intermediate_size: usize,
+) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+    let seq_len = fused.shape()[0];
+    let data = fused.to_vec()?;
+    let stride = 2 * intermediate_size;
+
+    let mut gate_data = vec![T::default(); seq_len * intermediate_size];
+    let mut up_data = vec![T::default(); seq_len * intermediate_size];
+
+    for row in 0..seq_len {
+        gate_data[row * intermediate_size..(row + 1) * intermediate_size]
+            .copy_from_slice(&data[row * stride..row * stride + intermediate_size]);
+        up_data[row * intermediate_size..(row + 1) * intermediate_size]
+            .copy_from_slice(&data[row * stride + intermediate_size..(row + 1) * stride]);
+    }
+
+    let gate = CudaTensor::from_slice(fused.context(), &[seq_len, intermediate_size], &gate_data)?;
+    let up = CudaTensor::from_slice(fused.context(), &[seq_len, intermediate_size], &up_data)?;
+    Ok((gate, up))
+}
+
 /// Reverse the llama.cpp Q/K weight permutation for f32 tensors.
 ///
 /// GGUF files interleave each head's rows: `[h0, h_half, h1, h_{half+1}, ...]`.
@@ -125,10 +178,25 @@ struct LlamaAttentionWeights<T: TensorDType> {
     o_proj: LinearWeight<T>,
 }
 
+/// Gate+Up projection storage: fused for dense weights, separate for quantized.
+enum GateUpWeight<T: TensorDType> {
+    /// Gate and up weights concatenated into a single (hidden, 2*intermediate)
+    /// dense tensor. After matmul the output columns split as
+    /// `[gate(intermediate), up(intermediate)]`.
+    Fused {
+        weight: CudaTensor<T>,
+        intermediate_size: usize,
+    },
+    /// Separate gate and up projections (used for quantized weights).
+    Separate {
+        gate_proj: Box<LinearWeight<T>>,
+        up_proj: Box<LinearWeight<T>>,
+    },
+}
+
 /// Weights for a single Llama MLP layer
 struct LlamaMlpWeights<T: TensorDType> {
-    gate_proj: LinearWeight<T>,
-    up_proj: LinearWeight<T>,
+    gate_up: GateUpWeight<T>,
     down_proj: LinearWeight<T>,
 }
 
@@ -294,22 +362,29 @@ where
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                mlp: LlamaMlpWeights {
-                    gate_proj: load_linear::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.mlp.gate_proj.weight"),
-                    )?,
-                    up_proj: load_linear::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.mlp.up_proj.weight"),
-                    )?,
-                    down_proj: load_linear::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.mlp.down_proj.weight"),
-                    )?,
+                mlp: {
+                    let gate =
+                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.gate_proj.weight"))?;
+                    let up =
+                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.up_proj.weight"))?;
+                    let gate_up = match (gate, up) {
+                        (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
+                            weight: concat_weights(&g, &u)?,
+                            intermediate_size: config.intermediate_size,
+                        },
+                        (g, u) => GateUpWeight::Separate {
+                            gate_proj: Box::new(g),
+                            up_proj: Box::new(u),
+                        },
+                    };
+                    LlamaMlpWeights {
+                        gate_up,
+                        down_proj: load_linear::<T>(
+                            ctx,
+                            loader,
+                            &format!("{prefix}.mlp.down_proj.weight"),
+                        )?,
+                    }
                 },
             };
 
@@ -535,17 +610,38 @@ where
     }
 
     /// Forward pass through MLP (SwiGLU)
-    #[allow(clippy::unused_self)] // Will use self.config when adding intermediate_size check
+    #[allow(clippy::unused_self)]
     fn forward_mlp(
         &self,
         hidden: &CudaTensor<T>,
         weights: &LlamaMlpWeights<T>,
     ) -> Result<CudaTensor<T>> {
-        // SwiGLU: silu(gate(x)) * up(x)
-        let gate = linear(hidden, &weights.gate_proj)?;
-        let up = linear(hidden, &weights.up_proj)?;
+        let (gate, up) = match &weights.gate_up {
+            GateUpWeight::Fused {
+                weight,
+                intermediate_size,
+            } => {
+                let seq_len = hidden.shape()[0];
+                let gate_up = matmul(hidden, weight)?;
+                // gate_up shape: (seq_len, 2 * intermediate_size)
+                if seq_len == 1 {
+                    // Decode: zero-copy split via slice_view
+                    let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
+                    let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
+                    (gate, up)
+                } else {
+                    // Prefill: deinterleave rows into two contiguous tensors
+                    split_gate_up(&gate_up, *intermediate_size)?
+                }
+            }
+            GateUpWeight::Separate { gate_proj, up_proj } => {
+                let gate = linear(hidden, gate_proj)?;
+                let up = linear(hidden, up_proj)?;
+                (gate, up)
+            }
+        };
 
-        // SwiGLU activation (fused in release builds)
+        // SwiGLU activation
         let intermediate = swiglu(&gate, &up)?;
 
         // Down projection
@@ -575,6 +671,7 @@ impl LlamaModel<f32> {
     }
 
     /// Load model weights from a GGUF loader, using quantized weights where available
+    #[allow(clippy::too_many_lines)]
     fn load_weights_gguf(
         ctx: &CudaContext,
         config: LlamaConfig,
@@ -645,10 +742,23 @@ impl LlamaModel<f32> {
                 },
                 post_attention_layernorm: loader
                     .load_f32(ctx, &format!("{prefix}.ffn_norm.weight"))?,
-                mlp: LlamaMlpWeights {
-                    gate_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_gate.weight"))?,
-                    up_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_up.weight"))?,
-                    down_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_down.weight"))?,
+                mlp: {
+                    let gate = load_linear(ctx, loader, &format!("{prefix}.ffn_gate.weight"))?;
+                    let up = load_linear(ctx, loader, &format!("{prefix}.ffn_up.weight"))?;
+                    let gate_up = match (gate, up) {
+                        (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
+                            weight: concat_weights(&g, &u)?,
+                            intermediate_size: config.intermediate_size,
+                        },
+                        (g, u) => GateUpWeight::Separate {
+                            gate_proj: Box::new(g),
+                            up_proj: Box::new(u),
+                        },
+                    };
+                    LlamaMlpWeights {
+                        gate_up,
+                        down_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_down.weight"))?,
+                    }
                 },
             };
 
@@ -856,10 +966,7 @@ where
                 self.config.rms_norm_eps,
             )?;
 
-            let gate = linear(&normed, &layer.mlp.gate_proj)?;
-            let up = linear(&normed, &layer.mlp.up_proj)?;
-            let intermediate = swiglu(&gate, &up)?;
-            let mlp_output = linear(&intermediate, &layer.mlp.down_proj)?;
+            let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
 
             add_inplace(&mut h, &mlp_output)?;
             hidden = h;
