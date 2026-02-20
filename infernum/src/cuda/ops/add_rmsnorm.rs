@@ -51,7 +51,9 @@ pub fn add_rmsnorm<T: TensorDType + cudarc::driver::DeviceRepr>(
     let shape = residual.shape();
     assert_eq!(shape, x.shape(), "residual and x must have the same shape");
 
-    let hidden_size = *shape.last().expect("Input must have at least one dimension");
+    let hidden_size = *shape
+        .last()
+        .expect("Input must have at least one dimension");
     let num_rows: usize = shape[..shape.len() - 1].iter().product();
 
     assert_eq!(
@@ -68,11 +70,7 @@ pub fn add_rmsnorm<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     let module_name = "add_rmsnorm";
     if !device.has_func(module_name, &kernel_name) {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            KERNEL_NAMES,
-        )?;
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
     }
 
     let func = device.get_func(module_name, &kernel_name).unwrap();
@@ -160,11 +158,15 @@ mod tests {
         let x_data: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.05, 0.1, 0.15, 0.2];
         let weight_data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
 
-        let residual_bf16: Vec<half::bf16> =
-            residual_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let residual_bf16: Vec<half::bf16> = residual_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v))
+            .collect();
         let x_bf16: Vec<half::bf16> = x_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
-        let weight_bf16: Vec<half::bf16> =
-            weight_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let weight_bf16: Vec<half::bf16> = weight_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v))
+            .collect();
 
         let residual = CudaTensor::from_slice(&ctx, &[2, 4], &residual_bf16).unwrap();
         let x = CudaTensor::from_slice(&ctx, &[2, 4], &x_bf16).unwrap();
@@ -173,8 +175,12 @@ mod tests {
         let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
 
         let sum_result: Vec<f32> = sum.to_vec().unwrap().iter().map(|v| v.to_f32()).collect();
-        let normed_result: Vec<f32> =
-            normed.to_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let normed_result: Vec<f32> = normed
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
 
         for i in 0..8 {
             let expected = residual_data[i] + x_data[i];

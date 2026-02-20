@@ -17,8 +17,6 @@ use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
-
-
 /// Perform matrix multiplication: C = A @ B
 ///
 /// Supports 2D matrices and batched 3D tensors.
