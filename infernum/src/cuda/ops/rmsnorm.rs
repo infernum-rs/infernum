@@ -75,7 +75,7 @@ pub fn rms_norm<T: TensorDType + cudarc::driver::DeviceRepr>(
     let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
 
     let device = input.context().device();
-    load_rmsnorm_kernels(&device)?;
+    load_rmsnorm_kernels(device)?;
 
     let kernel_name = format!("rmsnorm_{}", kernel_suffix::<T>());
     let func = device.get_func("rmsnorm", &kernel_name).unwrap();
@@ -137,7 +137,7 @@ pub fn rms_norm_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
     );
 
     let device = input.context().device();
-    load_rmsnorm_kernels(&device)?;
+    load_rmsnorm_kernels(device)?;
 
     let kernel_name = format!("rmsnorm_inplace_{}", kernel_suffix::<T>());
     let func = device.get_func("rmsnorm", &kernel_name).unwrap();
