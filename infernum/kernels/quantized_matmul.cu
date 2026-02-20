@@ -407,7 +407,7 @@ extern "C" __global__ void quantize_f32_to_q8_1(
 //
 // Launch config: grid = (N, 1, 1), block = (32, 1, 1), shared_mem = 0.
 
-// Q8_0 × Q8_1 dp4a GEMV (warp-parallel)
+// Q8_0 × Q8_1 dp4a GEMV (warp-parallel, vectorized loads)
 extern "C" __global__ void gemv_q8_q8_dp4a(
     float*              __restrict__ output,
     const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
@@ -429,18 +429,22 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
         float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
         float d_a = act_scales[b];
 
-        int base_k = b * 32;
-        const signed char* w_ptr = weight_data + n * K + base_k;
-        const signed char* a_ptr = act_data + base_k;
+        // 32 bytes per quant block = 2 × int4 (128-bit) loads
+        const int4* w_v = (const int4*)(weight_data + n * K + b * 32);
+        const int4* a_v = (const int4*)(act_data + b * 32);
+
+        int4 w0 = w_v[0], w1 = w_v[1];
+        int4 a0 = a_v[0], a1 = a_v[1];
 
         int sumi = 0;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            int w4, a4;
-            memcpy(&w4, w_ptr + i * 4, 4);
-            memcpy(&a4, a_ptr + i * 4, 4);
-            sumi = __dp4a(w4, a4, sumi);
-        }
+        sumi = __dp4a(w0.x, a0.x, sumi);
+        sumi = __dp4a(w0.y, a0.y, sumi);
+        sumi = __dp4a(w0.z, a0.z, sumi);
+        sumi = __dp4a(w0.w, a0.w, sumi);
+        sumi = __dp4a(w1.x, a1.x, sumi);
+        sumi = __dp4a(w1.y, a1.y, sumi);
+        sumi = __dp4a(w1.z, a1.z, sumi);
+        sumi = __dp4a(w1.w, a1.w, sumi);
 
         acc += d_w * d_a * (float)sumi;
     }
@@ -479,24 +483,27 @@ extern "C" __global__ void gemv_q4_q8_dp4a(
         float d_a = act_scales[b];
         float s_a = act_sums[b];
 
-        const unsigned char* w_ptr = weight_data + n * (K / 2) + b * 16;
-        const signed char* a_ptr = act_data + b * 32;
+        // 16 bytes weight data = 1 × int4 load
+        const int4* w_v = (const int4*)(weight_data + n * (K / 2) + b * 16);
+        int4 w = w_v[0];
+
+        // 32 bytes activation = 2 × int4 loads (lo half, hi half)
+        const int4* a_v = (const int4*)(act_data + b * 32);
+        int4 a_lo = a_v[0], a_hi = a_v[1];
 
         int sumi = 0;
+        // Nibble extraction + dp4a for 4 packed uint32
+        unsigned int uw[4] = {(unsigned int)w.x, (unsigned int)w.y,
+                              (unsigned int)w.z, (unsigned int)w.w};
+        int al[4] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w};
+        int ah[4] = {a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            unsigned int w4;
-            memcpy(&w4, w_ptr + i * 4, 4);
-
-            int lo = (int)(w4 & 0x0F0F0F0Fu);
-            int hi = (int)((w4 >> 4) & 0x0F0F0F0Fu);
-
-            int a_lo, a_hi;
-            memcpy(&a_lo, a_ptr + i * 4, 4);
-            memcpy(&a_hi, a_ptr + 16 + i * 4, 4);
-
-            sumi = __dp4a(lo, a_lo, sumi);
-            sumi = __dp4a(hi, a_hi, sumi);
+            int lo = (int)(uw[i] & 0x0F0F0F0Fu);
+            int hi = (int)((uw[i] >> 4) & 0x0F0F0F0Fu);
+            sumi = __dp4a(lo, al[i], sumi);
+            sumi = __dp4a(hi, ah[i], sumi);
         }
 
         acc += d_w * (d_a * (float)sumi - 8.0f * s_a);
