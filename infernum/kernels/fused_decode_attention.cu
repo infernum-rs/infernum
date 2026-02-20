@@ -105,7 +105,7 @@ extern "C" __global__ void fused_decode_attention_f32(
     }
 }
 
-// F16 version with F32 accumulation for accuracy
+// F16 version with F32 accumulation and score caching
 extern "C" __global__ void fused_decode_attention_f16(
     __half* __restrict__ output,       // (1, num_heads, head_dim)
     const __half* __restrict__ q,      // (1, num_heads, head_dim)
@@ -121,9 +121,18 @@ extern "C" __global__ void fused_decode_attention_f16(
     const int tid = threadIdx.x;
     const int kv_head = head * num_kv_heads / num_heads;
 
+    // Shared memory layout:
+    //   [0 .. head_dim)                    : Q vector (f32)
+    //   [head_dim .. head_dim + total_len) : cached weights (f32)
+    //   [head_dim + total_len .. ]         : reduction scratch (f32)
     extern __shared__ float shared[];
     float* s_q = shared;
-    float* s_scratch = shared + head_dim;
+    float* s_weights = shared + head_dim;
+    float* s_scratch = shared + head_dim + total_len;
+
+    const int kv_stride = num_kv_heads * head_dim;
+    const __half* k_base = k + kv_head * head_dim;
+    const __half* v_base = v + kv_head * head_dim;
 
     // Load Q into shared memory (convert to F32)
     for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -131,18 +140,20 @@ extern "C" __global__ void fused_decode_attention_f16(
     }
     __syncthreads();
 
-    // Pass 1: find max
+    // Pass 1: Compute scores and find max (parallel over positions)
     float local_max = -INFINITY;
     for (int t = tid; t < total_len; t += blockDim.x) {
         float dot = 0.0f;
-        const __half* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
+        const __half* k_ptr = k_base + t * kv_stride;
         for (int d = 0; d < head_dim; d++) {
             dot += s_q[d] * __half2float(k_ptr[d]);
         }
         dot *= scale;
+        s_weights[t] = dot;  // Cache the score
         local_max = fmaxf(local_max, dot);
     }
 
+    // Reduce max
     s_scratch[tid] = local_max;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -154,18 +165,15 @@ extern "C" __global__ void fused_decode_attention_f16(
     float max_val = s_scratch[0];
     __syncthreads();
 
-    // Pass 2: compute sum
+    // Pass 2: Compute exp and sum, store normalized weights
     float local_sum = 0.0f;
     for (int t = tid; t < total_len; t += blockDim.x) {
-        float dot = 0.0f;
-        const __half* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
-        for (int d = 0; d < head_dim; d++) {
-            dot += s_q[d] * __half2float(k_ptr[d]);
-        }
-        dot *= scale;
-        local_sum += expf(dot - max_val);
+        float w = expf(s_weights[t] - max_val);
+        s_weights[t] = w;
+        local_sum += w;
     }
 
+    // Reduce sum
     s_scratch[tid] = local_sum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -177,25 +185,25 @@ extern "C" __global__ void fused_decode_attention_f16(
     float sum_val = s_scratch[0];
     __syncthreads();
 
-    // Pass 3: weighted output
+    // Normalize weights in shared memory
+    float inv_sum = 1.0f / sum_val;
+    for (int t = tid; t < total_len; t += blockDim.x) {
+        s_weights[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Pass 3: Compute weighted output (parallel over dimensions)
+    // Uses cached weights - no Q·K recomputation!
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t < total_len; t++) {
-            float dot = 0.0f;
-            const __half* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
-            for (int dd = 0; dd < head_dim; dd++) {
-                dot += s_q[dd] * __half2float(k_ptr[dd]);
-            }
-            dot *= scale;
-            float weight = expf(dot - max_val) / sum_val;
-            const __half* v_ptr = v + t * num_kv_heads * head_dim + kv_head * head_dim;
-            acc += weight * __half2float(v_ptr[d]);
+            acc += s_weights[t] * __half2float(v_base[t * kv_stride + d]);
         }
         output[head * head_dim + d] = __float2half(acc);
     }
 }
 
-// BF16 version with F32 accumulation for accuracy
+// BF16 version with F32 accumulation and score caching
 extern "C" __global__ void fused_decode_attention_bf16(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ q,
@@ -211,9 +219,18 @@ extern "C" __global__ void fused_decode_attention_bf16(
     const int tid = threadIdx.x;
     const int kv_head = head * num_kv_heads / num_heads;
 
+    // Shared memory layout:
+    //   [0 .. head_dim)                    : Q vector (f32)
+    //   [head_dim .. head_dim + total_len) : cached weights (f32)
+    //   [head_dim + total_len .. ]         : reduction scratch (f32)
     extern __shared__ float shared[];
     float* s_q = shared;
-    float* s_scratch = shared + head_dim;
+    float* s_weights = shared + head_dim;
+    float* s_scratch = shared + head_dim + total_len;
+
+    const int kv_stride = num_kv_heads * head_dim;
+    const __nv_bfloat16* k_base = k + kv_head * head_dim;
+    const __nv_bfloat16* v_base = v + kv_head * head_dim;
 
     // Load Q into shared memory (convert to F32)
     for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -221,18 +238,20 @@ extern "C" __global__ void fused_decode_attention_bf16(
     }
     __syncthreads();
 
-    // Pass 1: find max
+    // Pass 1: Compute scores and find max (parallel over positions)
     float local_max = -INFINITY;
     for (int t = tid; t < total_len; t += blockDim.x) {
         float dot = 0.0f;
-        const __nv_bfloat16* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
+        const __nv_bfloat16* k_ptr = k_base + t * kv_stride;
         for (int d = 0; d < head_dim; d++) {
             dot += s_q[d] * __bfloat162float(k_ptr[d]);
         }
         dot *= scale;
+        s_weights[t] = dot;  // Cache the score
         local_max = fmaxf(local_max, dot);
     }
 
+    // Reduce max
     s_scratch[tid] = local_max;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -244,18 +263,15 @@ extern "C" __global__ void fused_decode_attention_bf16(
     float max_val = s_scratch[0];
     __syncthreads();
 
-    // Pass 2: compute sum
+    // Pass 2: Compute exp and sum, store normalized weights
     float local_sum = 0.0f;
     for (int t = tid; t < total_len; t += blockDim.x) {
-        float dot = 0.0f;
-        const __nv_bfloat16* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
-        for (int d = 0; d < head_dim; d++) {
-            dot += s_q[d] * __bfloat162float(k_ptr[d]);
-        }
-        dot *= scale;
-        local_sum += expf(dot - max_val);
+        float w = expf(s_weights[t] - max_val);
+        s_weights[t] = w;
+        local_sum += w;
     }
 
+    // Reduce sum
     s_scratch[tid] = local_sum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -267,19 +283,19 @@ extern "C" __global__ void fused_decode_attention_bf16(
     float sum_val = s_scratch[0];
     __syncthreads();
 
-    // Pass 3: weighted output
+    // Normalize weights in shared memory
+    float inv_sum = 1.0f / sum_val;
+    for (int t = tid; t < total_len; t += blockDim.x) {
+        s_weights[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Pass 3: Compute weighted output (parallel over dimensions)
+    // Uses cached weights - no Q·K recomputation!
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t < total_len; t++) {
-            float dot = 0.0f;
-            const __nv_bfloat16* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
-            for (int dd = 0; dd < head_dim; dd++) {
-                dot += s_q[dd] * __bfloat162float(k_ptr[dd]);
-            }
-            dot *= scale;
-            float weight = expf(dot - max_val) / sum_val;
-            const __nv_bfloat16* v_ptr = v + t * num_kv_heads * head_dim + kv_head * head_dim;
-            acc += weight * __bfloat162float(v_ptr[d]);
+            acc += s_weights[t] * __bfloat162float(v_base[t * kv_stride + d]);
         }
         output[head * head_dim + d] = __float2bfloat16(acc);
     }
