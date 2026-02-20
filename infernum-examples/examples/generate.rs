@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(gguf_loader.metadata())?);
         (model, tokenizer)
     } else {
-        let model = LlamaModel::from_pretrained(&ctx, &cli.model)?;
+        let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
         let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
         (model, tokenizer)
     };

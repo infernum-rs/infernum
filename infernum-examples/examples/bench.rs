@@ -1,57 +1,50 @@
 //! Minimal benchmark for infernum decode throughput
 //! Measures raw forward_next_token performance (no tokenizer decode needed)
+//!
+//! Usage:
+//!   cargo run --release --example bench --features cuda -- models/llama-3.2-1b 256
+//!   cargo run --release --example bench --features cuda -- --dtype bf16 models/llama-3.2-1b 256
+//!   cargo run --release --example bench --features cuda -- --pool models/llama-3.2-1b 256
 
 #![cfg(feature = "cuda")]
 
 use std::time::Instant;
 
+use clap::Parser;
+
 use infernum::cuda::CudaContext;
+use infernum::model::Model;
 use infernum::GenerateOptions;
 use infernum_llama::LlamaModel;
 use infernum_runtime::Engine;
 
-fn main() -> infernum::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let use_pool = args.iter().any(|a| a == "--pool");
-    let positional: Vec<&str> = args[1..]
-        .iter()
-        .filter(|a| !a.starts_with("--"))
-        .map(|s| s.as_str())
-        .collect();
-    let model_path = positional
-        .first()
-        .expect("Usage: bench <model_path> [n_tokens] [--pool]");
-    let n_gen: usize = positional.get(1).unwrap_or(&"128").parse().unwrap();
+#[derive(Parser)]
+#[command(name = "bench")]
+struct Cli {
+    /// Path to model directory or .gguf file
+    model: String,
 
-    let mut ctx = CudaContext::new(0)?;
-    if use_pool {
-        ctx.enable_buffer_pool();
-        eprintln!("Buffer pool: ENABLED");
-    } else {
-        eprintln!("Buffer pool: disabled");
-    }
+    /// Number of tokens to generate
+    #[arg(default_value_t = 128)]
+    n_gen: usize,
 
-    let is_gguf = model_path.ends_with(".gguf");
-    let model = if is_gguf {
-        LlamaModel::from_gguf(&ctx, &model_path)?
-    } else {
-        LlamaModel::from_pretrained(&ctx, &model_path)?
-    };
+    /// Compute dtype: f32 or bf16 (only for SafeTensors models)
+    #[arg(long, default_value = "f32")]
+    dtype: String,
 
-    eprintln!(
-        "Model loaded ({} layers, {} hidden)",
-        model.config().num_hidden_layers,
-        model.config().hidden_size,
-    );
+    /// Enable buffer pool
+    #[arg(long)]
+    pool: bool,
+}
 
-    let mut engine = Engine::new(&ctx, model)?;
+fn bench_model<M: Model>(model: M, ctx: &CudaContext, n_gen: usize) -> infernum::Result<()> {
+    let mut engine = Engine::new(ctx, model)?;
 
-    // Use simple numeric prompt tokens that are always valid
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let options = GenerateOptions {
         max_new_tokens: n_gen,
-        eos_token_id: None, // don't stop early
-        sampling: None,     // greedy
+        eos_token_id: None,
+        sampling: None,
         use_kv_cache: true,
     };
 
@@ -90,4 +83,48 @@ fn main() -> infernum::Result<()> {
     }
 
     Ok(())
+}
+
+fn main() -> infernum::Result<()> {
+    let cli = Cli::parse();
+    let mut ctx = CudaContext::new(0)?;
+
+    if cli.pool {
+        ctx.enable_buffer_pool();
+        eprintln!("Buffer pool: ENABLED");
+    } else {
+        eprintln!("Buffer pool: disabled");
+    }
+
+    let is_gguf = cli.model.ends_with(".gguf");
+
+    match cli.dtype.as_str() {
+        "f32" => {
+            let model = if is_gguf {
+                LlamaModel::from_gguf(&ctx, &cli.model)?
+            } else {
+                LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?
+            };
+            eprintln!(
+                "Model loaded: {} layers, {} hidden, dtype=f32",
+                model.config().num_hidden_layers,
+                model.config().hidden_size,
+            );
+            bench_model(model, &ctx, cli.n_gen)
+        }
+        "bf16" => {
+            assert!(
+                !is_gguf,
+                "bf16 dtype is only supported for SafeTensors models"
+            );
+            let model = LlamaModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
+            eprintln!(
+                "Model loaded: {} layers, {} hidden, dtype=bf16",
+                model.config().num_hidden_layers,
+                model.config().hidden_size,
+            );
+            bench_model(model, &ctx, cli.n_gen)
+        }
+        other => panic!("Unsupported dtype: {other}. Use f32 or bf16."),
+    }
 }

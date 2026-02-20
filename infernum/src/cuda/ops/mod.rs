@@ -20,13 +20,13 @@ mod swiglu;
 mod transpose;
 
 pub use add::{add, add_inplace};
-pub use add_rmsnorm::{add_rmsnorm, ADD_RMSNORM_FUSED};
+pub use add_rmsnorm::add_rmsnorm;
 pub use argmax::{argmax_last, argmax_last_scalar};
 pub use attention::{attention, attention_kv, ATTENTION_KV_FUSED};
-pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16};
+pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16, cast_to_f32};
 pub use embed::embedding_gather;
 pub use fused_attention::{fused_attention_decode, fused_attention_prefill};
-pub use matmul::{matmul, matmul_bf16_f32};
+pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
 pub use mul::mul;
 pub use quantized_matmul::quantized_matmul;
 pub use repeat_kv::repeat_kv;

@@ -8,6 +8,8 @@ use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use crate::dtype::DType;
 #[cfg(feature = "cuda")]
 use crate::{Error, Result};
+#[cfg(feature = "cuda")]
+use half::{bf16, f16};
 
 /// Trait for loading model weights from various formats
 #[cfg(feature = "cuda")]
@@ -21,12 +23,24 @@ pub trait WeightLoader {
     /// Returns an error if the tensor is not found or loading fails
     fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>>;
 
+    /// Load a tensor by name as f16 (no conversion if already f16)
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found or loading fails.
+    /// The default implementation returns `UnsupportedDtype`.
+    fn load_f16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor<f16>> {
+        let dtype = self.get_dtype(name)?;
+        Err(Error::UnsupportedDtype(format!(
+            "load_f16 not supported for dtype {dtype}"
+        )))
+    }
+
     /// Load a tensor as bf16, preserving half-precision on the GPU
     ///
     /// # Errors
     /// Returns an error if the tensor is not found or loading fails.
     /// The default implementation returns `UnsupportedDtype`.
-    fn load_bf16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::bf16>> {
+    fn load_bf16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor<bf16>> {
         let dtype = self.get_dtype(name)?;
         Err(Error::UnsupportedDtype(format!(
             "load_bf16 not supported for dtype {dtype}"

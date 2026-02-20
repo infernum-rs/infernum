@@ -10,30 +10,48 @@
     clippy::manual_div_ceil
 )]
 
-use cudarc::driver::{LaunchAsync, LaunchConfig};
+use cudarc::driver::{LaunchAsync, LaunchConfig, ValidAsZeroBits};
 
 use super::CudaContext;
 use super::CudaTensor;
+use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/append_kv.ptx"));
+const KERNEL_NAMES: &[&str] = &["append_kv_f32", "append_kv_f16", "append_kv_bf16"];
+
+/// Kernel name suffix for dtype
+fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
+    let type_name = std::any::type_name::<T>();
+    if type_name.contains("f32") {
+        "f32"
+    } else if type_name.contains("f16") && !type_name.contains("bf16") {
+        "f16"
+    } else if type_name.contains("bf16") {
+        "bf16"
+    } else {
+        panic!("Unsupported dtype for append_kv: {type_name}")
+    }
+}
 
 /// KV cache for one layer's key or value buffer.
 ///
 /// Layout: `(max_seq_len, num_kv_heads, head_dim)`, row-major.
 /// Only the first `current_len` positions contain valid data.
-struct LayerBuffer {
-    k: CudaTensor<f32>,
-    v: CudaTensor<f32>,
+struct LayerBuffer<T: TensorDType> {
+    k: CudaTensor<T>,
+    v: CudaTensor<T>,
 }
 
 /// Pre-allocated KV cache for all transformer layers.
 ///
 /// Holds key and value buffers on GPU, tracks current sequence length,
 /// and provides `append` / `get` / `reset` operations.
-pub struct KvCache {
-    layers: Vec<LayerBuffer>,
+///
+/// Generic over `T` (f32, f16, bf16) to support different compute precisions.
+pub struct KvCache<T: TensorDType = f32> {
+    layers: Vec<LayerBuffer<T>>,
     ctx: CudaContext,
     current_len: usize,
     max_seq_len: usize,
@@ -43,10 +61,10 @@ pub struct KvCache {
 
 /// Launch the GPU kernel that copies `new_data` into `cache` at `current_len`.
 #[allow(clippy::too_many_arguments)]
-fn launch_append(
+fn launch_append<T: TensorDType + cudarc::driver::DeviceRepr>(
     ctx: &CudaContext,
-    cache: &mut CudaTensor<f32>,
-    new_data: &CudaTensor<f32>,
+    cache: &mut CudaTensor<T>,
+    new_data: &CudaTensor<T>,
     current_len: usize,
     max_seq_len: usize,
     num_kv_heads: usize,
@@ -56,16 +74,13 @@ fn launch_append(
     let total = new_seq_len * num_kv_heads * head_dim;
     let device = ctx.device();
 
+    let kernel_name = format!("append_kv_{}", kernel_suffix::<T>());
     let module_name = "append_kv";
-    if !device.has_func(module_name, "append_kv_f32") {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            &["append_kv_f32"],
-        )?;
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
     }
 
-    let func = device.get_func(module_name, "append_kv_f32").unwrap();
+    let func = device.get_func(module_name, &kernel_name).unwrap();
 
     let block_size = 256;
     let grid_size = (total + block_size - 1) / block_size;
@@ -94,7 +109,7 @@ fn launch_append(
     Ok(())
 }
 
-impl KvCache {
+impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     /// Allocate a new KV cache.
     ///
     /// # Arguments
@@ -147,8 +162,8 @@ impl KvCache {
     pub fn append(
         &mut self,
         layer_idx: usize,
-        k_new: &CudaTensor<f32>,
-        v_new: &CudaTensor<f32>,
+        k_new: &CudaTensor<T>,
+        v_new: &CudaTensor<T>,
     ) -> Result<()> {
         let k_shape = k_new.shape();
         let v_shape = v_new.shape();
@@ -210,7 +225,7 @@ impl KvCache {
     /// # Panics
     /// Panics if `current_len` is 0 (no data appended yet).
     #[must_use]
-    pub fn get(&self, layer_idx: usize) -> (CudaTensor<f32>, CudaTensor<f32>) {
+    pub fn get(&self, layer_idx: usize) -> (CudaTensor<T>, CudaTensor<T>) {
         assert!(self.current_len > 0, "KV cache is empty");
         self.get_up_to(layer_idx, self.current_len)
     }
@@ -224,7 +239,7 @@ impl KvCache {
     /// # Panics
     /// Panics if `len` is 0 or exceeds `max_seq_len`.
     #[must_use]
-    pub fn get_up_to(&self, layer_idx: usize, len: usize) -> (CudaTensor<f32>, CudaTensor<f32>) {
+    pub fn get_up_to(&self, layer_idx: usize, len: usize) -> (CudaTensor<T>, CudaTensor<T>) {
         assert!(len > 0, "requested length must be > 0");
         assert!(
             len <= self.max_seq_len,
@@ -241,7 +256,7 @@ impl KvCache {
     ///
     /// Returns a `CudaTensor` that shares the same GPU allocation as the cache
     /// buffer — no allocation or copy occurs.
-    fn slice_to_len(&self, tensor: &CudaTensor<f32>, len: usize) -> CudaTensor<f32> {
+    fn slice_to_len(&self, tensor: &CudaTensor<T>, len: usize) -> CudaTensor<T> {
         let shape = [len, self.num_kv_heads, self.head_dim];
         tensor.slice_view(0, &shape)
     }
@@ -277,7 +292,8 @@ mod tests {
     #[test]
     fn test_kv_cache_new() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let cache = KvCache::new(&ctx, 2, 128, 4, 16).expect("Failed to create KV cache");
+        let cache: KvCache<f32> =
+            KvCache::new(&ctx, 2, 128, 4, 16).expect("Failed to create KV cache");
 
         assert_eq!(cache.current_len(), 0);
         assert_eq!(cache.max_seq_len(), 128);

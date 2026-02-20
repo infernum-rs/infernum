@@ -419,4 +419,78 @@ mod tests {
             assert!((got - exp).abs() < 0.5, "Mismatch at {i}: {got} vs {exp}");
         }
     }
+
+    #[test]
+    fn test_matmul_f16() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // A: 2x3, B: 3x4 -> C: 2x4
+        let a_data: Vec<half::f16> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .map(half::f16::from_f32)
+            .collect();
+        let b_data: Vec<half::f16> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]
+        .into_iter()
+        .map(half::f16::from_f32)
+        .collect();
+
+        let a = CudaTensor::from_slice(&ctx, &[2, 3], &a_data).unwrap();
+        let b = CudaTensor::from_slice(&ctx, &[3, 4], &b_data).unwrap();
+
+        let c = matmul(&a, &b).unwrap();
+
+        assert_eq!(c.shape(), &[2, 4]);
+
+        let result = c.to_vec().unwrap();
+        let expected: Vec<half::f16> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]
+            .into_iter()
+            .map(half::f16::from_f32)
+            .collect();
+
+        for (idx, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got.to_f32() - exp.to_f32()).abs() < 0.5,
+                "Mismatch at {idx}: {got} vs {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_bf16() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        // A: 2x3, B: 3x4 -> C: 2x4
+        let a_data: Vec<half::bf16> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect();
+        let b_data: Vec<half::bf16> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]
+        .into_iter()
+        .map(half::bf16::from_f32)
+        .collect();
+
+        let a = CudaTensor::from_slice(&ctx, &[2, 3], &a_data).unwrap();
+        let b = CudaTensor::from_slice(&ctx, &[3, 4], &b_data).unwrap();
+
+        let c = matmul(&a, &b).unwrap();
+
+        assert_eq!(c.shape(), &[2, 4]);
+
+        let result = c.to_vec().unwrap();
+        let expected: Vec<half::bf16> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect();
+
+        for (idx, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got.to_f32() - exp.to_f32()).abs() < 0.5,
+                "Mismatch at {idx}: {got} vs {exp}"
+            );
+        }
+    }
 }

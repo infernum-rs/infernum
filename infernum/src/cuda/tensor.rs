@@ -286,6 +286,36 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
         }
     }
 
+    /// Reinterpret this tensor as a different element type with the same size.
+    ///
+    /// This is a zero-copy operation: no data is moved or converted. The GPU
+    /// memory is shared via the same `Arc`. Use this when generic code needs
+    /// to convert between concrete types that are known (at runtime) to be
+    /// the same size — e.g. when `T::DTYPE == DType::F32` and you hold a
+    /// `CudaTensor<f32>` that needs to become `CudaTensor<T>`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `T` and `U` have identical in-memory
+    /// representations (same size, same alignment, same bit-pattern semantics).
+    /// In practice this means they should be the same type (e.g. both `f32`),
+    /// just opaque to the compiler due to generics.
+    #[must_use]
+    pub unsafe fn reinterpret<U: TensorDType + DeviceRepr>(self) -> CudaTensor<U> {
+        assert_eq!(
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<U>(),
+            "reinterpret: size mismatch ({} bytes vs {} bytes)",
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<U>(),
+        );
+        // All four fields (data, offset, shape, ctx) are transmuted.
+        // `Arc<CudaSlice<T>>` and `Arc<CudaSlice<U>>` have the same layout
+        // when T and U have the same size (CudaSlice is just a device pointer
+        // + length, parameterised by PhantomData<T>).
+        std::mem::transmute(self)
+    }
+
     /// If the Arc is shared or we have a non-zero offset, compact into a
     /// fresh, exclusively-owned allocation containing only our elements.
     fn ensure_exclusive_ownership(&mut self) {
