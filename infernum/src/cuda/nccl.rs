@@ -21,6 +21,15 @@ pub struct NcclCommunicator {
     comm: Comm,
 }
 
+// SAFETY: NcclCommunicator is Send because we own the comm handle and each
+// GPU thread gets its own communicator. The raw *mut ncclComm prevents
+// auto-derive but the handle is safe to move between threads.
+unsafe impl Send for NcclCommunicator {}
+
+// SAFETY: NcclCommunicator is Sync because all methods take &self and NCCL
+// serializes access internally. In practice we only access from one thread.
+unsafe impl Sync for NcclCommunicator {}
+
 impl NcclCommunicator {
     /// Create communicators for all available GPUs on a single node.
     ///

@@ -19,6 +19,8 @@
 mod engine;
 #[cfg(feature = "nccl")]
 mod parallel_engine;
+#[cfg(feature = "nccl")]
+mod parallel_runtime;
 #[cfg(feature = "cuda")]
 mod runtime;
 
@@ -26,5 +28,7 @@ mod runtime;
 pub use engine::Engine;
 #[cfg(feature = "nccl")]
 pub use parallel_engine::ParallelEngine;
+#[cfg(feature = "nccl")]
+pub use parallel_runtime::ParallelRuntime;
 #[cfg(feature = "cuda")]
 pub use runtime::Runtime;
