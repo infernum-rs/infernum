@@ -59,6 +59,7 @@ mod cuda {
         let status = Command::new("nvcc")
             .args([
                 "--ptx",
+                "-arch=compute_70",
                 "-o",
                 ptx_path.to_str().unwrap(),
                 cu_path.to_str().unwrap(),
