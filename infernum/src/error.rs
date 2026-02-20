@@ -61,4 +61,15 @@ pub enum Error {
     #[cfg(feature = "cuda")]
     #[error("CUDA graph error: {0}")]
     CudaGraph(String),
+
+    #[cfg(feature = "nccl")]
+    #[error("NCCL error: {0:?}")]
+    Nccl(cudarc::nccl::result::NcclError),
+}
+
+#[cfg(feature = "nccl")]
+impl From<cudarc::nccl::result::NcclError> for Error {
+    fn from(e: cudarc::nccl::result::NcclError) -> Self {
+        Self::Nccl(e)
+    }
 }
