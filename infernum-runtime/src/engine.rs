@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
-use infernum::cuda::{CudaContext, KvCache};
+use infernum::cuda::{CudaContext, CudaGraph, KvCache};
 use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams};
 
 /// Token-level inference engine.
@@ -132,7 +132,7 @@ impl<M: Model> Engine<M> {
         input_ids: &[u32],
         options: &GenerateOptions,
     ) -> Result<Vec<u32>> {
-        self.kv_cache.reset();
+        self.kv_cache.reset()?;
         let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
         let sampling = options.sampling.as_ref();
@@ -149,21 +149,190 @@ impl<M: Model> Engine<M> {
         }
         tokens.push(next_token);
 
-        // Decode: one token at a time
-        for _ in 1..options.max_new_tokens {
-            let logits = self
-                .model
-                .forward_next_token(next_token, &mut self.kv_cache)?;
-            let recent = recent_token_window(&tokens, sampling);
-            next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
-
-            if options.eos_token_id == Some(next_token) {
-                break;
-            }
-            tokens.push(next_token);
+        if options.use_cuda_graphs && options.max_new_tokens > 1 {
+            self.decode_loop_graph(&mut tokens, &mut next_token, options, &mut rng_state)?;
+        } else {
+            self.decode_loop_eager(&mut tokens, &mut next_token, options, &mut rng_state)?;
         }
 
         Ok(tokens)
+    }
+
+    /// Decode loop without CUDA graph capture (eager execution).
+    fn decode_loop_eager(
+        &mut self,
+        tokens: &mut Vec<u32>,
+        next_token: &mut u32,
+        options: &GenerateOptions,
+        rng_state: &mut Option<u64>,
+    ) -> Result<()> {
+        let sampling = options.sampling.as_ref();
+        for _ in 1..options.max_new_tokens {
+            let logits = self
+                .model
+                .forward_next_token(*next_token, &mut self.kv_cache)?;
+            let recent = recent_token_window(tokens, sampling);
+            *next_token = select_token(&logits, sampling, rng_state, recent)?;
+
+            if options.eos_token_id == Some(*next_token) {
+                break;
+            }
+            tokens.push(*next_token);
+        }
+        Ok(())
+    }
+
+    /// Decode loop with CUDA graph capture/replay.
+    ///
+    /// Step 1 runs eagerly (warmup — ensures all PTX modules are loaded).
+    /// Capture-once CUDA graph decode loop.
+    ///
+    /// Step 1: eager warmup (loads PTX, validates shapes).
+    /// Step 2: capture graph using indirect kernels, then launch.
+    /// Steps 3+: replay the captured graph (no re-capture).
+    ///
+    /// `kv_cache.advance(1)` is called after each graph launch, outside the
+    /// captured region.
+    fn decode_loop_graph(
+        &mut self,
+        tokens: &mut Vec<u32>,
+        next_token: &mut u32,
+        options: &GenerateOptions,
+        rng_state: &mut Option<u64>,
+    ) -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        let sampling = options.sampling.as_ref();
+
+        // Cap the effective max_seq_len for graph-captured kernels to the actual
+        // generation budget. This prevents shared memory from being sized for the
+        // model's full max_position_embeddings (e.g. 131072) which would exceed
+        // the per-block shared memory hardware limit.
+        let effective_max =
+            (self.kv_cache.current_len() + options.max_new_tokens).min(self.kv_cache.max_seq_len());
+        self.kv_cache.set_graph_max_seq_len(effective_max);
+
+        let device = self.kv_cache.device();
+        let mut graph = CudaGraph::new(&device)?;
+
+        let mut t_htod = Duration::ZERO;
+        let mut t_advance = Duration::ZERO;
+        let mut t_launch = Duration::ZERO;
+        let mut t_sync = Duration::ZERO;
+        let mut t_sample = Duration::ZERO;
+        let mut graph_steps = 0_u64;
+
+        // Holds the logits tensor from graph capture — its device address is
+        // stable so we can sample from it after each replay.
+        let mut captured_logits: Option<CudaTensor<f32>> = None;
+
+        for step in 1..options.max_new_tokens {
+            let t0 = Instant::now();
+            device.htod_copy_into(vec![*next_token], graph.token_input_mut())?;
+            t_htod += t0.elapsed();
+
+            if step == 1 {
+                // Warmup: eager execution to load all PTX kernels.
+                // forward_next_token_device internally calls advance(1).
+                let logits = self
+                    .model
+                    .forward_next_token_device(graph.token_input(), &mut self.kv_cache)?;
+                let recent = recent_token_window(tokens, sampling);
+                *next_token = select_token(&logits, sampling, rng_state, recent)?;
+            } else if step == 2 {
+                // Capture the graph once using indirect kernels.
+                graph.begin_capture()?;
+                let logits = self
+                    .model
+                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_cache)?;
+                graph.end_capture()?;
+
+                // Launch the just-captured graph
+                let t0 = Instant::now();
+                graph.launch()?;
+                t_launch += t0.elapsed();
+
+                let t0 = Instant::now();
+                device.synchronize()?;
+                t_sync += t0.elapsed();
+
+                // Advance position after graph execution (outside capture)
+                let t0 = Instant::now();
+                self.kv_cache.advance(1)?;
+                t_advance += t0.elapsed();
+
+                let t0 = Instant::now();
+                let recent = recent_token_window(tokens, sampling);
+                *next_token = select_token(&logits, sampling, rng_state, recent)?;
+                t_sample += t0.elapsed();
+
+                captured_logits = Some(logits);
+                graph_steps += 1;
+            } else {
+                // Replay the captured graph (no re-capture)
+                let t0 = Instant::now();
+                graph.launch()?;
+                t_launch += t0.elapsed();
+
+                let t0 = Instant::now();
+                device.synchronize()?;
+                t_sync += t0.elapsed();
+
+                let t0 = Instant::now();
+                self.kv_cache.advance(1)?;
+                t_advance += t0.elapsed();
+
+                let t0 = Instant::now();
+                let logits = captured_logits
+                    .as_ref()
+                    .expect("graph must be captured before replay");
+                let recent = recent_token_window(tokens, sampling);
+                *next_token = select_token(logits, sampling, rng_state, recent)?;
+                t_sample += t0.elapsed();
+
+                graph_steps += 1;
+            }
+
+            if options.eos_token_id == Some(*next_token) {
+                break;
+            }
+            tokens.push(*next_token);
+        }
+
+        Self::print_graph_profiling(graph_steps, t_htod, t_launch, t_sync, t_advance, t_sample);
+
+        Ok(())
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn print_graph_profiling(
+        steps: u64,
+        t_htod: std::time::Duration,
+        t_launch: std::time::Duration,
+        t_sync: std::time::Duration,
+        t_advance: std::time::Duration,
+        t_sample: std::time::Duration,
+    ) {
+        use std::time::Duration;
+        if steps == 0 {
+            return;
+        }
+        let s = steps as f64;
+        let row = |label: &str, d: Duration| {
+            eprintln!(
+                "  {label:<14} {:>8.2} ms total, {:>6.1} μs/step",
+                d.as_secs_f64() * 1e3,
+                d.as_secs_f64() * 1e6 / s
+            );
+        };
+        eprintln!("--- CUDA graph decode profiling ({steps} steps, capture-once) ---");
+        row("htod_copy:", t_htod);
+        row("launch:", t_launch);
+        row("sync:", t_sync);
+        row("advance:", t_advance);
+        row("sample:", t_sample);
+        let total = t_htod + t_launch + t_sync + t_advance + t_sample;
+        row("TOTAL:", total);
     }
 
     /// Generate without KV cache (recomputes full sequence each step).
@@ -193,7 +362,7 @@ impl<M: Model> Engine<M> {
         options: &GenerateOptions,
         tx: &mpsc::Sender<Result<u32>>,
     ) -> Result<()> {
-        self.kv_cache.reset();
+        self.kv_cache.reset()?;
         let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
         let sampling = options.sampling.as_ref();
@@ -214,22 +383,115 @@ impl<M: Model> Engine<M> {
         }
 
         // Decode
+        if options.use_cuda_graphs && options.max_new_tokens > 1 {
+            self.stream_decode_loop_graph(
+                &mut tokens,
+                &mut next_token,
+                options,
+                &mut rng_state,
+                tx,
+            )?;
+        } else {
+            self.stream_decode_loop_eager(
+                &mut tokens,
+                &mut next_token,
+                options,
+                &mut rng_state,
+                tx,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Streaming decode loop without CUDA graph capture.
+    fn stream_decode_loop_eager(
+        &mut self,
+        tokens: &mut Vec<u32>,
+        next_token: &mut u32,
+        options: &GenerateOptions,
+        rng_state: &mut Option<u64>,
+        tx: &mpsc::Sender<Result<u32>>,
+    ) -> Result<()> {
+        let sampling = options.sampling.as_ref();
         for _ in 1..options.max_new_tokens {
             let logits = self
                 .model
-                .forward_next_token(next_token, &mut self.kv_cache)?;
-            let recent = recent_token_window(&tokens, sampling);
-            next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
+                .forward_next_token(*next_token, &mut self.kv_cache)?;
+            let recent = recent_token_window(tokens, sampling);
+            *next_token = select_token(&logits, sampling, rng_state, recent)?;
 
-            if options.eos_token_id == Some(next_token) {
+            if options.eos_token_id == Some(*next_token) {
                 break;
             }
-            tokens.push(next_token);
-            if tx.send(Ok(next_token)).is_err() {
+            tokens.push(*next_token);
+            if tx.send(Ok(*next_token)).is_err() {
                 break;
             }
         }
+        Ok(())
+    }
 
+    /// Streaming decode loop with capture-once CUDA graph.
+    fn stream_decode_loop_graph(
+        &mut self,
+        tokens: &mut Vec<u32>,
+        next_token: &mut u32,
+        options: &GenerateOptions,
+        rng_state: &mut Option<u64>,
+        tx: &mpsc::Sender<Result<u32>>,
+    ) -> Result<()> {
+        let sampling = options.sampling.as_ref();
+        let device = self.kv_cache.device();
+        let mut graph = CudaGraph::new(&device)?;
+        let mut captured_logits: Option<CudaTensor<f32>> = None;
+
+        for step in 1..options.max_new_tokens {
+            device.htod_copy_into(vec![*next_token], graph.token_input_mut())?;
+
+            if step == 1 {
+                // Warmup: eager (forward_next_token_device calls advance)
+                let logits = self
+                    .model
+                    .forward_next_token_device(graph.token_input(), &mut self.kv_cache)?;
+                let recent = recent_token_window(tokens, sampling);
+                *next_token = select_token(&logits, sampling, rng_state, recent)?;
+            } else if step == 2 {
+                // Capture once using indirect kernels
+                graph.begin_capture()?;
+                let logits = self
+                    .model
+                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_cache)?;
+                graph.end_capture()?;
+
+                graph.launch()?;
+                device.synchronize()?;
+                self.kv_cache.advance(1)?;
+
+                let recent = recent_token_window(tokens, sampling);
+                *next_token = select_token(&logits, sampling, rng_state, recent)?;
+                captured_logits = Some(logits);
+            } else {
+                // Replay captured graph
+                graph.launch()?;
+                device.synchronize()?;
+                self.kv_cache.advance(1)?;
+
+                let logits = captured_logits
+                    .as_ref()
+                    .expect("graph must be captured before replay");
+                let recent = recent_token_window(tokens, sampling);
+                *next_token = select_token(logits, sampling, rng_state, recent)?;
+            }
+
+            if options.eos_token_id == Some(*next_token) {
+                break;
+            }
+            tokens.push(*next_token);
+            if tx.send(Ok(*next_token)).is_err() {
+                break;
+            }
+        }
         Ok(())
     }
 

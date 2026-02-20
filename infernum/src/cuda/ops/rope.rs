@@ -98,7 +98,12 @@ fn apply_rope_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     let module_name = "rope";
     if !device.has_func(module_name, &kernel_name) {
-        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+        let all_names: Vec<&str> = KERNEL_NAMES
+            .iter()
+            .chain(INDIRECT_KERNEL_NAMES.iter())
+            .copied()
+            .collect();
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, &all_names)?;
     }
 
     let func = device.get_func(module_name, &kernel_name).unwrap();
@@ -147,6 +152,84 @@ pub fn apply_rope<T: TensorDType + cudarc::driver::DeviceRepr>(
     position_offset: usize,
 ) -> Result<CudaTensor<T>> {
     apply_rope_generic(input, cos_cache, sin_cache, position_offset)
+}
+
+const INDIRECT_KERNEL_NAMES: &[&str] = &[
+    "rope_indirect_f32",
+    "rope_indirect_f16",
+    "rope_indirect_bf16",
+];
+
+/// Apply rotary positional embeddings using a GPU-resident position offset.
+///
+/// Identical to [`apply_rope`] but reads `position_offset` from the
+/// [`SeqPosition`]'s device pointer instead of a host scalar.  This makes
+/// the kernel capturable by a CUDA graph — the graph references the fixed
+/// device address, and only the value at that address changes between
+/// replays.
+///
+/// # Errors
+/// Returns an error if the kernel launch fails.
+pub fn apply_rope_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    position: &crate::cuda::SeqPosition,
+) -> Result<CudaTensor<T>> {
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (seq_len, num_heads, head_dim)"
+    );
+
+    let seq_len = shape[0];
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_indirect_{}", kernel_suffix::<T>());
+
+    let module_name = "rope";
+    if !device.has_func(module_name, &kernel_name) {
+        // Load both standard and indirect kernels from the same PTX
+        let all_names: Vec<&str> = KERNEL_NAMES
+            .iter()
+            .chain(INDIRECT_KERNEL_NAMES.iter())
+            .copied()
+            .collect();
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, &all_names)?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                seq_len as i32,
+                num_heads as i32,
+                head_dim as i32,
+                position.device(),
+            ),
+        )?;
+    }
+
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -235,6 +318,100 @@ mod tests {
                 "Mismatch at index {i}: got {got}, expected {want} — \
                  wrong rotation convention?"
             );
+        }
+    }
+
+    #[test]
+    fn test_rope_indirect_matches_direct_at_zero() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let input_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, 2, head_dim], &input_data).unwrap();
+
+        let direct = apply_rope(&input, &cos_cache, &sin_cache, 0).unwrap();
+
+        let mut pos = crate::cuda::SeqPosition::new(ctx.device()).unwrap();
+        pos.set(0, ctx.device()).unwrap();
+        let indirect = apply_rope_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
+
+        let direct_data = direct.to_vec().unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (d - ind).abs() < 1e-6,
+                "Mismatch at {i}: direct={d}, indirect={ind}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_indirect_matches_direct_nonzero_position() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let input_data = vec![1.0, 2.0, 3.0, 4.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
+
+        let position = 42;
+        let direct = apply_rope(&input, &cos_cache, &sin_cache, position).unwrap();
+
+        let mut pos = crate::cuda::SeqPosition::new(ctx.device()).unwrap();
+        pos.set(position, ctx.device()).unwrap();
+        let indirect = apply_rope_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
+
+        let direct_data = direct.to_vec().unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (d - ind).abs() < 1e-6,
+                "Mismatch at position {position}, index {i}: direct={d}, indirect={ind}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_indirect_updates_with_position() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let input_data = vec![1.0, 2.0, 3.0, 4.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
+
+        let mut pos = crate::cuda::SeqPosition::new(ctx.device()).unwrap();
+
+        // Position 5
+        pos.set(5, ctx.device()).unwrap();
+        let out5 = apply_rope_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
+        let ref5 = apply_rope(&input, &cos_cache, &sin_cache, 5).unwrap();
+
+        // Position 10
+        pos.set(10, ctx.device()).unwrap();
+        let out10 = apply_rope_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
+        let ref10 = apply_rope(&input, &cos_cache, &sin_cache, 10).unwrap();
+
+        let out5_data = out5.to_vec().unwrap();
+        let ref5_data = ref5.to_vec().unwrap();
+        let out10_data = out10.to_vec().unwrap();
+        let ref10_data = ref10.to_vec().unwrap();
+
+        // Results at different positions should differ
+        assert_ne!(
+            out5_data, out10_data,
+            "Different positions should produce different results"
+        );
+
+        // Each should match its direct counterpart
+        for (i, (&a, &b)) in out5_data.iter().zip(ref5_data.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-6, "pos=5 mismatch at {i}: {a} vs {b}");
+        }
+        for (i, (&a, &b)) in out10_data.iter().zip(ref10_data.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-6, "pos=10 mismatch at {i}: {a} vs {b}");
         }
     }
 }

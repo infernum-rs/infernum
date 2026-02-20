@@ -28,7 +28,8 @@ impl CudaContext {
     /// # Errors
     /// Returns an error if CUDA device initialization fails
     pub fn new(ordinal: usize) -> Result<Self> {
-        let device = CudaDevice::new(ordinal)?;
+        // Use a non-default stream so that CUDA graph capture is possible.
+        let device = CudaDevice::new_with_stream(ordinal)?;
         let blas = CudaBlas::new(device.clone())?;
         let blas_lt = CudaBlasLT::new(device.clone())?;
 

@@ -57,4 +57,8 @@ pub enum Error {
 
     #[error("Unsupported dtype: {0}")]
     UnsupportedDtype(String),
+
+    #[cfg(feature = "cuda")]
+    #[error("CUDA graph error: {0}")]
+    CudaGraph(String),
 }

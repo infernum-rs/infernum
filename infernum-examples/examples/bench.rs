@@ -35,9 +35,18 @@ struct Cli {
     /// Enable buffer pool
     #[arg(long)]
     pool: bool,
+
+    /// Enable CUDA graph capture/replay for the decode loop
+    #[arg(long)]
+    graphs: bool,
 }
 
-fn bench_model<M: Model>(model: M, ctx: &CudaContext, n_gen: usize) -> infernum::Result<()> {
+fn bench_model<M: Model>(
+    model: M,
+    ctx: &CudaContext,
+    n_gen: usize,
+    use_cuda_graphs: bool,
+) -> infernum::Result<()> {
     let mut engine = Engine::new(ctx, model)?;
 
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -46,6 +55,7 @@ fn bench_model<M: Model>(model: M, ctx: &CudaContext, n_gen: usize) -> infernum:
         eos_token_id: None,
         sampling: None,
         use_kv_cache: true,
+        use_cuda_graphs,
     };
 
     // Warmup
@@ -56,6 +66,7 @@ fn bench_model<M: Model>(model: M, ctx: &CudaContext, n_gen: usize) -> infernum:
             eos_token_id: None,
             sampling: None,
             use_kv_cache: true,
+            use_cuda_graphs: false,
         },
     )?;
 
@@ -96,6 +107,12 @@ fn main() -> infernum::Result<()> {
         eprintln!("Buffer pool: disabled");
     }
 
+    if cli.graphs {
+        eprintln!("CUDA graphs: ENABLED");
+    } else {
+        eprintln!("CUDA graphs: disabled");
+    }
+
     let is_gguf = cli.model.ends_with(".gguf");
 
     match cli.dtype.as_str() {
@@ -110,7 +127,7 @@ fn main() -> infernum::Result<()> {
                 model.config().num_hidden_layers,
                 model.config().hidden_size,
             );
-            bench_model(model, &ctx, cli.n_gen)
+            bench_model(model, &ctx, cli.n_gen, cli.graphs)
         }
         "bf16" => {
             assert!(
@@ -123,7 +140,7 @@ fn main() -> infernum::Result<()> {
                 model.config().num_hidden_layers,
                 model.config().hidden_size,
             );
-            bench_model(model, &ctx, cli.n_gen)
+            bench_model(model, &ctx, cli.n_gen, cli.graphs)
         }
         other => panic!("Unsupported dtype: {other}. Use f32 or bf16."),
     }

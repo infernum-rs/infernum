@@ -24,14 +24,16 @@ pub use add_rmsnorm::add_rmsnorm;
 pub use argmax::{argmax_last, argmax_last_scalar};
 pub use attention::{attention, attention_kv};
 pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16, cast_to_f32};
-pub use embed::embedding_gather;
-pub use fused_attention::{fused_attention_decode, fused_attention_prefill};
+pub use embed::{embedding_gather, embedding_gather_from_device};
+pub use fused_attention::{
+    fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill,
+};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
 pub use mul::mul;
 pub use quantized_matmul::quantized_matmul;
 pub use repeat_kv::repeat_kv;
 pub use rmsnorm::{rms_norm, rms_norm_inplace};
-pub use rope::{apply_rope, precompute_rope_cache};
+pub use rope::{apply_rope, apply_rope_indirect, precompute_rope_cache};
 pub use sample::sample_top_p;
 pub use silu::{silu, silu_inplace, silu_mul};
 pub use softmax::{softmax, softmax_causal};

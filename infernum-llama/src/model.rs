@@ -9,13 +9,15 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope, attention, cast_to_f32, embedding_gather, matmul,
-    matmul_bf16_f32, precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm,
-    rms_norm_inplace, swiglu, transpose_2d, GemmScalar,
+    add_inplace, add_rmsnorm, apply_rope, apply_rope_indirect, attention, cast_to_f32,
+    embedding_gather, embedding_gather_from_device, fused_attention_decode,
+    fused_attention_decode_indirect, fused_attention_prefill, matmul, matmul_bf16_f32,
+    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
+    transpose_2d, GemmScalar,
 };
-use infernum::cuda::ops::{fused_attention_decode, fused_attention_prefill};
 use infernum::cuda::{
-    CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, QuantizedTensor, ValidAsZeroBits,
+    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, QuantizedTensor,
+    ValidAsZeroBits,
 };
 use infernum::dtype::TensorDType;
 use infernum::tensor::Tensor;
@@ -529,7 +531,7 @@ where
         }
 
         // Advance KV cache position (once after all layers)
-        kv_cache.advance(seq_len);
+        kv_cache.advance(seq_len)?;
 
         // Final layer norm (in-place: hidden is consumed)
         rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
@@ -681,6 +683,157 @@ where
         embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
     }
 
+    /// Embed a single token ID already on the GPU (avoids `htod_sync_copy`)
+    fn embed_from_device(&self, token_id_gpu: &CudaSlice<u32>) -> Result<CudaTensor<T>> {
+        embedding_gather_from_device(&self.ctx, &self.embed_tokens, token_id_gpu, 1)
+    }
+
+    /// Decode-phase forward pass reading the token from a GPU buffer.
+    ///
+    /// Identical to [`Self::forward_next_token`] but avoids the host→device
+    /// copy, making the entire call capturable by a CUDA graph.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_next_token_device(
+        &self,
+        token_id_gpu: &CudaSlice<u32>,
+        kv_cache: &mut KvCache<T>,
+    ) -> Result<CudaTensor<f32>> {
+        let position_offset = kv_cache.current_len();
+
+        let mut hidden = self.embed_from_device(token_id_gpu)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
+        }
+
+        kv_cache.advance(1)?;
+        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+
+        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
+        self.lm_head_forward(&last_hidden)
+    }
+
+    /// Decode-phase forward pass using indirect kernels for CUDA graph capture.
+    ///
+    /// Uses `_indirect` kernel variants that read position from stable device
+    /// pointers. The entire call is capturable by a CUDA graph and the graph
+    /// can be replayed without re-capture.
+    ///
+    /// **Does not call `kv_cache.advance()`** — the caller must do that
+    /// outside the captured region.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_next_token_indirect(
+        &self,
+        token_id_gpu: &CudaSlice<u32>,
+        kv_cache: &mut KvCache<T>,
+    ) -> Result<CudaTensor<f32>> {
+        let mut hidden = self.embed_from_device(token_id_gpu)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_kv_indirect(&hidden, layer, layer_idx, kv_cache)?;
+        }
+
+        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+
+        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
+        self.lm_head_forward(&last_hidden)
+    }
+
+    /// Transformer layer forward pass using indirect kernels.
+    ///
+    /// Reads position from `kv_cache.current_position()` device pointer.
+    fn forward_layer_kv_indirect(
+        &self,
+        hidden: &CudaTensor<T>,
+        layer: &LlamaLayerWeights<T>,
+        layer_idx: usize,
+        kv_cache: &mut KvCache<T>,
+    ) -> Result<CudaTensor<T>> {
+        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+        let attn_output =
+            self.forward_attention_kv_indirect(&normed, &layer.attention, layer_idx, kv_cache)?;
+
+        let (mut hidden, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
+        add_inplace(&mut hidden, &mlp_output)?;
+        Ok(hidden)
+    }
+
+    /// Attention with indirect kernels (decode-only, seq_len=1).
+    ///
+    /// Uses `apply_rope_indirect`, `append_indirect`, and
+    /// `fused_attention_decode_indirect` so all position-dependent parameters
+    /// are read from stable device pointers.
+    fn forward_attention_kv_indirect(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &LlamaAttentionWeights<T>,
+        layer_idx: usize,
+        kv_cache: &mut KvCache<T>,
+    ) -> Result<CudaTensor<T>> {
+        let hidden_size = self.config.hidden_size;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_kv_heads();
+        let head_dim = self.config.head_dim();
+
+        // Project Q, K, V
+        let q = linear(hidden, &weights.q_proj)?;
+        let (k, v) = match &weights.kv_proj {
+            KvProjWeight::Fused { weight, kv_dim } => {
+                let kv = matmul(hidden, weight)?;
+                let k = kv.slice_view(0, &[1, *kv_dim]);
+                let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
+                (k, v)
+            }
+            KvProjWeight::Separate { k_proj, v_proj } => {
+                let k = linear(hidden, k_proj)?;
+                let v = linear(hidden, v_proj)?;
+                (k, v)
+            }
+        };
+
+        // Reshape to (1, num_heads, head_dim)
+        let q = q.reshape(&[1, num_heads, head_dim]);
+        let k = k.reshape(&[1, num_kv_heads, head_dim]);
+        let v = v.reshape(&[1, num_kv_heads, head_dim]);
+
+        // RoPE with indirect position
+        let position = kv_cache.current_position();
+        let q = apply_rope_indirect(&q, &self.cos_cache, &self.sin_cache, position)?;
+        let k = apply_rope_indirect(&k, &self.cos_cache, &self.sin_cache, position)?;
+
+        // Append to cache using indirect write offset
+        kv_cache.append_indirect(layer_idx, &k, &v)?;
+
+        // Full buffers (stable addresses for graph replay)
+        let (k_full, v_full) = kv_cache.full_buffers(layer_idx);
+
+        // Fused decode attention with indirect total_len.
+        // total_len = current_len + 1 (includes the just-appended token).
+        let total_len = kv_cache.current_total_len();
+        let attn_output = fused_attention_decode_indirect(
+            &q,
+            k_full,
+            v_full,
+            total_len,
+            kv_cache.graph_max_seq_len(),
+        )?;
+
+        let attn_output = attn_output.reshape(&[1, hidden_size]);
+        linear(&attn_output, &weights.o_proj)
+    }
+
     /// Forward pass through MLP (SwiGLU)
     #[allow(clippy::unused_self)]
     fn forward_mlp(
@@ -734,6 +887,10 @@ where
             }
         }
         let logits_t = linear(hidden, &self.lm_head)?;
+        if T::DTYPE == infernum::dtype::DType::F32 {
+            // T is f32 — zero-copy reinterpret (same layout, no GPU op)
+            return Ok(unsafe { logits_t.reinterpret() });
+        }
         cast_to_f32(&logits_t)
     }
 }
@@ -1106,6 +1263,22 @@ where
         kv_cache: &mut KvCache<T>,
     ) -> Result<CudaTensor<f32>> {
         self.forward_next_token(token_id, kv_cache)
+    }
+
+    fn forward_next_token_device(
+        &self,
+        token_id_gpu: &CudaSlice<u32>,
+        kv_cache: &mut KvCache<T>,
+    ) -> Result<CudaTensor<f32>> {
+        self.forward_next_token_device(token_id_gpu, kv_cache)
+    }
+
+    fn forward_next_token_indirect(
+        &self,
+        token_id_gpu: &CudaSlice<u32>,
+        kv_cache: &mut KvCache<T>,
+    ) -> Result<CudaTensor<f32>> {
+        self.forward_next_token_indirect(token_id_gpu, kv_cache)
     }
 }
 
@@ -1596,7 +1769,7 @@ mod tests {
         assert_eq!(kv_cache.current_len(), 3);
 
         // Reset and process a different sequence
-        kv_cache.reset();
+        kv_cache.reset().unwrap();
         assert_eq!(kv_cache.current_len(), 0);
 
         let prompt2: Vec<u32> = vec![2, 3];

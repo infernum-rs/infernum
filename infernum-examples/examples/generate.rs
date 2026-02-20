@@ -167,6 +167,7 @@ fn main() -> Result<()> {
             })
         },
         use_kv_cache: !cli.no_kv_cache,
+        use_cuda_graphs: false,
     };
 
     // Print decoding strategy

@@ -46,6 +46,9 @@ pub struct GenerateOptions {
     /// Whether to use the KV cache for efficient generation.
     /// When `false`, recomputes the full sequence at each step.
     pub use_kv_cache: bool,
+    /// Whether to use CUDA graph capture/replay for the decode loop.
+    /// Reduces per-token kernel launch overhead. Requires `use_kv_cache`.
+    pub use_cuda_graphs: bool,
 }
 
 impl Default for GenerateOptions {
@@ -55,6 +58,7 @@ impl Default for GenerateOptions {
             eos_token_id: None,
             sampling: None,
             use_kv_cache: true,
+            use_cuda_graphs: false,
         }
     }
 }
