@@ -5,6 +5,7 @@ use cudarc::cublaslt::CudaBlasLT;
 use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::{Arc, Mutex};
 
+use super::buffer_pool::BufferPool;
 use crate::Result;
 
 /// Manages CUDA device and associated resources (cuBLAS handle, etc.)
@@ -17,6 +18,8 @@ pub struct CudaContext {
     fp8_workspace: Arc<Mutex<Option<CudaSlice<u8>>>>,
     /// Cached compute capability (major, minor)
     compute_capability: (i32, i32),
+    /// Optional buffer pool for reusing GPU allocations
+    buffer_pool: Option<BufferPool>,
 }
 
 impl CudaContext {
@@ -25,7 +28,8 @@ impl CudaContext {
     /// # Errors
     /// Returns an error if CUDA device initialization fails
     pub fn new(ordinal: usize) -> Result<Self> {
-        let device = CudaDevice::new(ordinal)?;
+        // Use a non-default stream so that CUDA graph capture is possible.
+        let device = CudaDevice::new_with_stream(ordinal)?;
         let blas = CudaBlas::new(device.clone())?;
         let blas_lt = CudaBlasLT::new(device.clone())?;
 
@@ -46,6 +50,7 @@ impl CudaContext {
             blas_lt: Arc::new(blas_lt),
             fp8_workspace: Arc::new(Mutex::new(None)),
             compute_capability: (major, minor),
+            buffer_pool: None,
         })
     }
 
@@ -100,6 +105,23 @@ impl CudaContext {
         Ok(guard)
     }
 
+    /// Enable the GPU buffer pool for this context.
+    ///
+    /// Once enabled, `CudaTensor::uninit()` will attempt to reuse previously
+    /// freed GPU allocations instead of calling `cuMemAlloc` each time.
+    /// All clones of this context share the same pool.
+    pub fn enable_buffer_pool(&mut self) {
+        if self.buffer_pool.is_none() {
+            self.buffer_pool = Some(BufferPool::new(&self.device));
+        }
+    }
+
+    /// Get a reference to the buffer pool, if enabled.
+    #[must_use]
+    pub fn buffer_pool(&self) -> Option<&BufferPool> {
+        self.buffer_pool.as_ref()
+    }
+
     /// Synchronize the CUDA device (wait for all operations to complete)
     ///
     /// # Errors
@@ -135,6 +157,23 @@ mod tests {
             &ctx.fp8_workspace,
             &ctx2.fp8_workspace,
         ));
+    }
+
+    #[test]
+    fn test_buffer_pool_shared_across_clones() {
+        let mut ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        ctx.enable_buffer_pool();
+
+        let ctx2 = ctx.clone();
+
+        // Both should see the same pool
+        assert!(ctx.buffer_pool().is_some());
+        assert!(ctx2.buffer_pool().is_some());
+
+        // Release a buffer through one context, acquire through the other
+        let buf = ctx.device().alloc_zeros::<u8>(256).unwrap();
+        ctx.buffer_pool().unwrap().release(buf, 256);
+        assert!(unsafe { ctx2.buffer_pool().unwrap().acquire::<u8>(256, 256) }.is_some());
     }
 
     #[test]

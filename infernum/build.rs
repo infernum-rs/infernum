@@ -24,6 +24,9 @@ mod cuda {
 
         fs::create_dir_all(&ptx_dir).expect("Failed to create PTX output directory");
 
+        // Re-run when new .cu files are added to the directory
+        println!("cargo:rerun-if-changed={}", kernel_dir.display());
+
         let cu_files: Vec<PathBuf> = fs::read_dir(&kernel_dir)
             .expect("Failed to read kernels/ directory")
             .filter_map(|entry| {

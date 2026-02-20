@@ -426,6 +426,7 @@ dependencies = [
 name = "infernum-llama"
 version = "0.1.0"
 dependencies = [
+ "half",
  "infernum",
  "infernum-runtime",
  "serde",

@@ -427,7 +427,7 @@ mod tests {
         let v = CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &kv_data).unwrap();
 
         let output = attention_kv(&q, &mut kv_cache, 0, &k, &v).unwrap();
-        kv_cache.advance(seq_len);
+        kv_cache.advance(seq_len).unwrap();
 
         assert_eq!(output.shape(), &[seq_len, num_heads, head_dim]);
         assert_eq!(kv_cache.current_len(), seq_len);
@@ -459,7 +459,7 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[prefill_len, num_kv_heads, head_dim], &kv_data).unwrap();
 
         let _prefill_out = attention_kv(&q, &mut kv_cache, 0, &k, &v).unwrap();
-        kv_cache.advance(prefill_len);
+        kv_cache.advance(prefill_len).unwrap();
 
         // Decode one token
         let q1_data: Vec<f32> = (0..num_heads * head_dim)
@@ -474,7 +474,7 @@ mod tests {
         let v1 = CudaTensor::from_slice(&ctx, &[1, num_kv_heads, head_dim], &kv1_data).unwrap();
 
         let decode_out = attention_kv(&q1, &mut kv_cache, 0, &k1, &v1).unwrap();
-        kv_cache.advance(1);
+        kv_cache.advance(1).unwrap();
 
         assert_eq!(decode_out.shape(), &[1, num_heads, head_dim]);
         assert_eq!(kv_cache.current_len(), prefill_len + 1);

@@ -4,7 +4,12 @@
 //! must satisfy to be used with the Engine and Runtime.
 
 #[cfg(feature = "cuda")]
+use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
+
+#[cfg(feature = "cuda")]
 use crate::cuda::{CudaTensor, KvCache};
+#[cfg(feature = "cuda")]
+use crate::dtype::TensorDType;
 #[cfg(feature = "cuda")]
 use crate::Result;
 
@@ -25,10 +30,17 @@ pub struct ModelConfig {
 
 /// Trait for LLM models that can be used with the Engine.
 ///
-/// A model takes token IDs, runs a forward pass, and returns logits.
+/// A model takes token IDs, runs a forward pass, and returns logits (always f32).
 /// It supports both full-recompute and KV-cached inference.
+///
+/// The associated type `CacheDtype` determines the KV cache element type,
+/// allowing models to compute in f16/bf16 while the Engine allocates the
+/// correct cache type.
 #[cfg(feature = "cuda")]
 pub trait Model {
+    /// Element type for KV cache tensors (f32, f16, or bf16).
+    type CacheDtype: TensorDType + DeviceRepr + ValidAsZeroBits;
+
     /// Get the model configuration needed for resource allocation.
     fn config(&self) -> ModelConfig;
 
@@ -54,7 +66,7 @@ pub trait Model {
     fn forward_with_kv_cache(
         &self,
         input_ids: &[u32],
-        kv_cache: &mut KvCache,
+        kv_cache: &mut KvCache<Self::CacheDtype>,
     ) -> Result<CudaTensor<f32>>;
 
     /// Forward pass for a single token with KV cache (decode phase).
@@ -63,5 +75,55 @@ pub trait Model {
     ///
     /// # Errors
     /// Returns an error if the forward pass fails.
-    fn forward_next_token(&self, token_id: u32, kv_cache: &mut KvCache) -> Result<CudaTensor<f32>>;
+    fn forward_next_token(
+        &self,
+        token_id: u32,
+        kv_cache: &mut KvCache<Self::CacheDtype>,
+    ) -> Result<CudaTensor<f32>>;
+
+    /// Forward pass for a single token with KV cache, reading the token ID
+    /// from a GPU buffer instead of the host.
+    ///
+    /// This avoids the `htod_sync_copy` in [`Self::forward_next_token`], making
+    /// the entire forward pass capturable by a CUDA graph.
+    ///
+    /// The default implementation copies the token to host and delegates to
+    /// [`Self::forward_next_token`]. Models should override this to use
+    /// [`embedding_gather_from_device`](crate::cuda::ops::embedding_gather_from_device)
+    /// for a fully GPU-resident decode path.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    fn forward_next_token_device(
+        &self,
+        token_id_gpu: &CudaSlice<u32>,
+        kv_cache: &mut KvCache<Self::CacheDtype>,
+    ) -> Result<CudaTensor<f32>> {
+        // Fallback: read token ID from GPU (sync) and delegate.
+        // Models should override this to avoid the sync copy.
+        let host = token_id_gpu.device().dtoh_sync_copy(token_id_gpu)?;
+        self.forward_next_token(host[0], kv_cache)
+    }
+
+    /// Decode-phase forward pass using indirect kernels for CUDA graph capture.
+    ///
+    /// Uses `_indirect` kernel variants that read position/length from stable
+    /// device pointers (via [`KvCache::current_position`]) instead of host
+    /// scalars. This allows a CUDA graph to be captured once and replayed
+    /// on every subsequent decode step without re-capture.
+    ///
+    /// **Does not call `kv_cache.advance()`** — the caller must do that
+    /// outside the captured region after each graph launch.
+    ///
+    /// The default implementation falls back to [`Self::forward_next_token_device`].
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    fn forward_next_token_indirect(
+        &self,
+        token_id_gpu: &CudaSlice<u32>,
+        kv_cache: &mut KvCache<Self::CacheDtype>,
+    ) -> Result<CudaTensor<f32>> {
+        self.forward_next_token_device(token_id_gpu, kv_cache)
+    }
 }

@@ -1,7 +1,25 @@
+#include <cuda_bf16.h>
+
 // Transpose 2D: (rows, cols) -> (cols, rows)
 extern "C" __global__ void transpose_2d_f32(
     float* __restrict__ output,
     const float* __restrict__ input,
+    const int rows,
+    const int cols
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * cols;
+    if (idx < total) {
+        const int r = idx / cols;
+        const int c = idx % cols;
+        output[c * rows + r] = input[r * cols + c];
+    }
+}
+
+// Transpose 2D bf16: (rows, cols) -> (cols, rows)
+extern "C" __global__ void transpose_2d_bf16(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
     const int rows,
     const int cols
 ) {

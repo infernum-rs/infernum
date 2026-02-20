@@ -10,14 +10,43 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
+use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/rmsnorm.ptx"));
 
+const KERNEL_NAMES: &[&str] = &[
+    "rmsnorm_f32",
+    "rmsnorm_inplace_f32",
+    "rmsnorm_f16",
+    "rmsnorm_inplace_f16",
+    "rmsnorm_bf16",
+    "rmsnorm_inplace_bf16",
+];
+
+fn kernel_suffix<T: TensorDType>() -> &'static str {
+    match T::DTYPE {
+        crate::dtype::DType::F32 => "f32",
+        crate::dtype::DType::F16 => "f16",
+        crate::dtype::DType::BF16 => "bf16",
+        other => panic!("RMS norm not supported for dtype: {other}"),
+    }
+}
+
+fn load_rmsnorm_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
+    let module_name = "rmsnorm";
+    if !device.has_func(module_name, "rmsnorm_f32") {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+    }
+    Ok(())
+}
+
 /// Apply RMS normalization: output = (x / rms(x)) * weight
 ///
 /// where rms(x) = sqrt(mean(x^2) + eps)
+///
+/// Supports F32, F16, and BF16 tensor types.
 ///
 /// # Arguments
 /// * `input` - Input tensor of shape (batch, seq_len, hidden) or (seq_len, hidden)
@@ -26,11 +55,11 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/rmsnorm.ptx"))
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn rms_norm(
-    input: &CudaTensor<f32>,
-    weight: &CudaTensor<f32>,
+pub fn rms_norm<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    weight: &CudaTensor<T>,
     eps: f32,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor<T>> {
     let shape = input.shape();
     let hidden_size = *shape
         .last()
@@ -43,23 +72,18 @@ pub fn rms_norm(
         "Weight shape must match hidden dimension"
     );
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
 
     let device = input.context().device();
+    load_rmsnorm_kernels(device)?;
 
-    let module_name = "rmsnorm";
-    if !device.has_func(module_name, "rmsnorm_f32") {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            &["rmsnorm_f32", "rmsnorm_inplace_f32"],
-        )?;
-    }
-
-    let func = device.get_func(module_name, "rmsnorm_f32").unwrap();
+    let kernel_name = format!("rmsnorm_{}", kernel_suffix::<T>());
+    let func = device.get_func("rmsnorm", &kernel_name).unwrap();
 
     let block_size = 256.min(hidden_size);
-    let shared_mem = block_size * std::mem::size_of::<f32>();
+    // Shared memory for warp-level reduction: one float per warp
+    let num_warps = block_size.div_ceil(32);
+    let shared_mem = num_warps * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
         grid_dim: (num_rows as u32, 1, 1),
@@ -87,6 +111,8 @@ pub fn rms_norm(
 ///
 /// where rms(x) = sqrt(mean(x^2) + eps)
 ///
+/// Supports F32, F16, and BF16 tensor types.
+///
 /// # Arguments
 /// * `input` - Input tensor of shape (batch, seq_len, hidden) or (seq_len, hidden), modified in place
 /// * `weight` - Weight tensor of shape (hidden,)
@@ -94,9 +120,9 @@ pub fn rms_norm(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn rms_norm_inplace(
-    input: &mut CudaTensor<f32>,
-    weight: &CudaTensor<f32>,
+pub fn rms_norm_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &mut CudaTensor<T>,
+    weight: &CudaTensor<T>,
     eps: f32,
 ) -> Result<()> {
     let shape = input.shape();
@@ -112,20 +138,14 @@ pub fn rms_norm_inplace(
     );
 
     let device = input.context().device();
+    load_rmsnorm_kernels(device)?;
 
-    let module_name = "rmsnorm";
-    if !device.has_func(module_name, "rmsnorm_inplace_f32") {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            &["rmsnorm_f32", "rmsnorm_inplace_f32"],
-        )?;
-    }
-
-    let func = device.get_func(module_name, "rmsnorm_inplace_f32").unwrap();
+    let kernel_name = format!("rmsnorm_inplace_{}", kernel_suffix::<T>());
+    let func = device.get_func("rmsnorm", &kernel_name).unwrap();
 
     let block_size = 256.min(hidden_size);
-    let shared_mem = block_size * std::mem::size_of::<f32>();
+    let num_warps = block_size.div_ceil(32);
+    let shared_mem = num_warps * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
         grid_dim: (num_rows as u32, 1, 1),

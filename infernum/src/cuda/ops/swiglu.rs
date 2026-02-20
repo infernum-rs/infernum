@@ -12,26 +12,28 @@
 )]
 
 use crate::cuda::CudaTensor;
+use crate::dtype::TensorDType;
 use crate::Result;
 
 infernum_macros::define_block! {
     /// SwiGLU activation: `silu(gate) * up`
     ///
-    /// The decomposed version calls `silu` then `mul`. When fusion is active
-    /// (release builds by default), the existing `silu_mul` fused kernel
-    /// handles both in a single pass.
+    /// Uses the `silu_mul` fused kernel directly for all dtypes,
+    /// computing `silu(gate) * up` in a single pass.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn swiglu(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
-        let activated = super::silu(gate)?;
-        super::mul(&activated, up)
+    pub fn swiglu<T: TensorDType + cudarc::driver::DeviceRepr>(
+        gate: &CudaTensor<T>,
+        up: &CudaTensor<T>,
+    ) -> Result<CudaTensor<T>> {
+        super::silu_mul(gate, up)
     }
 }
 
 infernum_macros::define_fusion! {
-    block: SWIGLU_FUSED,
-    fn swiglu_fused(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+    name: "swiglu",
+    fn swiglu_fused_f32(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
         super::silu_mul(gate, up)
     }
 }
@@ -76,7 +78,7 @@ mod tests {
         let up = CudaTensor::from_slice(&ctx, &[8], &up_data).unwrap();
 
         let decomposed = swiglu_decomposed(&gate, &up).unwrap().to_vec().unwrap();
-        let fused = swiglu_fused(&gate, &up).unwrap().to_vec().unwrap();
+        let fused = swiglu_fused_f32(&gate, &up).unwrap().to_vec().unwrap();
 
         for i in 0..8 {
             assert!(

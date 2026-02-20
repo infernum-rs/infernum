@@ -62,8 +62,9 @@ pub fn argmax_last_scalar(input: &CudaTensor<f32>) -> Result<u32> {
     ensure_kernel_loaded(ctx)?;
     let func = device.get_func(MODULE_NAME, "argmax_last_f32").unwrap();
 
-    let block_size = 256.min(row_size.next_power_of_two());
-    let shared_mem = block_size * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+    let block_size = 1024.min(row_size.next_power_of_two().max(32));
+    let num_warps = block_size / 32;
+    let shared_mem = num_warps * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
 
     // Single-element output on GPU
     let mut out_device = device.alloc_zeros::<u32>(1)?;
@@ -118,8 +119,9 @@ fn argmax_last_gpu(
         .get_func(MODULE_NAME, "argmax_last_f32")
         .unwrap();
 
-    let block_size = 256.min(row_size.next_power_of_two());
-    let shared_mem = block_size * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+    let block_size = 1024.min(row_size.next_power_of_two().max(32));
+    let num_warps = block_size / 32;
+    let shared_mem = num_warps * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
 
     let cfg = LaunchConfig {
         grid_dim: (num_rows as u32, 1, 1),

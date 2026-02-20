@@ -11,33 +11,55 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
+use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/silu.ptx"));
+const KERNEL_NAMES: &[&str] = &[
+    "silu_f32",
+    "silu_inplace_f32",
+    "silu_mul_f32",
+    "silu_f16",
+    "silu_inplace_f16",
+    "silu_mul_f16",
+    "silu_bf16",
+    "silu_inplace_bf16",
+    "silu_mul_bf16",
+];
 
-/// Apply SiLU (Swish) activation: output = x * sigmoid(x)
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn silu(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+/// Kernel name suffix for dtype
+fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
+    let type_name = std::any::type_name::<T>();
+    if type_name.contains("f32") {
+        "f32"
+    } else if type_name.contains("f16") && !type_name.contains("bf16") {
+        "f16"
+    } else if type_name.contains("bf16") {
+        "bf16"
+    } else {
+        panic!("Unsupported dtype for silu: {type_name}")
+    }
+}
+
+/// Apply SiLU activation (generic version)
+fn silu_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+) -> Result<CudaTensor<T>> {
     let shape = input.shape();
     let n = input.numel();
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
 
     let device = input.context().device();
+    let kernel_name = format!("silu_{}", kernel_suffix::<T>());
 
     let module_name = "silu";
-    if !device.has_func(module_name, "silu_f32") {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            &["silu_f32", "silu_inplace_f32", "silu_mul_f32"],
-        )?;
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
     }
 
-    let func = device.get_func(module_name, "silu_f32").unwrap();
+    let func = device.get_func(module_name, &kernel_name).unwrap();
 
     let block_size = 256;
     let grid_size = (n + block_size - 1) / block_size;
@@ -58,24 +80,20 @@ pub fn silu(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     Ok(output)
 }
 
-/// Apply SiLU (Swish) activation in place: x = x * sigmoid(x)
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn silu_inplace(input: &mut CudaTensor<f32>) -> Result<()> {
+/// Apply SiLU inplace (generic version)
+fn silu_inplace_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &mut CudaTensor<T>,
+) -> Result<()> {
     let n = input.numel();
     let device = input.context().device();
+    let kernel_name = format!("silu_inplace_{}", kernel_suffix::<T>());
 
     let module_name = "silu";
-    if !device.has_func(module_name, "silu_inplace_f32") {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            &["silu_f32", "silu_inplace_f32", "silu_mul_f32"],
-        )?;
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
     }
 
-    let func = device.get_func(module_name, "silu_inplace_f32").unwrap();
+    let func = device.get_func(module_name, &kernel_name).unwrap();
 
     let block_size = 256;
     let grid_size = (n + block_size - 1) / block_size;
@@ -93,30 +111,27 @@ pub fn silu_inplace(input: &mut CudaTensor<f32>) -> Result<()> {
     Ok(())
 }
 
-/// Fused SiLU + multiply for SwiGLU: output = silu(gate) * up
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn silu_mul(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+/// Fused SiLU + multiply (generic version)
+fn silu_mul_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
+    gate: &CudaTensor<T>,
+    up: &CudaTensor<T>,
+) -> Result<CudaTensor<T>> {
     assert_eq!(gate.shape(), up.shape(), "gate and up must have same shape");
 
     let shape = gate.shape();
     let n = gate.numel();
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(gate.context(), shape)? };
+    let mut output = unsafe { CudaTensor::<T>::uninit(gate.context(), shape)? };
 
     let device = gate.context().device();
+    let kernel_name = format!("silu_mul_{}", kernel_suffix::<T>());
 
     let module_name = "silu";
-    if !device.has_func(module_name, "silu_mul_f32") {
-        device.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(PTX),
-            module_name,
-            &["silu_f32", "silu_inplace_f32", "silu_mul_f32"],
-        )?;
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
     }
 
-    let func = device.get_func(module_name, "silu_mul_f32").unwrap();
+    let func = device.get_func(module_name, &kernel_name).unwrap();
 
     let block_size = 256;
     let grid_size = (n + block_size - 1) / block_size;
@@ -140,6 +155,43 @@ pub fn silu_mul(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTens
     }
 
     Ok(output)
+}
+
+/// Apply SiLU (Swish) activation: output = x * sigmoid(x)
+///
+/// Supports F32, F16, and BF16 tensor types.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn silu<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+) -> Result<CudaTensor<T>> {
+    silu_generic(input)
+}
+
+/// Apply SiLU (Swish) activation in place: x = x * sigmoid(x)
+///
+/// Supports F32, F16, and BF16 tensor types.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn silu_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &mut CudaTensor<T>,
+) -> Result<()> {
+    silu_inplace_generic(input)
+}
+
+/// Fused SiLU + multiply for SwiGLU: output = silu(gate) * up
+///
+/// Supports F32, F16, and BF16 tensor types.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn silu_mul<T: TensorDType + cudarc::driver::DeviceRepr>(
+    gate: &CudaTensor<T>,
+    up: &CudaTensor<T>,
+) -> Result<CudaTensor<T>> {
+    silu_mul_generic(gate, up)
 }
 
 #[cfg(test)]

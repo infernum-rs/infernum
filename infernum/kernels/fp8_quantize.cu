@@ -1,72 +1,44 @@
 // Quantize f32 activations to FP8 E4M3, entirely on device.
 //
-// Two-kernel approach (no CPU readback):
-//   1. absmax_f32: parallel reduction to find max|x| across the tensor
-//   2. quantize_f32_to_fp8: reads absmax from device memory, computes scale,
-//      writes inv_scale to a device pointer, and quantizes all elements
+// Provides both separate kernels (absmax + quantize) and a fused single-kernel
+// version that uses atomic grid synchronization.
 
-extern "C" __global__ void absmax_f32(
-    const float* __restrict__ input,
-    unsigned int* __restrict__ max_bits,
-    const int numel
-) {
-    extern __shared__ unsigned int smax[];
-    int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+// ─── Warp-level max reduction ────────────────────────────────────────────────
 
-    float local_max = 0.0f;
-    for (int i = idx; i < numel; i += blockDim.x * gridDim.x) {
-        float v = fabsf(input[i]);
-        if (v > local_max) local_max = v;
+static __device__ __forceinline__ float warp_reduce_max_val(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
     }
-
-    smax[tid] = __float_as_uint(local_max);
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float a = __uint_as_float(smax[tid]);
-            float b = __uint_as_float(smax[tid + s]);
-            smax[tid] = __float_as_uint(fmaxf(a, b));
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        atomicMax(max_bits, smax[0]);
-    }
+    return val;
 }
 
-// Reads absmax from device memory, computes scale on-device, writes inv_scale,
-// and quantizes input to FP8 E4M3 — all without any CPU<->GPU synchronization.
-extern "C" __global__ void quantize_f32_to_fp8(
-    const float* __restrict__ input,
-    unsigned char* __restrict__ output,
-    const unsigned int* __restrict__ max_bits,
-    float* __restrict__ inv_scale_out,
-    const int numel
-) {
-    // First thread computes and broadcasts the scale via shared memory
-    __shared__ float s_scale;
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        float absmax = __uint_as_float(*max_bits);
-        float inv = (absmax > 0.0f) ? (absmax / 448.0f) : 1.0f;
-        *inv_scale_out = inv;
-    }
-    if (threadIdx.x == 0) {
-        float absmax = __uint_as_float(*max_bits);
-        s_scale = (absmax > 0.0f) ? (448.0f / absmax) : 1.0f;
+static __device__ __forceinline__ float block_reduce_max(float val) {
+    extern __shared__ char smem[];
+    float* shared = reinterpret_cast<float*>(smem);
+
+    const int lane_id = threadIdx.x % 32;
+    const int warp_id = threadIdx.x / 32;
+    const int num_warps = blockDim.x / 32;
+
+    val = warp_reduce_max_val(val);
+
+    if (lane_id == 0) {
+        shared[warp_id] = val;
     }
     __syncthreads();
 
-    float scale = s_scale;
+    if (warp_id == 0) {
+        val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        val = warp_reduce_max_val(val);
+    }
+    return val;
+}
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
+// ─── FP8 E4M3 encoding (device function) ────────────────────────────────────
 
-    float v = input[idx] * scale;
+static __device__ __forceinline__ unsigned char fp8_encode(float v) {
     v = fminf(fmaxf(v, -448.0f), 448.0f);
-
     unsigned char sign = (v < 0.0f) ? 1 : 0;
     float abs_v = fabsf(v);
 
@@ -97,5 +69,167 @@ extern "C" __global__ void quantize_f32_to_fp8(
         result = ((unsigned char)biased_exp << 3) | (unsigned char)mant;
     }
 
-    output[idx] = (sign << 7) | result;
+    return (sign << 7) | result;
+}
+
+// ─── Standalone absmax kernel (kept for compatibility) ──────────────────────
+
+extern "C" __global__ void absmax_f32(
+    const float* __restrict__ input,
+    unsigned int* __restrict__ max_bits,
+    const int numel
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float local_max = 0.0f;
+    // Vectorized loads
+    const int vec_count = numel / 4;
+    const float4* input_vec = reinterpret_cast<const float4*>(input);
+    for (int i = idx; i < vec_count; i += blockDim.x * gridDim.x) {
+        float4 v = input_vec[i];
+        local_max = fmaxf(local_max, fabsf(v.x));
+        local_max = fmaxf(local_max, fabsf(v.y));
+        local_max = fmaxf(local_max, fabsf(v.z));
+        local_max = fmaxf(local_max, fabsf(v.w));
+    }
+    // Remainder
+    for (int i = vec_count * 4 + idx; i < numel; i += blockDim.x * gridDim.x) {
+        local_max = fmaxf(local_max, fabsf(input[i]));
+    }
+
+    local_max = block_reduce_max(local_max);
+
+    if (threadIdx.x == 0) {
+        atomicMax(max_bits, __float_as_uint(local_max));
+    }
+}
+
+// ─── Standalone quantize kernel (kept for compatibility) ────────────────────
+
+extern "C" __global__ void quantize_f32_to_fp8(
+    const float* __restrict__ input,
+    unsigned char* __restrict__ output,
+    const unsigned int* __restrict__ max_bits,
+    float* __restrict__ inv_scale_out,
+    const int numel
+) {
+    __shared__ float s_scale;
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        float absmax = __uint_as_float(*max_bits);
+        float inv = (absmax > 0.0f) ? (absmax / 448.0f) : 1.0f;
+        *inv_scale_out = inv;
+    }
+    if (threadIdx.x == 0) {
+        float absmax = __uint_as_float(*max_bits);
+        s_scale = (absmax > 0.0f) ? (448.0f / absmax) : 1.0f;
+    }
+    __syncthreads();
+
+    float scale = s_scale;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+
+    output[idx] = fp8_encode(input[idx] * scale);
+}
+
+// ─── Fused absmax + quantize (single kernel) ────────────────────────────────
+//
+// Uses a two-phase approach within one kernel launch:
+// Phase 1: Each block computes its local absmax, atomicMax to global.
+//          The last block to finish (tracked by atomic counter) knows
+//          the global absmax is ready.
+// Phase 2: All blocks read the global absmax and quantize their elements.
+//
+// Grid sync via atomic counter — no cooperative groups needed.
+
+extern "C" __global__ void fused_absmax_quantize_f32(
+    const float* __restrict__ input,
+    unsigned char* __restrict__ output,
+    unsigned int* __restrict__ max_bits,      // pre-zeroed by host
+    float* __restrict__ inv_scale_out,
+    unsigned int* __restrict__ block_counter, // pre-zeroed by host
+    const int numel
+) {
+    // ── Phase 1: absmax reduction ──
+
+    float local_max = 0.0f;
+    const int grid_stride = blockDim.x * gridDim.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Vectorized loads
+    const int vec_count = numel / 4;
+    const float4* input_vec = reinterpret_cast<const float4*>(input);
+    int vec_idx = idx;
+    for (int i = vec_idx; i < vec_count; i += grid_stride) {
+        float4 v = input_vec[i];
+        local_max = fmaxf(local_max, fabsf(v.x));
+        local_max = fmaxf(local_max, fabsf(v.y));
+        local_max = fmaxf(local_max, fabsf(v.z));
+        local_max = fmaxf(local_max, fabsf(v.w));
+    }
+    for (int i = vec_count * 4 + idx; i < numel; i += grid_stride) {
+        local_max = fmaxf(local_max, fabsf(input[i]));
+    }
+
+    local_max = block_reduce_max(local_max);
+
+    __shared__ bool is_last_block;
+
+    if (threadIdx.x == 0) {
+        atomicMax(max_bits, __float_as_uint(local_max));
+
+        // Memory fence so all atomicMax writes are visible
+        __threadfence();
+
+        // Announce this block is done; check if we're the last one
+        unsigned int finished = atomicAdd(block_counter, 1);
+        is_last_block = (finished == gridDim.x - 1);
+    }
+    __syncthreads();
+
+    // ── Phase 2: quantize ──
+    // Only the last block computes the scale; all blocks must wait
+    // for it, but we can't do a true grid barrier. Instead, each block
+    // already has its local_max in the atomicMax. We just need
+    // the last block to be the one that writes inv_scale. All blocks
+    // then re-read max_bits (which is finalized after counter == gridDim.x - 1).
+    //
+    // Trick: all blocks that aren't last must spin-wait for the counter
+    // to reach gridDim.x. This is valid because the last block will
+    // always reach the counter increment.
+
+    if (is_last_block) {
+        // We are guaranteed all blocks have done atomicMax + threadfence
+        if (threadIdx.x == 0) {
+            float absmax = __uint_as_float(*max_bits);
+            float inv = (absmax > 0.0f) ? (absmax / 448.0f) : 1.0f;
+            *inv_scale_out = inv;
+        }
+    }
+
+    // Non-last blocks spin until counter reaches gridDim.x
+    if (!is_last_block) {
+        if (threadIdx.x == 0) {
+            while (atomicAdd(block_counter, 0) < gridDim.x) {
+                // spin
+            }
+        }
+        __syncthreads();
+    }
+
+    // Compute scale from finalized absmax
+    __shared__ float s_scale;
+    if (threadIdx.x == 0) {
+        float absmax = __uint_as_float(*max_bits);
+        s_scale = (absmax > 0.0f) ? (448.0f / absmax) : 1.0f;
+    }
+    __syncthreads();
+
+    float scale = s_scale;
+
+    // Quantize — each thread handles its strided elements
+    for (int i = idx; i < numel; i += grid_stride) {
+        output[i] = fp8_encode(input[i] * scale);
+    }
 }
