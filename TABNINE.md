@@ -190,6 +190,38 @@ The `infernum-examples` crate contains standalone binaries demonstrating usage a
 - If it needs a custom kernel, add the `.cu` file to `infernum-examples/kernels/` and update `infernum-examples/build.rs`.
 - Follow the existing pattern: use `clap::Parser` for CLI args, gate with `#![cfg(feature = "cuda")]`.
 
+### Benchmarking
+
+The `bench_comparison.sh` script compares infernum vs llama.cpp decode throughput on Llama 3.2 1B across multiple quantization formats. It outputs a Markdown table to stdout.
+
+**Prerequisites:**
+
+- CUDA GPU with `nvidia-smi`
+- llama.cpp built at `/home/amir/llama.cpp/` (with `llama-bench`, `llama-quantize`)
+- Rust toolchain (`cargo`)
+- `hf` CLI with token: `pip install 'huggingface_hub[cli]'`
+- Python 3 with `torch`, `transformers`, `gguf` packages
+
+**Usage:**
+
+```bash
+# Run all format benchmarks
+./bench_comparison.sh
+
+# Run only specific formats (comma-separated, case-insensitive)
+./bench_comparison.sh --tests fp8,gptq-int4
+
+# Dry run — show plan without executing
+./bench_comparison.sh --dry-run
+
+# Combine flags
+./bench_comparison.sh --dry-run --tests q8,q4
+```
+
+**Available test names:** `f32`, `bf16`, `f16`, `fp8`, `q8`, `q4`, `gptq-int4`, `all` (default).
+
+Only the models and GGUF conversions needed for the selected tests are downloaded/generated. Results are cached so repeated runs are fast.
+
 ### Implementation Guides
 
 An implementation guide is a design and implementation plan for a feature or optimization. It lives in `ephemeral-docs/` and serves as the single source of truth for the work in progress. Structure:
