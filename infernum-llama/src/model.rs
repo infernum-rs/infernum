@@ -621,8 +621,9 @@ where
 
     /// Load model weights with tensor-parallel sharding.
     ///
-    /// Only supports dense (non-quantized) linear weights — FP8 quantized
-    /// weights use `Replicate` strategy and are not sharded.
+    /// Dense and GPTQ/AWQ INT4 linear weights are sharded according to
+    /// `shard_strategy_for_weight`. FP8 block-quantized weights use
+    /// `Replicate` strategy.
     #[cfg(feature = "nccl")]
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn load_weights_sharded(
@@ -642,14 +643,26 @@ where
             strategy: ShardStrategy,
             quant_config: Option<&crate::QuantizationConfig>,
         ) -> Result<LinearWeight<T>> {
-            // GPTQ/AWQ: load via dedicated loader (replicated, no sharding)
+            // GPTQ/AWQ: load via dedicated sharded loader
             if let Some(qc) = quant_config {
                 let prefix = name
                     .strip_suffix(".weight")
                     .expect("GPTQ/AWQ weight name must end with .weight");
                 let qt = match qc.quant_method.as_str() {
-                    "gptq" => loader.load_gptq_linear(ctx, prefix, qc.group_size)?,
-                    "awq" => loader.load_awq_linear(ctx, prefix, qc.group_size)?,
+                    "gptq" => loader.load_gptq_linear_sharded(
+                        ctx,
+                        prefix,
+                        qc.group_size,
+                        shard,
+                        strategy,
+                    )?,
+                    "awq" => loader.load_awq_linear_sharded(
+                        ctx,
+                        prefix,
+                        qc.group_size,
+                        shard,
+                        strategy,
+                    )?,
                     other => panic!("unsupported quant_method: {other}"),
                 };
                 return Ok(LinearWeight::Quantized(qt));
@@ -2610,6 +2623,192 @@ mod tests {
             tokens_naive, tokens_kv,
             "KV-cache generate should match naive generate"
         );
+    }
+
+    /// Slice columns from a 2D row-major byte buffer (test helper).
+    fn slice_columns(
+        data: &[u8],
+        rows: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+        elem_bytes: usize,
+    ) -> Vec<u8> {
+        let row_bytes = total_cols * elem_bytes;
+        let col_start_bytes = col_start * elem_bytes;
+        let col_count_bytes = col_count * elem_bytes;
+        let mut result = Vec::with_capacity(rows * col_count_bytes);
+        for r in 0..rows {
+            let off = r * row_bytes + col_start_bytes;
+            result.extend_from_slice(&data[off..off + col_count_bytes]);
+        }
+        result
+    }
+
+    /// Slice contiguous rows from a 2D row-major byte buffer (test helper).
+    fn slice_rows(
+        data: &[u8],
+        cols: usize,
+        row_start: usize,
+        row_count: usize,
+        elem_bytes: usize,
+    ) -> Vec<u8> {
+        let row_bytes = cols * elem_bytes;
+        let start = row_start * row_bytes;
+        data[start..start + row_count * row_bytes].to_vec()
+    }
+
+    #[test]
+    fn test_linear_gptq_column_shard() {
+        // Column-parallel: split output dimension N into 2 shards, verify
+        // that concatenating shard outputs matches the full output.
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 32;
+        let n = 16; // must be divisible by 8 * world_size
+        let group_size = 32;
+        let world_size = 2;
+
+        let w_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01) - 0.5).collect();
+        let (qw, sc, qz) = pack_gptq_test(&w_data, n, k, group_size);
+
+        // Full (non-sharded) output
+        let full_weight = LinearWeight::Quantized(
+            QuantizedTensor::from_gptq_raw(
+                &ctx,
+                &[n, k],
+                DType::GPTQ_INT4,
+                &qw,
+                &sc,
+                &qz,
+                group_size,
+            )
+            .unwrap(),
+        );
+        let input_data: Vec<f32> = (0..k).map(|i| i as f32 * 0.1).collect();
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+        let full_output = linear(&input, &full_weight).unwrap().to_vec().unwrap();
+
+        // Column-sharded: split qweight, scales, qzeros along N
+        let mut shard_outputs = Vec::new();
+        for rank in 0..world_size {
+            let n_shard = n / world_size;
+            let n_start = rank * n_shard;
+
+            // qweight [K/8, N] int32 → slice columns
+            let qw_s = slice_columns(&qw, k / 8, n, n_start, n_shard, 4);
+            // scales [num_groups, N] f16 → slice columns
+            let sc_s = slice_columns(&sc, k / group_size, n, n_start, n_shard, 2);
+            // qzeros [num_groups, N/8] int32 → slice columns
+            let qz_s = slice_columns(&qz, k / group_size, n / 8, n_start / 8, n_shard / 8, 4);
+
+            let shard_weight = LinearWeight::Quantized(
+                QuantizedTensor::from_gptq_raw(
+                    &ctx,
+                    &[n_shard, k],
+                    DType::GPTQ_INT4,
+                    &qw_s,
+                    &sc_s,
+                    &qz_s,
+                    group_size,
+                )
+                .unwrap(),
+            );
+            let shard_out = linear(&input, &shard_weight).unwrap().to_vec().unwrap();
+            assert_eq!(shard_out.len(), n_shard);
+            shard_outputs.extend(shard_out);
+        }
+
+        // Concatenated shard outputs should match full output
+        assert_eq!(shard_outputs.len(), full_output.len());
+        for (i, (a, b)) in full_output.iter().zip(shard_outputs.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "Column shard mismatch at {i}: full={a} vs sharded={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_linear_gptq_row_shard() {
+        // Row-parallel: split input dimension K into 2 shards, verify
+        // that summing shard partial outputs matches the full output.
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 64; // must be divisible by group_size * world_size
+        let n = 8;
+        let group_size = 32;
+        let world_size = 2;
+
+        let w_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01) - 0.5).collect();
+        let (qw, sc, qz) = pack_gptq_test(&w_data, n, k, group_size);
+
+        // Full (non-sharded) output
+        let full_weight = LinearWeight::Quantized(
+            QuantizedTensor::from_gptq_raw(
+                &ctx,
+                &[n, k],
+                DType::GPTQ_INT4,
+                &qw,
+                &sc,
+                &qz,
+                group_size,
+            )
+            .unwrap(),
+        );
+        let input_data: Vec<f32> = (0..k).map(|i| i as f32 * 0.1).collect();
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+        let full_output = linear(&input, &full_weight).unwrap().to_vec().unwrap();
+
+        // Row-sharded: split qweight, scales, qzeros along K
+        let mut summed = vec![0.0_f32; n];
+        for rank in 0..world_size {
+            let k_shard = k / world_size;
+            let k_start = rank * k_shard;
+
+            // qweight [K/8, N] int32 → slice rows
+            let qw_s = slice_rows(&qw, n, k_start / 8, k_shard / 8, 4);
+            // scales [num_groups, N] f16 → slice rows
+            let g_start = k_start / group_size;
+            let g_shard = k_shard / group_size;
+            let sc_s = slice_rows(&sc, n, g_start, g_shard, 2);
+            // qzeros [num_groups, N/8] int32 → slice rows
+            let qz_s = slice_rows(&qz, n / 8, g_start, g_shard, 4);
+
+            let shard_weight = LinearWeight::Quantized(
+                QuantizedTensor::from_gptq_raw(
+                    &ctx,
+                    &[n, k_shard],
+                    DType::GPTQ_INT4,
+                    &qw_s,
+                    &sc_s,
+                    &qz_s,
+                    group_size,
+                )
+                .unwrap(),
+            );
+
+            // Input shard: columns [k_start..k_start+k_shard]
+            let input_shard_data: Vec<f32> = input_data[k_start..k_start + k_shard].to_vec();
+            let input_shard =
+                CudaTensor::from_slice(&ctx, &[1, k_shard], &input_shard_data).unwrap();
+            let shard_out = linear(&input_shard, &shard_weight)
+                .unwrap()
+                .to_vec()
+                .unwrap();
+
+            for (j, v) in shard_out.iter().enumerate() {
+                summed[j] += v;
+            }
+        }
+
+        // Summed shard outputs should match full output
+        for (i, (a, b)) in full_output.iter().zip(summed.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 0.5,
+                "Row shard mismatch at {i}: full={a} vs summed={b}"
+            );
+        }
     }
 
     #[test]

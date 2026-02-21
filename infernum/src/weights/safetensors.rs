@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use crate::cuda::shard::{ShardConfig, ShardStrategy};
 use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use crate::dtype::DType;
 use crate::weights::WeightLoader;
@@ -275,6 +276,277 @@ impl SafeTensorsLoader {
             group_size,
         )
     }
+
+    /// Load a GPTQ-quantized linear layer with tensor-parallel sharding.
+    ///
+    /// - `Column`: splits along the output dimension (N). Each rank gets
+    ///   `N/world_size` output channels.
+    /// - `Row`: splits along the input dimension (K). Each rank gets
+    ///   `K/world_size` input channels. Requires all-reduce after matmul.
+    /// - `Replicate`: loads the full tensor.
+    ///
+    /// # Errors
+    /// Returns an error if any required tensor is missing or GPU allocation fails.
+    ///
+    /// # Panics
+    /// Panics if dimensions are not compatible with sharding constraints.
+    #[allow(clippy::similar_names)]
+    pub fn load_gptq_linear_sharded(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+        shard: &ShardConfig,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        if strategy == ShardStrategy::Replicate || shard.world_size == 1 {
+            return self.load_gptq_linear(ctx, prefix, group_size);
+        }
+
+        let qweight_name = format!("{prefix}.qweight");
+        let scales_name = format!("{prefix}.scales");
+        let qzeros_name = format!("{prefix}.qzeros");
+
+        let qweight_meta = self
+            .tensors
+            .get(&qweight_name)
+            .ok_or_else(|| Error::WeightNotFound(qweight_name.clone()))?;
+
+        let qweight_data = self.get_tensor_data(&qweight_name)?;
+        let scales_data = self.get_tensor_data(&scales_name)?;
+        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
+
+        // GPTQ packed layout: qweight [K/8, N] int32
+        let in_features = qweight_meta.shape[0] * 8;
+        let out_features = qweight_meta.shape[1];
+        let num_groups = in_features / group_size;
+
+        match strategy {
+            ShardStrategy::Column => {
+                // Split along N (output dimension)
+                let (n_start, n_shard) = shard.shard_range(out_features);
+                assert_eq!(
+                    n_start % 8,
+                    0,
+                    "GPTQ column shard: N start ({n_start}) must be aligned to 8 for qzeros packing"
+                );
+
+                // qweight [K/8, N] int32 → slice columns [n_start..n_start+n_shard]
+                let qw_rows = in_features / 8;
+                let qw_sliced =
+                    slice_2d_columns(qweight_data, qw_rows, out_features, n_start, n_shard, 4);
+                // scales [num_groups, N] f16 → slice columns
+                let sc_sliced =
+                    slice_2d_columns(scales_data, num_groups, out_features, n_start, n_shard, 2);
+                // qzeros [num_groups, N/8] int32 → slice columns
+                let qz_cols = out_features / 8;
+                let qz_start = n_start / 8;
+                let qz_shard = n_shard / 8;
+                let qz_sliced =
+                    slice_2d_columns(qzeros_data, num_groups, qz_cols, qz_start, qz_shard, 4);
+
+                QuantizedTensor::from_gptq_raw(
+                    ctx,
+                    &[n_shard, in_features],
+                    DType::GPTQ_INT4,
+                    &qw_sliced,
+                    &sc_sliced,
+                    &qz_sliced,
+                    group_size,
+                )
+            }
+            ShardStrategy::Row => {
+                // Split along K (input dimension)
+                let (k_start, k_shard) = shard.shard_range(in_features);
+                assert_eq!(
+                    k_start % group_size,
+                    0,
+                    "GPTQ row shard: K start ({k_start}) must be aligned to group_size ({group_size})"
+                );
+
+                // qweight [K/8, N] int32 → slice rows [k_start/8..(k_start+k_shard)/8]
+                let qw_row_start = k_start / 8;
+                let qw_row_shard = k_shard / 8;
+                let qw_sliced =
+                    slice_2d_rows(qweight_data, out_features, qw_row_start, qw_row_shard, 4);
+                // scales [num_groups, N] f16 → slice rows [g_start..g_start+g_shard]
+                let g_start = k_start / group_size;
+                let g_shard = k_shard / group_size;
+                let sc_sliced = slice_2d_rows(scales_data, out_features, g_start, g_shard, 2);
+                // qzeros [num_groups, N/8] int32 → slice rows
+                let qz_cols = out_features / 8;
+                let qz_sliced = slice_2d_rows(qzeros_data, qz_cols, g_start, g_shard, 4);
+
+                QuantizedTensor::from_gptq_raw(
+                    ctx,
+                    &[out_features, k_shard],
+                    DType::GPTQ_INT4,
+                    &qw_sliced,
+                    &sc_sliced,
+                    &qz_sliced,
+                    group_size,
+                )
+            }
+            ShardStrategy::Replicate => unreachable!(),
+        }
+    }
+
+    /// Load an AWQ-quantized linear layer with tensor-parallel sharding.
+    ///
+    /// Same semantics as [`load_gptq_linear_sharded`](Self::load_gptq_linear_sharded)
+    /// but for AWQ's transposed packing layout.
+    ///
+    /// # Errors
+    /// Returns an error if any required tensor is missing or GPU allocation fails.
+    ///
+    /// # Panics
+    /// Panics if dimensions are not compatible with sharding constraints.
+    #[allow(clippy::similar_names)]
+    pub fn load_awq_linear_sharded(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+        shard: &ShardConfig,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        if strategy == ShardStrategy::Replicate || shard.world_size == 1 {
+            return self.load_awq_linear(ctx, prefix, group_size);
+        }
+
+        let qweight_name = format!("{prefix}.qweight");
+        let scales_name = format!("{prefix}.scales");
+        let qzeros_name = format!("{prefix}.qzeros");
+
+        let qweight_meta = self
+            .tensors
+            .get(&qweight_name)
+            .ok_or_else(|| Error::WeightNotFound(qweight_name.clone()))?;
+
+        let qweight_data = self.get_tensor_data(&qweight_name)?;
+        let scales_data = self.get_tensor_data(&scales_name)?;
+        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
+
+        // AWQ packed layout: qweight [K, N/8] int32
+        let in_features = qweight_meta.shape[0];
+        let out_features = qweight_meta.shape[1] * 8;
+        let num_groups = in_features / group_size;
+
+        match strategy {
+            ShardStrategy::Column => {
+                // Split along N (output dimension)
+                let (n_start, n_shard) = shard.shard_range(out_features);
+                assert_eq!(
+                    n_start % 8,
+                    0,
+                    "AWQ column shard: N start ({n_start}) must be aligned to 8 for packing"
+                );
+
+                // qweight [K, N/8] int32 → slice columns [n_start/8..(n_start+n_shard)/8]
+                let qw_cols = out_features / 8;
+                let qw_col_start = n_start / 8;
+                let qw_col_shard = n_shard / 8;
+                let qw_sliced = slice_2d_columns(
+                    qweight_data,
+                    in_features,
+                    qw_cols,
+                    qw_col_start,
+                    qw_col_shard,
+                    4,
+                );
+                // scales [num_groups, N] f16 → slice columns
+                let sc_sliced =
+                    slice_2d_columns(scales_data, num_groups, out_features, n_start, n_shard, 2);
+                // qzeros [num_groups, N/8] int32 → slice columns
+                let qz_cols = out_features / 8;
+                let qz_start = n_start / 8;
+                let qz_shard = n_shard / 8;
+                let qz_sliced =
+                    slice_2d_columns(qzeros_data, num_groups, qz_cols, qz_start, qz_shard, 4);
+
+                QuantizedTensor::from_gptq_raw(
+                    ctx,
+                    &[n_shard, in_features],
+                    DType::AWQ_INT4,
+                    &qw_sliced,
+                    &sc_sliced,
+                    &qz_sliced,
+                    group_size,
+                )
+            }
+            ShardStrategy::Row => {
+                // Split along K (input dimension)
+                let (k_start, k_shard) = shard.shard_range(in_features);
+                assert_eq!(
+                    k_start % group_size,
+                    0,
+                    "AWQ row shard: K start ({k_start}) must be aligned to group_size ({group_size})"
+                );
+
+                // qweight [K, N/8] int32 → slice rows [k_start..k_start+k_shard]
+                let qw_cols = out_features / 8;
+                let qw_sliced = slice_2d_rows(qweight_data, qw_cols, k_start, k_shard, 4);
+                // scales [num_groups, N] f16 → slice rows
+                let g_start = k_start / group_size;
+                let g_shard = k_shard / group_size;
+                let sc_sliced = slice_2d_rows(scales_data, out_features, g_start, g_shard, 2);
+                // qzeros [num_groups, N/8] int32 → slice rows
+                let qz_cols = out_features / 8;
+                let qz_sliced = slice_2d_rows(qzeros_data, qz_cols, g_start, g_shard, 4);
+
+                QuantizedTensor::from_gptq_raw(
+                    ctx,
+                    &[out_features, k_shard],
+                    DType::AWQ_INT4,
+                    &qw_sliced,
+                    &sc_sliced,
+                    &qz_sliced,
+                    group_size,
+                )
+            }
+            ShardStrategy::Replicate => unreachable!(),
+        }
+    }
+}
+
+/// Slice contiguous rows from a 2D row-major byte buffer.
+///
+/// Each row has `cols` elements of `elem_bytes` bytes each.
+/// Returns bytes for rows `[row_start .. row_start + row_count)`.
+fn slice_2d_rows(
+    data: &[u8],
+    cols: usize,
+    row_start: usize,
+    row_count: usize,
+    elem_bytes: usize,
+) -> Vec<u8> {
+    let row_bytes = cols * elem_bytes;
+    let start = row_start * row_bytes;
+    let end = start + row_count * row_bytes;
+    data[start..end].to_vec()
+}
+
+/// Slice columns from a 2D row-major byte buffer.
+///
+/// The buffer has `rows` rows of `total_cols` elements, each `elem_bytes` bytes.
+/// Returns bytes for columns `[col_start .. col_start + col_count)` from every row.
+fn slice_2d_columns(
+    data: &[u8],
+    rows: usize,
+    total_cols: usize,
+    col_start: usize,
+    col_count: usize,
+    elem_bytes: usize,
+) -> Vec<u8> {
+    let row_bytes = total_cols * elem_bytes;
+    let col_start_bytes = col_start * elem_bytes;
+    let col_count_bytes = col_count * elem_bytes;
+    let mut result = Vec::with_capacity(rows * col_count_bytes);
+    for r in 0..rows {
+        let row_offset = r * row_bytes + col_start_bytes;
+        result.extend_from_slice(&data[row_offset..row_offset + col_count_bytes]);
+    }
+    result
 }
 
 impl WeightLoader for SafeTensorsLoader {
@@ -430,6 +702,28 @@ impl WeightLoader for SafeTensorsLoader {
         Self::load_awq_linear(self, ctx, prefix, group_size)
     }
 
+    fn load_gptq_linear_sharded(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+        shard: &ShardConfig,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        Self::load_gptq_linear_sharded(self, ctx, prefix, group_size, shard, strategy)
+    }
+
+    fn load_awq_linear_sharded(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+        shard: &ShardConfig,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        Self::load_awq_linear_sharded(self, ctx, prefix, group_size, shard, strategy)
+    }
+
     fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
         let meta = self
             .tensors
@@ -490,5 +784,68 @@ mod tests {
             safetensors_dtype_to_dtype(safetensors::Dtype::I32),
             Ok(DType::U32)
         ));
+    }
+
+    #[test]
+    fn test_slice_2d_rows() {
+        // 3x4 matrix of u8, elem_bytes=1
+        let data: Vec<u8> = vec![
+            1, 2, 3, 4, // row 0
+            5, 6, 7, 8, // row 1
+            9, 10, 11, 12, // row 2
+        ];
+        // Slice rows 1..2
+        let sliced = slice_2d_rows(&data, 4, 1, 2, 1);
+        assert_eq!(sliced, vec![5, 6, 7, 8, 9, 10, 11, 12]);
+
+        // Slice single row 0
+        let sliced = slice_2d_rows(&data, 4, 0, 1, 1);
+        assert_eq!(sliced, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_slice_2d_rows_int32() {
+        // 2x2 matrix of int32 (elem_bytes=4)
+        let data: Vec<u8> = vec![
+            1, 0, 0, 0, // (0,0)
+            2, 0, 0, 0, // (0,1)
+            3, 0, 0, 0, // (1,0)
+            4, 0, 0, 0, // (1,1)
+        ];
+        let sliced = slice_2d_rows(&data, 2, 1, 1, 4);
+        assert_eq!(sliced, vec![3, 0, 0, 0, 4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_slice_2d_columns() {
+        // 3x4 matrix of u8
+        let data: Vec<u8> = vec![
+            1, 2, 3, 4, // row 0
+            5, 6, 7, 8, // row 1
+            9, 10, 11, 12, // row 2
+        ];
+        // Slice columns 1..3
+        let sliced = slice_2d_columns(&data, 3, 4, 1, 2, 1);
+        assert_eq!(sliced, vec![2, 3, 6, 7, 10, 11]);
+    }
+
+    #[test]
+    fn test_slice_2d_columns_int32() {
+        // 2x3 matrix of int32 (elem_bytes=4)
+        let data: Vec<u8> = vec![
+            1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, // row 0: [1, 2, 3]
+            4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, // row 1: [4, 5, 6]
+        ];
+        // Slice column 2 only
+        let sliced = slice_2d_columns(&data, 2, 3, 2, 1, 4);
+        assert_eq!(sliced, vec![3, 0, 0, 0, 6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_slice_2d_columns_full_width() {
+        // Slicing all columns should return the original data
+        let data: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
+        let sliced = slice_2d_columns(&data, 2, 3, 0, 3, 1);
+        assert_eq!(sliced, data);
     }
 }
