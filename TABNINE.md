@@ -57,8 +57,12 @@ infernum-serve/         # HTTP server (Axum, OpenAI-compatible API)
 # Build the project
 cargo build
 
-# Run tests
+# Run tests (no CUDA)
 cargo test --all
+
+# Run tests (with CUDA) — must use --test-threads=1 to avoid
+# CUDA context conflicts between parallel test threads
+cargo test --features cuda -- --test-threads=1
 
 # Check code with Clippy (pedantic mode, as per CI)
 cargo clippy -- -W clippy::pedantic
@@ -107,3 +111,52 @@ The GitHub Actions CI pipeline runs on every push/PR to `main`:
 - Design document: `docs/plan.md` (architecture and roadmap)
 - Short-term / ephemeral planning documents go in `ephemeral-docs/` (gitignored)
 - Git worktrees go in `worktrees/` (gitignored)
+
+### Integration Tests
+
+Integration tests live in `infernum-llama/tests/model_integration.rs`. They download real models from HuggingFace and verify end-to-end generation output. They are gated behind the `integration` feature so they don't run during normal `cargo test`.
+
+**Running integration tests:**
+
+```bash
+cargo test -p infernum-llama --features integration -- --test-threads=1
+```
+
+Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
+
+**What's tested:**
+
+- **SmolLM2-360M** (SafeTensors f32) — greedy generation correctness, no NaN/Inf in logits
+- **Llama-3.2-1B-Instruct FP8** (compressed-tensors) — no NaN/Inf in logits (generation quality test ignored for now)
+- GGUF integration tests are planned but not yet added
+
+**Writing new integration tests:**
+
+- Add a new `mod` block in `model_integration.rs` following the existing pattern (const `REPO`, `model_dir()` helper, test functions).
+- Use `download_model(repo_id)` to fetch model files — it handles caching automatically.
+- Use `generate_greedy()` for deterministic generation tests.
+- Use `#[ignore = "reason"]` for tests that document known issues but shouldn't block CI.
+- Only use ungated HuggingFace models (no auth tokens required).
+
+### Implementation Guides
+
+An implementation guide is a design and implementation plan for a feature or optimization. It lives in `ephemeral-docs/` and serves as the single source of truth for the work in progress. Structure:
+
+1. **Overview** — What we're building and why.
+2. **Steps** — The implementation broken into incremental steps. Each step should be small enough to verify independently.
+3. **Progress** — A log updated after each step is completed with results, observations, and any deviations from the plan.
+
+**Workflow:**
+
+1. Create the implementation guide in `ephemeral-docs/`. The guide **must specify the worktree name and branch** (e.g., `worktrees/my-feature` on branch `my-feature`).
+2. Create a git worktree for the work: `git worktree add worktrees/<name> -b <branch-name>`.
+3. **ALL implementation work happens exclusively in the worktree, never on `main`.** The main worktree is only for creating the guide, merging, and non-implementation tasks.
+4. Implement one step at a time in the worktree. After each step:
+   - Build: `cargo build --release --features cuda`
+   - Clippy: `cargo clippy -p infernum -p infernum-llama --features cuda -- -W clippy::pedantic`
+   - Format: `cargo fmt --all -- --check`
+   - Tests: `cargo test --all --features cuda -- --test-threads=1`
+   - If all pass: commit and push.
+   - Update the progress section in the implementation guide.
+5. As a final step, consider whether the work warrants new or updated integration tests (e.g., if it affects model output, adds a new weight format, or changes generation behavior). If so, add an integration test step to the guide.
+6. After all steps are complete, create a PR and merge.
