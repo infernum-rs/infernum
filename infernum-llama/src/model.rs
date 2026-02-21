@@ -299,12 +299,32 @@ struct LlamaMlpWeights<T: TensorDType> {
     down_proj: LinearWeight<T>,
 }
 
+/// Weights for a single `MoE` expert (same structure as a dense MLP).
+struct MoeExpertWeights<T: TensorDType> {
+    mlp: LlamaMlpWeights<T>,
+}
+
+/// Feed-forward network weights: either a single dense MLP or a Mixture-of-Experts layer.
+enum FfnWeights<T: TensorDType> {
+    /// Standard dense MLP (Llama, etc.)
+    Dense(Box<LlamaMlpWeights<T>>),
+    /// Mixture-of-Experts (Mixtral, etc.)
+    Moe {
+        /// Router gate weight, pre-transposed: shape `[hidden_size, num_experts]`
+        gate: CudaTensor<T>,
+        /// Per-expert MLP weights
+        experts: Vec<MoeExpertWeights<T>>,
+        /// How many experts to activate per token
+        num_experts_per_tok: usize,
+    },
+}
+
 /// Weights for a single Llama decoder layer
 struct LlamaLayerWeights<T: TensorDType> {
     input_layernorm: CudaTensor<T>,
     attention: LlamaAttentionWeights<T>,
     post_attention_layernorm: CudaTensor<T>,
-    mlp: LlamaMlpWeights<T>,
+    ffn: FfnWeights<T>,
 }
 
 /// Complete Llama model, generic over the compute dtype `T`.
@@ -483,6 +503,110 @@ where
             }
         }
 
+        /// Load a dense MLP (gate_proj, up_proj, down_proj) for a single layer.
+        fn load_dense_mlp<T: TensorDType + DeviceRepr>(
+            ctx: &CudaContext,
+            loader: &impl WeightLoader,
+            layer_prefix: &str,
+            config: &LlamaConfig,
+            qc: Option<&crate::QuantizationConfig>,
+        ) -> Result<LlamaMlpWeights<T>> {
+            let gate = load_linear::<T>(
+                ctx,
+                loader,
+                &format!("{layer_prefix}.mlp.gate_proj.weight"),
+                qc,
+            )?;
+            let up = load_linear::<T>(
+                ctx,
+                loader,
+                &format!("{layer_prefix}.mlp.up_proj.weight"),
+                qc,
+            )?;
+            let gate_up = match (gate, up) {
+                (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
+                    weight: concat_weights(&g, &u)?,
+                    intermediate_size: config.intermediate_size,
+                },
+                (g, u) => GateUpWeight::Separate {
+                    gate_proj: Box::new(g),
+                    up_proj: Box::new(u),
+                },
+            };
+            Ok(LlamaMlpWeights {
+                gate_up,
+                down_proj: load_linear::<T>(
+                    ctx,
+                    loader,
+                    &format!("{layer_prefix}.mlp.down_proj.weight"),
+                    qc,
+                )?,
+            })
+        }
+
+        /// Load MoE weights (router gate + per-expert MLPs) for a single layer.
+        ///
+        /// Mixtral SafeTensors naming:
+        /// - `{prefix}.block_sparse_moe.gate.weight` — router `[num_experts, hidden_size]`
+        /// - `{prefix}.block_sparse_moe.experts.{e}.w1.weight` — gate_proj
+        /// - `{prefix}.block_sparse_moe.experts.{e}.w2.weight` — down_proj
+        /// - `{prefix}.block_sparse_moe.experts.{e}.w3.weight` — up_proj
+        fn load_moe_weights<T: TensorDType + DeviceRepr>(
+            ctx: &CudaContext,
+            loader: &impl WeightLoader,
+            layer_prefix: &str,
+            config: &LlamaConfig,
+            qc: Option<&crate::QuantizationConfig>,
+        ) -> Result<FfnWeights<T>> {
+            let num_experts = config
+                .num_local_experts
+                .expect("MoE requires num_local_experts");
+            let num_experts_per_tok = config
+                .num_experts_per_tok
+                .expect("MoE requires num_experts_per_tok");
+
+            // Router gate: [num_experts, hidden_size] → pre-transpose to [hidden_size, num_experts]
+            let gate_name = format!("{layer_prefix}.block_sparse_moe.gate.weight");
+            let gate_f32 = loader.load_f32(ctx, &gate_name)?;
+            let gate_transposed = pretranspose_weight(&gate_f32)?;
+            let gate = if T::DTYPE == infernum::dtype::DType::F32 {
+                reinterpret_tensor(gate_transposed)
+            } else {
+                let data_f32 = gate_transposed.to_vec()?;
+                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
+                CudaTensor::from_slice(ctx, gate_transposed.shape(), &data_t)?
+            };
+
+            // Load each expert's MLP
+            let mut experts = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let ep = format!("{layer_prefix}.block_sparse_moe.experts.{e}");
+                // w1 = gate_proj, w2 = down_proj, w3 = up_proj
+                let gate_proj = load_linear::<T>(ctx, loader, &format!("{ep}.w1.weight"), qc)?;
+                let up_proj = load_linear::<T>(ctx, loader, &format!("{ep}.w3.weight"), qc)?;
+                let gate_up = match (gate_proj, up_proj) {
+                    (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
+                        weight: concat_weights(&g, &u)?,
+                        intermediate_size: config.intermediate_size,
+                    },
+                    (g, u) => GateUpWeight::Separate {
+                        gate_proj: Box::new(g),
+                        up_proj: Box::new(u),
+                    },
+                };
+                let down_proj = load_linear::<T>(ctx, loader, &format!("{ep}.w2.weight"), qc)?;
+                experts.push(MoeExpertWeights {
+                    mlp: LlamaMlpWeights { gate_up, down_proj },
+                });
+            }
+
+            Ok(FfnWeights::Moe {
+                gate,
+                experts,
+                num_experts_per_tok,
+            })
+        }
+
         let qc = config.quantization_config.as_ref();
 
         // Load embeddings
@@ -545,34 +669,12 @@ where
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                mlp: {
-                    let gate = load_linear::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.mlp.gate_proj.weight"),
-                        qc,
-                    )?;
-                    let up =
-                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.up_proj.weight"), qc)?;
-                    let gate_up = match (gate, up) {
-                        (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
-                            weight: concat_weights(&g, &u)?,
-                            intermediate_size: config.intermediate_size,
-                        },
-                        (g, u) => GateUpWeight::Separate {
-                            gate_proj: Box::new(g),
-                            up_proj: Box::new(u),
-                        },
-                    };
-                    LlamaMlpWeights {
-                        gate_up,
-                        down_proj: load_linear::<T>(
-                            ctx,
-                            loader,
-                            &format!("{prefix}.mlp.down_proj.weight"),
-                            qc,
-                        )?,
-                    }
+                ffn: if config.is_moe() {
+                    load_moe_weights::<T>(ctx, loader, &prefix, &config, qc)?
+                } else {
+                    FfnWeights::Dense(Box::new(load_dense_mlp::<T>(
+                        ctx, loader, &prefix, &config, qc,
+                    )?))
                 },
             };
 
@@ -828,7 +930,8 @@ where
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                mlp: {
+                ffn: {
+                    assert!(!config.is_moe(), "MoE sharding is not yet supported");
                     let gate_name = format!("{prefix}.mlp.gate_proj.weight");
                     let up_name = format!("{prefix}.mlp.up_proj.weight");
                     let down_name = format!("{prefix}.mlp.down_proj.weight");
@@ -856,7 +959,7 @@ where
                         up_proj: Box::new(up),
                     };
 
-                    LlamaMlpWeights {
+                    FfnWeights::Dense(Box::new(LlamaMlpWeights {
                         gate_up,
                         down_proj: load_linear_sharded::<T>(
                             ctx,
@@ -866,7 +969,7 @@ where
                             shard_strategy_for_weight(&down_name),
                             qc,
                         )?,
-                    }
+                    }))
                 },
             };
 
@@ -1016,7 +1119,7 @@ where
         )?;
 
         // MLP
-        let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
 
         // Residual connection (in-place: hidden += mlp_output)
         add_inplace(&mut hidden, &mlp_output)?;
@@ -1197,7 +1300,7 @@ where
             self.config.rms_norm_eps,
         )?;
 
-        let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
         add_inplace(&mut hidden, &mlp_output)?;
         Ok(hidden)
     }
@@ -1308,6 +1411,35 @@ where
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
+    }
+
+    /// Dispatch to dense MLP or MoE forward pass.
+    fn forward_ffn(&self, hidden: &CudaTensor<T>, ffn: &FfnWeights<T>) -> Result<CudaTensor<T>> {
+        match ffn {
+            FfnWeights::Dense(mlp) => self.forward_mlp(hidden, mlp),
+            FfnWeights::Moe {
+                gate,
+                experts,
+                num_experts_per_tok,
+            } => self.forward_moe(hidden, gate, experts, *num_experts_per_tok),
+        }
+    }
+
+    /// Forward pass through a Mixture-of-Experts layer.
+    fn forward_moe(
+        &self,
+        hidden: &CudaTensor<T>,
+        gate: &CudaTensor<T>,
+        experts: &[MoeExpertWeights<T>],
+        num_experts_per_tok: usize,
+    ) -> Result<CudaTensor<T>> {
+        infernum::cuda::moe::moe_forward(
+            hidden,
+            gate,
+            experts.len(),
+            num_experts_per_tok,
+            |expert_idx, expert_input| self.forward_mlp(expert_input, &experts[expert_idx].mlp),
+        )
     }
 
     /// Project hidden states to vocabulary logits (always f32)
@@ -1434,7 +1566,8 @@ impl LlamaModel<f32> {
                 },
                 post_attention_layernorm: loader
                     .load_f32(ctx, &format!("{prefix}.ffn_norm.weight"))?,
-                mlp: {
+                ffn: {
+                    assert!(!config.is_moe(), "MoE GGUF loading is not yet supported");
                     let gate = load_linear(ctx, loader, &format!("{prefix}.ffn_gate.weight"))?;
                     let up = load_linear(ctx, loader, &format!("{prefix}.ffn_up.weight"))?;
                     let gate_up = match (gate, up) {
@@ -1447,10 +1580,10 @@ impl LlamaModel<f32> {
                             up_proj: Box::new(u),
                         },
                     };
-                    LlamaMlpWeights {
+                    FfnWeights::Dense(Box::new(LlamaMlpWeights {
                         gate_up,
                         down_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_down.weight"))?,
-                    }
+                    }))
                 },
             };
 
@@ -1566,7 +1699,7 @@ impl LlamaModel<f32> {
         )?;
 
         // MLP
-        let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
 
         // Residual connection (in-place: hidden += mlp_output)
         add_inplace(&mut hidden, &mlp_output)?;
@@ -1699,7 +1832,7 @@ where
                 self.config.rms_norm_eps,
             )?;
 
-            let mlp_output = self.forward_mlp(&normed, &layer.mlp)?;
+            let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
 
             add_inplace(&mut h, &mlp_output)?;
             hidden = h;
