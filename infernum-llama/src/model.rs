@@ -685,20 +685,58 @@ where
         let norm = load_typed::<T>(loader, ctx, "model.norm.weight")?;
 
         // Load or tie lm_head
+        // For quantized models (GPTQ, AWQ, FP8), quantize lm_head to Q8_0
+        // so decode uses the fast dp4a GEMV kernel instead of cuBLAS.
         let lm_head = if config.tie_word_embeddings {
-            // Transpose embedding table for lm_head
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
-            let transposed = pretranspose_weight(&embed_f32)?;
-            if T::DTYPE == infernum::dtype::DType::F32 {
-                LinearWeight::Dense(reinterpret_tensor(transposed))
+            if qc.is_some() {
+                // Quantize embedding table to Q8_0 for fast decode GEMV.
+                // Shape is [vocab_size, hidden_dim] — already (N, K) for quantized_matmul.
+                let embed_f32 = cast_to_f32(&embed_tokens)?;
+                let data = embed_f32.to_vec()?;
+                LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
+                    ctx,
+                    embed_f32.shape(),
+                    &data,
+                )?)
             } else {
-                let shape = transposed.shape().to_vec();
-                let data_f32 = transposed.to_vec()?;
-                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
-                LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
+                let embed_f32 = cast_to_f32(&embed_tokens)?;
+                let transposed = pretranspose_weight(&embed_f32)?;
+                if T::DTYPE == infernum::dtype::DType::F32 {
+                    LinearWeight::Dense(reinterpret_tensor(transposed))
+                } else {
+                    let shape = transposed.shape().to_vec();
+                    let data_f32 = transposed.to_vec()?;
+                    let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
+                    LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
+                }
             }
         } else {
-            load_linear::<T>(ctx, loader, "lm_head.weight", None)?
+            let lw = load_linear::<T>(ctx, loader, "lm_head.weight", None)?;
+            if qc.is_some() {
+                if let LinearWeight::Dense(ref w) = lw {
+                    let f32_w = cast_to_f32(w)?;
+                    let data = f32_w.to_vec()?;
+                    // Untranspose: dense lm_head is [K, N] (pretransposed),
+                    // but quantized_matmul expects [N, K] (row-major weights).
+                    let k = f32_w.shape()[0];
+                    let n = f32_w.shape()[1];
+                    let mut row_major = vec![0.0_f32; data.len()];
+                    for r in 0..k {
+                        for c in 0..n {
+                            row_major[c * k + r] = data[r * n + c];
+                        }
+                    }
+                    LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
+                        ctx,
+                        &[n, k],
+                        &row_major,
+                    )?)
+                } else {
+                    lw
+                }
+            } else {
+                lw
+            }
         };
 
         // Precompute RoPE cache in f32, then convert to T
