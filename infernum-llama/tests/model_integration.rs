@@ -225,3 +225,43 @@ mod llama_gptq {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 }
+
+// ─── Mixtral MoE ─────────────────────────────────────────────────────────────
+
+/// jamesdborin/tiny-mixtral (ungated, 2-layer Mixtral with 8 experts, ~988MB f32)
+mod mixtral_moe_tiny {
+    use super::*;
+
+    const REPO: &str = "jamesdborin/tiny-mixtral";
+
+    fn model_dir() -> PathBuf {
+        download_model(REPO)
+    }
+
+    #[test]
+    fn loads_and_generates() {
+        // Random weights won't produce meaningful text, but generation must not panic
+        let _output = generate_greedy(&model_dir(), "Hello", 10);
+    }
+
+    #[test]
+    fn no_nan_in_output() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+        let input_ids = tokenizer.encode("Hello world", true).unwrap();
+
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits_vec = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+}
