@@ -148,7 +148,6 @@ mod llama_fp8 {
     }
 
     #[test]
-    #[ignore = "FP8 generation quality not yet correct — produces garbage output"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(

@@ -435,14 +435,20 @@ where
             if dtype.is_quantized() {
                 let mut qt = loader.load_quantized(ctx, name)?;
 
-                // FP8 models store a per-tensor scale as a sibling tensor
+                // FP8 models store a scale as a sibling tensor
                 // e.g. "model.layers.0.self_attn.q_proj.weight" ->
                 //      "model.layers.0.self_attn.q_proj.weight_scale"
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
                     let scale_val = scale_tensor.to_vec()?;
-                    qt.set_weight_scale(ctx, scale_val[0])?;
+                    if scale_val.len() == 1 {
+                        // Per-tensor scale (single scalar)
+                        qt.set_weight_scale(ctx, scale_val[0])?;
+                    } else {
+                        // Per-channel scale (one per output row)
+                        qt.set_channel_scales(ctx, &scale_val)?;
+                    }
                 }
 
                 Ok(LinearWeight::Quantized(qt))
