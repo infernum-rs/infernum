@@ -74,6 +74,35 @@ cargo fmt --all -- --check
 cargo fmt --all
 ```
 
+### Feature Flags
+
+Most CUDA-dependent code is behind feature flags. The `cuda` feature must be enabled to compile or test GPU code.
+
+| Crate | Feature | What it enables |
+|---|---|---|
+| `infernum` | `cuda` | CUDA tensor, ops, kernels (requires CUDA toolkit) |
+| `infernum` | `nccl` | Multi-GPU NCCL support (implies `cuda`) |
+| `infernum` | `force-fuse` | Force fused kernels in debug builds |
+| `infernum` | `no-fuse` | Disable fused kernels in release builds |
+| `infernum-llama` | `cuda` | Enables `infernum/cuda` + `infernum-runtime/cuda` |
+| `infernum-llama` | `nccl` | Multi-GPU (implies `cuda`) |
+| `infernum-llama` | `integration` | Integration tests — downloads real models (implies `cuda`) |
+| `infernum-runtime` | `cuda` | Enables `infernum/cuda` |
+| `infernum-runtime` | `nccl` | Multi-GPU (implies `cuda`) |
+| `infernum-examples` | `cuda` | All CUDA deps for examples |
+| `infernum-examples` | `nccl` | Multi-GPU examples |
+
+```bash
+# Run CUDA unit tests (e.g. quantized matmul kernels)
+cargo test -p infernum --features cuda
+
+# Run integration tests (downloads models, needs GPU)
+cargo test -p infernum-llama --features integration -- --test-threads=1
+
+# Build examples
+cargo build -p infernum-examples --features cuda --examples
+```
+
 ## Development Conventions
 
 ### Code Style
