@@ -61,6 +61,78 @@ pub trait WeightLoader {
         )))
     }
 
+    /// Load a GPTQ INT4 quantized linear layer from `{prefix}.qweight`,
+    /// `{prefix}.scales`, and `{prefix}.qzeros` tensors.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedDtype` by default. Overridden by `SafeTensorsLoader`.
+    fn load_gptq_linear(
+        &self,
+        _ctx: &CudaContext,
+        _prefix: &str,
+        _group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        Err(Error::UnsupportedDtype(
+            "load_gptq_linear not supported by this loader".into(),
+        ))
+    }
+
+    /// Load an AWQ INT4 quantized linear layer from `{prefix}.qweight`,
+    /// `{prefix}.scales`, and `{prefix}.qzeros` tensors.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedDtype` by default. Overridden by `SafeTensorsLoader`.
+    fn load_awq_linear(
+        &self,
+        _ctx: &CudaContext,
+        _prefix: &str,
+        _group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        Err(Error::UnsupportedDtype(
+            "load_awq_linear not supported by this loader".into(),
+        ))
+    }
+
+    /// Load a GPTQ INT4 quantized linear layer, slicing the packed weights
+    /// according to the shard strategy before uploading to the GPU.
+    ///
+    /// - `Column`: splits along the output dimension (N)
+    /// - `Row`: splits along the input dimension (K)
+    /// - `Replicate`: loads the full tensor
+    ///
+    /// The default implementation ignores the shard config and loads the full
+    /// tensor (equivalent to `Replicate`).
+    fn load_gptq_linear_sharded(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+        _shard: &ShardConfig,
+        _strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        self.load_gptq_linear(ctx, prefix, group_size)
+    }
+
+    /// Load an AWQ INT4 quantized linear layer, slicing the packed weights
+    /// according to the shard strategy before uploading to the GPU.
+    ///
+    /// - `Column`: splits along the output dimension (N)
+    /// - `Row`: splits along the input dimension (K)
+    /// - `Replicate`: loads the full tensor
+    ///
+    /// The default implementation ignores the shard config and loads the full
+    /// tensor (equivalent to `Replicate`).
+    fn load_awq_linear_sharded(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+        _shard: &ShardConfig,
+        _strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        self.load_awq_linear(ctx, prefix, group_size)
+    }
+
     /// Load an f32 tensor, slicing according to the shard strategy.
     ///
     /// For `Column`: splits along dim 0 (output features / rows).

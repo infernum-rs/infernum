@@ -199,7 +199,7 @@ fn main() -> Result<()> {
 
     let (output_tokens, prompt_len) = if !options.use_kv_cache {
         // Naive generation: use Engine directly for non-KV-cached path
-        let mut engine = Engine::new(&ctx, model)?;
+        let mut engine = Engine::new(model)?;
         let input_ids = tokenizer.encode(&cli.prompt, true)?;
         let prompt_len = input_ids.len();
 
@@ -218,7 +218,7 @@ fn main() -> Result<()> {
         (tokens, prompt_len)
     } else {
         // KV-cached streaming via Runtime
-        let mut runtime = Runtime::new(&ctx, model, tokenizer)?;
+        let mut runtime = Runtime::new(model, tokenizer)?;
         let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
         let tokens = runtime.generate_stream(&cli.prompt, &options)?;
         (tokens, prompt_len)

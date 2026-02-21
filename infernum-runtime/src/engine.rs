@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
-use infernum::cuda::{CudaContext, CudaGraph, KvCache};
+use infernum::cuda::{CudaGraph, KvCache};
 use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams};
 
 /// Token-level inference engine.
@@ -18,28 +18,36 @@ use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, Sampling
 pub struct Engine<M: Model> {
     model: M,
     model_config: ModelConfig,
-    kv_cache: KvCache<M::CacheDtype>,
+    kv_caches: Vec<KvCache<M::CacheDtype>>,
 }
 
 impl<M: Model> Engine<M> {
     /// Create a new engine wrapping the given model.
     ///
+    /// Allocates one KV cache per device returned by [`Model::devices`].
+    ///
     /// # Errors
     /// Returns an error if KV cache allocation fails.
-    pub fn new(ctx: &CudaContext, model: M) -> Result<Self> {
+    pub fn new(model: M) -> Result<Self> {
         infernum::fusion::init();
         let model_config = model.config();
-        let kv_cache = KvCache::new(
-            ctx,
-            model_config.num_layers,
-            model_config.max_seq_len,
-            model_config.num_kv_heads,
-            model_config.head_dim,
-        )?;
+        let kv_caches = model
+            .devices()
+            .iter()
+            .map(|ctx| {
+                KvCache::new(
+                    ctx,
+                    model_config.num_layers,
+                    model_config.max_seq_len,
+                    model_config.num_kv_heads,
+                    model_config.head_dim,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             model,
             model_config,
-            kv_cache,
+            kv_caches,
         })
     }
 
@@ -132,7 +140,9 @@ impl<M: Model> Engine<M> {
         input_ids: &[u32],
         options: &GenerateOptions,
     ) -> Result<Vec<u32>> {
-        self.kv_cache.reset()?;
+        for kv in &mut self.kv_caches {
+            kv.reset()?;
+        }
         let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
         let sampling = options.sampling.as_ref();
@@ -140,7 +150,7 @@ impl<M: Model> Engine<M> {
         // Prefill: process entire prompt
         let logits = self
             .model
-            .forward_with_kv_cache(input_ids, &mut self.kv_cache)?;
+            .forward_with_kv_cache(input_ids, &mut self.kv_caches)?;
         let recent = recent_token_window(&tokens, sampling);
         let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
@@ -149,7 +159,8 @@ impl<M: Model> Engine<M> {
         }
         tokens.push(next_token);
 
-        if options.use_cuda_graphs && options.max_new_tokens > 1 {
+        // CUDA graphs only supported for single-device models
+        if options.use_cuda_graphs && options.max_new_tokens > 1 && self.kv_caches.len() == 1 {
             self.decode_loop_graph(&mut tokens, &mut next_token, options, &mut rng_state)?;
         } else {
             self.decode_loop_eager(&mut tokens, &mut next_token, options, &mut rng_state)?;
@@ -170,7 +181,7 @@ impl<M: Model> Engine<M> {
         for _ in 1..options.max_new_tokens {
             let logits = self
                 .model
-                .forward_next_token(*next_token, &mut self.kv_cache)?;
+                .forward_next_token(*next_token, &mut self.kv_caches)?;
             let recent = recent_token_window(tokens, sampling);
             *next_token = select_token(&logits, sampling, rng_state, recent)?;
 
@@ -208,11 +219,11 @@ impl<M: Model> Engine<M> {
         // generation budget. This prevents shared memory from being sized for the
         // model's full max_position_embeddings (e.g. 131072) which would exceed
         // the per-block shared memory hardware limit.
-        let effective_max =
-            (self.kv_cache.current_len() + options.max_new_tokens).min(self.kv_cache.max_seq_len());
-        self.kv_cache.set_graph_max_seq_len(effective_max);
+        let effective_max = (self.kv_caches[0].current_len() + options.max_new_tokens)
+            .min(self.kv_caches[0].max_seq_len());
+        self.kv_caches[0].set_graph_max_seq_len(effective_max);
 
-        let device = self.kv_cache.device();
+        let device = self.kv_caches[0].device();
         let mut graph = CudaGraph::new(&device)?;
 
         let mut t_htod = Duration::ZERO;
@@ -236,7 +247,7 @@ impl<M: Model> Engine<M> {
                 // forward_next_token_device internally calls advance(1).
                 let logits = self
                     .model
-                    .forward_next_token_device(graph.token_input(), &mut self.kv_cache)?;
+                    .forward_next_token_device(graph.token_input(), &mut self.kv_caches)?;
                 let recent = recent_token_window(tokens, sampling);
                 *next_token = select_token(&logits, sampling, rng_state, recent)?;
             } else if step == 2 {
@@ -244,7 +255,7 @@ impl<M: Model> Engine<M> {
                 graph.begin_capture()?;
                 let logits = self
                     .model
-                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_cache)?;
+                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_caches)?;
                 graph.end_capture()?;
 
                 // Launch the just-captured graph
@@ -258,7 +269,7 @@ impl<M: Model> Engine<M> {
 
                 // Advance position after graph execution (outside capture)
                 let t0 = Instant::now();
-                self.kv_cache.advance(1)?;
+                self.kv_caches[0].advance(1)?;
                 t_advance += t0.elapsed();
 
                 let t0 = Instant::now();
@@ -279,7 +290,7 @@ impl<M: Model> Engine<M> {
                 t_sync += t0.elapsed();
 
                 let t0 = Instant::now();
-                self.kv_cache.advance(1)?;
+                self.kv_caches[0].advance(1)?;
                 t_advance += t0.elapsed();
 
                 let t0 = Instant::now();
@@ -362,7 +373,9 @@ impl<M: Model> Engine<M> {
         options: &GenerateOptions,
         tx: &mpsc::Sender<Result<u32>>,
     ) -> Result<()> {
-        self.kv_cache.reset()?;
+        for kv in &mut self.kv_caches {
+            kv.reset()?;
+        }
         let mut tokens = input_ids.to_vec();
         let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
         let sampling = options.sampling.as_ref();
@@ -370,7 +383,7 @@ impl<M: Model> Engine<M> {
         // Prefill
         let logits = self
             .model
-            .forward_with_kv_cache(input_ids, &mut self.kv_cache)?;
+            .forward_with_kv_cache(input_ids, &mut self.kv_caches)?;
         let recent = recent_token_window(&tokens, sampling);
         let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
@@ -382,8 +395,8 @@ impl<M: Model> Engine<M> {
             return Ok(());
         }
 
-        // Decode
-        if options.use_cuda_graphs && options.max_new_tokens > 1 {
+        // Decode (CUDA graphs only for single-device)
+        if options.use_cuda_graphs && options.max_new_tokens > 1 && self.kv_caches.len() == 1 {
             self.stream_decode_loop_graph(
                 &mut tokens,
                 &mut next_token,
@@ -417,7 +430,7 @@ impl<M: Model> Engine<M> {
         for _ in 1..options.max_new_tokens {
             let logits = self
                 .model
-                .forward_next_token(*next_token, &mut self.kv_cache)?;
+                .forward_next_token(*next_token, &mut self.kv_caches)?;
             let recent = recent_token_window(tokens, sampling);
             *next_token = select_token(&logits, sampling, rng_state, recent)?;
 
@@ -442,7 +455,7 @@ impl<M: Model> Engine<M> {
         tx: &mpsc::Sender<Result<u32>>,
     ) -> Result<()> {
         let sampling = options.sampling.as_ref();
-        let device = self.kv_cache.device();
+        let device = self.kv_caches[0].device();
         let mut graph = CudaGraph::new(&device)?;
         let mut captured_logits: Option<CudaTensor<f32>> = None;
 
@@ -453,7 +466,7 @@ impl<M: Model> Engine<M> {
                 // Warmup: eager (forward_next_token_device calls advance)
                 let logits = self
                     .model
-                    .forward_next_token_device(graph.token_input(), &mut self.kv_cache)?;
+                    .forward_next_token_device(graph.token_input(), &mut self.kv_caches)?;
                 let recent = recent_token_window(tokens, sampling);
                 *next_token = select_token(&logits, sampling, rng_state, recent)?;
             } else if step == 2 {
@@ -461,12 +474,12 @@ impl<M: Model> Engine<M> {
                 graph.begin_capture()?;
                 let logits = self
                     .model
-                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_cache)?;
+                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_caches)?;
                 graph.end_capture()?;
 
                 graph.launch()?;
                 device.synchronize()?;
-                self.kv_cache.advance(1)?;
+                self.kv_caches[0].advance(1)?;
 
                 let recent = recent_token_window(tokens, sampling);
                 *next_token = select_token(&logits, sampling, rng_state, recent)?;
@@ -475,7 +488,7 @@ impl<M: Model> Engine<M> {
                 // Replay captured graph
                 graph.launch()?;
                 device.synchronize()?;
-                self.kv_cache.advance(1)?;
+                self.kv_caches[0].advance(1)?;
 
                 let logits = captured_logits
                     .as_ref()

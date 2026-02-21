@@ -1,9 +1,9 @@
 //! Quantized matrix multiplication kernels
 //!
 //! Performs `output = input @ dequantize(weight)^T` where weights are stored
-//! in `Q8_0`, `Q4_0`, or `F8E4M3` format. Input activations and output remain f32.
-//! Dequantization happens on-the-fly inside the kernel — the full f32 weight
-//! matrix never exists in GPU memory.
+//! in `Q8_0`, `Q4_0`, `Q6_K`, `F8E4M3`, `GPTQ_INT4`, or `AWQ_INT4` format.
+//! Input activations and output remain f32. Dequantization happens on-the-fly
+//! inside the kernel — the full f32 weight matrix never exists in GPU memory.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -29,6 +29,10 @@ use crate::Result;
 
 const QUANTIZED_MATMUL_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/kernels/quantized_matmul.ptx"));
+
+const GPTQ_MATMUL_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/gptq_matmul.ptx"));
+
+const AWQ_MATMUL_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/awq_matmul.ptx"));
 
 // ---------------------------------------------------------------------------
 // FP8 activation quantization kernel (compiled at build time)
@@ -566,6 +570,72 @@ fn quantized_matmul_2d(
                         m as i32,
                         n as i32,
                         k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::GPTQ_INT4 => {
+            let gptq_module = "gptq_matmul";
+            if !device.has_func(gptq_module, "matmul_gptq_f32") {
+                device.load_ptx(
+                    cudarc::nvrtc::Ptx::from_src(GPTQ_MATMUL_PTX),
+                    gptq_module,
+                    &["matmul_gptq_f32"],
+                )?;
+            }
+            let group_size = weight
+                .group_size()
+                .expect("GPTQ_INT4 weight must have group_size");
+            let qzeros = weight
+                .qzeros_slice()
+                .expect("GPTQ_INT4 weight must have qzeros");
+            let func = device.get_func(gptq_module, "matmul_gptq_f32").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &input.cuda_slice(),
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        qzeros,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        group_size as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::AWQ_INT4 => {
+            let awq_module = "awq_matmul";
+            if !device.has_func(awq_module, "matmul_awq_f32") {
+                device.load_ptx(
+                    cudarc::nvrtc::Ptx::from_src(AWQ_MATMUL_PTX),
+                    awq_module,
+                    &["matmul_awq_f32"],
+                )?;
+            }
+            let group_size = weight
+                .group_size()
+                .expect("AWQ_INT4 weight must have group_size");
+            let qzeros = weight
+                .qzeros_slice()
+                .expect("AWQ_INT4 weight must have qzeros");
+            let func = device.get_func(awq_module, "matmul_awq_f32").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &input.cuda_slice(),
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        qzeros,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        group_size as i32,
                     ),
                 )?;
             }
@@ -1863,6 +1933,494 @@ mod tests {
                 b,
                 sums_host[b],
                 expected_sum
+            );
+        }
+    }
+
+    fn pack_gptq_host(
+        weights: &[f32],
+        out_features: usize,
+        in_features: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        assert_eq!(weights.len(), out_features * in_features);
+        assert_eq!(in_features % 8, 0);
+        assert_eq!(in_features % group_size, 0);
+        assert_eq!(out_features % 8, 0);
+
+        let num_groups = in_features / group_size;
+        let packed_rows = in_features / 8;
+
+        // Compute per-group, per-output-feature scales
+        // scale = max_abs / 7.0 (INT4 unsigned range is 0..15, centered at zero_point)
+        // We use zero_point = 8 so effective range is [-8, 7] * scale
+        let zero_point = 8_i32;
+
+        let mut scales_f16 = vec![half::f16::from_f32(0.0); num_groups * out_features];
+        let mut quantized = vec![0_i32; out_features * in_features];
+
+        for n in 0..out_features {
+            for g in 0..num_groups {
+                let k_start = g * group_size;
+                let k_end = k_start + group_size;
+                let group_vals: Vec<f32> = (k_start..k_end)
+                    .map(|k| weights[n * in_features + k])
+                    .collect();
+                let max_abs = group_vals.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
+                scales_f16[g * out_features + n] = half::f16::from_f32(scale);
+
+                for (j, &v) in group_vals.iter().enumerate() {
+                    let q = ((v / scale).round() as i32 + zero_point).clamp(0, 15);
+                    quantized[n * in_features + k_start + j] = q;
+                }
+            }
+        }
+
+        // Pack qweight: [in_features/8, out_features] as int32
+        // qweight[pr * N + n] packs 8 values at k=pr*8..pr*8+7 for output n
+        let mut qweight = vec![0_u8; packed_rows * out_features * 4];
+        for pr in 0..packed_rows {
+            for n in 0..out_features {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    let k = pr * 8 + j;
+                    let q = quantized[n * in_features + k] as u32;
+                    packed |= (q & 0xF) << (j * 4);
+                }
+                let idx = (pr * out_features + n) * 4;
+                qweight[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        // Pack scales: [num_groups, out_features] as f16 (already computed)
+        let mut scales_bytes = vec![0_u8; num_groups * out_features * 2];
+        for i in 0..num_groups * out_features {
+            let bytes = scales_f16[i].to_le_bytes();
+            scales_bytes[i * 2] = bytes[0];
+            scales_bytes[i * 2 + 1] = bytes[1];
+        }
+
+        // Pack qzeros: [num_groups, out_features/8] as int32
+        // AutoGPTQ convention: stored = actual_zero_point - 1
+        let stored_zp = (zero_point - 1) as u32;
+        let qzeros_cols = out_features / 8;
+        let mut qzeros = vec![0_u8; num_groups * qzeros_cols * 4];
+        for g in 0..num_groups {
+            for col in 0..qzeros_cols {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    packed |= (stored_zp & 0xF) << (j * 4);
+                }
+                let idx = (g * qzeros_cols + col) * 4;
+                qzeros[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        (qweight, scales_bytes, qzeros)
+    }
+
+    /// CPU reference for GPTQ matmul: `output[m][n] = sum_k input[m][k] * dequant(weight)[k][n]`
+    fn gptq_matmul_reference(
+        input: &[f32],
+        qweight: &[u8],
+        scales: &[u8],
+        qzeros: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let packed_rows = k / 8;
+        let qzeros_cols = n / 8;
+        let mut output = vec![0.0_f32; m * n];
+
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0_f32;
+                for pr in 0..packed_rows {
+                    let base_k = pr * 8;
+                    let group_idx = base_k / group_size;
+
+                    // Read scale (f16)
+                    let s_idx = (group_idx * n + col) * 2;
+                    let scale =
+                        half::f16::from_le_bytes([scales[s_idx], scales[s_idx + 1]]).to_f32();
+
+                    // Read zero-point (packed int4)
+                    let qz_idx = (group_idx * qzeros_cols + col / 8) * 4;
+                    let qz_packed = u32::from_le_bytes([
+                        qzeros[qz_idx],
+                        qzeros[qz_idx + 1],
+                        qzeros[qz_idx + 2],
+                        qzeros[qz_idx + 3],
+                    ]);
+                    let qz_shift = (col % 8) * 4;
+                    // AutoGPTQ stores qzeros with -1 offset: actual = stored + 1
+                    let qzero = (((qz_packed >> qz_shift) & 0xF) + 1) as i32;
+
+                    // Read packed qweight
+                    let qw_idx = (pr * n + col) * 4;
+                    let packed = u32::from_le_bytes([
+                        qweight[qw_idx],
+                        qweight[qw_idx + 1],
+                        qweight[qw_idx + 2],
+                        qweight[qw_idx + 3],
+                    ]);
+
+                    for j in 0..8 {
+                        let kk = base_k + j;
+                        if kk >= k {
+                            break;
+                        }
+                        let q = ((packed >> (j * 4)) & 0xF) as i32;
+                        let w = (q - qzero) as f32 * scale;
+                        acc += input[row * k + kk] * w;
+                    }
+                }
+                output[row * n + col] = acc;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn test_matmul_gptq_basic() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 128;
+        let m = 1;
+        let n = 8;
+        let group_size = 128;
+
+        // input: all 1.0 → output = sum of dequantized weight column
+        let input_data = vec![1.0_f32; m * k];
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        // weight: constant 2.0
+        let w_data: Vec<f32> = vec![2.0_f32; n * k];
+        let (qweight, scales, qzeros) = pack_gptq_host(&w_data, n, k, group_size);
+
+        let weight = QuantizedTensor::from_gptq_raw(
+            &ctx,
+            &[n, k],
+            DType::GPTQ_INT4,
+            &qweight,
+            &scales,
+            &qzeros,
+            group_size,
+        )
+        .unwrap();
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        assert_eq!(output.shape(), &[m, n]);
+
+        let result = output.to_vec().unwrap();
+
+        // Expected: 128 * 2.0 = 256.0 (INT4 quantization adds some error)
+        let expected = 256.0_f32;
+        for (i, &v) in result.iter().enumerate() {
+            assert!(
+                (v - expected).abs() < expected * 0.15,
+                "GPTQ basic [{i}]: {} vs expected ~{}",
+                v,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_gptq_matches_reference() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 4;
+        let k = 128;
+        let n = 16;
+        let group_size = 128;
+
+        let mut state: u64 = 31337;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        let (qweight, scales, qzeros) = pack_gptq_host(&w_data, n, k, group_size);
+
+        // CPU reference using the same packed data
+        let expected =
+            gptq_matmul_reference(&input_data, &qweight, &scales, &qzeros, m, n, k, group_size);
+
+        let weight = QuantizedTensor::from_gptq_raw(
+            &ctx,
+            &[n, k],
+            DType::GPTQ_INT4,
+            &qweight,
+            &scales,
+            &qzeros,
+            group_size,
+        )
+        .unwrap();
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+
+        for i in 0..m * n {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "GPTQ mismatch at [{}, {}]: got {} expected {} (diff={:.6})",
+                i / n,
+                i % n,
+                result[i],
+                expected[i],
+                diff
+            );
+        }
+    }
+
+    /// Pack f32 weights into AWQ INT4 format on the host.
+    /// Returns (qweight, scales, qzeros) as raw byte vectors.
+    ///
+    /// - `weights`: `[out_features, in_features]` in row-major order
+    /// - `qweight`: `[in_features, out_features/8]` as `int32` (packs 8 output channels per int32)
+    /// - `scales`:  `[num_groups, out_features]` as `f16`
+    /// - `qzeros`:  `[num_groups, out_features/8]` as `int32`
+    fn pack_awq_host(
+        weights: &[f32],
+        out_features: usize,
+        in_features: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        assert_eq!(weights.len(), out_features * in_features);
+        assert_eq!(out_features % 8, 0);
+        assert_eq!(in_features % group_size, 0);
+
+        let num_groups = in_features / group_size;
+        let packed_cols = out_features / 8;
+        let zero_point = 8_i32;
+
+        // Compute scales and quantize (same grouping as GPTQ)
+        let mut scales_f16 = vec![half::f16::from_f32(0.0); num_groups * out_features];
+        let mut quantized = vec![0_i32; out_features * in_features];
+
+        for n in 0..out_features {
+            for g in 0..num_groups {
+                let k_start = g * group_size;
+                let k_end = k_start + group_size;
+                let group_vals: Vec<f32> = (k_start..k_end)
+                    .map(|k| weights[n * in_features + k])
+                    .collect();
+                let max_abs = group_vals.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
+                scales_f16[g * out_features + n] = half::f16::from_f32(scale);
+
+                for (j, &v) in group_vals.iter().enumerate() {
+                    let q = ((v / scale).round() as i32 + zero_point).clamp(0, 15);
+                    quantized[n * in_features + k_start + j] = q;
+                }
+            }
+        }
+
+        // Pack qweight: [in_features, out_features/8] as int32
+        // qweight[k * packed_cols + col] packs 8 output channels col*8..col*8+7 for input k
+        let mut qweight = vec![0_u8; in_features * packed_cols * 4];
+        for k in 0..in_features {
+            for col in 0..packed_cols {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    let n = col * 8 + j;
+                    let q = quantized[n * in_features + k] as u32;
+                    packed |= (q & 0xF) << (j * 4);
+                }
+                let idx = (k * packed_cols + col) * 4;
+                qweight[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        // Pack scales: [num_groups, out_features] as f16
+        let mut scales_bytes = vec![0_u8; num_groups * out_features * 2];
+        for i in 0..num_groups * out_features {
+            let bytes = scales_f16[i].to_le_bytes();
+            scales_bytes[i * 2] = bytes[0];
+            scales_bytes[i * 2 + 1] = bytes[1];
+        }
+
+        // Pack qzeros: [num_groups, out_features/8] as int32
+        // AutoAWQ convention: stored = actual_zero_point - 1
+        let stored_zp = (zero_point - 1) as u32;
+        let mut qzeros = vec![0_u8; num_groups * packed_cols * 4];
+        for g in 0..num_groups {
+            for col in 0..packed_cols {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    packed |= (stored_zp & 0xF) << (j * 4);
+                }
+                let idx = (g * packed_cols + col) * 4;
+                qzeros[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        (qweight, scales_bytes, qzeros)
+    }
+
+    /// CPU reference for AWQ matmul: `output[m][n] = sum_k input[m][k] * dequant(weight)[k][n]`
+    fn awq_matmul_reference(
+        input: &[f32],
+        qweight: &[u8],
+        scales: &[u8],
+        qzeros: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let packed_cols = n / 8;
+        let mut output = vec![0.0_f32; m * n];
+
+        for row in 0..m {
+            for col in 0..n {
+                let n_col = col / 8;
+                let n_shift = (col % 8) * 4;
+                let mut acc = 0.0_f32;
+
+                for kk in 0..k {
+                    let group_idx = kk / group_size;
+
+                    // Scale (f16)
+                    let s_idx = (group_idx * n + col) * 2;
+                    let scale =
+                        half::f16::from_le_bytes([scales[s_idx], scales[s_idx + 1]]).to_f32();
+
+                    // Zero-point (packed int4)
+                    let qz_idx = (group_idx * packed_cols + n_col) * 4;
+                    let qz_packed = u32::from_le_bytes([
+                        qzeros[qz_idx],
+                        qzeros[qz_idx + 1],
+                        qzeros[qz_idx + 2],
+                        qzeros[qz_idx + 3],
+                    ]);
+                    // AutoAWQ stores qzeros with -1 offset: actual = stored + 1
+                    let qzero = (((qz_packed >> n_shift) & 0xF) + 1) as i32;
+
+                    // Quantized weight
+                    let qw_idx = (kk * packed_cols + n_col) * 4;
+                    let qw_packed = u32::from_le_bytes([
+                        qweight[qw_idx],
+                        qweight[qw_idx + 1],
+                        qweight[qw_idx + 2],
+                        qweight[qw_idx + 3],
+                    ]);
+                    let q = ((qw_packed >> n_shift) & 0xF) as i32;
+
+                    let w = (q - qzero) as f32 * scale;
+                    acc += input[row * k + kk] * w;
+                }
+                output[row * n + col] = acc;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn test_matmul_awq_basic() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 128;
+        let m = 1;
+        let n = 8;
+        let group_size = 128;
+
+        let input_data = vec![1.0_f32; m * k];
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        let w_data: Vec<f32> = vec![2.0_f32; n * k];
+        let (qweight, scales, qzeros) = pack_awq_host(&w_data, n, k, group_size);
+
+        let weight = QuantizedTensor::from_gptq_raw(
+            &ctx,
+            &[n, k],
+            DType::AWQ_INT4,
+            &qweight,
+            &scales,
+            &qzeros,
+            group_size,
+        )
+        .unwrap();
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        assert_eq!(output.shape(), &[m, n]);
+
+        let result = output.to_vec().unwrap();
+
+        let expected = 256.0_f32;
+        for (i, &v) in result.iter().enumerate() {
+            assert!(
+                (v - expected).abs() < expected * 0.15,
+                "AWQ basic [{i}]: {} vs expected ~{}",
+                v,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_awq_matches_reference() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 4;
+        let k = 128;
+        let n = 16;
+        let group_size = 128;
+
+        let mut state: u64 = 42424;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        let (qweight, scales, qzeros) = pack_awq_host(&w_data, n, k, group_size);
+
+        let expected =
+            awq_matmul_reference(&input_data, &qweight, &scales, &qzeros, m, n, k, group_size);
+
+        let weight = QuantizedTensor::from_gptq_raw(
+            &ctx,
+            &[n, k],
+            DType::AWQ_INT4,
+            &qweight,
+            &scales,
+            &qzeros,
+            group_size,
+        )
+        .unwrap();
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+
+        for i in 0..m * n {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "AWQ mismatch at [{}, {}]: got {} expected {} (diff={:.6})",
+                i / n,
+                i % n,
+                result[i],
+                expected[i],
+                diff
             );
         }
     }

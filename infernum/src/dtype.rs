@@ -11,6 +11,9 @@ pub const Q6_K_BLOCK_ELEMENTS: usize = 256;
 /// Byte size of one `Q6_K` super-block: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210
 pub const Q6_K_BLOCK_SIZE_BYTES: usize = 210;
 
+/// Default group size for GPTQ / AWQ quantization (elements per scale/zero group)
+pub const GPTQ_GROUP_SIZE: usize = 128;
+
 /// Supported data types for tensors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)] // GGML K-quant names use underscores (Q6_K, Q4_K, etc.)
@@ -31,6 +34,10 @@ pub enum DType {
     Q6_K,
     /// 8-bit floating point (E4M3 format: 4 exponent, 3 mantissa bits)
     F8E4M3,
+    /// GPTQ INT4: group-quantized 4-bit (packed in int32, with f16 scales and int32 zero-points)
+    GPTQ_INT4,
+    /// AWQ INT4: group-quantized 4-bit (packed in int32, transposed packing axis vs GPTQ)
+    AWQ_INT4,
 }
 
 impl DType {
@@ -45,9 +52,9 @@ impl DType {
             Self::F32 | Self::U32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::F8E4M3 => 1,
-            Self::Q8_0 | Self::Q4_0 | Self::Q6_K => panic!(
-                "Block-quantized types have no fixed per-element size; use block_size_in_bytes()"
-            ),
+            Self::Q8_0 | Self::Q4_0 | Self::Q6_K | Self::GPTQ_INT4 | Self::AWQ_INT4 => {
+                panic!("Quantized types have no fixed per-element size")
+            }
         }
     }
 
@@ -74,13 +81,22 @@ impl DType {
     /// Whether this dtype is a quantized format
     #[must_use]
     pub const fn is_quantized(self) -> bool {
-        matches!(self, Self::Q8_0 | Self::Q4_0 | Self::Q6_K | Self::F8E4M3)
+        matches!(
+            self,
+            Self::Q8_0 | Self::Q4_0 | Self::Q6_K | Self::F8E4M3 | Self::GPTQ_INT4 | Self::AWQ_INT4
+        )
     }
 
-    /// Whether this dtype is a block-quantized format (has scale factors)
+    /// Whether this dtype is a block-quantized format (GGML-style: scale per block)
     #[must_use]
     pub const fn is_block_quantized(self) -> bool {
         matches!(self, Self::Q8_0 | Self::Q4_0 | Self::Q6_K)
+    }
+
+    /// Whether this dtype is a group-quantized format (GPTQ/AWQ-style: scale + zero per group)
+    #[must_use]
+    pub const fn is_group_quantized(self) -> bool {
+        matches!(self, Self::GPTQ_INT4 | Self::AWQ_INT4)
     }
 
     /// Convert from safetensors dtype string
@@ -91,6 +107,8 @@ impl DType {
             "F16" => Some(Self::F16),
             "BF16" => Some(Self::BF16),
             "F8_E4M3" => Some(Self::F8E4M3),
+            // GPTQ/AWQ store qweight and qzeros as int32
+            "I32" => Some(Self::U32),
             _ => None,
         }
     }
@@ -107,6 +125,8 @@ impl fmt::Display for DType {
             Self::Q4_0 => write!(f, "q4_0"),
             Self::Q6_K => write!(f, "q6_k"),
             Self::F8E4M3 => write!(f, "f8e4m3"),
+            Self::GPTQ_INT4 => write!(f, "gptq_int4"),
+            Self::AWQ_INT4 => write!(f, "awq_int4"),
         }
     }
 }
@@ -175,15 +195,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "block_size_in_bytes")]
+    #[should_panic(expected = "no fixed per-element size")]
     fn test_dtype_size_in_bytes_q8_panics() {
         let _ = DType::Q8_0.size_in_bytes();
     }
 
     #[test]
-    #[should_panic(expected = "block_size_in_bytes")]
+    #[should_panic(expected = "no fixed per-element size")]
     fn test_dtype_size_in_bytes_q4_panics() {
         let _ = DType::Q4_0.size_in_bytes();
+    }
+
+    #[test]
+    #[should_panic(expected = "no fixed per-element size")]
+    fn test_dtype_size_in_bytes_gptq_panics() {
+        let _ = DType::GPTQ_INT4.size_in_bytes();
+    }
+
+    #[test]
+    #[should_panic(expected = "no fixed per-element size")]
+    fn test_dtype_size_in_bytes_awq_panics() {
+        let _ = DType::AWQ_INT4.size_in_bytes();
     }
 
     #[test]
@@ -206,15 +238,30 @@ mod tests {
         assert!(DType::Q4_0.is_quantized());
         assert!(DType::Q6_K.is_quantized());
         assert!(DType::F8E4M3.is_quantized());
+        assert!(DType::GPTQ_INT4.is_quantized());
+        assert!(DType::AWQ_INT4.is_quantized());
     }
 
     #[test]
     fn test_dtype_is_block_quantized() {
         assert!(!DType::F32.is_block_quantized());
         assert!(!DType::F8E4M3.is_block_quantized());
+        assert!(!DType::GPTQ_INT4.is_block_quantized());
+        assert!(!DType::AWQ_INT4.is_block_quantized());
         assert!(DType::Q8_0.is_block_quantized());
         assert!(DType::Q4_0.is_block_quantized());
         assert!(DType::Q6_K.is_block_quantized());
+    }
+
+    #[test]
+    fn test_dtype_is_group_quantized() {
+        assert!(!DType::F32.is_group_quantized());
+        assert!(!DType::F16.is_group_quantized());
+        assert!(!DType::Q8_0.is_group_quantized());
+        assert!(!DType::Q4_0.is_group_quantized());
+        assert!(!DType::F8E4M3.is_group_quantized());
+        assert!(DType::GPTQ_INT4.is_group_quantized());
+        assert!(DType::AWQ_INT4.is_group_quantized());
     }
 
     #[test]
@@ -223,7 +270,7 @@ mod tests {
         assert_eq!(DType::from_safetensors("F16"), Some(DType::F16));
         assert_eq!(DType::from_safetensors("BF16"), Some(DType::BF16));
         assert_eq!(DType::from_safetensors("F8_E4M3"), Some(DType::F8E4M3));
-        assert_eq!(DType::from_safetensors("I32"), None);
+        assert_eq!(DType::from_safetensors("I32"), Some(DType::U32));
         assert_eq!(DType::from_safetensors("invalid"), None);
     }
 
@@ -237,6 +284,8 @@ mod tests {
         assert_eq!(format!("{}", DType::Q4_0), "q4_0");
         assert_eq!(format!("{}", DType::Q6_K), "q6_k");
         assert_eq!(format!("{}", DType::F8E4M3), "f8e4m3");
+        assert_eq!(format!("{}", DType::GPTQ_INT4), "gptq_int4");
+        assert_eq!(format!("{}", DType::AWQ_INT4), "awq_int4");
     }
 
     #[test]

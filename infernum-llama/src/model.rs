@@ -401,11 +401,36 @@ where
         /// Load a linear weight — quantized if the tensor uses a quantized dtype,
         /// otherwise dense (pre-transposed). For FP8 weights, also loads the
         /// companion `weight_scale` tensor if present.
+        ///
+        /// When `quant_config` is `Some`, uses GPTQ or AWQ loading instead of
+        /// the generic `load_quantized` path.
         fn load_linear<T: TensorDType + DeviceRepr>(
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
+            quant_config: Option<&crate::QuantizationConfig>,
         ) -> Result<LinearWeight<T>> {
+            // GPTQ/AWQ: load via dedicated loader using the layer prefix
+            if let Some(qc) = quant_config {
+                let prefix = name
+                    .strip_suffix(".weight")
+                    .expect("GPTQ/AWQ weight name must end with .weight");
+                match qc.quant_method.as_str() {
+                    "gptq" => {
+                        let qt = loader.load_gptq_linear(ctx, prefix, qc.group_size)?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    "awq" => {
+                        let qt = loader.load_awq_linear(ctx, prefix, qc.group_size)?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    _ => {
+                        // Unknown quant method (e.g. "compressed-tensors") —
+                        // fall through to standard weight loading
+                    }
+                }
+            }
+
             let dtype = loader.get_dtype(name)?;
             if dtype.is_quantized() {
                 let mut qt = loader.load_quantized(ctx, name)?;
@@ -452,6 +477,8 @@ where
             }
         }
 
+        let qc = config.quantization_config.as_ref();
+
         // Load embeddings
         let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
 
@@ -471,11 +498,13 @@ where
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.k_proj.weight"),
+                        qc,
                     )?;
                     let v = load_linear::<T>(
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.v_proj.weight"),
+                        qc,
                     )?;
                     let kv_proj = match (k, v) {
                         (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
@@ -494,12 +523,14 @@ where
                             ctx,
                             loader,
                             &format!("{prefix}.self_attn.q_proj.weight"),
+                            qc,
                         )?,
                         kv_proj,
                         o_proj: load_linear::<T>(
                             ctx,
                             loader,
                             &format!("{prefix}.self_attn.o_proj.weight"),
+                            qc,
                         )?,
                     }
                 },
@@ -509,10 +540,14 @@ where
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
                 mlp: {
-                    let gate =
-                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.gate_proj.weight"))?;
+                    let gate = load_linear::<T>(
+                        ctx,
+                        loader,
+                        &format!("{prefix}.mlp.gate_proj.weight"),
+                        qc,
+                    )?;
                     let up =
-                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.up_proj.weight"))?;
+                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.up_proj.weight"), qc)?;
                     let gate_up = match (gate, up) {
                         (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
                             weight: concat_weights(&g, &u)?,
@@ -529,6 +564,7 @@ where
                             ctx,
                             loader,
                             &format!("{prefix}.mlp.down_proj.weight"),
+                            qc,
                         )?,
                     }
                 },
@@ -554,7 +590,7 @@ where
                 LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
             }
         } else {
-            load_linear::<T>(ctx, loader, "lm_head.weight")?
+            load_linear::<T>(ctx, loader, "lm_head.weight", None)?
         };
 
         // Precompute RoPE cache in f32, then convert to T
@@ -593,8 +629,9 @@ where
 
     /// Load model weights with tensor-parallel sharding.
     ///
-    /// Only supports dense (non-quantized) linear weights — FP8 quantized
-    /// weights use `Replicate` strategy and are not sharded.
+    /// Dense and GPTQ/AWQ INT4 linear weights are sharded according to
+    /// `shard_strategy_for_weight`. FP8 block-quantized weights use
+    /// `Replicate` strategy.
     #[cfg(feature = "nccl")]
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn load_weights_sharded(
@@ -605,14 +642,48 @@ where
         nccl_comm: NcclCommunicator,
     ) -> Result<Self> {
         /// Load a sharded linear weight. Quantized weights fall back to
-        /// `Replicate` (sharding block-quantized formats is unsupported).
+        /// `Replicate` (sharding quantized formats is unsupported).
         fn load_linear_sharded<T: TensorDType + DeviceRepr>(
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
             shard: &ShardConfig,
             strategy: ShardStrategy,
+            quant_config: Option<&crate::QuantizationConfig>,
         ) -> Result<LinearWeight<T>> {
+            // GPTQ/AWQ: load via dedicated sharded loader
+            if let Some(qc) = quant_config {
+                let prefix = name
+                    .strip_suffix(".weight")
+                    .expect("GPTQ/AWQ weight name must end with .weight");
+                match qc.quant_method.as_str() {
+                    "gptq" => {
+                        let qt = loader.load_gptq_linear_sharded(
+                            ctx,
+                            prefix,
+                            qc.group_size,
+                            shard,
+                            strategy,
+                        )?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    "awq" => {
+                        let qt = loader.load_awq_linear_sharded(
+                            ctx,
+                            prefix,
+                            qc.group_size,
+                            shard,
+                            strategy,
+                        )?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    _ => {
+                        // Unknown quant method (e.g. "compressed-tensors") —
+                        // fall through to standard weight loading
+                    }
+                }
+            }
+
             let dtype = loader.get_dtype(name)?;
             if dtype.is_quantized() {
                 let mut qt =
@@ -677,6 +748,8 @@ where
             config.intermediate_size
         );
 
+        let qc = config.quantization_config.as_ref();
+
         // Embeddings and norms are replicated
         let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
 
@@ -705,6 +778,7 @@ where
                         &q_name,
                         &shard,
                         shard_strategy_for_weight(&q_name),
+                        qc,
                     )?;
                     let k_proj = load_linear_sharded::<T>(
                         ctx,
@@ -712,6 +786,7 @@ where
                         &k_name,
                         &shard,
                         shard_strategy_for_weight(&k_name),
+                        qc,
                     )?;
                     let v_proj = load_linear_sharded::<T>(
                         ctx,
@@ -719,6 +794,7 @@ where
                         &v_name,
                         &shard,
                         shard_strategy_for_weight(&v_name),
+                        qc,
                     )?;
 
                     // With TP we keep K/V separate — fusing sharded weights
@@ -737,6 +813,7 @@ where
                             &o_name,
                             &shard,
                             shard_strategy_for_weight(&o_name),
+                            qc,
                         )?,
                     }
                 },
@@ -756,6 +833,7 @@ where
                         &gate_name,
                         &shard,
                         shard_strategy_for_weight(&gate_name),
+                        qc,
                     )?;
                     let up = load_linear_sharded::<T>(
                         ctx,
@@ -763,6 +841,7 @@ where
                         &up_name,
                         &shard,
                         shard_strategy_for_weight(&up_name),
+                        qc,
                     )?;
 
                     // Keep gate/up separate for the same reason as K/V
@@ -779,6 +858,7 @@ where
                             &down_name,
                             &shard,
                             shard_strategy_for_weight(&down_name),
+                            qc,
                         )?,
                     }
                 },
@@ -807,6 +887,7 @@ where
                 "lm_head.weight",
                 &shard,
                 ShardStrategy::Replicate,
+                None,
             )?
         };
 
@@ -1562,6 +1643,10 @@ where
         }
     }
 
+    fn devices(&self) -> Vec<&CudaContext> {
+        vec![&self.ctx]
+    }
+
     fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
         // Non-KV-cache forward: compute in T, cast logits to f32 at the end.
         let mut hidden = self.embed(input_ids)?;
@@ -1621,33 +1706,57 @@ where
     fn forward_with_kv_cache(
         &self,
         input_ids: &[u32],
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_with_kv_cache(input_ids, kv_cache)
+        self.forward_with_kv_cache(input_ids, &mut kv_caches[0])
     }
 
     fn forward_next_token(
         &self,
         token_id: u32,
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token(token_id, kv_cache)
+        self.forward_next_token(token_id, &mut kv_caches[0])
     }
 
     fn forward_next_token_device(
         &self,
         token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_device(token_id_gpu, kv_cache)
+        self.forward_next_token_device(token_id_gpu, &mut kv_caches[0])
     }
 
     fn forward_next_token_indirect(
         &self,
         token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_indirect(token_id_gpu, kv_cache)
+        self.forward_next_token_indirect(token_id_gpu, &mut kv_caches[0])
+    }
+}
+
+#[cfg(feature = "nccl")]
+#[allow(private_bounds)]
+impl<T> infernum::ShardedLoadable for LlamaModel<T>
+where
+    T: TensorDType
+        + DeviceRepr
+        + GemmScalar
+        + Default
+        + ValidAsZeroBits
+        + MaybeNcclType
+        + Send
+        + Sync,
+    CudaBlas: Gemm<T>,
+{
+    fn load_shard(
+        ctx: &CudaContext,
+        model_path: &Path,
+        shard: ShardConfig,
+        comm: NcclCommunicator,
+    ) -> Result<Self> {
+        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
     }
 }
 
@@ -1815,20 +1924,52 @@ mod tests {
     }
 
     /// Mock weight loader that stores pre-built tensors by name
+    /// Stored GPTQ data for a single linear layer
+    struct GptqLayerData {
+        shape: Vec<usize>,
+        qweight: Vec<u8>,
+        scales: Vec<u8>,
+        qzeros: Vec<u8>,
+        group_size: usize,
+    }
+
     struct MockWeightLoader {
         tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
+        gptq_weights: HashMap<String, GptqLayerData>,
     }
 
     impl MockWeightLoader {
         fn new() -> Self {
             Self {
                 tensors: HashMap::new(),
+                gptq_weights: HashMap::new(),
             }
         }
 
         fn add(&mut self, name: &str, shape: &[usize], data: Vec<f32>) {
             self.tensors
                 .insert(name.to_string(), (shape.to_vec(), data));
+        }
+
+        fn add_gptq(
+            &mut self,
+            prefix: &str,
+            shape: &[usize],
+            qweight: Vec<u8>,
+            scales: Vec<u8>,
+            qzeros: Vec<u8>,
+            group_size: usize,
+        ) {
+            self.gptq_weights.insert(
+                prefix.to_string(),
+                GptqLayerData {
+                    shape: shape.to_vec(),
+                    qweight,
+                    scales,
+                    qzeros,
+                    group_size,
+                },
+            );
         }
     }
 
@@ -1859,6 +2000,27 @@ mod tests {
             Err(infernum::Error::UnsupportedDtype(format!(
                 "MockWeightLoader: load_bf16 not supported (tensor: {name})"
             )))
+        }
+
+        fn load_gptq_linear(
+            &self,
+            ctx: &CudaContext,
+            prefix: &str,
+            _group_size: usize,
+        ) -> Result<QuantizedTensor> {
+            let data = self
+                .gptq_weights
+                .get(prefix)
+                .unwrap_or_else(|| panic!("MockWeightLoader: GPTQ prefix not found: {prefix}"));
+            QuantizedTensor::from_gptq_raw(
+                ctx,
+                &data.shape,
+                DType::GPTQ_INT4,
+                &data.qweight,
+                &data.scales,
+                &data.qzeros,
+                data.group_size,
+            )
         }
 
         fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
@@ -1893,6 +2055,7 @@ mod tests {
             tie_word_embeddings: false,
             bos_token_id: 1,
             eos_token_id: 2,
+            quantization_config: None,
         }
     }
 
@@ -1983,6 +2146,311 @@ mod tests {
         LlamaModel::<f32>::load_weights(ctx, config, &loader).expect("Failed to build tiny model")
     }
 
+    /// Pack f32 weights into GPTQ INT4 format on the host.
+    ///
+    /// - `weights`: `[out_features, in_features]` in row-major order
+    /// - Returns `(qweight, scales, qzeros)` as raw byte vectors
+    fn pack_gptq_test(
+        weights: &[f32],
+        out_features: usize,
+        in_features: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        assert_eq!(weights.len(), out_features * in_features);
+        assert_eq!(in_features % 8, 0);
+        assert_eq!(in_features % group_size, 0);
+        assert_eq!(out_features % 8, 0);
+
+        let num_groups = in_features / group_size;
+        let packed_rows = in_features / 8;
+        let zero_point = 8_i32;
+
+        let mut scales_f16 = vec![half::f16::from_f32(0.0); num_groups * out_features];
+        let mut quantized = vec![0_i32; out_features * in_features];
+
+        for n in 0..out_features {
+            for g in 0..num_groups {
+                let k_start = g * group_size;
+                let k_end = k_start + group_size;
+                let group_vals: Vec<f32> = (k_start..k_end)
+                    .map(|k| weights[n * in_features + k])
+                    .collect();
+                let max_abs = group_vals.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
+                scales_f16[g * out_features + n] = half::f16::from_f32(scale);
+
+                for (j, &v) in group_vals.iter().enumerate() {
+                    let q = ((v / scale).round() as i32 + zero_point).clamp(0, 15);
+                    quantized[n * in_features + k_start + j] = q;
+                }
+            }
+        }
+
+        // Pack qweight: [in_features/8, out_features] as int32
+        let mut qweight = vec![0_u8; packed_rows * out_features * 4];
+        for pr in 0..packed_rows {
+            for n in 0..out_features {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    let k = pr * 8 + j;
+                    let q = quantized[n * in_features + k] as u32;
+                    packed |= (q & 0xF) << (j * 4);
+                }
+                let idx = (pr * out_features + n) * 4;
+                qweight[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        // Pack scales: [num_groups, out_features] as f16
+        let mut scales_bytes = vec![0_u8; num_groups * out_features * 2];
+        for (i, &s) in scales_f16.iter().enumerate() {
+            let bytes = s.to_le_bytes();
+            scales_bytes[i * 2] = bytes[0];
+            scales_bytes[i * 2 + 1] = bytes[1];
+        }
+
+        // Pack qzeros: [num_groups, out_features/8] as int32
+        let qzeros_cols = out_features / 8;
+        let mut qzeros = vec![0_u8; num_groups * qzeros_cols * 4];
+        for g in 0..num_groups {
+            for col in 0..qzeros_cols {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    packed |= (zero_point as u32 & 0xF) << (j * 4);
+                }
+                let idx = (g * qzeros_cols + col) * 4;
+                qzeros[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        (qweight, scales_bytes, qzeros)
+    }
+
+    /// Build a tiny LlamaConfig with GPTQ quantization enabled.
+    /// Uses group_size=32 to keep dimensions small.
+    fn tiny_gptq_config() -> LlamaConfig {
+        LlamaConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            quantization_config: Some(crate::QuantizationConfig {
+                quant_method: "gptq".to_string(),
+                bits: 4,
+                group_size: 32,
+            }),
+        }
+    }
+
+    /// Generate pseudo-random weights and pack into GPTQ format, advancing the seed.
+    fn rand_gptq(
+        seed_offset: &mut usize,
+        out_f: usize,
+        in_f: usize,
+        group_size: usize,
+        scale: f32,
+    ) -> (Vec<usize>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        *seed_offset += 1;
+        let mut w = pseudo_random_weights(out_f * in_f, scale);
+        w.rotate_left(*seed_offset % (out_f * in_f).max(1));
+        let (qw, sc, qz) = pack_gptq_test(&w, out_f, in_f, group_size);
+        (vec![out_f, in_f], qw, sc, qz)
+    }
+
+    /// Generate pseudo-random f32 data, advancing the seed offset
+    fn rand_f32(seed_offset: &mut usize, n: usize, scale: f32) -> Vec<f32> {
+        *seed_offset += 1;
+        let mut vals = pseudo_random_weights(n, scale);
+        vals.rotate_left(*seed_offset % n.max(1));
+        vals
+    }
+
+    /// Build a MockWeightLoader with GPTQ-quantized linear layers
+    fn tiny_gptq_weight_loader(config: &LlamaConfig) -> MockWeightLoader {
+        let h = config.hidden_size;
+        let inter = config.intermediate_size;
+        let vocab = config.vocab_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads();
+        let head_dim = config.head_dim();
+        let group_size = config.quantization_config.as_ref().unwrap().group_size;
+        let scale = 0.02;
+
+        let mut loader = MockWeightLoader::new();
+        let mut seed_offset: usize = 0;
+
+        // Embeddings (always dense f32)
+        loader.add(
+            "model.embed_tokens.weight",
+            &[vocab, h],
+            rand_f32(&mut seed_offset, vocab * h, scale),
+        );
+
+        // Layer 0
+        let prefix = "model.layers.0";
+        loader.add(
+            &format!("{prefix}.input_layernorm.weight"),
+            &[h],
+            vec![1.0; h],
+        );
+
+        let gptq_layers: Vec<(&str, usize, usize)> = vec![
+            ("self_attn.q_proj", num_heads * head_dim, h),
+            ("self_attn.k_proj", num_kv_heads * head_dim, h),
+            ("self_attn.v_proj", num_kv_heads * head_dim, h),
+            ("self_attn.o_proj", h, num_heads * head_dim),
+            ("mlp.gate_proj", inter, h),
+            ("mlp.up_proj", inter, h),
+            ("mlp.down_proj", h, inter),
+        ];
+
+        for (name, out_f, in_f) in &gptq_layers {
+            let (shape, qw, sc, qz) = rand_gptq(&mut seed_offset, *out_f, *in_f, group_size, scale);
+            loader.add_gptq(&format!("{prefix}.{name}"), &shape, qw, sc, qz, group_size);
+        }
+
+        loader.add(
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &[h],
+            vec![1.0; h],
+        );
+
+        // Final norm
+        loader.add("model.norm.weight", &[h], vec![1.0; h]);
+
+        // lm_head (always dense, never quantized)
+        loader.add(
+            "lm_head.weight",
+            &[vocab, h],
+            rand_f32(&mut seed_offset, vocab * h, scale),
+        );
+
+        loader
+    }
+
+    fn build_tiny_gptq_model(ctx: &CudaContext) -> LlamaModel<f32> {
+        let config = tiny_gptq_config();
+        let loader = tiny_gptq_weight_loader(&config);
+        LlamaModel::<f32>::load_weights(ctx, config, &loader)
+            .expect("Failed to build tiny GPTQ model")
+    }
+
+    #[test]
+    fn test_linear_gptq() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 32;
+        let n = 8;
+        let group_size = 32;
+
+        // Constant weight = 1.0 → output[i] ≈ sum of input row
+        let w_data = vec![1.0_f32; n * k];
+        let (qw, sc, qz) = pack_gptq_test(&w_data, n, k, group_size);
+
+        let weight = LinearWeight::Quantized(
+            QuantizedTensor::from_gptq_raw(
+                &ctx,
+                &[n, k],
+                DType::GPTQ_INT4,
+                &qw,
+                &sc,
+                &qz,
+                group_size,
+            )
+            .unwrap(),
+        );
+
+        // Input: row of 1.0s → expected output ≈ 32.0 per output
+        let input_data = vec![1.0_f32; k];
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+
+        let output = linear(&input, &weight).unwrap();
+        assert_eq!(output.shape(), &[1, n]);
+
+        let result = output.to_vec().unwrap();
+        let expected = 32.0_f32;
+        for (i, &v) in result.iter().enumerate() {
+            assert!(
+                (v - expected).abs() < expected * 0.15,
+                "GPTQ linear [{i}]: {v} vs expected ~{expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_gptq_output_shape() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+
+        let input_ids: Vec<u32> = vec![1, 5, 10];
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+
+        assert_eq!(logits.shape(), &[3, 64]);
+    }
+
+    #[test]
+    fn test_forward_gptq_single_token() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+
+        let logits = model.forward(&[0]).expect("Forward pass failed");
+        assert_eq!(logits.shape(), &[1, 64]);
+
+        let data = logits.to_vec().unwrap();
+        assert!(
+            data.iter().all(|x| x.is_finite()),
+            "Logits contain non-finite values"
+        );
+    }
+
+    #[test]
+    fn test_forward_gptq_deterministic() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+
+        let input_ids: Vec<u32> = vec![1, 5, 10];
+        let logits1 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+        let logits2 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+
+        for (i, (a, b)) in logits1.iter().zip(logits2.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "GPTQ non-deterministic at index {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_gptq_respects_max_tokens() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+        let mut engine = infernum_runtime::Engine::new(model).expect("Failed to build engine");
+
+        let prompt = vec![1_u32, 5, 10];
+        let max_new = 4;
+        let options = infernum::GenerateOptions {
+            max_new_tokens: max_new,
+            use_kv_cache: false,
+            ..Default::default()
+        };
+        let tokens = engine.generate(&prompt, &options).unwrap();
+
+        assert!(tokens.len() <= prompt.len() + max_new);
+        assert!(
+            tokens.len() > prompt.len(),
+            "Should generate at least 1 token"
+        );
+        assert_eq!(&tokens[..prompt.len()], &prompt);
+    }
+
     #[test]
     fn test_forward_output_shape() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
@@ -2030,7 +2498,7 @@ mod tests {
 
     fn build_tiny_engine(ctx: &CudaContext) -> infernum_runtime::Engine<LlamaModel<f32>> {
         let model = build_tiny_model(ctx);
-        infernum_runtime::Engine::new(ctx, model).expect("Failed to build engine")
+        infernum_runtime::Engine::new(model).expect("Failed to build engine")
     }
 
     #[test]
@@ -2208,6 +2676,192 @@ mod tests {
             tokens_naive, tokens_kv,
             "KV-cache generate should match naive generate"
         );
+    }
+
+    /// Slice columns from a 2D row-major byte buffer (test helper).
+    fn slice_columns(
+        data: &[u8],
+        rows: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+        elem_bytes: usize,
+    ) -> Vec<u8> {
+        let row_bytes = total_cols * elem_bytes;
+        let col_start_bytes = col_start * elem_bytes;
+        let col_count_bytes = col_count * elem_bytes;
+        let mut result = Vec::with_capacity(rows * col_count_bytes);
+        for r in 0..rows {
+            let off = r * row_bytes + col_start_bytes;
+            result.extend_from_slice(&data[off..off + col_count_bytes]);
+        }
+        result
+    }
+
+    /// Slice contiguous rows from a 2D row-major byte buffer (test helper).
+    fn slice_rows(
+        data: &[u8],
+        cols: usize,
+        row_start: usize,
+        row_count: usize,
+        elem_bytes: usize,
+    ) -> Vec<u8> {
+        let row_bytes = cols * elem_bytes;
+        let start = row_start * row_bytes;
+        data[start..start + row_count * row_bytes].to_vec()
+    }
+
+    #[test]
+    fn test_linear_gptq_column_shard() {
+        // Column-parallel: split output dimension N into 2 shards, verify
+        // that concatenating shard outputs matches the full output.
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 32;
+        let n = 16; // must be divisible by 8 * world_size
+        let group_size = 32;
+        let world_size = 2;
+
+        let w_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01) - 0.5).collect();
+        let (qw, sc, qz) = pack_gptq_test(&w_data, n, k, group_size);
+
+        // Full (non-sharded) output
+        let full_weight = LinearWeight::Quantized(
+            QuantizedTensor::from_gptq_raw(
+                &ctx,
+                &[n, k],
+                DType::GPTQ_INT4,
+                &qw,
+                &sc,
+                &qz,
+                group_size,
+            )
+            .unwrap(),
+        );
+        let input_data: Vec<f32> = (0..k).map(|i| i as f32 * 0.1).collect();
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+        let full_output = linear(&input, &full_weight).unwrap().to_vec().unwrap();
+
+        // Column-sharded: split qweight, scales, qzeros along N
+        let mut shard_outputs = Vec::new();
+        for rank in 0..world_size {
+            let n_shard = n / world_size;
+            let n_start = rank * n_shard;
+
+            // qweight [K/8, N] int32 → slice columns
+            let qw_s = slice_columns(&qw, k / 8, n, n_start, n_shard, 4);
+            // scales [num_groups, N] f16 → slice columns
+            let sc_s = slice_columns(&sc, k / group_size, n, n_start, n_shard, 2);
+            // qzeros [num_groups, N/8] int32 → slice columns
+            let qz_s = slice_columns(&qz, k / group_size, n / 8, n_start / 8, n_shard / 8, 4);
+
+            let shard_weight = LinearWeight::Quantized(
+                QuantizedTensor::from_gptq_raw(
+                    &ctx,
+                    &[n_shard, k],
+                    DType::GPTQ_INT4,
+                    &qw_s,
+                    &sc_s,
+                    &qz_s,
+                    group_size,
+                )
+                .unwrap(),
+            );
+            let shard_out = linear(&input, &shard_weight).unwrap().to_vec().unwrap();
+            assert_eq!(shard_out.len(), n_shard);
+            shard_outputs.extend(shard_out);
+        }
+
+        // Concatenated shard outputs should match full output
+        assert_eq!(shard_outputs.len(), full_output.len());
+        for (i, (a, b)) in full_output.iter().zip(shard_outputs.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "Column shard mismatch at {i}: full={a} vs sharded={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_linear_gptq_row_shard() {
+        // Row-parallel: split input dimension K into 2 shards, verify
+        // that summing shard partial outputs matches the full output.
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 64; // must be divisible by group_size * world_size
+        let n = 8;
+        let group_size = 32;
+        let world_size = 2;
+
+        let w_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01) - 0.5).collect();
+        let (qw, sc, qz) = pack_gptq_test(&w_data, n, k, group_size);
+
+        // Full (non-sharded) output
+        let full_weight = LinearWeight::Quantized(
+            QuantizedTensor::from_gptq_raw(
+                &ctx,
+                &[n, k],
+                DType::GPTQ_INT4,
+                &qw,
+                &sc,
+                &qz,
+                group_size,
+            )
+            .unwrap(),
+        );
+        let input_data: Vec<f32> = (0..k).map(|i| i as f32 * 0.1).collect();
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+        let full_output = linear(&input, &full_weight).unwrap().to_vec().unwrap();
+
+        // Row-sharded: split qweight, scales, qzeros along K
+        let mut summed = vec![0.0_f32; n];
+        for rank in 0..world_size {
+            let k_shard = k / world_size;
+            let k_start = rank * k_shard;
+
+            // qweight [K/8, N] int32 → slice rows
+            let qw_s = slice_rows(&qw, n, k_start / 8, k_shard / 8, 4);
+            // scales [num_groups, N] f16 → slice rows
+            let g_start = k_start / group_size;
+            let g_shard = k_shard / group_size;
+            let sc_s = slice_rows(&sc, n, g_start, g_shard, 2);
+            // qzeros [num_groups, N/8] int32 → slice rows
+            let qz_s = slice_rows(&qz, n / 8, g_start, g_shard, 4);
+
+            let shard_weight = LinearWeight::Quantized(
+                QuantizedTensor::from_gptq_raw(
+                    &ctx,
+                    &[n, k_shard],
+                    DType::GPTQ_INT4,
+                    &qw_s,
+                    &sc_s,
+                    &qz_s,
+                    group_size,
+                )
+                .unwrap(),
+            );
+
+            // Input shard: columns [k_start..k_start+k_shard]
+            let input_shard_data: Vec<f32> = input_data[k_start..k_start + k_shard].to_vec();
+            let input_shard =
+                CudaTensor::from_slice(&ctx, &[1, k_shard], &input_shard_data).unwrap();
+            let shard_out = linear(&input_shard, &shard_weight)
+                .unwrap()
+                .to_vec()
+                .unwrap();
+
+            for (j, v) in shard_out.iter().enumerate() {
+                summed[j] += v;
+            }
+        }
+
+        // Summed shard outputs should match full output
+        for (i, (a, b)) in full_output.iter().zip(summed.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 0.5,
+                "Row shard mismatch at {i}: full={a} vs summed={b}"
+            );
+        }
     }
 
     #[test]

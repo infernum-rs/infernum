@@ -13,7 +13,9 @@
 use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::cuda::CudaContext;
-use crate::dtype::{DType, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE};
+use crate::dtype::{
+    DType, GPTQ_GROUP_SIZE, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE,
+};
 use crate::Result;
 
 /// A tensor stored in a quantized format on the GPU.
@@ -28,15 +30,25 @@ use crate::Result;
 /// For FP8 (F8E4M3):
 /// - `data` holds the raw fp8 bytes (one per element)
 /// - `scales` is empty (no block structure)
+///
+/// For group-quantized formats (`GPTQ_INT4`, `AWQ_INT4`):
+/// - `data` holds packed int4 weights (8 values per int32)
+/// - `scales` holds f16 per-group scale factors
+/// - `qzeros` holds packed int4 zero-points (8 values per int32)
+/// - `group_size` is the number of elements per quantization group (typically 128)
 pub struct QuantizedTensor {
     /// Raw quantized data on the GPU
     data: CudaSlice<u8>,
-    /// Per-block scale factors (f16, stored as raw bytes; empty for FP8)
+    /// Per-block/per-group scale factors (f16, stored as raw bytes; empty for FP8)
     scales: CudaSlice<u8>,
+    /// Per-group zero-points (packed int32, stored as raw bytes; only for GPTQ/AWQ)
+    qzeros: Option<CudaSlice<u8>>,
     /// Logical shape of the tensor (number of elements per dimension)
     shape: Vec<usize>,
     /// Quantization format
     dtype: DType,
+    /// Number of elements per quantization group (only for GPTQ/AWQ)
+    group_size: Option<usize>,
     /// Per-tensor scale factor (used by FP8 dynamic quantization; 1.0 for block-quantized)
     weight_scale: f32,
     /// Cached device-side weight scale (lazily allocated, avoids per-matmul host→device copies)
@@ -103,14 +115,18 @@ impl QuantizedTensor {
         Ok(Self {
             data: gpu_data,
             scales: gpu_scales,
+            qzeros: None,
             shape: shape.to_vec(),
             dtype,
+            group_size: None,
             weight_scale: 1.0,
             d_weight_scale: None,
         })
     }
 
     /// Create a quantized tensor from pre-allocated GPU slices.
+    ///
+    /// For GPTQ/AWQ formats, use [`from_gptq_raw`](Self::from_gptq_raw) instead.
     ///
     /// # Panics
     /// Panics if `dtype` is not a quantized format.
@@ -128,8 +144,10 @@ impl QuantizedTensor {
         Self {
             data,
             scales,
+            qzeros: None,
             shape: shape.to_vec(),
             dtype,
+            group_size: None,
             weight_scale: 1.0,
             d_weight_scale: None,
         }
@@ -215,6 +233,81 @@ impl QuantizedTensor {
         &self.scales
     }
 
+    /// Raw device pointer to zero-points (GPTQ/AWQ only)
+    ///
+    /// # Panics
+    /// Panics if this tensor does not have zero-points (i.e., is not GPTQ/AWQ).
+    #[must_use]
+    pub fn qzeros_ptr(&self) -> *const u8 {
+        *self
+            .qzeros
+            .as_ref()
+            .expect("qzeros_ptr() only valid for GPTQ/AWQ tensors")
+            .device_ptr() as *const u8
+    }
+
+    /// Reference to the underlying zero-points slice (GPTQ/AWQ only)
+    #[must_use]
+    pub fn qzeros_slice(&self) -> Option<&CudaSlice<u8>> {
+        self.qzeros.as_ref()
+    }
+
+    /// Quantization group size (GPTQ/AWQ only)
+    #[must_use]
+    pub fn group_size(&self) -> Option<usize> {
+        self.group_size
+    }
+
+    /// Create a GPTQ/AWQ quantized tensor from raw host data.
+    ///
+    /// # Arguments
+    /// * `ctx` — CUDA context
+    /// * `shape` — logical weight shape `[in_features, out_features]` (the unpacked dimensions)
+    /// * `dtype` — `GPTQ_INT4` or `AWQ_INT4`
+    /// * `qweight` — packed int4 weights as raw bytes (int32 layout)
+    /// * `scales` — per-group f16 scale factors as raw bytes
+    /// * `qzeros` — packed int4 zero-points as raw bytes (int32 layout)
+    /// * `group_size` — number of elements per quantization group
+    ///
+    /// # Errors
+    /// Returns an error if GPU memory allocation or copy fails.
+    ///
+    /// # Panics
+    /// Panics if `dtype` is not a group-quantized format.
+    pub fn from_gptq_raw(
+        ctx: &CudaContext,
+        shape: &[usize],
+        dtype: DType,
+        qweight: &[u8],
+        scales: &[u8],
+        qzeros: &[u8],
+        group_size: usize,
+    ) -> Result<Self> {
+        assert!(
+            dtype.is_group_quantized(),
+            "from_gptq_raw requires GPTQ_INT4 or AWQ_INT4, got {dtype}"
+        );
+        assert!(
+            group_size > 0,
+            "group_size must be positive, got {group_size}"
+        );
+
+        let gpu_data = ctx.device().htod_sync_copy(qweight)?;
+        let gpu_scales = ctx.device().htod_sync_copy(scales)?;
+        let gpu_qzeros = ctx.device().htod_sync_copy(qzeros)?;
+
+        Ok(Self {
+            data: gpu_data,
+            scales: gpu_scales,
+            qzeros: Some(gpu_qzeros),
+            shape: shape.to_vec(),
+            dtype,
+            group_size: Some(group_size),
+            weight_scale: 1.0,
+            d_weight_scale: None,
+        })
+    }
+
     /// Validate that the data byte count matches what we expect for the dtype
     fn validate_data_size(numel: usize, dtype: DType, data: &[u8]) {
         let expected = match dtype {
@@ -249,6 +342,19 @@ impl QuantizedTensor {
                 num_blocks * Q6_K_BLOCK_SIZE_BYTES // packed super-blocks
             }
             DType::F8E4M3 => numel, // 1 byte per element, no scales
+            DType::GPTQ_INT4 | DType::AWQ_INT4 => {
+                let gs = self.group_size.unwrap_or(GPTQ_GROUP_SIZE);
+                let in_features = self.shape[0];
+                let out_features = self.shape[1];
+                let num_groups = in_features / gs;
+                // qweight: packed int4 → numel / 2 bytes (stored as int32)
+                let qweight_bytes = numel / 2;
+                // scales: f16 per group per out_feature
+                let scales_bytes = num_groups * out_features * 2;
+                // qzeros: packed int4 zero-points per group
+                let qzeros_bytes = num_groups * out_features / 2;
+                qweight_bytes + scales_bytes + qzeros_bytes
+            }
             _ => unreachable!(),
         }
     }
@@ -346,5 +452,85 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         // 33 elements is not divisible by 32
         let _ = QuantizedTensor::from_raw(&ctx, &[33], DType::Q8_0, &[0u8; 33], &[0u8; 2]);
+    }
+
+    #[test]
+    fn test_quantized_tensor_gptq_creation() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let in_features = 256;
+        let out_features = 128;
+        let group_size = 128;
+        let num_groups = in_features / group_size;
+
+        // qweight: [in_features/8, out_features] as int32 → (256/8)*128*4 bytes
+        let qweight = vec![0u8; (in_features / 8) * out_features * 4];
+        // scales: [num_groups, out_features] as f16 → 2*128*2 bytes
+        let scales = vec![0u8; num_groups * out_features * 2];
+        // qzeros: [num_groups, out_features/8] as int32 → 2*(128/8)*4 bytes
+        let qzeros = vec![0u8; num_groups * (out_features / 8) * 4];
+
+        let qt = QuantizedTensor::from_gptq_raw(
+            &ctx,
+            &[in_features, out_features],
+            DType::GPTQ_INT4,
+            &qweight,
+            &scales,
+            &qzeros,
+            group_size,
+        )
+        .expect("Failed to create GPTQ tensor");
+
+        assert_eq!(qt.shape(), &[in_features, out_features]);
+        assert_eq!(qt.dtype(), DType::GPTQ_INT4);
+        assert_eq!(qt.numel(), in_features * out_features);
+        assert_eq!(qt.group_size(), Some(group_size));
+        assert!(qt.qzeros_slice().is_some());
+    }
+
+    #[test]
+    fn test_quantized_tensor_awq_creation() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let in_features = 256;
+        let out_features = 128;
+        let group_size = 128;
+        let num_groups = in_features / group_size;
+
+        let qweight = vec![0u8; in_features * (out_features / 8) * 4];
+        let scales = vec![0u8; num_groups * out_features * 2];
+        let qzeros = vec![0u8; num_groups * (out_features / 8) * 4];
+
+        let qt = QuantizedTensor::from_gptq_raw(
+            &ctx,
+            &[in_features, out_features],
+            DType::AWQ_INT4,
+            &qweight,
+            &scales,
+            &qzeros,
+            group_size,
+        )
+        .expect("Failed to create AWQ tensor");
+
+        assert_eq!(qt.dtype(), DType::AWQ_INT4);
+        assert_eq!(qt.group_size(), Some(group_size));
+    }
+
+    #[test]
+    #[should_panic(expected = "GPTQ_INT4 or AWQ_INT4")]
+    fn test_gptq_raw_rejects_non_group_quantized() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let _ = QuantizedTensor::from_gptq_raw(&ctx, &[32, 32], DType::Q8_0, &[], &[], &[], 128);
+    }
+
+    #[test]
+    fn test_quantized_tensor_non_gptq_has_no_qzeros() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let qt =
+            QuantizedTensor::from_raw(&ctx, &[8, 8], DType::F8E4M3, &vec![0u8; 64], &[]).unwrap();
+
+        assert!(qt.qzeros_slice().is_none());
+        assert_eq!(qt.group_size(), None);
     }
 }

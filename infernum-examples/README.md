@@ -55,6 +55,31 @@ cargo run --release --example bench --features cuda -- /path/to/model
 cargo run --release --example bench --features cuda -- /path/to/model 256
 ```
 
+### `generate_parallel` — Multi-GPU text generation
+
+Loads a SafeTensors model across multiple GPUs using tensor parallelism (NCCL)
+and generates text. Supports both full-precision and GPTQ/AWQ quantized models.
+
+```bash
+cargo run --release --example generate_parallel --features nccl -- \
+  -m /path/to/model --gpus 4 "Hello"
+
+# Greedy decoding
+cargo run --release --example generate_parallel --features nccl -- \
+  -m /path/to/model --gpus 2 --greedy "The capital of France is"
+```
+
+### `verify_parallel` — Multi-GPU correctness check
+
+Loads the same model on 1 GPU and on N GPUs (tensor-parallel), runs greedy
+decoding with the same prompt, and verifies that the generated tokens match
+exactly. Useful for validating that sharded inference produces identical results.
+
+```bash
+cargo run --release --example verify_parallel --features nccl -- \
+  -m /path/to/model --gpus 2
+```
+
 ## Benchmarking against llama.cpp
 
 To compare infernum performance against llama.cpp:

@@ -85,7 +85,7 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
     let model = LlamaModel::<f32>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
-    let mut runtime = Runtime::new(&ctx, model, tokenizer).expect("Failed to create runtime");
+    let mut runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
     runtime
         .generate(prompt, &greedy_options(max_tokens))
         .expect("Generation failed")
@@ -183,3 +183,46 @@ mod llama_fp8 {
 
 // TODO: Add GGUF integration test once we pick an ungated GGUF model.
 // Will test LlamaModel::from_gguf() and GgufTokenizer.
+
+// ─── GPTQ INT4 ───────────────────────────────────────────────────────────────
+
+/// Llama-3.2-1B GPTQ INT4 (ungated, ~985MB, group_size=128, sym=true)
+mod llama_gptq {
+    use super::*;
+
+    const REPO: &str = "shuyuej/Llama-3.2-1B-GPTQ";
+
+    fn model_dir() -> PathBuf {
+        download_model(REPO)
+    }
+
+    #[test]
+    fn capital_of_france() {
+        let output = generate_greedy(&model_dir(), "The capital of France is", 30);
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn no_nan_in_output() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+        let input_ids = tokenizer.encode("Hello world", true).unwrap();
+
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits_vec = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+}

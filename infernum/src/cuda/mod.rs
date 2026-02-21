@@ -10,6 +10,8 @@ pub mod ops;
 mod quantized;
 pub mod seq_position;
 pub mod shard;
+#[cfg(feature = "nccl")]
+mod sharded;
 mod tensor;
 
 pub use buffer_pool::{BufferPool, PooledSlice};
@@ -23,6 +25,8 @@ pub use nccl::NcclCommunicator;
 pub use quantized::QuantizedTensor;
 pub use seq_position::SeqPosition;
 pub use shard::{GpuConfig, ShardConfig, ShardStrategy};
+#[cfg(feature = "nccl")]
+pub use sharded::ShardedModel;
 pub use tensor::CudaTensor;
 
 // Re-export cudarc types/traits needed by downstream generic model code
