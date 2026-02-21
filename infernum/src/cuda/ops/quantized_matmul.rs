@@ -335,6 +335,9 @@ fn quantized_gemv(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor<f32>> {
+    // Multi-warp GEMV: NWARPS warps per output row, K-split across all threads
+    const NWARPS: u32 = 4;
+
     let ctx = input.context();
     let device = ctx.device();
 
@@ -345,8 +348,6 @@ fn quantized_gemv(
 
     let module_name = "quantized_matmul";
 
-    // Multi-warp GEMV: NWARPS warps per output row, K-split across all threads
-    const NWARPS: u32 = 4;
     let cfg = LaunchConfig {
         grid_dim: (n as u32, 1, 1),
         block_dim: (32, NWARPS, 1),

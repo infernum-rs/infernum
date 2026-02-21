@@ -167,6 +167,7 @@ pub struct PooledSlice<T: DeviceRepr> {
 
 impl<T: DeviceRepr> PooledSlice<T> {
     /// Wrap a `CudaSlice` without pool backing (will free normally on drop).
+    #[must_use]
     pub fn unpooled(slice: CudaSlice<T>) -> Self {
         Self {
             slice: Some(slice),
@@ -176,6 +177,7 @@ impl<T: DeviceRepr> PooledSlice<T> {
     }
 
     /// Wrap a `CudaSlice` with pool backing (will return to pool on drop).
+    #[must_use]
     pub fn pooled(slice: CudaSlice<T>, pool: BufferPool, byte_size: usize) -> Self {
         Self {
             slice: Some(slice),
