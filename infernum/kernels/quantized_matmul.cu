@@ -391,15 +391,15 @@ extern "C" __global__ void quantize_f32_to_q8_1(
 }
 
 // -----------------------------------------------------------------------
-// dp4a GEMV kernels: warp-parallel K-splitting with dp4a
+// dp4a GEMV kernels: multi-warp K-splitting with dp4a
 // -----------------------------------------------------------------------
-// One warp (32 threads) per output row. Each thread processes a subset of
-// the K-dimension quant blocks, then a warp shuffle reduction sums the
-// partial f32 accumulators. This parallelizes the K-loop 32-way.
+// NWARPS warps (blockDim.y) per output row. Each warp's 32 lanes split K,
+// then intra-warp shuffle + inter-warp shared-memory reduction.
 //
-// Launch config: grid = (N, 1, 1), block = (32, 1, 1), shared_mem = 0.
+// Launch config: grid = (N, 1, 1), block = (32, NWARPS, 1),
+//                shared_mem = NWARPS * sizeof(float) bytes.
 
-// Q8_0 × Q8_1 dp4a GEMV (warp-parallel, vectorized loads)
+// Q8_0 × Q8_1 dp4a GEMV (multi-warp, vectorized loads)
 extern "C" __global__ void gemv_q8_q8_dp4a(
     float*              __restrict__ output,
     const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
@@ -412,12 +412,15 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
     const int n = blockIdx.x;
     if (n >= N) return;
 
-    const int tid = threadIdx.x;           // lane within warp [0..31]
+    const int lane = threadIdx.x;          // lane within warp [0..31]
+    const int warp_id = threadIdx.y;       // warp index [0..NWARPS-1]
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;   // flat thread id within block
+    const int nthreads = nwarps * 32;
     const int blocks_per_row = K / 32;
     float acc = 0.0f;
 
-    // Each thread handles blocks: tid, tid+32, tid+64, ...
-    for (int b = tid; b < blocks_per_row; b += 32) {
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
         float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
         float d_a = act_scales[b];
 
@@ -441,18 +444,36 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
         acc += d_w * d_a * (float)sumi;
     }
 
-    // Warp reduction
+    // Intra-warp reduction
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
     }
 
-    if (tid == 0) {
-        output[n] = acc;
+    // Inter-warp reduction via shared memory
+    if (nwarps > 1) {
+        extern __shared__ float smem[];  // [nwarps] floats
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        // Warp 0 reduces across all warps
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            output[n] = sum;
+        }
+    } else {
+        if (lane == 0) {
+            output[n] = acc;
+        }
     }
 }
 
-// Q4_0 × Q8_1 dp4a GEMV (warp-parallel, with zero-point correction)
+// Q4_0 × Q8_1 dp4a GEMV (multi-warp, with zero-point correction)
 extern "C" __global__ void gemv_q4_q8_dp4a(
     float*              __restrict__ output,
     const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
@@ -466,11 +487,15 @@ extern "C" __global__ void gemv_q4_q8_dp4a(
     const int n = blockIdx.x;
     if (n >= N) return;
 
-    const int tid = threadIdx.x;
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
     const int blocks_per_row = K / 32;
     float acc = 0.0f;
 
-    for (int b = tid; b < blocks_per_row; b += 32) {
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
         float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
         float d_a = act_scales[b];
         float s_a = act_sums[b];
@@ -501,13 +526,30 @@ extern "C" __global__ void gemv_q4_q8_dp4a(
         acc += d_w * (d_a * (float)sumi - 8.0f * s_a);
     }
 
-    // Warp reduction
+    // Intra-warp reduction
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
     }
 
-    if (tid == 0) {
-        output[n] = acc;
+    // Inter-warp reduction via shared memory
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            output[n] = sum;
+        }
+    } else {
+        if (lane == 0) {
+            output[n] = acc;
+        }
     }
 }

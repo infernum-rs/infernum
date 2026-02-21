@@ -345,11 +345,12 @@ fn quantized_gemv(
 
     let module_name = "quantized_matmul";
 
-    // One warp (32 threads) per output row, K-split across lanes
+    // Multi-warp GEMV: NWARPS warps per output row, K-split across all threads
+    const NWARPS: u32 = 4;
     let cfg = LaunchConfig {
         grid_dim: (n as u32, 1, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
+        block_dim: (32, NWARPS, 1),
+        shared_mem_bytes: NWARPS * 4, // NWARPS × sizeof(f32) for inter-warp reduction
     };
 
     match weight.dtype() {
