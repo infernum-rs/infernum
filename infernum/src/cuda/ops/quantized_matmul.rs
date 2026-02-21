@@ -2002,14 +2002,15 @@ mod tests {
         }
 
         // Pack qzeros: [num_groups, out_features/8] as int32
-        // All zero-points are `zero_point` (=8)
+        // AutoGPTQ convention: stored = actual_zero_point - 1
+        let stored_zp = (zero_point - 1) as u32;
         let qzeros_cols = out_features / 8;
         let mut qzeros = vec![0_u8; num_groups * qzeros_cols * 4];
         for g in 0..num_groups {
             for col in 0..qzeros_cols {
                 let mut packed: u32 = 0;
                 for j in 0..8 {
-                    packed |= (zero_point as u32 & 0xF) << (j * 4);
+                    packed |= (stored_zp & 0xF) << (j * 4);
                 }
                 let idx = (g * qzeros_cols + col) * 4;
                 qzeros[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
@@ -2055,7 +2056,8 @@ mod tests {
                         qzeros[qz_idx + 3],
                     ]);
                     let qz_shift = (col % 8) * 4;
-                    let qzero = ((qz_packed >> qz_shift) & 0xF) as i32;
+                    // AutoGPTQ stores qzeros with -1 offset: actual = stored + 1
+                    let qzero = (((qz_packed >> qz_shift) & 0xF) + 1) as i32;
 
                     // Read packed qweight
                     let qw_idx = (pr * n + col) * 4;
@@ -2251,12 +2253,14 @@ mod tests {
         }
 
         // Pack qzeros: [num_groups, out_features/8] as int32
+        // AutoAWQ convention: stored = actual_zero_point - 1
+        let stored_zp = (zero_point - 1) as u32;
         let mut qzeros = vec![0_u8; num_groups * packed_cols * 4];
         for g in 0..num_groups {
             for col in 0..packed_cols {
                 let mut packed: u32 = 0;
                 for j in 0..8 {
-                    packed |= (zero_point as u32 & 0xF) << (j * 4);
+                    packed |= (stored_zp & 0xF) << (j * 4);
                 }
                 let idx = (g * packed_cols + col) * 4;
                 qzeros[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
@@ -2302,7 +2306,8 @@ mod tests {
                         qzeros[qz_idx + 2],
                         qzeros[qz_idx + 3],
                     ]);
-                    let qzero = ((qz_packed >> n_shift) & 0xF) as i32;
+                    // AutoAWQ stores qzeros with -1 offset: actual = stored + 1
+                    let qzero = (((qz_packed >> n_shift) & 0xF) + 1) as i32;
 
                     // Quantized weight
                     let qw_idx = (kk * packed_cols + n_col) * 4;

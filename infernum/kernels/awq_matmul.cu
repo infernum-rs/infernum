@@ -11,7 +11,8 @@
 //   qzeros:   [num_groups, out_features/8] as int32
 //             Packed INT4 zero-points, same packing as qweight columns
 //
-// Dequantization: w = (qweight_val - qzero_val) * scale
+// Dequantization: w = (qweight_val - (stored_qzero + 1)) * scale
+// AutoAWQ stores qzeros with a -1 offset: stored = actual_zero_point - 1
 
 // Manual f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC)
 __device__ float f16_to_f32(unsigned short bits) {
@@ -63,8 +64,9 @@ extern "C" __global__ void matmul_awq_f32(
         float scale = f16_to_f32(scales[group_idx * N + n]);
 
         // Get zero-point for this group and output channel
+        // AutoAWQ stores qzeros with -1 offset: actual = stored + 1
         int qz_packed = qzeros[group_idx * packed_cols + n_col];
-        int qzero = (qz_packed >> n_shift) & 0xF;
+        int qzero = ((qz_packed >> n_shift) & 0xF) + 1;
 
         // Get quantized weight for this (k, n)
         int qw_packed = qweight[k * packed_cols + n_col];

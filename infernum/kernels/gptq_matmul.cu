@@ -10,7 +10,8 @@
 //   qzeros:   [num_groups, out_features/8] as int32
 //             Packed INT4 zero-points, same packing as qweight
 //
-// Dequantization: w = (qweight_val - qzero_val) * scale
+// Dequantization: w = (qweight_val - (stored_qzero + 1)) * scale
+// AutoGPTQ stores qzeros with a -1 offset: stored = actual_zero_point - 1
 
 // Manual f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC)
 __device__ float f16_to_f32(unsigned short bits) {
@@ -67,9 +68,10 @@ extern "C" __global__ void matmul_gptq_f32(
         float scale = f16_to_f32(scales[group_idx * N + n]);
 
         // Get zero-point for this group
+        // AutoGPTQ stores qzeros with a -1 offset: stored = actual - 1
         int qz_packed = qzeros[group_idx * (N / 8) + n / 8];
         int qz_shift = (n % 8) * 4;
-        int qzero = (qz_packed >> qz_shift) & 0xF;
+        int qzero = ((qz_packed >> qz_shift) & 0xF) + 1;
 
         // Unpack and dequantize 8 INT4 values
         for (int j = 0; j < 8; ++j) {
