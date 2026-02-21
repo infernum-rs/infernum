@@ -396,6 +396,55 @@ impl QuantizedTensor {
         })
     }
 
+    /// Quantize `f32` data to `Q8_0` and create a [`QuantizedTensor`] on the GPU.
+    ///
+    /// Each block of [`QUANTIZATION_BLOCK_SIZE`] elements is independently
+    /// quantized: `scale = max(|x|) / 127`, `q = round(x / scale)`.
+    ///
+    /// # Arguments
+    /// * `ctx` — CUDA context
+    /// * `shape` — logical element shape (e.g. `[vocab_size, hidden_dim]`)
+    /// * `data` — f32 values in row-major order
+    ///
+    /// # Errors
+    /// Returns an error if GPU memory allocation or copy fails.
+    ///
+    /// # Panics
+    /// Panics if `data.len()` does not match the product of `shape`, or if the
+    /// total number of elements is not divisible by [`QUANTIZATION_BLOCK_SIZE`].
+    pub fn from_f32_as_q8(ctx: &CudaContext, shape: &[usize], data: &[f32]) -> Result<Self> {
+        let numel: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            numel,
+            "from_f32_as_q8: data length ({}) must match shape product ({numel})",
+            data.len()
+        );
+        assert_eq!(
+            numel % QUANTIZATION_BLOCK_SIZE,
+            0,
+            "from_f32_as_q8: element count ({numel}) must be divisible by block size ({QUANTIZATION_BLOCK_SIZE})"
+        );
+
+        let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+        let mut q_data = Vec::with_capacity(numel);
+        let mut q_scales = Vec::with_capacity(num_blocks * 2);
+
+        for block in data.chunks(QUANTIZATION_BLOCK_SIZE) {
+            let max_abs = block.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+            let scale_f16 = half::f16::from_f32(scale);
+            q_scales.extend_from_slice(&scale_f16.to_le_bytes());
+
+            for &v in block {
+                let q = (v / scale).round().clamp(-128.0, 127.0) as i8;
+                q_data.push(q.cast_unsigned());
+            }
+        }
+
+        Self::from_raw(ctx, shape, DType::Q8_0, &q_data, &q_scales)
+    }
+
     /// Validate that the data byte count matches what we expect for the dtype
     fn validate_data_size(numel: usize, dtype: DType, data: &[u8]) {
         let expected = match dtype {
