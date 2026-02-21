@@ -172,7 +172,7 @@ impl SafeTensorsLoader {
         let scales_data = self.get_tensor_data(&scales_name)?;
         let qzeros_data = self.get_tensor_data(&qzeros_name)?;
 
-        // Derive logical shape: [in_features, out_features]
+        // Derive logical shape: [out_features, in_features] (N, K convention)
         let in_features = qweight_meta.shape[0] * 8; // unpacked from int32
         let out_features = qweight_meta.shape[1];
 
@@ -194,7 +194,7 @@ impl SafeTensorsLoader {
 
         QuantizedTensor::from_gptq_raw(
             ctx,
-            &[in_features, out_features],
+            &[out_features, in_features],
             DType::GPTQ_INT4,
             qweight_data,
             scales_data,
@@ -245,7 +245,7 @@ impl SafeTensorsLoader {
         let scales_data = self.get_tensor_data(&scales_name)?;
         let qzeros_data = self.get_tensor_data(&qzeros_name)?;
 
-        // Derive logical shape: [in_features, out_features]
+        // Derive logical shape: [out_features, in_features] (N, K convention)
         let in_features = qweight_meta.shape[0];
         let out_features = qweight_meta.shape[1] * 8; // unpacked from int32
 
@@ -267,7 +267,7 @@ impl SafeTensorsLoader {
 
         QuantizedTensor::from_gptq_raw(
             ctx,
-            &[in_features, out_features],
+            &[out_features, in_features],
             DType::AWQ_INT4,
             qweight_data,
             scales_data,

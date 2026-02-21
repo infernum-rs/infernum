@@ -75,7 +75,7 @@ pub struct LlamaConfig {
     #[serde(default = "default_bos_token_id")]
     pub bos_token_id: u32,
 
-    /// End of sequence token ID
+    /// End of sequence token ID (first value when the config specifies an array)
     #[serde(
         default = "default_eos_token_id",
         deserialize_with = "deserialize_single_or_first"
