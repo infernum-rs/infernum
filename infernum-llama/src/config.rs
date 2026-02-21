@@ -18,8 +18,13 @@ pub struct QuantizationConfig {
     #[serde(default = "default_quant_bits")]
     pub bits: u32,
 
-    /// Number of elements per quantization group (typically 128)
-    #[serde(default = "default_group_size")]
+    /// Number of elements per quantization group (typically 128).
+    /// A value of 0 means per-channel quantization (one group = full input dim),
+    /// resolved to `in_features` at load time. JSON value `-1` is deserialized as 0.
+    #[serde(
+        default = "default_group_size",
+        deserialize_with = "deserialize_group_size"
+    )]
     pub group_size: usize,
 }
 
@@ -29,6 +34,21 @@ fn default_quant_bits() -> u32 {
 
 fn default_group_size() -> usize {
     128
+}
+
+/// Deserialize `group_size`: -1 (per-channel) → 0 sentinel, positive values pass through.
+#[allow(clippy::cast_possible_truncation)]
+fn deserialize_group_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    if value <= 0 {
+        Ok(0)
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        Ok(value as usize)
+    }
 }
 
 /// Configuration for Llama models
@@ -432,6 +452,29 @@ mod tests {
         let qc = config.quantization_config.unwrap();
         assert_eq!(qc.bits, 4);
         assert_eq!(qc.group_size, 128);
+    }
+
+    #[test]
+    fn test_config_gptq_per_channel() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "quantization_config": {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": -1
+            }
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        let qc = config.quantization_config.unwrap();
+        assert_eq!(
+            qc.group_size, 0,
+            "group_size=-1 should deserialize as 0 (per-channel sentinel)"
+        );
     }
 
     #[test]

@@ -177,6 +177,13 @@ impl SafeTensorsLoader {
         let in_features = qweight_meta.shape[0] * 8; // unpacked from int32
         let out_features = qweight_meta.shape[1];
 
+        // Resolve per-channel sentinel: group_size=0 means one group = full input dim
+        let group_size = if group_size == 0 {
+            in_features
+        } else {
+            group_size
+        };
+
         // Validate scales shape
         let expected_num_groups = in_features / group_size;
         assert_eq!(
@@ -250,6 +257,13 @@ impl SafeTensorsLoader {
         let in_features = qweight_meta.shape[0];
         let out_features = qweight_meta.shape[1] * 8; // unpacked from int32
 
+        // Resolve per-channel sentinel: group_size=0 means one group = full input dim
+        let group_size = if group_size == 0 {
+            in_features
+        } else {
+            group_size
+        };
+
         // Validate scales shape
         let expected_num_groups = in_features / group_size;
         assert_eq!(
@@ -319,6 +333,13 @@ impl SafeTensorsLoader {
         // GPTQ packed layout: qweight [K/8, N] int32
         let in_features = qweight_meta.shape[0] * 8;
         let out_features = qweight_meta.shape[1];
+
+        // Resolve per-channel sentinel: group_size=0 means one group = full input dim
+        let group_size = if group_size == 0 {
+            in_features
+        } else {
+            group_size
+        };
         let num_groups = in_features / group_size;
 
         match strategy {
@@ -430,6 +451,13 @@ impl SafeTensorsLoader {
         // AWQ packed layout: qweight [K, N/8] int32
         let in_features = qweight_meta.shape[0];
         let out_features = qweight_meta.shape[1] * 8;
+
+        // Resolve per-channel sentinel: group_size=0 means one group = full input dim
+        let group_size = if group_size == 0 {
+            in_features
+        } else {
+            group_size
+        };
         let num_groups = in_features / group_size;
 
         match strategy {

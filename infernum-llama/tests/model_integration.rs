@@ -44,7 +44,7 @@ fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
     let body = response
         .into_body()
         .with_config()
-        .limit(2 * 1024 * 1024 * 1024) // 2 GB
+        .limit(5 * 1024 * 1024 * 1024) // 5 GB
         .read_to_vec()
         .unwrap_or_else(|e| panic!("Failed to read response body for {filename}: {e}"));
 
@@ -278,8 +278,9 @@ mod mixtral_moe_tiny {
 
 /// Mixtral-8x7B-Instruct-v0.1 (ungated, ~93GB bf16, 19 sharded SafeTensors)
 ///
-/// Validates generation quality with a real Mixtral model. Too large for CI —
-/// run manually with:
+/// Validates MoE generation quality with a real Mixtral model.
+/// Requires ~186GB VRAM (loaded as f32) — needs multi-GPU.
+/// Run manually with:
 ///   cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_8x7b
 mod mixtral_8x7b {
     use super::*;
@@ -317,7 +318,7 @@ mod mixtral_8x7b {
     }
 
     #[test]
-    #[ignore = "93GB model — run manually with --ignored"]
+    #[ignore = "93GB model, needs ~186GB VRAM — run manually with --ignored on multi-GPU"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(
@@ -327,7 +328,7 @@ mod mixtral_8x7b {
     }
 
     #[test]
-    #[ignore = "93GB model — run manually with --ignored"]
+    #[ignore = "93GB model, needs ~186GB VRAM — run manually with --ignored on multi-GPU"]
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
