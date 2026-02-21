@@ -1857,20 +1857,52 @@ mod tests {
     }
 
     /// Mock weight loader that stores pre-built tensors by name
+    /// Stored GPTQ data for a single linear layer
+    struct GptqLayerData {
+        shape: Vec<usize>,
+        qweight: Vec<u8>,
+        scales: Vec<u8>,
+        qzeros: Vec<u8>,
+        group_size: usize,
+    }
+
     struct MockWeightLoader {
         tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
+        gptq_weights: HashMap<String, GptqLayerData>,
     }
 
     impl MockWeightLoader {
         fn new() -> Self {
             Self {
                 tensors: HashMap::new(),
+                gptq_weights: HashMap::new(),
             }
         }
 
         fn add(&mut self, name: &str, shape: &[usize], data: Vec<f32>) {
             self.tensors
                 .insert(name.to_string(), (shape.to_vec(), data));
+        }
+
+        fn add_gptq(
+            &mut self,
+            prefix: &str,
+            shape: &[usize],
+            qweight: Vec<u8>,
+            scales: Vec<u8>,
+            qzeros: Vec<u8>,
+            group_size: usize,
+        ) {
+            self.gptq_weights.insert(
+                prefix.to_string(),
+                GptqLayerData {
+                    shape: shape.to_vec(),
+                    qweight,
+                    scales,
+                    qzeros,
+                    group_size,
+                },
+            );
         }
     }
 
@@ -1901,6 +1933,27 @@ mod tests {
             Err(infernum::Error::UnsupportedDtype(format!(
                 "MockWeightLoader: load_bf16 not supported (tensor: {name})"
             )))
+        }
+
+        fn load_gptq_linear(
+            &self,
+            ctx: &CudaContext,
+            prefix: &str,
+            _group_size: usize,
+        ) -> Result<QuantizedTensor> {
+            let data = self
+                .gptq_weights
+                .get(prefix)
+                .unwrap_or_else(|| panic!("MockWeightLoader: GPTQ prefix not found: {prefix}"));
+            QuantizedTensor::from_gptq_raw(
+                ctx,
+                &data.shape,
+                DType::GPTQ_INT4,
+                &data.qweight,
+                &data.scales,
+                &data.qzeros,
+                data.group_size,
+            )
         }
 
         fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
@@ -2024,6 +2077,312 @@ mod tests {
         let config = tiny_config();
         let loader = tiny_weight_loader(&config);
         LlamaModel::<f32>::load_weights(ctx, config, &loader).expect("Failed to build tiny model")
+    }
+
+    /// Pack f32 weights into GPTQ INT4 format on the host.
+    ///
+    /// - `weights`: `[out_features, in_features]` in row-major order
+    /// - Returns `(qweight, scales, qzeros)` as raw byte vectors
+    fn pack_gptq_test(
+        weights: &[f32],
+        out_features: usize,
+        in_features: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        assert_eq!(weights.len(), out_features * in_features);
+        assert_eq!(in_features % 8, 0);
+        assert_eq!(in_features % group_size, 0);
+        assert_eq!(out_features % 8, 0);
+
+        let num_groups = in_features / group_size;
+        let packed_rows = in_features / 8;
+        let zero_point = 8_i32;
+
+        let mut scales_f16 = vec![half::f16::from_f32(0.0); num_groups * out_features];
+        let mut quantized = vec![0_i32; out_features * in_features];
+
+        for n in 0..out_features {
+            for g in 0..num_groups {
+                let k_start = g * group_size;
+                let k_end = k_start + group_size;
+                let group_vals: Vec<f32> = (k_start..k_end)
+                    .map(|k| weights[n * in_features + k])
+                    .collect();
+                let max_abs = group_vals.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
+                scales_f16[g * out_features + n] = half::f16::from_f32(scale);
+
+                for (j, &v) in group_vals.iter().enumerate() {
+                    let q = ((v / scale).round() as i32 + zero_point).clamp(0, 15);
+                    quantized[n * in_features + k_start + j] = q;
+                }
+            }
+        }
+
+        // Pack qweight: [in_features/8, out_features] as int32
+        let mut qweight = vec![0_u8; packed_rows * out_features * 4];
+        for pr in 0..packed_rows {
+            for n in 0..out_features {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    let k = pr * 8 + j;
+                    let q = quantized[n * in_features + k] as u32;
+                    packed |= (q & 0xF) << (j * 4);
+                }
+                let idx = (pr * out_features + n) * 4;
+                qweight[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        // Pack scales: [num_groups, out_features] as f16
+        let mut scales_bytes = vec![0_u8; num_groups * out_features * 2];
+        for (i, &s) in scales_f16.iter().enumerate() {
+            let bytes = s.to_le_bytes();
+            scales_bytes[i * 2] = bytes[0];
+            scales_bytes[i * 2 + 1] = bytes[1];
+        }
+
+        // Pack qzeros: [num_groups, out_features/8] as int32
+        let qzeros_cols = out_features / 8;
+        let mut qzeros = vec![0_u8; num_groups * qzeros_cols * 4];
+        for g in 0..num_groups {
+            for col in 0..qzeros_cols {
+                let mut packed: u32 = 0;
+                for j in 0..8 {
+                    packed |= (zero_point as u32 & 0xF) << (j * 4);
+                }
+                let idx = (g * qzeros_cols + col) * 4;
+                qzeros[idx..idx + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        (qweight, scales_bytes, qzeros)
+    }
+
+    /// Build a tiny LlamaConfig with GPTQ quantization enabled.
+    /// Uses group_size=32 to keep dimensions small.
+    fn tiny_gptq_config() -> LlamaConfig {
+        LlamaConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            quantization_config: Some(crate::QuantizationConfig {
+                quant_method: "gptq".to_string(),
+                bits: 4,
+                group_size: 32,
+            }),
+        }
+    }
+
+    /// Generate pseudo-random weights and pack into GPTQ format, advancing the seed.
+    fn rand_gptq(
+        seed_offset: &mut usize,
+        out_f: usize,
+        in_f: usize,
+        group_size: usize,
+        scale: f32,
+    ) -> (Vec<usize>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        *seed_offset += 1;
+        let mut w = pseudo_random_weights(out_f * in_f, scale);
+        w.rotate_left(*seed_offset % (out_f * in_f).max(1));
+        let (qw, sc, qz) = pack_gptq_test(&w, out_f, in_f, group_size);
+        (vec![out_f, in_f], qw, sc, qz)
+    }
+
+    /// Generate pseudo-random f32 data, advancing the seed offset
+    fn rand_f32(seed_offset: &mut usize, n: usize, scale: f32) -> Vec<f32> {
+        *seed_offset += 1;
+        let mut vals = pseudo_random_weights(n, scale);
+        vals.rotate_left(*seed_offset % n.max(1));
+        vals
+    }
+
+    /// Build a MockWeightLoader with GPTQ-quantized linear layers
+    fn tiny_gptq_weight_loader(config: &LlamaConfig) -> MockWeightLoader {
+        let h = config.hidden_size;
+        let inter = config.intermediate_size;
+        let vocab = config.vocab_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads();
+        let head_dim = config.head_dim();
+        let group_size = config.quantization_config.as_ref().unwrap().group_size;
+        let scale = 0.02;
+
+        let mut loader = MockWeightLoader::new();
+        let mut seed_offset: usize = 0;
+
+        // Embeddings (always dense f32)
+        loader.add(
+            "model.embed_tokens.weight",
+            &[vocab, h],
+            rand_f32(&mut seed_offset, vocab * h, scale),
+        );
+
+        // Layer 0
+        let prefix = "model.layers.0";
+        loader.add(
+            &format!("{prefix}.input_layernorm.weight"),
+            &[h],
+            vec![1.0; h],
+        );
+
+        let gptq_layers: Vec<(&str, usize, usize)> = vec![
+            ("self_attn.q_proj", num_heads * head_dim, h),
+            ("self_attn.k_proj", num_kv_heads * head_dim, h),
+            ("self_attn.v_proj", num_kv_heads * head_dim, h),
+            ("self_attn.o_proj", h, num_heads * head_dim),
+            ("mlp.gate_proj", inter, h),
+            ("mlp.up_proj", inter, h),
+            ("mlp.down_proj", h, inter),
+        ];
+
+        for (name, out_f, in_f) in &gptq_layers {
+            let (shape, qw, sc, qz) = rand_gptq(&mut seed_offset, *out_f, *in_f, group_size, scale);
+            loader.add_gptq(&format!("{prefix}.{name}"), &shape, qw, sc, qz, group_size);
+        }
+
+        loader.add(
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &[h],
+            vec![1.0; h],
+        );
+
+        // Final norm
+        loader.add("model.norm.weight", &[h], vec![1.0; h]);
+
+        // lm_head (always dense, never quantized)
+        loader.add(
+            "lm_head.weight",
+            &[vocab, h],
+            rand_f32(&mut seed_offset, vocab * h, scale),
+        );
+
+        loader
+    }
+
+    fn build_tiny_gptq_model(ctx: &CudaContext) -> LlamaModel<f32> {
+        let config = tiny_gptq_config();
+        let loader = tiny_gptq_weight_loader(&config);
+        LlamaModel::<f32>::load_weights(ctx, config, &loader)
+            .expect("Failed to build tiny GPTQ model")
+    }
+
+    #[test]
+    fn test_linear_gptq() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 32;
+        let n = 8;
+        let group_size = 32;
+
+        // Constant weight = 1.0 → output[i] ≈ sum of input row
+        let w_data = vec![1.0_f32; n * k];
+        let (qw, sc, qz) = pack_gptq_test(&w_data, n, k, group_size);
+
+        let weight = LinearWeight::Quantized(
+            QuantizedTensor::from_gptq_raw(
+                &ctx,
+                &[n, k],
+                DType::GPTQ_INT4,
+                &qw,
+                &sc,
+                &qz,
+                group_size,
+            )
+            .unwrap(),
+        );
+
+        // Input: row of 1.0s → expected output ≈ 32.0 per output
+        let input_data = vec![1.0_f32; k];
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+
+        let output = linear(&input, &weight).unwrap();
+        assert_eq!(output.shape(), &[1, n]);
+
+        let result = output.to_vec().unwrap();
+        let expected = 32.0_f32;
+        for (i, &v) in result.iter().enumerate() {
+            assert!(
+                (v - expected).abs() < expected * 0.15,
+                "GPTQ linear [{i}]: {v} vs expected ~{expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_gptq_output_shape() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+
+        let input_ids: Vec<u32> = vec![1, 5, 10];
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+
+        assert_eq!(logits.shape(), &[3, 64]);
+    }
+
+    #[test]
+    fn test_forward_gptq_single_token() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+
+        let logits = model.forward(&[0]).expect("Forward pass failed");
+        assert_eq!(logits.shape(), &[1, 64]);
+
+        let data = logits.to_vec().unwrap();
+        assert!(
+            data.iter().all(|x| x.is_finite()),
+            "Logits contain non-finite values"
+        );
+    }
+
+    #[test]
+    fn test_forward_gptq_deterministic() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+
+        let input_ids: Vec<u32> = vec![1, 5, 10];
+        let logits1 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+        let logits2 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+
+        for (i, (a, b)) in logits1.iter().zip(logits2.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "GPTQ non-deterministic at index {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_gptq_respects_max_tokens() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model = build_tiny_gptq_model(&ctx);
+        let mut engine =
+            infernum_runtime::Engine::new(&ctx, model).expect("Failed to build engine");
+
+        let prompt = vec![1_u32, 5, 10];
+        let max_new = 4;
+        let options = infernum::GenerateOptions {
+            max_new_tokens: max_new,
+            use_kv_cache: false,
+            ..Default::default()
+        };
+        let tokens = engine.generate(&prompt, &options).unwrap();
+
+        assert!(tokens.len() <= prompt.len() + max_new);
+        assert!(
+            tokens.len() > prompt.len(),
+            "Should generate at least 1 token"
+        );
+        assert_eq!(&tokens[..prompt.len()], &prompt);
     }
 
     #[test]
