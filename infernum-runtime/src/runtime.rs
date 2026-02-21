@@ -5,7 +5,6 @@
 
 use std::io::{self, Write};
 
-use infernum::cuda::CudaContext;
 use infernum::{GenerateOptions, Model, Result, Tokenizer};
 
 use crate::Engine;
@@ -20,12 +19,12 @@ pub struct Runtime<M: Model, T: Tokenizer> {
 }
 
 impl<M: Model, T: Tokenizer> Runtime<M, T> {
-    /// Create a new runtime from a CUDA context, model, and tokenizer.
+    /// Create a new runtime from a model and tokenizer.
     ///
     /// # Errors
     /// Returns an error if KV cache allocation fails.
-    pub fn new(ctx: &CudaContext, model: M, tokenizer: T) -> Result<Self> {
-        let engine = Engine::new(ctx, model)?;
+    pub fn new(model: M, tokenizer: T) -> Result<Self> {
+        let engine = Engine::new(model)?;
         Ok(Self { engine, tokenizer })
     }
 

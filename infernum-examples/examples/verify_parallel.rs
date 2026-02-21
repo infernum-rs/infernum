@@ -8,7 +8,6 @@
 //!   cargo run --example verify_parallel --features nccl -- \
 //!     -m /path/to/llama --gpus 2
 
-use std::thread;
 use std::time::Instant;
 
 use clap::Parser;
@@ -16,9 +15,9 @@ use cudarc::driver::CudaDevice;
 
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::{GenerateOptions, GpuConfig, NcclCommunicator, Result, ShardConfig};
+use infernum::{GenerateOptions, Model as _, Result, ShardedModel};
 use infernum_llama::LlamaModel;
-use infernum_runtime::{ParallelRuntime, Runtime};
+use infernum_runtime::Runtime;
 
 /// Verify that multi-GPU TP produces identical output to single-GPU.
 #[derive(Parser)]
@@ -87,7 +86,7 @@ fn main() -> Result<()> {
         );
 
         let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-        let mut runtime = Runtime::new(&ctx, model, tokenizer)?;
+        let mut runtime = Runtime::new(model, tokenizer)?;
         let t0 = Instant::now();
         let output = runtime.generate(&cli.prompt, &options)?;
         let elapsed = t0.elapsed();
@@ -102,45 +101,19 @@ fn main() -> Result<()> {
     let parallel_output = {
         println!("\n=== {world_size} GPUs (tensor parallel) ===");
         let t0 = Instant::now();
-        let devices: Vec<_> = (0..world_size)
-            .map(|i| CudaDevice::new(i).expect("failed to create CUDA device"))
-            .collect();
-        let comms = NcclCommunicator::from_devices(devices)?;
-
-        let model_path = &cli.model;
-        let models: Vec<(CudaContext, LlamaModel<f32>)> = thread::scope(|s| {
-            let handles: Vec<_> = comms
-                .into_iter()
-                .enumerate()
-                .map(|(rank, comm)| {
-                    s.spawn(move || {
-                        let ctx = CudaContext::new(rank)?;
-                        let gpu_config = GpuConfig::Sharded(ShardConfig { rank, world_size });
-                        let model = LlamaModel::<f32>::from_pretrained_sharded(
-                            &ctx, model_path, gpu_config, comm,
-                        )?;
-                        Ok::<_, infernum::Error>((ctx, model))
-                    })
-                })
-                .collect();
-
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("GPU thread panicked"))
-                .collect::<Result<Vec<_>>>()
-        })?;
-
+        let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&cli.model, world_size)?;
+        let cfg = model.config();
         println!(
-            "Loaded in {:.2}s ({} layers, hidden={})",
+            "Loaded in {:.2}s ({} layers, head_dim={})",
             t0.elapsed().as_secs_f64(),
-            models[0].1.config().num_hidden_layers,
-            models[0].1.config().hidden_size,
+            cfg.num_layers,
+            cfg.head_dim,
         );
 
         let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-        let mut parallel_runtime = ParallelRuntime::new(models, tokenizer)?;
+        let mut runtime = Runtime::new(model, tokenizer)?;
         let t0 = Instant::now();
-        let output = parallel_runtime.generate(&cli.prompt, &options)?;
+        let output = runtime.generate(&cli.prompt, &options)?;
         let elapsed = t0.elapsed();
 
         println!("Output: {output}");

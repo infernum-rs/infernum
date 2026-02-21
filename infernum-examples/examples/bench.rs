@@ -41,13 +41,8 @@ struct Cli {
     graphs: bool,
 }
 
-fn bench_model<M: Model>(
-    model: M,
-    ctx: &CudaContext,
-    n_gen: usize,
-    use_cuda_graphs: bool,
-) -> infernum::Result<()> {
-    let mut engine = Engine::new(ctx, model)?;
+fn bench_model<M: Model>(model: M, n_gen: usize, use_cuda_graphs: bool) -> infernum::Result<()> {
+    let mut engine = Engine::new(model)?;
 
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let options = GenerateOptions {
@@ -84,15 +79,6 @@ fn bench_model<M: Model>(
         tok_s,
     );
 
-    if let Some(pool) = ctx.buffer_pool() {
-        eprintln!(
-            "Pool stats: {} hits, {} misses, {:.1} MB cached",
-            pool.hits(),
-            pool.misses(),
-            pool.free_bytes() as f64 / (1024.0 * 1024.0),
-        );
-    }
-
     Ok(())
 }
 
@@ -115,7 +101,7 @@ fn main() -> infernum::Result<()> {
 
     let is_gguf = cli.model.ends_with(".gguf");
 
-    match cli.dtype.as_str() {
+    let result = match cli.dtype.as_str() {
         "f32" => {
             let model = if is_gguf {
                 LlamaModel::from_gguf(&ctx, &cli.model)?
@@ -127,7 +113,7 @@ fn main() -> infernum::Result<()> {
                 model.config().num_hidden_layers,
                 model.config().hidden_size,
             );
-            bench_model(model, &ctx, cli.n_gen, cli.graphs)
+            bench_model(model, cli.n_gen, cli.graphs)
         }
         "bf16" => {
             assert!(
@@ -140,8 +126,19 @@ fn main() -> infernum::Result<()> {
                 model.config().num_hidden_layers,
                 model.config().hidden_size,
             );
-            bench_model(model, &ctx, cli.n_gen, cli.graphs)
+            bench_model(model, cli.n_gen, cli.graphs)
         }
         other => panic!("Unsupported dtype: {other}. Use f32 or bf16."),
+    };
+
+    if let Some(pool) = ctx.buffer_pool() {
+        eprintln!(
+            "Pool stats: {} hits, {} misses, {:.1} MB cached",
+            pool.hits(),
+            pool.misses(),
+            pool.free_bytes() as f64 / (1024.0 * 1024.0),
+        );
     }
+
+    result
 }

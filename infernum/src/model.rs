@@ -3,11 +3,16 @@
 //! Defines the interface that all model implementations (Llama, Qwen, etc.)
 //! must satisfy to be used with the Engine and Runtime.
 
+#[cfg(feature = "nccl")]
+use std::path::Path;
+
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
 
+#[cfg(feature = "nccl")]
+use crate::cuda::{nccl::NcclCommunicator, ShardConfig};
 #[cfg(feature = "cuda")]
-use crate::cuda::{CudaTensor, KvCache};
+use crate::cuda::{CudaContext, CudaTensor, KvCache};
 #[cfg(feature = "cuda")]
 use crate::dtype::TensorDType;
 #[cfg(feature = "cuda")]
@@ -44,6 +49,13 @@ pub trait Model {
     /// Get the model configuration needed for resource allocation.
     fn config(&self) -> ModelConfig;
 
+    /// Devices this model spans.
+    ///
+    /// Single-GPU models return a single element; sharded models return one
+    /// `CudaContext` per GPU. The Engine uses this to allocate one KV cache
+    /// per device.
+    fn devices(&self) -> Vec<&CudaContext>;
+
     /// Full forward pass (no KV cache, recomputes everything).
     ///
     /// # Arguments
@@ -61,12 +73,14 @@ pub trait Model {
     /// Processes all input tokens, populating the KV cache, and returns
     /// logits for the **last** token only: shape (1, `vocab_size`).
     ///
+    /// The slice contains one KV cache per device (see [`Self::devices`]).
+    ///
     /// # Errors
     /// Returns an error if the forward pass fails.
     fn forward_with_kv_cache(
         &self,
         input_ids: &[u32],
-        kv_cache: &mut KvCache<Self::CacheDtype>,
+        kv_caches: &mut [KvCache<Self::CacheDtype>],
     ) -> Result<CudaTensor<f32>>;
 
     /// Forward pass for a single token with KV cache (decode phase).
@@ -78,7 +92,7 @@ pub trait Model {
     fn forward_next_token(
         &self,
         token_id: u32,
-        kv_cache: &mut KvCache<Self::CacheDtype>,
+        kv_caches: &mut [KvCache<Self::CacheDtype>],
     ) -> Result<CudaTensor<f32>>;
 
     /// Forward pass for a single token with KV cache, reading the token ID
@@ -97,12 +111,10 @@ pub trait Model {
     fn forward_next_token_device(
         &self,
         token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<Self::CacheDtype>,
+        kv_caches: &mut [KvCache<Self::CacheDtype>],
     ) -> Result<CudaTensor<f32>> {
-        // Fallback: read token ID from GPU (sync) and delegate.
-        // Models should override this to avoid the sync copy.
         let host = token_id_gpu.device().dtoh_sync_copy(token_id_gpu)?;
-        self.forward_next_token(host[0], kv_cache)
+        self.forward_next_token(host[0], kv_caches)
     }
 
     /// Decode-phase forward pass using indirect kernels for CUDA graph capture.
@@ -122,8 +134,36 @@ pub trait Model {
     fn forward_next_token_indirect(
         &self,
         token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<Self::CacheDtype>,
+        kv_caches: &mut [KvCache<Self::CacheDtype>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_device(token_id_gpu, kv_cache)
+        self.forward_next_token_device(token_id_gpu, kv_caches)
     }
+}
+
+/// Trait for models that can load a single tensor-parallel shard.
+///
+/// Implementing this trait allows a model to be used with
+/// [`ShardedModel`](crate::cuda::ShardedModel), which orchestrates loading N
+/// shards across N GPUs and wraps them behind the standard [`Model`] trait.
+#[cfg(feature = "nccl")]
+pub trait ShardedLoadable: Model + Send + Sync
+where
+    Self: Sized,
+{
+    /// Load a single shard of this model for tensor-parallel inference.
+    ///
+    /// # Arguments
+    /// * `ctx` — CUDA context for the target GPU
+    /// * `model_path` — Path to the model directory (`SafeTensors`, GGUF, etc.)
+    /// * `shard` — This GPU's rank and world size
+    /// * `comm` — NCCL communicator for all-reduce during inference
+    ///
+    /// # Errors
+    /// Returns an error if weight loading or initialization fails.
+    fn load_shard(
+        ctx: &CudaContext,
+        model_path: &Path,
+        shard: ShardConfig,
+        comm: NcclCommunicator,
+    ) -> Result<Self>;
 }

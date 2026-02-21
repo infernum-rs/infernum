@@ -1617,6 +1617,10 @@ where
         }
     }
 
+    fn devices(&self) -> Vec<&CudaContext> {
+        vec![&self.ctx]
+    }
+
     fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
         // Non-KV-cache forward: compute in T, cast logits to f32 at the end.
         let mut hidden = self.embed(input_ids)?;
@@ -1676,33 +1680,57 @@ where
     fn forward_with_kv_cache(
         &self,
         input_ids: &[u32],
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_with_kv_cache(input_ids, kv_cache)
+        self.forward_with_kv_cache(input_ids, &mut kv_caches[0])
     }
 
     fn forward_next_token(
         &self,
         token_id: u32,
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token(token_id, kv_cache)
+        self.forward_next_token(token_id, &mut kv_caches[0])
     }
 
     fn forward_next_token_device(
         &self,
         token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_device(token_id_gpu, kv_cache)
+        self.forward_next_token_device(token_id_gpu, &mut kv_caches[0])
     }
 
     fn forward_next_token_indirect(
         &self,
         token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
+        kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_indirect(token_id_gpu, kv_cache)
+        self.forward_next_token_indirect(token_id_gpu, &mut kv_caches[0])
+    }
+}
+
+#[cfg(feature = "nccl")]
+#[allow(private_bounds)]
+impl<T> infernum::ShardedLoadable for LlamaModel<T>
+where
+    T: TensorDType
+        + DeviceRepr
+        + GemmScalar
+        + Default
+        + ValidAsZeroBits
+        + MaybeNcclType
+        + Send
+        + Sync,
+    CudaBlas: Gemm<T>,
+{
+    fn load_shard(
+        ctx: &CudaContext,
+        model_path: &Path,
+        shard: ShardConfig,
+        comm: NcclCommunicator,
+    ) -> Result<Self> {
+        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
     }
 }
 
@@ -2378,8 +2406,7 @@ mod tests {
     fn test_generate_gptq_respects_max_tokens() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model = build_tiny_gptq_model(&ctx);
-        let mut engine =
-            infernum_runtime::Engine::new(&ctx, model).expect("Failed to build engine");
+        let mut engine = infernum_runtime::Engine::new(model).expect("Failed to build engine");
 
         let prompt = vec![1_u32, 5, 10];
         let max_new = 4;
@@ -2445,7 +2472,7 @@ mod tests {
 
     fn build_tiny_engine(ctx: &CudaContext) -> infernum_runtime::Engine<LlamaModel<f32>> {
         let model = build_tiny_model(ctx);
-        infernum_runtime::Engine::new(ctx, model).expect("Failed to build engine")
+        infernum_runtime::Engine::new(model).expect("Failed to build engine")
     }
 
     #[test]
