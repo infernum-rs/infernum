@@ -167,6 +167,29 @@ Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
 - Use `#[ignore = "reason"]` for tests that document known issues but shouldn't block CI.
 - Only use ungated HuggingFace models (no auth tokens required).
 
+### Examples
+
+The `infernum-examples` crate contains standalone binaries demonstrating usage and extension of Infernum. All require `--features cuda`. See `infernum-examples/README.md` for full details including llama.cpp comparison instructions.
+
+**Key examples:**
+
+| Example | Purpose | Usage |
+|---------|---------|-------|
+| `generate` | Text generation with configurable sampling (SafeTensors + GGUF) | `cargo run --example generate --features cuda -- -m /path/to/model "Hello"` |
+| `bench` | Decode throughput measurement (greedy, KV cache) | `cargo run --release --example bench --features cuda -- /path/to/model 128` |
+| `generate_parallel` | Multi-GPU text generation (tensor parallelism) | `cargo run --example generate_parallel --features nccl -- -m /path/to/model --gpus 2 "Hello"` |
+| `verify_parallel` | Correctness check: single-GPU vs multi-GPU output match | `cargo run --example verify_parallel --features nccl -- -m /path/to/model --gpus 2` |
+| `custom_cuda_op` | Adding a custom CUDA C kernel (write .cu → nvcc → PTX → launch) | `cargo run --example custom_cuda_op --features cuda` |
+| `custom_triton_op` | Adding a custom Triton kernel (Python → PTX → launch) | `cargo run --example custom_triton_op --features cuda` |
+
+**`bench` flags:** `--pool` (buffer pool), `--graphs` (CUDA graphs), `--dtype bf16` (cast weights).
+
+**Adding new examples:**
+
+- Add a new `.rs` file in `infernum-examples/examples/`.
+- If it needs a custom kernel, add the `.cu` file to `infernum-examples/kernels/` and update `infernum-examples/build.rs`.
+- Follow the existing pattern: use `clap::Parser` for CLI args, gate with `#![cfg(feature = "cuda")]`.
+
 ### Implementation Guides
 
 An implementation guide is a design and implementation plan for a feature or optimization. It lives in `ephemeral-docs/` and serves as the single source of truth for the work in progress. Structure:
@@ -187,5 +210,8 @@ An implementation guide is a design and implementation plan for a feature or opt
    - Tests: `cargo test --all --features cuda -- --test-threads=1`
    - If all pass: commit and push.
    - Update the progress section in the implementation guide.
-5. As a final step, consider whether the work warrants new or updated integration tests (e.g., if it affects model output, adds a new weight format, or changes generation behavior). If so, add an integration test step to the guide.
+5. As a final step, consider whether the work warrants:
+   - **Integration tests** — if it affects model output, adds a new weight format, or changes generation behavior.
+   - **Examples** — if it adds a new user-facing capability that benefits from an interactive demo (e.g., a new inference mode, a new kernel type, a new model family).
+   If so, add a step to the guide.
 6. After all steps are complete, create a PR. **Never merge the PR** — only the human reviews and merges.
