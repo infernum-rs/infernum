@@ -12,7 +12,7 @@ pub mod seq_position;
 pub mod shard;
 mod tensor;
 
-pub use buffer_pool::BufferPool;
+pub use buffer_pool::{BufferPool, PooledSlice};
 pub use context::CudaContext;
 #[cfg(feature = "nccl")]
 pub use cudarc::nccl::safe::NcclType;

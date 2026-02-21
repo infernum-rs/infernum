@@ -1,20 +1,9 @@
-// Manual f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC)
+// f16 → f32 using PTX cvt instruction (single HW instruction on sm_70+,
+// avoids cuda_fp16.h dependency while being more efficient than bit tricks).
 __device__ float f16_to_f32(unsigned short bits) {
-    unsigned int sign = (bits >> 15) & 0x1;
-    unsigned int exp  = (bits >> 10) & 0x1F;
-    unsigned int mant = bits & 0x3FF;
-
     float result;
-    if (exp == 0) {
-        // Subnormal or zero
-        result = ldexpf((float)mant / 1024.0f, -14);
-    } else if (exp == 31) {
-        // Inf / NaN — treat as zero for safety in scale context
-        result = 0.0f;
-    } else {
-        result = ldexpf(1.0f + (float)mant / 1024.0f, (int)exp - 15);
-    }
-    return sign ? -result : result;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(bits));
+    return result;
 }
 
 // Q8_0 matmul: output[m][n] = sum_k( input[m][k] * dequant(weight[n][k]) )
@@ -229,4 +218,338 @@ extern "C" __global__ void matmul_q6k_f32(
     }
 
     output[m * N + n] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// GEMV kernels: specialized for M=1 decode
+// ---------------------------------------------------------------------------
+//
+// One thread per output element (same principle as the GEMM kernel with M=1,
+// but using a 1D block layout to avoid wasting 15/16 of threads).
+//
+// Block: (GEMV_BLOCK, 1) threads     Grid: (ceil(N / GEMV_BLOCK), 1)
+// Each thread loops over all K/32 quant blocks sequentially, maximizing
+// instruction-level parallelism and sequential memory access for weights.
+// Input vector is small (fits in L2 cache) and is broadcast to all threads.
+
+#define GEMV_BLOCK 16
+
+// Q8_0 GEMV: output[n] = dot(input[K], dequant(weight[n, K]))
+extern "C" __global__ void gemv_q8_f32(
+    float*              __restrict__ output,
+    const float*        __restrict__ input,
+    const signed char*  __restrict__ weight_data,
+    const unsigned short* __restrict__ weight_scales,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x * GEMV_BLOCK + threadIdx.x;
+    if (n >= N) return;
+
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        float scale = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        int base_k = b * 32;
+        const signed char* w_ptr = weight_data + n * K + base_k;
+        const float* in_ptr = input + base_k;
+
+        float block_acc = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int w4;
+            memcpy(&w4, w_ptr + i * 4, 4);
+            const signed char* w4b = (const signed char*)&w4;
+
+            float4 in4;
+            memcpy(&in4, in_ptr + i * 4, 16);
+
+            block_acc += w4b[0] * in4.x + w4b[1] * in4.y +
+                         w4b[2] * in4.z + w4b[3] * in4.w;
+        }
+
+        acc += scale * block_acc;
+    }
+
+    output[n] = acc;
+}
+
+// Q4_0 GEMV: output[n] = dot(input[K], dequant(weight[n, K]))
+// GGML Q4_0 packing: byte[j] has element j (low nibble), element j+16 (high nibble)
+extern "C" __global__ void gemv_q4_f32(
+    float*              __restrict__ output,
+    const float*        __restrict__ input,
+    const unsigned char* __restrict__ weight_data,
+    const unsigned short* __restrict__ weight_scales,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x * GEMV_BLOCK + threadIdx.x;
+    if (n >= N) return;
+
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        float scale = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        int base_k = b * 32;
+        const unsigned char* w_ptr = weight_data + n * (K / 2) + b * 16;
+        const float* in_ptr = input + base_k;
+
+        float block_acc = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            unsigned int w4;
+            memcpy(&w4, w_ptr + i * 4, 4);
+            const unsigned char* w4b = (const unsigned char*)&w4;
+
+            float4 in_lo;
+            memcpy(&in_lo, in_ptr + i * 4, 16);
+
+            float4 in_hi;
+            memcpy(&in_hi, in_ptr + 16 + i * 4, 16);
+
+            block_acc += ((int)(w4b[0] & 0x0F) - 8) * in_lo.x;
+            block_acc += ((int)(w4b[1] & 0x0F) - 8) * in_lo.y;
+            block_acc += ((int)(w4b[2] & 0x0F) - 8) * in_lo.z;
+            block_acc += ((int)(w4b[3] & 0x0F) - 8) * in_lo.w;
+
+            block_acc += ((int)(w4b[0] >> 4) - 8) * in_hi.x;
+            block_acc += ((int)(w4b[1] >> 4) - 8) * in_hi.y;
+            block_acc += ((int)(w4b[2] >> 4) - 8) * in_hi.z;
+            block_acc += ((int)(w4b[3] >> 4) - 8) * in_hi.w;
+        }
+
+        acc += scale * block_acc;
+    }
+
+    output[n] = acc;
+}
+
+// -----------------------------------------------------------------------
+// Activation quantization: f32 → Q8_1 (int8 data + f32 scale + f32 sum)
+// -----------------------------------------------------------------------
+// One CUDA block per 32-element quant block. 32 threads cooperate to:
+//   1. Find absmax via warp reduction
+//   2. Quantize each element to int8
+//   3. Compute sum(qs) via warp reduction
+//   4. Write data, scale (= absmax / 127), and weighted sum (= d * sum(qs))
+//
+// Input:  f32 activations [K]       (K must be divisible by 32)
+// Output: int8 data [K], f32 scales [K/32], f32 sums [K/32]
+
+extern "C" __global__ void quantize_f32_to_q8_1(
+    signed char*        __restrict__ out_data,
+    float*              __restrict__ out_scales,
+    float*              __restrict__ out_sums,
+    const float*        __restrict__ input,
+    const int K
+) {
+    const int block_idx = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..31
+    const int base_k = block_idx * 32;
+
+    if (base_k + tid >= K) return;
+
+    // Load one element per thread
+    float val = input[base_k + tid];
+    float abs_val = fabsf(val);
+
+    // Warp reduction: find max absolute value
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_xor_sync(0xFFFFFFFF, abs_val, offset);
+        abs_val = fmaxf(abs_val, other);
+    }
+    // abs_val now contains the block maximum in all lanes
+
+    float d = abs_val / 127.0f;
+    float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+
+    // Quantize
+    int qi = __float2int_rn(val * inv_d);
+    qi = max(-128, min(127, qi));
+
+    // Write quantized value
+    out_data[base_k + tid] = (signed char)qi;
+
+    // Warp reduction: sum of quantized values
+    int qi_sum = qi;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qi_sum += __shfl_xor_sync(0xFFFFFFFF, qi_sum, offset);
+    }
+
+    // Lane 0 writes scale and weighted sum
+    if (tid == 0) {
+        out_scales[block_idx] = d;
+        out_sums[block_idx] = d * (float)qi_sum;
+    }
+}
+
+// -----------------------------------------------------------------------
+// dp4a GEMV kernels: multi-warp K-splitting with dp4a
+// -----------------------------------------------------------------------
+// NWARPS warps (blockDim.y) per output row. Each warp's 32 lanes split K,
+// then intra-warp shuffle + inter-warp shared-memory reduction.
+//
+// Launch config: grid = (N, 1, 1), block = (32, NWARPS, 1),
+//                shared_mem = NWARPS * sizeof(float) bytes.
+
+// Q8_0 × Q8_1 dp4a GEMV (multi-warp, vectorized loads)
+extern "C" __global__ void gemv_q8_q8_dp4a(
+    float*              __restrict__ output,
+    const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
+    const float*        __restrict__ act_scales,   // [K/32] per-block scales
+    const signed char*  __restrict__ weight_data,  // [N, K] int8 weights
+    const unsigned short* __restrict__ weight_scales, // [N, K/32] f16 scales
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+
+    const int lane = threadIdx.x;          // lane within warp [0..31]
+    const int warp_id = threadIdx.y;       // warp index [0..NWARPS-1]
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;   // flat thread id within block
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        float d_a = act_scales[b];
+
+        // 32 bytes per quant block = 2 × int4 (128-bit) loads
+        const int4* w_v = (const int4*)(weight_data + n * K + b * 32);
+        const int4* a_v = (const int4*)(act_data + b * 32);
+
+        int4 w0 = w_v[0], w1 = w_v[1];
+        int4 a0 = a_v[0], a1 = a_v[1];
+
+        int sumi = 0;
+        sumi = __dp4a(w0.x, a0.x, sumi);
+        sumi = __dp4a(w0.y, a0.y, sumi);
+        sumi = __dp4a(w0.z, a0.z, sumi);
+        sumi = __dp4a(w0.w, a0.w, sumi);
+        sumi = __dp4a(w1.x, a1.x, sumi);
+        sumi = __dp4a(w1.y, a1.y, sumi);
+        sumi = __dp4a(w1.z, a1.z, sumi);
+        sumi = __dp4a(w1.w, a1.w, sumi);
+
+        acc += d_w * d_a * (float)sumi;
+    }
+
+    // Intra-warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    // Inter-warp reduction via shared memory
+    if (nwarps > 1) {
+        extern __shared__ float smem[];  // [nwarps] floats
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        // Warp 0 reduces across all warps
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            output[n] = sum;
+        }
+    } else {
+        if (lane == 0) {
+            output[n] = acc;
+        }
+    }
+}
+
+// Q4_0 × Q8_1 dp4a GEMV (multi-warp, with zero-point correction)
+extern "C" __global__ void gemv_q4_q8_dp4a(
+    float*              __restrict__ output,
+    const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
+    const float*        __restrict__ act_scales,   // [K/32] per-block scales
+    const float*        __restrict__ act_sums,     // [K/32] per-block weighted sums
+    const unsigned char* __restrict__ weight_data,  // [N, K/2] packed nibbles
+    const unsigned short* __restrict__ weight_scales, // [N, K/32] f16 scales
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        float d_a = act_scales[b];
+        float s_a = act_sums[b];
+
+        // 16 bytes weight data = 1 × int4 load
+        const int4* w_v = (const int4*)(weight_data + n * (K / 2) + b * 16);
+        int4 w = w_v[0];
+
+        // 32 bytes activation = 2 × int4 loads (lo half, hi half)
+        const int4* a_v = (const int4*)(act_data + b * 32);
+        int4 a_lo = a_v[0], a_hi = a_v[1];
+
+        int sumi = 0;
+        // Nibble extraction + dp4a for 4 packed uint32
+        unsigned int uw[4] = {(unsigned int)w.x, (unsigned int)w.y,
+                              (unsigned int)w.z, (unsigned int)w.w};
+        int al[4] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w};
+        int ah[4] = {a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int lo = (int)(uw[i] & 0x0F0F0F0Fu);
+            int hi = (int)((uw[i] >> 4) & 0x0F0F0F0Fu);
+            sumi = __dp4a(lo, al[i], sumi);
+            sumi = __dp4a(hi, ah[i], sumi);
+        }
+
+        acc += d_w * (d_a * (float)sumi - 8.0f * s_a);
+    }
+
+    // Intra-warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    // Inter-warp reduction via shared memory
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            output[n] = sum;
+        }
+    } else {
+        if (lane == 0) {
+            output[n] = acc;
+        }
+    }
 }

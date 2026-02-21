@@ -122,6 +122,39 @@ impl CudaContext {
         self.buffer_pool.as_ref()
     }
 
+    /// Allocate a pool-backed GPU buffer of `numel` elements of type `T`.
+    ///
+    /// When the buffer pool is enabled, tries to reuse a previously freed
+    /// allocation of the same byte size.  Otherwise falls back to
+    /// `cuMemAlloc`.  The returned [`PooledSlice`] returns the buffer to
+    /// the pool on drop.
+    ///
+    /// # Safety
+    /// The buffer contents are uninitialized.  The caller must write before
+    /// reading.
+    ///
+    /// # Errors
+    /// Returns an error if GPU memory allocation fails.
+    pub unsafe fn pool_alloc<T: cudarc::driver::DeviceRepr>(
+        &self,
+        numel: usize,
+    ) -> Result<super::buffer_pool::PooledSlice<T>> {
+        use super::buffer_pool::PooledSlice;
+
+        let byte_size = numel * std::mem::size_of::<T>();
+
+        if let Some(pool) = self.buffer_pool() {
+            if let Some(slice) = pool.acquire::<T>(byte_size, numel) {
+                return Ok(PooledSlice::pooled(slice, pool.clone(), byte_size));
+            }
+            let slice = self.device.alloc::<T>(numel)?;
+            Ok(PooledSlice::pooled(slice, pool.clone(), byte_size))
+        } else {
+            let slice = self.device.alloc::<T>(numel)?;
+            Ok(PooledSlice::unpooled(slice))
+        }
+    }
+
     /// Synchronize the CUDA device (wait for all operations to complete)
     ///
     /// # Errors

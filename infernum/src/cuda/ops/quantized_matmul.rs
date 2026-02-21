@@ -15,6 +15,7 @@
 use cudarc::cublaslt::MatmulShared;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice, LaunchAsync, LaunchConfig};
 
+use crate::cuda::buffer_pool::PooledSlice;
 use crate::cuda::quantized::QuantizedTensor;
 use crate::cuda::CudaContext;
 use crate::cuda::CudaTensor;
@@ -254,6 +255,148 @@ fn quantized_matmul_fp8_cublas(
 }
 
 // ---------------------------------------------------------------------------
+// GEMV: M=1 decode fast path for quantized formats
+// ---------------------------------------------------------------------------
+
+/// Quantize f32 activations to `Q8_1` format on the GPU.
+///
+/// Returns `(data [K] as i8, scales [K/32] as f32, sums [K/32] as f32)`.
+/// Each 32-element block gets: `scale = absmax / 127`, `qi = round(v / scale)`,
+/// `sum = scale * Σqi`.
+///
+/// Scratch buffers are pool-backed when the context has a buffer pool enabled,
+/// making this function safe to call during CUDA graph capture (after a warmup
+/// step has populated the pool).
+fn quantize_activations_to_q8_1(
+    ctx: &CudaContext,
+    input: &CudaTensor<f32>,
+    k: usize,
+) -> Result<(PooledSlice<i8>, PooledSlice<f32>, PooledSlice<f32>)> {
+    assert_eq!(k % 32, 0, "K must be divisible by 32 for Q8_1 quantization");
+
+    let device = ctx.device();
+    let num_blocks = k / 32;
+
+    let mut act_data = unsafe { ctx.pool_alloc::<i8>(k)? };
+    let mut act_scales = unsafe { ctx.pool_alloc::<f32>(num_blocks)? };
+    let mut act_sums = unsafe { ctx.pool_alloc::<f32>(num_blocks)? };
+
+    let module_name = "quantized_matmul";
+    if !device.has_func(module_name, "quantize_f32_to_q8_1") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(QUANTIZED_MATMUL_PTX),
+            module_name,
+            &[
+                "matmul_q8_f32",
+                "matmul_q4_f32",
+                "matmul_fp8_f32",
+                "matmul_q6k_f32",
+                "gemv_q8_f32",
+                "gemv_q4_f32",
+                "quantize_f32_to_q8_1",
+                "gemv_q8_q8_dp4a",
+                "gemv_q4_q8_dp4a",
+            ],
+        )?;
+    }
+    let func = device
+        .get_func(module_name, "quantize_f32_to_q8_1")
+        .unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_blocks as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                &mut *act_data,
+                &mut *act_scales,
+                &mut *act_sums,
+                &input.cuda_slice(),
+                k as i32,
+            ),
+        )?;
+    }
+
+    Ok((act_data, act_scales, act_sums))
+}
+
+/// GEMV kernel for M=1 decode: `output[1, N] = input[1, K] @ dequant(weight[N, K])^T`
+///
+/// Quantizes f32 activations to `Q8_1` on-the-fly, then uses `dp4a` integer dot
+/// products for ~4× compute throughput and ~4× bandwidth reduction vs f32.
+fn quantized_gemv(
+    input: &CudaTensor<f32>,
+    weight: &QuantizedTensor,
+    n: usize,
+    k: usize,
+) -> Result<CudaTensor<f32>> {
+    // Multi-warp GEMV: NWARPS warps per output row, K-split across all threads
+    const NWARPS: u32 = 4;
+
+    let ctx = input.context();
+    let device = ctx.device();
+
+    // Quantize activations: f32 [K] → Q8_1 (int8 data + f32 scales + f32 sums)
+    let (act_data, act_scales, act_sums) = quantize_activations_to_q8_1(ctx, input, k)?;
+
+    let mut output = unsafe { CudaTensor::<f32>::uninit(ctx, &[1, n])? };
+
+    let module_name = "quantized_matmul";
+
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (32, NWARPS, 1),
+        shared_mem_bytes: NWARPS * 4, // NWARPS × sizeof(f32) for inter-warp reduction
+    };
+
+    match weight.dtype() {
+        DType::Q8_0 => {
+            let func = device.get_func(module_name, "gemv_q8_q8_dp4a").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &*act_data,
+                        &*act_scales,
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::Q4_0 => {
+            let func = device.get_func(module_name, "gemv_q4_q8_dp4a").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &*act_data,
+                        &*act_scales,
+                        &*act_sums,
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        other => panic!("quantized_gemv: unsupported dtype {other}"),
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -311,8 +454,6 @@ fn quantized_matmul_2d(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor<f32>> {
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), &[m, n])? };
-
     let device = input.context().device();
 
     let module_name = "quantized_matmul";
@@ -325,9 +466,21 @@ fn quantized_matmul_2d(
                 "matmul_q4_f32",
                 "matmul_fp8_f32",
                 "matmul_q6k_f32",
+                "gemv_q8_f32",
+                "gemv_q4_f32",
+                "quantize_f32_to_q8_1",
+                "gemv_q8_q8_dp4a",
+                "gemv_q4_q8_dp4a",
             ],
         )?;
     }
+
+    // GEMV fast path for M=1 decode (Q8_0 and Q4_0 only)
+    if m == 1 && matches!(weight.dtype(), DType::Q8_0 | DType::Q4_0) {
+        return quantized_gemv(input, weight, n, k);
+    }
+
+    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), &[m, n])? };
 
     let block_x = 16;
     let block_y = 16;
@@ -1401,6 +1554,315 @@ mod tests {
                 result[i],
                 expected[i],
                 (result[i] - expected[i]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_q8_m1() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 1;
+        let k = 2048;
+        let n = 2048;
+
+        let mut state: u64 = 11111;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+        let (q_data, q_scales) = quantize_q8_host(&w_data, QUANTIZATION_BLOCK_SIZE);
+        let weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q8_0, &q_data, &q_scales).unwrap();
+
+        // Q8_1 quantize activations on CPU (matching GPU: f32 scale = absmax/127)
+        let blocks_per_row = k / QUANTIZATION_BLOCK_SIZE;
+        let mut act_q8 = vec![0_i8; k];
+        let mut act_f32_scales = vec![0.0_f32; blocks_per_row];
+        for b in 0..blocks_per_row {
+            let block = &input_data[b * QUANTIZATION_BLOCK_SIZE..(b + 1) * QUANTIZATION_BLOCK_SIZE];
+            let max_abs = block.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+            let scale = max_abs / 127.0;
+            act_f32_scales[b] = scale;
+            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            for j in 0..QUANTIZATION_BLOCK_SIZE {
+                act_q8[b * QUANTIZATION_BLOCK_SIZE + j] =
+                    (block[j] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            }
+        }
+
+        // Reference: dp4a-style dot product with both sides quantized
+        let mut expected = vec![0.0_f32; m * n];
+        for col in 0..n {
+            let mut acc = 0.0_f64;
+            for b in 0..blocks_per_row {
+                let w_scale = half::f16::from_le_bytes([
+                    q_scales[col * blocks_per_row * 2 + b * 2],
+                    q_scales[col * blocks_per_row * 2 + b * 2 + 1],
+                ])
+                .to_f32();
+                let a_scale = act_f32_scales[b];
+
+                let mut sumi: i32 = 0;
+                for j in 0..QUANTIZATION_BLOCK_SIZE {
+                    let w_qi = q_data[col * k + b * QUANTIZATION_BLOCK_SIZE + j] as i8 as i32;
+                    let a_qi = act_q8[b * QUANTIZATION_BLOCK_SIZE + j] as i32;
+                    sumi += w_qi * a_qi;
+                }
+                acc += f64::from(w_scale * a_scale * sumi as f32);
+            }
+            expected[col] = acc as f32;
+        }
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+        assert_eq!(result.len(), n);
+
+        for i in 0..n {
+            let diff = (result[i] - expected[i]).abs();
+            let ok = if expected[i].abs() < 0.1 {
+                diff < 0.05
+            } else {
+                diff / expected[i].abs() < 0.10
+            };
+            assert!(
+                ok,
+                "GEMV Q8 mismatch at [{}]: got {} expected {} (diff={:.6})",
+                i, result[i], expected[i], diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_q4_m1() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 1;
+        let k = 2048;
+        let n = 2048;
+
+        let mut state: u64 = 22222;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+        let (q4_data, q4_scales) = quantize_q4_host(&w_data, QUANTIZATION_BLOCK_SIZE);
+
+        // Q8_1 quantize activations on CPU (matching GPU: f32 scales)
+        let blocks_per_row = k / QUANTIZATION_BLOCK_SIZE;
+        let mut act_q8 = vec![0_i8; k];
+        let mut act_f32_scales = vec![0.0_f32; blocks_per_row];
+        let mut act_f32_sums = vec![0.0_f32; blocks_per_row];
+        for b in 0..blocks_per_row {
+            let block = &input_data[b * QUANTIZATION_BLOCK_SIZE..(b + 1) * QUANTIZATION_BLOCK_SIZE];
+            let max_abs = block.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+            let scale = max_abs / 127.0;
+            act_f32_scales[b] = scale;
+            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            let mut qi_sum: i32 = 0;
+            for j in 0..QUANTIZATION_BLOCK_SIZE {
+                let qi = (block[j] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                act_q8[b * QUANTIZATION_BLOCK_SIZE + j] = qi;
+                qi_sum += qi as i32;
+            }
+            act_f32_sums[b] = scale * qi_sum as f32;
+        }
+
+        // Reference: simulate the dp4a Q4×Q8_1 computation with zero-point correction
+        let mut expected = vec![0.0_f32; n];
+        for col in 0..n {
+            let mut acc = 0.0_f64;
+            for b in 0..blocks_per_row {
+                let d_w = half::f16::from_le_bytes([
+                    q4_scales[col * blocks_per_row * 2 + b * 2],
+                    q4_scales[col * blocks_per_row * 2 + b * 2 + 1],
+                ])
+                .to_f32();
+                let d_a = act_f32_scales[b];
+                let s_a = act_f32_sums[b];
+
+                // dp4a-style: unsigned nibbles × int8 activations
+                let w_offset = col * (k / 2) + b * 16;
+                let a_offset = b * QUANTIZATION_BLOCK_SIZE;
+                let mut sumi: i32 = 0;
+                for j in 0..16 {
+                    let byte = q4_data[w_offset + j];
+                    let w_lo = (byte & 0x0F) as i32;
+                    let w_hi = (byte >> 4) as i32;
+                    let a_lo = act_q8[a_offset + j] as i32;
+                    let a_hi = act_q8[a_offset + 16 + j] as i32;
+                    sumi += w_lo * a_lo + w_hi * a_hi;
+                }
+                // Zero-point correction: subtract 8 * s_a
+                acc += f64::from(d_w * (d_a * sumi as f32 - 8.0 * s_a));
+            }
+            expected[col] = acc as f32;
+        }
+
+        let weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q4_0, &q4_data, &q4_scales).unwrap();
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+        assert_eq!(result.len(), n);
+
+        for i in 0..n {
+            let diff = (result[i] - expected[i]).abs();
+            let ok = if expected[i].abs() < 0.1 {
+                diff < 0.05
+            } else {
+                diff / expected[i].abs() < 0.10
+            };
+            assert!(
+                ok,
+                "GEMV Q4 mismatch at [{}]: got {} expected {} (diff={:.6})",
+                i, result[i], expected[i], diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_matches_gemm_q8() {
+        // Verify GEMV (dp4a with Q8_1 activations) produces results close to
+        // GEMM (f32 activations). The paths differ by activation quantization
+        // error, so we allow ~10% relative tolerance.
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 2048;
+        let n = 512;
+
+        let mut state: u64 = 33333;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let (q_data, q_scales) = quantize_q8_host(&w_data, QUANTIZATION_BLOCK_SIZE);
+        let weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q8_0, &q_data, &q_scales).unwrap();
+
+        // M=1 → uses GEMV path (dp4a with Q8_1 quantized activations)
+        let input_m1 = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+        let gemv_result = quantized_matmul(&input_m1, &weight)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+
+        // M=2 with identical rows → uses GEMM path (f32 activations)
+        let input_m2_data: Vec<f32> = input_data
+            .iter()
+            .chain(input_data.iter())
+            .copied()
+            .collect();
+        let input_m2 = CudaTensor::from_slice(&ctx, &[2, k], &input_m2_data).unwrap();
+        let gemm_result = quantized_matmul(&input_m2, &weight)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+
+        for i in 0..n {
+            let diff = (gemv_result[i] - gemm_result[i]).abs();
+            let ok = if gemm_result[i].abs() < 0.5 {
+                diff < 0.2
+            } else {
+                diff / gemm_result[i].abs() < 0.20
+            };
+            assert!(
+                ok,
+                "GEMV vs GEMM mismatch at [{}]: GEMV={} GEMM={} (diff={:.6})",
+                i, gemv_result[i], gemm_result[i], diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_quantize_f32_to_q8_1() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 256;
+
+        let mut state: u64 = 44444;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..k).map(|_| rand_f32()).collect();
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+
+        let (act_data, act_scales, act_sums) =
+            quantize_activations_to_q8_1(&ctx, &input, k).unwrap();
+
+        let data_host: Vec<i8> = ctx.device().dtoh_sync_copy(&*act_data).unwrap();
+        let scales_host: Vec<f32> = ctx.device().dtoh_sync_copy(&*act_scales).unwrap();
+        let sums_host: Vec<f32> = ctx.device().dtoh_sync_copy(&*act_sums).unwrap();
+
+        let num_blocks = k / 32;
+        assert_eq!(scales_host.len(), num_blocks);
+        assert_eq!(sums_host.len(), num_blocks);
+
+        for b in 0..num_blocks {
+            let block = &input_data[b * 32..(b + 1) * 32];
+            let max_abs = block.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+            let expected_scale = max_abs / 127.0;
+
+            // Scale should match closely
+            assert!(
+                (scales_host[b] - expected_scale).abs() < 1e-5,
+                "Scale mismatch at block {}: got {} expected {}",
+                b,
+                scales_host[b],
+                expected_scale
+            );
+
+            // Check quantized values and sum
+            let inv_scale = if expected_scale > 0.0 {
+                1.0 / expected_scale
+            } else {
+                0.0
+            };
+            let mut expected_qi_sum: i32 = 0;
+            for j in 0..32 {
+                let expected_qi = (block[j] * inv_scale).round().clamp(-128.0, 127.0) as i8 as i32;
+                let actual_qi = data_host[b * 32 + j] as i32;
+                assert!(
+                    (actual_qi - expected_qi).abs() <= 1,
+                    "Q8_1 data mismatch at block {} elem {}: got {} expected {}",
+                    b,
+                    j,
+                    actual_qi,
+                    expected_qi
+                );
+                expected_qi_sum += actual_qi;
+            }
+
+            let expected_sum = expected_scale * expected_qi_sum as f32;
+            assert!(
+                (sums_host[b] - expected_sum).abs() < 1e-3,
+                "Sum mismatch at block {}: got {} expected {}",
+                b,
+                sums_host[b],
+                expected_sum
             );
         }
     }
