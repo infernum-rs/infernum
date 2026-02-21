@@ -23,6 +23,10 @@ static __device__ __forceinline__ float block_reduce_max(float val) {
 
     val = warp_reduce_max_val(val);
 
+    if (num_warps <= 1) {
+        return val;
+    }
+
     if (lane_id == 0) {
         shared[warp_id] = val;
     }
@@ -31,8 +35,13 @@ static __device__ __forceinline__ float block_reduce_max(float val) {
     if (warp_id == 0) {
         val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
         val = warp_reduce_max_val(val);
+        if (lane_id == 0) {
+            shared[0] = val;
+        }
     }
-    return val;
+    __syncthreads();
+
+    return shared[0];
 }
 
 // ─── FP8 E4M3 encoding (device function) ────────────────────────────────────

@@ -51,8 +51,33 @@ pub struct LlamaConfig {
     pub bos_token_id: u32,
 
     /// End of sequence token ID
-    #[serde(default = "default_eos_token_id")]
+    #[serde(
+        default = "default_eos_token_id",
+        deserialize_with = "deserialize_single_or_first"
+    )]
     pub eos_token_id: u32,
+}
+
+/// Deserialize a field that may be a single `u32` or an array of `u32`.
+/// When an array is provided, the first element is used.
+fn deserialize_single_or_first<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SingleOrVec {
+        Single(u32),
+        Vec(Vec<u32>),
+    }
+
+    match SingleOrVec::deserialize(deserializer)? {
+        SingleOrVec::Single(v) => Ok(v),
+        SingleOrVec::Vec(v) => v
+            .first()
+            .copied()
+            .ok_or_else(|| serde::de::Error::custom("eos_token_id array is empty")),
+    }
 }
 
 fn default_max_position_embeddings() -> usize {
@@ -301,5 +326,35 @@ mod tests {
         assert!(result.is_err());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_config_eos_token_id_as_array() {
+        let json = r#"{
+            "vocab_size": 128256,
+            "hidden_size": 2048,
+            "intermediate_size": 8192,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 32,
+            "eos_token_id": [128001, 128008, 128009]
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.eos_token_id, 128001);
+    }
+
+    #[test]
+    fn test_config_eos_token_id_as_scalar() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "intermediate_size": 5632,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 32,
+            "eos_token_id": 42
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.eos_token_id, 42);
     }
 }
