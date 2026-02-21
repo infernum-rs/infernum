@@ -147,6 +147,11 @@ pub trait TensorDType: Copy + Clone + Default + Send + Sync + 'static {
     /// Used by generic code that computes values in f32 (e.g. `RoPE` cache)
     /// and needs to store them in the model's native dtype.
     fn from_f32(v: f32) -> Self;
+
+    /// Convert this value to `f32`.
+    ///
+    /// Used by generic code that accumulates in f32 (e.g. `MoE` routing).
+    fn to_f32(self) -> f32;
 }
 
 impl TensorDType for f32 {
@@ -154,6 +159,10 @@ impl TensorDType for f32 {
 
     fn from_f32(v: f32) -> Self {
         v
+    }
+
+    fn to_f32(self) -> f32 {
+        self
     }
 }
 
@@ -163,6 +172,10 @@ impl TensorDType for half::f16 {
     fn from_f32(v: f32) -> Self {
         Self::from_f32(v)
     }
+
+    fn to_f32(self) -> f32 {
+        half::f16::to_f32(self)
+    }
 }
 
 impl TensorDType for half::bf16 {
@@ -171,6 +184,10 @@ impl TensorDType for half::bf16 {
     fn from_f32(v: f32) -> Self {
         Self::from_f32(v)
     }
+
+    fn to_f32(self) -> f32 {
+        half::bf16::to_f32(self)
+    }
 }
 
 impl TensorDType for u32 {
@@ -178,6 +195,10 @@ impl TensorDType for u32 {
 
     fn from_f32(_v: f32) -> Self {
         panic!("u32 does not support from_f32 conversion")
+    }
+
+    fn to_f32(self) -> f32 {
+        panic!("u32 does not support to_f32 conversion")
     }
 }
 

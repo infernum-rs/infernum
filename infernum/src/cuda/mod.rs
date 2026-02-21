@@ -4,6 +4,7 @@ pub mod buffer_pool;
 mod context;
 mod graph;
 pub mod kv_cache;
+pub mod moe;
 #[cfg(feature = "nccl")]
 pub mod nccl;
 pub mod ops;

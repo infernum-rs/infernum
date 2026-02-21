@@ -2062,6 +2062,8 @@ mod tests {
             bos_token_id: 1,
             eos_token_id: 2,
             quantization_config: None,
+            num_local_experts: None,
+            num_experts_per_tok: None,
         }
     }
 
@@ -2253,6 +2255,8 @@ mod tests {
                 bits: 4,
                 group_size: 32,
             }),
+            num_local_experts: None,
+            num_experts_per_tok: None,
         }
     }
 
