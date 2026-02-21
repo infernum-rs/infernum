@@ -1375,7 +1375,12 @@ impl LlamaModel<f32> {
 
         // Output head
         let lm_head = if config.tie_word_embeddings {
-            LinearWeight::Dense(pretranspose_weight(&embed_tokens)?)
+            let embd_dtype = loader.get_dtype("token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                LinearWeight::Quantized(loader.load_quantized(ctx, "token_embd.weight")?)
+            } else {
+                LinearWeight::Dense(pretranspose_weight(&embed_tokens)?)
+            }
         } else if loader.contains("output.weight") {
             let dtype = loader.get_dtype("output.weight")?;
             if dtype.is_quantized() {
@@ -1387,7 +1392,12 @@ impl LlamaModel<f32> {
             }
         } else {
             // Fallback: tie to embeddings
-            LinearWeight::Dense(pretranspose_weight(&embed_tokens)?)
+            let embd_dtype = loader.get_dtype("token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                LinearWeight::Quantized(loader.load_quantized(ctx, "token_embd.weight")?)
+            } else {
+                LinearWeight::Dense(pretranspose_weight(&embed_tokens)?)
+            }
         };
 
         // Precompute RoPE cache
