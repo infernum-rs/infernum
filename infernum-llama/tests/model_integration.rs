@@ -55,6 +55,14 @@ fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
 ///
 /// Files are cached in `~/.cache/infernum/models/<org>/<model>/`.
 fn download_model(repo_id: &str) -> PathBuf {
+    download_model_files(repo_id, REQUIRED_FILES)
+}
+
+/// Download specific files from a HuggingFace model repo.
+///
+/// Use this instead of [`download_model`] for sharded models or repos
+/// with non-standard file layouts.
+fn download_model_files(repo_id: &str, files: &[&str]) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let cache_dir = PathBuf::from(home)
         .join(".cache")
@@ -62,7 +70,7 @@ fn download_model(repo_id: &str) -> PathBuf {
         .join("models")
         .join(repo_id);
 
-    for filename in REQUIRED_FILES {
+    for filename in files {
         download_file(repo_id, filename, &cache_dir.join(filename));
     }
 
@@ -245,6 +253,81 @@ mod mixtral_moe_tiny {
     }
 
     #[test]
+    fn no_nan_in_output() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+        let input_ids = tokenizer.encode("Hello world", true).unwrap();
+
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits_vec = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+}
+
+// ─── Mixtral MoE (real weights) ─────────────────────────────────────────────
+
+/// Mixtral-8x7B-Instruct-v0.1 (ungated, ~93GB bf16, 19 sharded SafeTensors)
+///
+/// Validates generation quality with a real Mixtral model. Too large for CI —
+/// run manually with:
+///   cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_8x7b
+mod mixtral_8x7b {
+    use super::*;
+
+    const REPO: &str = "mistralai/Mixtral-8x7B-Instruct-v0.1";
+
+    const FILES: &[&str] = &[
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00019.safetensors",
+        "model-00002-of-00019.safetensors",
+        "model-00003-of-00019.safetensors",
+        "model-00004-of-00019.safetensors",
+        "model-00005-of-00019.safetensors",
+        "model-00006-of-00019.safetensors",
+        "model-00007-of-00019.safetensors",
+        "model-00008-of-00019.safetensors",
+        "model-00009-of-00019.safetensors",
+        "model-00010-of-00019.safetensors",
+        "model-00011-of-00019.safetensors",
+        "model-00012-of-00019.safetensors",
+        "model-00013-of-00019.safetensors",
+        "model-00014-of-00019.safetensors",
+        "model-00015-of-00019.safetensors",
+        "model-00016-of-00019.safetensors",
+        "model-00017-of-00019.safetensors",
+        "model-00018-of-00019.safetensors",
+        "model-00019-of-00019.safetensors",
+    ];
+
+    fn model_dir() -> PathBuf {
+        download_model_files(REPO, FILES)
+    }
+
+    #[test]
+    #[ignore = "93GB model — run manually with --ignored"]
+    fn capital_of_france() {
+        let output = generate_greedy(&model_dir(), "The capital of France is", 30);
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in output, got: {output}"
+        );
+    }
+
+    #[test]
+    #[ignore = "93GB model — run manually with --ignored"]
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
