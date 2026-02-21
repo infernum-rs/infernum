@@ -18,6 +18,31 @@ use crate::dtype::{
 };
 use crate::Result;
 
+/// Transpose a row-major `[rows, cols]` matrix of fixed-size elements.
+///
+/// Each element is `elem_size` bytes wide. The input byte slice has
+/// `rows * cols * elem_size` bytes; the output has the same size but
+/// in `[cols, rows]` order.
+fn transpose_bytes(data: &[u8], rows: usize, cols: usize, elem_size: usize) -> Vec<u8> {
+    let expected = rows * cols * elem_size;
+    assert_eq!(
+        data.len(),
+        expected,
+        "transpose_bytes: expected {expected} bytes for [{rows}, {cols}] × {elem_size}, got {}",
+        data.len()
+    );
+
+    let mut out = vec![0u8; expected];
+    for r in 0..rows {
+        for c in 0..cols {
+            let src = (r * cols + c) * elem_size;
+            let dst = (c * rows + r) * elem_size;
+            out[dst..dst + elem_size].copy_from_slice(&data[src..src + elem_size]);
+        }
+    }
+    out
+}
+
 /// A tensor stored in a quantized format on the GPU.
 ///
 /// Unlike [`CudaTensor<T>`](super::CudaTensor), this is not parameterized by
@@ -293,9 +318,17 @@ impl QuantizedTensor {
 
     /// Create a GPTQ/AWQ quantized tensor from raw host data.
     ///
+    /// For `GPTQ_INT4`, the qweight, scales, and qzeros are transposed from their
+    /// original column-major layout to row-major for coalesced GPU access:
+    /// - `qweight`: `[K/8, N]` → `[N, K/8]` (int32 elements)
+    /// - `scales`:  `[num_groups, N]` → `[N, num_groups]` (f16 elements)
+    /// - `qzeros`:  `[num_groups, N/8]` → `[N/8, num_groups]` (int32 elements)
+    ///
+    /// `AWQ_INT4` weights are uploaded unchanged (already row-major for K).
+    ///
     /// # Arguments
     /// * `ctx` — CUDA context
-    /// * `shape` — logical weight shape `[in_features, out_features]` (the unpacked dimensions)
+    /// * `shape` — logical weight shape `[out_features, in_features]` (N, K)
     /// * `dtype` — `GPTQ_INT4` or `AWQ_INT4`
     /// * `qweight` — packed int4 weights as raw bytes (int32 layout)
     /// * `scales` — per-group f16 scale factors as raw bytes
@@ -307,6 +340,7 @@ impl QuantizedTensor {
     ///
     /// # Panics
     /// Panics if `dtype` is not a group-quantized format.
+    #[allow(clippy::similar_names)]
     pub fn from_gptq_raw(
         ctx: &CudaContext,
         shape: &[usize],
@@ -325,9 +359,29 @@ impl QuantizedTensor {
             "group_size must be positive, got {group_size}"
         );
 
-        let gpu_data = ctx.device().htod_sync_copy(qweight)?;
-        let gpu_scales = ctx.device().htod_sync_copy(scales)?;
-        let gpu_qzeros = ctx.device().htod_sync_copy(qzeros)?;
+        // GPTQ weights arrive in column-major layout that causes strided GPU access.
+        // Transpose to row-major at load time (one-time CPU cost) so the GEMV kernel
+        // can use coalesced/vectorized loads.
+        let (qw_data, sc_data, qz_data) = if dtype == DType::GPTQ_INT4 {
+            let n = shape[0]; // out_features
+            let k = shape[1]; // in_features
+            let num_groups = k / group_size;
+
+            // qweight: [K/8, N] int32 → [N, K/8] int32
+            let qw_transposed = transpose_bytes(qweight, k / 8, n, 4);
+            // scales: [num_groups, N] f16 → [N, num_groups] f16
+            let sc_transposed = transpose_bytes(scales, num_groups, n, 2);
+            // qzeros: [num_groups, N/8] int32 → [N/8, num_groups] int32
+            let qz_transposed = transpose_bytes(qzeros, num_groups, n / 8, 4);
+
+            (qw_transposed, sc_transposed, qz_transposed)
+        } else {
+            (qweight.to_vec(), scales.to_vec(), qzeros.to_vec())
+        };
+
+        let gpu_data = ctx.device().htod_sync_copy(&qw_data)?;
+        let gpu_scales = ctx.device().htod_sync_copy(&sc_data)?;
+        let gpu_qzeros = ctx.device().htod_sync_copy(&qz_data)?;
 
         Ok(Self {
             data: gpu_data,
@@ -492,21 +546,22 @@ mod tests {
     fn test_quantized_tensor_gptq_creation() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
 
-        let in_features = 256;
-        let out_features = 128;
+        let in_features = 256; // K
+        let out_features = 128; // N
         let group_size = 128;
         let num_groups = in_features / group_size;
 
-        // qweight: [in_features/8, out_features] as int32 → (256/8)*128*4 bytes
+        // qweight: [K/8, N] as int32 → (256/8)*128*4 bytes
         let qweight = vec![0u8; (in_features / 8) * out_features * 4];
-        // scales: [num_groups, out_features] as f16 → 2*128*2 bytes
+        // scales: [num_groups, N] as f16 → 2*128*2 bytes
         let scales = vec![0u8; num_groups * out_features * 2];
-        // qzeros: [num_groups, out_features/8] as int32 → 2*(128/8)*4 bytes
+        // qzeros: [num_groups, N/8] as int32 → 2*(128/8)*4 bytes
         let qzeros = vec![0u8; num_groups * (out_features / 8) * 4];
 
+        // shape is [N, K] = [out_features, in_features] (matches loader convention)
         let qt = QuantizedTensor::from_gptq_raw(
             &ctx,
-            &[in_features, out_features],
+            &[out_features, in_features],
             DType::GPTQ_INT4,
             &qweight,
             &scales,
@@ -515,7 +570,7 @@ mod tests {
         )
         .expect("Failed to create GPTQ tensor");
 
-        assert_eq!(qt.shape(), &[in_features, out_features]);
+        assert_eq!(qt.shape(), &[out_features, in_features]);
         assert_eq!(qt.dtype(), DType::GPTQ_INT4);
         assert_eq!(qt.numel(), in_features * out_features);
         assert_eq!(qt.group_size(), Some(group_size));
