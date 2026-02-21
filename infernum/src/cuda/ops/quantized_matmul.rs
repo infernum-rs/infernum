@@ -15,6 +15,7 @@
 use cudarc::cublaslt::MatmulShared;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice, LaunchAsync, LaunchConfig};
 
+use crate::cuda::buffer_pool::PooledSlice;
 use crate::cuda::quantized::QuantizedTensor;
 use crate::cuda::CudaContext;
 use crate::cuda::CudaTensor;
@@ -262,19 +263,23 @@ fn quantized_matmul_fp8_cublas(
 /// Returns `(data [K] as i8, scales [K/32] as f32, sums [K/32] as f32)`.
 /// Each 32-element block gets: `scale = absmax / 127`, `qi = round(v / scale)`,
 /// `sum = scale * Σqi`.
+///
+/// Scratch buffers are pool-backed when the context has a buffer pool enabled,
+/// making this function safe to call during CUDA graph capture (after a warmup
+/// step has populated the pool).
 fn quantize_activations_to_q8_1(
     ctx: &CudaContext,
     input: &CudaTensor<f32>,
     k: usize,
-) -> Result<(CudaSlice<i8>, CudaSlice<f32>, CudaSlice<f32>)> {
+) -> Result<(PooledSlice<i8>, PooledSlice<f32>, PooledSlice<f32>)> {
     assert_eq!(k % 32, 0, "K must be divisible by 32 for Q8_1 quantization");
 
     let device = ctx.device();
     let num_blocks = k / 32;
 
-    let mut act_data = unsafe { device.alloc::<i8>(k)? };
-    let mut act_scales = unsafe { device.alloc::<f32>(num_blocks)? };
-    let mut act_sums = unsafe { device.alloc::<f32>(num_blocks)? };
+    let mut act_data = unsafe { ctx.pool_alloc::<i8>(k)? };
+    let mut act_scales = unsafe { ctx.pool_alloc::<f32>(num_blocks)? };
+    let mut act_sums = unsafe { ctx.pool_alloc::<f32>(num_blocks)? };
 
     let module_name = "quantized_matmul";
     if !device.has_func(module_name, "quantize_f32_to_q8_1") {
@@ -308,9 +313,9 @@ fn quantize_activations_to_q8_1(
         func.launch(
             cfg,
             (
-                &mut act_data,
-                &mut act_scales,
-                &mut act_sums,
+                &mut *act_data,
+                &mut *act_scales,
+                &mut *act_sums,
                 &input.cuda_slice(),
                 k as i32,
             ),
@@ -355,8 +360,8 @@ fn quantized_gemv(
                     cfg,
                     (
                         output.cuda_slice_mut(),
-                        &act_data,
-                        &act_scales,
+                        &*act_data,
+                        &*act_scales,
                         weight.data_slice(),
                         weight.scales_slice(),
                         n as i32,
@@ -372,9 +377,9 @@ fn quantized_gemv(
                     cfg,
                     (
                         output.cuda_slice_mut(),
-                        &act_data,
-                        &act_scales,
-                        &act_sums,
+                        &*act_data,
+                        &*act_scales,
+                        &*act_sums,
                         weight.data_slice(),
                         weight.scales_slice(),
                         n as i32,
@@ -1806,9 +1811,9 @@ mod tests {
         let (act_data, act_scales, act_sums) =
             quantize_activations_to_q8_1(&ctx, &input, k).unwrap();
 
-        let data_host: Vec<i8> = ctx.device().dtoh_sync_copy(&act_data).unwrap();
-        let scales_host: Vec<f32> = ctx.device().dtoh_sync_copy(&act_scales).unwrap();
-        let sums_host: Vec<f32> = ctx.device().dtoh_sync_copy(&act_sums).unwrap();
+        let data_host: Vec<i8> = ctx.device().dtoh_sync_copy(&*act_data).unwrap();
+        let scales_host: Vec<f32> = ctx.device().dtoh_sync_copy(&*act_scales).unwrap();
+        let sums_host: Vec<f32> = ctx.device().dtoh_sync_copy(&*act_sums).unwrap();
 
         let num_blocks = k / 32;
         assert_eq!(scales_host.len(), num_blocks);

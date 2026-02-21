@@ -1297,12 +1297,11 @@ where
     match weight {
         LinearWeight::Dense(w) => matmul(input, w),
         LinearWeight::Quantized(w) => {
-            assert_eq!(
-                T::DTYPE,
-                infernum::dtype::DType::F32,
-                "Quantized weights only support f32 activations"
-            );
-            let input_f32 = cast_to_f32(input)?;
+            let input_f32 = if T::DTYPE == infernum::dtype::DType::F32 {
+                reinterpret_tensor(input.slice_view(0, input.shape()))
+            } else {
+                cast_to_f32(input)?
+            };
             let output_f32 = quantized_matmul(&input_f32, w)?;
             Ok(reinterpret_tensor(output_f32))
         }

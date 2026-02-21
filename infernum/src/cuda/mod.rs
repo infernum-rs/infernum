@@ -9,7 +9,7 @@ mod quantized;
 pub mod seq_position;
 mod tensor;
 
-pub use buffer_pool::BufferPool;
+pub use buffer_pool::{BufferPool, PooledSlice};
 pub use context::CudaContext;
 pub use graph::CudaGraph;
 pub use kv_cache::KvCache;

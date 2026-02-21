@@ -154,6 +154,59 @@ impl BufferPool {
     }
 }
 
+/// RAII wrapper around a `CudaSlice<T>` that returns to a [`BufferPool`] on drop.
+///
+/// Provides `Deref` / `DerefMut` to the inner `CudaSlice<T>` for transparent
+/// use with kernel launch parameters. When dropped, the buffer is returned to
+/// the pool for reuse rather than freed.
+pub struct PooledSlice<T: DeviceRepr> {
+    slice: Option<CudaSlice<T>>,
+    pool: Option<BufferPool>,
+    byte_size: usize,
+}
+
+impl<T: DeviceRepr> PooledSlice<T> {
+    /// Wrap a `CudaSlice` without pool backing (will free normally on drop).
+    pub fn unpooled(slice: CudaSlice<T>) -> Self {
+        Self {
+            slice: Some(slice),
+            pool: None,
+            byte_size: 0,
+        }
+    }
+
+    /// Wrap a `CudaSlice` with pool backing (will return to pool on drop).
+    pub fn pooled(slice: CudaSlice<T>, pool: BufferPool, byte_size: usize) -> Self {
+        Self {
+            slice: Some(slice),
+            pool: Some(pool),
+            byte_size,
+        }
+    }
+}
+
+impl<T: DeviceRepr> Drop for PooledSlice<T> {
+    fn drop(&mut self) {
+        if let (Some(pool), Some(slice)) = (self.pool.take(), self.slice.take()) {
+            pool.release(slice, self.byte_size);
+        }
+    }
+}
+
+impl<T: DeviceRepr> std::ops::Deref for PooledSlice<T> {
+    type Target = CudaSlice<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.slice.as_ref().expect("buffer already dropped")
+    }
+}
+
+impl<T: DeviceRepr> std::ops::DerefMut for PooledSlice<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.slice.as_mut().expect("buffer already dropped")
+    }
+}
+
 impl Default for BufferPool {
     fn default() -> Self {
         let device = CudaDevice::new(0).expect("Failed to create CUDA device for default pool");
