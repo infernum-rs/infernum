@@ -53,6 +53,9 @@ pub struct QuantizedTensor {
     weight_scale: f32,
     /// Cached device-side weight scale (lazily allocated, avoids per-matmul host→device copies)
     d_weight_scale: Option<CudaSlice<f32>>,
+    /// Per-channel (per-row) scale factors on GPU, shape [N] as f32.
+    /// Used by compressed-tensors FP8 models. When set, `weight_scale` is ignored.
+    d_channel_scales: Option<CudaSlice<f32>>,
 }
 
 impl QuantizedTensor {
@@ -121,6 +124,7 @@ impl QuantizedTensor {
             group_size: None,
             weight_scale: 1.0,
             d_weight_scale: None,
+            d_channel_scales: None,
         })
     }
 
@@ -150,6 +154,7 @@ impl QuantizedTensor {
             group_size: None,
             weight_scale: 1.0,
             d_weight_scale: None,
+            d_channel_scales: None,
         }
     }
 
@@ -185,6 +190,34 @@ impl QuantizedTensor {
     #[must_use]
     pub fn d_weight_scale(&self) -> Option<&CudaSlice<f32>> {
         self.d_weight_scale.as_ref()
+    }
+
+    /// Set per-channel (per-row) scale factors and upload them to the GPU.
+    ///
+    /// Used by compressed-tensors FP8 models where each output channel has
+    /// its own scale factor. Shape must be `[N]` where N is `shape[0]`.
+    ///
+    /// # Errors
+    /// Returns an error if GPU allocation fails.
+    ///
+    /// # Panics
+    /// Panics if `scales.len()` does not match `shape[0]`.
+    pub fn set_channel_scales(&mut self, ctx: &CudaContext, scales: &[f32]) -> Result<()> {
+        assert_eq!(
+            scales.len(),
+            self.shape[0],
+            "channel scales length ({}) must match shape[0] ({})",
+            scales.len(),
+            self.shape[0]
+        );
+        self.d_channel_scales = Some(ctx.device().htod_sync_copy(scales)?);
+        Ok(())
+    }
+
+    /// Get the per-channel scale factors on GPU, if set.
+    #[must_use]
+    pub fn d_channel_scales(&self) -> Option<&CudaSlice<f32>> {
+        self.d_channel_scales.as_ref()
     }
 
     /// Total number of logical elements
@@ -305,6 +338,7 @@ impl QuantizedTensor {
             group_size: Some(group_size),
             weight_scale: 1.0,
             d_weight_scale: None,
+            d_channel_scales: None,
         })
     }
 

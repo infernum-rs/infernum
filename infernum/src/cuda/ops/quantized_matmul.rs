@@ -40,6 +40,8 @@ const AWQ_MATMUL_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/awq
 
 const FP8_QUANTIZE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/fp8_quantize.ptx"));
 
+const SCALE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/scale.ptx"));
+
 // ---------------------------------------------------------------------------
 // FP8 cuBLAS helpers
 // ---------------------------------------------------------------------------
@@ -125,11 +127,7 @@ fn execute_fp8_gemm(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor<f32>> {
-    use cudarc::cublaslt::{result as lt_result, sys as lt_sys};
-
-    let blas_lt = ctx.blas_lt();
-
-    // Weight scale: use pre-cached device buffer if available, else create one
+    // Resolve weight scale from the tensor
     let d_scale_b_owned;
     let d_scale_b = if let Some(s) = weight.d_weight_scale() {
         s
@@ -137,6 +135,24 @@ fn execute_fp8_gemm(
         d_scale_b_owned = ctx.device().htod_sync_copy(&[weight.weight_scale()])?;
         &d_scale_b_owned
     };
+    execute_fp8_gemm_with_scale(ctx, act_fp8, weight, d_inv_scale_a, d_scale_b, m, n, k)
+}
+
+/// Core cuBLASLt FP8 GEMM with an explicit weight scale buffer.
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+fn execute_fp8_gemm_with_scale(
+    ctx: &CudaContext,
+    act_fp8: &CudaSlice<u8>,
+    weight: &QuantizedTensor,
+    d_inv_scale_a: &CudaSlice<f32>,
+    d_scale_b: &CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaTensor<f32>> {
+    use cudarc::cublaslt::{result as lt_result, sys as lt_sys};
+
+    let blas_lt = ctx.blas_lt();
 
     let fp8_type = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
     let f32_type = lt_sys::cudaDataType_t::CUDA_R_32F;
@@ -255,7 +271,41 @@ fn quantized_matmul_fp8_cublas(
     k: usize,
 ) -> Result<CudaTensor<f32>> {
     let (act_fp8, d_inv_scale_a) = quantize_activations_to_fp8(ctx, input, m * k)?;
-    execute_fp8_gemm(ctx, &act_fp8, weight, &d_inv_scale_a, m, n, k)
+
+    if let Some(channel_scales) = weight.d_channel_scales() {
+        // Per-channel scales: run GEMM with weight_scale=1.0, then post-multiply
+        let d_one = ctx.device().htod_sync_copy(&[1.0_f32])?;
+        let mut output =
+            execute_fp8_gemm_with_scale(ctx, &act_fp8, weight, &d_inv_scale_a, &d_one, m, n, k)?;
+
+        // Apply per-channel scales: output[m, n] *= channel_scales[n]
+        let total = m * n;
+        let device = ctx.device();
+        let module_name = "scale";
+        if !device.has_func(module_name, "scale_rows_f32") {
+            device.load_ptx(
+                cudarc::nvrtc::Ptx::from_src(SCALE_PTX),
+                module_name,
+                &["scale_f32", "scale_rows_f32"],
+            )?;
+        }
+        let func = device.get_func(module_name, "scale_rows_f32").unwrap();
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    output.cuda_slice_mut(),
+                    channel_scales,
+                    n as i32,
+                    total as i32,
+                ),
+            )?;
+        }
+        Ok(output)
+    } else {
+        execute_fp8_gemm(ctx, &act_fp8, weight, &d_inv_scale_a, m, n, k)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +587,16 @@ fn quantized_matmul_2d(
             if input.context().supports_fp8_tensor_cores() && n >= 16 && k >= 16 {
                 return quantized_matmul_fp8_cublas(input.context(), input, weight, m, n, k);
             }
+
+            // Per-channel scales: use stored buffer or broadcast scalar
+            let scales_owned;
+            let scales_slice = if let Some(cs) = weight.d_channel_scales() {
+                cs
+            } else {
+                scales_owned = device.htod_sync_copy(&vec![weight.weight_scale(); n])?;
+                &scales_owned
+            };
+
             let func = device.get_func(module_name, "matmul_fp8_f32").unwrap();
             unsafe {
                 func.launch(
@@ -545,7 +605,7 @@ fn quantized_matmul_2d(
                         output.cuda_slice_mut(),
                         &input.cuda_slice(),
                         weight.data_slice(),
-                        weight.weight_scale(),
+                        scales_slice,
                         m as i32,
                         n as i32,
                         k as i32,
@@ -2422,6 +2482,106 @@ mod tests {
                 expected[i],
                 diff
             );
+        }
+    }
+
+    #[test]
+    fn test_fp8_channel_scales_custom_kernel() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 2;
+        let k = 32;
+        let n = 4;
+
+        let mut state: u64 = 99999;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        let w_f32: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+        let w_fp8: Vec<u8> = w_f32.iter().map(|&v| f32_to_fp8_e4m3(v)).collect();
+        let channel_scales: Vec<f32> = (0..n).map(|_| rand_f32().abs() + 0.1).collect();
+
+        let mut weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::F8E4M3, &w_fp8, &[]).unwrap();
+        weight.set_channel_scales(&ctx, &channel_scales).unwrap();
+
+        let output = quantized_matmul(&input, &weight).unwrap();
+        let result = output.to_vec().unwrap();
+
+        // Reference: matmul then per-channel scale
+        let ref_unscaled = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);
+        for row in 0..m {
+            for col in 0..n {
+                let i = row * n + col;
+                let expected = ref_unscaled[i] * channel_scales[col];
+                let tol = expected.abs() * 0.15 + 0.5;
+                assert!(
+                    (result[i] - expected).abs() < tol,
+                    "FP8 channel_scales custom [{row},{col}]: {} vs expected {} (diff={})",
+                    result[i],
+                    expected,
+                    (result[i] - expected).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fp8_channel_scales_cublas() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        if !ctx.supports_fp8_tensor_cores() {
+            eprintln!("Skipping FP8 cuBLAS channel_scales test: no FP8 tensor cores");
+            return;
+        }
+
+        let m = 16;
+        let k = 32;
+        let n = 16;
+
+        let mut state: u64 = 77777;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        let w_f32: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+        let w_fp8: Vec<u8> = w_f32.iter().map(|&v| f32_to_fp8_e4m3(v)).collect();
+        let channel_scales: Vec<f32> = (0..n).map(|_| rand_f32().abs() + 0.1).collect();
+
+        let mut weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::F8E4M3, &w_fp8, &[]).unwrap();
+        weight.set_channel_scales(&ctx, &channel_scales).unwrap();
+
+        let output = quantized_matmul_fp8_cublas(&ctx, &input, &weight, m, n, k).unwrap();
+        let result = output.to_vec().unwrap();
+
+        // Reference: matmul then per-channel scale
+        let ref_unscaled = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);
+        for row in 0..m {
+            for col in 0..n {
+                let i = row * n + col;
+                let expected = ref_unscaled[i] * channel_scales[col];
+                let tol = expected.abs() * 0.2 + 0.5;
+                assert!(
+                    (result[i] - expected).abs() < tol,
+                    "FP8 channel_scales cuBLAS [{row},{col}]: {} vs expected {} (diff={})",
+                    result[i],
+                    expected,
+                    (result[i] - expected).abs()
+                );
+            }
         }
     }
 }
