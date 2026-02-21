@@ -61,6 +61,38 @@ pub trait WeightLoader {
         )))
     }
 
+    /// Load a GPTQ INT4 quantized linear layer from `{prefix}.qweight`,
+    /// `{prefix}.scales`, and `{prefix}.qzeros` tensors.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedDtype` by default. Overridden by `SafeTensorsLoader`.
+    fn load_gptq_linear(
+        &self,
+        _ctx: &CudaContext,
+        _prefix: &str,
+        _group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        Err(Error::UnsupportedDtype(
+            "load_gptq_linear not supported by this loader".into(),
+        ))
+    }
+
+    /// Load an AWQ INT4 quantized linear layer from `{prefix}.qweight`,
+    /// `{prefix}.scales`, and `{prefix}.qzeros` tensors.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedDtype` by default. Overridden by `SafeTensorsLoader`.
+    fn load_awq_linear(
+        &self,
+        _ctx: &CudaContext,
+        _prefix: &str,
+        _group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        Err(Error::UnsupportedDtype(
+            "load_awq_linear not supported by this loader".into(),
+        ))
+    }
+
     /// Load an f32 tensor, slicing according to the shard strategy.
     ///
     /// For `Column`: splits along dim 0 (output features / rows).

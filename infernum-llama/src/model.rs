@@ -401,11 +401,28 @@ where
         /// Load a linear weight — quantized if the tensor uses a quantized dtype,
         /// otherwise dense (pre-transposed). For FP8 weights, also loads the
         /// companion `weight_scale` tensor if present.
+        ///
+        /// When `quant_config` is `Some`, uses GPTQ or AWQ loading instead of
+        /// the generic `load_quantized` path.
         fn load_linear<T: TensorDType + DeviceRepr>(
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
+            quant_config: Option<&crate::QuantizationConfig>,
         ) -> Result<LinearWeight<T>> {
+            // GPTQ/AWQ: load via dedicated loader using the layer prefix
+            if let Some(qc) = quant_config {
+                let prefix = name
+                    .strip_suffix(".weight")
+                    .expect("GPTQ/AWQ weight name must end with .weight");
+                let qt = match qc.quant_method.as_str() {
+                    "gptq" => loader.load_gptq_linear(ctx, prefix, qc.group_size)?,
+                    "awq" => loader.load_awq_linear(ctx, prefix, qc.group_size)?,
+                    other => panic!("unsupported quant_method: {other}"),
+                };
+                return Ok(LinearWeight::Quantized(qt));
+            }
+
             let dtype = loader.get_dtype(name)?;
             if dtype.is_quantized() {
                 let mut qt = loader.load_quantized(ctx, name)?;
@@ -452,6 +469,8 @@ where
             }
         }
 
+        let qc = config.quantization_config.as_ref();
+
         // Load embeddings
         let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
 
@@ -471,11 +490,13 @@ where
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.k_proj.weight"),
+                        qc,
                     )?;
                     let v = load_linear::<T>(
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.v_proj.weight"),
+                        qc,
                     )?;
                     let kv_proj = match (k, v) {
                         (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
@@ -494,12 +515,14 @@ where
                             ctx,
                             loader,
                             &format!("{prefix}.self_attn.q_proj.weight"),
+                            qc,
                         )?,
                         kv_proj,
                         o_proj: load_linear::<T>(
                             ctx,
                             loader,
                             &format!("{prefix}.self_attn.o_proj.weight"),
+                            qc,
                         )?,
                     }
                 },
@@ -509,10 +532,14 @@ where
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
                 mlp: {
-                    let gate =
-                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.gate_proj.weight"))?;
+                    let gate = load_linear::<T>(
+                        ctx,
+                        loader,
+                        &format!("{prefix}.mlp.gate_proj.weight"),
+                        qc,
+                    )?;
                     let up =
-                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.up_proj.weight"))?;
+                        load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.up_proj.weight"), qc)?;
                     let gate_up = match (gate, up) {
                         (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
                             weight: concat_weights(&g, &u)?,
@@ -529,6 +556,7 @@ where
                             ctx,
                             loader,
                             &format!("{prefix}.mlp.down_proj.weight"),
+                            qc,
                         )?,
                     }
                 },
@@ -554,7 +582,7 @@ where
                 LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
             }
         } else {
-            load_linear::<T>(ctx, loader, "lm_head.weight")?
+            load_linear::<T>(ctx, loader, "lm_head.weight", None)?
         };
 
         // Precompute RoPE cache in f32, then convert to T
@@ -605,14 +633,28 @@ where
         nccl_comm: NcclCommunicator,
     ) -> Result<Self> {
         /// Load a sharded linear weight. Quantized weights fall back to
-        /// `Replicate` (sharding block-quantized formats is unsupported).
+        /// `Replicate` (sharding quantized formats is unsupported).
         fn load_linear_sharded<T: TensorDType + DeviceRepr>(
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
             shard: &ShardConfig,
             strategy: ShardStrategy,
+            quant_config: Option<&crate::QuantizationConfig>,
         ) -> Result<LinearWeight<T>> {
+            // GPTQ/AWQ: load via dedicated loader (replicated, no sharding)
+            if let Some(qc) = quant_config {
+                let prefix = name
+                    .strip_suffix(".weight")
+                    .expect("GPTQ/AWQ weight name must end with .weight");
+                let qt = match qc.quant_method.as_str() {
+                    "gptq" => loader.load_gptq_linear(ctx, prefix, qc.group_size)?,
+                    "awq" => loader.load_awq_linear(ctx, prefix, qc.group_size)?,
+                    other => panic!("unsupported quant_method: {other}"),
+                };
+                return Ok(LinearWeight::Quantized(qt));
+            }
+
             let dtype = loader.get_dtype(name)?;
             if dtype.is_quantized() {
                 let mut qt =
@@ -677,6 +719,8 @@ where
             config.intermediate_size
         );
 
+        let qc = config.quantization_config.as_ref();
+
         // Embeddings and norms are replicated
         let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
 
@@ -705,6 +749,7 @@ where
                         &q_name,
                         &shard,
                         shard_strategy_for_weight(&q_name),
+                        qc,
                     )?;
                     let k_proj = load_linear_sharded::<T>(
                         ctx,
@@ -712,6 +757,7 @@ where
                         &k_name,
                         &shard,
                         shard_strategy_for_weight(&k_name),
+                        qc,
                     )?;
                     let v_proj = load_linear_sharded::<T>(
                         ctx,
@@ -719,6 +765,7 @@ where
                         &v_name,
                         &shard,
                         shard_strategy_for_weight(&v_name),
+                        qc,
                     )?;
 
                     // With TP we keep K/V separate — fusing sharded weights
@@ -737,6 +784,7 @@ where
                             &o_name,
                             &shard,
                             shard_strategy_for_weight(&o_name),
+                            qc,
                         )?,
                     }
                 },
@@ -756,6 +804,7 @@ where
                         &gate_name,
                         &shard,
                         shard_strategy_for_weight(&gate_name),
+                        qc,
                     )?;
                     let up = load_linear_sharded::<T>(
                         ctx,
@@ -763,6 +812,7 @@ where
                         &up_name,
                         &shard,
                         shard_strategy_for_weight(&up_name),
+                        qc,
                     )?;
 
                     // Keep gate/up separate for the same reason as K/V
@@ -779,6 +829,7 @@ where
                             &down_name,
                             &shard,
                             shard_strategy_for_weight(&down_name),
+                            qc,
                         )?,
                     }
                 },
@@ -807,6 +858,7 @@ where
                 "lm_head.weight",
                 &shard,
                 ShardStrategy::Replicate,
+                None,
             )?
         };
 

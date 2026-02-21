@@ -412,6 +412,24 @@ impl WeightLoader for SafeTensorsLoader {
         }
     }
 
+    fn load_gptq_linear(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        Self::load_gptq_linear(self, ctx, prefix, group_size)
+    }
+
+    fn load_awq_linear(
+        &self,
+        ctx: &CudaContext,
+        prefix: &str,
+        group_size: usize,
+    ) -> Result<QuantizedTensor> {
+        Self::load_awq_linear(self, ctx, prefix, group_size)
+    }
+
     fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
         let meta = self
             .tensors
