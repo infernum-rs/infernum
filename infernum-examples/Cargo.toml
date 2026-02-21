@@ -8,6 +8,7 @@ build = "build.rs"
 [features]
 default = []
 cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-runtime/cuda", "cudarc"]
+nccl = ["cuda", "infernum/nccl", "infernum-llama/nccl", "infernum-runtime/nccl"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
@@ -19,6 +20,14 @@ infernum-runtime = { path = "../infernum-runtime" }
 [[example]]
 name = "generate"
 required-features = ["cuda"]
+
+[[example]]
+name = "generate_parallel"
+required-features = ["nccl"]
+
+[[example]]
+name = "verify_parallel"
+required-features = ["nccl"]
 
 [[example]]
 name = "bench"

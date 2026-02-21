@@ -8,6 +8,8 @@ build = "build.rs"
 default = []
 # Enable CUDA support - requires CUDA toolkit installed
 cuda = ["cudarc"]
+# Enable NCCL for multi-GPU tensor parallelism (requires libnccl)
+nccl = ["cuda", "cudarc/nccl"]
 # Force fused kernels even in debug builds
 force-fuse = []
 # Disable fused kernels even in release builds

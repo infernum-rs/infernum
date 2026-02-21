@@ -12,6 +12,7 @@ static __device__ __forceinline__ float warp_reduce_sum(float val) {
 
 // Block-level sum reduction: warp shuffle + shared memory for inter-warp
 // Shared memory needs (block_size / 32) floats when block_size > 32.
+// Returns the total sum to ALL threads in the block.
 static __device__ __forceinline__ float block_reduce_sum(float val, float* shared) {
     const int lane_id = threadIdx.x % 32;
     const int warp_id = threadIdx.x / 32;
@@ -28,11 +29,17 @@ static __device__ __forceinline__ float block_reduce_sum(float val, float* share
     __syncthreads();
 
     // First warp reduces the per-warp sums
-    val = (lane_id < (int)(blockDim.x / 32)) ? shared[lane_id] : 0.0f;
     if (warp_id == 0) {
+        val = (lane_id < (int)(blockDim.x / 32)) ? shared[lane_id] : 0.0f;
         val = warp_reduce_sum(val);
+        // Broadcast result to shared memory so all warps can read it
+        if (lane_id == 0) {
+            shared[0] = val;
+        }
     }
-    return val;
+    __syncthreads();
+
+    return shared[0];
 }
 
 // ============================================================================

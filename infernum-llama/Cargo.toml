@@ -6,6 +6,8 @@ edition = "2021"
 [features]
 default = []
 cuda = ["infernum/cuda", "infernum-runtime/cuda"]
+nccl = ["cuda", "infernum/nccl"]
+integration = ["cuda"]
 
 [dependencies]
 infernum = { path = "../infernum" }
@@ -15,3 +17,4 @@ serde_json = "1.0"
 
 [dev-dependencies]
 infernum-runtime = { path = "../infernum-runtime" }
+ureq = { version = "3", features = ["json"] }

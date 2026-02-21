@@ -3,7 +3,8 @@
 #![allow(
     clippy::struct_field_names, // _proj suffix is conventional for Llama weights
     clippy::no_effect_underscore_binding,
-    clippy::doc_markdown // tensor shape docs trigger false positives
+    clippy::doc_markdown, // tensor shape docs trigger false positives
+    unused_mut // variables are conditionally mutated via cfg(feature = "nccl")
 )]
 
 use std::path::Path;
@@ -16,11 +17,38 @@ use infernum::cuda::ops::{
     transpose_2d, GemmScalar,
 };
 use infernum::cuda::{
-    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, QuantizedTensor,
-    ValidAsZeroBits,
+    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, QuantizedTensor,
+    ShardStrategy, ValidAsZeroBits,
 };
+#[cfg(feature = "nccl")]
+use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig};
 use infernum::dtype::TensorDType;
 use infernum::tensor::Tensor;
+
+/// When NCCL is enabled, `MaybeNcclType` is `NcclType` — only types that
+/// support NCCL all-reduce satisfy it. When NCCL is disabled, it's a blanket
+/// trait so all tensor types work without NCCL-specific bounds.
+#[cfg(feature = "nccl")]
+trait MaybeNcclType: NcclType {}
+#[cfg(feature = "nccl")]
+impl<T: NcclType> MaybeNcclType for T {}
+
+#[cfg(not(feature = "nccl"))]
+trait MaybeNcclType {}
+#[cfg(not(feature = "nccl"))]
+impl<T> MaybeNcclType for T {}
+
+#[cfg(feature = "nccl")]
+fn nccl_all_reduce<T>(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor<T>) -> Result<()>
+where
+    T: TensorDType + DeviceRepr + ValidAsZeroBits + NcclType,
+{
+    if let Some(comm) = comm {
+        comm.all_reduce_sum_inplace(tensor)?;
+    }
+    Ok(())
+}
+
 use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 use infernum::KvCache;
 use infernum::Result;
@@ -170,6 +198,33 @@ fn load_typed<T: TensorDType + DeviceRepr>(
     }
 }
 
+/// Load a tensor with sharding, dispatching by `T::DTYPE`.
+#[cfg(feature = "nccl")]
+fn load_typed_sharded<T: TensorDType + DeviceRepr>(
+    loader: &impl WeightLoader,
+    ctx: &CudaContext,
+    name: &str,
+    shard: &ShardConfig,
+    strategy: ShardStrategy,
+) -> Result<CudaTensor<T>> {
+    use infernum::dtype::DType;
+    match T::DTYPE {
+        DType::F32 => {
+            let t = loader.load_f32_sharded(ctx, name, shard, strategy)?;
+            Ok(reinterpret_tensor(t))
+        }
+        DType::F16 => {
+            let t = loader.load_f16_sharded(ctx, name, shard, strategy)?;
+            Ok(reinterpret_tensor(t))
+        }
+        DType::BF16 => {
+            let t = loader.load_bf16_sharded(ctx, name, shard, strategy)?;
+            Ok(reinterpret_tensor(t))
+        }
+        other => panic!("Unsupported dtype for load_typed_sharded: {other}"),
+    }
+}
+
 /// Reinterpret a `CudaTensor<A>` as `CudaTensor<B>` when both have the same
 /// layout (same `DType`). This is a zero-cost cast (no copy, no kernel).
 ///
@@ -264,6 +319,15 @@ struct LlamaLayerWeights<T: TensorDType> {
 pub struct LlamaModel<T: TensorDType> {
     config: LlamaConfig,
     ctx: CudaContext,
+    #[allow(dead_code)]
+    gpu_config: GpuConfig,
+
+    #[cfg(feature = "nccl")]
+    nccl_comm: Option<NcclCommunicator>,
+
+    // Per-GPU head counts (== full counts for single-GPU, divided for TP)
+    tp_num_heads: usize,
+    tp_num_kv_heads: usize,
 
     // Embeddings
     embed_tokens: CudaTensor<T>,
@@ -282,9 +346,10 @@ pub struct LlamaModel<T: TensorDType> {
     sin_cache: CudaTensor<T>,
 }
 
+#[allow(private_bounds)]
 impl<T> LlamaModel<T>
 where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits,
+    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
     CudaBlas: Gemm<T>,
 {
     /// Load a Llama model from a directory containing SafeTensors and config.json
@@ -302,6 +367,28 @@ where
         let loader = SafeTensorsLoader::from_directory(model_path)?;
 
         Self::load_weights(ctx, config, &loader)
+    }
+
+    /// Load a Llama model with tensor-parallel sharding across multiple GPUs.
+    ///
+    /// Requires SafeTensors format (FP8/BF16). GGUF is not supported for
+    /// multi-GPU because sharding block-quantized formats is non-trivial.
+    ///
+    /// # Errors
+    /// Returns an error if loading fails or if head counts are not evenly
+    /// divisible by the world size.
+    #[cfg(feature = "nccl")]
+    pub fn from_pretrained_sharded(
+        ctx: &CudaContext,
+        model_path: impl AsRef<Path>,
+        gpu_config: GpuConfig,
+        nccl_comm: NcclCommunicator,
+    ) -> Result<Self> {
+        let model_path = model_path.as_ref();
+        let config_path = model_path.join("config.json");
+        let config = LlamaConfig::from_file(&config_path)?;
+        let loader = SafeTensorsLoader::from_directory(model_path)?;
+        Self::load_weights_sharded(ctx, config, &loader, gpu_config, nccl_comm)
     }
 
     /// Load model weights from a weight loader
@@ -488,8 +575,264 @@ where
         };
 
         Ok(Self {
+            tp_num_heads: config.num_attention_heads,
+            tp_num_kv_heads: config.num_kv_heads(),
             config,
             ctx: ctx.clone(),
+            gpu_config: GpuConfig::Single,
+            #[cfg(feature = "nccl")]
+            nccl_comm: None,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+        })
+    }
+
+    /// Load model weights with tensor-parallel sharding.
+    ///
+    /// Only supports dense (non-quantized) linear weights — FP8 quantized
+    /// weights use `Replicate` strategy and are not sharded.
+    #[cfg(feature = "nccl")]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    fn load_weights_sharded(
+        ctx: &CudaContext,
+        config: LlamaConfig,
+        loader: &impl WeightLoader,
+        gpu_config: GpuConfig,
+        nccl_comm: NcclCommunicator,
+    ) -> Result<Self> {
+        /// Load a sharded linear weight. Quantized weights fall back to
+        /// `Replicate` (sharding block-quantized formats is unsupported).
+        fn load_linear_sharded<T: TensorDType + DeviceRepr>(
+            ctx: &CudaContext,
+            loader: &impl WeightLoader,
+            name: &str,
+            shard: &ShardConfig,
+            strategy: ShardStrategy,
+        ) -> Result<LinearWeight<T>> {
+            let dtype = loader.get_dtype(name)?;
+            if dtype.is_quantized() {
+                let mut qt =
+                    loader.load_quantized_sharded(ctx, name, shard, ShardStrategy::Replicate)?;
+                let scale_name = format!("{name}_scale");
+                if loader.contains(&scale_name) {
+                    let scale_tensor = loader.load_f32(ctx, &scale_name)?;
+                    let scale_val = scale_tensor.to_vec()?;
+                    qt.set_weight_scale(ctx, scale_val[0])?;
+                }
+                Ok(LinearWeight::Quantized(qt))
+            } else {
+                let f32_weight = loader.load_f32_sharded(ctx, name, shard, strategy)?;
+                let transposed = pretranspose_weight(&f32_weight)?;
+                if T::DTYPE == infernum::dtype::DType::F32 {
+                    Ok(LinearWeight::Dense(reinterpret_tensor(transposed)))
+                } else {
+                    let native = load_typed_sharded::<T>(loader, ctx, name, shard, strategy)?;
+                    let shape = native.shape().to_vec();
+                    let data = native.to_vec()?;
+                    let rows = shape[0];
+                    let cols = shape[1];
+                    let mut transposed_data = vec![T::default(); data.len()];
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            transposed_data[c * rows + r] = data[r * cols + c];
+                        }
+                    }
+                    Ok(LinearWeight::Dense(CudaTensor::from_slice(
+                        ctx,
+                        &[cols, rows],
+                        &transposed_data,
+                    )?))
+                }
+            }
+        }
+
+        let shard = match &gpu_config {
+            GpuConfig::Sharded(s) => *s,
+            GpuConfig::Single => {
+                return Self::load_weights(ctx, config, loader).map(|mut m| {
+                    m.nccl_comm = Some(nccl_comm);
+                    m
+                })
+            }
+        };
+        let world_size = shard.world_size;
+
+        assert!(
+            config.num_attention_heads.is_multiple_of(world_size),
+            "num_attention_heads ({}) must be divisible by world_size ({world_size})",
+            config.num_attention_heads
+        );
+        assert!(
+            config.num_kv_heads().is_multiple_of(world_size),
+            "num_kv_heads ({}) must be divisible by world_size ({world_size})",
+            config.num_kv_heads()
+        );
+        assert!(
+            config.intermediate_size.is_multiple_of(world_size),
+            "intermediate_size ({}) must be divisible by world_size ({world_size})",
+            config.intermediate_size
+        );
+
+        // Embeddings and norms are replicated
+        let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
+
+        let tp_num_heads = config.num_attention_heads / world_size;
+        let tp_num_kv_heads = config.num_kv_heads() / world_size;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            let layer = LlamaLayerWeights {
+                input_layernorm: load_typed::<T>(
+                    loader,
+                    ctx,
+                    &format!("{prefix}.input_layernorm.weight"),
+                )?,
+                attention: {
+                    let q_name = format!("{prefix}.self_attn.q_proj.weight");
+                    let k_name = format!("{prefix}.self_attn.k_proj.weight");
+                    let v_name = format!("{prefix}.self_attn.v_proj.weight");
+                    let o_name = format!("{prefix}.self_attn.o_proj.weight");
+
+                    let q_proj = load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &q_name,
+                        &shard,
+                        shard_strategy_for_weight(&q_name),
+                    )?;
+                    let k_proj = load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &k_name,
+                        &shard,
+                        shard_strategy_for_weight(&k_name),
+                    )?;
+                    let v_proj = load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &v_name,
+                        &shard,
+                        shard_strategy_for_weight(&v_name),
+                    )?;
+
+                    // With TP we keep K/V separate — fusing sharded weights
+                    // would require matching the shard boundary to the K/V split.
+                    let kv_proj = KvProjWeight::Separate {
+                        k_proj: Box::new(k_proj),
+                        v_proj: Box::new(v_proj),
+                    };
+
+                    LlamaAttentionWeights {
+                        q_proj,
+                        kv_proj,
+                        o_proj: load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &o_name,
+                            &shard,
+                            shard_strategy_for_weight(&o_name),
+                        )?,
+                    }
+                },
+                post_attention_layernorm: load_typed::<T>(
+                    loader,
+                    ctx,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                )?,
+                mlp: {
+                    let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+                    let up_name = format!("{prefix}.mlp.up_proj.weight");
+                    let down_name = format!("{prefix}.mlp.down_proj.weight");
+
+                    let gate = load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &gate_name,
+                        &shard,
+                        shard_strategy_for_weight(&gate_name),
+                    )?;
+                    let up = load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &up_name,
+                        &shard,
+                        shard_strategy_for_weight(&up_name),
+                    )?;
+
+                    // Keep gate/up separate for the same reason as K/V
+                    let gate_up = GateUpWeight::Separate {
+                        gate_proj: Box::new(gate),
+                        up_proj: Box::new(up),
+                    };
+
+                    LlamaMlpWeights {
+                        gate_up,
+                        down_proj: load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &down_name,
+                            &shard,
+                            shard_strategy_for_weight(&down_name),
+                        )?,
+                    }
+                },
+            };
+
+            layers.push(layer);
+        }
+
+        // Final norm and lm_head are replicated
+        let norm = load_typed::<T>(loader, ctx, "model.norm.weight")?;
+        let lm_head = if config.tie_word_embeddings {
+            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let transposed = pretranspose_weight(&embed_f32)?;
+            if T::DTYPE == infernum::dtype::DType::F32 {
+                LinearWeight::Dense(reinterpret_tensor(transposed))
+            } else {
+                let shape = transposed.shape().to_vec();
+                let data_f32 = transposed.to_vec()?;
+                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
+                LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
+            }
+        } else {
+            load_linear_sharded::<T>(
+                ctx,
+                loader,
+                "lm_head.weight",
+                &shard,
+                ShardStrategy::Replicate,
+            )?
+        };
+
+        let (cos_f32, sin_f32) = precompute_rope_cache(
+            ctx,
+            config.max_position_embeddings,
+            config.head_dim(),
+            config.rope_theta,
+        )?;
+        let (cos_cache, sin_cache) = if T::DTYPE == infernum::dtype::DType::F32 {
+            (reinterpret_tensor(cos_f32), reinterpret_tensor(sin_f32))
+        } else {
+            let cos_data: Vec<T> = cos_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
+            let sin_data: Vec<T> = sin_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
+            let cos = CudaTensor::from_slice(ctx, cos_f32.shape(), &cos_data)?;
+            let sin = CudaTensor::from_slice(ctx, sin_f32.shape(), &sin_data)?;
+            (cos, sin)
+        };
+
+        Ok(Self {
+            tp_num_heads,
+            tp_num_kv_heads,
+            config,
+            ctx: ctx.clone(),
+            gpu_config,
+            nccl_comm: Some(nccl_comm),
             embed_tokens,
             layers,
             norm,
@@ -607,9 +950,8 @@ where
         position_offset: usize,
     ) -> Result<CudaTensor<T>> {
         let seq_len = hidden.shape()[0];
-        let hidden_size = self.config.hidden_size;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_kv_heads();
+        let num_heads = self.tp_num_heads;
+        let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
         // Project Q, K, V
@@ -655,11 +997,14 @@ where
             fused_attention_prefill(&q, &k_full, &v_full, kv_cache.current_len())?
         };
 
-        // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
-        let attn_output = attn_output.reshape(&[seq_len, hidden_size]);
+        // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, num_heads * head_dim)
+        let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
 
-        // Output projection
-        linear(&attn_output, &weights.o_proj)
+        // Output projection (row-parallel in TP: needs all-reduce)
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// Extract the last row from a (seq_len, hidden_size) tensor
@@ -782,9 +1127,8 @@ where
         layer_idx: usize,
         kv_cache: &mut KvCache<T>,
     ) -> Result<CudaTensor<T>> {
-        let hidden_size = self.config.hidden_size;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_kv_heads();
+        let num_heads = self.tp_num_heads;
+        let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
         // Project Q, K, V
@@ -830,8 +1174,11 @@ where
             kv_cache.graph_max_seq_len(),
         )?;
 
-        let attn_output = attn_output.reshape(&[1, hidden_size]);
-        linear(&attn_output, &weights.o_proj)
+        let attn_output = attn_output.reshape(&[1, num_heads * head_dim]);
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// Forward pass through MLP (SwiGLU)
@@ -869,8 +1216,11 @@ where
         // SwiGLU activation
         let intermediate = swiglu(&gate, &up)?;
 
-        // Down projection
-        linear(&intermediate, &weights.down_proj)
+        // Down projection (row-parallel in TP: needs all-reduce)
+        let mut out = linear(&intermediate, &weights.down_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// Project hidden states to vocabulary logits (always f32)
@@ -1049,8 +1399,13 @@ impl LlamaModel<f32> {
         )?;
 
         Ok(Self {
+            tp_num_heads: config.num_attention_heads,
+            tp_num_kv_heads: config.num_kv_heads(),
             config,
             ctx: ctx.clone(),
+            gpu_config: GpuConfig::Single,
+            #[cfg(feature = "nccl")]
+            nccl_comm: None,
             embed_tokens,
             layers,
             norm,
@@ -1128,9 +1483,8 @@ impl LlamaModel<f32> {
         weights: &LlamaAttentionWeights<f32>,
     ) -> Result<CudaTensor<f32>> {
         let seq_len = hidden.shape()[0];
-        let hidden_size = self.config.hidden_size;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_kv_heads();
+        let num_heads = self.tp_num_heads;
+        let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
         // Project Q, K, V
@@ -1158,8 +1512,8 @@ impl LlamaModel<f32> {
 
         // Expand K, V for GQA if needed
         let (k, v) = if num_kv_heads < num_heads {
-            let k = repeat_kv(&k, self.config.num_heads_per_kv())?;
-            let v = repeat_kv(&v, self.config.num_heads_per_kv())?;
+            let k = repeat_kv(&k, num_heads / num_kv_heads)?;
+            let v = repeat_kv(&v, num_heads / num_kv_heads)?;
             (k, v)
         } else {
             (k, v)
@@ -1168,17 +1522,21 @@ impl LlamaModel<f32> {
         // Compute attention
         let attn_output = attention(&q, &k, &v, true)?;
 
-        // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
-        let attn_output = attn_output.reshape(&[seq_len, hidden_size]);
+        // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, num_heads * head_dim)
+        let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
 
-        // Output projection
-        linear(&attn_output, &weights.o_proj)
+        // Output projection (row-parallel in TP: needs all-reduce)
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 }
 
+#[allow(private_bounds)]
 impl<T> infernum::Model for LlamaModel<T>
 where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits,
+    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
     CudaBlas: Gemm<T>,
 {
     type CacheDtype = T;
@@ -1188,7 +1546,7 @@ where
         infernum::ModelConfig {
             num_layers: config.num_hidden_layers,
             max_seq_len: config.max_position_embeddings,
-            num_kv_heads: config.num_kv_heads(),
+            num_kv_heads: self.tp_num_kv_heads,
             head_dim: config.head_dim(),
             eos_token_id: config.eos_token_id,
         }
@@ -1203,10 +1561,9 @@ where
             // For the trait's forward (no KV cache), we use fused attention
             // to avoid the f32-only decomposed attention path.
             let seq_len = hidden.shape()[0];
-            let num_heads = self.config.num_attention_heads;
-            let num_kv_heads = self.config.num_kv_heads();
+            let num_heads = self.tp_num_heads;
+            let num_kv_heads = self.tp_num_kv_heads;
             let head_dim = self.config.head_dim();
-            let hidden_size = self.config.hidden_size;
 
             let q = linear(&normed, &layer.attention.q_proj)?;
             let (k, v) = match &layer.attention.kv_proj {
@@ -1229,8 +1586,10 @@ where
             let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
 
             let attn_output = fused_attention_prefill(&q, &k, &v, 0)?;
-            let attn_output = attn_output.reshape(&[seq_len, hidden_size]);
-            let attn_output = linear(&attn_output, &layer.attention.o_proj)?;
+            let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
+            let mut attn_output = linear(&attn_output, &layer.attention.o_proj)?;
+            #[cfg(feature = "nccl")]
+            nccl_all_reduce(self.nccl_comm.as_ref(), &mut attn_output)?;
 
             let (mut h, normed) = add_rmsnorm(
                 &hidden,
@@ -1280,6 +1639,37 @@ where
     ) -> Result<CudaTensor<f32>> {
         self.forward_next_token_indirect(token_id_gpu, kv_cache)
     }
+}
+
+/// Determine the sharding strategy for a given SafeTensors weight name.
+///
+/// - Column-parallel (split output dim): `q_proj`, `k_proj`, `v_proj`, `gate_proj`, `up_proj`
+/// - Row-parallel (split input dim): `o_proj`, `down_proj`
+/// - Replicate: norms, embeddings, RoPE caches, `lm_head`, scales, everything else
+#[allow(dead_code)]
+fn shard_strategy_for_weight(name: &str) -> ShardStrategy {
+    // Scale tensors are always replicated (per-tensor scalars)
+    if name.ends_with("_scale") {
+        return ShardStrategy::Replicate;
+    }
+
+    // Column-parallel projections (split along output dimension)
+    if name.ends_with("q_proj.weight")
+        || name.ends_with("k_proj.weight")
+        || name.ends_with("v_proj.weight")
+        || name.ends_with("gate_proj.weight")
+        || name.ends_with("up_proj.weight")
+    {
+        return ShardStrategy::Column;
+    }
+
+    // Row-parallel projections (split along input dimension)
+    if name.ends_with("o_proj.weight") || name.ends_with("down_proj.weight") {
+        return ShardStrategy::Row;
+    }
+
+    // Everything else: norms, embeddings, lm_head
+    ShardStrategy::Replicate
 }
 
 /// Linear projection: output = input @ weight
@@ -1808,5 +2198,54 @@ mod tests {
             tokens_naive, tokens_kv,
             "KV-cache generate should match naive generate"
         );
+    }
+
+    #[test]
+    fn test_shard_strategy_column_parallel() {
+        let column_names = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.5.self_attn.k_proj.weight",
+            "model.layers.31.self_attn.v_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+        ];
+        for name in &column_names {
+            assert!(
+                matches!(shard_strategy_for_weight(name), ShardStrategy::Column),
+                "{name} should be Column"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_strategy_row_parallel() {
+        let row_names = [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.31.mlp.down_proj.weight",
+        ];
+        for name in &row_names {
+            assert!(
+                matches!(shard_strategy_for_weight(name), ShardStrategy::Row),
+                "{name} should be Row"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_strategy_replicate() {
+        let replicate_names = [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight_scale",
+        ];
+        for name in &replicate_names {
+            assert!(
+                matches!(shard_strategy_for_weight(name), ShardStrategy::Replicate),
+                "{name} should be Replicate"
+            );
+        }
     }
 }

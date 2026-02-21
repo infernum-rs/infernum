@@ -208,6 +208,39 @@ mod tests {
     }
 
     #[test]
+    fn test_rmsnorm_multi_warp() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let hidden_size = 2048;
+        let input_data: Vec<f32> = (0..hidden_size)
+            .map(|i| ((i as f32) * 0.001 - 0.5).sin())
+            .collect();
+        let weight_data: Vec<f32> = vec![1.0; hidden_size];
+
+        let input = CudaTensor::from_slice(&ctx, &[1, hidden_size], &input_data).unwrap();
+        let weight = CudaTensor::from_slice(&ctx, &[hidden_size], &weight_data).unwrap();
+
+        let output = rms_norm(&input, &weight, 1e-6).unwrap();
+        let result = output.to_vec().unwrap();
+
+        let sum_sq: f32 = input_data.iter().map(|x| x * x).sum();
+        let rms = (sum_sq / hidden_size as f32).sqrt();
+        let expected: Vec<f32> = input_data.iter().map(|x| x / rms).collect();
+
+        for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-3,
+                "Mismatch at index {i}: {got} vs {exp} (rms={rms})"
+            );
+        }
+
+        assert!(
+            result.iter().all(|x| x.is_finite()),
+            "Output contains NaN or Inf"
+        );
+    }
+
+    #[test]
     fn test_rmsnorm_inplace() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
 
