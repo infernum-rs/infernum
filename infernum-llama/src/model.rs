@@ -415,12 +415,20 @@ where
                 let prefix = name
                     .strip_suffix(".weight")
                     .expect("GPTQ/AWQ weight name must end with .weight");
-                let qt = match qc.quant_method.as_str() {
-                    "gptq" => loader.load_gptq_linear(ctx, prefix, qc.group_size)?,
-                    "awq" => loader.load_awq_linear(ctx, prefix, qc.group_size)?,
-                    other => panic!("unsupported quant_method: {other}"),
-                };
-                return Ok(LinearWeight::Quantized(qt));
+                match qc.quant_method.as_str() {
+                    "gptq" => {
+                        let qt = loader.load_gptq_linear(ctx, prefix, qc.group_size)?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    "awq" => {
+                        let qt = loader.load_awq_linear(ctx, prefix, qc.group_size)?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    _ => {
+                        // Unknown quant method (e.g. "compressed-tensors") —
+                        // fall through to standard weight loading
+                    }
+                }
             }
 
             let dtype = loader.get_dtype(name)?;
@@ -648,24 +656,32 @@ where
                 let prefix = name
                     .strip_suffix(".weight")
                     .expect("GPTQ/AWQ weight name must end with .weight");
-                let qt = match qc.quant_method.as_str() {
-                    "gptq" => loader.load_gptq_linear_sharded(
-                        ctx,
-                        prefix,
-                        qc.group_size,
-                        shard,
-                        strategy,
-                    )?,
-                    "awq" => loader.load_awq_linear_sharded(
-                        ctx,
-                        prefix,
-                        qc.group_size,
-                        shard,
-                        strategy,
-                    )?,
-                    other => panic!("unsupported quant_method: {other}"),
-                };
-                return Ok(LinearWeight::Quantized(qt));
+                match qc.quant_method.as_str() {
+                    "gptq" => {
+                        let qt = loader.load_gptq_linear_sharded(
+                            ctx,
+                            prefix,
+                            qc.group_size,
+                            shard,
+                            strategy,
+                        )?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    "awq" => {
+                        let qt = loader.load_awq_linear_sharded(
+                            ctx,
+                            prefix,
+                            qc.group_size,
+                            shard,
+                            strategy,
+                        )?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    _ => {
+                        // Unknown quant method (e.g. "compressed-tensors") —
+                        // fall through to standard weight loading
+                    }
+                }
             }
 
             let dtype = loader.get_dtype(name)?;
