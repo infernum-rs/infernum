@@ -157,14 +157,33 @@ Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
 
 - **SmolLM2-360M** (SafeTensors f32) — greedy generation correctness, no NaN/Inf in logits
 - **Llama-3.2-1B-Instruct FP8** (compressed-tensors) — no NaN/Inf in logits (generation quality test ignored for now)
+- **Llama-3.2-1B GPTQ** (GPTQ INT4, group_size=128) — greedy generation correctness, no NaN/Inf in logits
+- **Mixtral-tiny** (`jamesdborin/tiny-mixtral`, 2-layer MoE, ~988MB f32) — MoE loading/routing plumbing, no NaN/Inf in logits (random weights, no quality check)
 - GGUF integration tests are planned but not yet added
+
+**Ignored (large model) tests:**
+
+Some integration tests are marked `#[ignore]` because they require very large model downloads and GPU memory. They are skipped by default and must be run manually:
+
+```bash
+# Run all ignored tests
+cargo test -p infernum-llama --features integration -- --ignored --test-threads=1
+
+# Run a specific ignored test module
+cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_2x7b
+```
+
+Currently ignored:
+
+- **laser-dolphin-mixtral-2x7b-dpo** (`macadeliccc/laser-dolphin-mixtral-2x7b-dpo`, ~24GB bf16, 3 sharded SafeTensors) — validates MoE generation quality with real weights. Requires ~48GB VRAM (loaded as f32); fits on a single A100 80GB.
 
 **Writing new integration tests:**
 
 - Add a new `mod` block in `model_integration.rs` following the existing pattern (const `REPO`, `model_dir()` helper, test functions).
 - Use `download_model(repo_id)` to fetch model files — it handles caching automatically.
+- For sharded models, use `download_model_files(repo_id, &["file1", "file2", ...])` with an explicit file list.
 - Use `generate_greedy()` for deterministic generation tests.
-- Use `#[ignore = "reason"]` for tests that document known issues but shouldn't block CI.
+- Use `#[ignore = "reason"]` for tests that are too large for CI but validate quality with real weights.
 - Only use ungated HuggingFace models (no auth tokens required).
 
 ### Examples
