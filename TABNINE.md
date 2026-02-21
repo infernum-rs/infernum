@@ -188,4 +188,4 @@ An implementation guide is a design and implementation plan for a feature or opt
    - If all pass: commit and push.
    - Update the progress section in the implementation guide.
 5. As a final step, consider whether the work warrants new or updated integration tests (e.g., if it affects model output, adds a new weight format, or changes generation behavior). If so, add an integration test step to the guide.
-6. After all steps are complete, create a PR and merge.
+6. After all steps are complete, create a PR. **Never merge the PR** — only the human reviews and merges.
