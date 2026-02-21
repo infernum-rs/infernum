@@ -2,32 +2,21 @@
 //
 // Computes: output[m][n] = sum_k( input[m][k] * dequant(weight[k][n]) )
 //
-// GPTQ layout:
-//   qweight:  [in_features/8, out_features] as int32
-//             Each int32 packs 8 INT4 values (bits 0-3 = element 0, bits 4-7 = element 1, ...)
-//   scales:   [num_groups, out_features] as f16
-//             One scale per group of `group_size` input elements per output
-//   qzeros:   [num_groups, out_features/8] as int32
-//             Packed INT4 zero-points, same packing as qweight
+// GPTQ transposed layout (repacked at load time for coalesced GPU access):
+//   qweight:  [N, K/8] as int32  (row n holds all packed weights for output n)
+//             Each int32 packs 8 INT4 values (bits 0-3 = element 0, ...)
+//   scales:   [N, num_groups] as f16
+//   qzeros:   [N/8, num_groups] as int32  (packed INT4 zero-points)
 //
 // Dequantization: w = (qweight_val - (stored_qzero + 1)) * scale
 // AutoGPTQ stores qzeros with a -1 offset: stored = actual_zero_point - 1
 
-// Manual f16 → f32 decode (avoids cuda_fp16.h dependency in NVRTC)
+// f16 → f32 using PTX cvt instruction (single HW instruction on sm_70+,
+// avoids cuda_fp16.h dependency while being more efficient than bit tricks).
 __device__ float f16_to_f32(unsigned short bits) {
-    unsigned int sign = (bits >> 15) & 0x1;
-    unsigned int exp  = (bits >> 10) & 0x1F;
-    unsigned int mant = bits & 0x3FF;
-
     float result;
-    if (exp == 0) {
-        result = ldexpf((float)mant / 1024.0f, -14);
-    } else if (exp == 31) {
-        result = 0.0f;
-    } else {
-        result = ldexpf(1.0f + (float)mant / 1024.0f, (int)exp - 15);
-    }
-    return sign ? -result : result;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(bits));
+    return result;
 }
 
 // Each thread computes one (m, n) output element.
@@ -37,9 +26,9 @@ __device__ float f16_to_f32(unsigned short bits) {
 extern "C" __global__ void matmul_gptq_f32(
     float*       __restrict__ output,
     const float* __restrict__ input,
-    const int*   __restrict__ qweight,      // [K/8, N]
-    const unsigned short* __restrict__ scales,  // [K/group_size, N] as f16
-    const int*   __restrict__ qzeros,       // [K/group_size, N/8]
+    const int*   __restrict__ qweight,      // [N, K/8]
+    const unsigned short* __restrict__ scales,  // [N, num_groups] as f16
+    const int*   __restrict__ qzeros,       // [N/8, num_groups]
     const int M,
     const int N,
     const int K,
@@ -49,31 +38,24 @@ extern "C" __global__ void matmul_gptq_f32(
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (m >= M || n >= N) return;
 
-    const int packed_rows = K / 8;       // number of int32 rows in qweight
+    const int packed_per_row = K / 8;
     const int num_groups = K / group_size;
 
     float acc = 0.0f;
     const float* in_ptr = input + m * K;
 
-    // Iterate over packed rows (each int32 covers 8 input elements)
-    for (int pr = 0; pr < packed_rows; ++pr) {
-        int packed_val = qweight[pr * N + n];
+    for (int pr = 0; pr < packed_per_row; ++pr) {
+        int packed_val = qweight[n * packed_per_row + pr];
 
         int base_k = pr * 8;
-
-        // Determine which group these 8 elements belong to
         int group_idx = base_k / group_size;
 
-        // Get scale for this group
-        float scale = f16_to_f32(scales[group_idx * N + n]);
+        float scale = f16_to_f32(scales[n * num_groups + group_idx]);
 
-        // Get zero-point for this group
-        // AutoGPTQ stores qzeros with a -1 offset: stored = actual - 1
-        int qz_packed = qzeros[group_idx * (N / 8) + n / 8];
+        int qz_packed = qzeros[(n / 8) * num_groups + group_idx];
         int qz_shift = (n % 8) * 4;
         int qzero = ((qz_packed >> qz_shift) & 0xF) + 1;
 
-        // Unpack and dequantize 8 INT4 values
         for (int j = 0; j < 8; ++j) {
             int k = base_k + j;
             if (k >= K) break;
@@ -90,8 +72,8 @@ extern "C" __global__ void matmul_gptq_f32(
 // ---------------------------------------------------------------------------
 // dp4a GEMV kernel for GPTQ INT4 × Q8_1 (M=1 decode fast path)
 // ---------------------------------------------------------------------------
-// Same warp-parallel pattern as gemv_q4_q8_dp4a, but with GPTQ-specific
-// data layout (column-major qweight) and per-group zero-point correction.
+// Warp-parallel GEMV using dp4a (INT8 dot product with INT32 accumulate).
+// Weights are transposed at load time to [N, K/8] for coalesced access.
 //
 // Launch: grid=(N,1,1), block=(32, NWARPS, 1), shared=NWARPS*sizeof(float)
 //
@@ -102,9 +84,9 @@ extern "C" __global__ void gemv_gptq_q8_dp4a(
     const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
     const float*        __restrict__ act_scales,   // [K/32] per-block scales
     const float*        __restrict__ act_sums,     // [K/32] per-block weighted sums
-    const int*          __restrict__ qweight,      // [K/8, N] column-major packed int4
-    const unsigned short* __restrict__ scales,     // [num_groups, N] f16 weight scales
-    const int*          __restrict__ qzeros,       // [num_groups, N/8] packed int4 zeros
+    const int*          __restrict__ qweight,      // [N, K/8] row-major packed int4
+    const unsigned short* __restrict__ scales,     // [N, num_groups] f16 weight scales
+    const int*          __restrict__ qzeros,       // [N/8, num_groups] packed int4 zeros
     const int N,
     const int K,
     const int group_size
@@ -118,21 +100,22 @@ extern "C" __global__ void gemv_gptq_q8_dp4a(
     const int tid = warp_id * 32 + lane;
     const int nthreads = nwarps * 32;
     const int blocks_per_row = K / 32;
+    const int packed_per_row = K / 8;
+    const int num_groups = K / group_size;
     const int n_div_8 = n / 8;
     const int n_mod_8_x4 = (n % 8) * 4;
 
     float acc = 0.0f;
 
     for (int b = tid; b < blocks_per_row; b += nthreads) {
-        // Group index for zero-point and weight scale lookup
         int group_idx = (b * 32) / group_size;
 
-        float d_w = f16_to_f32(scales[group_idx * N + n]);
+        float d_w = f16_to_f32(scales[n * num_groups + group_idx]);
         float d_a = act_scales[b];
         float s_a = act_sums[b];
 
         // Zero-point: stored with -1 offset, packed INT4
-        int qz_packed = qzeros[group_idx * (N / 8) + n_div_8];
+        int qz_packed = qzeros[n_div_8 * num_groups + group_idx];
         int qzero = ((qz_packed >> n_mod_8_x4) & 0xF) + 1;
 
         // Load 32 activation bytes as 8 × int32 (2 × int4 vector loads)
@@ -143,27 +126,23 @@ extern "C" __global__ void gemv_gptq_q8_dp4a(
 
         int sumi = 0;
 
-        // Process 4 packed int32s (32 weight elements) from column-major qweight.
-        // Each packed int32 covers 8 consecutive K elements.
-        // Stride is N between consecutive packed rows.
-        int qw_base = b * 4 * N + n;  // qweight[(b*4) * N + n]
+        // Vector-load 4 contiguous packed int32s (32 weight elements) from row n.
+        const int4* w_v = (const int4*)(qweight + n * packed_per_row + b * 4);
+        int4 w = w_v[0];
+        int packed[4] = {w.x, w.y, w.z, w.w};
 
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int packed = qweight[qw_base + i * N];
-
-            // Extract 8 nibbles and repack into sequential order for dp4a.
-            // GPTQ packing: byte[j] = (elem[2j+1] << 4) | elem[2j]
-            // lo nibbles = even elements, hi nibbles = odd elements.
-            // We need sequential order to match activation layout.
-            unsigned int q0 = (packed >>  0) & 0xF;
-            unsigned int q1 = (packed >>  4) & 0xF;
-            unsigned int q2 = (packed >>  8) & 0xF;
-            unsigned int q3 = (packed >> 12) & 0xF;
-            unsigned int q4 = (packed >> 16) & 0xF;
-            unsigned int q5 = (packed >> 20) & 0xF;
-            unsigned int q6 = (packed >> 24) & 0xF;
-            unsigned int q7 = (packed >> 28) & 0xF;
+            // Extract 8 nibbles and repack into dp4a-compatible byte order.
+            // GPTQ packing: bits [4j+3:4j] = element j (j=0..7)
+            unsigned int q0 = (packed[i] >>  0) & 0xF;
+            unsigned int q1 = (packed[i] >>  4) & 0xF;
+            unsigned int q2 = (packed[i] >>  8) & 0xF;
+            unsigned int q3 = (packed[i] >> 12) & 0xF;
+            unsigned int q4 = (packed[i] >> 16) & 0xF;
+            unsigned int q5 = (packed[i] >> 20) & 0xF;
+            unsigned int q6 = (packed[i] >> 24) & 0xF;
+            unsigned int q7 = (packed[i] >> 28) & 0xF;
 
             int pack_a = (int)(q0 | (q1 << 8) | (q2 << 16) | (q3 << 24));
             int pack_b = (int)(q4 | (q5 << 8) | (q6 << 16) | (q7 << 24));
