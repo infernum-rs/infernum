@@ -276,41 +276,26 @@ mod mixtral_moe_tiny {
 
 // ─── Mixtral MoE (real weights) ─────────────────────────────────────────────
 
-/// Mixtral-8x7B-Instruct-v0.1 (ungated, ~93GB bf16, 19 sharded SafeTensors)
+/// laser-dolphin-mixtral-2x7b-dpo (ungated, ~24GB bf16, 3 sharded SafeTensors)
 ///
-/// Validates MoE generation quality with a real Mixtral model.
-/// Requires ~186GB VRAM (loaded as f32) — needs multi-GPU.
+/// Real Mixtral-architecture MoE model with 2 experts (top-2), 32 layers.
+/// Requires ~48GB VRAM (loaded as f32) — fits on a single A100 80GB or 2+ GPUs.
 /// Run manually with:
-///   cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_8x7b
-mod mixtral_8x7b {
+///   cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_2x7b
+mod mixtral_2x7b {
     use super::*;
 
-    const REPO: &str = "mistralai/Mixtral-8x7B-Instruct-v0.1";
+    const REPO: &str = "macadeliccc/laser-dolphin-mixtral-2x7b-dpo";
 
     const FILES: &[&str] = &[
         "config.json",
         "tokenizer.json",
         "tokenizer_config.json",
+        "tokenizer.model",
         "model.safetensors.index.json",
-        "model-00001-of-00019.safetensors",
-        "model-00002-of-00019.safetensors",
-        "model-00003-of-00019.safetensors",
-        "model-00004-of-00019.safetensors",
-        "model-00005-of-00019.safetensors",
-        "model-00006-of-00019.safetensors",
-        "model-00007-of-00019.safetensors",
-        "model-00008-of-00019.safetensors",
-        "model-00009-of-00019.safetensors",
-        "model-00010-of-00019.safetensors",
-        "model-00011-of-00019.safetensors",
-        "model-00012-of-00019.safetensors",
-        "model-00013-of-00019.safetensors",
-        "model-00014-of-00019.safetensors",
-        "model-00015-of-00019.safetensors",
-        "model-00016-of-00019.safetensors",
-        "model-00017-of-00019.safetensors",
-        "model-00018-of-00019.safetensors",
-        "model-00019-of-00019.safetensors",
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
     ];
 
     fn model_dir() -> PathBuf {
@@ -318,7 +303,7 @@ mod mixtral_8x7b {
     }
 
     #[test]
-    #[ignore = "93GB model, needs ~186GB VRAM — run manually with --ignored on multi-GPU"]
+    #[ignore = "24GB model, needs ~48GB VRAM — run manually with --ignored"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(
@@ -328,7 +313,7 @@ mod mixtral_8x7b {
     }
 
     #[test]
-    #[ignore = "93GB model, needs ~186GB VRAM — run manually with --ignored on multi-GPU"]
+    #[ignore = "24GB model, needs ~48GB VRAM — run manually with --ignored"]
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();

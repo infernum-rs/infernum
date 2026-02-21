@@ -170,12 +170,12 @@ Some integration tests are marked `#[ignore]` because they require very large mo
 cargo test -p infernum-llama --features integration -- --ignored --test-threads=1
 
 # Run a specific ignored test module
-cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_8x7b
+cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_2x7b
 ```
 
 Currently ignored:
 
-- **Mixtral-8x7B-Instruct-v0.1** (`mistralai/Mixtral-8x7B-Instruct-v0.1`, ~93GB bf16, 19 sharded SafeTensors) — validates MoE generation quality with real weights. Requires ~186GB VRAM (loaded as f32); needs multi-GPU.
+- **laser-dolphin-mixtral-2x7b-dpo** (`macadeliccc/laser-dolphin-mixtral-2x7b-dpo`, ~24GB bf16, 3 sharded SafeTensors) — validates MoE generation quality with real weights. Requires ~48GB VRAM (loaded as f32); fits on a single A100 80GB.
 
 **Writing new integration tests:**
 
