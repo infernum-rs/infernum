@@ -105,9 +105,10 @@ fn sample_from_logits(
     let sum: f32 = exps.iter().sum();
     let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
 
-    // Build (index, probability) pairs and sort descending by probability
+    // Build (index, probability) pairs and sort descending by probability.
+    // Use total_cmp so NaN values don't panic (they sort to the end).
     let mut indexed: Vec<(u32, f32)> = (0..n as u32).zip(probs).collect();
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     // Compute cumulative probability and find the nucleus
     let mut cumulative = 0.0_f32;

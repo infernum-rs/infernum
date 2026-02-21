@@ -207,4 +207,55 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_add_rmsnorm_multi_warp() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let hidden_size = 2048;
+        let residual_data: Vec<f32> = (0..hidden_size)
+            .map(|i| ((i as f32) * 0.001 - 0.5).sin())
+            .collect();
+        let x_data: Vec<f32> = (0..hidden_size)
+            .map(|i| ((i as f32) * 0.002 + 0.3).cos() * 0.1)
+            .collect();
+        let weight_data: Vec<f32> = vec![1.0; hidden_size];
+
+        let residual = CudaTensor::from_slice(&ctx, &[1, hidden_size], &residual_data).unwrap();
+        let x = CudaTensor::from_slice(&ctx, &[1, hidden_size], &x_data).unwrap();
+        let weight = CudaTensor::from_slice(&ctx, &[hidden_size], &weight_data).unwrap();
+
+        let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
+
+        let sum_result = sum.to_vec().unwrap();
+        let normed_result = normed.to_vec().unwrap();
+
+        let expected_sum: Vec<f32> = residual_data
+            .iter()
+            .zip(x_data.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+        let sum_sq: f32 = expected_sum.iter().map(|v| v * v).sum();
+        let rms = (sum_sq / hidden_size as f32).sqrt();
+
+        for (i, (&got, &exp)) in sum_result.iter().zip(expected_sum.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "Sum mismatch at {i}: {got} vs {exp}"
+            );
+        }
+
+        for (i, &got) in normed_result.iter().enumerate() {
+            let exp = expected_sum[i] / rms;
+            assert!(
+                (got - exp).abs() < 1e-3,
+                "Normed mismatch at {i}: {got} vs {exp} (rms={rms})"
+            );
+        }
+
+        assert!(
+            normed_result.iter().all(|x| x.is_finite()),
+            "Output contains NaN or Inf"
+        );
+    }
 }
