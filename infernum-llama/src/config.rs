@@ -85,6 +85,14 @@ pub struct LlamaConfig {
     /// Quantization configuration (present for GPTQ/AWQ models)
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
+
+    /// Number of experts per `MoE` layer (e.g. 8 for Mixtral). `None` = dense model.
+    #[serde(default)]
+    pub num_local_experts: Option<usize>,
+
+    /// Number of experts activated per token (e.g. 2 for Mixtral)
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
 }
 
 /// Deserialize a field that may be a single `u32` or an array of `u32`.
@@ -138,6 +146,12 @@ impl LlamaConfig {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Returns true if this model uses Mixture-of-Experts layers
+    #[must_use]
+    pub fn is_moe(&self) -> bool {
+        self.num_local_experts.is_some_and(|n| n > 1)
     }
 
     /// Build a `LlamaConfig` from GGUF metadata key-value pairs.
@@ -202,6 +216,12 @@ impl LlamaConfig {
                 .and_then(GgufValue::as_usize)
                 .unwrap_or(2) as u32,
             quantization_config: None,
+            num_local_experts: metadata
+                .get("llama.expert_count")
+                .and_then(GgufValue::as_usize),
+            num_experts_per_tok: metadata
+                .get("llama.expert_used_count")
+                .and_then(GgufValue::as_usize),
         })
     }
 
@@ -461,5 +481,56 @@ mod tests {
 
         let config: LlamaConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.eos_token_id, 42);
+    }
+
+    #[test]
+    fn test_config_mixtral_moe() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.num_local_experts, Some(8));
+        assert_eq!(config.num_experts_per_tok, Some(2));
+        assert!(config.is_moe());
+    }
+
+    #[test]
+    fn test_config_dense_has_no_moe_fields() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.num_local_experts, None);
+        assert_eq!(config.num_experts_per_tok, None);
+        assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_config_is_moe_requires_multiple_experts() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_local_experts": 1,
+            "num_experts_per_tok": 1
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.is_moe());
     }
 }
