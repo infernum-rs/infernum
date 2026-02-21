@@ -142,8 +142,8 @@ jobs:
       - name: Cache HuggingFace models
         uses: actions/cache@v4
         with:
-          path: ~/.cache/huggingface/hub
-          key: hf-models-integration-v1
+          path: ~/.cache/infernum/models
+          key: infernum-models-integration-v1
 
       - name: Run integration tests
         run: cargo test -p infernum-llama --features integration -- --test-threads=1

@@ -5,13 +5,12 @@
 //!
 //!   cargo test -p infernum-llama --features integration -- --test-threads=1
 //!
-//! Models are cached in the standard HuggingFace cache directory
-//! (`~/.cache/huggingface/hub/`), so subsequent runs are fast.
+//! Models are cached in `~/.cache/infernum/models/`, so subsequent runs are fast.
 #![cfg(feature = "integration")]
 
+use std::fs;
 use std::path::PathBuf;
 
-use hf_hub::api::sync::Api;
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
@@ -19,31 +18,55 @@ use infernum_llama::LlamaModel;
 use infernum_runtime::Runtime;
 
 /// Files needed from a HuggingFace repo to load a SafeTensors model.
-const SAFETENSORS_FILES: &[&str] = &[
+const REQUIRED_FILES: &[&str] = &[
     "config.json",
     "model.safetensors",
     "tokenizer.json",
     "tokenizer_config.json",
 ];
 
-/// Download a model from HuggingFace Hub and return the local directory path.
+/// Download a single file from HuggingFace Hub to `dest`.
 ///
-/// Uses the standard HF cache, so files are only downloaded once.
-fn download_model(repo_id: &str) -> PathBuf {
-    let api = Api::new().expect("Failed to create HuggingFace API client");
-    let repo = api.model(repo_id.to_string());
-
-    let mut model_dir = None;
-    for filename in SAFETENSORS_FILES {
-        let path = repo
-            .get(filename)
-            .unwrap_or_else(|e| panic!("Failed to download {repo_id}/{filename}: {e}"));
-        if model_dir.is_none() {
-            model_dir = Some(path.parent().unwrap().to_path_buf());
-        }
+/// Skips the download if `dest` already exists.
+fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
+    if dest.exists() {
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).expect("Failed to create cache directory");
     }
 
-    model_dir.expect("No files downloaded")
+    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
+    let response = ureq::get(&url).call().unwrap_or_else(|e| {
+        panic!("Failed to download {repo_id}/{filename}: {e}");
+    });
+
+    let body = response
+        .into_body()
+        .with_config()
+        .limit(2 * 1024 * 1024 * 1024) // 2 GB
+        .read_to_vec()
+        .unwrap_or_else(|e| panic!("Failed to read response body for {filename}: {e}"));
+
+    fs::write(dest, &body).unwrap_or_else(|e| panic!("Failed to write {}: {e}", dest.display()));
+}
+
+/// Download a model from HuggingFace Hub and return the local directory path.
+///
+/// Files are cached in `~/.cache/infernum/models/<org>/<model>/`.
+fn download_model(repo_id: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let cache_dir = PathBuf::from(home)
+        .join(".cache")
+        .join("infernum")
+        .join("models")
+        .join(repo_id);
+
+    for filename in REQUIRED_FILES {
+        download_file(repo_id, filename, &cache_dir.join(filename));
+    }
+
+    cache_dir
 }
 
 /// Greedy generation options (deterministic, no sampling).
