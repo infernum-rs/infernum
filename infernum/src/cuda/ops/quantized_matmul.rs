@@ -444,6 +444,40 @@ fn quantized_gemv(
                 )?;
             }
         }
+        DType::GPTQ_INT4 => {
+            let gptq_module = "gptq_matmul";
+            if !device.has_func(gptq_module, "gemv_gptq_q8_dp4a") {
+                device.load_ptx(
+                    cudarc::nvrtc::Ptx::from_src(GPTQ_MATMUL_PTX),
+                    gptq_module,
+                    &["matmul_gptq_f32", "gemv_gptq_q8_dp4a"],
+                )?;
+            }
+            let group_size = weight
+                .group_size()
+                .expect("GPTQ_INT4 weight must have group_size");
+            let qzeros = weight
+                .qzeros_slice()
+                .expect("GPTQ_INT4 weight must have qzeros");
+            let func = device.get_func(gptq_module, "gemv_gptq_q8_dp4a").unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &*act_data,
+                        &*act_scales,
+                        &*act_sums,
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        qzeros,
+                        n as i32,
+                        k as i32,
+                        group_size as i32,
+                    ),
+                )?;
+            }
+        }
         other => panic!("quantized_gemv: unsupported dtype {other}"),
     }
 
@@ -529,8 +563,8 @@ fn quantized_matmul_2d(
         )?;
     }
 
-    // GEMV fast path for M=1 decode (Q8_0 and Q4_0 only)
-    if m == 1 && matches!(weight.dtype(), DType::Q8_0 | DType::Q4_0) {
+    // GEMV fast path for M=1 decode
+    if m == 1 && matches!(weight.dtype(), DType::Q8_0 | DType::Q4_0 | DType::GPTQ_INT4) {
         return quantized_gemv(input, weight, n, k);
     }
 
@@ -640,7 +674,7 @@ fn quantized_matmul_2d(
                 device.load_ptx(
                     cudarc::nvrtc::Ptx::from_src(GPTQ_MATMUL_PTX),
                     gptq_module,
-                    &["matmul_gptq_f32"],
+                    &["matmul_gptq_f32", "gemv_gptq_q8_dp4a"],
                 )?;
             }
             let group_size = weight
@@ -2238,6 +2272,63 @@ mod tests {
                 "GPTQ mismatch at [{}, {}]: got {} expected {} (diff={:.6})",
                 i / n,
                 i % n,
+                result[i],
+                expected[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_gptq_gemv_dp4a() {
+        // Verify that M=1 GEMV (dp4a path) matches the naive GPTQ matmul
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let k = 256;
+        let n = 64;
+        let group_size = 128;
+
+        let mut state: u64 = 42;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let (qweight, scales, qzeros) = pack_gptq_host(&w_data, n, k, group_size);
+
+        // CPU reference
+        let expected =
+            gptq_matmul_reference(&input_data, &qweight, &scales, &qzeros, 1, n, k, group_size);
+
+        let weight = QuantizedTensor::from_gptq_raw(
+            &ctx,
+            &[n, k],
+            DType::GPTQ_INT4,
+            &qweight,
+            &scales,
+            &qzeros,
+            group_size,
+        )
+        .unwrap();
+
+        // M=1 → dispatches to gemv_gptq_q8_dp4a
+        let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
+        let output = quantized_matmul(&input, &weight).unwrap();
+        assert_eq!(output.shape(), &[1, n]);
+
+        let result = output.to_vec().unwrap();
+
+        for i in 0..n {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 0.5,
+                "GPTQ GEMV mismatch at [{}]: got {} expected {} (diff={:.6})",
+                i,
                 result[i],
                 expected[i],
                 diff
