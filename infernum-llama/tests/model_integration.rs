@@ -27,6 +27,7 @@ const REQUIRED_FILES: &[&str] = &[
 
 /// Download a single file from HuggingFace Hub to `dest`.
 ///
+/// Streams directly to disk to avoid buffering large files in memory.
 /// Skips the download if `dest` already exists.
 fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
     if dest.exists() {
@@ -41,14 +42,14 @@ fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
         panic!("Failed to download {repo_id}/{filename}: {e}");
     });
 
-    let body = response
-        .into_body()
-        .with_config()
-        .limit(5 * 1024 * 1024 * 1024) // 5 GB
-        .read_to_vec()
-        .unwrap_or_else(|e| panic!("Failed to read response body for {filename}: {e}"));
-
-    fs::write(dest, &body).unwrap_or_else(|e| panic!("Failed to write {}: {e}", dest.display()));
+    // Stream to a temp file first, then rename — avoids partial files on failure.
+    let tmp_dest = dest.with_extension("tmp");
+    let mut file = fs::File::create(&tmp_dest)
+        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp_dest.display()));
+    std::io::copy(&mut response.into_body().as_reader(), &mut file)
+        .unwrap_or_else(|e| panic!("Failed to download {filename}: {e}"));
+    fs::rename(&tmp_dest, dest)
+        .unwrap_or_else(|e| panic!("Failed to rename {}: {e}", tmp_dest.display()));
 }
 
 /// Download a model from HuggingFace Hub and return the local directory path.
