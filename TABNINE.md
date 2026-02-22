@@ -32,6 +32,16 @@ Key design patterns:
 
 The project is in early development (Phase 1). Currently contains a minimal skeleton with a placeholder `hello()` function.
 
+### Supported Model Families
+
+All models below are loaded via `infernum-llama`. Mistral/Devstral/Mixtral are architecturally identical to Llama and share the same implementation. Type aliases (`MistralModel`, `MixtralModel`) are provided for API clarity.
+
+| Family | `model_type` | Architecture | Notes |
+|--------|-------------|--------------|-------|
+| Llama | `llama` | Dense | Llama 2, Llama 3, SmolLM2, CodeLlama, etc. |
+| Mistral | `mistral` | Dense | Mistral v1/v2/v3, Devstral (code fine-tune) |
+| Mixtral | `mixtral` | MoE | Mixtral 8x7B, 8x22B, etc. |
+
 ### Planned Crate Structure
 
 ```
@@ -175,6 +185,7 @@ cargo test -p infernum-llama --features integration -- --ignored --test-threads=
 
 Currently ignored:
 
+- **Mistral-7B-Instruct-v0.3** (`mistralai/Mistral-7B-Instruct-v0.3`, ~14.5GB bf16, 3 sharded SafeTensors) — validates `model_type: "mistral"` loads correctly via `MistralModel` alias. Requires ~30GB VRAM (loaded as f32).
 - **laser-dolphin-mixtral-2x7b-dpo** (`macadeliccc/laser-dolphin-mixtral-2x7b-dpo`, ~24GB bf16, 3 sharded SafeTensors) — validates MoE generation quality with real weights. Requires ~48GB VRAM (loaded as f32); fits on a single A100 80GB.
 
 **Writing new integration tests:**
