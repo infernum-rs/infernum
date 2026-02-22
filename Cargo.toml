@@ -4,6 +4,7 @@ members = [
     "infernum-examples",
     "infernum-llama",
     "infernum-macros",
+    "infernum-qwen",
     "infernum-runtime",
 ]
 resolver = "2"
