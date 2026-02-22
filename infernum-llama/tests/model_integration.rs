@@ -335,3 +335,62 @@ mod mixtral_2x7b {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 }
+
+// ─── MoE tensor-parallel (multi-GPU) ────────────────────────────────────────
+
+/// tiny-mixtral on 2 GPUs — validates MoE sharded loading and forward pass.
+///
+/// Uses the same tiny random-weight Mixtral as `mixtral_moe_tiny`, but
+/// loads across 2 GPUs with tensor parallelism to verify that the sharded
+/// MoE weight loading and the single all-reduce forward path work correctly.
+///
+/// Requires 2+ CUDA GPUs and the `nccl` feature. Run manually with:
+///   cargo test -p infernum-llama --features integration,nccl -- --ignored --test-threads=1 mixtral_moe_tp
+#[cfg(feature = "nccl")]
+mod mixtral_moe_tp {
+    use super::*;
+    use infernum::{Model as _, ShardedModel};
+
+    const REPO: &str = "jamesdborin/tiny-mixtral";
+
+    fn model_dir() -> PathBuf {
+        download_model(REPO)
+    }
+
+    #[test]
+    #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
+    fn loads_and_generates_2gpu() {
+        let model_dir = model_dir();
+        let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&model_dir, 2)
+            .expect("Failed to load sharded MoE model");
+
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let mut runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+        let _output = runtime
+            .generate("Hello", &greedy_options(10))
+            .expect("Sharded MoE generation failed");
+    }
+
+    #[test]
+    #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
+    fn no_nan_in_output_2gpu() {
+        let model_dir = model_dir();
+        let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&model_dir, 2)
+            .expect("Failed to load sharded MoE model");
+
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let input_ids = tokenizer.encode("Hello world", true).unwrap();
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x: &&f32| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x: &&f32| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+}
