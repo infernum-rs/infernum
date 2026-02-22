@@ -473,6 +473,152 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
     }
 }
 
+// Q6_K × Q8_1 dp4a GEMV (multi-warp, with zero-point correction)
+//
+// Q6_K super-block: 256 elements, 210 bytes
+//   ql[128] — lower 4 bits, 2 per byte (low/high nibble)
+//   qh[64]  — upper 2 bits, 4 per byte (2-bit fields)
+//   scales[16] — i8 sub-block scales (one per 16 elements)
+//   d (f16) — super-block scale (2 bytes)
+//
+// Iterates over Q8_1 blocks (K/32) for good thread utilization,
+// deriving the Q6_K super-block and intra-super-block position (row8)
+// from the block index.
+//
+// Key subtlety: Q6_K sub-block scales are per 16 elements, but Q8_1 blocks
+// are 32 elements. So within one Q8_1 block, two different sub-block scales
+// apply to the first and second halves. We compute per-half activation sums
+// inline using dp4a with a vector of all 1s.
+extern "C" __global__ void gemv_q6k_q8_dp4a(
+    float*              __restrict__ output,
+    const signed char*  __restrict__ act_data,     // [K] int8 quantized activations
+    const float*        __restrict__ act_scales,   // [K/32] per-block scales
+    const float*        __restrict__ act_sums,     // [K/32] (unused, kept for uniform API)
+    const unsigned char* __restrict__ weight_data, // [N * (K/256) * 210] packed super-blocks
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+
+    const int blocks_per_row = K / 32;    // Q8_1 blocks per row
+    const int sblocks_per_row = K / 256;  // Q6_K super-blocks per row
+    const int block_bytes = 210;
+
+    float acc = 0.0f;
+    const int ones = 0x01010101;
+
+    // Iterate over Q8_1 blocks (32 elements each) for good thread utilization
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        int sb = b / 8;      // Q6_K super-block index
+        int row8 = b % 8;    // position within super-block (0..7)
+
+        int sb_offset = (n * sblocks_per_row + sb) * block_bytes;
+        const unsigned char* ql     = weight_data + sb_offset;
+        const unsigned char* qh     = weight_data + sb_offset + 128;
+        const signed char*   scales = (const signed char*)(weight_data + sb_offset + 128 + 64);
+        float d = f16_to_f32(*(const unsigned short*)(weight_data + sb_offset + 128 + 64 + 16));
+
+        float d_a = act_scales[b];
+
+        int ql_base = (row8 / 4) * 64 + (row8 % 2) * 32;
+        int ql_nibble_hi = ((row8 % 4) >= 2) ? 1 : 0;
+
+        int qh_base = (row8 / 4) * 32;
+        int qh_shift = (row8 % 4) * 2;
+
+        int sc0 = (int)scales[row8 * 2];
+        int sc1 = (int)scales[row8 * 2 + 1];
+
+        int sumi0 = 0, sumi1 = 0;
+        int asum0 = 0, asum1 = 0;
+
+        const int* a_ptr = (const int*)(act_data + b * 32);
+
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            int col32_start = g * 4;
+
+            unsigned char ql_b0 = ql[ql_base + col32_start + 0];
+            unsigned char ql_b1 = ql[ql_base + col32_start + 1];
+            unsigned char ql_b2 = ql[ql_base + col32_start + 2];
+            unsigned char ql_b3 = ql[ql_base + col32_start + 3];
+
+            int ql0, ql1, ql2, ql3;
+            if (ql_nibble_hi == 0) {
+                ql0 = ql_b0 & 0x0F; ql1 = ql_b1 & 0x0F;
+                ql2 = ql_b2 & 0x0F; ql3 = ql_b3 & 0x0F;
+            } else {
+                ql0 = ql_b0 >> 4; ql1 = ql_b1 >> 4;
+                ql2 = ql_b2 >> 4; ql3 = ql_b3 >> 4;
+            }
+
+            unsigned char qh_b0 = qh[qh_base + col32_start + 0];
+            unsigned char qh_b1 = qh[qh_base + col32_start + 1];
+            unsigned char qh_b2 = qh[qh_base + col32_start + 2];
+            unsigned char qh_b3 = qh[qh_base + col32_start + 3];
+
+            int qh0 = (qh_b0 >> qh_shift) & 0x03;
+            int qh1 = (qh_b1 >> qh_shift) & 0x03;
+            int qh2 = (qh_b2 >> qh_shift) & 0x03;
+            int qh3 = (qh_b3 >> qh_shift) & 0x03;
+
+            int q_packed = (ql0 | (qh0 << 4))
+                         | ((ql1 | (qh1 << 4)) << 8)
+                         | ((ql2 | (qh2 << 4)) << 16)
+                         | ((ql3 | (qh3 << 4)) << 24);
+
+            int a_val = a_ptr[g];
+
+            if (g < 4) {
+                sumi0 = __dp4a(q_packed, a_val, sumi0);
+                asum0 = __dp4a(ones, a_val, asum0);
+            } else {
+                sumi1 = __dp4a(q_packed, a_val, sumi1);
+                asum1 = __dp4a(ones, a_val, asum1);
+            }
+        }
+
+        // dequant(w_i) = d * sc * (q_i - 32)
+        // dot = d * sc * d_a * (Σ q_i*a_i - 32 * Σ a_i)
+        acc += d * (float)sc0 * d_a * ((float)sumi0 - 32.0f * (float)asum0);
+        acc += d * (float)sc1 * d_a * ((float)sumi1 - 32.0f * (float)asum1);
+    }
+
+    // Intra-warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    // Inter-warp reduction via shared memory
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            output[n] = sum;
+        }
+    } else {
+        if (lane == 0) {
+            output[n] = acc;
+        }
+    }
+}
+
 // Q4_0 × Q8_1 dp4a GEMV (multi-warp, with zero-point correction)
 extern "C" __global__ void gemv_q4_q8_dp4a(
     float*              __restrict__ output,
