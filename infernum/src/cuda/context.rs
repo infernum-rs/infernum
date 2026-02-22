@@ -54,6 +54,39 @@ impl CudaContext {
         })
     }
 
+    /// Create a `CudaContext` wrapping an existing device handle.
+    ///
+    /// Use this when the `CudaDevice` was already created externally (e.g.
+    /// by NCCL communicator setup) and must be shared with the context to
+    /// ensure all operations use the same CUDA stream.
+    ///
+    /// # Errors
+    /// Returns an error if cuBLAS/cuBLASLt handle creation fails.
+    pub fn from_device(device: Arc<CudaDevice>) -> Result<Self> {
+        let blas = CudaBlas::new(device.clone())?;
+        let blas_lt = CudaBlasLT::new(device.clone())?;
+
+        let major = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+            .unwrap_or(0);
+        let minor = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            )
+            .unwrap_or(0);
+
+        Ok(Self {
+            device,
+            blas: Arc::new(blas),
+            blas_lt: Arc::new(blas_lt),
+            fp8_workspace: Arc::new(Mutex::new(None)),
+            compute_capability: (major, minor),
+            buffer_pool: None,
+        })
+    }
+
     /// Get a reference to the underlying CUDA device
     #[must_use]
     pub fn device(&self) -> &Arc<CudaDevice> {

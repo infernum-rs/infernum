@@ -10,8 +10,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
-use cudarc::driver::CudaDevice;
-
 use super::nccl::NcclCommunicator;
 use super::{CudaContext, CudaTensor, KvCache, ShardConfig};
 use crate::model::ShardedLoadable;
@@ -39,19 +37,24 @@ impl<M: ShardedLoadable> ShardedModel<M> {
     #[allow(clippy::missing_panics_doc)]
     pub fn from_pretrained(model_path: impl AsRef<Path>, num_gpus: usize) -> Result<Self> {
         let model_path = model_path.as_ref();
-        let devices: Vec<Arc<CudaDevice>> = (0..num_gpus)
-            .map(|i| CudaDevice::new(i).map_err(crate::Error::from))
-            .collect::<Result<_>>()?;
-        let comms = NcclCommunicator::from_devices(devices)?;
+        // Generate a shared NCCL ID on the main thread, then let each worker
+        // thread create its own CudaContext + NcclCommunicator via from_rank.
+        // This ensures each comm is initialised on the same thread (and CUDA
+        // context) that will later call all-reduce, avoiding ncclInvalidUsage.
+        let nccl_id = super::nccl::NcclId::new()?;
 
         let replicas: Vec<(CudaContext, M)> = thread::scope(|s| {
-            let handles: Vec<_> = comms
-                .into_iter()
-                .enumerate()
-                .map(|(rank, comm)| {
+            let handles: Vec<_> = (0..num_gpus)
+                .map(|rank| {
                     let world_size = num_gpus;
                     s.spawn(move || {
                         let ctx = CudaContext::new(rank)?;
+                        let comm = NcclCommunicator::from_rank(
+                            Arc::clone(ctx.device()),
+                            rank,
+                            world_size,
+                            nccl_id,
+                        )?;
                         let shard = ShardConfig { rank, world_size };
                         let model = M::load_shard(&ctx, model_path, shard, comm)?;
                         Ok::<_, crate::Error>((ctx, model))
