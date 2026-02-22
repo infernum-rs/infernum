@@ -113,6 +113,20 @@ pub struct LlamaConfig {
     /// Number of experts activated per token (e.g. 2 for Mixtral)
     #[serde(default)]
     pub num_experts_per_tok: Option<usize>,
+
+    /// Sliding window size for local attention. When set and `use_sliding_window`
+    /// is true, attention is restricted to the most recent `sliding_window` positions.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+
+    /// Whether sliding window attention is enabled. Default: false.
+    #[serde(default)]
+    pub use_sliding_window: bool,
+
+    /// SWA applies only to layers `[0, max_window_layers)`. Layers at or above
+    /// this index use full causal attention. When absent, all layers use SWA.
+    #[serde(default)]
+    pub max_window_layers: Option<usize>,
 }
 
 /// Deserialize a field that may be a single `u32` or an array of `u32`.
@@ -172,6 +186,21 @@ impl LlamaConfig {
     #[must_use]
     pub fn is_moe(&self) -> bool {
         self.num_local_experts.is_some_and(|n| n > 1)
+    }
+
+    /// Returns the effective sliding window size for a given layer, or `None`
+    /// if full causal attention should be used.
+    #[must_use]
+    pub fn effective_sliding_window(&self, layer_idx: usize) -> Option<usize> {
+        if !self.use_sliding_window {
+            return None;
+        }
+        if let Some(max_layers) = self.max_window_layers {
+            if layer_idx >= max_layers {
+                return None;
+            }
+        }
+        self.sliding_window
     }
 
     /// Build a `LlamaConfig` from GGUF metadata key-value pairs.
@@ -242,6 +271,15 @@ impl LlamaConfig {
             num_experts_per_tok: metadata
                 .get("llama.expert_used_count")
                 .and_then(GgufValue::as_usize),
+            sliding_window: metadata
+                .get("llama.attention.sliding_window")
+                .and_then(GgufValue::as_usize)
+                .filter(|&w| w > 0),
+            use_sliding_window: metadata
+                .get("llama.attention.sliding_window")
+                .and_then(GgufValue::as_usize)
+                .is_some_and(|w| w > 0),
+            max_window_layers: None,
         })
     }
 
@@ -575,5 +613,89 @@ mod tests {
 
         let config: LlamaConfig = serde_json::from_str(json).unwrap();
         assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_config_sliding_window_mistral() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "sliding_window": 4096,
+            "use_sliding_window": true,
+            "max_window_layers": 28
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+        assert!(config.use_sliding_window);
+        assert_eq!(config.max_window_layers, Some(28));
+
+        // Layers below max_window_layers use SWA
+        assert_eq!(config.effective_sliding_window(0), Some(4096));
+        assert_eq!(config.effective_sliding_window(27), Some(4096));
+
+        // Layers at or above max_window_layers use full attention
+        assert_eq!(config.effective_sliding_window(28), None);
+        assert_eq!(config.effective_sliding_window(31), None);
+    }
+
+    #[test]
+    fn test_config_sliding_window_disabled() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "sliding_window": 32768,
+            "use_sliding_window": false
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, Some(32768));
+        assert!(!config.use_sliding_window);
+
+        // SWA disabled: all layers use full attention
+        assert_eq!(config.effective_sliding_window(0), None);
+    }
+
+    #[test]
+    fn test_config_sliding_window_all_layers() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "sliding_window": 4096,
+            "use_sliding_window": true
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+
+        // No max_window_layers: all layers use SWA
+        assert_eq!(config.effective_sliding_window(0), Some(4096));
+        assert_eq!(config.effective_sliding_window(31), Some(4096));
+    }
+
+    #[test]
+    fn test_config_no_sliding_window_fields() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, None);
+        assert!(!config.use_sliding_window);
+        assert_eq!(config.max_window_layers, None);
+        assert_eq!(config.effective_sliding_window(0), None);
     }
 }

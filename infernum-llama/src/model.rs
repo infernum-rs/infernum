@@ -1303,10 +1303,11 @@ where
         let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
 
         // Compute attention using fused kernels (generic over T)
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
         let attn_output = if seq_len == 1 {
-            fused_attention_decode(&q, &k_full, &v_full)?
+            fused_attention_decode(&q, &k_full, &v_full, sliding_window)?
         } else {
-            fused_attention_prefill(&q, &k_full, &v_full, kv_cache.current_len())?
+            fused_attention_prefill(&q, &k_full, &v_full, kv_cache.current_len(), sliding_window)?
         };
 
         // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, num_heads * head_dim)
@@ -1477,6 +1478,7 @@ where
 
         // Fused decode attention with indirect total_len.
         // total_len = current_len + 1 (includes the just-appended token).
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
         let total_len = kv_cache.current_total_len();
         let attn_output = fused_attention_decode_indirect(
             &q,
@@ -1484,6 +1486,7 @@ where
             v_full,
             total_len,
             kv_cache.graph_max_seq_len(),
+            sliding_window,
         )?;
 
         let attn_output = attn_output.reshape(&[1, num_heads * head_dim]);
@@ -1957,7 +1960,7 @@ where
     fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
         // Non-KV-cache forward: compute in T, cast logits to f32 at the end.
         let mut hidden = self.embed(input_ids)?;
-        for layer in &self.layers {
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
             let normed = rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             // For the trait's forward (no KV cache), we use fused attention
@@ -1987,7 +1990,8 @@ where
             let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
             let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
 
-            let attn_output = fused_attention_prefill(&q, &k, &v, 0)?;
+            let sliding_window = self.config.effective_sliding_window(layer_idx);
+            let attn_output = fused_attention_prefill(&q, &k, &v, 0, sliding_window)?;
             let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
             let mut attn_output = linear(&attn_output, &layer.attention.o_proj)?;
             #[cfg(feature = "nccl")]
@@ -2379,6 +2383,9 @@ mod tests {
             quantization_config: None,
             num_local_experts: None,
             num_experts_per_tok: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            max_window_layers: None,
         }
     }
 
@@ -2572,6 +2579,9 @@ mod tests {
             }),
             num_local_experts: None,
             num_experts_per_tok: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            max_window_layers: None,
         }
     }
 

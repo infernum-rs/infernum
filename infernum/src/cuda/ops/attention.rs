@@ -193,7 +193,7 @@ infernum_macros::define_block! {
         let probs = if new_seq_len == 1 {
             softmax_batched(&scores)?
         } else {
-            causal_softmax_with_offset(&scores, kv_cache.current_len())?
+            causal_softmax_with_offset(&scores, kv_cache.current_len(), None)?
         };
 
         // Output: (heads, new_seq, total) @ (heads, total, dim) -> (heads, new_seq, dim)
@@ -304,8 +304,13 @@ fn causal_softmax(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 
 /// Causal softmax with position offset for KV-cache prefill.
 ///
-/// Input: `(batch, seq_q, seq_k)` — query position `i` attends to key `[0..offset + i + 1)`.
-fn causal_softmax_with_offset(scores: &CudaTensor<f32>, offset: usize) -> Result<CudaTensor<f32>> {
+/// Input: `(batch, seq_q, seq_k)` — query position `i` attends to key `[0..offset + i + 1)`,
+/// further restricted by `sliding_window`.
+fn causal_softmax_with_offset(
+    scores: &CudaTensor<f32>,
+    offset: usize,
+    sliding_window: Option<usize>,
+) -> Result<CudaTensor<f32>> {
     let shape = scores.shape();
     let batch = shape[0];
     let seq_q = shape[1];
@@ -338,6 +343,8 @@ fn causal_softmax_with_offset(scores: &CudaTensor<f32>, offset: usize) -> Result
         shared_mem_bytes: shared_mem as u32,
     };
 
+    let window_size = sliding_window.map_or(-1, |w| w as i32);
+
     unsafe {
         func.launch(
             cfg,
@@ -348,6 +355,7 @@ fn causal_softmax_with_offset(scores: &CudaTensor<f32>, offset: usize) -> Result
                 seq_q as i32,
                 seq_k as i32,
                 offset as i32,
+                window_size,
             ),
         )?;
     }

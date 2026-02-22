@@ -138,6 +138,7 @@ fn ensure_fused_prefill_kernel<T: cudarc::driver::DeviceRepr>(
 /// * `q` — query tensor of shape `(1, num_heads, head_dim)`
 /// * `k` — full cached keys of shape `(total_len, num_kv_heads, head_dim)`
 /// * `v` — full cached values of shape `(total_len, num_kv_heads, head_dim)`
+/// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
 /// # Returns
 /// Output tensor of shape `(1, num_heads, head_dim)`
@@ -148,6 +149,7 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
     q: &CudaTensor<T>,
     k: &CudaTensor<T>,
     v: &CudaTensor<T>,
+    sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
     let q_shape = q.shape();
     let k_shape = k.shape();
@@ -200,6 +202,8 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
         shared_mem_bytes: shared_mem as u32,
     };
 
+    let window_size = sliding_window.map_or(-1, |w| w as i32);
+
     unsafe {
         func.launch(
             cfg,
@@ -213,6 +217,7 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
                 num_heads as i32,
                 num_kv_heads as i32,
                 head_dim as i32,
+                window_size,
             ),
         )?;
     }
@@ -224,13 +229,14 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// Computes `softmax(Q @ K^T / sqrt(d), causal_mask) @ V` in a single kernel.
 /// Handles GQA natively. Query position `i` attends to key positions
-/// `[0 .. offset + i + 1)`.
+/// `[0 .. offset + i + 1)`, further restricted by `sliding_window`.
 ///
 /// # Arguments
 /// * `q` — query tensor of shape `(seq_q, num_heads, head_dim)`
 /// * `k` — full cached keys of shape `(total_len, num_kv_heads, head_dim)`
 /// * `v` — full cached values of shape `(total_len, num_kv_heads, head_dim)`
 /// * `offset` — position offset for causal mask (from KV cache)
+/// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
 /// # Returns
 /// Output tensor of shape `(seq_q, num_heads, head_dim)`
@@ -242,6 +248,7 @@ pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
     k: &CudaTensor<T>,
     v: &CudaTensor<T>,
     offset: usize,
+    sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
     let q_shape = q.shape();
     let k_shape = k.shape();
@@ -297,6 +304,8 @@ pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
         shared_mem_bytes: shared_mem as u32,
     };
 
+    let window_size = sliding_window.map_or(-1, |w| w as i32);
+
     unsafe {
         func.launch(
             cfg,
@@ -312,6 +321,7 @@ pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
                 num_kv_heads as i32,
                 head_dim as i32,
                 offset as i32,
+                window_size,
             ),
         )?;
     }
@@ -342,6 +352,7 @@ const FUSED_DECODE_INDIRECT_KERNEL_NAMES: &[&str] = &[
 /// * `v` — full cached values of shape `(max_seq_len, num_kv_heads, head_dim)`
 /// * `position` — GPU-resident total sequence length
 /// * `max_seq_len` — maximum sequence length (for shared-memory sizing)
+/// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
@@ -351,6 +362,7 @@ pub fn fused_attention_decode_indirect<T: TensorDType + cudarc::driver::DeviceRe
     v: &CudaTensor<T>,
     position: &crate::cuda::SeqPosition,
     max_seq_len: usize,
+    sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
     let q_shape = q.shape();
     assert_eq!(q_shape.len(), 3, "Q must be 3D: (1, num_heads, head_dim)");
@@ -401,6 +413,8 @@ pub fn fused_attention_decode_indirect<T: TensorDType + cudarc::driver::DeviceRe
         shared_mem_bytes: shared_mem as u32,
     };
 
+    let window_size = sliding_window.map_or(-1, |w| w as i32);
+
     unsafe {
         func.launch(
             cfg,
@@ -414,6 +428,7 @@ pub fn fused_attention_decode_indirect<T: TensorDType + cudarc::driver::DeviceRe
                 num_heads as i32,
                 num_kv_heads as i32,
                 head_dim as i32,
+                window_size,
             ),
         )?;
     }
@@ -442,9 +457,9 @@ infernum_macros::define_fusion! {
         let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
 
         if new_seq_len == 1 {
-            fused_attention_decode(q, &k_full, &v_full)
+            fused_attention_decode(q, &k_full, &v_full, None)
         } else {
-            fused_attention_prefill(q, &k_full, &v_full, kv_cache.current_len())
+            fused_attention_prefill(q, &k_full, &v_full, kv_cache.current_len(), None)
         }
     }
 }
@@ -528,7 +543,7 @@ mod tests {
         let k = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &k_data).unwrap();
         let v = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &v_data).unwrap();
 
-        let fused = fused_attention_decode(&q, &k, &v).unwrap();
+        let fused = fused_attention_decode(&q, &k, &v, None).unwrap();
         let reference = reference_attention_kv(&q, &k, &v, num_heads);
 
         assert_eq!(fused.shape(), &[1, num_heads, head_dim]);
@@ -569,7 +584,7 @@ mod tests {
         let v =
             CudaTensor::from_slice(&ctx, &[total_len, num_kv_heads, head_dim], &v_data).unwrap();
 
-        let fused = fused_attention_decode(&q, &k, &v).unwrap();
+        let fused = fused_attention_decode(&q, &k, &v, None).unwrap();
         let reference = reference_attention_kv(&q, &k, &v, num_heads);
 
         let fused_data = fused.to_vec().unwrap();
@@ -591,7 +606,7 @@ mod tests {
         let k = CudaTensor::from_slice(&ctx, &[1, 1, 4], &[1.0, 0.0, 0.0, 0.0]).unwrap();
         let v = CudaTensor::from_slice(&ctx, &[1, 1, 4], &[0.5, 0.5, 0.5, 0.5]).unwrap();
 
-        let output = fused_attention_decode(&q, &k, &v).unwrap();
+        let output = fused_attention_decode(&q, &k, &v, None).unwrap();
         let result = output.to_vec().unwrap();
 
         // Only one key position, so output == V
@@ -620,7 +635,7 @@ mod tests {
         let k = CudaTensor::from_slice(&ctx, &[seq_q, num_heads, head_dim], &k_data).unwrap();
         let v = CudaTensor::from_slice(&ctx, &[seq_q, num_heads, head_dim], &v_data).unwrap();
 
-        let fused = fused_attention_prefill(&q, &k, &v, 0).unwrap();
+        let fused = fused_attention_prefill(&q, &k, &v, 0, None).unwrap();
         let reference = attention(&q, &k, &v, true).unwrap();
 
         assert_eq!(fused.shape(), &[seq_q, num_heads, head_dim]);
@@ -664,7 +679,7 @@ mod tests {
         let v_exp = super::super::repeat_kv(&v, num_heads / num_kv_heads).unwrap();
         let reference = attention(&q, &k_exp, &v_exp, true).unwrap();
 
-        let fused = fused_attention_prefill(&q, &k, &v, 0).unwrap();
+        let fused = fused_attention_prefill(&q, &k, &v, 0, None).unwrap();
 
         let fused_data = fused.to_vec().unwrap();
         let ref_data = reference.to_vec().unwrap();
@@ -789,7 +804,7 @@ mod tests {
         kv_cache.append(0, &k_new, &v_new).unwrap();
         let total_len = cache_len + new_seq;
         let (k_full, v_full) = kv_cache.get_up_to(0, total_len);
-        let fused = fused_attention_prefill(&q, &k_full, &v_full, cache_len).unwrap();
+        let fused = fused_attention_prefill(&q, &k_full, &v_full, cache_len, None).unwrap();
 
         // CPU reference with offset-aware causal mask
         let k_full_cpu = k_full.to_vec().unwrap();
@@ -855,7 +870,7 @@ mod tests {
         let (k_full, v_full) = kv_cache.get_up_to(0, total_len);
 
         // Fused kernel
-        let fused_output = fused_attention_decode(&q1, &k_full, &v_full).unwrap();
+        let fused_output = fused_attention_decode(&q1, &k_full, &v_full, None).unwrap();
 
         // Independent reference (transpose + matmul + softmax)
         let ref_output = reference_attention_kv(&q1, &k_full, &v_full, num_heads);
@@ -896,7 +911,7 @@ mod tests {
         let v =
             CudaTensor::from_slice(&ctx, &[total_len, num_kv_heads, head_dim], &v_data).unwrap();
 
-        let fused = fused_attention_decode(&q, &k, &v).unwrap();
+        let fused = fused_attention_decode(&q, &k, &v, None).unwrap();
         let reference = reference_attention_kv(&q, &k, &v, num_heads);
 
         let fused_data = fused.to_vec().unwrap();
@@ -954,7 +969,7 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &k_data).unwrap();
         let v_direct =
             CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &v_data).unwrap();
-        let direct = fused_attention_decode(&q, &k_direct, &v_direct).unwrap();
+        let direct = fused_attention_decode(&q, &k_direct, &v_direct, None).unwrap();
 
         // Indirect: K/V sized to max_seq_len, only first total_len rows filled
         let mut k_full_data = vec![0.0_f32; max_seq_len * num_heads * head_dim];
@@ -972,7 +987,7 @@ mod tests {
         pos.set(total_len, ctx.device()).unwrap();
 
         let indirect =
-            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len).unwrap();
+            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len, None).unwrap();
 
         assert_eq!(indirect.shape(), &[1, num_heads, head_dim]);
 
@@ -1013,7 +1028,7 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[total_len, num_kv_heads, head_dim], &k_data).unwrap();
         let v_direct =
             CudaTensor::from_slice(&ctx, &[total_len, num_kv_heads, head_dim], &v_data).unwrap();
-        let direct = fused_attention_decode(&q, &k_direct, &v_direct).unwrap();
+        let direct = fused_attention_decode(&q, &k_direct, &v_direct, None).unwrap();
 
         // Indirect
         let mut k_full_data = vec![0.0_f32; max_seq_len * num_kv_heads * head_dim];
@@ -1031,7 +1046,7 @@ mod tests {
         pos.set(total_len, ctx.device()).unwrap();
 
         let indirect =
-            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len).unwrap();
+            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len, None).unwrap();
 
         assert_eq!(indirect.shape(), &[1, num_heads, head_dim]);
 
@@ -1068,12 +1083,12 @@ mod tests {
         // total_len = 3
         pos.set(3, ctx.device()).unwrap();
         let out3 =
-            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len).unwrap();
+            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len, None).unwrap();
 
         // total_len = 10
         pos.set(10, ctx.device()).unwrap();
         let out10 =
-            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len).unwrap();
+            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len, None).unwrap();
 
         let data3 = out3.to_vec().unwrap();
         let data10 = out10.to_vec().unwrap();
@@ -1097,13 +1112,254 @@ mod tests {
             &v_full.to_vec().unwrap()[..3 * num_heads * head_dim],
         )
         .unwrap();
-        let direct3 = fused_attention_decode(&q, &k3, &v3).unwrap();
+        let direct3 = fused_attention_decode(&q, &k3, &v3, None).unwrap();
 
         let direct3_data = direct3.to_vec().unwrap();
         for (i, (&a, &b)) in data3.iter().zip(direct3_data.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 1e-3,
                 "total_len=3 mismatch at {i}: indirect={a}, direct={b}"
+            );
+        }
+    }
+
+    /// CPU reference for decode attention with sliding window.
+    fn cpu_decode_sliding_window(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        total_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+    ) -> Vec<f32> {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let win_start = total_len.saturating_sub(window);
+        let mut output = vec![0.0f32; num_heads * head_dim];
+
+        for h in 0..num_heads {
+            let kv_h = h * num_kv_heads / num_heads;
+            let mut scores = Vec::new();
+            for t in win_start..total_len {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    let qi = q[h * head_dim + d];
+                    let ki = k[t * num_kv_heads * head_dim + kv_h * head_dim + d];
+                    dot += qi * ki;
+                }
+                scores.push(dot * scale);
+            }
+            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - max_s).exp();
+                sum_exp += *s;
+            }
+            for s in &mut scores {
+                *s /= sum_exp;
+            }
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (idx, t) in (win_start..total_len).enumerate() {
+                    let vi = v[t * num_kv_heads * head_dim + kv_h * head_dim + d];
+                    acc += scores[idx] * vi;
+                }
+                output[h * head_dim + d] = acc;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn test_fused_decode_sliding_window() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let num_heads = 2;
+        let head_dim = 4;
+        let total_len = 8;
+        let window = 3;
+
+        let q_data: Vec<f32> = (0..num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.17).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.11).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.07).sin())
+            .collect();
+
+        let q = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+        let k = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &k_data).unwrap();
+        let v = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &v_data).unwrap();
+
+        let windowed = fused_attention_decode(&q, &k, &v, Some(window)).unwrap();
+        let full = fused_attention_decode(&q, &k, &v, None).unwrap();
+
+        let windowed_data = windowed.to_vec().unwrap();
+        let full_data = full.to_vec().unwrap();
+
+        // Windowed and full should differ (total_len > window)
+        assert_ne!(
+            windowed_data, full_data,
+            "Windowed should differ from full attention"
+        );
+
+        // Verify against CPU reference
+        let ref_data = cpu_decode_sliding_window(
+            &q_data, &k_data, &v_data, total_len, num_heads, num_heads, head_dim, window,
+        );
+
+        for (i, (&w, &r)) in windowed_data.iter().zip(ref_data.iter()).enumerate() {
+            assert!(
+                (w - r).abs() < 1e-3,
+                "SWA decode mismatch at {i}: gpu={w}, cpu={r}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_decode_sliding_window_larger_than_seq() {
+        // When window >= total_len, windowed should match full attention
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let num_heads = 2;
+        let head_dim = 4;
+        let total_len = 5;
+        let window = 10;
+
+        let q_data: Vec<f32> = (0..num_heads * head_dim)
+            .map(|x| (x as f32) * 0.1)
+            .collect();
+        let k_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| (x as f32) * 0.05)
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| (x as f32) * 0.02)
+            .collect();
+
+        let q = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+        let k = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &k_data).unwrap();
+        let v = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &v_data).unwrap();
+
+        let windowed = fused_attention_decode(&q, &k, &v, Some(window)).unwrap();
+        let full = fused_attention_decode(&q, &k, &v, None).unwrap();
+
+        let windowed_data = windowed.to_vec().unwrap();
+        let full_data = full.to_vec().unwrap();
+
+        for (i, (&w, &f)) in windowed_data.iter().zip(full_data.iter()).enumerate() {
+            assert!(
+                (w - f).abs() < 1e-4,
+                "Window >= seq should match full at {i}: windowed={w}, full={f}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_prefill_sliding_window() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let num_heads = 2;
+        let head_dim = 4;
+        let seq_q = 6;
+        let window = 3;
+
+        let q_data: Vec<f32> = (0..seq_q * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.13).sin())
+            .collect();
+        let k_data = q_data.clone();
+        let v_data: Vec<f32> = (0..seq_q * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.07).cos())
+            .collect();
+
+        let q = CudaTensor::from_slice(&ctx, &[seq_q, num_heads, head_dim], &q_data).unwrap();
+        let k = CudaTensor::from_slice(&ctx, &[seq_q, num_heads, head_dim], &k_data).unwrap();
+        let v = CudaTensor::from_slice(&ctx, &[seq_q, num_heads, head_dim], &v_data).unwrap();
+
+        let windowed = fused_attention_prefill(&q, &k, &v, 0, Some(window)).unwrap();
+        let full = fused_attention_prefill(&q, &k, &v, 0, None).unwrap();
+
+        let windowed_data = windowed.to_vec().unwrap();
+        let full_data = full.to_vec().unwrap();
+
+        // First `window` positions should be identical (window covers all valid keys)
+        let first_window_elems = window * num_heads * head_dim;
+        for (i, (&w, &f)) in windowed_data[..first_window_elems]
+            .iter()
+            .zip(full_data[..first_window_elems].iter())
+            .enumerate()
+        {
+            assert!(
+                (w - f).abs() < 1e-4,
+                "First {window} rows should match: mismatch at {i}: windowed={w}, full={f}"
+            );
+        }
+
+        // Later positions should differ (window restricts attention)
+        let later = &windowed_data[first_window_elems..];
+        let later_full = &full_data[first_window_elems..];
+        assert_ne!(
+            later, later_full,
+            "Later positions should differ with sliding window"
+        );
+    }
+
+    #[test]
+    fn test_fused_decode_indirect_sliding_window() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let num_heads = 2;
+        let head_dim = 4;
+        let total_len = 8;
+        let max_seq_len = 16;
+        let window = 3;
+
+        let q_data: Vec<f32> = (0..num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.17).sin())
+            .collect();
+        let q = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+
+        // Direct
+        let k_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.11).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.07).sin())
+            .collect();
+        let k_direct =
+            CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &k_data).unwrap();
+        let v_direct =
+            CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &v_data).unwrap();
+        let direct = fused_attention_decode(&q, &k_direct, &v_direct, Some(window)).unwrap();
+
+        // Indirect
+        let mut k_full_data = vec![0.0_f32; max_seq_len * num_heads * head_dim];
+        let mut v_full_data = vec![0.0_f32; max_seq_len * num_heads * head_dim];
+        k_full_data[..k_data.len()].copy_from_slice(&k_data);
+        v_full_data[..v_data.len()].copy_from_slice(&v_data);
+        let k_full =
+            CudaTensor::from_slice(&ctx, &[max_seq_len, num_heads, head_dim], &k_full_data)
+                .unwrap();
+        let v_full =
+            CudaTensor::from_slice(&ctx, &[max_seq_len, num_heads, head_dim], &v_full_data)
+                .unwrap();
+
+        let mut pos = crate::cuda::SeqPosition::new(ctx.device()).unwrap();
+        pos.set(total_len, ctx.device()).unwrap();
+
+        let indirect =
+            fused_attention_decode_indirect(&q, &k_full, &v_full, &pos, max_seq_len, Some(window))
+                .unwrap();
+
+        let direct_data = direct.to_vec().unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (d - ind).abs() < 1e-3,
+                "SWA indirect mismatch at {i}: direct={d}, indirect={ind}"
             );
         }
     }
