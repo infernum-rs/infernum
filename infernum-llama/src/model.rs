@@ -867,6 +867,89 @@ where
             }
         }
 
+        /// Load MoE weights with tensor-parallel sharding for a single layer.
+        ///
+        /// Each expert's MLP weights are sharded the same way as a dense MLP:
+        /// `w1`/`w3` (gate/up) are column-parallel, `w2` (down) is row-parallel.
+        /// The router gate is replicated on all ranks.
+        fn load_moe_weights_sharded<T: TensorDType + DeviceRepr>(
+            ctx: &CudaContext,
+            loader: &impl WeightLoader,
+            layer_prefix: &str,
+            config: &LlamaConfig,
+            shard: &ShardConfig,
+            qc: Option<&crate::QuantizationConfig>,
+        ) -> Result<FfnWeights<T>> {
+            let num_experts = config
+                .num_local_experts
+                .expect("MoE requires num_local_experts");
+            let num_experts_per_tok = config
+                .num_experts_per_tok
+                .expect("MoE requires num_experts_per_tok");
+
+            // Router gate: replicated on all ranks
+            // [num_experts, hidden_size] → pre-transpose to [hidden_size, num_experts]
+            let gate_name = format!("{layer_prefix}.block_sparse_moe.gate.weight");
+            let gate_f32 = loader.load_f32(ctx, &gate_name)?;
+            let gate_transposed = pretranspose_weight(&gate_f32)?;
+            let gate = if T::DTYPE == infernum::dtype::DType::F32 {
+                reinterpret_tensor(gate_transposed)
+            } else {
+                let data_f32 = gate_transposed.to_vec()?;
+                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
+                CudaTensor::from_slice(ctx, gate_transposed.shape(), &data_t)?
+            };
+
+            // Load each expert's MLP with sharded weights
+            let mut experts = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let ep = format!("{layer_prefix}.block_sparse_moe.experts.{e}");
+                // w1 = gate_proj (column-parallel), w3 = up_proj (column-parallel)
+                let gate_proj = load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{ep}.w1.weight"),
+                    shard,
+                    ShardStrategy::Column,
+                    qc,
+                )?;
+                let up_proj = load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{ep}.w3.weight"),
+                    shard,
+                    ShardStrategy::Column,
+                    qc,
+                )?;
+
+                // Keep gate/up separate (same as dense sharded MLP)
+                let gate_up = GateUpWeight::Separate {
+                    gate_proj: Box::new(gate_proj),
+                    up_proj: Box::new(up_proj),
+                };
+
+                // w2 = down_proj (row-parallel)
+                let down_proj = load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{ep}.w2.weight"),
+                    shard,
+                    ShardStrategy::Row,
+                    qc,
+                )?;
+
+                experts.push(MoeExpertWeights {
+                    mlp: LlamaMlpWeights { gate_up, down_proj },
+                });
+            }
+
+            Ok(FfnWeights::Moe {
+                gate,
+                experts,
+                num_experts_per_tok,
+            })
+        }
+
         let shard = match &gpu_config {
             GpuConfig::Sharded(s) => *s,
             GpuConfig::Single => {
@@ -968,8 +1051,9 @@ where
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                ffn: {
-                    assert!(!config.is_moe(), "MoE sharding is not yet supported");
+                ffn: if config.is_moe() {
+                    load_moe_weights_sharded::<T>(ctx, loader, &prefix, &config, &shard, qc)?
+                } else {
                     let gate_name = format!("{prefix}.mlp.gate_proj.weight");
                     let up_name = format!("{prefix}.mlp.up_proj.weight");
                     let down_name = format!("{prefix}.mlp.down_proj.weight");
@@ -1451,6 +1535,43 @@ where
         Ok(out)
     }
 
+    /// Forward pass through MLP without all-reduce.
+    ///
+    /// Used by MoE: each expert produces a partial (rank-local) output that
+    /// gets weighted-summed, and a single all-reduce is applied after
+    /// combining all experts rather than once per expert.
+    #[allow(clippy::unused_self)]
+    fn forward_mlp_no_reduce(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &LlamaMlpWeights<T>,
+    ) -> Result<CudaTensor<T>> {
+        let (gate, up) = match &weights.gate_up {
+            GateUpWeight::Fused {
+                weight,
+                intermediate_size,
+            } => {
+                let seq_len = hidden.shape()[0];
+                let gate_up = matmul(hidden, weight)?;
+                if seq_len == 1 {
+                    let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
+                    let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
+                    (gate, up)
+                } else {
+                    split_gate_up(&gate_up, *intermediate_size)?
+                }
+            }
+            GateUpWeight::Separate { gate_proj, up_proj } => {
+                let gate = linear(hidden, gate_proj)?;
+                let up = linear(hidden, up_proj)?;
+                (gate, up)
+            }
+        };
+
+        let intermediate = swiglu(&gate, &up)?;
+        linear(&intermediate, &weights.down_proj)
+    }
+
     /// Dispatch to dense MLP or MoE forward pass.
     fn forward_ffn(&self, hidden: &CudaTensor<T>, ffn: &FfnWeights<T>) -> Result<CudaTensor<T>> {
         match ffn {
@@ -1464,6 +1585,10 @@ where
     }
 
     /// Forward pass through a Mixture-of-Experts layer.
+    ///
+    /// Each expert runs without all-reduce (via `forward_mlp_no_reduce`);
+    /// the partial rank-local outputs are weighted-summed by `moe_forward`,
+    /// and a single all-reduce is applied to the combined result.
     fn forward_moe(
         &self,
         hidden: &CudaTensor<T>,
@@ -1471,13 +1596,18 @@ where
         experts: &[MoeExpertWeights<T>],
         num_experts_per_tok: usize,
     ) -> Result<CudaTensor<T>> {
-        infernum::cuda::moe::moe_forward(
+        let mut out = infernum::cuda::moe::moe_forward(
             hidden,
             gate,
             experts.len(),
             num_experts_per_tok,
-            |expert_idx, expert_input| self.forward_mlp(expert_input, &experts[expert_idx].mlp),
-        )
+            |expert_idx, expert_input| {
+                self.forward_mlp_no_reduce(expert_input, &experts[expert_idx].mlp)
+            },
+        )?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// Project hidden states to vocabulary logits (always f32)
@@ -1941,7 +2071,8 @@ where
 ///
 /// - Column-parallel (split output dim): `q_proj`, `k_proj`, `v_proj`, `gate_proj`, `up_proj`
 /// - Row-parallel (split input dim): `o_proj`, `down_proj`
-/// - Replicate: norms, embeddings, RoPE caches, `lm_head`, scales, everything else
+/// - MoE experts: `w1`/`w3` Column, `w2` Row (Mixtral naming)
+/// - Replicate: norms, embeddings, RoPE caches, `lm_head`, router gate, scales, everything else
 #[allow(dead_code)]
 fn shard_strategy_for_weight(name: &str) -> ShardStrategy {
     // Scale tensors are always replicated (per-tensor scalars)
@@ -1964,7 +2095,20 @@ fn shard_strategy_for_weight(name: &str) -> ShardStrategy {
         return ShardStrategy::Row;
     }
 
-    // Everything else: norms, embeddings, lm_head
+    // MoE expert projections (Mixtral SafeTensors naming)
+    // w1 = gate_proj (column-parallel), w3 = up_proj (column-parallel)
+    // w2 = down_proj (row-parallel)
+    // Router gate falls through to Replicate below.
+    if name.contains(".block_sparse_moe.experts.") {
+        if name.ends_with(".w1.weight") || name.ends_with(".w3.weight") {
+            return ShardStrategy::Column;
+        }
+        if name.ends_with(".w2.weight") {
+            return ShardStrategy::Row;
+        }
+    }
+
+    // Everything else: norms, embeddings, lm_head, router gate
     ShardStrategy::Replicate
 }
 
@@ -3053,6 +3197,10 @@ mod tests {
             "model.layers.31.self_attn.v_proj.weight",
             "model.layers.0.mlp.gate_proj.weight",
             "model.layers.0.mlp.up_proj.weight",
+            // MoE expert projections: w1 = gate_proj, w3 = up_proj
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.7.w3.weight",
+            "model.layers.31.block_sparse_moe.experts.3.w1.weight",
         ];
         for name in &column_names {
             assert!(
@@ -3067,6 +3215,9 @@ mod tests {
         let row_names = [
             "model.layers.0.self_attn.o_proj.weight",
             "model.layers.31.mlp.down_proj.weight",
+            // MoE expert projections: w2 = down_proj
+            "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+            "model.layers.31.block_sparse_moe.experts.5.w2.weight",
         ];
         for name in &row_names {
             assert!(
@@ -3085,6 +3236,8 @@ mod tests {
             "model.layers.0.input_layernorm.weight",
             "model.layers.0.post_attention_layernorm.weight",
             "model.layers.0.self_attn.q_proj.weight_scale",
+            // MoE router gate: replicated on all ranks
+            "model.layers.0.block_sparse_moe.gate.weight",
         ];
         for name in &replicate_names {
             assert!(
