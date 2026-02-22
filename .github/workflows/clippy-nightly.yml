@@ -46,6 +46,12 @@ jobs:
           echo "LD_LIBRARY_PATH=${CUDA_LIB}:${CUDA_TARGETS_LIB}:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           sudo ldconfig ${CUDA_LIB} ${CUDA_TARGETS_LIB}
 
+      - name: Install Triton
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install triton
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+
       - name: Install Rust nightly
         run: rustup toolchain install nightly --component clippy
 
