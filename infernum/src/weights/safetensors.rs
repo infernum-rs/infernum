@@ -326,10 +326,6 @@ impl SafeTensorsLoader {
             .get(&qweight_name)
             .ok_or_else(|| Error::WeightNotFound(qweight_name.clone()))?;
 
-        let qweight_data = self.get_tensor_data(&qweight_name)?;
-        let scales_data = self.get_tensor_data(&scales_name)?;
-        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
-
         // GPTQ packed layout: qweight [K/8, N] int32
         let in_features = qweight_meta.shape[0] * 8;
         let out_features = qweight_meta.shape[1];
@@ -340,6 +336,10 @@ impl SafeTensorsLoader {
         } else {
             group_size
         };
+
+        let qweight_data = self.get_tensor_data(&qweight_name)?;
+        let scales_data = self.get_tensor_data(&scales_name)?;
+        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
         let num_groups = in_features / group_size;
 
         match strategy {
@@ -379,24 +379,37 @@ impl SafeTensorsLoader {
             ShardStrategy::Row => {
                 // Split along K (input dimension)
                 let (k_start, k_shard) = shard.shard_range(in_features);
-                assert_eq!(
-                    k_start % group_size,
-                    0,
-                    "GPTQ row shard: K start ({k_start}) must be aligned to group_size ({group_size})"
-                );
 
                 // qweight [K/8, N] int32 → slice rows [k_start/8..(k_start+k_shard)/8]
                 let qw_row_start = k_start / 8;
                 let qw_row_shard = k_shard / 8;
                 let qw_sliced =
                     slice_2d_rows(qweight_data, out_features, qw_row_start, qw_row_shard, 4);
-                // scales [num_groups, N] f16 → slice rows [g_start..g_start+g_shard]
-                let g_start = k_start / group_size;
-                let g_shard = k_shard / group_size;
-                let sc_sliced = slice_2d_rows(scales_data, out_features, g_start, g_shard, 2);
-                // qzeros [num_groups, N/8] int32 → slice rows
-                let qz_cols = out_features / 8;
-                let qz_sliced = slice_2d_rows(qzeros_data, qz_cols, g_start, g_shard, 4);
+
+                // Per-channel quantization (group_size == in_features) has
+                // exactly 1 group covering the entire K dimension.  All ranks
+                // share the same scales/qzeros row; only the qweight rows are
+                // sliced. The all-reduce after matmul sums partial dot products.
+                let (sc_sliced, qz_sliced, shard_group_size) = if group_size == in_features {
+                    // Replicate the single scales row and single qzeros row.
+                    // Tell the kernel group_size == k_shard so it uses the
+                    // single group for the entire (sharded) K range.
+                    (scales_data.to_vec(), qzeros_data.to_vec(), k_shard)
+                } else {
+                    assert_eq!(
+                        k_start % group_size,
+                        0,
+                        "GPTQ row shard: K start ({k_start}) must be aligned to group_size ({group_size})"
+                    );
+                    // scales [num_groups, N] f16 → slice rows [g_start..g_start+g_shard]
+                    let g_start = k_start / group_size;
+                    let g_shard = k_shard / group_size;
+                    let sc = slice_2d_rows(scales_data, out_features, g_start, g_shard, 2);
+                    // qzeros [num_groups, N/8] int32 → slice rows
+                    let qz_cols = out_features / 8;
+                    let qz = slice_2d_rows(qzeros_data, qz_cols, g_start, g_shard, 4);
+                    (sc, qz, group_size)
+                };
 
                 QuantizedTensor::from_gptq_raw(
                     ctx,
@@ -405,7 +418,7 @@ impl SafeTensorsLoader {
                     &qw_sliced,
                     &sc_sliced,
                     &qz_sliced,
-                    group_size,
+                    shard_group_size,
                 )
             }
             ShardStrategy::Replicate => unreachable!(),
@@ -444,10 +457,6 @@ impl SafeTensorsLoader {
             .get(&qweight_name)
             .ok_or_else(|| Error::WeightNotFound(qweight_name.clone()))?;
 
-        let qweight_data = self.get_tensor_data(&qweight_name)?;
-        let scales_data = self.get_tensor_data(&scales_name)?;
-        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
-
         // AWQ packed layout: qweight [K, N/8] int32
         let in_features = qweight_meta.shape[0];
         let out_features = qweight_meta.shape[1] * 8;
@@ -458,6 +467,10 @@ impl SafeTensorsLoader {
         } else {
             group_size
         };
+
+        let qweight_data = self.get_tensor_data(&qweight_name)?;
+        let scales_data = self.get_tensor_data(&scales_name)?;
+        let qzeros_data = self.get_tensor_data(&qzeros_name)?;
         let num_groups = in_features / group_size;
 
         match strategy {
@@ -505,22 +518,28 @@ impl SafeTensorsLoader {
             ShardStrategy::Row => {
                 // Split along K (input dimension)
                 let (k_start, k_shard) = shard.shard_range(in_features);
-                assert_eq!(
-                    k_start % group_size,
-                    0,
-                    "AWQ row shard: K start ({k_start}) must be aligned to group_size ({group_size})"
-                );
 
                 // qweight [K, N/8] int32 → slice rows [k_start..k_start+k_shard]
                 let qw_cols = out_features / 8;
                 let qw_sliced = slice_2d_rows(qweight_data, qw_cols, k_start, k_shard, 4);
-                // scales [num_groups, N] f16 → slice rows
-                let g_start = k_start / group_size;
-                let g_shard = k_shard / group_size;
-                let sc_sliced = slice_2d_rows(scales_data, out_features, g_start, g_shard, 2);
-                // qzeros [num_groups, N/8] int32 → slice rows
-                let qz_cols = out_features / 8;
-                let qz_sliced = slice_2d_rows(qzeros_data, qz_cols, g_start, g_shard, 4);
+
+                // Per-channel quantization: replicate the single group row,
+                // same logic as the GPTQ path above.
+                let (sc_sliced, qz_sliced, shard_group_size) = if group_size == in_features {
+                    (scales_data.to_vec(), qzeros_data.to_vec(), k_shard)
+                } else {
+                    assert_eq!(
+                        k_start % group_size,
+                        0,
+                        "AWQ row shard: K start ({k_start}) must be aligned to group_size ({group_size})"
+                    );
+                    let g_start = k_start / group_size;
+                    let g_shard = k_shard / group_size;
+                    let sc = slice_2d_rows(scales_data, out_features, g_start, g_shard, 2);
+                    let qz_cols = out_features / 8;
+                    let qz = slice_2d_rows(qzeros_data, qz_cols, g_start, g_shard, 4);
+                    (sc, qz, group_size)
+                };
 
                 QuantizedTensor::from_gptq_raw(
                     ctx,
@@ -529,7 +548,7 @@ impl SafeTensorsLoader {
                     &qw_sliced,
                     &sc_sliced,
                     &qz_sliced,
-                    group_size,
+                    shard_group_size,
                 )
             }
             ShardStrategy::Replicate => unreachable!(),

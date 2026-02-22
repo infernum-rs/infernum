@@ -63,13 +63,55 @@ pub enum Error {
     CudaGraph(String),
 
     #[cfg(feature = "nccl")]
-    #[error("NCCL error: {0:?}")]
-    Nccl(cudarc::nccl::result::NcclError),
+    #[error("NCCL error: {0}")]
+    Nccl(#[from] NcclErrorWrapper),
 }
+
+/// Wrapper around `cudarc::nccl::result::NcclError` that provides useful
+/// `Debug` and `Display` output. The upstream type's `Debug` impl discards
+/// the `ncclResult_t` error code, printing only the opaque string "`NcclError`".
+#[cfg(feature = "nccl")]
+pub struct NcclErrorWrapper(pub cudarc::nccl::result::NcclError);
+
+#[cfg(feature = "nccl")]
+impl NcclErrorWrapper {
+    fn error_name(&self) -> &'static str {
+        use cudarc::nccl::sys::ncclResult_t;
+        match self.0 .0 {
+            ncclResult_t::ncclUnhandledCudaError => {
+                "ncclUnhandledCudaError (an unhandled CUDA error)"
+            }
+            ncclResult_t::ncclSystemError => "ncclSystemError (a system call failed)",
+            ncclResult_t::ncclInternalError => "ncclInternalError (an internal NCCL error)",
+            ncclResult_t::ncclInvalidArgument => {
+                "ncclInvalidArgument (an invalid argument was passed)"
+            }
+            ncclResult_t::ncclInvalidUsage => "ncclInvalidUsage (invalid API usage)",
+            _ => "unknown NCCL error code",
+        }
+    }
+}
+
+#[cfg(feature = "nccl")]
+impl std::fmt::Debug for NcclErrorWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error_name())
+    }
+}
+
+#[cfg(feature = "nccl")]
+impl std::fmt::Display for NcclErrorWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error_name())
+    }
+}
+
+#[cfg(feature = "nccl")]
+impl std::error::Error for NcclErrorWrapper {}
 
 #[cfg(feature = "nccl")]
 impl From<cudarc::nccl::result::NcclError> for Error {
     fn from(e: cudarc::nccl::result::NcclError) -> Self {
-        Self::Nccl(e)
+        Self::Nccl(NcclErrorWrapper(e))
     }
 }

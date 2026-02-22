@@ -60,6 +60,12 @@ impl NcclCommunicator {
         Ok(Self { comm })
     }
 
+    /// The CUDA device this communicator was created on.
+    #[must_use]
+    pub fn device(&self) -> Arc<CudaDevice> {
+        self.comm.device()
+    }
+
     /// This communicator's rank (0-based).
     #[must_use]
     pub fn rank(&self) -> usize {

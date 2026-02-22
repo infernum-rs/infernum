@@ -79,13 +79,15 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
 
         self.engine.generate_stream(&input_ids, &options, |rx| {
             let mut tokens = input_ids.clone();
+            let mut prev_len = tokenizer.decode(&tokens)?.len();
 
             for token_result in rx {
                 let token = token_result?;
                 tokens.push(token);
-                let text = tokenizer.decode_token(token)?;
-                print!("{text}");
+                let full_text = tokenizer.decode(&tokens)?;
+                print!("{}", &full_text[prev_len..]);
                 io::stdout().flush()?;
+                prev_len = full_text.len();
             }
 
             Ok::<Vec<u32>, infernum::Error>(tokens)
