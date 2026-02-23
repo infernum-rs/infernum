@@ -1784,15 +1784,16 @@ where
         + ValidAsZeroBits
         + MaybeNcclType
         + Send
+        + Sync
         + 'static,
     CudaBlas: Gemm<T>,
 {
-    fn from_pretrained_sharded(
+    fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,
-        gpu_config: GpuConfig,
-        nccl_comm: NcclCommunicator,
+        shard: ShardConfig,
+        comm: NcclCommunicator,
     ) -> Result<Self> {
-        Self::from_pretrained_sharded(ctx, model_path, gpu_config, nccl_comm)
+        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
     }
 }
