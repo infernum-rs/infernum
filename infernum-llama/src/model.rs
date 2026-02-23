@@ -1604,6 +1604,7 @@ where
             gate,
             experts.len(),
             num_experts_per_tok,
+            true, // Mixtral always renormalizes top-K weights
             |expert_idx, expert_input| {
                 self.forward_mlp_no_reduce(expert_input, &experts[expert_idx].mlp)
             },
@@ -2368,6 +2369,7 @@ mod tests {
     /// Build a tiny LlamaConfig for testing
     fn tiny_config() -> LlamaConfig {
         LlamaConfig {
+            model_type: "llama".to_string(),
             vocab_size: 64,
             hidden_size: 32,
             intermediate_size: 64,
@@ -2560,6 +2562,7 @@ mod tests {
     /// Uses group_size=32 to keep dimensions small.
     fn tiny_gptq_config() -> LlamaConfig {
         LlamaConfig {
+            model_type: "llama".to_string(),
             vocab_size: 64,
             hidden_size: 32,
             intermediate_size: 64,

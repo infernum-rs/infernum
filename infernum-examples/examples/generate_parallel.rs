@@ -1,23 +1,29 @@
 //! Multi-GPU text generation example
 //!
 //! Loads a SafeTensors model across multiple GPUs using tensor parallelism
-//! and generates text.
+//! and generates text. Auto-detects model family (Llama/Mistral/Mixtral/Qwen).
 //!
 //! Usage:
 //!   cargo run --example generate_parallel --features nccl --
-//!     -m /path/to/llama --gpus 2 "Hello"
+//!     -m /path/to/model --gpus 2 "Hello"
+//!   # Load weights in bf16 (halves memory):
+//!   cargo run --example generate_parallel --features nccl --
+//!     -m /path/to/model --gpus 4 --dtype bf16 "Hello"
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use clap::Parser;
+use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::{GenerateOptions, Model as _, Result, SamplingParams, ShardedModel};
+use infernum::{GenerateOptions, Result, SamplingParams, ShardedModel};
 use infernum_llama::LlamaModel;
+use infernum_qwen::QwenModel;
 use infernum_runtime::Runtime;
 
-/// Multi-GPU text generation with Llama models (tensor parallelism)
+/// Multi-GPU text generation with tensor parallelism
 #[derive(Parser)]
 #[command(name = "generate_parallel")]
 struct Cli {
@@ -41,6 +47,10 @@ struct Cli {
     /// Maximum tokens to generate
     #[arg(short = 'n', long, default_value_t = 100)]
     max_tokens: usize,
+
+    /// Compute dtype: f32 or bf16
+    #[arg(long, default_value = "f32")]
+    dtype: String,
 
     /// Use greedy (argmax) decoding instead of sampling
     #[arg(long)]
@@ -67,29 +77,38 @@ struct Cli {
     repetition_penalty_window: usize,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let world_size = cli.gpus;
+/// Peek at just the `model_type` field from config.json.
+#[derive(Deserialize)]
+struct ModelTypeProbe {
+    #[serde(default = "default_model_type")]
+    model_type: String,
+}
 
-    println!(
-        "Loading model from: {} across {} GPUs",
-        cli.model, world_size
-    );
+fn default_model_type() -> String {
+    "llama".to_string()
+}
 
-    let t0 = Instant::now();
-    let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&cli.model, world_size)?;
+fn detect_model_type(model_path: &str) -> Result<String> {
+    let config_path = Path::new(model_path).join("config.json");
+    let content = std::fs::read_to_string(&config_path)?;
+    let probe: ModelTypeProbe = serde_json::from_str(&content)?;
+    Ok(probe.model_type)
+}
+
+fn run_parallel<M: Model + Send>(
+    model: M,
+    tokenizer: LlamaTokenizer,
+    cli: &Cli,
+    world_size: usize,
+) -> Result<()> {
     let cfg = model.config();
     println!(
-        "Model loaded in {:.2}s ({} layers, head_dim={})",
-        t0.elapsed().as_secs_f64(),
-        cfg.num_layers,
-        cfg.head_dim,
+        "Model loaded ({} layers, head_dim={})",
+        cfg.num_layers, cfg.head_dim,
     );
 
-    let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     println!("Tokenizer loaded (vocab {})", tokenizer.vocab_size());
 
-    // Build generation options
     let options = GenerateOptions {
         max_new_tokens: cli.max_tokens,
         eos_token_id: None,
@@ -139,4 +158,52 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+use infernum::model::Model;
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let world_size = cli.gpus;
+
+    println!(
+        "Loading model from: {} across {} GPUs (dtype={})",
+        cli.model, world_size, cli.dtype,
+    );
+
+    let model_type = detect_model_type(&cli.model)?;
+    let is_qwen = matches!(model_type.as_str(), "qwen2" | "qwen3" | "qwen3_moe");
+    let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
+
+    let t0 = Instant::now();
+
+    match (cli.dtype.as_str(), is_qwen) {
+        ("f32", false) => {
+            let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&cli.model, world_size)?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        ("bf16", false) => {
+            let model = ShardedModel::<LlamaModel<infernum::dtype::BF16>>::from_pretrained(
+                &cli.model, world_size,
+            )?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        ("f32", true) => {
+            let model = ShardedModel::<QwenModel<f32>>::from_pretrained(&cli.model, world_size)?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        ("bf16", true) => {
+            let model = ShardedModel::<QwenModel<infernum::dtype::BF16>>::from_pretrained(
+                &cli.model, world_size,
+            )?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        (other, _) => Err(infernum::Error::UnsupportedModel(format!(
+            "Unsupported dtype: \"{other}\". Use f32 or bf16."
+        ))),
+    }
 }

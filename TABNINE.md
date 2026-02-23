@@ -32,13 +32,23 @@ Key design patterns:
 
 The project is in early development (Phase 1). Currently contains a minimal skeleton with a placeholder `hello()` function.
 
+### Supported Model Families
+
+All models below are loaded via `infernum-llama`. Mistral/Devstral/Mixtral are architecturally identical to Llama and share the same implementation. Type aliases (`MistralModel`, `MixtralModel`) are provided for API clarity.
+
+| Family | `model_type` | Architecture | Notes |
+|--------|-------------|--------------|-------|
+| Llama | `llama` | Dense | Llama 2, Llama 3, SmolLM2, CodeLlama, etc. |
+| Mistral | `mistral` | Dense | Mistral v1/v2/v3, Devstral (code fine-tune) |
+| Mixtral | `mixtral` | MoE | Mixtral 8x7B, 8x22B, etc. |
+
 ### Planned Crate Structure
 
 ```
 infernum/               # Core crate (tensor traits, ops, CUDA impls, blocks, weight loading)
 infernum-macros/        # Procedural macros (define_block!, etc.)
 infernum-llama/         # Llama model family
-infernum-qwen/          # Qwen model family (later)
+infernum-qwen/          # Qwen model family (Qwen2/2.5, Qwen3/3.5, Qwen3-MoE)
 infernum-phi/           # Phi model family (later)
 infernum-runtime/       # Execution runtime (scheduler, KV cache, batching)
 infernum-serve/         # HTTP server (Axum, OpenAI-compatible API)
@@ -87,6 +97,9 @@ Most CUDA-dependent code is behind feature flags. The `cuda` feature must be ena
 | `infernum-llama` | `cuda` | Enables `infernum/cuda` + `infernum-runtime/cuda` |
 | `infernum-llama` | `nccl` | Multi-GPU (implies `cuda`) |
 | `infernum-llama` | `integration` | Integration tests — downloads real models (implies `cuda`) |
+| `infernum-qwen` | `cuda` | Enables `infernum/cuda` + `infernum-runtime/cuda` |
+| `infernum-qwen` | `nccl` | Multi-GPU (implies `cuda`) |
+| `infernum-qwen` | `integration` | Integration tests — downloads real models (implies `cuda`) |
 | `infernum-runtime` | `cuda` | Enables `infernum/cuda` |
 | `infernum-runtime` | `nccl` | Multi-GPU (implies `cuda`) |
 | `infernum-examples` | `cuda` | All CUDA deps for examples |
@@ -143,23 +156,33 @@ The GitHub Actions CI pipeline runs on every push/PR to `main`:
 
 ### Integration Tests
 
-Integration tests live in `infernum-llama/tests/model_integration.rs`. They download real models from HuggingFace and verify end-to-end generation output. They are gated behind the `integration` feature so they don't run during normal `cargo test`.
+Integration tests live in each model crate's `tests/model_integration.rs`. They download real models from HuggingFace and verify end-to-end generation output. They are gated behind the `integration` feature so they don't run during normal `cargo test`.
 
 **Running integration tests:**
 
 ```bash
+# Llama/Mixtral/Mistral family
 cargo test -p infernum-llama --features integration -- --test-threads=1
+
+# Qwen family
+cargo test -p infernum-qwen --features integration -- --test-threads=1
 ```
 
 Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
 
-**What's tested:**
+**What's tested (infernum-llama):**
 
 - **SmolLM2-360M** (SafeTensors f32) — greedy generation correctness, no NaN/Inf in logits
 - **Llama-3.2-1B-Instruct FP8** (compressed-tensors) — no NaN/Inf in logits (generation quality test ignored for now)
 - **Llama-3.2-1B GPTQ** (GPTQ INT4, group_size=128) — greedy generation correctness, no NaN/Inf in logits
 - **Mixtral-tiny** (`jamesdborin/tiny-mixtral`, 2-layer MoE, ~988MB f32) — MoE loading/routing plumbing, no NaN/Inf in logits (random weights, no quality check)
 - GGUF integration tests are planned but not yet added
+
+**What's tested (infernum-qwen):**
+
+- **Qwen2.5-0.5B** (`Qwen/Qwen2.5-0.5B`, ~987MB bf16) — greedy generation correctness ("Paris"), no NaN/Inf. Tests Q/K/V bias and tied embeddings.
+- **Qwen3-0.6B** (`Qwen/Qwen3-0.6B`, ~1.2GB bf16) — greedy generation correctness ("Paris"), no NaN/Inf. Tests QK-norm (RMSNorm on Q/K per-head before RoPE) and explicit `head_dim` override.
+- **Qwen3-MoE-tiny** (`yujiepan/qwen3-moe-tiny-random`, ~5MB, random weights) — MoE loading/routing plumbing, no NaN/Inf. Tests `decoder_sparse_step` (mixed dense/MoE layers), 8 experts top-2.
 
 **Ignored (large model) tests:**
 
@@ -175,6 +198,7 @@ cargo test -p infernum-llama --features integration -- --ignored --test-threads=
 
 Currently ignored:
 
+- **Mistral-7B-Instruct-v0.3** (`mistralai/Mistral-7B-Instruct-v0.3`, ~14.5GB bf16, 3 sharded SafeTensors) — validates `model_type: "mistral"` loads correctly via `MistralModel` alias. Requires ~30GB VRAM (loaded as f32).
 - **laser-dolphin-mixtral-2x7b-dpo** (`macadeliccc/laser-dolphin-mixtral-2x7b-dpo`, ~24GB bf16, 3 sharded SafeTensors) — validates MoE generation quality with real weights. Requires ~48GB VRAM (loaded as f32); fits on a single A100 80GB.
 
 **Writing new integration tests:**

@@ -663,7 +663,10 @@ dependencies = [
  "cudarc",
  "infernum",
  "infernum-llama",
+ "infernum-qwen",
  "infernum-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -685,6 +688,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "infernum-qwen"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "infernum",
+ "infernum-runtime",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

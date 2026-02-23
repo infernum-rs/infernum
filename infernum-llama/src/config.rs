@@ -56,6 +56,10 @@ where
 /// Parsed from the model's `config.json` file
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlamaConfig {
+    /// Model architecture type (e.g., `"llama"`, `"mistral"`, `"mixtral"`)
+    #[serde(default = "default_model_type")]
+    pub model_type: String,
+
     /// Vocabulary size
     pub vocab_size: usize,
 
@@ -151,6 +155,10 @@ where
     }
 }
 
+fn default_model_type() -> String {
+    "llama".to_string()
+}
+
 fn default_max_position_embeddings() -> usize {
     2048
 }
@@ -171,15 +179,36 @@ fn default_eos_token_id() -> u32 {
     2
 }
 
+/// Supported `model_type` values for the Llama model family.
+const SUPPORTED_MODEL_TYPES: &[&str] = &["llama", "mistral", "mixtral"];
+
 impl LlamaConfig {
     /// Load configuration from a JSON file
     ///
     /// # Errors
-    /// Returns an error if the file cannot be read or parsed
+    /// Returns an error if the file cannot be read or parsed, or if the
+    /// `model_type` is not supported.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;
+        config.validate_model_type()?;
         Ok(config)
+    }
+
+    /// Validate that the `model_type` is one we support.
+    ///
+    /// # Errors
+    /// Returns [`infernum::Error::UnsupportedModel`] if the model type is unknown.
+    pub fn validate_model_type(&self) -> Result<()> {
+        if SUPPORTED_MODEL_TYPES.contains(&self.model_type.as_str()) {
+            Ok(())
+        } else {
+            Err(infernum::Error::UnsupportedModel(format!(
+                "Unsupported model_type: \"{}\". Supported: {}",
+                self.model_type,
+                SUPPORTED_MODEL_TYPES.join(", "),
+            )))
+        }
     }
 
     /// Returns true if this model uses Mixture-of-Experts layers
@@ -231,6 +260,13 @@ impl LlamaConfig {
                 .unwrap_or(default)
         };
 
+        // GGUF stores model architecture in `general.architecture` (e.g. "llama", "mistral")
+        let model_type = metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .unwrap_or("llama")
+            .to_string();
+
         let hidden_size = get_usize("llama.embedding_length")?;
         let num_attention_heads = get_usize("llama.attention.head_count")?;
 
@@ -238,7 +274,8 @@ impl LlamaConfig {
             .get("llama.attention.head_count_kv")
             .and_then(GgufValue::as_usize);
 
-        Ok(Self {
+        let config = Self {
+            model_type,
             vocab_size: get_usize("llama.vocab_size")
                 .or_else(|_| get_usize("tokenizer.ggml.tokens_count"))
                 .unwrap_or(32000),
@@ -280,7 +317,9 @@ impl LlamaConfig {
                 .and_then(GgufValue::as_usize)
                 .is_some_and(|w| w > 0),
             max_window_layers: None,
-        })
+        };
+        config.validate_model_type()?;
+        Ok(config)
     }
 
     /// Get the number of key-value heads (for grouped-query attention)
@@ -616,8 +655,107 @@ mod tests {
     }
 
     #[test]
+    fn test_config_model_type_default() {
+        let json = r#"{
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "intermediate_size": 5632,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 32
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model_type, "llama");
+        assert!(config.validate_model_type().is_ok());
+    }
+
+    #[test]
+    fn test_config_model_type_mistral() {
+        let json = r#"{
+            "model_type": "mistral",
+            "vocab_size": 32768,
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model_type, "mistral");
+        assert!(config.validate_model_type().is_ok());
+    }
+
+    #[test]
+    fn test_config_model_type_mixtral() {
+        let json = r#"{
+            "model_type": "mixtral",
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model_type, "mixtral");
+        assert!(config.validate_model_type().is_ok());
+    }
+
+    #[test]
+    fn test_config_model_type_unsupported() {
+        let json = r#"{
+            "model_type": "gpt2",
+            "vocab_size": 50257,
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12
+        }"#;
+
+        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        let err = config.validate_model_type().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gpt2"),
+            "Error should mention the unsupported type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_config_from_file_rejects_unsupported_model_type() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("infernum_test_unsupported_model.json");
+
+        let json = r#"{
+            "model_type": "phi",
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "intermediate_size": 5632,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 32
+        }"#;
+
+        std::fs::write(&path, json).unwrap();
+
+        let result = LlamaConfig::from_file(&path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("phi"),
+            "Error should mention the unsupported type: {msg}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn test_config_sliding_window_mistral() {
         let json = r#"{
+            "model_type": "mistral",
             "vocab_size": 32000,
             "hidden_size": 4096,
             "intermediate_size": 14336,

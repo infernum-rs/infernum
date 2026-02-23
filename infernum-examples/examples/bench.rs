@@ -8,14 +8,17 @@
 
 #![cfg(feature = "cuda")]
 
+use std::path::Path;
 use std::time::Instant;
 
 use clap::Parser;
+use serde::Deserialize;
 
 use infernum::cuda::CudaContext;
 use infernum::model::Model;
 use infernum::GenerateOptions;
 use infernum_llama::LlamaModel;
+use infernum_qwen::QwenModel;
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
@@ -39,6 +42,24 @@ struct Cli {
     /// Enable CUDA graph capture/replay for the decode loop
     #[arg(long)]
     graphs: bool,
+}
+
+/// Peek at just the `model_type` field from config.json.
+#[derive(Deserialize)]
+struct ModelTypeProbe {
+    #[serde(default = "default_model_type")]
+    model_type: String,
+}
+
+fn default_model_type() -> String {
+    "llama".to_string()
+}
+
+fn detect_model_type(model_path: &str) -> infernum::Result<String> {
+    let config_path = Path::new(model_path).join("config.json");
+    let content = std::fs::read_to_string(&config_path)?;
+    let probe: ModelTypeProbe = serde_json::from_str(&content)?;
+    Ok(probe.model_type)
 }
 
 fn bench_model<M: Model>(model: M, n_gen: usize, use_cuda_graphs: bool) -> infernum::Result<()> {
@@ -82,6 +103,21 @@ fn bench_model<M: Model>(model: M, n_gen: usize, use_cuda_graphs: bool) -> infer
     Ok(())
 }
 
+fn bench_with_info<M: Model>(
+    model: M,
+    num_layers: usize,
+    hidden_size: usize,
+    dtype: &str,
+    n_gen: usize,
+    use_cuda_graphs: bool,
+) -> infernum::Result<()> {
+    eprintln!(
+        "Model loaded: {} layers, {} hidden, dtype={}",
+        num_layers, hidden_size, dtype,
+    );
+    bench_model(model, n_gen, use_cuda_graphs)
+}
+
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
     let mut ctx = CudaContext::new(0)?;
@@ -100,35 +136,43 @@ fn main() -> infernum::Result<()> {
     }
 
     let is_gguf = cli.model.ends_with(".gguf");
+    let model_type = if is_gguf {
+        "llama".to_string()
+    } else {
+        detect_model_type(&cli.model)?
+    };
+    let is_qwen = matches!(model_type.as_str(), "qwen2" | "qwen3" | "qwen3_moe");
 
-    let result = match cli.dtype.as_str() {
-        "f32" => {
+    let result = match (cli.dtype.as_str(), is_qwen) {
+        ("f32", false) => {
             let model = if is_gguf {
                 LlamaModel::from_gguf(&ctx, &cli.model)?
             } else {
                 LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?
             };
-            eprintln!(
-                "Model loaded: {} layers, {} hidden, dtype=f32",
-                model.config().num_hidden_layers,
-                model.config().hidden_size,
-            );
-            bench_model(model, cli.n_gen, cli.graphs)
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
         }
-        "bf16" => {
+        ("bf16", false) => {
             assert!(
                 !is_gguf,
                 "bf16 dtype is only supported for SafeTensors models"
             );
             let model = LlamaModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
-            eprintln!(
-                "Model loaded: {} layers, {} hidden, dtype=bf16",
-                model.config().num_hidden_layers,
-                model.config().hidden_size,
-            );
-            bench_model(model, cli.n_gen, cli.graphs)
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
         }
-        other => panic!("Unsupported dtype: {other}. Use f32 or bf16."),
+        ("f32", true) => {
+            let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
+        }
+        ("bf16", true) => {
+            let model = QwenModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
+        }
+        (other, _) => panic!("Unsupported dtype: {other}. Use f32 or bf16."),
     };
 
     if let Some(pool) = ctx.buffer_pool() {
