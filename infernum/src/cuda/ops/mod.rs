@@ -36,8 +36,8 @@ pub use quantized_matmul::quantized_matmul;
 pub use repeat_kv::repeat_kv;
 pub use rmsnorm::{rms_norm, rms_norm_inplace};
 pub use rope::{
-    apply_rope, apply_rope_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
-    RopeScaling,
+    apply_rope, apply_rope_indirect, apply_rope_interleaved, apply_rope_interleaved_indirect,
+    precompute_rope_cache, precompute_rope_cache_scaled, RopeScaling,
 };
 pub use sample::sample_top_p;
 pub use silu::{silu, silu_inplace, silu_mul};
