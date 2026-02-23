@@ -7,6 +7,7 @@ use std::io::{self, Write};
 
 use infernum::{GenerateOptions, Model, ModelConfig, Result, Tokenizer};
 
+use crate::engine::GenerationEvent;
 use crate::Engine;
 
 /// Text-level inference runtime.
@@ -84,13 +85,18 @@ impl<T: Tokenizer> Runtime<T> {
             let mut tokens = input_ids.clone();
             let mut prev_len = tokenizer.decode(&tokens)?.len();
 
-            for token_result in rx {
-                let token = token_result?;
-                tokens.push(token);
-                let full_text = tokenizer.decode(&tokens)?;
-                print!("{}", &full_text[prev_len..]);
-                io::stdout().flush()?;
-                prev_len = full_text.len();
+            for event in rx {
+                match event {
+                    GenerationEvent::Token(id) => {
+                        tokens.push(id);
+                        let full_text = tokenizer.decode(&tokens)?;
+                        print!("{}", &full_text[prev_len..]);
+                        io::stdout().flush()?;
+                        prev_len = full_text.len();
+                    }
+                    GenerationEvent::Error(e) => return Err(e),
+                    GenerationEvent::Finished(_) => break,
+                }
             }
 
             Ok::<Vec<u32>, infernum::Error>(tokens)

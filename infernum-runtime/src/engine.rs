@@ -15,23 +15,47 @@ use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
 use infernum::cuda::{CudaGraph, KvCache};
 use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams};
 
-/// Trait for sending tokens from the engine to the caller.
+/// Why generation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Model produced the end-of-sequence token.
+    Stop,
+    /// Reached the maximum number of tokens.
+    Length,
+    /// The receiver was dropped (client disconnect).
+    Cancelled,
+}
+
+/// An event produced by the engine during generation.
+///
+/// Sent through a single channel so ordering is guaranteed:
+/// zero or more `Token`s, then exactly one terminal event
+/// (`Finished` or `Error`).
+pub enum GenerationEvent {
+    /// A newly generated token.
+    Token(u32),
+    /// An error occurred during generation.
+    Error(infernum::Error),
+    /// Generation completed with the given reason.
+    Finished(FinishReason),
+}
+
+/// Trait for sending generation events from the engine to the caller.
 ///
 /// Abstracted so callers can provide either a sync or async sender.
-/// The engine's worker thread calls [`TokenSender::send`] for each generated
-/// token. Return `false` to signal that the receiver has been dropped and
+/// Return `false` to signal that the receiver has been dropped and
 /// generation should stop.
 pub trait TokenSender: Send {
-    /// Send a token (or error) to the receiver.
+    /// Send a generation event to the receiver.
     ///
     /// Returns `false` if the receiver has been dropped, signalling the
     /// engine to abort generation early.
-    fn send(&self, token: Result<u32>) -> bool;
+    fn send(&self, event: GenerationEvent) -> bool;
 }
 
-impl TokenSender for mpsc::Sender<Result<u32>> {
-    fn send(&self, token: Result<u32>) -> bool {
-        mpsc::Sender::send(self, token).is_ok()
+impl TokenSender for mpsc::Sender<GenerationEvent> {
+    fn send(&self, event: GenerationEvent) -> bool {
+        mpsc::Sender::send(self, event).is_ok()
     }
 }
 
@@ -136,8 +160,12 @@ impl Engine {
         self.submit(input_ids.to_vec(), options.clone(), tx);
 
         let mut tokens = input_ids.to_vec();
-        for token_result in rx {
-            tokens.push(token_result?);
+        for event in rx {
+            match event {
+                GenerationEvent::Token(id) => tokens.push(id),
+                GenerationEvent::Error(e) => return Err(e),
+                GenerationEvent::Finished(_) => break,
+            }
         }
         Ok(tokens)
     }
@@ -162,7 +190,7 @@ impl Engine {
         consumer: F,
     ) -> R
     where
-        F: FnOnce(mpsc::Receiver<Result<u32>>) -> R,
+        F: FnOnce(mpsc::Receiver<GenerationEvent>) -> R,
     {
         let (tx, rx) = mpsc::channel();
         self.submit(input_ids.to_vec(), options.clone(), tx);
@@ -192,7 +220,7 @@ fn process_kv_cached<M: Model>(
     kv_caches: &mut [KvCache<M::CacheDtype>],
     request: &GenerationRequest,
 ) {
-    let mut run = || -> Result<()> {
+    let mut run = || -> Result<FinishReason> {
         for kv in kv_caches.iter_mut() {
             kv.reset()?;
         }
@@ -206,11 +234,11 @@ fn process_kv_cached<M: Model>(
         let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
         if request.options.eos_token_id == Some(next_token) {
-            return Ok(());
+            return Ok(FinishReason::Stop);
         }
         tokens.push(next_token);
-        if !request.token_tx.send(Ok(next_token)) {
-            return Ok(());
+        if !request.token_tx.send(GenerationEvent::Token(next_token)) {
+            return Ok(FinishReason::Cancelled);
         }
 
         // CUDA graphs only supported for single-device models
@@ -226,7 +254,7 @@ fn process_kv_cached<M: Model>(
                 &request.options,
                 &mut rng_state,
                 &*request.token_tx,
-            )?;
+            )
         } else {
             stream_decode_loop_eager(
                 model,
@@ -236,20 +264,23 @@ fn process_kv_cached<M: Model>(
                 &request.options,
                 &mut rng_state,
                 &*request.token_tx,
-            )?;
+            )
         }
-
-        Ok(())
     };
 
-    if let Err(e) = run() {
-        let _ = request.token_tx.send(Err(e));
+    match run() {
+        Ok(reason) => {
+            let _ = request.token_tx.send(GenerationEvent::Finished(reason));
+        }
+        Err(e) => {
+            let _ = request.token_tx.send(GenerationEvent::Error(e));
+        }
     }
 }
 
 /// Process a single request without KV cache (recomputes full sequence each step).
 fn process_naive<M: Model>(model: &M, request: &GenerationRequest) {
-    let run = || -> Result<()> {
+    let run = || -> Result<FinishReason> {
         let mut tokens = request.input_ids.clone();
         let mut rng_state = request.options.sampling.as_ref().map(|s| s.seed);
         let sampling = request.options.sampling.as_ref();
@@ -260,19 +291,24 @@ fn process_naive<M: Model>(model: &M, request: &GenerationRequest) {
             let next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
             if request.options.eos_token_id == Some(next_token) {
-                break;
+                return Ok(FinishReason::Stop);
             }
             tokens.push(next_token);
-            if !request.token_tx.send(Ok(next_token)) {
-                break;
+            if !request.token_tx.send(GenerationEvent::Token(next_token)) {
+                return Ok(FinishReason::Cancelled);
             }
         }
 
-        Ok(())
+        Ok(FinishReason::Length)
     };
 
-    if let Err(e) = run() {
-        let _ = request.token_tx.send(Err(e));
+    match run() {
+        Ok(reason) => {
+            let _ = request.token_tx.send(GenerationEvent::Finished(reason));
+        }
+        Err(e) => {
+            let _ = request.token_tx.send(GenerationEvent::Error(e));
+        }
     }
 }
 
@@ -285,7 +321,7 @@ fn stream_decode_loop_eager<M: Model>(
     options: &GenerateOptions,
     rng_state: &mut Option<u64>,
     tx: &dyn TokenSender,
-) -> Result<()> {
+) -> Result<FinishReason> {
     let sampling = options.sampling.as_ref();
     for _ in 1..options.max_new_tokens {
         let logits = model.forward_next_token(*next_token, kv_caches)?;
@@ -293,14 +329,14 @@ fn stream_decode_loop_eager<M: Model>(
         *next_token = select_token(&logits, sampling, rng_state, recent)?;
 
         if options.eos_token_id == Some(*next_token) {
-            break;
+            return Ok(FinishReason::Stop);
         }
         tokens.push(*next_token);
-        if !tx.send(Ok(*next_token)) {
-            break;
+        if !tx.send(GenerationEvent::Token(*next_token)) {
+            return Ok(FinishReason::Cancelled);
         }
     }
-    Ok(())
+    Ok(FinishReason::Length)
 }
 
 /// Streaming decode loop with capture-once CUDA graph.
@@ -320,7 +356,7 @@ fn stream_decode_loop_graph<M: Model>(
     options: &GenerateOptions,
     rng_state: &mut Option<u64>,
     tx: &dyn TokenSender,
-) -> Result<()> {
+) -> Result<FinishReason> {
     let sampling = options.sampling.as_ref();
 
     // Cap the effective max_seq_len for graph-captured kernels
@@ -367,14 +403,14 @@ fn stream_decode_loop_graph<M: Model>(
         }
 
         if options.eos_token_id == Some(*next_token) {
-            break;
+            return Ok(FinishReason::Stop);
         }
         tokens.push(*next_token);
-        if !tx.send(Ok(*next_token)) {
-            break;
+        if !tx.send(GenerationEvent::Token(*next_token)) {
+            return Ok(FinishReason::Cancelled);
         }
     }
-    Ok(())
+    Ok(FinishReason::Length)
 }
 
 /// Select the next token from logits, either via greedy argmax or sampling.

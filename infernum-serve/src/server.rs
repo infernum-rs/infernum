@@ -23,7 +23,7 @@ use infernum::{
     ChatMessage, GenerateOptions, Model, ModelConfig, Result as InfernumResult, SamplingParams,
     Tokenizer,
 };
-use infernum_runtime::{Engine, TokenSender};
+use infernum_runtime::{Engine, FinishReason, GenerationEvent, TokenSender};
 
 use crate::types::{
     ChatChoice, ChatChunkChoice, ChatCompletionChunk, ChatCompletionRequest,
@@ -39,11 +39,11 @@ use crate::types::{
 ///
 /// Uses `blocking_send`, which is safe because the engine's worker thread
 /// is a plain `std::thread` (not a tokio task).
-struct TokioTokenSender(tokio_mpsc::Sender<InfernumResult<u32>>);
+struct TokioTokenSender(tokio_mpsc::Sender<GenerationEvent>);
 
 impl TokenSender for TokioTokenSender {
-    fn send(&self, token: InfernumResult<u32>) -> bool {
-        self.0.blocking_send(token).is_ok()
+    fn send(&self, event: GenerationEvent) -> bool {
+        self.0.blocking_send(event).is_ok()
     }
 }
 
@@ -312,7 +312,7 @@ async fn chat_completions_handler(
     let stream = request.stream.unwrap_or(false);
 
     if stream {
-        handle_streaming(handle, input_ids, options, prompt_tokens, &request.model).into_response()
+        handle_streaming(handle, input_ids, options, &request.model).into_response()
     } else {
         handle_non_streaming(handle, input_ids, options, prompt_tokens, &request.model)
             .await
@@ -331,7 +331,7 @@ async fn handle_non_streaming(
     prompt_tokens: usize,
     model_name: &str,
 ) -> Response {
-    let (tx, mut rx) = tokio_mpsc::channel::<InfernumResult<u32>>(256);
+    let (tx, mut rx) = tokio_mpsc::channel::<GenerationEvent>(256);
     handle
         .engine
         .submit(input_ids, options, TokioTokenSender(tx));
@@ -339,10 +339,10 @@ async fn handle_non_streaming(
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut finish_reason = "length";
 
-    while let Some(result) = rx.recv().await {
-        match result {
-            Ok(token) => generated_ids.push(token),
-            Err(e) => {
+    while let Some(event) = rx.recv().await {
+        match event {
+            GenerationEvent::Token(id) => generated_ids.push(id),
+            GenerationEvent::Error(e) => {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("Generation error: {e}"),
@@ -351,16 +351,14 @@ async fn handle_non_streaming(
                     None,
                 );
             }
+            GenerationEvent::Finished(reason) => {
+                finish_reason = match reason {
+                    FinishReason::Stop => "stop",
+                    FinishReason::Length | FinishReason::Cancelled => "length",
+                };
+                break;
+            }
         }
-    }
-
-    // If the channel closed before max_tokens, it could be EOS
-    if generated_ids
-        .last()
-        .is_some_and(|&t| Some(t) == Some(handle.model_config.eos_token_id))
-    {
-        finish_reason = "stop";
-        generated_ids.pop(); // don't include EOS in output
     }
 
     // Decode generated tokens
@@ -406,15 +404,13 @@ async fn handle_non_streaming(
 // Streaming (SSE) response
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::cast_possible_truncation)]
 fn handle_streaming(
     handle: Arc<ModelHandle>,
     input_ids: Vec<u32>,
     options: GenerateOptions,
-    _prompt_tokens: usize,
     model_name: &str,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let (engine_tx, mut engine_rx) = tokio_mpsc::channel::<InfernumResult<u32>>(256);
+    let (engine_tx, mut engine_rx) = tokio_mpsc::channel::<GenerationEvent>(256);
     handle
         .engine
         .submit(input_ids, options, TokioTokenSender(engine_tx));
@@ -424,7 +420,6 @@ fn handle_streaming(
     let id = generate_id();
     let created = unix_timestamp();
     let model = model_name.to_string();
-    let eos_token_id = handle.model_config.eos_token_id;
 
     tokio::spawn(async move {
         // First chunk: role
@@ -446,19 +441,10 @@ fn handle_streaming(
             return;
         }
 
-        let mut last_was_eos = false;
-        let mut all_ids = Vec::new();
-
-        while let Some(result) = engine_rx.recv().await {
-            match result {
-                Ok(token) => {
-                    if token == eos_token_id {
-                        last_was_eos = true;
-                        break;
-                    }
-                    all_ids.push(token);
-
-                    // Decode incremental text
+        let mut finish = "length";
+        while let Some(event) = engine_rx.recv().await {
+            match event {
+                GenerationEvent::Token(token) => {
                     let Ok(text) = handle.tokenizer.decode_token(token) else {
                         continue;
                     };
@@ -481,12 +467,16 @@ fn handle_streaming(
                         return;
                     }
                 }
-                Err(_) => break,
+                GenerationEvent::Error(_) => break,
+                GenerationEvent::Finished(reason) => {
+                    finish = match reason {
+                        FinishReason::Stop => "stop",
+                        FinishReason::Length | FinishReason::Cancelled => "length",
+                    };
+                    break;
+                }
             }
         }
-
-        // Final chunk with finish_reason
-        let finish = if last_was_eos { "stop" } else { "length" };
         let final_chunk = ChatCompletionChunk {
             id: id.clone(),
             object: "chat.completion.chunk".into(),
