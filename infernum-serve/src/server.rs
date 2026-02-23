@@ -100,17 +100,25 @@ impl ModelEntry {
     /// Create a new model entry.
     ///
     /// The model is consumed and moved into a background engine thread.
+    /// `max_seq_len` caps the KV cache allocation; `None` uses the default
+    /// (`min(model.max_position_embeddings, 4096)`).
     ///
     /// # Panics
     /// Panics if engine creation fails (KV cache allocation).
-    pub fn new<M, T, C>(name: &str, model: M, tokenizer: T, template: C) -> Self
+    pub fn new<M, T, C>(
+        name: &str,
+        model: M,
+        tokenizer: T,
+        template: C,
+        max_seq_len: Option<usize>,
+    ) -> Self
     where
         M: Model + Send + 'static,
         T: Tokenizer + Send + Sync + 'static,
         C: ChatTemplate + 'static,
     {
         let model_config = model.config();
-        let engine = Engine::new(model).expect("Failed to create engine");
+        let engine = Engine::with_max_seq_len(model, max_seq_len).expect("Failed to create engine");
         Self {
             name: name.to_string(),
             handle: ModelHandle {

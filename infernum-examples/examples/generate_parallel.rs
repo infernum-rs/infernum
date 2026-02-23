@@ -76,6 +76,10 @@ struct Cli {
     /// Number of recent tokens to consider for repetition penalty
     #[arg(long, default_value_t = 64)]
     repetition_penalty_window: usize,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -137,7 +141,7 @@ fn run_parallel<M: Model + Send + 'static>(
         println!("Decoding: greedy (argmax)");
     }
 
-    let runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
 
     print!("{}", cli.prompt);
     io::stdout().flush()?;

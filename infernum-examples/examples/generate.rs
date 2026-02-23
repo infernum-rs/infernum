@@ -79,6 +79,10 @@ struct Cli {
     /// Number of recent tokens to consider for repetition penalty
     #[arg(long, default_value_t = 64)]
     repetition_penalty_window: usize,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 /// Abstraction over tokenizer backends so we can use either one.
@@ -204,7 +208,7 @@ fn run_generate<M: Model + Send + 'static>(
     let start = Instant::now();
 
     let (output_tokens, prompt_len) = if !options.use_kv_cache {
-        let engine = Engine::new(model)?;
+        let engine = Engine::with_max_seq_len(model, cli.max_seq_len)?;
         let input_ids = tokenizer.encode(&cli.prompt, true)?;
         let prompt_len = input_ids.len();
 
@@ -221,7 +225,7 @@ fn run_generate<M: Model + Send + 'static>(
 
         (tokens, prompt_len)
     } else {
-        let runtime = Runtime::new(model, tokenizer)?;
+        let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
         let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
         let tokens = runtime.generate_stream(&cli.prompt, &options)?;
         (tokens, prompt_len)

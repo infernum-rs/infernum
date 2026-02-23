@@ -66,6 +66,13 @@ struct GenerationRequest {
     token_tx: Box<dyn TokenSender>,
 }
 
+/// Default KV cache sequence length when no override is provided.
+///
+/// Models like DeepSeek-V3 declare `max_position_embeddings = 163840`,
+/// which would require hundreds of GB of KV cache per GPU.  We default
+/// to a much smaller value; callers can raise it with `Engine::with_max_seq_len`.
+const DEFAULT_MAX_SEQ_LEN: usize = 4096;
+
 /// Handle to the engine's worker thread.
 ///
 /// The engine owns a long-lived thread that processes generation requests
@@ -78,17 +85,37 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Create a new engine wrapping the given model.
+    /// Create a new engine with the default KV cache size.
+    ///
+    /// The KV cache is sized to `min(model.max_seq_len, 4096)`.
+    /// Use [`Engine::with_max_seq_len`] to override.
+    ///
+    /// # Errors
+    /// Returns an error if KV cache allocation fails.
+    pub fn new<M: Model + Send + 'static>(model: M) -> Result<Self> {
+        Self::with_max_seq_len(model, None)
+    }
+
+    /// Create a new engine with an explicit KV cache size.
     ///
     /// Spawns a long-lived worker thread that owns the model and KV caches.
     /// The thread loops waiting for [`GenerationRequest`]s submitted via
     /// [`Engine::submit`].
     ///
+    /// `max_seq_len` caps the KV cache allocation.  When `None`, defaults
+    /// to `min(model.max_position_embeddings, 4096)`.
+    ///
     /// # Errors
     /// Returns an error if KV cache allocation fails.
-    pub fn new<M: Model + Send + 'static>(model: M) -> Result<Self> {
+    pub fn with_max_seq_len<M: Model + Send + 'static>(
+        model: M,
+        max_seq_len: Option<usize>,
+    ) -> Result<Self> {
         infernum::fusion::init();
-        let model_config = model.config();
+        let mut model_config = model.config();
+        let effective_max =
+            max_seq_len.unwrap_or_else(|| model_config.max_seq_len.min(DEFAULT_MAX_SEQ_LEN));
+        model_config.max_seq_len = effective_max;
         let kv_caches = model
             .devices()
             .iter()
@@ -96,7 +123,7 @@ impl Engine {
                 KvCache::new(
                     ctx,
                     model_config.num_layers,
-                    model_config.max_seq_len,
+                    effective_max,
                     model_config.num_kv_heads,
                     model_config.head_dim,
                 )

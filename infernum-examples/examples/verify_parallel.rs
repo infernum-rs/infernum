@@ -47,6 +47,10 @@ struct Cli {
     /// Maximum tokens to generate
     #[arg(short = 'n', long, default_value_t = 20)]
     max_tokens: usize,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -69,7 +73,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
 
 fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-    let runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
     let output = runtime.generate(
         &cli.prompt,
@@ -89,7 +93,7 @@ fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> R
 
 fn run_multi_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-    let runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
     let output = runtime.generate(
         &cli.prompt,

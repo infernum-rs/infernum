@@ -119,7 +119,7 @@ impl Model for MockModel {
 async fn spawn_test_server() -> SocketAddr {
     let ctx = CudaContext::new(0).expect("CUDA context");
     let model = MockModel::new(&ctx);
-    let entry = ModelEntry::new("test-model", model, MockTokenizer, RawTemplate);
+    let entry = ModelEntry::new("test-model", model, MockTokenizer, RawTemplate, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

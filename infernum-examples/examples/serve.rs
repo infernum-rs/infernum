@@ -49,6 +49,10 @@ struct Cli {
     /// Port to listen on
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -106,15 +110,15 @@ async fn main() -> Result<()> {
     let entry = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
             let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            ModelEntry::new(&cli.name, model, tokenizer, template)
+            ModelEntry::new(&cli.name, model, tokenizer, template, cli.max_seq_len)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
             let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            ModelEntry::new(&cli.name, model, tokenizer, template)
+            ModelEntry::new(&cli.name, model, tokenizer, template, cli.max_seq_len)
         }
         "deepseek_v3" => {
             let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            ModelEntry::new(&cli.name, model, tokenizer, template)
+            ModelEntry::new(&cli.name, model, tokenizer, template, cli.max_seq_len)
         }
         other => {
             return Err(infernum::Error::UnsupportedModel(format!(

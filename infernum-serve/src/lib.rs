@@ -17,7 +17,7 @@
 //!     let template = /* chat template */;
 //!
 //!     let server = Server::builder()
-//!         .add_model(ModelEntry::new("my-model", model, tokenizer, template))
+//!         .add_model(ModelEntry::new("my-model", model, tokenizer, template, None))
 //!         .bind(([0, 0, 0, 0], 8080))
 //!         .build();
 //!
