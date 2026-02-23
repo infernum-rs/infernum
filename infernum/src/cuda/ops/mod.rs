@@ -10,6 +10,7 @@ mod embed;
 mod fused_attention;
 mod linear;
 mod matmul;
+mod mla_tensor_ops;
 mod mul;
 mod quantized_matmul;
 mod repeat_kv;
@@ -33,6 +34,7 @@ pub use fused_attention::{
 };
 pub use linear::{linear, reinterpret_tensor, LinearWeight};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
+pub use mla_tensor_ops::{broadcast_to_heads, concat_inner_dim, pad_inner_dim, split_inner_dim};
 pub use mul::{mul, scale_f32_inplace};
 pub use quantized_matmul::quantized_matmul;
 pub use repeat_kv::repeat_kv;

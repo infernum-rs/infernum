@@ -12,11 +12,12 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect, cast_to_f32,
-    embedding_gather, embedding_gather_from_device, fused_attention_decode,
-    fused_attention_decode_indirect, fused_attention_prefill, linear, matmul_bf16_f32,
-    precompute_rope_cache, precompute_rope_cache_scaled, reinterpret_tensor, rms_norm,
-    rms_norm_inplace, swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
+    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect,
+    broadcast_to_heads, cast_to_f32, concat_inner_dim, embedding_gather,
+    embedding_gather_from_device, fused_attention_decode, fused_attention_decode_indirect,
+    fused_attention_prefill, linear, matmul_bf16_f32, pad_inner_dim, precompute_rope_cache,
+    precompute_rope_cache_scaled, reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim,
+    swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
     CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, ValidAsZeroBits,
@@ -958,20 +959,13 @@ where
         let total = tensor.shape()[1];
         assert_eq!(total, dim1 + dim2, "split_last_dim: dim mismatch");
 
-        let data = tensor.to_vec()?;
-        let mut a_data = vec![T::default(); seq_len * dim1];
-        let mut b_data = vec![T::default(); seq_len * dim2];
-
-        for row in 0..seq_len {
-            a_data[row * dim1..(row + 1) * dim1]
-                .copy_from_slice(&data[row * total..row * total + dim1]);
-            b_data[row * dim2..(row + 1) * dim2]
-                .copy_from_slice(&data[row * total + dim1..(row + 1) * total]);
+        if seq_len == 1 {
+            let a = tensor.slice_view(0, &[1, dim1]);
+            let b = tensor.slice_view(dim1, &[1, dim2]);
+            Ok((a, b))
+        } else {
+            split_inner_dim(tensor, dim1, dim2)
         }
-
-        let a = CudaTensor::from_slice(tensor.context(), &[seq_len, dim1], &a_data)?;
-        let b = CudaTensor::from_slice(tensor.context(), &[seq_len, dim2], &b_data)?;
-        Ok((a, b))
     }
 
     /// Split a 3D tensor `[seq, num_heads, total_dim]` into two parts along last dim.
@@ -985,24 +979,11 @@ where
         let total = tensor.shape()[2];
         assert_eq!(total, dim1 + dim2, "split_head_dim: dim mismatch");
 
-        let data = tensor.to_vec()?;
-        let mut a_data = vec![T::default(); seq_len * num_heads * dim1];
-        let mut b_data = vec![T::default(); seq_len * num_heads * dim2];
-
-        for s in 0..seq_len {
-            for h in 0..num_heads {
-                let src_offset = (s * num_heads + h) * total;
-                let a_offset = (s * num_heads + h) * dim1;
-                let b_offset = (s * num_heads + h) * dim2;
-                a_data[a_offset..a_offset + dim1]
-                    .copy_from_slice(&data[src_offset..src_offset + dim1]);
-                b_data[b_offset..b_offset + dim2]
-                    .copy_from_slice(&data[src_offset + dim1..src_offset + total]);
-            }
-        }
-
-        let a = CudaTensor::from_slice(tensor.context(), &[seq_len, num_heads, dim1], &a_data)?;
-        let b = CudaTensor::from_slice(tensor.context(), &[seq_len, num_heads, dim2], &b_data)?;
+        let outer = seq_len * num_heads;
+        let flat = tensor.reshape(&[outer, total]);
+        let (a_flat, b_flat) = split_inner_dim(&flat, dim1, dim2)?;
+        let a = a_flat.reshape(&[seq_len, num_heads, dim1]);
+        let b = b_flat.reshape(&[seq_len, num_heads, dim2]);
         Ok((a, b))
     }
 
@@ -1015,42 +996,16 @@ where
         assert_eq!(seq_len, b.shape()[0]);
         assert_eq!(num_heads, b.shape()[1]);
 
-        let total = dim1 + dim2;
-        let a_data = a.to_vec()?;
-        let b_data = b.to_vec()?;
-        let mut out_data = vec![T::default(); seq_len * num_heads * total];
-
-        for s in 0..seq_len {
-            for h in 0..num_heads {
-                let out_offset = (s * num_heads + h) * total;
-                let a_offset = (s * num_heads + h) * dim1;
-                let b_offset = (s * num_heads + h) * dim2;
-                out_data[out_offset..out_offset + dim1]
-                    .copy_from_slice(&a_data[a_offset..a_offset + dim1]);
-                out_data[out_offset + dim1..out_offset + total]
-                    .copy_from_slice(&b_data[b_offset..b_offset + dim2]);
-            }
-        }
-
-        CudaTensor::from_slice(a.context(), &[seq_len, num_heads, total], &out_data)
+        let outer = seq_len * num_heads;
+        let a_flat = a.reshape(&[outer, dim1]);
+        let b_flat = b.reshape(&[outer, dim2]);
+        let out_flat = concat_inner_dim(&a_flat, &b_flat)?;
+        Ok(out_flat.reshape(&[seq_len, num_heads, dim1 + dim2]))
     }
 
     /// Broadcast `[seq, 1, rope_dim]` to `[seq, num_heads, rope_dim]`.
     fn broadcast_kv_rope(k_rope: &CudaTensor<T>, num_heads: usize) -> Result<CudaTensor<T>> {
-        let seq_len = k_rope.shape()[0];
-        let rope_dim = k_rope.shape()[2];
-        let data = k_rope.to_vec()?;
-
-        let mut out_data = vec![T::default(); seq_len * num_heads * rope_dim];
-        for s in 0..seq_len {
-            let src = &data[s * rope_dim..(s + 1) * rope_dim];
-            for h in 0..num_heads {
-                let dst_offset = (s * num_heads + h) * rope_dim;
-                out_data[dst_offset..dst_offset + rope_dim].copy_from_slice(src);
-            }
-        }
-
-        CudaTensor::from_slice(k_rope.context(), &[seq_len, num_heads, rope_dim], &out_data)
+        broadcast_to_heads(k_rope, num_heads)
     }
 
     /// Pad V from `[seq, num_heads, v_head_dim]` to `[seq, num_heads, qk_head_dim]`.
@@ -1062,19 +1017,10 @@ where
             return Ok(v.slice_view(0, v.shape()));
         }
 
-        let v_data = v.to_vec()?;
-        let mut out_data = vec![T::default(); seq_len * num_heads * qk_head_dim];
-        for s in 0..seq_len {
-            for h in 0..num_heads {
-                let src_offset = (s * num_heads + h) * v_dim;
-                let dst_offset = (s * num_heads + h) * qk_head_dim;
-                out_data[dst_offset..dst_offset + v_dim]
-                    .copy_from_slice(&v_data[src_offset..src_offset + v_dim]);
-                // Remaining elements stay as default (zero)
-            }
-        }
-
-        CudaTensor::from_slice(v.context(), &[seq_len, num_heads, qk_head_dim], &out_data)
+        let outer = seq_len * num_heads;
+        let flat = v.reshape(&[outer, v_dim]);
+        let padded = pad_inner_dim(&flat, qk_head_dim)?;
+        Ok(padded.reshape(&[seq_len, num_heads, qk_head_dim]))
     }
 
     /// Truncate attention output from `[seq, num_heads, qk_head_dim]` to
@@ -1087,22 +1033,11 @@ where
             return Ok(attn_out.slice_view(0, attn_out.shape()));
         }
 
-        let data = attn_out.to_vec()?;
-        let mut out_data = vec![T::default(); seq_len * num_heads * v_head_dim];
-        for s in 0..seq_len {
-            for h in 0..num_heads {
-                let src_offset = (s * num_heads + h) * qk_dim;
-                let dst_offset = (s * num_heads + h) * v_head_dim;
-                out_data[dst_offset..dst_offset + v_head_dim]
-                    .copy_from_slice(&data[src_offset..src_offset + v_head_dim]);
-            }
-        }
-
-        CudaTensor::from_slice(
-            attn_out.context(),
-            &[seq_len, num_heads, v_head_dim],
-            &out_data,
-        )
+        let outer = seq_len * num_heads;
+        let flat = attn_out.reshape(&[outer, qk_dim]);
+        let discard_dim = qk_dim - v_head_dim;
+        let (kept, _) = split_inner_dim(&flat, v_head_dim, discard_dim)?;
+        Ok(kept.reshape(&[seq_len, num_heads, v_head_dim]))
     }
 
     /// MLA attention forward pass.
