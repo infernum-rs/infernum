@@ -16,7 +16,7 @@
 
 use cudarc::driver::{LaunchAsync, LaunchConfig, ValidAsZeroBits};
 
-use super::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
+use super::block_allocator::{BlockConfig, BlockTable};
 use super::CudaContext;
 use super::CudaTensor;
 use crate::dtype::TensorDType;
@@ -58,8 +58,6 @@ struct LayerPool<T: TensorDType> {
 /// uses block tables to index into the shared pool.
 pub struct PagedKvCache<T: TensorDType = f32> {
     layers: Vec<LayerPool<T>>,
-    /// Block allocator (CPU-side bookkeeping).
-    pub allocator: BlockAllocator,
     ctx: CudaContext,
     block_size: usize,
     num_kv_heads: usize,
@@ -103,7 +101,6 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
 
         Ok(Self {
             layers,
-            allocator: BlockAllocator::new(block_config),
             ctx: ctx.clone(),
             block_size: block_config.block_size,
             num_kv_heads,
@@ -280,6 +277,7 @@ fn launch_append_paged<T: TensorDType + cudarc::driver::DeviceRepr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cuda::block_allocator::BlockAllocator;
 
     fn make_ctx() -> CudaContext {
         CudaContext::new(0).expect("Failed to create CUDA context")
@@ -299,7 +297,6 @@ mod tests {
         assert_eq!(cache.block_size(), 4);
         assert_eq!(cache.num_kv_heads(), 4);
         assert_eq!(cache.head_dim(), 16);
-        assert_eq!(cache.allocator.num_free(), 10);
     }
 
     #[test]
@@ -314,9 +311,10 @@ mod tests {
             num_blocks: 4,
         };
         let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = BlockAllocator::new(&config);
 
         // Allocate one block and create a block table
-        let block_idx = cache.allocator.allocate().unwrap();
+        let block_idx = allocator.allocate().unwrap();
         let mut table = BlockTable::new(block_size);
         table.append_block(block_idx);
 
@@ -353,8 +351,9 @@ mod tests {
             num_blocks: 4,
         };
         let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = BlockAllocator::new(&config);
 
-        let b0 = cache.allocator.allocate().unwrap();
+        let b0 = allocator.allocate().unwrap();
         let mut table = BlockTable::new(block_size);
         table.append_block(b0);
 
@@ -372,7 +371,7 @@ mod tests {
 
         // Token 2 — needs new block
         assert!(table.needs_new_block());
-        let b1 = cache.allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
         table.append_block(b1);
 
         let k2 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[5.0_f32, 6.0]).unwrap();
@@ -407,10 +406,11 @@ mod tests {
             num_blocks: 4,
         };
         let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = BlockAllocator::new(&config);
 
         // Prefill 6 tokens → needs ceil(6/4) = 2 blocks
-        let b0 = cache.allocator.allocate().unwrap();
-        let b1 = cache.allocator.allocate().unwrap();
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
         let mut table = BlockTable::new(block_size);
         table.append_block(b0);
         table.append_block(b1);
@@ -455,8 +455,9 @@ mod tests {
             num_blocks: 4,
         };
         let mut cache = PagedKvCache::new(&ctx, 2, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = BlockAllocator::new(&config);
 
-        let b0 = cache.allocator.allocate().unwrap();
+        let b0 = allocator.allocate().unwrap();
         let mut table = BlockTable::new(block_size);
         table.append_block(b0);
 
@@ -495,18 +496,19 @@ mod tests {
             num_blocks: 2,
         };
         let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = BlockAllocator::new(&config);
 
         // Request 1: use both blocks
-        let b0 = cache.allocator.allocate().unwrap();
-        let b1 = cache.allocator.allocate().unwrap();
-        assert!(cache.allocator.allocate().is_none()); // exhausted
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        assert!(allocator.allocate().is_none()); // exhausted
 
         // Free request 1's blocks
-        cache.allocator.free_all(&[b0, b1]);
-        assert_eq!(cache.allocator.num_free(), 2);
+        allocator.free_all(&[b0, b1]);
+        assert_eq!(allocator.num_free(), 2);
 
         // Request 2: allocate and write
-        let b2 = cache.allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
         let mut table = BlockTable::new(block_size);
         table.append_block(b2);
 

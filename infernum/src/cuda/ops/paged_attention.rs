@@ -286,10 +286,11 @@ mod tests {
             num_blocks,
         };
         let mut paged_kv = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = crate::cuda::block_allocator::BlockAllocator::new(&config);
 
         // Allocate blocks and build block table
-        let b0 = paged_kv.allocator.allocate().unwrap();
-        let b1 = paged_kv.allocator.allocate().unwrap();
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
         let mut table = BlockTable::new(block_size);
         table.append_block(b0);
         table.append_block(b1);
@@ -334,9 +335,10 @@ mod tests {
             num_blocks,
         };
         let mut paged_kv = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = crate::cuda::block_allocator::BlockAllocator::new(&config);
 
         // Request 0: 3 tokens (1 block)
-        let b0 = paged_kv.allocator.allocate().unwrap();
+        let b0 = allocator.allocate().unwrap();
         let mut table0 = BlockTable::new(block_size);
         table0.append_block(b0);
 
@@ -353,8 +355,8 @@ mod tests {
         table0.advance(seq0);
 
         // Request 1: 6 tokens (2 blocks)
-        let b1 = paged_kv.allocator.allocate().unwrap();
-        let b2 = paged_kv.allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
         let mut table1 = BlockTable::new(block_size);
         table1.append_block(b1);
         table1.append_block(b2);
@@ -449,9 +451,10 @@ mod tests {
             num_blocks: 8,
         };
         let mut paged_kv = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = crate::cuda::block_allocator::BlockAllocator::new(&config);
 
-        let b0 = paged_kv.allocator.allocate().unwrap();
-        let b1 = paged_kv.allocator.allocate().unwrap();
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
         let mut table = BlockTable::new(block_size);
         table.append_block(b0);
         table.append_block(b1);

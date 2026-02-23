@@ -62,11 +62,12 @@ impl BatchedEngine {
             model_config.num_kv_heads,
             model_config.head_dim,
         )?;
+        let allocator = BlockAllocator::new(&block_config);
 
         let (request_tx, request_rx) = mpsc::channel::<BatchedRequest>();
 
         let worker = thread::spawn(move || {
-            batched_worker_loop(model, paged_kv, batch_config, request_rx);
+            batched_worker_loop(model, paged_kv, allocator, batch_config, request_rx);
         });
 
         Ok(Self {
@@ -142,6 +143,7 @@ impl BatchedEngine {
 fn batched_worker_loop<M: Model>(
     model: M,
     mut paged_kv: PagedKvCache<M::CacheDtype>,
+    mut allocator: BlockAllocator,
     batch_config: BatchConfig,
     request_rx: mpsc::Receiver<BatchedRequest>,
 ) {
@@ -164,18 +166,31 @@ fn batched_worker_loop<M: Model>(
         }
 
         // 3. Scheduler decides what to process this iteration
-        let output = scheduler.step(&mut paged_kv.allocator);
+        let output = scheduler.step(&mut allocator);
 
         // 4. Run prefills (one at a time, sequential)
         for task in &output.prefill {
             let idx = task.running_idx;
             let token_ids = task.token_ids.clone();
-            process_prefill(idx, &token_ids, &model, &mut paged_kv, &mut scheduler);
+            process_prefill(
+                idx,
+                &token_ids,
+                &model,
+                &mut paged_kv,
+                &mut allocator,
+                &mut scheduler,
+            );
         }
 
         // 5. Run decode steps (one at a time for now; batched decode later)
         for task in &output.decode {
-            process_decode(task.running_idx, &model, &mut paged_kv, &mut scheduler);
+            process_decode(
+                task.running_idx,
+                &model,
+                &mut paged_kv,
+                &mut allocator,
+                &mut scheduler,
+            );
         }
     }
 }
@@ -186,6 +201,7 @@ fn process_prefill<M: Model>(
     token_ids: &[u32],
     model: &M,
     paged_kv: &mut PagedKvCache<M::CacheDtype>,
+    allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
 ) {
     // Run forward pass — needs mutable borrow of seq.block_table + paged_kv
@@ -214,7 +230,7 @@ fn process_prefill<M: Model>(
 
             match select_token(&logits, sampling, &mut rng_state, recent) {
                 Ok(token_id) => {
-                    handle_new_token(idx, token_id, &mut paged_kv.allocator, scheduler);
+                    handle_new_token(idx, token_id, allocator, scheduler);
                 }
                 Err(e) => {
                     let seq = &mut scheduler.running_mut()[idx];
@@ -236,6 +252,7 @@ fn process_decode<M: Model>(
     idx: usize,
     model: &M,
     paged_kv: &mut PagedKvCache<M::CacheDtype>,
+    allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
 ) {
     // Extract the token to feed and run forward
@@ -273,7 +290,7 @@ fn process_decode<M: Model>(
 
             match select_token(&logits, sampling, &mut rng_state, recent) {
                 Ok(token_id) => {
-                    handle_new_token(idx, token_id, &mut paged_kv.allocator, scheduler);
+                    handle_new_token(idx, token_id, allocator, scheduler);
                 }
                 Err(e) => {
                     let seq = &mut scheduler.running_mut()[idx];
