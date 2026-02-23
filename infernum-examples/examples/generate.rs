@@ -144,7 +144,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
 }
 
 /// Run generation with a model that implements the `Model` trait.
-fn run_generate<M: Model + Send>(
+fn run_generate<M: Model + Send + 'static>(
     model: M,
     tokenizer: Tokenizer,
     num_layers: usize,
@@ -203,7 +203,7 @@ fn run_generate<M: Model + Send>(
     let start = Instant::now();
 
     let (output_tokens, prompt_len) = if !options.use_kv_cache {
-        let mut engine = Engine::new(model)?;
+        let engine = Engine::new(model)?;
         let input_ids = tokenizer.encode(&cli.prompt, true)?;
         let prompt_len = input_ids.len();
 
@@ -220,7 +220,7 @@ fn run_generate<M: Model + Send>(
 
         (tokens, prompt_len)
     } else {
-        let mut runtime = Runtime::new(model, tokenizer)?;
+        let runtime = Runtime::new(model, tokenizer)?;
         let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
         let tokens = runtime.generate_stream(&cli.prompt, &options)?;
         (tokens, prompt_len)

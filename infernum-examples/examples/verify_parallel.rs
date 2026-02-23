@@ -68,7 +68,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
 
 fn run_single_gpu<M: infernum::Model + Send>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-    let mut runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::new(model, tokenizer)?;
     let t0 = Instant::now();
     let output = runtime.generate(
         &cli.prompt,
@@ -88,7 +88,7 @@ fn run_single_gpu<M: infernum::Model + Send>(model: M, cli: &Cli) -> Result<Stri
 
 fn run_multi_gpu<M: infernum::Model + Send>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-    let mut runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::new(model, tokenizer)?;
     let t0 = Instant::now();
     let output = runtime.generate(
         &cli.prompt,

@@ -2770,7 +2770,7 @@ mod tests {
     fn test_generate_gptq_respects_max_tokens() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model = build_tiny_gptq_model(&ctx);
-        let mut engine = infernum_runtime::Engine::new(model).expect("Failed to build engine");
+        let engine = infernum_runtime::Engine::new(model).expect("Failed to build engine");
 
         let prompt = vec![1_u32, 5, 10];
         let max_new = 4;
@@ -2834,7 +2834,7 @@ mod tests {
         }
     }
 
-    fn build_tiny_engine(ctx: &CudaContext) -> infernum_runtime::Engine<LlamaModel<f32>> {
+    fn build_tiny_engine(ctx: &CudaContext) -> infernum_runtime::Engine {
         let model = build_tiny_model(ctx);
         infernum_runtime::Engine::new(model).expect("Failed to build engine")
     }
@@ -2842,7 +2842,7 @@ mod tests {
     #[test]
     fn test_generate_respects_max_tokens() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let mut engine = build_tiny_engine(&ctx);
+        let engine = build_tiny_engine(&ctx);
 
         let prompt = vec![1_u32, 5, 10];
         let max_new = 4;
@@ -2866,7 +2866,7 @@ mod tests {
     #[test]
     fn test_generate_stops_on_eos() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let mut engine = build_tiny_engine(&ctx);
+        let engine = build_tiny_engine(&ctx);
 
         // Run generate with a very large max_new_tokens but EOS set to a
         // token that the model is likely to produce with random weights
@@ -2988,7 +2988,7 @@ mod tests {
     #[test]
     fn test_kv_cache_generate_matches_naive_generate() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let mut engine = build_tiny_engine(&ctx);
+        let engine = build_tiny_engine(&ctx);
 
         let prompt: Vec<u32> = vec![1, 5, 10];
         let max_new = 5;
