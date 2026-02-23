@@ -42,6 +42,22 @@ All models below are loaded via `infernum-llama`. Mistral/Devstral/Mixtral are a
 | Mistral | `mistral` | Dense | Mistral v1/v2/v3, Devstral (code fine-tune) |
 | Mixtral | `mixtral` | MoE | Mixtral 8x7B, 8x22B, etc. |
 
+### Sliding Window Attention
+
+Sliding window attention (SWA) restricts each query position to attend only to the most recent `W` key positions, instead of the full causal history. This is used by Mistral, Qwen3, and Qwen3-MoE models.
+
+**Current implementation (Phase 1 — mask-only):** The full KV cache is kept, but the attention kernels clamp the iteration window. Functionally correct, no memory savings yet.
+
+**Config fields** (in both `LlamaConfig` and `QwenConfig`):
+
+- `sliding_window: Option<usize>` — window size `W`
+- `use_sliding_window: bool` — whether SWA is enabled
+- `max_window_layers: Option<usize>` — SWA applies only to layers `[0, max_window_layers)`. Layers at or above this index use full causal attention.
+
+**Helper:** `config.effective_sliding_window(layer_idx) -> Option<usize>` returns the window size for a given layer, or `None` for full attention.
+
+**Phase 2 (planned, separate guide):** Ring-buffer KV cache to reduce memory from O(seq_len) to O(W).
+
 ### Planned Crate Structure
 
 ```

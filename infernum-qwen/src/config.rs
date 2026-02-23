@@ -161,6 +161,20 @@ pub struct QwenConfig {
     /// Default: 1 (all layers are MoE when `num_experts` is set).
     #[serde(default = "default_decoder_sparse_step")]
     pub decoder_sparse_step: usize,
+
+    /// Sliding window size for local attention. When set and `use_sliding_window`
+    /// is true, attention is restricted to the most recent `sliding_window` positions.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+
+    /// Whether sliding window attention is enabled. Default: false.
+    #[serde(default)]
+    pub use_sliding_window: bool,
+
+    /// SWA applies only to layers `[0, max_window_layers)`. Layers at or above
+    /// this index use full causal attention. When absent, all layers use SWA.
+    #[serde(default)]
+    pub max_window_layers: Option<usize>,
 }
 
 /// Deserialize a field that may be a single `u32` or an array of `u32`.
@@ -274,6 +288,21 @@ impl QwenConfig {
     #[must_use]
     pub fn num_heads_per_kv(&self) -> usize {
         self.num_attention_heads / self.num_kv_heads()
+    }
+
+    /// Returns the effective sliding window size for a given layer, or `None`
+    /// if full causal attention should be used.
+    #[must_use]
+    pub fn effective_sliding_window(&self, layer_idx: usize) -> Option<usize> {
+        if !self.use_sliding_window {
+            return None;
+        }
+        if let Some(max_layers) = self.max_window_layers {
+            if layer_idx >= max_layers {
+                return None;
+            }
+        }
+        self.sliding_window
     }
 }
 
@@ -547,5 +576,89 @@ mod tests {
 
         let config: QwenConfig = serde_json::from_str(json).unwrap();
         assert!(!config.norm_topk_prob);
+    }
+
+    #[test]
+    fn test_config_sliding_window_qwen3() {
+        let json = r#"{
+            "vocab_size": 151936,
+            "hidden_size": 2048,
+            "intermediate_size": 8192,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "sliding_window": 4096,
+            "use_sliding_window": true,
+            "max_window_layers": 28
+        }"#;
+
+        let config: QwenConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+        assert!(config.use_sliding_window);
+        assert_eq!(config.max_window_layers, Some(28));
+
+        // Layers below max_window_layers use SWA
+        assert_eq!(config.effective_sliding_window(0), Some(4096));
+        assert_eq!(config.effective_sliding_window(27), Some(4096));
+
+        // Layers at or above max_window_layers use full attention
+        assert_eq!(config.effective_sliding_window(28), None);
+        assert_eq!(config.effective_sliding_window(35), None);
+    }
+
+    #[test]
+    fn test_config_sliding_window_disabled() {
+        let json = r#"{
+            "vocab_size": 151936,
+            "hidden_size": 2048,
+            "intermediate_size": 8192,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 16,
+            "sliding_window": 32768,
+            "use_sliding_window": false
+        }"#;
+
+        let config: QwenConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, Some(32768));
+        assert!(!config.use_sliding_window);
+
+        // SWA disabled: all layers use full attention
+        assert_eq!(config.effective_sliding_window(0), None);
+    }
+
+    #[test]
+    fn test_config_sliding_window_all_layers() {
+        let json = r#"{
+            "vocab_size": 151936,
+            "hidden_size": 2048,
+            "intermediate_size": 8192,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 16,
+            "sliding_window": 4096,
+            "use_sliding_window": true
+        }"#;
+
+        let config: QwenConfig = serde_json::from_str(json).unwrap();
+
+        // No max_window_layers: all layers use SWA
+        assert_eq!(config.effective_sliding_window(0), Some(4096));
+        assert_eq!(config.effective_sliding_window(35), Some(4096));
+    }
+
+    #[test]
+    fn test_config_no_sliding_window_fields() {
+        let json = r#"{
+            "vocab_size": 151936,
+            "hidden_size": 896,
+            "intermediate_size": 4864,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 14
+        }"#;
+
+        let config: QwenConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, None);
+        assert!(!config.use_sliding_window);
+        assert_eq!(config.max_window_layers, None);
+        assert_eq!(config.effective_sliding_window(0), None);
     }
 }

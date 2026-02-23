@@ -14,21 +14,21 @@ extern "C" __global__ void fused_prefill_attention_f32(
     const int num_heads,
     const int num_kv_heads,
     const int head_dim,
-    const int offset           // causal offset for KV cache
+    const int offset,          // causal offset for KV cache
+    const int window_size      // <= 0 means full attention (no window)
 ) {
-    // blockIdx.x = head, blockIdx.y = query position
     const int head = blockIdx.x;
     const int qpos = blockIdx.y;
     const int tid = threadIdx.x;
 
     const int kv_head = head * num_kv_heads / num_heads;
     const int max_valid_k = offset + qpos + 1;
+    const int min_valid_k = (window_size > 0) ? max(0, max_valid_k - window_size) : 0;
 
     extern __shared__ float shared[];
     float* s_q = shared;
     float* s_scratch = shared + head_dim;
 
-    // Load Q for this (qpos, head) into shared memory
     const float* q_ptr = q + qpos * num_heads * head_dim + head * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         s_q[d] = q_ptr[d];
@@ -37,7 +37,7 @@ extern "C" __global__ void fused_prefill_attention_f32(
 
     // Pass 1: find max score over valid key positions
     float local_max = -INFINITY;
-    for (int t = tid; t < max_valid_k && t < total_len; t += blockDim.x) {
+    for (int t = min_valid_k + tid; t < max_valid_k && t < total_len; t += blockDim.x) {
         float dot = 0.0f;
         const float* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
@@ -60,7 +60,7 @@ extern "C" __global__ void fused_prefill_attention_f32(
 
     // Pass 2: compute exp(score - max) and sum
     float local_sum = 0.0f;
-    for (int t = tid; t < max_valid_k && t < total_len; t += blockDim.x) {
+    for (int t = min_valid_k + tid; t < max_valid_k && t < total_len; t += blockDim.x) {
         float dot = 0.0f;
         const float* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
@@ -85,7 +85,7 @@ extern "C" __global__ void fused_prefill_attention_f32(
     float* out_ptr = output + qpos * num_heads * head_dim + head * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < max_valid_k && t < total_len; t++) {
+        for (int t = min_valid_k; t < max_valid_k && t < total_len; t++) {
             float dot = 0.0f;
             const float* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
             for (int dd = 0; dd < head_dim; dd++) {
@@ -113,13 +113,15 @@ extern "C" __global__ void fused_prefill_attention_f16(
     const int num_heads,
     const int num_kv_heads,
     const int head_dim,
-    const int offset
+    const int offset,
+    const int window_size
 ) {
     const int head = blockIdx.x;
     const int qpos = blockIdx.y;
     const int tid = threadIdx.x;
     const int kv_head = head * num_kv_heads / num_heads;
     const int max_valid_k = offset + qpos + 1;
+    const int min_valid_k = (window_size > 0) ? max(0, max_valid_k - window_size) : 0;
 
     extern __shared__ float shared[];
     float* s_q = shared;
@@ -133,7 +135,7 @@ extern "C" __global__ void fused_prefill_attention_f16(
 
     // Pass 1: find max
     float local_max = -INFINITY;
-    for (int t = tid; t < max_valid_k && t < total_len; t += blockDim.x) {
+    for (int t = min_valid_k + tid; t < max_valid_k && t < total_len; t += blockDim.x) {
         float dot = 0.0f;
         const __half* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
@@ -156,7 +158,7 @@ extern "C" __global__ void fused_prefill_attention_f16(
 
     // Pass 2: compute sum
     float local_sum = 0.0f;
-    for (int t = tid; t < max_valid_k && t < total_len; t += blockDim.x) {
+    for (int t = min_valid_k + tid; t < max_valid_k && t < total_len; t += blockDim.x) {
         float dot = 0.0f;
         const __half* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
@@ -181,7 +183,7 @@ extern "C" __global__ void fused_prefill_attention_f16(
     __half* out_ptr = output + qpos * num_heads * head_dim + head * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < max_valid_k && t < total_len; t++) {
+        for (int t = min_valid_k; t < max_valid_k && t < total_len; t++) {
             float dot = 0.0f;
             const __half* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
             for (int dd = 0; dd < head_dim; dd++) {
@@ -208,13 +210,15 @@ extern "C" __global__ void fused_prefill_attention_bf16(
     const int num_heads,
     const int num_kv_heads,
     const int head_dim,
-    const int offset
+    const int offset,
+    const int window_size
 ) {
     const int head = blockIdx.x;
     const int qpos = blockIdx.y;
     const int tid = threadIdx.x;
     const int kv_head = head * num_kv_heads / num_heads;
     const int max_valid_k = offset + qpos + 1;
+    const int min_valid_k = (window_size > 0) ? max(0, max_valid_k - window_size) : 0;
 
     extern __shared__ float shared[];
     float* s_q = shared;
@@ -228,7 +232,7 @@ extern "C" __global__ void fused_prefill_attention_bf16(
 
     // Pass 1: find max
     float local_max = -INFINITY;
-    for (int t = tid; t < max_valid_k && t < total_len; t += blockDim.x) {
+    for (int t = min_valid_k + tid; t < max_valid_k && t < total_len; t += blockDim.x) {
         float dot = 0.0f;
         const __nv_bfloat16* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
@@ -251,7 +255,7 @@ extern "C" __global__ void fused_prefill_attention_bf16(
 
     // Pass 2: compute sum
     float local_sum = 0.0f;
-    for (int t = tid; t < max_valid_k && t < total_len; t += blockDim.x) {
+    for (int t = min_valid_k + tid; t < max_valid_k && t < total_len; t += blockDim.x) {
         float dot = 0.0f;
         const __nv_bfloat16* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
@@ -276,7 +280,7 @@ extern "C" __global__ void fused_prefill_attention_bf16(
     __nv_bfloat16* out_ptr = output + qpos * num_heads * head_dim + head * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < max_valid_k && t < total_len; t++) {
+        for (int t = min_valid_k; t < max_valid_k && t < total_len; t++) {
             float dot = 0.0f;
             const __nv_bfloat16* k_ptr = k + t * num_kv_heads * head_dim + kv_head * head_dim;
             for (int dd = 0; dd < head_dim; dd++) {
