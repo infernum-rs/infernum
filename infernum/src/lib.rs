@@ -22,6 +22,8 @@ pub mod tokenizer;
 pub mod weights;
 
 #[cfg(feature = "cuda")]
+pub use cuda::ops::LinearWeight;
+#[cfg(feature = "cuda")]
 pub use cuda::BufferPool;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaGraph;

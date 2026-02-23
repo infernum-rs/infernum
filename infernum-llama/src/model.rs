@@ -12,9 +12,9 @@ use std::path::Path;
 use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_indirect, attention, cast_to_f32,
     embedding_gather, embedding_gather_from_device, fused_attention_decode,
-    fused_attention_decode_indirect, fused_attention_prefill, matmul, matmul_bf16_f32,
-    precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
-    transpose_2d, GemmScalar,
+    fused_attention_decode_indirect, fused_attention_prefill, linear, matmul, matmul_bf16_f32,
+    precompute_rope_cache, reinterpret_tensor, repeat_kv, rms_norm, rms_norm_inplace, swiglu,
+    transpose_2d, GemmScalar, LinearWeight,
 };
 use infernum::cuda::{
     CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, QuantizedTensor,
@@ -223,36 +223,6 @@ fn load_typed_sharded<T: TensorDType + DeviceRepr>(
         }
         other => panic!("Unsupported dtype for load_typed_sharded: {other}"),
     }
-}
-
-/// Reinterpret a `CudaTensor<A>` as `CudaTensor<B>` when both have the same
-/// layout (same `DType`). This is a zero-cost cast (no copy, no kernel).
-///
-/// # Panics
-/// Panics if `size_of::<A>() != size_of::<B>()`.
-fn reinterpret_tensor<A: TensorDType + DeviceRepr, B: TensorDType + DeviceRepr>(
-    tensor: CudaTensor<A>,
-) -> CudaTensor<B> {
-    assert_eq!(
-        std::mem::size_of::<A>(),
-        std::mem::size_of::<B>(),
-        "reinterpret_tensor: size mismatch between {} and {}",
-        A::DTYPE,
-        B::DTYPE,
-    );
-    // The caller ensures A::DTYPE == B::DTYPE, so the GPU memory layout is identical.
-    // We reconstruct the tensor using the raw components.
-    unsafe { tensor.reinterpret() }
-}
-
-/// A linear layer weight that is either a dense matrix (pre-transposed for
-/// standard matmul) or a quantized tensor (dequantized on-the-fly in the kernel).
-enum LinearWeight<T: TensorDType> {
-    /// Pre-transposed dense weight: shape (in_features, out_features)
-    Dense(CudaTensor<T>),
-    /// Quantized weight: shape (out_features, in_features) — transposed inside kernel.
-    /// Only valid when `T = f32`.
-    Quantized(QuantizedTensor),
 }
 
 /// K+V projection storage: fused for dense weights, separate for quantized.
@@ -2115,32 +2085,6 @@ fn shard_strategy_for_weight(name: &str) -> ShardStrategy {
 
     // Everything else: norms, embeddings, lm_head, router gate
     ShardStrategy::Replicate
-}
-
-/// Linear projection: output = input @ weight
-///
-/// For `Dense` weights: pre-transposed as (in_features, out_features), uses standard matmul.
-/// For `Quantized` weights: stored as (out_features, in_features), dequantized on-the-fly.
-///
-/// # Panics
-/// Panics if `Quantized` variant is used with `T != f32`.
-fn linear<T>(input: &CudaTensor<T>, weight: &LinearWeight<T>) -> Result<CudaTensor<T>>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default,
-    CudaBlas: Gemm<T>,
-{
-    match weight {
-        LinearWeight::Dense(w) => matmul(input, w),
-        LinearWeight::Quantized(w) => {
-            let input_f32 = if T::DTYPE == infernum::dtype::DType::F32 {
-                reinterpret_tensor(input.slice_view(0, input.shape()))
-            } else {
-                cast_to_f32(input)?
-            };
-            let output_f32 = quantized_matmul(&input_f32, w)?;
-            Ok(reinterpret_tensor(output_f32))
-        }
-    }
 }
 
 #[cfg(test)]

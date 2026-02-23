@@ -8,6 +8,7 @@ mod bias_add;
 mod cast;
 mod embed;
 mod fused_attention;
+mod linear;
 mod matmul;
 mod mul;
 mod quantized_matmul;
@@ -30,6 +31,7 @@ pub use embed::{embedding_gather, embedding_gather_from_device};
 pub use fused_attention::{
     fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill,
 };
+pub use linear::{linear, reinterpret_tensor, LinearWeight};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
 pub use mul::mul;
 pub use quantized_matmul::quantized_matmul;

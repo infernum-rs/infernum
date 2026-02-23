@@ -12,15 +12,14 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect,
-    cast_f32_to_bf16, cast_to_f32, embedding_gather, embedding_gather_from_device,
-    fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill, matmul,
-    matmul_bf16_f32, precompute_rope_cache, precompute_rope_cache_scaled, quantized_matmul,
-    rms_norm, rms_norm_inplace, swiglu, transpose_2d, GemmScalar, RopeScaling,
+    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect, cast_to_f32,
+    embedding_gather, embedding_gather_from_device, fused_attention_decode,
+    fused_attention_decode_indirect, fused_attention_prefill, linear, matmul_bf16_f32,
+    precompute_rope_cache, precompute_rope_cache_scaled, reinterpret_tensor, rms_norm,
+    rms_norm_inplace, swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
-    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, QuantizedTensor,
-    ValidAsZeroBits,
+    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, ValidAsZeroBits,
 };
 #[cfg(feature = "nccl")]
 use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig, ShardStrategy};
@@ -110,25 +109,7 @@ fn load_typed_sharded<T: TensorDType + DeviceRepr>(
     }
 }
 
-fn reinterpret_tensor<A: TensorDType + DeviceRepr, B: TensorDType + DeviceRepr>(
-    tensor: CudaTensor<A>,
-) -> CudaTensor<B> {
-    assert_eq!(
-        std::mem::size_of::<A>(),
-        std::mem::size_of::<B>(),
-        "reinterpret_tensor: size mismatch between {} and {}",
-        A::DTYPE,
-        B::DTYPE,
-    );
-    unsafe { tensor.reinterpret() }
-}
-
 // --- Weight structures ---
-
-enum LinearWeight<T: TensorDType> {
-    Dense(CudaTensor<T>),
-    Quantized(QuantizedTensor),
-}
 
 /// MLA attention weights (shared by dense and MoE layers)
 struct DeepSeekAttentionWeights<T: TensorDType> {
@@ -1493,31 +1474,6 @@ where
 
         let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
         self.lm_head_forward(&last_hidden)
-    }
-}
-
-fn linear<T>(input: &CudaTensor<T>, weight: &LinearWeight<T>) -> Result<CudaTensor<T>>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default,
-    CudaBlas: Gemm<T>,
-{
-    match weight {
-        LinearWeight::Dense(w) => matmul(input, w),
-        LinearWeight::Quantized(w) => {
-            let input_f32 = if T::DTYPE == infernum::dtype::DType::F32 {
-                reinterpret_tensor(input.slice_view(0, input.shape()))
-            } else {
-                cast_to_f32(input)?
-            };
-            let output_f32 = quantized_matmul(&input_f32, w)?;
-            match T::DTYPE {
-                infernum::dtype::DType::F32 => Ok(reinterpret_tensor(output_f32)),
-                infernum::dtype::DType::BF16 => {
-                    Ok(reinterpret_tensor(cast_f32_to_bf16(&output_f32)?))
-                }
-                other => panic!("Quantized matmul not supported for dtype {other}"),
-            }
-        }
     }
 }
 
