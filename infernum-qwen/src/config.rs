@@ -91,6 +91,11 @@ pub struct QwenConfig {
     #[serde(default)]
     pub num_key_value_heads: Option<usize>,
 
+    /// Per-head dimension. When present, overrides `hidden_size / num_attention_heads`.
+    /// Qwen3 models use this to decouple head_dim from hidden_size.
+    #[serde(rename = "head_dim", default)]
+    pub explicit_head_dim: Option<usize>,
+
     /// Maximum sequence length
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
@@ -241,11 +246,12 @@ impl QwenConfig {
 
     /// Returns `true` if `layer_idx` should be an MoE layer.
     ///
+    /// Follows HuggingFace's convention: `(layer_idx + 1) % decoder_sparse_step == 0`.
     /// For `decoder_sparse_step = 1` (default), all layers are MoE.
-    /// For `decoder_sparse_step = N`, only layers where `idx % N == 0` are MoE.
+    /// For `decoder_sparse_step = 2`, layers 1, 3, 5, ... (0-indexed) are MoE.
     #[must_use]
     pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
-        self.is_moe() && layer_idx.is_multiple_of(self.decoder_sparse_step)
+        self.is_moe() && (layer_idx + 1).is_multiple_of(self.decoder_sparse_step)
     }
 
     /// Get the number of key-value heads (for grouped-query attention)
@@ -254,10 +260,14 @@ impl QwenConfig {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
 
-    /// Get the head dimension
+    /// Get the head dimension.
+    ///
+    /// Prefers the explicit `head_dim` from config (Qwen3), falls back
+    /// to `hidden_size / num_attention_heads`.
     #[must_use]
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.explicit_head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     /// Get the number of heads per key-value head (for GQA)
@@ -295,6 +305,8 @@ mod tests {
         assert_eq!(config.num_kv_heads(), 2);
         assert_eq!(config.head_dim(), 64);
         assert_eq!(config.num_heads_per_kv(), 7);
+        // No explicit head_dim → falls back to hidden_size / num_attention_heads
+        assert_eq!(config.head_dim(), 64);
         assert!(config.tie_word_embeddings);
         assert_eq!(config.eos_token_id, 151645);
         assert!(!config.is_moe());
@@ -311,6 +323,7 @@ mod tests {
             "num_hidden_layers": 28,
             "num_attention_heads": 16,
             "num_key_value_heads": 8,
+            "head_dim": 128,
             "max_position_embeddings": 40960,
             "rms_norm_eps": 1e-6,
             "rope_theta": 1000000.0,
@@ -320,6 +333,8 @@ mod tests {
         let config: QwenConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.hidden_size, 1024);
         assert_eq!(config.num_kv_heads(), 8);
+        // Qwen3 head_dim (128) overrides hidden_size/num_heads (64)
+        assert_eq!(config.head_dim(), 128);
         assert!(!config.is_moe());
     }
 
@@ -367,10 +382,12 @@ mod tests {
         }"#;
 
         let config: QwenConfig = serde_json::from_str(json).unwrap();
-        assert!(config.is_moe_layer(0));
-        assert!(!config.is_moe_layer(1));
-        assert!(config.is_moe_layer(2));
-        assert!(!config.is_moe_layer(3));
+        // HF convention: (layer_idx + 1) % step == 0
+        // step=2 → layers 1, 3 are MoE; layers 0, 2 are dense
+        assert!(!config.is_moe_layer(0));
+        assert!(config.is_moe_layer(1));
+        assert!(!config.is_moe_layer(2));
+        assert!(config.is_moe_layer(3));
     }
 
     #[test]
