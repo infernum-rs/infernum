@@ -1204,12 +1204,14 @@ where
     ) -> Result<CudaTensor<T>> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
         let attn_output = self.forward_attention_kv(
             &normed,
             &layer.attention,
             layer_idx,
             kv_cache,
             position_offset,
+            sliding_window,
         )?;
 
         let (mut hidden, normed) = add_rmsnorm(
@@ -1231,6 +1233,7 @@ where
         layer_idx: usize,
         kv_cache: &mut KvCache<T>,
         position_offset: usize,
+        sliding_window: Option<usize>,
     ) -> Result<CudaTensor<T>> {
         let seq_len = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
@@ -1296,9 +1299,9 @@ where
 
         // Attention
         let attn_output = if seq_len == 1 {
-            fused_attention_decode(&q, &k_full, &v_full)?
+            fused_attention_decode(&q, &k_full, &v_full, sliding_window)?
         } else {
-            fused_attention_prefill(&q, &k_full, &v_full, kv_cache.current_len())?
+            fused_attention_prefill(&q, &k_full, &v_full, kv_cache.current_len(), sliding_window)?
         };
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
@@ -1384,8 +1387,14 @@ where
         kv_cache: &mut KvCache<T>,
     ) -> Result<CudaTensor<T>> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-        let attn_output =
-            self.forward_attention_kv_indirect(&normed, &layer.attention, layer_idx, kv_cache)?;
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
+        let attn_output = self.forward_attention_kv_indirect(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            kv_cache,
+            sliding_window,
+        )?;
         let (mut hidden, normed) = add_rmsnorm(
             hidden,
             &attn_output,
@@ -1403,6 +1412,7 @@ where
         weights: &QwenAttentionWeights<T>,
         layer_idx: usize,
         kv_cache: &mut KvCache<T>,
+        sliding_window: Option<usize>,
     ) -> Result<CudaTensor<T>> {
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
@@ -1462,6 +1472,7 @@ where
             v_full,
             total_len,
             kv_cache.graph_max_seq_len(),
+            sliding_window,
         )?;
 
         let attn_output = attn_output.reshape(&[1, num_heads * head_dim]);
@@ -1670,7 +1681,7 @@ where
         let seq_len = input_ids.len();
         let mut hidden = self.embed(input_ids)?;
 
-        for layer in &self.layers {
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
             let normed = rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             let num_heads = self.tp_num_heads;
@@ -1718,7 +1729,8 @@ where
             let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
             let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
 
-            let attn_output = fused_attention_prefill(&q, &k, &v, 0)?;
+            let sliding_window = self.config.effective_sliding_window(layer_idx);
+            let attn_output = fused_attention_prefill(&q, &k, &v, 0, sliding_window)?;
             let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
             let mut attn_output = linear(&attn_output, &layer.attention.o_proj)?;
             #[cfg(feature = "nccl")]
