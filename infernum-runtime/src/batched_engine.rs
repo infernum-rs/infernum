@@ -4,12 +4,10 @@
 //! worker loop with an iteration-level scheduler. Multiple requests share
 //! the GPU, with scheduling decisions made at every decode step.
 //!
-//! # Current Implementation
-//!
-//! Each sequence's decode step is processed individually via
-//! `forward_prefill_paged` (single-token prefill). True batched decode
-//! (`forward_batch_decode`) will be wired in a follow-up once the
-//! scheduler and lifecycle are proven correct.
+//! Decode steps use `forward_batch_decode` to process all active sequences
+//! in a single forward pass (one weight read). Multi-GPU is supported:
+//! one [`PagedKvCache`] is allocated per device, sharing the same logical
+//! block indices via a single [`BlockAllocator`].
 
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -17,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig};
 use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
 use infernum::cuda::PagedKvCache;
-use infernum::{GenerateOptions, Model, ModelConfig, Result, SamplingParams};
+use infernum::{GenerateOptions, Model, ModelConfig, Result, SamplingParams, Tensor};
 
 use crate::engine::{FinishReason, GenerationEvent, TokenSender};
 use crate::scheduler::{BatchConfig, Scheduler, SequencePhase};
@@ -54,20 +52,22 @@ impl BatchedEngine {
             block_size: batch_config.block_size,
             num_blocks: batch_config.num_blocks,
         };
-        let ctx = model.devices()[0].clone();
-        let paged_kv = PagedKvCache::new(
-            &ctx,
-            model_config.num_layers,
-            &block_config,
-            model_config.num_kv_heads,
-            model_config.head_dim,
-        )?;
+        let mut paged_kvs = Vec::new();
+        for ctx in model.devices() {
+            paged_kvs.push(PagedKvCache::new(
+                ctx,
+                model_config.num_layers,
+                &block_config,
+                model_config.num_kv_heads,
+                model_config.head_dim,
+            )?);
+        }
         let allocator = BlockAllocator::new(&block_config);
 
         let (request_tx, request_rx) = mpsc::channel::<BatchedRequest>();
 
         let worker = thread::spawn(move || {
-            batched_worker_loop(model, paged_kv, allocator, batch_config, request_rx);
+            batched_worker_loop(model, paged_kvs, allocator, batch_config, request_rx);
         });
 
         Ok(Self {
@@ -142,7 +142,7 @@ impl BatchedEngine {
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn batched_worker_loop<M: Model>(
     model: M,
-    mut paged_kv: PagedKvCache<M::CacheDtype>,
+    mut paged_kvs: Vec<PagedKvCache<M::CacheDtype>>,
     mut allocator: BlockAllocator,
     batch_config: BatchConfig,
     request_rx: mpsc::Receiver<BatchedRequest>,
@@ -176,18 +176,18 @@ fn batched_worker_loop<M: Model>(
                 idx,
                 &token_ids,
                 &model,
-                &mut paged_kv,
+                &mut paged_kvs,
                 &mut allocator,
                 &mut scheduler,
             );
         }
 
-        // 5. Run decode steps (one at a time for now; batched decode later)
-        for task in &output.decode {
-            process_decode(
-                task.running_idx,
+        // 5. Run decode steps
+        if !output.decode.is_empty() {
+            process_decode_batch(
+                &output.decode,
                 &model,
-                &mut paged_kv,
+                &mut paged_kvs,
                 &mut allocator,
                 &mut scheduler,
             );
@@ -200,7 +200,7 @@ fn process_prefill<M: Model>(
     idx: usize,
     token_ids: &[u32],
     model: &M,
-    paged_kv: &mut PagedKvCache<M::CacheDtype>,
+    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
 ) {
@@ -208,12 +208,7 @@ fn process_prefill<M: Model>(
     let (result, num_tokens) = {
         let seq = &scheduler.running()[idx];
         let start_pos = seq.block_table.seq_len();
-        let r = model.forward_prefill_paged(
-            token_ids,
-            std::slice::from_mut(paged_kv),
-            &seq.block_table,
-            start_pos,
-        );
+        let r = model.forward_prefill_paged(token_ids, paged_kvs, &seq.block_table, start_pos);
         (r, token_ids.len())
     };
 
@@ -255,68 +250,93 @@ fn process_prefill<M: Model>(
     }
 }
 
-/// Process a decode step for one sequence.
-fn process_decode<M: Model>(
-    idx: usize,
+/// Process all decode tasks in a single batched forward pass.
+fn process_decode_batch<M: Model>(
+    tasks: &[crate::scheduler::DecodeTask],
     model: &M,
-    paged_kv: &mut PagedKvCache<M::CacheDtype>,
+    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
 ) {
-    // Extract the token to feed and run forward
-    let result = {
+    // Gather tokens, block tables, and positions for all decode sequences
+    let mut token_ids = Vec::with_capacity(tasks.len());
+    let mut block_tables = Vec::with_capacity(tasks.len());
+    let mut positions = Vec::with_capacity(tasks.len());
+    let running_indices: Vec<usize> = tasks.iter().map(|t| t.running_idx).collect();
+
+    for &idx in &running_indices {
         let seq = &scheduler.running()[idx];
         let tok = seq
             .generated_ids
             .last()
             .copied()
             .unwrap_or_else(|| *seq.prompt_ids.last().unwrap_or(&0));
-        let start_pos = seq.block_table.seq_len();
-        model.forward_prefill_paged(
-            &[tok],
-            std::slice::from_mut(paged_kv),
-            &seq.block_table,
-            start_pos,
-        )
-    };
+        token_ids.push(tok);
+        block_tables.push(seq.block_table.clone());
+        positions.push(seq.block_table.seq_len());
+    }
+
+    let result = model.forward_batch_decode(&token_ids, paged_kvs, &block_tables, &positions);
 
     match result {
         Ok(logits) => {
-            // Advance block table for the decoded token
-            scheduler.running_mut()[idx].block_table.advance(1);
+            // Advance block tables for all decoded tokens
+            for &idx in &running_indices {
+                scheduler.running_mut()[idx].block_table.advance(1);
+            }
 
-            // Extract data needed for sampling before mutable borrow
-            let (all_tokens, sampling_clone, gen_len) = {
-                let seq = &scheduler.running()[idx];
-                let toks: Vec<u32> = seq
-                    .prompt_ids
-                    .iter()
-                    .chain(seq.generated_ids.iter())
-                    .copied()
-                    .collect();
-                let s = seq.options.sampling.clone();
-                let gl = seq.generated_ids.len();
-                (toks, s, gl)
-            };
-            let sampling = sampling_clone.as_ref();
-            let mut rng_state = sampling.map(|s| s.seed ^ (gen_len as u64));
-            let recent = recent_token_window(&all_tokens, sampling);
+            let vocab_size = logits.shape()[1];
 
-            match select_token(&logits, sampling, &mut rng_state, recent) {
-                Ok(token_id) => {
-                    handle_new_token(idx, token_id, allocator, scheduler);
-                }
-                Err(e) => {
-                    let seq = &mut scheduler.running_mut()[idx];
-                    seq.phase = SequencePhase::Finished(FinishReason::Stop);
-                    let _ = seq.token_tx.send(GenerationEvent::Error(e));
+            // Sample per-sequence from the batched logits
+            for (batch_pos, &idx) in running_indices.iter().enumerate() {
+                let seq_logits = logits.slice_view(batch_pos * vocab_size, &[1, vocab_size]);
+
+                let (all_tokens, sampling_clone, gen_len) = {
+                    let seq = &scheduler.running()[idx];
+                    let toks: Vec<u32> = seq
+                        .prompt_ids
+                        .iter()
+                        .chain(seq.generated_ids.iter())
+                        .copied()
+                        .collect();
+                    let s = seq.options.sampling.clone();
+                    let gl = seq.generated_ids.len();
+                    (toks, s, gl)
+                };
+                let sampling = sampling_clone.as_ref();
+                let mut rng_state = sampling.map(|s| s.seed ^ (gen_len as u64));
+                let recent = recent_token_window(&all_tokens, sampling);
+
+                match select_token(&seq_logits, sampling, &mut rng_state, recent) {
+                    Ok(token_id) => {
+                        handle_new_token(idx, token_id, allocator, scheduler);
+                    }
+                    Err(e) => {
+                        let seq = &mut scheduler.running_mut()[idx];
+                        seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                        let _ = seq.token_tx.send(GenerationEvent::Error(e));
+                    }
                 }
             }
         }
         Err(e) => {
-            let seq = &mut scheduler.running_mut()[idx];
-            seq.phase = SequencePhase::Finished(FinishReason::Stop);
-            let _ = seq.token_tx.send(GenerationEvent::Error(e));
+            let msg = format!("{e}");
+            // Send the original error to the first sequence
+            if let Some(&first_idx) = running_indices.first() {
+                let seq = &mut scheduler.running_mut()[first_idx];
+                seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                let _ = seq.token_tx.send(GenerationEvent::Error(e));
+            }
+            // Mark remaining sequences as failed
+            for &idx in running_indices.iter().skip(1) {
+                let seq = &mut scheduler.running_mut()[idx];
+                seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                let _ = seq
+                    .token_tx
+                    .send(GenerationEvent::Error(infernum::Error::InvalidShape(
+                        format!("batched decode failed: {msg}"),
+                    )));
+            }
         }
     }
 }
