@@ -2365,6 +2365,7 @@ mod tests {
     /// Build a tiny LlamaConfig for testing
     fn tiny_config() -> LlamaConfig {
         LlamaConfig {
+            model_type: "llama".to_string(),
             vocab_size: 64,
             hidden_size: 32,
             intermediate_size: 64,
@@ -2554,6 +2555,7 @@ mod tests {
     /// Uses group_size=32 to keep dimensions small.
     fn tiny_gptq_config() -> LlamaConfig {
         LlamaConfig {
+            model_type: "llama".to_string(),
             vocab_size: 64,
             hidden_size: 32,
             intermediate_size: 64,

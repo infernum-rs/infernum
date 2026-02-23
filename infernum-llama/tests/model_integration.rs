@@ -394,3 +394,76 @@ mod mixtral_moe_tp {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 }
+
+// ─── Mistral (dense) ────────────────────────────────────────────────────────
+
+/// Mistral-7B-Instruct-v0.3 (ungated, ~14.5GB, 3 sharded SafeTensors)
+///
+/// Dense Mistral model with `model_type: "mistral"`. Architecturally identical
+/// to Llama — tests that `model_type` validation accepts `"mistral"` and that
+/// loading + generation works correctly via the `MistralModel` alias.
+///
+/// Run manually with:
+///   cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mistral_7b
+mod mistral_7b {
+    use super::*;
+    use infernum_llama::MistralModel;
+
+    const REPO: &str = "mistralai/Mistral-7B-Instruct-v0.3";
+
+    const FILES: &[&str] = &[
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
+    ];
+
+    fn model_dir() -> PathBuf {
+        download_model_files(REPO, FILES)
+    }
+
+    #[test]
+    #[ignore = "14.5GB model, needs ~30GB VRAM — run manually with --ignored"]
+    fn capital_of_france() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            MistralModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let mut runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+        let output = runtime
+            .generate("The capital of France is", &greedy_options(30))
+            .expect("Generation failed");
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in output, got: {output}"
+        );
+    }
+
+    #[test]
+    #[ignore = "14.5GB model, needs ~30GB VRAM — run manually with --ignored"]
+    fn no_nan_in_output() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            MistralModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+        let input_ids = tokenizer.encode("Hello world", true).unwrap();
+
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits_vec = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+}
