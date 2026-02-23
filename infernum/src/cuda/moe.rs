@@ -11,9 +11,11 @@
 use cudarc::cublas::{CudaBlas, Gemm};
 use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
 
-use super::ops::matmul;
+use super::ops::{
+    add_inplace, cast_f32_to_bf16, cast_to_f32, matmul, reinterpret_tensor, scale_f32_inplace,
+};
 use super::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::{DType, TensorDType};
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -144,6 +146,8 @@ where
 }
 
 /// Decode fast path: single token, run each selected expert and weighted-sum.
+///
+/// Accumulates on GPU in f32 to avoid GPU↔CPU round trips per expert.
 fn decode_moe<T, F>(
     hidden: &CudaTensor<T>,
     assignments: &[(usize, f32)],
@@ -156,20 +160,20 @@ where
     let hidden_size = hidden.shape()[1];
     let ctx = hidden.context();
 
-    // Accumulate weighted expert outputs on CPU
-    let mut accum = vec![0.0_f32; hidden_size];
+    let mut accum: CudaTensor<f32> = CudaTensor::zeros(ctx, &[1, hidden_size])?;
 
     for &(expert_idx, weight) in assignments {
         let expert_out = expert_fn(expert_idx, hidden)?;
-        let out_host = expert_out.to_vec()?;
-        for (a, v) in accum.iter_mut().zip(&out_host) {
-            *a += weight * v.to_f32();
-        }
+        let mut out_f32 = cast_to_f32(&expert_out)?;
+        scale_f32_inplace(&mut out_f32, weight)?;
+        add_inplace(&mut accum, &out_f32)?;
     }
 
-    // Convert back to T
-    let result_data: Vec<T> = accum.iter().map(|v| T::from_f32(*v)).collect();
-    CudaTensor::from_slice(ctx, &[1, hidden_size], &result_data)
+    match T::DTYPE {
+        DType::F32 => Ok(reinterpret_tensor(accum)),
+        DType::BF16 => Ok(reinterpret_tensor(cast_f32_to_bf16(&accum)?)),
+        other => panic!("MoE decode not supported for dtype {other}"),
+    }
 }
 
 /// Prefill path: group tokens by expert, gather rows, run experts, scatter-add.

@@ -83,6 +83,43 @@ pub fn mul<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(output)
 }
 
+const SCALE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/scale.ptx"));
+
+/// Scale all elements of an f32 tensor in-place: `data[i] *= scale`.
+///
+/// # Errors
+/// Returns an error if the kernel launch fails.
+pub fn scale_f32_inplace(tensor: &mut CudaTensor<f32>, scale: f32) -> Result<()> {
+    let n = tensor.numel();
+    let device = tensor.context().device();
+
+    let module_name = "scale";
+    if !device.has_func(module_name, "scale_f32") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(SCALE_PTX),
+            module_name,
+            &["scale_f32"],
+        )?;
+    }
+
+    let func = device.get_func(module_name, "scale_f32").unwrap();
+
+    let block_size = 256;
+    let grid_size = (n + block_size - 1) / block_size;
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(cfg, (tensor.cuda_slice_mut(), scale, n as i32))?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

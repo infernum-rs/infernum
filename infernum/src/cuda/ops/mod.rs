@@ -33,7 +33,7 @@ pub use fused_attention::{
 };
 pub use linear::{linear, reinterpret_tensor, LinearWeight};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
-pub use mul::mul;
+pub use mul::{mul, scale_f32_inplace};
 pub use quantized_matmul::quantized_matmul;
 pub use repeat_kv::repeat_kv;
 pub use rmsnorm::{rms_norm, rms_norm_inplace};
