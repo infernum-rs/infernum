@@ -17,10 +17,12 @@
 
 #![allow(clippy::module_name_repetitions, clippy::missing_panics_doc)]
 
+#[cfg(feature = "cuda")]
 use std::collections::VecDeque;
 
 #[cfg(feature = "cuda")]
 use infernum::cuda::block_allocator::{BlockAllocator, BlockTable};
+#[cfg(feature = "cuda")]
 use infernum::GenerateOptions;
 
 #[cfg(feature = "cuda")]
