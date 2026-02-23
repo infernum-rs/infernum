@@ -916,6 +916,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "infernum-gemma"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "infernum",
+ "infernum-runtime",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "infernum-llama"
 version = "0.1.0"
 dependencies = [
