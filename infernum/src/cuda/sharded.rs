@@ -10,8 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+use super::block_allocator::BlockTable;
 use super::nccl::NcclCommunicator;
-use super::{CudaContext, CudaTensor, KvCache, ShardConfig};
+use super::{CudaContext, CudaTensor, KvCache, PagedKvCache, ShardConfig};
 use crate::model::ShardedLoadable;
 use crate::{Model, Result};
 
@@ -131,6 +132,62 @@ where
                 .zip(kv_caches.iter_mut())
                 .map(|((_, model), kv)| {
                     s.spawn(move || model.forward_next_token(token_id, std::slice::from_mut(kv)))
+                })
+                .collect();
+
+            collect_rank0(handles)
+        })
+    }
+
+    fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        block_tables: &[BlockTable],
+        positions: &[usize],
+    ) -> Result<CudaTensor<f32>> {
+        thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .zip(paged_kvs.iter_mut())
+                .map(|((_, model), kv)| {
+                    s.spawn(move || {
+                        model.forward_batch_decode(
+                            token_ids,
+                            std::slice::from_mut(kv),
+                            block_tables,
+                            positions,
+                        )
+                    })
+                })
+                .collect();
+
+            collect_rank0(handles)
+        })
+    }
+
+    fn forward_prefill_paged(
+        &self,
+        input_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        block_table: &BlockTable,
+        start_pos: usize,
+    ) -> Result<CudaTensor<f32>> {
+        thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .zip(paged_kvs.iter_mut())
+                .map(|((_, model), kv)| {
+                    s.spawn(move || {
+                        model.forward_prefill_paged(
+                            input_ids,
+                            std::slice::from_mut(kv),
+                            block_table,
+                            start_pos,
+                        )
+                    })
                 })
                 .collect();
 
