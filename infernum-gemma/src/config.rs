@@ -14,10 +14,35 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantizationConfig {
     pub quant_method: String,
-    #[serde(default)]
-    pub bits: Option<usize>,
-    #[serde(default)]
-    pub group_size: Option<usize>,
+    #[serde(default = "default_quant_bits")]
+    pub bits: u32,
+    #[serde(
+        default = "default_group_size",
+        deserialize_with = "deserialize_group_size"
+    )]
+    pub group_size: usize,
+}
+
+fn default_quant_bits() -> u32 {
+    4
+}
+
+fn default_group_size() -> usize {
+    128
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn deserialize_group_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    if value <= 0 {
+        Ok(0)
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        Ok(value as usize)
+    }
 }
 
 /// Configuration for Gemma 2 and Gemma 3 text models.
