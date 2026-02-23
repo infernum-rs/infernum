@@ -11,8 +11,8 @@ use std::path::Path;
 
 use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope, apply_rope_indirect, attention, cast_to_f32,
-    embedding_gather, embedding_gather_from_device, fused_attention_decode,
+    add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_indirect, attention,
+    cast_to_f32, embedding_gather, embedding_gather_from_device, fused_attention_decode,
     fused_attention_decode_indirect, fused_attention_prefill, gather_paged_kv, matmul,
     matmul_bf16_f32, paged_attention_decode, precompute_rope_cache, quantized_matmul, repeat_kv,
     rms_norm, rms_norm_inplace, swiglu, transpose_2d, GemmScalar,
@@ -1566,32 +1566,29 @@ where
         let kv_stride = num_kv_heads * head_dim;
         let sliding_window = self.config.effective_sliding_window(layer_idx);
 
-        // Process per-sequence: RoPE, K/V append, decode attention
-        // Collect attention outputs for batched O-projection
+        // Batched RoPE: one kernel launch for all sequences
+        let q = apply_rope_batched(&q, &self.cos_cache, &self.sin_cache, positions)?;
+        let k = apply_rope_batched(&k, &self.cos_cache, &self.sin_cache, positions)?;
+
+        // Per-sequence: K/V append + paged decode attention
         let mut attn_parts = Vec::with_capacity(batch_size);
         for (i, &pos) in positions.iter().enumerate() {
             let q_i = q.slice_view(i * q_stride, &[1, num_heads, head_dim]);
             let k_i = k.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
             let v_i = v.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
 
-            let q_roped = apply_rope(&q_i, &self.cos_cache, &self.sin_cache, pos)?;
-            let k_roped = apply_rope(&k_i, &self.cos_cache, &self.sin_cache, pos)?;
+            paged_kv.append_paged(layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
 
-            // Append K/V to paged cache
-            paged_kv.append_paged(layer_idx, &block_tables[i], &k_roped, &v_i, pos)?;
-
-            // Single-sequence paged decode attention
             let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
             let attn_i = paged_attention_decode(
                 &self.ctx,
-                &q_roped,
+                &q_i,
                 k_pool,
                 v_pool,
                 &[block_tables[i].clone()],
                 paged_kv.block_size(),
             )?;
 
-            // Reshape: (1, num_heads, head_dim) -> (1, num_heads * head_dim)
             attn_parts.push(attn_i.reshape(&[1, num_heads * head_dim]));
         }
 
