@@ -57,6 +57,103 @@ pub fn precompute_rope_cache(
     Ok((cos_cache, sin_cache))
 }
 
+/// RoPE scaling configuration (from `config.json` `rope_scaling` field).
+#[derive(Debug, Clone)]
+pub struct RopeScaling {
+    /// Scaling type: `"yarn"`, `"linear"`, etc.
+    pub rope_type: String,
+    /// Extension factor (e.g. 4.0 means 4× the original context)
+    pub factor: f32,
+    /// Original context length before scaling
+    pub original_max_position_embeddings: usize,
+}
+
+/// Precompute RoPE cache with YaRN or linear scaling.
+///
+/// YaRN splits dimensions into three bands (high-frequency, low-frequency,
+/// middle) and applies differential scaling so that short-wavelength
+/// dimensions keep their resolution while long-wavelength dimensions
+/// are interpolated. A magnitude correction `sqrt(1 + 0.1 * ln(factor))`
+/// is baked into the cos/sin values.
+///
+/// For `rope_type == "linear"`, all frequencies are uniformly divided by
+/// `factor`.
+///
+/// # Arguments
+/// * `ctx` - CUDA context
+/// * `max_seq_len` - Maximum sequence length
+/// * `head_dim` - Dimension of each attention head
+/// * `base` - Base frequency (typically 10000.0 or 1000000.0)
+/// * `scaling` - Scaling configuration
+///
+/// # Returns
+/// (cos_cache, sin_cache) tensors of shape `(max_seq_len, head_dim/2)`
+///
+/// # Errors
+/// Returns an error if allocation fails
+pub fn precompute_rope_cache_scaled(
+    ctx: &CudaContext,
+    max_seq_len: usize,
+    head_dim: usize,
+    base: f32,
+    scaling: &RopeScaling,
+) -> Result<(CudaTensor<f32>, CudaTensor<f32>)> {
+    let half_dim = head_dim / 2;
+    let factor = scaling.factor;
+    let orig_max_pos = scaling.original_max_position_embeddings as f32;
+
+    let mut cos_data = vec![0.0_f32; max_seq_len * half_dim];
+    let mut sin_data = vec![0.0_f32; max_seq_len * half_dim];
+
+    if scaling.rope_type == "yarn" {
+        // YaRN parameters (matches HF transformers defaults)
+        let beta_low = 1.0_f32;
+        let beta_high = 32.0_f32;
+        let low_freq_wavelen = orig_max_pos / beta_low;
+        let high_freq_wavelen = orig_max_pos / beta_high;
+
+        // Magnitude correction
+        let attn_scale = (1.0 + 0.1 * factor.ln()).sqrt();
+
+        for i in 0..half_dim {
+            let freq = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+            let wavelen = 2.0 * std::f32::consts::PI / freq;
+
+            let scaled_freq = if wavelen < high_freq_wavelen {
+                freq
+            } else if wavelen > low_freq_wavelen {
+                freq / factor
+            } else {
+                let ramp = (low_freq_wavelen / wavelen - 1.0)
+                    / (low_freq_wavelen / high_freq_wavelen - 1.0);
+                freq * (1.0 - ramp) / factor + freq * ramp
+            };
+
+            for pos in 0..max_seq_len {
+                let angle = pos as f32 * scaled_freq;
+                cos_data[pos * half_dim + i] = angle.cos() * attn_scale;
+                sin_data[pos * half_dim + i] = angle.sin() * attn_scale;
+            }
+        }
+    } else {
+        // "linear" or unknown: uniform interpolation (freq / factor)
+        for i in 0..half_dim {
+            let freq = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+            let scaled_freq = freq / factor;
+            for pos in 0..max_seq_len {
+                let angle = pos as f32 * scaled_freq;
+                cos_data[pos * half_dim + i] = angle.cos();
+                sin_data[pos * half_dim + i] = angle.sin();
+            }
+        }
+    }
+
+    let cos_cache = CudaTensor::from_slice(ctx, &[max_seq_len, half_dim], &cos_data)?;
+    let sin_cache = CudaTensor::from_slice(ctx, &[max_seq_len, half_dim], &sin_data)?;
+
+    Ok((cos_cache, sin_cache))
+}
+
 /// Kernel name suffix for dtype
 fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
     let type_name = std::any::type_name::<T>();
@@ -412,6 +509,118 @@ mod tests {
         }
         for (i, (&a, &b)) in out10_data.iter().zip(ref10_data.iter()).enumerate() {
             assert!((a - b).abs() < 1e-6, "pos=10 mismatch at {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_rope_yarn_factor_1_matches_standard() {
+        // YaRN with factor=1.0 should produce identical results to standard
+        // RoPE (all dimensions fall in the high-frequency band, scale ≈ 1.0).
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 64;
+        let max_seq = 128;
+        let base = 10000.0;
+
+        let (cos_std, sin_std) = precompute_rope_cache(&ctx, max_seq, head_dim, base).unwrap();
+        let scaling = RopeScaling {
+            rope_type: "yarn".to_string(),
+            factor: 1.0,
+            original_max_position_embeddings: 4096,
+        };
+        let (cos_yarn, sin_yarn) =
+            precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
+
+        let cos_std_v = cos_std.to_vec().unwrap();
+        let sin_std_v = sin_std.to_vec().unwrap();
+        let cos_yarn_v = cos_yarn.to_vec().unwrap();
+        let sin_yarn_v = sin_yarn.to_vec().unwrap();
+
+        // scale = sqrt(1 + 0.1 * ln(1.0)) = sqrt(1.0) = 1.0
+        for (i, (&a, &b)) in cos_std_v.iter().zip(cos_yarn_v.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "cos mismatch at {i}: standard={a}, yarn_factor1={b}"
+            );
+        }
+        for (i, (&a, &b)) in sin_std_v.iter().zip(sin_yarn_v.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "sin mismatch at {i}: standard={a}, yarn_factor1={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_yarn_magnitude_correction() {
+        // Verify that YaRN applies the magnitude correction sqrt(1 + 0.1*ln(factor))
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let max_seq = 4;
+        let base = 10000.0;
+        let factor = 4.0_f32;
+
+        let scaling = RopeScaling {
+            rope_type: "yarn".to_string(),
+            factor,
+            original_max_position_embeddings: 32768,
+        };
+        let (cos_yarn, sin_yarn) =
+            precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
+
+        let cos_v = cos_yarn.to_vec().unwrap();
+        let sin_v = sin_yarn.to_vec().unwrap();
+
+        let expected_scale = (1.0 + 0.1 * factor.ln()).sqrt();
+
+        // At position 0, cos should be scale * 1.0 and sin should be scale * 0.0
+        let half_dim = head_dim / 2;
+        for i in 0..half_dim {
+            assert!(
+                (cos_v[i] - expected_scale).abs() < 1e-5,
+                "pos=0, dim={i}: cos={}, expected scale={}",
+                cos_v[i],
+                expected_scale
+            );
+            assert!(
+                sin_v[i].abs() < 1e-5,
+                "pos=0, dim={i}: sin={}, expected 0.0",
+                sin_v[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_linear_scaling() {
+        // Linear scaling: all frequencies divided by factor
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let max_seq = 8;
+        let base = 10000.0;
+        let factor = 2.0_f32;
+
+        let scaling = RopeScaling {
+            rope_type: "linear".to_string(),
+            factor,
+            original_max_position_embeddings: 4096,
+        };
+        let (cos_lin, sin_lin) =
+            precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
+
+        let cos_v = cos_lin.to_vec().unwrap();
+        let half_dim = head_dim / 2;
+
+        // Position p with linear scaling should match position p/factor in standard
+        // cos_lin[pos=4, dim=0] should equal cos_std[pos=2, dim=0]
+        let (cos_std, _) = precompute_rope_cache(&ctx, max_seq, head_dim, base).unwrap();
+        let cos_std_v = cos_std.to_vec().unwrap();
+
+        let pos_lin = 4;
+        let pos_std = 2; // 4 / factor
+        for i in 0..half_dim {
+            assert!(
+                (cos_v[pos_lin * half_dim + i] - cos_std_v[pos_std * half_dim + i]).abs() < 1e-5,
+                "linear scaling mismatch at dim {i}"
+            );
         }
     }
 }

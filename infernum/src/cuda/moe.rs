@@ -57,10 +57,12 @@ fn renormalize(selections: &mut [(usize, f32)]) {
 /// * `hidden` — input hidden states, shape `[seq_len, hidden_size]`
 /// * `gate_weight` — pre-transposed router weight, shape `[hidden_size, num_experts]`
 /// * `num_experts_per_tok` — how many experts to activate per token
+/// * `norm_topk_prob` — if `true`, renormalize selected expert weights to sum
+///   to 1.0 after top-K selection. Mixtral and Qwen3-MoE use `true`.
 ///
 /// # Returns
 /// Per-token routing assignments: for each token, a `Vec<(expert_idx, weight)>`
-/// of length `num_experts_per_tok` with weights summing to 1.0.
+/// of length `num_experts_per_tok`.
 ///
 /// # Errors
 /// Returns an error if the matmul or device-to-host copy fails.
@@ -68,6 +70,7 @@ pub fn moe_route<T>(
     hidden: &CudaTensor<T>,
     gate_weight: &CudaTensor<T>,
     num_experts_per_tok: usize,
+    norm_topk_prob: bool,
 ) -> Result<Vec<TokenRouting>>
 where
     T: TensorDType + DeviceRepr + super::ops::GemmScalar + Default,
@@ -89,7 +92,9 @@ where
             .collect();
         softmax_inplace(&mut row);
         let mut selected = topk(&row, num_experts_per_tok);
-        renormalize(&mut selected);
+        if norm_topk_prob {
+            renormalize(&mut selected);
+        }
         routing.push(selected);
     }
 
@@ -107,6 +112,7 @@ where
 /// * `gate_weight` — pre-transposed router weight, shape `[hidden_size, num_experts]`
 /// * `num_experts` — total number of experts
 /// * `num_experts_per_tok` — experts activated per token
+/// * `norm_topk_prob` — renormalize top-K weights to sum to 1.0
 /// * `expert_fn` — called as `expert_fn(expert_idx, expert_input)` → expert output
 ///
 /// # Errors
@@ -116,6 +122,7 @@ pub fn moe_forward<T, F>(
     gate_weight: &CudaTensor<T>,
     num_experts: usize,
     num_experts_per_tok: usize,
+    norm_topk_prob: bool,
     expert_fn: F,
 ) -> Result<CudaTensor<T>>
 where
@@ -125,7 +132,7 @@ where
 {
     let seq_len = hidden.shape()[0];
     let hidden_size = hidden.shape()[1];
-    let routing = moe_route(hidden, gate_weight, num_experts_per_tok)?;
+    let routing = moe_route(hidden, gate_weight, num_experts_per_tok, norm_topk_prob)?;
 
     if seq_len == 1 {
         // Decode fast path: single token, no gather/scatter needed

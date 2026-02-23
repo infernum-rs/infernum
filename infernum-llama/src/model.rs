@@ -1601,6 +1601,7 @@ where
             gate,
             experts.len(),
             num_experts_per_tok,
+            true, // Mixtral always renormalizes top-K weights
             |expert_idx, expert_input| {
                 self.forward_mlp_no_reduce(expert_input, &experts[expert_idx].mlp)
             },

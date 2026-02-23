@@ -1,9 +1,9 @@
-//! Text generation example using Llama
+//! Text generation example supporting Llama and Qwen model families
 //!
 //! Usage:
-//!   # SafeTensors directory:
-//!   cargo run --example generate --features cuda -- -m /path/to/llama "Hello"
-//!   # GGUF file:
+//!   # SafeTensors directory (auto-detects model family):
+//!   cargo run --example generate --features cuda -- -m /path/to/model "Hello"
+//!   # GGUF file (Llama family only):
 //!   cargo run --example generate --features cuda -- -m model.gguf "Hello"
 //!   # Greedy decoding:
 //!   cargo run --example generate --features cuda -- -m model.gguf --greedy "Hello"
@@ -11,21 +11,25 @@
 //!   cargo run --example generate --features cuda -- -m model.gguf -t 0.8 -p 0.95 "Hello"
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use clap::Parser;
+use serde::Deserialize;
 
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
-use infernum::{GenerateOptions, Result, SamplingParams};
+use infernum::{GenerateOptions, Model, Result, SamplingParams};
 use infernum_llama::LlamaModel;
+use infernum_qwen::QwenModel;
 use infernum_runtime::{Engine, Runtime};
 
-/// Text generation with Llama models
+/// Text generation with Llama and Qwen models
 ///
 /// Automatically detects .gguf files and loads tokenizer from GGUF metadata.
 /// For SafeTensors directories, expects tokenizer.json alongside the weights.
+/// The model family (Llama/Mistral/Mixtral vs Qwen) is auto-detected from config.json.
 /// Uses KV cache and nucleus sampling by default.
 #[derive(Parser)]
 #[command(name = "generate")]
@@ -121,40 +125,42 @@ impl Tokenizer {
     }
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// Peek at just the `model_type` field from config.json.
+#[derive(Deserialize)]
+struct ModelTypeProbe {
+    #[serde(default = "default_model_type")]
+    model_type: String,
+}
 
-    let is_gguf = cli.model.ends_with(".gguf");
+fn default_model_type() -> String {
+    "llama".to_string()
+}
 
-    println!("Loading model from: {}", cli.model);
+fn detect_model_type(model_path: &str) -> Result<String> {
+    let config_path = Path::new(model_path).join("config.json");
+    let content = std::fs::read_to_string(&config_path)?;
+    let probe: ModelTypeProbe = serde_json::from_str(&content)?;
+    Ok(probe.model_type)
+}
 
-    // Initialize CUDA
-    let ctx = CudaContext::new(0)?;
-    println!("CUDA context initialized");
-
-    // Load model + tokenizer based on file type
-    let (model, tokenizer) = if is_gguf {
-        let model = LlamaModel::from_gguf(&ctx, &cli.model)?;
-        let gguf_loader = infernum::GgufLoader::from_file(&cli.model)?;
-        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(gguf_loader.metadata())?);
-        (model, tokenizer)
-    } else {
-        let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
-        (model, tokenizer)
-    };
-
+/// Run generation with a model that implements the `Model` trait.
+fn run_generate<M: Model + Send>(
+    model: M,
+    tokenizer: Tokenizer,
+    num_layers: usize,
+    hidden_size: usize,
+    cli: &Cli,
+) -> Result<()> {
     println!(
         "Model loaded ({} layers, {} hidden, vocab {})",
-        model.config().num_hidden_layers,
-        model.config().hidden_size,
+        num_layers,
+        hidden_size,
         tokenizer.vocab_size(),
     );
 
-    // Build generation options
     let options = GenerateOptions {
         max_new_tokens: cli.max_tokens,
-        eos_token_id: None, // Runtime fills from model config
+        eos_token_id: None,
         sampling: if cli.greedy {
             None
         } else {
@@ -170,7 +176,6 @@ fn main() -> Result<()> {
         use_cuda_graphs: false,
     };
 
-    // Print decoding strategy
     if let Some(ref params) = options.sampling {
         println!(
             "Sampling: temperature={}, top_p={}, seed={}, repetition_penalty={} (window={})",
@@ -198,7 +203,6 @@ fn main() -> Result<()> {
     let start = Instant::now();
 
     let (output_tokens, prompt_len) = if !options.use_kv_cache {
-        // Naive generation: use Engine directly for non-KV-cached path
         let mut engine = Engine::new(model)?;
         let input_ids = tokenizer.encode(&cli.prompt, true)?;
         let prompt_len = input_ids.len();
@@ -208,7 +212,6 @@ fn main() -> Result<()> {
 
         let tokens = engine.generate(&input_ids, &opts)?;
 
-        // Print output tokens
         for &tok in &tokens[prompt_len..] {
             let text = tokenizer.decode_token(tok)?;
             print!("{text}");
@@ -217,7 +220,6 @@ fn main() -> Result<()> {
 
         (tokens, prompt_len)
     } else {
-        // KV-cached streaming via Runtime
         let mut runtime = Runtime::new(model, tokenizer)?;
         let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
         let tokens = runtime.generate_stream(&cli.prompt, &options)?;
@@ -236,4 +238,46 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let is_gguf = cli.model.ends_with(".gguf");
+
+    println!("Loading model from: {}", cli.model);
+
+    let ctx = CudaContext::new(0)?;
+    println!("CUDA context initialized");
+
+    if is_gguf {
+        // GGUF is Llama-family only
+        let model = LlamaModel::from_gguf(&ctx, &cli.model)?;
+        let gguf_loader = infernum::GgufLoader::from_file(&cli.model)?;
+        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(gguf_loader.metadata())?);
+        let num_layers = model.config().num_hidden_layers;
+        let hidden_size = model.config().hidden_size;
+        run_generate(model, tokenizer, num_layers, hidden_size, &cli)
+    } else {
+        let model_type = detect_model_type(&cli.model)?;
+        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
+
+        match model_type.as_str() {
+            "llama" | "mistral" | "mixtral" => {
+                let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let num_layers = model.config().num_hidden_layers;
+                let hidden_size = model.config().hidden_size;
+                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
+            }
+            "qwen2" | "qwen3" | "qwen3_moe" => {
+                let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let num_layers = model.config().num_hidden_layers;
+                let hidden_size = model.config().hidden_size;
+                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
+            }
+            other => Err(infernum::Error::UnsupportedModel(format!(
+                "Unsupported model_type: \"{other}\". Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe"
+            ))),
+        }
+    }
 }
