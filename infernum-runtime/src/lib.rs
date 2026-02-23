@@ -19,6 +19,7 @@
 mod engine;
 #[cfg(feature = "cuda")]
 mod runtime;
+mod scheduler;
 
 #[cfg(feature = "cuda")]
 pub use engine::Engine;
@@ -26,3 +27,8 @@ pub use engine::Engine;
 pub use engine::{FinishReason, GenerationEvent, TokenSender};
 #[cfg(feature = "cuda")]
 pub use runtime::Runtime;
+pub use scheduler::BatchConfig;
+#[cfg(feature = "cuda")]
+pub use scheduler::{
+    DecodeTask, PrefillTask, Scheduler, SchedulerOutput, SequencePhase, SequenceState,
+};
