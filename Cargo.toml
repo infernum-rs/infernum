@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "infernum",
+    "infernum-deepseek",
     "infernum-examples",
     "infernum-llama",
     "infernum-macros",
