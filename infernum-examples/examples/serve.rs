@@ -29,6 +29,7 @@ use serde::Deserialize;
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{ChatTemplate, Result};
+use infernum_gemma::{GemmaModel, GemmaTemplate};
 use infernum_llama::{Llama3Template, LlamaModel, MistralTemplate};
 use infernum_qwen::{ChatMLTemplate, QwenModel};
 use infernum_serve::{ModelEntry, Server};
@@ -71,6 +72,7 @@ fn select_template(model_type: &str) -> Box<dyn ChatTemplate> {
     match model_type {
         "mistral" => Box::new(MistralTemplate),
         "qwen2" | "qwen3" | "qwen3_moe" => Box::new(ChatMLTemplate),
+        "gemma2" | "gemma3_text" => Box::new(GemmaTemplate),
         _ => Box::new(Llama3Template),
     }
 }
@@ -108,6 +110,10 @@ async fn main() -> Result<()> {
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
             let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            ModelEntry::new(&cli.name, model, tokenizer, template)
+        }
+        "gemma2" | "gemma3_text" => {
+            let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::new(&cli.name, model, tokenizer, template)
         }
         other => {

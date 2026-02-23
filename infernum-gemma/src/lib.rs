@@ -7,9 +7,12 @@
 
 #![allow(clippy::doc_markdown)]
 
+mod chat_templates;
 mod config;
 #[cfg(feature = "cuda")]
 mod model;
+
+pub use chat_templates::GemmaTemplate;
 
 pub use config::GemmaConfig;
 #[cfg(feature = "cuda")]
