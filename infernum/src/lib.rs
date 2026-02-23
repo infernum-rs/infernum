@@ -9,6 +9,7 @@
 // Allow proc macros to use `::infernum::` paths from within this crate.
 extern crate self as infernum;
 
+pub mod chat_template;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dtype;
@@ -48,3 +49,5 @@ pub use tokenizer::GgufTokenizer;
 pub use tokenizer::Tokenizer;
 #[cfg(feature = "cuda")]
 pub use weights::GgufLoader;
+
+pub use chat_template::{ChatMessage, ChatTemplate, RawTemplate};

@@ -4,10 +4,12 @@
 //! identical to Llama. [`MistralModel`] and [`MixtralModel`] are provided
 //! as type aliases for API clarity.
 
+mod chat_templates;
 mod config;
 #[cfg(feature = "cuda")]
 mod model;
 
+pub use chat_templates::{Llama3Template, MistralTemplate};
 pub use config::{LlamaConfig, QuantizationConfig};
 #[cfg(feature = "cuda")]
 pub use model::LlamaModel;
