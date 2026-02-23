@@ -9,10 +9,12 @@ use std::path::Path;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
 
+#[cfg(feature = "cuda")]
+use crate::cuda::block_allocator::BlockTable;
 #[cfg(feature = "nccl")]
 use crate::cuda::{nccl::NcclCommunicator, ShardConfig};
 #[cfg(feature = "cuda")]
-use crate::cuda::{CudaContext, CudaTensor, KvCache};
+use crate::cuda::{CudaContext, CudaTensor, KvCache, PagedKvCache};
 #[cfg(feature = "cuda")]
 use crate::dtype::TensorDType;
 #[cfg(feature = "cuda")]
@@ -137,6 +139,42 @@ pub trait Model {
         kv_caches: &mut [KvCache<Self::CacheDtype>],
     ) -> Result<CudaTensor<f32>> {
         self.forward_next_token_device(token_id_gpu, kv_caches)
+    }
+
+    /// Batched decode forward pass with paged KV cache.
+    ///
+    /// Processes one new token per sequence for `batch_size` sequences.
+    /// Each sequence has its own block table into the shared KV pool.
+    ///
+    /// Returns logits of shape `(batch_size, vocab_size)`.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    fn forward_batch_decode(
+        &self,
+        _token_ids: &[u32],
+        _paged_kv: &mut PagedKvCache<Self::CacheDtype>,
+        _block_tables: &[BlockTable],
+        _positions: &[usize],
+    ) -> Result<CudaTensor<f32>> {
+        unimplemented!("forward_batch_decode not implemented for this model")
+    }
+
+    /// Single-sequence prefill forward pass with paged KV cache.
+    ///
+    /// Processes all prompt tokens for one sequence, writing K/V into the
+    /// paged cache. Returns logits for the **last** token only: shape
+    /// `(1, vocab_size)`.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    fn forward_prefill_paged(
+        &self,
+        _input_ids: &[u32],
+        _paged_kv: &mut PagedKvCache<Self::CacheDtype>,
+        _block_table: &mut BlockTable,
+    ) -> Result<CudaTensor<f32>> {
+        unimplemented!("forward_prefill_paged not implemented for this model")
     }
 }
 
