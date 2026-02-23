@@ -23,7 +23,9 @@ use infernum::{
     ChatMessage, GenerateOptions, Model, ModelConfig, Result as InfernumResult, SamplingParams,
     Tokenizer,
 };
-use infernum_runtime::{Engine, FinishReason, GenerationEvent, TokenSender};
+use infernum_runtime::{
+    BatchConfig, BatchedEngine, Engine, FinishReason, GenerationEvent, TokenSender,
+};
 
 use crate::types::{
     ChatChoice, ChatChunkChoice, ChatCompletionChunk, ChatCompletionRequest,
@@ -48,12 +50,46 @@ impl TokenSender for TokioTokenSender {
 }
 
 // ---------------------------------------------------------------------------
+// ErasedEngine — trait for type-erased engine submit
+// ---------------------------------------------------------------------------
+
+/// Object-safe trait for submitting generation requests.
+///
+/// Both [`Engine`] (sequential) and [`BatchedEngine`] (inflight batching)
+/// implement this, allowing the server to use either backend.
+trait ErasedEngine: Send + Sync {
+    fn submit(&self, input_ids: Vec<u32>, options: GenerateOptions, token_tx: Box<dyn TokenSender>);
+}
+
+impl ErasedEngine for Engine {
+    fn submit(
+        &self,
+        input_ids: Vec<u32>,
+        options: GenerateOptions,
+        token_tx: Box<dyn TokenSender>,
+    ) {
+        Engine::submit(self, input_ids, options, token_tx);
+    }
+}
+
+impl ErasedEngine for BatchedEngine {
+    fn submit(
+        &self,
+        input_ids: Vec<u32>,
+        options: GenerateOptions,
+        token_tx: Box<dyn TokenSender>,
+    ) {
+        BatchedEngine::submit(self, input_ids, options, token_tx);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ModelHandle — type-erased model handle
 // ---------------------------------------------------------------------------
 
 /// Type-erased handle to a model, its engine, tokenizer, and chat template.
 struct ModelHandle {
-    engine: Engine,
+    engine: Box<dyn ErasedEngine>,
     tokenizer: Box<dyn ErasedTokenizer>,
     template: Box<dyn ChatTemplate>,
     model_config: ModelConfig,
@@ -97,7 +133,7 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
-    /// Create a new model entry.
+    /// Create a new model entry using the sequential engine.
     ///
     /// The model is consumed and moved into a background engine thread.
     ///
@@ -114,7 +150,40 @@ impl ModelEntry {
         Self {
             name: name.to_string(),
             handle: ModelHandle {
-                engine,
+                engine: Box::new(engine),
+                tokenizer: Box::new(tokenizer),
+                template: Box::new(template),
+                model_config,
+            },
+        }
+    }
+
+    /// Create a new model entry using the batched engine (inflight batching).
+    ///
+    /// Supports concurrent requests with paged KV cache and iteration-level
+    /// scheduling.
+    ///
+    /// # Panics
+    /// Panics if engine creation fails (paged KV cache allocation).
+    pub fn new_batched<M, T, C>(
+        name: &str,
+        model: M,
+        tokenizer: T,
+        template: C,
+        batch_config: BatchConfig,
+    ) -> Self
+    where
+        M: Model + Send + 'static,
+        T: Tokenizer + Send + Sync + 'static,
+        C: ChatTemplate + 'static,
+    {
+        let model_config = model.config();
+        let engine =
+            BatchedEngine::new(model, batch_config).expect("Failed to create batched engine");
+        Self {
+            name: name.to_string(),
+            handle: ModelHandle {
+                engine: Box::new(engine),
                 tokenizer: Box::new(tokenizer),
                 template: Box::new(template),
                 model_config,
@@ -334,7 +403,7 @@ async fn handle_non_streaming(
     let (tx, mut rx) = tokio_mpsc::channel::<GenerationEvent>(256);
     handle
         .engine
-        .submit(input_ids, options, TokioTokenSender(tx));
+        .submit(input_ids, options, Box::new(TokioTokenSender(tx)));
 
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut finish_reason = "length";
@@ -413,7 +482,7 @@ fn handle_streaming(
     let (engine_tx, mut engine_rx) = tokio_mpsc::channel::<GenerationEvent>(256);
     handle
         .engine
-        .submit(input_ids, options, TokioTokenSender(engine_tx));
+        .submit(input_ids, options, Box::new(TokioTokenSender(engine_tx)));
 
     let (sse_tx, sse_rx) = tokio_mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
 

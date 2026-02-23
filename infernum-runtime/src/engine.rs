@@ -59,6 +59,12 @@ impl TokenSender for mpsc::Sender<GenerationEvent> {
     }
 }
 
+impl TokenSender for Box<dyn TokenSender> {
+    fn send(&self, event: GenerationEvent) -> bool {
+        (**self).send(event)
+    }
+}
+
 /// A generation request submitted to the engine's worker thread.
 struct GenerationRequest {
     input_ids: Vec<u32>,
