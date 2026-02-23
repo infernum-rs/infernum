@@ -62,8 +62,12 @@ fn detect_model_type(model_path: &str) -> infernum::Result<String> {
     Ok(probe.model_type)
 }
 
-fn bench_model<M: Model>(model: M, n_gen: usize, use_cuda_graphs: bool) -> infernum::Result<()> {
-    let mut engine = Engine::new(model)?;
+fn bench_model<M: Model + Send + 'static>(
+    model: M,
+    n_gen: usize,
+    use_cuda_graphs: bool,
+) -> infernum::Result<()> {
+    let engine = Engine::new(model)?;
 
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let options = GenerateOptions {
@@ -103,7 +107,7 @@ fn bench_model<M: Model>(model: M, n_gen: usize, use_cuda_graphs: bool) -> infer
     Ok(())
 }
 
-fn bench_with_info<M: Model>(
+fn bench_with_info<M: Model + Send + 'static>(
     model: M,
     num_layers: usize,
     hidden_size: usize,

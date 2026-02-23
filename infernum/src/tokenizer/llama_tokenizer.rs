@@ -63,7 +63,7 @@ impl LlamaTokenizer {
     pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         let encoding = self
             .tokenizer
-            .encode(text, false)
+            .encode(text, true)
             .map_err(|e| Error::Tokenizer(e.to_string()))?;
 
         let mut ids: Vec<u32> = encoding.get_ids().to_vec();

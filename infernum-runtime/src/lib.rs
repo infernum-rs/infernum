@@ -23,4 +23,6 @@ mod runtime;
 #[cfg(feature = "cuda")]
 pub use engine::Engine;
 #[cfg(feature = "cuda")]
+pub use engine::{FinishReason, GenerationEvent, TokenSender};
+#[cfg(feature = "cuda")]
 pub use runtime::Runtime;

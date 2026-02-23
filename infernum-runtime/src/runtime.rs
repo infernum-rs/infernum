@@ -5,32 +5,33 @@
 
 use std::io::{self, Write};
 
-use infernum::{GenerateOptions, Model, Result, Tokenizer};
+use infernum::{GenerateOptions, Model, ModelConfig, Result, Tokenizer};
 
+use crate::engine::GenerationEvent;
 use crate::Engine;
 
 /// Text-level inference runtime.
 ///
 /// Combines a model (via Engine) with a tokenizer to provide text-in, text-out
 /// generation. Each Runtime instance serves one model.
-pub struct Runtime<M: Model, T: Tokenizer> {
-    engine: Engine<M>,
+pub struct Runtime<T: Tokenizer> {
+    engine: Engine,
     tokenizer: T,
 }
 
-impl<M: Model, T: Tokenizer> Runtime<M, T> {
+impl<T: Tokenizer> Runtime<T> {
     /// Create a new runtime from a model and tokenizer.
     ///
     /// # Errors
     /// Returns an error if KV cache allocation fails.
-    pub fn new(model: M, tokenizer: T) -> Result<Self> {
+    pub fn new<M: Model + Send + 'static>(model: M, tokenizer: T) -> Result<Self> {
         let engine = Engine::new(model)?;
         Ok(Self { engine, tokenizer })
     }
 
     /// Get a reference to the underlying engine.
     #[must_use]
-    pub fn engine(&self) -> &Engine<M> {
+    pub fn engine(&self) -> &Engine {
         &self.engine
     }
 
@@ -38,6 +39,12 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
     #[must_use]
     pub fn tokenizer(&self) -> &T {
         &self.tokenizer
+    }
+
+    /// Get the model configuration.
+    #[must_use]
+    pub fn model_config(&self) -> &ModelConfig {
+        self.engine.model_config()
     }
 
     /// Generate text, blocking until complete.
@@ -51,7 +58,7 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
     ///
     /// # Errors
     /// Returns an error if tokenization or generation fails.
-    pub fn generate(&mut self, prompt: &str, options: &GenerateOptions) -> Result<String> {
+    pub fn generate(&self, prompt: &str, options: &GenerateOptions) -> Result<String> {
         let input_ids = self.tokenizer.encode(prompt, true)?;
         let options = self.fill_eos(options);
         let output_ids = self.engine.generate(&input_ids, &options)?;
@@ -69,10 +76,7 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
     ///
     /// # Errors
     /// Returns an error if tokenization or generation fails.
-    pub fn generate_stream(&mut self, prompt: &str, options: &GenerateOptions) -> Result<Vec<u32>>
-    where
-        M: Send,
-    {
+    pub fn generate_stream(&self, prompt: &str, options: &GenerateOptions) -> Result<Vec<u32>> {
         let input_ids = self.tokenizer.encode(prompt, true)?;
         let options = self.fill_eos(options);
         let tokenizer = &self.tokenizer;
@@ -81,13 +85,18 @@ impl<M: Model, T: Tokenizer> Runtime<M, T> {
             let mut tokens = input_ids.clone();
             let mut prev_len = tokenizer.decode(&tokens)?.len();
 
-            for token_result in rx {
-                let token = token_result?;
-                tokens.push(token);
-                let full_text = tokenizer.decode(&tokens)?;
-                print!("{}", &full_text[prev_len..]);
-                io::stdout().flush()?;
-                prev_len = full_text.len();
+            for event in rx {
+                match event {
+                    GenerationEvent::Token(id) => {
+                        tokens.push(id);
+                        let full_text = tokenizer.decode(&tokens)?;
+                        print!("{}", &full_text[prev_len..]);
+                        io::stdout().flush()?;
+                        prev_len = full_text.len();
+                    }
+                    GenerationEvent::Error(e) => return Err(e),
+                    GenerationEvent::Finished(_) => break,
+                }
             }
 
             Ok::<Vec<u32>, infernum::Error>(tokens)

@@ -3,32 +3,90 @@
 //! The [`Engine`] manages a model and its KV cache, providing token-level
 //! generation (tokens in, tokens out). It is generic over any [`Model`]
 //! implementation.
+//!
+//! The engine spawns a long-lived worker thread at construction. Callers
+//! submit generation requests via [`Engine::submit`] and receive tokens
+//! through a [`TokenSender`] implementation of their choice.
 
 use std::sync::mpsc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
 use infernum::cuda::{CudaGraph, KvCache};
 use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams};
 
-/// Token-level inference engine.
-///
-/// Wraps a model and manages its KV cache. Handles the prefill/decode loop
-/// and sampling logic. Does not know about text — that is the Runtime's job.
-pub struct Engine<M: Model> {
-    model: M,
-    model_config: ModelConfig,
-    kv_caches: Vec<KvCache<M::CacheDtype>>,
+/// Why generation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Model produced the end-of-sequence token.
+    Stop,
+    /// Reached the maximum number of tokens.
+    Length,
+    /// The receiver was dropped (client disconnect).
+    Cancelled,
 }
 
-impl<M: Model> Engine<M> {
+/// An event produced by the engine during generation.
+///
+/// Sent through a single channel so ordering is guaranteed:
+/// zero or more `Token`s, then exactly one terminal event
+/// (`Finished` or `Error`).
+pub enum GenerationEvent {
+    /// A newly generated token.
+    Token(u32),
+    /// An error occurred during generation.
+    Error(infernum::Error),
+    /// Generation completed with the given reason.
+    Finished(FinishReason),
+}
+
+/// Trait for sending generation events from the engine to the caller.
+///
+/// Abstracted so callers can provide either a sync or async sender.
+/// Return `false` to signal that the receiver has been dropped and
+/// generation should stop.
+pub trait TokenSender: Send {
+    /// Send a generation event to the receiver.
+    ///
+    /// Returns `false` if the receiver has been dropped, signalling the
+    /// engine to abort generation early.
+    fn send(&self, event: GenerationEvent) -> bool;
+}
+
+impl TokenSender for mpsc::Sender<GenerationEvent> {
+    fn send(&self, event: GenerationEvent) -> bool {
+        mpsc::Sender::send(self, event).is_ok()
+    }
+}
+
+/// A generation request submitted to the engine's worker thread.
+struct GenerationRequest {
+    input_ids: Vec<u32>,
+    options: GenerateOptions,
+    token_tx: Box<dyn TokenSender>,
+}
+
+/// Handle to the engine's worker thread.
+///
+/// The engine owns a long-lived thread that processes generation requests
+/// sequentially. Callers submit requests via [`Engine::submit`] and receive
+/// tokens through the provided [`TokenSender`].
+pub struct Engine {
+    request_tx: mpsc::Sender<GenerationRequest>,
+    model_config: ModelConfig,
+    _worker: JoinHandle<()>,
+}
+
+impl Engine {
     /// Create a new engine wrapping the given model.
     ///
-    /// Allocates one KV cache per device returned by [`Model::devices`].
+    /// Spawns a long-lived worker thread that owns the model and KV caches.
+    /// The thread loops waiting for [`GenerationRequest`]s submitted via
+    /// [`Engine::submit`].
     ///
     /// # Errors
     /// Returns an error if KV cache allocation fails.
-    pub fn new(model: M) -> Result<Self> {
+    pub fn new<M: Model + Send + 'static>(model: M) -> Result<Self> {
         infernum::fusion::init();
         let model_config = model.config();
         let kv_caches = model
@@ -44,23 +102,46 @@ impl<M: Model> Engine<M> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            model,
-            model_config,
-            kv_caches,
-        })
-    }
 
-    /// Get a reference to the underlying model.
-    #[must_use]
-    pub fn model(&self) -> &M {
-        &self.model
+        let (request_tx, request_rx) = mpsc::channel::<GenerationRequest>();
+
+        let worker = thread::spawn(move || {
+            worker_loop(model, kv_caches, request_rx);
+        });
+
+        Ok(Self {
+            request_tx,
+            model_config,
+            _worker: worker,
+        })
     }
 
     /// Get the model configuration.
     #[must_use]
     pub fn model_config(&self) -> &ModelConfig {
         &self.model_config
+    }
+
+    /// Submit a generation request with a caller-provided token sender.
+    ///
+    /// Tokens are sent through `token_tx` as they are generated. The sender
+    /// receives `Ok(token_id)` for each token, and generation stops when
+    /// either the maximum token count is reached, an EOS token is produced,
+    /// or the sender returns `false` (receiver dropped).
+    pub fn submit(
+        &self,
+        input_ids: Vec<u32>,
+        options: GenerateOptions,
+        token_tx: impl TokenSender + 'static,
+    ) {
+        let request = GenerationRequest {
+            input_ids,
+            options,
+            token_tx: Box::new(token_tx),
+        };
+        // If the worker thread has panicked, the send will fail.
+        // That's fine — the receiver will see the channel close.
+        let _ = self.request_tx.send(request);
     }
 
     /// Generate tokens, blocking until complete.
@@ -70,24 +151,30 @@ impl<M: Model> Engine<M> {
     /// * `options` - Generation options (sampling, max tokens, KV cache, etc.)
     ///
     /// # Returns
-    /// The full token sequence (prompt + generated tokens)
+    /// The generated token IDs (not including the prompt).
     ///
     /// # Errors
     /// Returns an error if a forward pass fails.
-    pub fn generate(&mut self, input_ids: &[u32], options: &GenerateOptions) -> Result<Vec<u32>> {
-        if options.use_kv_cache {
-            self.generate_kv_cached(input_ids, options)
-        } else {
-            self.generate_naive(input_ids, options)
+    pub fn generate(&self, input_ids: &[u32], options: &GenerateOptions) -> Result<Vec<u32>> {
+        let (tx, rx) = mpsc::channel();
+        self.submit(input_ids.to_vec(), options.clone(), tx);
+
+        let mut tokens = input_ids.to_vec();
+        for event in rx {
+            match event {
+                GenerationEvent::Token(id) => tokens.push(id),
+                GenerationEvent::Error(e) => return Err(e),
+                GenerationEvent::Finished(_) => break,
+            }
         }
+        Ok(tokens)
     }
 
     /// Generate tokens with streaming via a channel.
     ///
-    /// Runs the generation loop in a scoped thread, sending each new token
-    /// through a channel. The provided `consumer` closure receives the
-    /// [`mpsc::Receiver`] and is called on the current thread while tokens
-    /// are being produced.
+    /// The provided `consumer` closure receives a [`mpsc::Receiver`] and is
+    /// called on the current thread while tokens are being produced by the
+    /// engine's worker thread.
     ///
     /// # Arguments
     /// * `input_ids` - Prompt token IDs
@@ -96,445 +183,234 @@ impl<M: Model> Engine<M> {
     ///
     /// # Returns
     /// The return value of the `consumer` closure.
-    #[allow(clippy::missing_panics_doc)]
     pub fn generate_stream<F, R>(
-        &mut self,
+        &self,
         input_ids: &[u32],
         options: &GenerateOptions,
         consumer: F,
     ) -> R
     where
-        M: Send,
-        F: FnOnce(mpsc::Receiver<Result<u32>>) -> R,
+        F: FnOnce(mpsc::Receiver<GenerationEvent>) -> R,
     {
         let (tx, rx) = mpsc::channel();
-        let input_ids = input_ids.to_vec();
-        let options = options.clone();
-
-        let mut result = None;
-
-        thread::scope(|s| {
-            s.spawn(|| {
-                let gen_result = if options.use_kv_cache {
-                    self.stream_kv_cached(&input_ids, &options, &tx)
-                } else {
-                    self.stream_naive(&input_ids, &options, &tx)
-                };
-
-                if let Err(e) = gen_result {
-                    let _ = tx.send(Err(e));
-                }
-                // Drop tx so the receiver sees the channel close
-                drop(tx);
-            });
-
-            result = Some(consumer(rx));
-        });
-
-        result.expect("thread::scope completed without producing a result")
+        self.submit(input_ids.to_vec(), options.clone(), tx);
+        consumer(rx)
     }
+}
 
-    /// Generate with KV cache (prefill + single-token decode steps).
-    fn generate_kv_cached(
-        &mut self,
-        input_ids: &[u32],
-        options: &GenerateOptions,
-    ) -> Result<Vec<u32>> {
-        for kv in &mut self.kv_caches {
+/// The worker thread's main loop. Processes requests sequentially.
+#[allow(clippy::needless_pass_by_value)]
+fn worker_loop<M: Model>(
+    model: M,
+    mut kv_caches: Vec<KvCache<M::CacheDtype>>,
+    request_rx: mpsc::Receiver<GenerationRequest>,
+) {
+    while let Ok(request) = request_rx.recv() {
+        if request.options.use_kv_cache {
+            process_kv_cached(&model, &mut kv_caches, &request);
+        } else {
+            process_naive(&model, &request);
+        }
+    }
+}
+
+/// Process a single request using the KV cache (prefill + decode).
+fn process_kv_cached<M: Model>(
+    model: &M,
+    kv_caches: &mut [KvCache<M::CacheDtype>],
+    request: &GenerationRequest,
+) {
+    let mut run = || -> Result<FinishReason> {
+        for kv in kv_caches.iter_mut() {
             kv.reset()?;
         }
-        let mut tokens = input_ids.to_vec();
-        let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
-        let sampling = options.sampling.as_ref();
+        let mut tokens = request.input_ids.clone();
+        let mut rng_state = request.options.sampling.as_ref().map(|s| s.seed);
+        let sampling = request.options.sampling.as_ref();
 
         // Prefill: process entire prompt
-        let logits = self
-            .model
-            .forward_with_kv_cache(input_ids, &mut self.kv_caches)?;
+        let logits = model.forward_with_kv_cache(&request.input_ids, kv_caches)?;
         let recent = recent_token_window(&tokens, sampling);
         let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
-        if options.eos_token_id == Some(next_token) {
-            return Ok(tokens);
+        if request.options.eos_token_id == Some(next_token) {
+            return Ok(FinishReason::Stop);
         }
         tokens.push(next_token);
+        if !request.token_tx.send(GenerationEvent::Token(next_token)) {
+            return Ok(FinishReason::Cancelled);
+        }
 
         // CUDA graphs only supported for single-device models
-        if options.use_cuda_graphs && options.max_new_tokens > 1 && self.kv_caches.len() == 1 {
-            self.decode_loop_graph(&mut tokens, &mut next_token, options, &mut rng_state)?;
+        if request.options.use_cuda_graphs
+            && request.options.max_new_tokens > 1
+            && kv_caches.len() == 1
+        {
+            stream_decode_loop_graph(
+                model,
+                kv_caches,
+                &mut tokens,
+                &mut next_token,
+                &request.options,
+                &mut rng_state,
+                &*request.token_tx,
+            )
         } else {
-            self.decode_loop_eager(&mut tokens, &mut next_token, options, &mut rng_state)?;
+            stream_decode_loop_eager(
+                model,
+                kv_caches,
+                &mut tokens,
+                &mut next_token,
+                &request.options,
+                &mut rng_state,
+                &*request.token_tx,
+            )
         }
+    };
 
-        Ok(tokens)
-    }
-
-    /// Decode loop without CUDA graph capture (eager execution).
-    fn decode_loop_eager(
-        &mut self,
-        tokens: &mut Vec<u32>,
-        next_token: &mut u32,
-        options: &GenerateOptions,
-        rng_state: &mut Option<u64>,
-    ) -> Result<()> {
-        let sampling = options.sampling.as_ref();
-        for _ in 1..options.max_new_tokens {
-            let logits = self
-                .model
-                .forward_next_token(*next_token, &mut self.kv_caches)?;
-            let recent = recent_token_window(tokens, sampling);
-            *next_token = select_token(&logits, sampling, rng_state, recent)?;
-
-            if options.eos_token_id == Some(*next_token) {
-                break;
-            }
-            tokens.push(*next_token);
+    match run() {
+        Ok(reason) => {
+            let _ = request.token_tx.send(GenerationEvent::Finished(reason));
         }
-        Ok(())
-    }
-
-    /// Decode loop with CUDA graph capture/replay.
-    ///
-    /// Step 1 runs eagerly (warmup — ensures all PTX modules are loaded).
-    /// Capture-once CUDA graph decode loop.
-    ///
-    /// Step 1: eager warmup (loads PTX, validates shapes).
-    /// Step 2: capture graph using indirect kernels, then launch.
-    /// Steps 3+: replay the captured graph (no re-capture).
-    ///
-    /// `kv_cache.advance(1)` is called after each graph launch, outside the
-    /// captured region.
-    fn decode_loop_graph(
-        &mut self,
-        tokens: &mut Vec<u32>,
-        next_token: &mut u32,
-        options: &GenerateOptions,
-        rng_state: &mut Option<u64>,
-    ) -> Result<()> {
-        use std::time::{Duration, Instant};
-
-        let sampling = options.sampling.as_ref();
-
-        // Cap the effective max_seq_len for graph-captured kernels to the actual
-        // generation budget. This prevents shared memory from being sized for the
-        // model's full max_position_embeddings (e.g. 131072) which would exceed
-        // the per-block shared memory hardware limit.
-        let effective_max = (self.kv_caches[0].current_len() + options.max_new_tokens)
-            .min(self.kv_caches[0].max_seq_len());
-        self.kv_caches[0].set_graph_max_seq_len(effective_max);
-
-        let device = self.kv_caches[0].device();
-        let mut graph = CudaGraph::new(&device)?;
-
-        let mut t_htod = Duration::ZERO;
-        let mut t_advance = Duration::ZERO;
-        let mut t_launch = Duration::ZERO;
-        let mut t_sync = Duration::ZERO;
-        let mut t_sample = Duration::ZERO;
-        let mut graph_steps = 0_u64;
-
-        // Holds the logits tensor from graph capture — its device address is
-        // stable so we can sample from it after each replay.
-        let mut captured_logits: Option<CudaTensor<f32>> = None;
-
-        for step in 1..options.max_new_tokens {
-            let t0 = Instant::now();
-            device.htod_copy_into(vec![*next_token], graph.token_input_mut())?;
-            t_htod += t0.elapsed();
-
-            if step == 1 {
-                // Warmup: eager execution to load all PTX kernels.
-                // forward_next_token_device internally calls advance(1).
-                let logits = self
-                    .model
-                    .forward_next_token_device(graph.token_input(), &mut self.kv_caches)?;
-                let recent = recent_token_window(tokens, sampling);
-                *next_token = select_token(&logits, sampling, rng_state, recent)?;
-            } else if step == 2 {
-                // Capture the graph once using indirect kernels.
-                graph.begin_capture()?;
-                let logits = self
-                    .model
-                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_caches)?;
-                graph.end_capture()?;
-
-                // Launch the just-captured graph
-                let t0 = Instant::now();
-                graph.launch()?;
-                t_launch += t0.elapsed();
-
-                let t0 = Instant::now();
-                device.synchronize()?;
-                t_sync += t0.elapsed();
-
-                // Advance position after graph execution (outside capture)
-                let t0 = Instant::now();
-                self.kv_caches[0].advance(1)?;
-                t_advance += t0.elapsed();
-
-                let t0 = Instant::now();
-                let recent = recent_token_window(tokens, sampling);
-                *next_token = select_token(&logits, sampling, rng_state, recent)?;
-                t_sample += t0.elapsed();
-
-                captured_logits = Some(logits);
-                graph_steps += 1;
-            } else {
-                // Replay the captured graph (no re-capture)
-                let t0 = Instant::now();
-                graph.launch()?;
-                t_launch += t0.elapsed();
-
-                let t0 = Instant::now();
-                device.synchronize()?;
-                t_sync += t0.elapsed();
-
-                let t0 = Instant::now();
-                self.kv_caches[0].advance(1)?;
-                t_advance += t0.elapsed();
-
-                let t0 = Instant::now();
-                let logits = captured_logits
-                    .as_ref()
-                    .expect("graph must be captured before replay");
-                let recent = recent_token_window(tokens, sampling);
-                *next_token = select_token(logits, sampling, rng_state, recent)?;
-                t_sample += t0.elapsed();
-
-                graph_steps += 1;
-            }
-
-            if options.eos_token_id == Some(*next_token) {
-                break;
-            }
-            tokens.push(*next_token);
+        Err(e) => {
+            let _ = request.token_tx.send(GenerationEvent::Error(e));
         }
-
-        Self::print_graph_profiling(graph_steps, t_htod, t_launch, t_sync, t_advance, t_sample);
-
-        Ok(())
     }
+}
 
-    #[allow(clippy::cast_precision_loss)]
-    fn print_graph_profiling(
-        steps: u64,
-        t_htod: std::time::Duration,
-        t_launch: std::time::Duration,
-        t_sync: std::time::Duration,
-        t_advance: std::time::Duration,
-        t_sample: std::time::Duration,
-    ) {
-        use std::time::Duration;
-        if steps == 0 {
-            return;
-        }
-        let s = steps as f64;
-        let row = |label: &str, d: Duration| {
-            eprintln!(
-                "  {label:<14} {:>8.2} ms total, {:>6.1} μs/step",
-                d.as_secs_f64() * 1e3,
-                d.as_secs_f64() * 1e6 / s
-            );
-        };
-        eprintln!("--- CUDA graph decode profiling ({steps} steps, capture-once) ---");
-        row("htod_copy:", t_htod);
-        row("launch:", t_launch);
-        row("sync:", t_sync);
-        row("advance:", t_advance);
-        row("sample:", t_sample);
-        let total = t_htod + t_launch + t_sync + t_advance + t_sample;
-        row("TOTAL:", total);
-    }
+/// Process a single request without KV cache (recomputes full sequence each step).
+fn process_naive<M: Model>(model: &M, request: &GenerationRequest) {
+    let run = || -> Result<FinishReason> {
+        let mut tokens = request.input_ids.clone();
+        let mut rng_state = request.options.sampling.as_ref().map(|s| s.seed);
+        let sampling = request.options.sampling.as_ref();
 
-    /// Generate without KV cache (recomputes full sequence each step).
-    fn generate_naive(&self, input_ids: &[u32], options: &GenerateOptions) -> Result<Vec<u32>> {
-        let mut tokens = input_ids.to_vec();
-        let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
-        let sampling = options.sampling.as_ref();
-
-        for _ in 0..options.max_new_tokens {
-            let logits = self.model.forward(&tokens)?;
+        for _ in 0..request.options.max_new_tokens {
+            let logits = model.forward(&tokens)?;
             let recent = recent_token_window(&tokens, sampling);
             let next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
 
-            if options.eos_token_id == Some(next_token) {
-                break;
+            if request.options.eos_token_id == Some(next_token) {
+                return Ok(FinishReason::Stop);
             }
             tokens.push(next_token);
+            if !request.token_tx.send(GenerationEvent::Token(next_token)) {
+                return Ok(FinishReason::Cancelled);
+            }
         }
 
-        Ok(tokens)
+        Ok(FinishReason::Length)
+    };
+
+    match run() {
+        Ok(reason) => {
+            let _ = request.token_tx.send(GenerationEvent::Finished(reason));
+        }
+        Err(e) => {
+            let _ = request.token_tx.send(GenerationEvent::Error(e));
+        }
     }
+}
 
-    /// Stream with KV cache, sending each token through the channel.
-    fn stream_kv_cached(
-        &mut self,
-        input_ids: &[u32],
-        options: &GenerateOptions,
-        tx: &mpsc::Sender<Result<u32>>,
-    ) -> Result<()> {
-        for kv in &mut self.kv_caches {
-            kv.reset()?;
+/// Streaming decode loop without CUDA graph capture.
+fn stream_decode_loop_eager<M: Model>(
+    model: &M,
+    kv_caches: &mut [KvCache<M::CacheDtype>],
+    tokens: &mut Vec<u32>,
+    next_token: &mut u32,
+    options: &GenerateOptions,
+    rng_state: &mut Option<u64>,
+    tx: &dyn TokenSender,
+) -> Result<FinishReason> {
+    let sampling = options.sampling.as_ref();
+    for _ in 1..options.max_new_tokens {
+        let logits = model.forward_next_token(*next_token, kv_caches)?;
+        let recent = recent_token_window(tokens, sampling);
+        *next_token = select_token(&logits, sampling, rng_state, recent)?;
+
+        if options.eos_token_id == Some(*next_token) {
+            return Ok(FinishReason::Stop);
         }
-        let mut tokens = input_ids.to_vec();
-        let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
-        let sampling = options.sampling.as_ref();
-
-        // Prefill
-        let logits = self
-            .model
-            .forward_with_kv_cache(input_ids, &mut self.kv_caches)?;
-        let recent = recent_token_window(&tokens, sampling);
-        let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
-
-        if options.eos_token_id == Some(next_token) {
-            return Ok(());
+        tokens.push(*next_token);
+        if !tx.send(GenerationEvent::Token(*next_token)) {
+            return Ok(FinishReason::Cancelled);
         }
-        tokens.push(next_token);
-        if tx.send(Ok(next_token)).is_err() {
-            return Ok(());
-        }
-
-        // Decode (CUDA graphs only for single-device)
-        if options.use_cuda_graphs && options.max_new_tokens > 1 && self.kv_caches.len() == 1 {
-            self.stream_decode_loop_graph(
-                &mut tokens,
-                &mut next_token,
-                options,
-                &mut rng_state,
-                tx,
-            )?;
-        } else {
-            self.stream_decode_loop_eager(
-                &mut tokens,
-                &mut next_token,
-                options,
-                &mut rng_state,
-                tx,
-            )?;
-        }
-
-        Ok(())
     }
+    Ok(FinishReason::Length)
+}
 
-    /// Streaming decode loop without CUDA graph capture.
-    fn stream_decode_loop_eager(
-        &mut self,
-        tokens: &mut Vec<u32>,
-        next_token: &mut u32,
-        options: &GenerateOptions,
-        rng_state: &mut Option<u64>,
-        tx: &mpsc::Sender<Result<u32>>,
-    ) -> Result<()> {
-        let sampling = options.sampling.as_ref();
-        for _ in 1..options.max_new_tokens {
-            let logits = self
-                .model
-                .forward_next_token(*next_token, &mut self.kv_caches)?;
+/// Streaming decode loop with capture-once CUDA graph.
+///
+/// Step 1 runs eagerly (warmup — ensures all PTX modules are loaded).
+/// Step 2: capture graph using indirect kernels, then launch.
+/// Steps 3+: replay the captured graph (no re-capture).
+///
+/// `kv_cache.advance(1)` is called after each graph launch, outside the
+/// captured region.
+#[allow(clippy::too_many_arguments)]
+fn stream_decode_loop_graph<M: Model>(
+    model: &M,
+    kv_caches: &mut [KvCache<M::CacheDtype>],
+    tokens: &mut Vec<u32>,
+    next_token: &mut u32,
+    options: &GenerateOptions,
+    rng_state: &mut Option<u64>,
+    tx: &dyn TokenSender,
+) -> Result<FinishReason> {
+    let sampling = options.sampling.as_ref();
+
+    // Cap the effective max_seq_len for graph-captured kernels
+    let effective_max =
+        (kv_caches[0].current_len() + options.max_new_tokens).min(kv_caches[0].max_seq_len());
+    kv_caches[0].set_graph_max_seq_len(effective_max);
+
+    let device = kv_caches[0].device();
+    let mut graph = CudaGraph::new(&device)?;
+    let mut captured_logits: Option<CudaTensor<f32>> = None;
+
+    for step in 1..options.max_new_tokens {
+        device.htod_copy_into(vec![*next_token], graph.token_input_mut())?;
+
+        if step == 1 {
+            // Warmup: eager (forward_next_token_device calls advance)
+            let logits = model.forward_next_token_device(graph.token_input(), kv_caches)?;
             let recent = recent_token_window(tokens, sampling);
             *next_token = select_token(&logits, sampling, rng_state, recent)?;
+        } else if step == 2 {
+            // Capture once using indirect kernels
+            graph.begin_capture()?;
+            let logits = model.forward_next_token_indirect(graph.token_input(), kv_caches)?;
+            graph.end_capture()?;
 
-            if options.eos_token_id == Some(*next_token) {
-                break;
-            }
-            tokens.push(*next_token);
-            if tx.send(Ok(*next_token)).is_err() {
-                break;
-            }
-        }
-        Ok(())
-    }
+            graph.launch()?;
+            device.synchronize()?;
+            kv_caches[0].advance(1)?;
 
-    /// Streaming decode loop with capture-once CUDA graph.
-    fn stream_decode_loop_graph(
-        &mut self,
-        tokens: &mut Vec<u32>,
-        next_token: &mut u32,
-        options: &GenerateOptions,
-        rng_state: &mut Option<u64>,
-        tx: &mpsc::Sender<Result<u32>>,
-    ) -> Result<()> {
-        let sampling = options.sampling.as_ref();
-        let device = self.kv_caches[0].device();
-        let mut graph = CudaGraph::new(&device)?;
-        let mut captured_logits: Option<CudaTensor<f32>> = None;
+            let recent = recent_token_window(tokens, sampling);
+            *next_token = select_token(&logits, sampling, rng_state, recent)?;
+            captured_logits = Some(logits);
+        } else {
+            // Replay captured graph
+            graph.launch()?;
+            device.synchronize()?;
+            kv_caches[0].advance(1)?;
 
-        for step in 1..options.max_new_tokens {
-            device.htod_copy_into(vec![*next_token], graph.token_input_mut())?;
-
-            if step == 1 {
-                // Warmup: eager (forward_next_token_device calls advance)
-                let logits = self
-                    .model
-                    .forward_next_token_device(graph.token_input(), &mut self.kv_caches)?;
-                let recent = recent_token_window(tokens, sampling);
-                *next_token = select_token(&logits, sampling, rng_state, recent)?;
-            } else if step == 2 {
-                // Capture once using indirect kernels
-                graph.begin_capture()?;
-                let logits = self
-                    .model
-                    .forward_next_token_indirect(graph.token_input(), &mut self.kv_caches)?;
-                graph.end_capture()?;
-
-                graph.launch()?;
-                device.synchronize()?;
-                self.kv_caches[0].advance(1)?;
-
-                let recent = recent_token_window(tokens, sampling);
-                *next_token = select_token(&logits, sampling, rng_state, recent)?;
-                captured_logits = Some(logits);
-            } else {
-                // Replay captured graph
-                graph.launch()?;
-                device.synchronize()?;
-                self.kv_caches[0].advance(1)?;
-
-                let logits = captured_logits
-                    .as_ref()
-                    .expect("graph must be captured before replay");
-                let recent = recent_token_window(tokens, sampling);
-                *next_token = select_token(logits, sampling, rng_state, recent)?;
-            }
-
-            if options.eos_token_id == Some(*next_token) {
-                break;
-            }
-            tokens.push(*next_token);
-            if tx.send(Ok(*next_token)).is_err() {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// Stream without KV cache, sending each token through the channel.
-    fn stream_naive(
-        &self,
-        input_ids: &[u32],
-        options: &GenerateOptions,
-        tx: &mpsc::Sender<Result<u32>>,
-    ) -> Result<()> {
-        let mut tokens = input_ids.to_vec();
-        let mut rng_state = options.sampling.as_ref().map(|s| s.seed);
-        let sampling = options.sampling.as_ref();
-
-        for _ in 0..options.max_new_tokens {
-            let logits = self.model.forward(&tokens)?;
-            let recent = recent_token_window(&tokens, sampling);
-            let next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
-
-            if options.eos_token_id == Some(next_token) {
-                break;
-            }
-            tokens.push(next_token);
-            if tx.send(Ok(next_token)).is_err() {
-                break;
-            }
+            let logits = captured_logits
+                .as_ref()
+                .expect("graph must be captured before replay");
+            let recent = recent_token_window(tokens, sampling);
+            *next_token = select_token(logits, sampling, rng_state, recent)?;
         }
 
-        Ok(())
+        if options.eos_token_id == Some(*next_token) {
+            return Ok(FinishReason::Stop);
+        }
+        tokens.push(*next_token);
+        if !tx.send(GenerationEvent::Token(*next_token)) {
+            return Ok(FinishReason::Cancelled);
+        }
     }
+    Ok(FinishReason::Length)
 }
 
 /// Select the next token from logits, either via greedy argmax or sampling.

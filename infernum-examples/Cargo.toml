@@ -7,7 +7,7 @@ build = "build.rs"
 
 [features]
 default = []
-cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-qwen/cuda", "infernum-runtime/cuda", "cudarc"]
+cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-qwen/cuda", "infernum-runtime/cuda", "infernum-serve/cuda", "cudarc"]
 nccl = ["cuda", "infernum/nccl", "infernum-llama/nccl", "infernum-qwen/nccl", "infernum-runtime/nccl"]
 
 [dependencies]
@@ -17,8 +17,10 @@ infernum = { path = "../infernum" }
 infernum-llama = { path = "../infernum-llama" }
 infernum-qwen = { path = "../infernum-qwen" }
 infernum-runtime = { path = "../infernum-runtime" }
+infernum-serve = { path = "../infernum-serve" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[example]]
 name = "generate"
@@ -42,4 +44,8 @@ required-features = ["cuda"]
 
 [[example]]
 name = "custom_triton_op"
+required-features = ["cuda"]
+
+[[example]]
+name = "serve"
 required-features = ["cuda"]

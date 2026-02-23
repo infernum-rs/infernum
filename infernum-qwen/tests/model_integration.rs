@@ -91,7 +91,7 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
     let model = QwenModel::<f32>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
-    let mut runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+    let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
     runtime
         .generate(prompt, &greedy_options(max_tokens))
         .expect("Generation failed")

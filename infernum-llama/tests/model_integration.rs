@@ -94,7 +94,7 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
     let model = LlamaModel::<f32>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
-    let mut runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+    let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
     runtime
         .generate(prompt, &greedy_options(max_tokens))
         .expect("Generation failed")
@@ -367,7 +367,7 @@ mod mixtral_moe_tp {
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
-        let mut runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+        let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
         let _output = runtime
             .generate("Hello", &greedy_options(10))
             .expect("Sharded MoE generation failed");
@@ -435,7 +435,7 @@ mod mistral_7b {
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
-        let mut runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+        let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
         let output = runtime
             .generate("The capital of France is", &greedy_options(30))
             .expect("Generation failed");

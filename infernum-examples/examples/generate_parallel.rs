@@ -136,7 +136,7 @@ fn run_parallel<M: Model + Send>(
         println!("Decoding: greedy (argmax)");
     }
 
-    let mut runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::new(model, tokenizer)?;
 
     print!("{}", cli.prompt);
     io::stdout().flush()?;
