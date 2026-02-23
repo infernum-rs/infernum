@@ -24,6 +24,12 @@ pub trait ChatTemplate: Send + Sync {
     fn apply(&self, messages: &[ChatMessage]) -> String;
 }
 
+impl ChatTemplate for Box<dyn ChatTemplate> {
+    fn apply(&self, messages: &[ChatMessage]) -> String {
+        (**self).apply(messages)
+    }
+}
+
 /// A raw template that concatenates message contents without special tokens.
 ///
 /// Useful for base (non-instruct) models and testing.

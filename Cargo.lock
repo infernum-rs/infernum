@@ -998,8 +998,10 @@ dependencies = [
  "infernum-llama",
  "infernum-qwen",
  "infernum-runtime",
+ "infernum-serve",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
