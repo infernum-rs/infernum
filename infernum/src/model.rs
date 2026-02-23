@@ -146,6 +146,9 @@ pub trait Model {
     /// Processes one new token per sequence for `batch_size` sequences.
     /// Each sequence has its own block table into the shared KV pool.
     ///
+    /// The slice contains one `PagedKvCache` per device (see [`Self::devices`]).
+    /// Single-GPU models receive a one-element slice.
+    ///
     /// Returns logits of shape `(batch_size, vocab_size)`.
     ///
     /// # Errors
@@ -153,7 +156,7 @@ pub trait Model {
     fn forward_batch_decode(
         &self,
         _token_ids: &[u32],
-        _paged_kv: &mut PagedKvCache<Self::CacheDtype>,
+        _paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
         _block_tables: &[BlockTable],
         _positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
@@ -166,13 +169,21 @@ pub trait Model {
     /// paged cache. Returns logits for the **last** token only: shape
     /// `(1, vocab_size)`.
     ///
+    /// The slice contains one `PagedKvCache` per device (see [`Self::devices`]).
+    /// Single-GPU models receive a one-element slice.
+    ///
+    /// `start_pos` is the sequence position of the first token in `input_ids`
+    /// (i.e., `block_table.seq_len()` before this call). The model does
+    /// **not** call `block_table.advance()` — the caller is responsible.
+    ///
     /// # Errors
     /// Returns an error if the forward pass fails.
     fn forward_prefill_paged(
         &self,
         _input_ids: &[u32],
-        _paged_kv: &mut PagedKvCache<Self::CacheDtype>,
-        _block_table: &mut BlockTable,
+        _paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        _block_table: &BlockTable,
+        _start_pos: usize,
     ) -> Result<CudaTensor<f32>> {
         unimplemented!("forward_prefill_paged not implemented for this model")
     }

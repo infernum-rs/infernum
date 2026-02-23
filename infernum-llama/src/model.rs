@@ -1413,11 +1413,12 @@ where
     pub fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kvs: &mut [PagedKvCache<T>],
         block_tables: &[BlockTable],
         positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
         let batch_size = token_ids.len();
+        let paged_kv = &mut paged_kvs[0];
 
         // Embed tokens: (batch_size,) -> (batch_size, hidden_size)
         let mut hidden = self.embed(token_ids)?;
@@ -1455,11 +1456,12 @@ where
     pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kv: &mut PagedKvCache<T>,
-        block_table: &mut BlockTable,
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_table: &BlockTable,
+        start_pos: usize,
     ) -> Result<CudaTensor<f32>> {
         let seq_len = input_ids.len();
-        let start_pos = block_table.seq_len();
+        let paged_kv = &mut paged_kvs[0];
 
         let mut hidden = self.embed(input_ids)?;
 
@@ -1474,9 +1476,6 @@ where
                 seq_len,
             )?;
         }
-
-        // Advance the block table after all layers
-        block_table.advance(seq_len);
 
         rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
@@ -2362,20 +2361,21 @@ where
     fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kvs: &mut [PagedKvCache<T>],
         block_tables: &[BlockTable],
         positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_batch_decode(token_ids, paged_kv, block_tables, positions)
+        self.forward_batch_decode(token_ids, paged_kvs, block_tables, positions)
     }
 
     fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kv: &mut PagedKvCache<T>,
-        block_table: &mut BlockTable,
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_table: &BlockTable,
+        start_pos: usize,
     ) -> Result<CudaTensor<f32>> {
-        self.forward_prefill_paged(input_ids, paged_kv, block_table)
+        self.forward_prefill_paged(input_ids, paged_kvs, block_table, start_pos)
     }
 }
 

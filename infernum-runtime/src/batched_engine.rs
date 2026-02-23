@@ -204,16 +204,24 @@ fn process_prefill<M: Model>(
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
 ) {
-    // Run forward pass — needs mutable borrow of seq.block_table + paged_kv
-    let result = {
-        let seq = &mut scheduler.running_mut()[idx];
-        model.forward_prefill_paged(token_ids, paged_kv, &mut seq.block_table)
+    // Run forward pass
+    let (result, num_tokens) = {
+        let seq = &scheduler.running()[idx];
+        let start_pos = seq.block_table.seq_len();
+        let r = model.forward_prefill_paged(
+            token_ids,
+            std::slice::from_mut(paged_kv),
+            &seq.block_table,
+            start_pos,
+        );
+        (r, token_ids.len())
     };
 
     match result {
         Ok(logits) => {
             let seq = &mut scheduler.running_mut()[idx];
-            seq.prefill_progress += token_ids.len();
+            seq.block_table.advance(num_tokens);
+            seq.prefill_progress += num_tokens;
 
             if seq.prefill_progress < seq.prompt_ids.len() {
                 return;
@@ -256,21 +264,27 @@ fn process_decode<M: Model>(
     scheduler: &mut Scheduler,
 ) {
     // Extract the token to feed and run forward
-    let (last_token, result) = {
-        let seq = &mut scheduler.running_mut()[idx];
+    let result = {
+        let seq = &scheduler.running()[idx];
         let tok = seq
             .generated_ids
             .last()
             .copied()
             .unwrap_or_else(|| *seq.prompt_ids.last().unwrap_or(&0));
-        let r = model.forward_prefill_paged(&[tok], paged_kv, &mut seq.block_table);
-        (tok, r)
+        let start_pos = seq.block_table.seq_len();
+        model.forward_prefill_paged(
+            &[tok],
+            std::slice::from_mut(paged_kv),
+            &seq.block_table,
+            start_pos,
+        )
     };
-
-    let _ = last_token; // used only inside the block above
 
     match result {
         Ok(logits) => {
+            // Advance block table for the decoded token
+            scheduler.running_mut()[idx].block_table.advance(1);
+
             // Extract data needed for sampling before mutable borrow
             let (all_tokens, sampling_clone, gen_len) = {
                 let seq = &scheduler.running()[idx];
