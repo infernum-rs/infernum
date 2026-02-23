@@ -9,6 +9,7 @@ pub mod moe;
 #[cfg(feature = "nccl")]
 pub mod nccl;
 pub mod ops;
+pub mod paged_kv_cache;
 mod quantized;
 pub mod seq_position;
 pub mod shard;
@@ -25,6 +26,7 @@ pub use graph::CudaGraph;
 pub use kv_cache::KvCache;
 #[cfg(feature = "nccl")]
 pub use nccl::NcclCommunicator;
+pub use paged_kv_cache::PagedKvCache;
 pub use quantized::QuantizedTensor;
 pub use seq_position::SeqPosition;
 pub use shard::{GpuConfig, ShardConfig, ShardStrategy};
