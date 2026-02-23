@@ -1299,9 +1299,17 @@ where
 
         // Attention
         let attn_output = if seq_len == 1 {
-            fused_attention_decode(&q, &k_full, &v_full, sliding_window)?
+            fused_attention_decode(&q, &k_full, &v_full, None, None, sliding_window)?
         } else {
-            fused_attention_prefill(&q, &k_full, &v_full, kv_cache.current_len(), sliding_window)?
+            fused_attention_prefill(
+                &q,
+                &k_full,
+                &v_full,
+                kv_cache.current_len(),
+                None,
+                None,
+                sliding_window,
+            )?
         };
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
@@ -1472,6 +1480,8 @@ where
             v_full,
             total_len,
             kv_cache.graph_max_seq_len(),
+            None,
+            None,
             sliding_window,
         )?;
 
@@ -1730,7 +1740,7 @@ where
             let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
 
             let sliding_window = self.config.effective_sliding_window(layer_idx);
-            let attn_output = fused_attention_prefill(&q, &k, &v, 0, sliding_window)?;
+            let attn_output = fused_attention_prefill(&q, &k, &v, 0, None, None, sliding_window)?;
             let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
             let mut attn_output = linear(&attn_output, &layer.attention.o_proj)?;
             #[cfg(feature = "nccl")]
