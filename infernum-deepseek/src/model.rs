@@ -12,11 +12,11 @@
 use std::path::Path;
 
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect, cast_to_f32,
-    embedding_gather, embedding_gather_from_device, fused_attention_decode,
-    fused_attention_decode_indirect, fused_attention_prefill, matmul, matmul_bf16_f32,
-    precompute_rope_cache, precompute_rope_cache_scaled, quantized_matmul, rms_norm,
-    rms_norm_inplace, swiglu, transpose_2d, GemmScalar, RopeScaling,
+    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect,
+    cast_f32_to_bf16, cast_to_f32, embedding_gather, embedding_gather_from_device,
+    fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill, matmul,
+    matmul_bf16_f32, precompute_rope_cache, precompute_rope_cache_scaled, quantized_matmul,
+    rms_norm, rms_norm_inplace, swiglu, transpose_2d, GemmScalar, RopeScaling,
 };
 use infernum::cuda::{
     CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, QuantizedTensor,
@@ -1510,7 +1510,13 @@ where
                 cast_to_f32(input)?
             };
             let output_f32 = quantized_matmul(&input_f32, w)?;
-            Ok(reinterpret_tensor(output_f32))
+            match T::DTYPE {
+                infernum::dtype::DType::F32 => Ok(reinterpret_tensor(output_f32)),
+                infernum::dtype::DType::BF16 => {
+                    Ok(reinterpret_tensor(cast_f32_to_bf16(&output_f32)?))
+                }
+                other => panic!("Quantized matmul not supported for dtype {other}"),
+            }
         }
     }
 }
