@@ -196,7 +196,10 @@ where
     }
 }
 
-/// Collect results from parallel threads, returning rank 0's value.
+/// Collect results from parallel threads, returning rank 0's `Result`.
+///
+/// Other ranks' results are discarded — NCCL all-reduce has already made
+/// the logits identical across all devices.
 fn collect_rank0<T>(handles: Vec<thread::ScopedJoinHandle<'_, Result<T>>>) -> Result<T> {
     let results: Vec<Result<T>> = handles
         .into_iter()
