@@ -34,13 +34,15 @@ The project is in early development (Phase 1). Currently contains a minimal skel
 
 ### Supported Model Families
 
-All models below are loaded via `infernum-llama`. Mistral/Devstral/Mixtral are architecturally identical to Llama and share the same implementation. Type aliases (`MistralModel`, `MixtralModel`) are provided for API clarity.
+Llama/Mistral/Mixtral are loaded via `infernum-llama` (architecturally identical, type aliases for API clarity). Qwen models are loaded via `infernum-qwen`. DeepSeek V3/R1 are loaded via `infernum-deepseek`.
 
-| Family | `model_type` | Architecture | Notes |
-|--------|-------------|--------------|-------|
-| Llama | `llama` | Dense | Llama 2, Llama 3, SmolLM2, CodeLlama, etc. |
-| Mistral | `mistral` | Dense | Mistral v1/v2/v3, Devstral (code fine-tune) |
-| Mixtral | `mixtral` | MoE | Mixtral 8x7B, 8x22B, etc. |
+| Family | `model_type` | Architecture | Crate | Notes |
+|--------|-------------|--------------|-------|-------|
+| Llama | `llama` | Dense | `infernum-llama` | Llama 2, Llama 3, SmolLM2, CodeLlama, etc. |
+| Mistral | `mistral` | Dense | `infernum-llama` | Mistral v1/v2/v3, Devstral (code fine-tune) |
+| Mixtral | `mixtral` | MoE | `infernum-llama` | Mixtral 8x7B, 8x22B, etc. |
+| Qwen | `qwen2` / `qwen3` / `qwen3_moe` | Dense / MoE | `infernum-qwen` | Qwen2/2.5, Qwen3, Qwen3-MoE |
+| DeepSeek | `deepseek_v3` | MLA + MoE | `infernum-deepseek` | DeepSeek-V3, DeepSeek-R1 |
 
 ### Sliding Window Attention
 
@@ -63,6 +65,7 @@ Sliding window attention (SWA) restricts each query position to attend only to t
 ```
 infernum/               # Core crate (tensor traits, ops, CUDA impls, blocks, weight loading)
 infernum-macros/        # Procedural macros (define_block!, etc.)
+infernum-deepseek/      # DeepSeek model family (V3, R1 — MLA + MoE)
 infernum-llama/         # Llama model family
 infernum-qwen/          # Qwen model family (Qwen2/2.5, Qwen3/3.5, Qwen3-MoE)
 infernum-phi/           # Phi model family (later)
@@ -110,6 +113,9 @@ Most CUDA-dependent code is behind feature flags. The `cuda` feature must be ena
 | `infernum` | `nccl` | Multi-GPU NCCL support (implies `cuda`) |
 | `infernum` | `force-fuse` | Force fused kernels in debug builds |
 | `infernum` | `no-fuse` | Disable fused kernels in release builds |
+| `infernum-deepseek` | `cuda` | Enables `infernum/cuda` + `infernum-runtime/cuda` |
+| `infernum-deepseek` | `nccl` | Multi-GPU (implies `cuda`) |
+| `infernum-deepseek` | `integration` | Integration tests — downloads real models (implies `cuda`) |
 | `infernum-llama` | `cuda` | Enables `infernum/cuda` + `infernum-runtime/cuda` |
 | `infernum-llama` | `nccl` | Multi-GPU (implies `cuda`) |
 | `infernum-llama` | `integration` | Integration tests — downloads real models (implies `cuda`) |
@@ -182,6 +188,9 @@ cargo test -p infernum-llama --features integration -- --test-threads=1
 
 # Qwen family
 cargo test -p infernum-qwen --features integration -- --test-threads=1
+
+# DeepSeek family
+cargo test -p infernum-deepseek --features integration -- --test-threads=1
 ```
 
 Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
@@ -199,6 +208,10 @@ Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
 - **Qwen2.5-0.5B** (`Qwen/Qwen2.5-0.5B`, ~987MB bf16) — greedy generation correctness ("Paris"), no NaN/Inf. Tests Q/K/V bias and tied embeddings.
 - **Qwen3-0.6B** (`Qwen/Qwen3-0.6B`, ~1.2GB bf16) — greedy generation correctness ("Paris"), no NaN/Inf. Tests QK-norm (RMSNorm on Q/K per-head before RoPE) and explicit `head_dim` override.
 - **Qwen3-MoE-tiny** (`yujiepan/qwen3-moe-tiny-random`, ~5MB, random weights) — MoE loading/routing plumbing, no NaN/Inf. Tests `decoder_sparse_step` (mixed dense/MoE layers), 8 experts top-2.
+
+**What's tested (infernum-deepseek):**
+
+- **DeepSeek-V3-tiny** (`yujiepan/deepseek-v3-tiny-random`, ~8.8MB, random weights) — MLA pipeline (Q LoRA compression, joint KV projection, interleaved RoPE, V padding), sigmoid MoE routing with bias correction and grouped top-k, shared expert, dense→MoE layer transition (`first_k_dense_replace=1`). No NaN/Inf.
 
 **Ignored (large model) tests:**
 
