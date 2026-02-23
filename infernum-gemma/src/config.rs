@@ -116,7 +116,10 @@ struct RawConfig {
     rope_local_base_freq: Option<f64>,
     #[serde(default = "default_bos")]
     bos_token_id: u32,
-    #[serde(default = "default_eos")]
+    #[serde(
+        default = "default_eos",
+        deserialize_with = "deserialize_single_or_first"
+    )]
     eos_token_id: u32,
     #[serde(default)]
     quantization_config: Option<QuantizationConfig>,
@@ -139,6 +142,26 @@ fn default_bos() -> u32 {
 }
 fn default_eos() -> u32 {
     1
+}
+
+fn deserialize_single_or_first<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SingleOrVec {
+        Single(u32),
+        Vec(Vec<u32>),
+    }
+
+    match SingleOrVec::deserialize(deserializer)? {
+        SingleOrVec::Single(v) => Ok(v),
+        SingleOrVec::Vec(v) => v
+            .first()
+            .copied()
+            .ok_or_else(|| serde::de::Error::custom("eos_token_id array is empty")),
+    }
 }
 
 impl GemmaConfig {
