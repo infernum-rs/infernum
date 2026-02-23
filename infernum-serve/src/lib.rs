@@ -1,4 +1,4 @@
-//! Infernum Serve: OpenAI-compatible HTTP server for LLM inference
+//! Infernum Serve: `OpenAI`-compatible HTTP server for LLM inference
 //!
 //! This crate provides an Axum-based HTTP server that exposes models via
 //! the `OpenAI` Chat Completions API. It is a **library** — users construct
@@ -12,11 +12,12 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let runtime = /* load model + tokenizer */;
+//!     let model = /* load model */;
+//!     let tokenizer = /* load tokenizer */;
 //!     let template = /* chat template */;
 //!
 //!     let server = Server::builder()
-//!         .add_model(ModelEntry::new("my-model", runtime, template))
+//!         .add_model(ModelEntry::new("my-model", model, tokenizer, template))
 //!         .bind(([0, 0, 0, 0], 8080))
 //!         .build();
 //!
