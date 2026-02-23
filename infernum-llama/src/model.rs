@@ -1595,16 +1595,19 @@ where
             attn_parts.push(attn_i.reshape(&[1, num_heads * head_dim]));
         }
 
-        // Build batched attention output on host (simple for MVP; GPU concat later)
         let attn_output = if batch_size == 1 {
             attn_parts.into_iter().next().unwrap()
         } else {
-            // Gather to host, concatenate, upload
-            let mut host_data = Vec::with_capacity(batch_size * num_heads * head_dim);
-            for part in &attn_parts {
-                host_data.extend_from_slice(&part.to_vec()?);
+            let row_size = num_heads * head_dim;
+            let mut output =
+                unsafe { CudaTensor::<T>::uninit(&self.ctx, &[batch_size, row_size])? };
+            let out_slice = output.cuda_slice_mut();
+            for (i, part) in attn_parts.iter().enumerate() {
+                let src = part.cuda_slice().slice(..row_size);
+                let mut dst = out_slice.slice_mut(i * row_size..(i + 1) * row_size);
+                self.ctx.device().dtod_copy(&src, &mut dst)?;
             }
-            CudaTensor::from_slice(&self.ctx, &[batch_size, num_heads * head_dim], &host_data)?
+            output
         };
         let _ = sliding_window; // will be used when batched paged attention supports it
 
