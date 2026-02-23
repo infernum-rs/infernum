@@ -663,7 +663,10 @@ dependencies = [
  "cudarc",
  "infernum",
  "infernum-llama",
+ "infernum-qwen",
  "infernum-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
