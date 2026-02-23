@@ -310,16 +310,16 @@ fn handle_new_token(
 
     seq.generated_ids.push(token_id);
 
+    if !seq.token_tx.send(GenerationEvent::Token(token_id)) {
+        seq.phase = SequencePhase::Finished(FinishReason::Cancelled);
+        return;
+    }
+
     if seq.generated_ids.len() >= seq.options.max_new_tokens {
         seq.phase = SequencePhase::Finished(FinishReason::Length);
         let _ = seq
             .token_tx
             .send(GenerationEvent::Finished(FinishReason::Length));
-        return;
-    }
-
-    if !seq.token_tx.send(GenerationEvent::Token(token_id)) {
-        seq.phase = SequencePhase::Finished(FinishReason::Cancelled);
         return;
     }
 
