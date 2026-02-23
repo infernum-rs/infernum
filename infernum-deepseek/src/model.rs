@@ -22,6 +22,8 @@ use infernum::cuda::{
     CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, QuantizedTensor,
     ValidAsZeroBits,
 };
+#[cfg(feature = "nccl")]
+use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig, ShardStrategy};
 use infernum::dtype::TensorDType;
 use infernum::tensor::Tensor;
 use infernum::weights::{SafeTensorsLoader, WeightLoader};
@@ -29,6 +31,29 @@ use infernum::KvCache;
 use infernum::Result;
 
 use crate::DeepSeekConfig;
+
+// --- NCCL conditional trait bounds (same pattern as infernum-llama / infernum-qwen) ---
+
+#[cfg(feature = "nccl")]
+trait MaybeNcclType: NcclType {}
+#[cfg(feature = "nccl")]
+impl<T: NcclType> MaybeNcclType for T {}
+
+#[cfg(not(feature = "nccl"))]
+trait MaybeNcclType {}
+#[cfg(not(feature = "nccl"))]
+impl<T> MaybeNcclType for T {}
+
+#[cfg(feature = "nccl")]
+fn nccl_all_reduce<T>(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor<T>) -> Result<()>
+where
+    T: TensorDType + DeviceRepr + ValidAsZeroBits + NcclType,
+{
+    if let Some(comm) = comm {
+        comm.all_reduce_sum_inplace(tensor)?;
+    }
+    Ok(())
+}
 
 // --- Weight helpers ---
 
@@ -56,6 +81,32 @@ fn load_typed<T: TensorDType + DeviceRepr>(
             Ok(reinterpret_tensor(t))
         }
         other => panic!("Unsupported dtype for load_typed: {other}"),
+    }
+}
+
+#[cfg(feature = "nccl")]
+fn load_typed_sharded<T: TensorDType + DeviceRepr>(
+    loader: &impl WeightLoader,
+    ctx: &CudaContext,
+    name: &str,
+    shard: &ShardConfig,
+    strategy: ShardStrategy,
+) -> Result<CudaTensor<T>> {
+    use infernum::dtype::DType;
+    match T::DTYPE {
+        DType::F32 => {
+            let t = loader.load_f32_sharded(ctx, name, shard, strategy)?;
+            Ok(reinterpret_tensor(t))
+        }
+        DType::F16 => {
+            let t = loader.load_f16_sharded(ctx, name, shard, strategy)?;
+            Ok(reinterpret_tensor(t))
+        }
+        DType::BF16 => {
+            let t = loader.load_bf16_sharded(ctx, name, shard, strategy)?;
+            Ok(reinterpret_tensor(t))
+        }
+        other => panic!("Unsupported dtype for load_typed_sharded: {other}"),
     }
 }
 
@@ -127,6 +178,11 @@ pub struct DeepSeekModel<T: TensorDType> {
     #[allow(dead_code)]
     gpu_config: GpuConfig,
 
+    #[cfg(feature = "nccl")]
+    nccl_comm: Option<NcclCommunicator>,
+
+    tp_num_heads: usize,
+
     embed_tokens: CudaTensor<T>,
     layers: Vec<DeepSeekLayerWeights<T>>,
     norm: CudaTensor<T>,
@@ -139,9 +195,10 @@ pub struct DeepSeekModel<T: TensorDType> {
     attn_scale: f32,
 }
 
+#[allow(private_bounds)]
 impl<T> DeepSeekModel<T>
 where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits,
+    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
     CudaBlas: Gemm<T>,
 {
     /// Load a DeepSeek model from a directory containing SafeTensors and config.json
@@ -449,9 +506,413 @@ where
         let attn_scale = config.mla_attn_scale();
 
         Ok(Self {
+            tp_num_heads: config.num_attention_heads,
             config,
             ctx: ctx.clone(),
             gpu_config: GpuConfig::Single,
+            #[cfg(feature = "nccl")]
+            nccl_comm: None,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+            attn_scale,
+        })
+    }
+
+    /// Load a DeepSeek model with tensor-parallel sharding across multiple GPUs.
+    ///
+    /// # Errors
+    /// Returns an error if loading fails or head counts are not divisible.
+    #[cfg(feature = "nccl")]
+    pub fn from_pretrained_sharded(
+        ctx: &CudaContext,
+        model_path: impl AsRef<Path>,
+        gpu_config: GpuConfig,
+        nccl_comm: NcclCommunicator,
+    ) -> Result<Self> {
+        let model_path = model_path.as_ref();
+        let config_path = model_path.join("config.json");
+        let config = DeepSeekConfig::from_file(&config_path)?;
+        let loader = SafeTensorsLoader::from_directory(model_path)?;
+        Self::load_weights_sharded(ctx, config, &loader, gpu_config, nccl_comm)
+    }
+
+    #[cfg(feature = "nccl")]
+    #[allow(clippy::too_many_lines)]
+    fn load_weights_sharded(
+        ctx: &CudaContext,
+        config: DeepSeekConfig,
+        loader: &impl WeightLoader,
+        gpu_config: GpuConfig,
+        nccl_comm: NcclCommunicator,
+    ) -> Result<Self> {
+        fn load_linear_sharded<T: TensorDType + DeviceRepr>(
+            ctx: &CudaContext,
+            loader: &impl WeightLoader,
+            name: &str,
+            shard: &ShardConfig,
+            strategy: ShardStrategy,
+            quant_config: Option<&crate::config::QuantizationConfig>,
+        ) -> Result<LinearWeight<T>> {
+            if let Some(qc) = quant_config {
+                let prefix = name
+                    .strip_suffix(".weight")
+                    .expect("GPTQ/AWQ weight name must end with .weight");
+                match qc.quant_method.as_str() {
+                    "gptq" => {
+                        let qt = loader.load_gptq_linear_sharded(
+                            ctx,
+                            prefix,
+                            qc.group_size,
+                            shard,
+                            strategy,
+                        )?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    "awq" => {
+                        let qt = loader.load_awq_linear_sharded(
+                            ctx,
+                            prefix,
+                            qc.group_size,
+                            shard,
+                            strategy,
+                        )?;
+                        return Ok(LinearWeight::Quantized(qt));
+                    }
+                    _ => {}
+                }
+            }
+
+            let dtype = loader.get_dtype(name)?;
+            if dtype.is_quantized() {
+                let mut qt =
+                    loader.load_quantized_sharded(ctx, name, shard, ShardStrategy::Replicate)?;
+                let scale_name = format!("{name}_scale");
+                if loader.contains(&scale_name) {
+                    let scale_tensor = loader.load_f32(ctx, &scale_name)?;
+                    let scale_val = scale_tensor.to_vec()?;
+                    if scale_val.len() == 1 {
+                        qt.set_weight_scale(ctx, scale_val[0])?;
+                    } else {
+                        qt.set_channel_scales(ctx, &scale_val)?;
+                    }
+                }
+                Ok(LinearWeight::Quantized(qt))
+            } else {
+                let f32_weight = loader.load_f32_sharded(ctx, name, shard, strategy)?;
+                let transposed = pretranspose_weight(&f32_weight)?;
+                if T::DTYPE == infernum::dtype::DType::F32 {
+                    Ok(LinearWeight::Dense(reinterpret_tensor(transposed)))
+                } else {
+                    let native = load_typed_sharded::<T>(loader, ctx, name, shard, strategy)?;
+                    let shape = native.shape().to_vec();
+                    let data = native.to_vec()?;
+                    let rows = shape[0];
+                    let cols = shape[1];
+                    let mut transposed_data = vec![T::default(); data.len()];
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            transposed_data[c * rows + r] = data[r * cols + c];
+                        }
+                    }
+                    Ok(LinearWeight::Dense(CudaTensor::from_slice(
+                        ctx,
+                        &[cols, rows],
+                        &transposed_data,
+                    )?))
+                }
+            }
+        }
+
+        let shard = match &gpu_config {
+            GpuConfig::Sharded(s) => *s,
+            GpuConfig::Single => {
+                return Self::load_weights(ctx, config, loader).map(|mut m| {
+                    m.nccl_comm = Some(nccl_comm);
+                    m
+                })
+            }
+        };
+        let world_size = shard.world_size;
+
+        assert!(
+            config.num_attention_heads.is_multiple_of(world_size),
+            "num_attention_heads ({}) must be divisible by world_size ({world_size})",
+            config.num_attention_heads
+        );
+
+        let qc = config.quantization_config.as_ref();
+        let tp_num_heads = config.num_attention_heads / world_size;
+
+        let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            // MLA attention weights
+            // q_a_proj, kv_a_proj_with_mqa: replicated (shared bottleneck)
+            // q_b_proj, kv_b_proj: column-sharded (output is per-head)
+            // o_proj: row-sharded (all-reduce after)
+            let attention = DeepSeekAttentionWeights {
+                q_a_proj: load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{prefix}.self_attn.q_a_proj.weight"),
+                    &shard,
+                    ShardStrategy::Replicate,
+                    qc,
+                )?,
+                q_a_layernorm: load_typed::<T>(
+                    loader,
+                    ctx,
+                    &format!("{prefix}.self_attn.q_a_layernorm.weight"),
+                )?,
+                q_b_proj: load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{prefix}.self_attn.q_b_proj.weight"),
+                    &shard,
+                    ShardStrategy::Column,
+                    qc,
+                )?,
+                kv_a_proj_with_mqa: load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
+                    &shard,
+                    ShardStrategy::Replicate,
+                    qc,
+                )?,
+                kv_a_layernorm: load_typed::<T>(
+                    loader,
+                    ctx,
+                    &format!("{prefix}.self_attn.kv_a_layernorm.weight"),
+                )?,
+                kv_b_proj: load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{prefix}.self_attn.kv_b_proj.weight"),
+                    &shard,
+                    ShardStrategy::Column,
+                    qc,
+                )?,
+                o_proj: load_linear_sharded::<T>(
+                    ctx,
+                    loader,
+                    &format!("{prefix}.self_attn.o_proj.weight"),
+                    &shard,
+                    ShardStrategy::Row,
+                    qc,
+                )?,
+            };
+
+            // FFN: dense or MoE
+            let ffn = if config.is_moe_layer(i) {
+                let num_experts = config
+                    .n_routed_experts
+                    .expect("MoE layer requires n_routed_experts");
+
+                // Router gate: replicated
+                let gate_name = format!("{prefix}.mlp.gate.weight");
+                let gate_f32 = loader.load_f32(ctx, &gate_name)?;
+                let gate_transposed = pretranspose_weight(&gate_f32)?;
+                let gate_weight = if T::DTYPE == infernum::dtype::DType::F32 {
+                    reinterpret_tensor(gate_transposed)
+                } else {
+                    let data_f32 = gate_transposed.to_vec()?;
+                    let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
+                    CudaTensor::from_slice(ctx, gate_transposed.shape(), &data_t)?
+                };
+
+                // Bias correction: replicated
+                let bias_name = format!("{prefix}.mlp.gate.e_score_correction_bias");
+                let e_score_correction_bias = if loader.contains(&bias_name) {
+                    loader.load_f32(ctx, &bias_name)?.to_vec()?
+                } else {
+                    vec![0.0_f32; num_experts]
+                };
+
+                // Per-expert MLPs: gate/up column-sharded, down row-sharded
+                let mut experts = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let ep = format!("{prefix}.mlp.experts.{e}");
+                    experts.push(DenseMlpWeights {
+                        gate_proj: load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &format!("{ep}.gate_proj.weight"),
+                            &shard,
+                            ShardStrategy::Column,
+                            qc,
+                        )?,
+                        up_proj: load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &format!("{ep}.up_proj.weight"),
+                            &shard,
+                            ShardStrategy::Column,
+                            qc,
+                        )?,
+                        down_proj: load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &format!("{ep}.down_proj.weight"),
+                            &shard,
+                            ShardStrategy::Row,
+                            qc,
+                        )?,
+                    });
+                }
+
+                // Shared expert: gate/up column-sharded, down row-sharded
+                let sp = format!("{prefix}.mlp.shared_experts");
+                let shared_expert = DenseMlpWeights {
+                    gate_proj: load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &format!("{sp}.gate_proj.weight"),
+                        &shard,
+                        ShardStrategy::Column,
+                        qc,
+                    )?,
+                    up_proj: load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &format!("{sp}.up_proj.weight"),
+                        &shard,
+                        ShardStrategy::Column,
+                        qc,
+                    )?,
+                    down_proj: load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &format!("{sp}.down_proj.weight"),
+                        &shard,
+                        ShardStrategy::Row,
+                        qc,
+                    )?,
+                };
+
+                FfnWeights::Moe(Box::new(MoeWeights {
+                    gate_weight,
+                    e_score_correction_bias,
+                    experts,
+                    shared_expert,
+                }))
+            } else {
+                let mp = format!("{prefix}.mlp");
+                FfnWeights::Dense(Box::new(DenseMlpWeights {
+                    gate_proj: load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &format!("{mp}.gate_proj.weight"),
+                        &shard,
+                        ShardStrategy::Column,
+                        qc,
+                    )?,
+                    up_proj: load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &format!("{mp}.up_proj.weight"),
+                        &shard,
+                        ShardStrategy::Column,
+                        qc,
+                    )?,
+                    down_proj: load_linear_sharded::<T>(
+                        ctx,
+                        loader,
+                        &format!("{mp}.down_proj.weight"),
+                        &shard,
+                        ShardStrategy::Row,
+                        qc,
+                    )?,
+                }))
+            };
+
+            layers.push(DeepSeekLayerWeights {
+                input_layernorm: load_typed::<T>(
+                    loader,
+                    ctx,
+                    &format!("{prefix}.input_layernorm.weight"),
+                )?,
+                attention,
+                post_attention_layernorm: load_typed::<T>(
+                    loader,
+                    ctx,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                )?,
+                ffn,
+            });
+        }
+
+        let norm = load_typed::<T>(loader, ctx, "model.norm.weight")?;
+
+        let lm_head = if config.tie_word_embeddings {
+            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let transposed = pretranspose_weight(&embed_f32)?;
+            if T::DTYPE == infernum::dtype::DType::F32 {
+                LinearWeight::Dense(reinterpret_tensor(transposed))
+            } else {
+                let shape = transposed.shape().to_vec();
+                let data_f32 = transposed.to_vec()?;
+                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
+                LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
+            }
+        } else {
+            load_linear_sharded::<T>(
+                ctx,
+                loader,
+                "lm_head.weight",
+                &shard,
+                ShardStrategy::Replicate,
+                None,
+            )?
+        };
+
+        let rope_head_dim = config.qk_rope_head_dim;
+        let (cos_f32, sin_f32) = if let Some(ref rs) = config.rope_scaling {
+            let scaling = RopeScaling {
+                rope_type: rs.rope_type.clone(),
+                factor: rs.factor,
+                original_max_position_embeddings: rs.original_max_position_embeddings,
+            };
+            precompute_rope_cache_scaled(
+                ctx,
+                config.max_position_embeddings,
+                rope_head_dim,
+                config.rope_theta,
+                &scaling,
+            )?
+        } else {
+            precompute_rope_cache(
+                ctx,
+                config.max_position_embeddings,
+                rope_head_dim,
+                config.rope_theta,
+            )?
+        };
+        let (cos_cache, sin_cache) = if T::DTYPE == infernum::dtype::DType::F32 {
+            (reinterpret_tensor(cos_f32), reinterpret_tensor(sin_f32))
+        } else {
+            let cos_data: Vec<T> = cos_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
+            let sin_data: Vec<T> = sin_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
+            let cos = CudaTensor::from_slice(ctx, cos_f32.shape(), &cos_data)?;
+            let sin = CudaTensor::from_slice(ctx, sin_f32.shape(), &sin_data)?;
+            (cos, sin)
+        };
+
+        let attn_scale = config.mla_attn_scale();
+
+        Ok(Self {
+            tp_num_heads,
+            config,
+            ctx: ctx.clone(),
+            gpu_config,
+            nccl_comm: Some(nccl_comm),
             embed_tokens,
             layers,
             norm,
@@ -674,7 +1135,7 @@ where
         position_offset: usize,
     ) -> Result<CudaTensor<T>> {
         let seq_len = hidden.shape()[0];
-        let num_heads = self.config.num_attention_heads;
+        let num_heads = self.tp_num_heads;
         let qk_nope_dim = self.config.qk_nope_head_dim;
         let qk_rope_dim = self.config.qk_rope_head_dim;
         let qk_head_dim = self.config.qk_head_dim();
@@ -754,7 +1215,10 @@ where
 
         // --- Output projection ---
         let attn_output = attn_output.reshape(&[seq_len, num_heads * v_head_dim]);
-        linear(&attn_output, &weights.o_proj)
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     /// MLA attention forward using indirect kernels for CUDA graph capture.
@@ -766,7 +1230,7 @@ where
         layer_idx: usize,
         kv_cache: &mut KvCache<T>,
     ) -> Result<CudaTensor<T>> {
-        let num_heads = self.config.num_attention_heads;
+        let num_heads = self.tp_num_heads;
         let qk_nope_dim = self.config.qk_nope_head_dim;
         let qk_rope_dim = self.config.qk_rope_head_dim;
         let qk_head_dim = self.config.qk_head_dim();
@@ -820,13 +1284,31 @@ where
 
         let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
         let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
-        linear(&attn_output, &weights.o_proj)
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
     }
 
     // --- FFN ---
 
     #[allow(clippy::unused_self)]
     fn forward_mlp(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &DenseMlpWeights<T>,
+    ) -> Result<CudaTensor<T>> {
+        let gate = linear(hidden, &weights.gate_proj)?;
+        let up = linear(hidden, &weights.up_proj)?;
+        let intermediate = swiglu(&gate, &up)?;
+        let mut out = linear(&intermediate, &weights.down_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
+    }
+
+    #[allow(clippy::unused_self)]
+    fn forward_mlp_no_reduce(
         &self,
         hidden: &CudaTensor<T>,
         weights: &DenseMlpWeights<T>,
@@ -855,14 +1337,16 @@ where
             self.config.norm_topk_prob,
             self.config.routed_scaling_factor,
             |expert_idx, expert_input| {
-                self.forward_mlp(expert_input, &moe_weights.experts[expert_idx])
+                self.forward_mlp_no_reduce(expert_input, &moe_weights.experts[expert_idx])
             },
         )?;
 
         // Add shared expert output
-        let shared_output = self.forward_mlp(hidden, &moe_weights.shared_expert)?;
+        let shared_output = self.forward_mlp_no_reduce(hidden, &moe_weights.shared_expert)?;
         add_inplace(&mut routed_output, &shared_output)?;
 
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut routed_output)?;
         Ok(routed_output)
     }
 
@@ -1033,9 +1517,10 @@ where
 
 // --- Model trait implementation ---
 
+#[allow(private_bounds)]
 impl<T> infernum::Model for DeepSeekModel<T>
 where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits,
+    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
     CudaBlas: Gemm<T>,
 {
     type CacheDtype = T;
@@ -1045,8 +1530,8 @@ where
         infernum::ModelConfig {
             num_layers: config.num_hidden_layers,
             max_seq_len: config.max_position_embeddings,
-            // KV cache stores decompressed KV: num_heads × qk_head_dim (Phase 1)
-            num_kv_heads: config.num_attention_heads,
+            // KV cache stores decompressed KV: tp_num_heads × qk_head_dim (Phase 1)
+            num_kv_heads: self.tp_num_heads,
             head_dim: config.qk_head_dim(),
             eos_token_id: config.eos_token_id,
         }
@@ -1119,5 +1604,30 @@ where
         kv_caches: &mut [KvCache<T>],
     ) -> Result<CudaTensor<f32>> {
         self.forward_next_token_indirect(token_id_gpu, &mut kv_caches[0])
+    }
+}
+
+#[cfg(feature = "nccl")]
+#[allow(private_bounds)]
+impl<T> infernum::ShardedLoadable for DeepSeekModel<T>
+where
+    T: TensorDType
+        + DeviceRepr
+        + GemmScalar
+        + Default
+        + ValidAsZeroBits
+        + MaybeNcclType
+        + Send
+        + Sync
+        + 'static,
+    CudaBlas: Gemm<T>,
+{
+    fn load_shard(
+        ctx: &CudaContext,
+        model_path: &Path,
+        shard: ShardConfig,
+        comm: NcclCommunicator,
+    ) -> Result<Self> {
+        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
     }
 }
