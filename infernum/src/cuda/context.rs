@@ -44,13 +44,14 @@ impl CudaContext {
             )
             .unwrap_or(0);
 
+        let buffer_pool = BufferPool::new(&device);
         Ok(Self {
             device,
             blas: Arc::new(blas),
             blas_lt: Arc::new(blas_lt),
             fp8_workspace: Arc::new(Mutex::new(None)),
             compute_capability: (major, minor),
-            buffer_pool: None,
+            buffer_pool: Some(buffer_pool),
         })
     }
 
@@ -77,13 +78,14 @@ impl CudaContext {
             )
             .unwrap_or(0);
 
+        let buffer_pool = BufferPool::new(&device);
         Ok(Self {
             device,
             blas: Arc::new(blas),
             blas_lt: Arc::new(blas_lt),
             fp8_workspace: Arc::new(Mutex::new(None)),
             compute_capability: (major, minor),
-            buffer_pool: None,
+            buffer_pool: Some(buffer_pool),
         })
     }
 
@@ -138,18 +140,7 @@ impl CudaContext {
         Ok(guard)
     }
 
-    /// Enable the GPU buffer pool for this context.
-    ///
-    /// Once enabled, `CudaTensor::uninit()` will attempt to reuse previously
-    /// freed GPU allocations instead of calling `cuMemAlloc` each time.
-    /// All clones of this context share the same pool.
-    pub fn enable_buffer_pool(&mut self) {
-        if self.buffer_pool.is_none() {
-            self.buffer_pool = Some(BufferPool::new(&self.device));
-        }
-    }
-
-    /// Get a reference to the buffer pool, if enabled.
+    /// Get a reference to the buffer pool.
     #[must_use]
     pub fn buffer_pool(&self) -> Option<&BufferPool> {
         self.buffer_pool.as_ref()
@@ -227,9 +218,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_shared_across_clones() {
-        let mut ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        ctx.enable_buffer_pool();
-
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let ctx2 = ctx.clone();
 
         // Both should see the same pool
