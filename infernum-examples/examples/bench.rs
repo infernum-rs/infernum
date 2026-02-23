@@ -17,6 +17,7 @@ use serde::Deserialize;
 use infernum::cuda::CudaContext;
 use infernum::model::Model;
 use infernum::GenerateOptions;
+use infernum_deepseek::DeepSeekModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
 use infernum_runtime::Engine;
@@ -145,10 +146,8 @@ fn main() -> infernum::Result<()> {
     } else {
         detect_model_type(&cli.model)?
     };
-    let is_qwen = matches!(model_type.as_str(), "qwen2" | "qwen3" | "qwen3_moe");
-
-    let result = match (cli.dtype.as_str(), is_qwen) {
-        ("f32", false) => {
+    let result = match (cli.dtype.as_str(), model_type.as_str()) {
+        ("f32", "llama" | "mistral" | "mixtral") => {
             let model = if is_gguf {
                 LlamaModel::from_gguf(&ctx, &cli.model)?
             } else {
@@ -157,7 +156,7 @@ fn main() -> infernum::Result<()> {
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
         }
-        ("bf16", false) => {
+        ("bf16", "llama" | "mistral" | "mixtral") => {
             assert!(
                 !is_gguf,
                 "bf16 dtype is only supported for SafeTensors models"
@@ -166,13 +165,23 @@ fn main() -> infernum::Result<()> {
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
         }
-        ("f32", true) => {
+        ("f32", "qwen2" | "qwen3" | "qwen3_moe") => {
             let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
         }
-        ("bf16", true) => {
+        ("bf16", "qwen2" | "qwen3" | "qwen3_moe") => {
             let model = QwenModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
+        }
+        ("f32", "deepseek_v3") => {
+            let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
+        }
+        ("bf16", "deepseek_v3") => {
+            let model = DeepSeekModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
         }

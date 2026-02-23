@@ -7,13 +7,14 @@ build = "build.rs"
 
 [features]
 default = []
-cuda = ["infernum/cuda", "infernum-llama/cuda", "infernum-qwen/cuda", "infernum-runtime/cuda", "infernum-serve/cuda", "cudarc"]
-nccl = ["cuda", "infernum/nccl", "infernum-llama/nccl", "infernum-qwen/nccl", "infernum-runtime/nccl"]
+cuda = ["infernum/cuda", "infernum-deepseek/cuda", "infernum-llama/cuda", "infernum-qwen/cuda", "infernum-runtime/cuda", "infernum-serve/cuda", "cudarc"]
+nccl = ["cuda", "infernum/nccl", "infernum-deepseek/nccl", "infernum-llama/nccl", "infernum-qwen/nccl", "infernum-runtime/nccl"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 cudarc = { version = "0.12", features = ["f16", "cuda-12060"], optional = true }
 infernum = { path = "../infernum" }
+infernum-deepseek = { path = "../infernum-deepseek" }
 infernum-llama = { path = "../infernum-llama" }
 infernum-qwen = { path = "../infernum-qwen" }
 infernum-runtime = { path = "../infernum-runtime" }

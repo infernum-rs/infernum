@@ -918,6 +918,7 @@ dependencies = [
  "clap",
  "cudarc",
  "infernum",
+ "infernum-deepseek",
  "infernum-llama",
  "infernum-qwen",
  "infernum-runtime",

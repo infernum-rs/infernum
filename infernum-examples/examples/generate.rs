@@ -21,6 +21,7 @@ use infernum::cuda::CudaContext;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Model, Result, SamplingParams};
+use infernum_deepseek::DeepSeekModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
 use infernum_runtime::{Engine, Runtime};
@@ -275,8 +276,14 @@ fn main() -> Result<()> {
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
+            "deepseek_v3" => {
+                let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let num_layers = model.config().num_hidden_layers;
+                let hidden_size = model.config().hidden_size;
+                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
+            }
             other => Err(infernum::Error::UnsupportedModel(format!(
-                "Unsupported model_type: \"{other}\". Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe"
+                "Unsupported model_type: \"{other}\". Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, deepseek_v3"
             ))),
         }
     }
