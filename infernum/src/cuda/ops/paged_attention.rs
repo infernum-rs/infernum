@@ -375,7 +375,8 @@ mod tests {
         let v_contig =
             CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &v_data).unwrap();
 
-        let expected = fused_attention_decode(&q_contig, &k_contig, &v_contig, None).unwrap();
+        let expected =
+            fused_attention_decode(&q_contig, &k_contig, &v_contig, None, None, None).unwrap();
         let expected_vals = expected.to_vec().unwrap();
 
         // --- Paged path ---
@@ -507,7 +508,8 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &k0_data).unwrap();
         let v0_contig =
             CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &v0_data).unwrap();
-        let expected0 = fused_attention_decode(&q0_gpu, &k0_contig, &v0_contig, None).unwrap();
+        let expected0 =
+            fused_attention_decode(&q0_gpu, &k0_contig, &v0_contig, None, None, None).unwrap();
         let exp0 = expected0.to_vec().unwrap();
         for i in 0..req_size {
             assert!(
@@ -524,7 +526,8 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[seq1, num_kv_heads, head_dim], &k1_data).unwrap();
         let v1_contig =
             CudaTensor::from_slice(&ctx, &[seq1, num_kv_heads, head_dim], &v1_data).unwrap();
-        let expected1 = fused_attention_decode(&q1_gpu, &k1_contig, &v1_contig, None).unwrap();
+        let expected1 =
+            fused_attention_decode(&q1_gpu, &k1_contig, &v1_contig, None, None, None).unwrap();
         let exp1 = expected1.to_vec().unwrap();
         for i in 0..req_size {
             assert!(
