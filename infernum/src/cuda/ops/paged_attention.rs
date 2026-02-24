@@ -28,6 +28,15 @@ const PAGED_DECODE_PTX: &str = include_str!(concat!(
     "/kernels/paged_decode_attention.ptx"
 ));
 
+const GATHER_PAGED_KV_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/kernels/gather_paged_kv.ptx"));
+
+const GATHER_PAGED_KV_KERNEL_NAMES: &[&str] = &[
+    "gather_paged_kv_f32",
+    "gather_paged_kv_f16",
+    "gather_paged_kv_bf16",
+];
+
 const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
     "paged_decode_attention_f32",
     "paged_decode_attention_f16",
@@ -57,6 +66,21 @@ fn ensure_paged_decode_kernel<T: cudarc::driver::DeviceRepr>(
             cudarc::nvrtc::Ptx::from_src(PAGED_DECODE_PTX),
             module_name,
             PAGED_DECODE_KERNEL_NAMES,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_gather_kernel<T: cudarc::driver::DeviceRepr>(
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Result<()> {
+    let module_name = "gather_paged_kv";
+    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix::<T>());
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(GATHER_PAGED_KV_PTX),
+            module_name,
+            GATHER_PAGED_KV_KERNEL_NAMES,
         )?;
     }
     Ok(())
@@ -377,40 +401,67 @@ pub fn gather_paged_kv<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
     let head_dim = paged_kv.head_dim();
     let block_size = paged_kv.block_size();
     let ctx = paged_kv.context();
+    let device = ctx.device();
+
+    ensure_gather_kernel::<T>(device)?;
 
     let shape = [seq_len, num_kv_heads, head_dim];
     let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
 
-    // Read entire pool to host, gather the relevant blocks, upload contiguous result.
-    // This is simple and correct. A GPU gather kernel would be faster for large sequences
-    // but this path is only used for prefill (Step 10 profiles whether to optimize).
-    let k_all = k_pool.to_vec()?;
-    let v_all = v_pool.to_vec()?;
+    // Upload block table to GPU
+    let block_table_i32: Vec<i32> = block_table.blocks().iter().map(|&b| b as i32).collect();
+    let block_table_gpu = device.htod_sync_copy(&block_table_i32)?;
 
-    let token_stride = num_kv_heads * head_dim;
-    let block_stride = block_size * token_stride;
+    let total = seq_len * num_kv_heads * head_dim;
+    let threads = 256;
+    let blocks = total.div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
-    let mut k_gathered = vec![T::default(); seq_len * token_stride];
-    let mut v_gathered = vec![T::default(); seq_len * token_stride];
+    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix::<T>());
 
-    for t in 0..seq_len {
-        let logical_block = t / block_size;
-        let offset_in_block = t % block_size;
-        let physical_block = block_table.blocks()[logical_block];
-
-        let src_offset = physical_block * block_stride + offset_in_block * token_stride;
-        let dst_offset = t * token_stride;
-
-        k_gathered[dst_offset..dst_offset + token_stride]
-            .copy_from_slice(&k_all[src_offset..src_offset + token_stride]);
-        v_gathered[dst_offset..dst_offset + token_stride]
-            .copy_from_slice(&v_all[src_offset..src_offset + token_stride]);
+    let mut k_out = unsafe { CudaTensor::<T>::uninit(ctx, &shape)? };
+    let func = device
+        .get_func("gather_paged_kv", &kernel_name)
+        .expect("gather kernel not loaded");
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                k_out.cuda_slice_mut(),
+                &k_pool.cuda_slice(),
+                &block_table_gpu,
+                seq_len as i32,
+                block_size as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+            ),
+        )?;
     }
 
-    let k_contig = CudaTensor::from_slice(ctx, &shape, &k_gathered)?;
-    let v_contig = CudaTensor::from_slice(ctx, &shape, &v_gathered)?;
+    let mut v_out = unsafe { CudaTensor::<T>::uninit(ctx, &shape)? };
+    let func = device
+        .get_func("gather_paged_kv", &kernel_name)
+        .expect("gather kernel not loaded");
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                v_out.cuda_slice_mut(),
+                &v_pool.cuda_slice(),
+                &block_table_gpu,
+                seq_len as i32,
+                block_size as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+            ),
+        )?;
+    }
 
-    Ok((k_contig, v_contig))
+    Ok((k_out, v_out))
 }
 
 #[cfg(test)]
