@@ -1970,9 +1970,9 @@ where
         infernum::ModelConfig {
             num_layers: config.num_hidden_layers,
             max_seq_len: config.max_position_embeddings,
-            // KV cache stores decompressed KV: tp_num_heads × qk_head_dim (Phase 1)
-            num_kv_heads: self.tp_num_heads,
-            head_dim: config.qk_head_dim(),
+            // Compressed KV cache: single latent vector per token
+            num_kv_heads: 1,
+            head_dim: config.kv_lora_rank + config.qk_rope_head_dim,
             eos_token_id: config.eos_token_id,
         }
     }
