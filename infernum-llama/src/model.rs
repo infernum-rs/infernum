@@ -12,14 +12,13 @@ use std::path::Path;
 use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
-    apply_rope_indirect, attention, cast_to_f32, embedding_gather, embedding_gather_from_device,
-    fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill,
-    gather_paged_kv, matmul, matmul_bf16_f32, paged_attention_decode,
+    attention, cast_to_f32, embedding_gather, embedding_gather_from_device,
+    fused_attention_prefill, gather_paged_kv, matmul, matmul_bf16_f32, paged_attention_decode,
     paged_attention_decode_indirect, precompute_rope_cache, quantized_matmul, repeat_kv, rms_norm,
     rms_norm_inplace, swiglu, transpose_2d, GemmScalar,
 };
 use infernum::cuda::{
-    BatchedGraphInputs, CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig,
+    BatchedGraphInputs, CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, GpuConfig,
     PagedKvCache, QuantizedTensor, ShardStrategy, ValidAsZeroBits,
 };
 #[cfg(feature = "nccl")]
@@ -52,7 +51,6 @@ where
 }
 
 use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
-use infernum::KvCache;
 use infernum::Result;
 
 use crate::LlamaConfig;
@@ -1164,172 +1162,6 @@ where
 
     /// Forward pass with KV cache (prefill phase)
     ///
-    /// Processes the full prompt, populating the KV cache for each layer,
-    /// and returns logits for the **last** token only: shape `(1, vocab_size)`.
-    ///
-    /// After this call, `kv_cache.current_len()` equals `input_ids.len()`.
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_with_kv_cache(
-        &self,
-        input_ids: &[u32],
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<f32>> {
-        let seq_len = input_ids.len();
-        let position_offset = kv_cache.current_len();
-
-        // Embed tokens: (seq_len,) -> (seq_len, hidden_size)
-        let mut hidden = self.embed(input_ids)?;
-
-        // Run through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
-        }
-
-        // Advance KV cache position (once after all layers)
-        kv_cache.advance(seq_len)?;
-
-        // Final layer norm (in-place: hidden is consumed)
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        // Extract last hidden state, then project to vocab logits
-        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
-        self.lm_head_forward(&last_hidden)
-    }
-
-    /// Forward pass for a single token with KV cache (decode phase)
-    ///
-    /// Processes one new token, appending its KV to the cache, and returns
-    /// logits of shape `(1, vocab_size)`.
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_next_token(
-        &self,
-        token_id: u32,
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_with_kv_cache(&[token_id], kv_cache)
-    }
-
-    /// Forward pass through a single transformer layer using KV cache
-    fn forward_layer_kv(
-        &self,
-        hidden: &CudaTensor<T>,
-        layer: &LlamaLayerWeights<T>,
-        layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
-        position_offset: usize,
-    ) -> Result<CudaTensor<T>> {
-        // Pre-attention RMS norm
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-
-        // Self-attention with KV cache
-        let attn_output = self.forward_attention_kv(
-            &normed,
-            &layer.attention,
-            layer_idx,
-            kv_cache,
-            position_offset,
-        )?;
-
-        // Residual add + pre-MLP RMS norm (fused in release builds)
-        let (mut hidden, normed) = add_rmsnorm(
-            hidden,
-            &attn_output,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        // MLP
-        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-
-        // Residual connection (in-place: hidden += mlp_output)
-        add_inplace(&mut hidden, &mlp_output)?;
-        Ok(hidden)
-    }
-
-    /// Forward pass through attention with KV cache.
-    ///
-    /// Directly calls fused attention kernels (which are generic over T)
-    /// rather than going through the `attention_kv` block, which has an
-    /// f32-only decomposed fallback.
-    fn forward_attention_kv(
-        &self,
-        hidden: &CudaTensor<T>,
-        weights: &LlamaAttentionWeights<T>,
-        layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
-        position_offset: usize,
-    ) -> Result<CudaTensor<T>> {
-        let seq_len = hidden.shape()[0];
-        let num_heads = self.tp_num_heads;
-        let num_kv_heads = self.tp_num_kv_heads;
-        let head_dim = self.config.head_dim();
-
-        // Project Q, K, V
-        let q = linear(hidden, &weights.q_proj)?;
-        let (k, v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
-                let kv = matmul(hidden, weight)?;
-                if seq_len == 1 {
-                    let k = kv.slice_view(0, &[1, *kv_dim]);
-                    let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
-                    (k, v)
-                } else {
-                    split_kv(&kv, *kv_dim)?
-                }
-            }
-            KvProjWeight::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
-                (k, v)
-            }
-        };
-
-        // Reshape: (seq_len, num_heads * head_dim) -> (seq_len, num_heads, head_dim)
-        let q = q.reshape(&[seq_len, num_heads, head_dim]);
-        let k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
-        let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
-
-        // Apply RoPE with position offset
-        let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, position_offset)?;
-        let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, position_offset)?;
-
-        // Append new K/V to cache
-        kv_cache.append(layer_idx, &k, &v)?;
-
-        // Retrieve full cached K/V including the just-appended tokens
-        let total_len = kv_cache.current_len() + seq_len;
-        let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
-
-        // Compute attention using fused kernels (generic over T)
-        let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output = if seq_len == 1 {
-            fused_attention_decode(&q, &k_full, &v_full, None, None, sliding_window)?
-        } else {
-            fused_attention_prefill(
-                &q,
-                &k_full,
-                &v_full,
-                kv_cache.current_len(),
-                None,
-                None,
-                sliding_window,
-            )?
-        };
-
-        // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, num_heads * head_dim)
-        let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-
-        // Output projection (row-parallel in TP: needs all-reduce)
-        let mut out = linear(&attn_output, &weights.o_proj)?;
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
-        Ok(out)
-    }
-
     /// Extract the last row from a (seq_len, hidden_size) tensor
     fn extract_last_row(&self, hidden: &CudaTensor<T>, seq_len: usize) -> Result<CudaTensor<T>> {
         if seq_len == 1 {
@@ -1349,66 +1181,6 @@ where
     /// Embed token IDs
     fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor<T>> {
         embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
-    }
-
-    /// Embed a single token ID already on the GPU (avoids `htod_sync_copy`)
-    fn embed_from_device(&self, token_id_gpu: &CudaSlice<u32>) -> Result<CudaTensor<T>> {
-        embedding_gather_from_device(&self.ctx, &self.embed_tokens, token_id_gpu, 1)
-    }
-
-    /// Decode-phase forward pass reading the token from a GPU buffer.
-    ///
-    /// Identical to [`Self::forward_next_token`] but avoids the host→device
-    /// copy, making the entire call capturable by a CUDA graph.
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_next_token_device(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<f32>> {
-        let position_offset = kv_cache.current_len();
-
-        let mut hidden = self.embed_from_device(token_id_gpu)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
-        }
-
-        kv_cache.advance(1)?;
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
-        self.lm_head_forward(&last_hidden)
-    }
-
-    /// Decode-phase forward pass using indirect kernels for CUDA graph capture.
-    ///
-    /// Uses `_indirect` kernel variants that read position from stable device
-    /// pointers. The entire call is capturable by a CUDA graph and the graph
-    /// can be replayed without re-capture.
-    ///
-    /// **Does not call `kv_cache.advance()`** — the caller must do that
-    /// outside the captured region.
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_next_token_indirect(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<f32>> {
-        let mut hidden = self.embed_from_device(token_id_gpu)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv_indirect(&hidden, layer, layer_idx, kv_cache)?;
-        }
-
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
-        self.lm_head_forward(&last_hidden)
     }
 
     /// Batched decode forward pass with paged KV cache.
@@ -1902,102 +1674,6 @@ where
     }
 
     /// Transformer layer forward pass using indirect kernels.
-    ///
-    /// Reads position from `kv_cache.current_position()` device pointer.
-    fn forward_layer_kv_indirect(
-        &self,
-        hidden: &CudaTensor<T>,
-        layer: &LlamaLayerWeights<T>,
-        layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<T>> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-
-        let attn_output =
-            self.forward_attention_kv_indirect(&normed, &layer.attention, layer_idx, kv_cache)?;
-
-        let (mut hidden, normed) = add_rmsnorm(
-            hidden,
-            &attn_output,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut hidden, &mlp_output)?;
-        Ok(hidden)
-    }
-
-    /// Attention with indirect kernels (decode-only, seq_len=1).
-    ///
-    /// Uses `apply_rope_indirect`, `append_indirect`, and
-    /// `fused_attention_decode_indirect` so all position-dependent parameters
-    /// are read from stable device pointers.
-    fn forward_attention_kv_indirect(
-        &self,
-        hidden: &CudaTensor<T>,
-        weights: &LlamaAttentionWeights<T>,
-        layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<T>> {
-        let num_heads = self.tp_num_heads;
-        let num_kv_heads = self.tp_num_kv_heads;
-        let head_dim = self.config.head_dim();
-
-        // Project Q, K, V
-        let q = linear(hidden, &weights.q_proj)?;
-        let (k, v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
-                let kv = matmul(hidden, weight)?;
-                let k = kv.slice_view(0, &[1, *kv_dim]);
-                let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
-                (k, v)
-            }
-            KvProjWeight::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
-                (k, v)
-            }
-        };
-
-        // Reshape to (1, num_heads, head_dim)
-        let q = q.reshape(&[1, num_heads, head_dim]);
-        let k = k.reshape(&[1, num_kv_heads, head_dim]);
-        let v = v.reshape(&[1, num_kv_heads, head_dim]);
-
-        // RoPE with indirect position
-        let position = kv_cache.current_position();
-        let q = apply_rope_indirect(&q, &self.cos_cache, &self.sin_cache, position)?;
-        let k = apply_rope_indirect(&k, &self.cos_cache, &self.sin_cache, position)?;
-
-        // Append to cache using indirect write offset
-        kv_cache.append_indirect(layer_idx, &k, &v)?;
-
-        // Full buffers (stable addresses for graph replay)
-        let (k_full, v_full) = kv_cache.full_buffers(layer_idx);
-
-        // Fused decode attention with indirect total_len.
-        // total_len = current_len + 1 (includes the just-appended token).
-        let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let total_len = kv_cache.current_total_len();
-        let attn_output = fused_attention_decode_indirect(
-            &q,
-            k_full,
-            v_full,
-            total_len,
-            kv_cache.graph_max_seq_len(),
-            None,
-            None,
-            sliding_window,
-        )?;
-
-        let attn_output = attn_output.reshape(&[1, num_heads * head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
-        Ok(out)
-    }
-
     /// Forward pass through MLP (SwiGLU)
     #[allow(clippy::unused_self)]
     fn forward_mlp(
@@ -2515,38 +2191,6 @@ where
 
         rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden)
-    }
-
-    fn forward_with_kv_cache(
-        &self,
-        input_ids: &[u32],
-        kv_caches: &mut [KvCache<T>],
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_with_kv_cache(input_ids, &mut kv_caches[0])
-    }
-
-    fn forward_next_token(
-        &self,
-        token_id: u32,
-        kv_caches: &mut [KvCache<T>],
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token(token_id, &mut kv_caches[0])
-    }
-
-    fn forward_next_token_device(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_caches: &mut [KvCache<T>],
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_device(token_id_gpu, &mut kv_caches[0])
-    }
-
-    fn forward_next_token_indirect(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_caches: &mut [KvCache<T>],
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_indirect(token_id_gpu, &mut kv_caches[0])
     }
 
     fn forward_batch_decode(
@@ -3427,93 +3071,6 @@ mod tests {
                 "Should stop before appending the EOS token"
             );
         }
-    }
-
-    #[test]
-    fn test_forward_with_kv_cache_output_shape() {
-        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let model = build_tiny_model(&ctx);
-        let config = tiny_config();
-
-        let mut kv_cache = KvCache::new(
-            &ctx,
-            config.num_hidden_layers,
-            config.max_position_embeddings,
-            config.num_kv_heads(),
-            config.head_dim(),
-        )
-        .unwrap();
-
-        let input_ids: Vec<u32> = vec![1, 5, 10];
-        let logits = model
-            .forward_with_kv_cache(&input_ids, &mut kv_cache)
-            .expect("Forward with KV cache failed");
-
-        // Returns (1, vocab_size) — logits for last token only
-        assert_eq!(logits.shape(), &[1, config.vocab_size]);
-        assert_eq!(kv_cache.current_len(), input_ids.len());
-    }
-
-    #[test]
-    fn test_forward_next_token_output_shape() {
-        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let model = build_tiny_model(&ctx);
-        let config = tiny_config();
-
-        let mut kv_cache = KvCache::new(
-            &ctx,
-            config.num_hidden_layers,
-            config.max_position_embeddings,
-            config.num_kv_heads(),
-            config.head_dim(),
-        )
-        .unwrap();
-
-        // Prefill
-        let prompt: Vec<u32> = vec![1, 5, 10];
-        model.forward_with_kv_cache(&prompt, &mut kv_cache).unwrap();
-
-        // Decode one token
-        let logits = model
-            .forward_next_token(42, &mut kv_cache)
-            .expect("Forward next token failed");
-
-        assert_eq!(logits.shape(), &[1, config.vocab_size]);
-        assert_eq!(kv_cache.current_len(), prompt.len() + 1);
-    }
-
-    #[test]
-    fn test_kv_cache_reset_reuse() {
-        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let model = build_tiny_model(&ctx);
-        let config = tiny_config();
-
-        let mut kv_cache = KvCache::new(
-            &ctx,
-            config.num_hidden_layers,
-            config.max_position_embeddings,
-            config.num_kv_heads(),
-            config.head_dim(),
-        )
-        .unwrap();
-
-        // First sequence
-        let prompt1: Vec<u32> = vec![1, 5, 10];
-        model
-            .forward_with_kv_cache(&prompt1, &mut kv_cache)
-            .unwrap();
-        assert_eq!(kv_cache.current_len(), 3);
-
-        // Reset and process a different sequence
-        kv_cache.reset().unwrap();
-        assert_eq!(kv_cache.current_len(), 0);
-
-        let prompt2: Vec<u32> = vec![2, 3];
-        let logits = model
-            .forward_with_kv_cache(&prompt2, &mut kv_cache)
-            .unwrap();
-        assert_eq!(logits.shape(), &[1, config.vocab_size]);
-        assert_eq!(kv_cache.current_len(), 2);
     }
 
     #[test]

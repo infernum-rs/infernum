@@ -9,23 +9,23 @@
 
 use std::path::Path;
 
+use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope, apply_rope_indirect, bias_add_inplace, cast_to_f32,
-    embedding_gather, embedding_gather_from_device, fused_attention_decode,
-    fused_attention_decode_indirect, fused_attention_prefill, matmul, matmul_bf16_f32, mul,
-    precompute_rope_cache, precompute_rope_cache_scaled, quantized_matmul, rms_norm,
-    rms_norm_inplace, swiglu, transpose_2d, GemmScalar, RopeScaling,
+    add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
+    bias_add_inplace, cast_to_f32, embedding_gather, embedding_gather_from_device,
+    fused_attention_prefill, gather_paged_kv, matmul, matmul_bf16_f32, mul, paged_attention_decode,
+    paged_attention_decode_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
+    quantized_matmul, rms_norm, rms_norm_inplace, swiglu, transpose_2d, GemmScalar, RopeScaling,
 };
 use infernum::cuda::{
-    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, QuantizedTensor,
-    ValidAsZeroBits,
+    BatchedGraphInputs, CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, GpuConfig,
+    PagedKvCache, QuantizedTensor, ValidAsZeroBits,
 };
 #[cfg(feature = "nccl")]
 use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig, ShardStrategy};
 use infernum::dtype::TensorDType;
 use infernum::tensor::Tensor;
 use infernum::weights::{SafeTensorsLoader, WeightLoader};
-use infernum::KvCache;
 use infernum::Result;
 
 use crate::QwenConfig;
@@ -1157,168 +1157,6 @@ where
         &self.config
     }
 
-    /// Forward pass with KV cache (prefill phase)
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_with_kv_cache(
-        &self,
-        input_ids: &[u32],
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<f32>> {
-        let seq_len = input_ids.len();
-        let position_offset = kv_cache.current_len();
-
-        let mut hidden = self.embed(input_ids)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
-        }
-
-        kv_cache.advance(seq_len)?;
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
-        self.lm_head_forward(&last_hidden)
-    }
-
-    /// Forward pass for a single token with KV cache (decode phase)
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_next_token(
-        &self,
-        token_id: u32,
-        kv_cache: &mut KvCache<T>,
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_with_kv_cache(&[token_id], kv_cache)
-    }
-
-    fn forward_layer_kv(
-        &self,
-        hidden: &CudaTensor<T>,
-        layer: &QwenLayerWeights<T>,
-        layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
-        position_offset: usize,
-    ) -> Result<CudaTensor<T>> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-
-        let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output = self.forward_attention_kv(
-            &normed,
-            &layer.attention,
-            layer_idx,
-            kv_cache,
-            position_offset,
-            sliding_window,
-        )?;
-
-        let (mut hidden, normed) = add_rmsnorm(
-            hidden,
-            &attn_output,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut hidden, &mlp_output)?;
-        Ok(hidden)
-    }
-
-    fn forward_attention_kv(
-        &self,
-        hidden: &CudaTensor<T>,
-        weights: &QwenAttentionWeights<T>,
-        layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
-        position_offset: usize,
-        sliding_window: Option<usize>,
-    ) -> Result<CudaTensor<T>> {
-        let seq_len = hidden.shape()[0];
-        let num_heads = self.tp_num_heads;
-        let num_kv_heads = self.tp_num_kv_heads;
-        let head_dim = self.config.head_dim();
-
-        // Project Q, K, V
-        let mut q = linear(hidden, &weights.q_proj)?;
-        let (mut k, mut v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
-                let kv = matmul(hidden, weight)?;
-                if seq_len == 1 {
-                    let k = kv.slice_view(0, &[1, *kv_dim]);
-                    let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
-                    (k, v)
-                } else {
-                    split_kv(&kv, *kv_dim)?
-                }
-            }
-            KvProjWeight::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
-                (k, v)
-            }
-        };
-
-        // Optional Q/K/V bias (Qwen2, Qwen3-MoE)
-        if let Some(ref bias) = weights.q_bias {
-            bias_add_inplace(&mut q, bias)?;
-        }
-        if let Some(ref bias) = weights.k_bias {
-            bias_add_inplace(&mut k, bias)?;
-        }
-        if let Some(ref bias) = weights.v_bias {
-            bias_add_inplace(&mut v, bias)?;
-        }
-
-        // Reshape: (seq_len, dim) → (seq_len, num_heads, head_dim)
-        let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
-        let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
-        let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
-
-        // Optional QK-norm (Qwen3): RMSNorm per-head before RoPE
-        if let Some(ref q_norm_w) = weights.q_norm {
-            let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-            q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
-        }
-        if let Some(ref k_norm_w) = weights.k_norm {
-            let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-            k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
-        }
-
-        // Apply RoPE
-        let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, position_offset)?;
-        let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, position_offset)?;
-
-        // KV cache
-        kv_cache.append(layer_idx, &k, &v)?;
-        let total_len = kv_cache.current_len() + seq_len;
-        let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
-
-        // Attention
-        let attn_output = if seq_len == 1 {
-            fused_attention_decode(&q, &k_full, &v_full, None, None, sliding_window)?
-        } else {
-            fused_attention_prefill(
-                &q,
-                &k_full,
-                &v_full,
-                kv_cache.current_len(),
-                None,
-                None,
-                sliding_window,
-            )?
-        };
-
-        let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
-        Ok(out)
-    }
-
     fn extract_last_row(&self, hidden: &CudaTensor<T>, seq_len: usize) -> Result<CudaTensor<T>> {
         if seq_len == 1 {
             return Ok(hidden.reshape(&[1, self.config.hidden_size]));
@@ -1338,90 +1176,149 @@ where
         embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
     }
 
-    fn embed_from_device(&self, token_id_gpu: &CudaSlice<u32>) -> Result<CudaTensor<T>> {
-        embedding_gather_from_device(&self.ctx, &self.embed_tokens, token_id_gpu, 1)
-    }
+    // --- Paged KV cache methods ---
 
-    /// Decode-phase forward pass reading the token from a GPU buffer.
+    /// Batched decode forward pass with paged KV cache.
     ///
     /// # Errors
     /// Returns an error if the forward pass fails.
-    pub fn forward_next_token_device(
+    pub fn forward_batch_decode(
         &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
+        token_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_tables: &[BlockTable],
+        positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
-        let position_offset = kv_cache.current_len();
+        let batch_size = token_ids.len();
+        let paged_kv = &mut paged_kvs[0];
 
-        let mut hidden = self.embed_from_device(token_id_gpu)?;
+        let mut hidden = self.embed(token_ids)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
+            hidden = self.forward_layer_paged_decode(
+                &hidden,
+                layer,
+                layer_idx,
+                paged_kv,
+                block_tables,
+                positions,
+            )?;
         }
 
-        kv_cache.advance(1)?;
         rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
-        self.lm_head_forward(&last_hidden)
+        self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
 
-    /// Forward pass using indirect kernels for CUDA graph capture.
+    /// Batched decode using indirect kernels for CUDA graph capture.
     ///
     /// # Errors
     /// Returns an error if the forward pass fails.
-    pub fn forward_next_token_indirect(
+    pub fn forward_batch_decode_indirect(
         &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache<T>,
+        graph_inputs: &BatchedGraphInputs,
+        paged_kvs: &mut [PagedKvCache<T>],
+        max_seq_len: usize,
     ) -> Result<CudaTensor<f32>> {
-        let mut hidden = self.embed_from_device(token_id_gpu)?;
+        let batch_size = graph_inputs.max_batch_size();
+        let paged_kv = &mut paged_kvs[0];
+
+        let mut hidden = embedding_gather_from_device(
+            &self.ctx,
+            &self.embed_tokens,
+            graph_inputs.token_ids(),
+            batch_size,
+        )?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv_indirect(&hidden, layer, layer_idx, kv_cache)?;
+            hidden = self.forward_layer_paged_decode_indirect(
+                &hidden,
+                layer,
+                layer_idx,
+                paged_kv,
+                graph_inputs,
+                max_seq_len,
+            )?;
         }
 
         rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
+    }
 
-        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
+    /// Single-sequence prefill with paged KV cache.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_prefill_paged(
+        &self,
+        input_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_table: &BlockTable,
+        start_pos: usize,
+    ) -> Result<CudaTensor<f32>> {
+        let seq_len = input_ids.len();
+        let paged_kv = &mut paged_kvs[0];
+
+        let mut hidden = self.embed(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_paged_prefill(
+                &hidden,
+                layer,
+                layer_idx,
+                paged_kv,
+                block_table,
+                start_pos,
+                seq_len,
+            )?;
+        }
+
+        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
         self.lm_head_forward(&last_hidden)
     }
 
-    fn forward_layer_kv_indirect(
+    fn forward_layer_paged_decode(
         &self,
         hidden: &CudaTensor<T>,
         layer: &QwenLayerWeights<T>,
         layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
+        paged_kv: &mut PagedKvCache<T>,
+        block_tables: &[BlockTable],
+        positions: &[usize],
     ) -> Result<CudaTensor<T>> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-        let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output = self.forward_attention_kv_indirect(
+
+        let attn_output = self.forward_attention_paged_decode(
             &normed,
             &layer.attention,
             layer_idx,
-            kv_cache,
-            sliding_window,
+            paged_kv,
+            block_tables,
+            positions,
         )?;
+
         let (mut hidden, normed) = add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
         )?;
+
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
         add_inplace(&mut hidden, &mlp_output)?;
         Ok(hidden)
     }
 
-    fn forward_attention_kv_indirect(
+    fn forward_attention_paged_decode(
         &self,
         hidden: &CudaTensor<T>,
         weights: &QwenAttentionWeights<T>,
         layer_idx: usize,
-        kv_cache: &mut KvCache<T>,
-        sliding_window: Option<usize>,
+        paged_kv: &mut PagedKvCache<T>,
+        block_tables: &[BlockTable],
+        positions: &[usize],
     ) -> Result<CudaTensor<T>> {
+        let batch_size = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
@@ -1430,9 +1327,13 @@ where
         let (mut k, mut v) = match &weights.kv_proj {
             KvProjWeight::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
-                let k = kv.slice_view(0, &[1, *kv_dim]);
-                let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
-                (k, v)
+                if batch_size == 1 {
+                    let k = kv.slice_view(0, &[1, *kv_dim]);
+                    let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
+                    (k, v)
+                } else {
+                    split_kv(&kv, *kv_dim)?
+                }
             }
             KvProjWeight::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
@@ -1451,41 +1352,321 @@ where
             bias_add_inplace(&mut v, bias)?;
         }
 
-        let mut q = q.reshape(&[1, num_heads, head_dim]);
-        let mut k = k.reshape(&[1, num_kv_heads, head_dim]);
-        let v = v.reshape(&[1, num_kv_heads, head_dim]);
+        let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
+        let mut k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
+        let v = v.reshape(&[batch_size, num_kv_heads, head_dim]);
 
         if let Some(ref q_norm_w) = weights.q_norm {
-            let flat_q = q.reshape(&[num_heads, head_dim]);
+            let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
             let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-            q = normed_q.reshape(&[1, num_heads, head_dim]);
+            q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
-            let flat_k = k.reshape(&[num_kv_heads, head_dim]);
+            let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
             let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-            k = normed_k.reshape(&[1, num_kv_heads, head_dim]);
+            k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
         }
 
-        let position = kv_cache.current_position();
-        let q = apply_rope_indirect(&q, &self.cos_cache, &self.sin_cache, position)?;
-        let k = apply_rope_indirect(&k, &self.cos_cache, &self.sin_cache, position)?;
+        let q = apply_rope_batched(&q, &self.cos_cache, &self.sin_cache, positions)?;
+        let k = apply_rope_batched(&k, &self.cos_cache, &self.sin_cache, positions)?;
 
-        kv_cache.append_indirect(layer_idx, &k, &v)?;
+        let q_stride = num_heads * head_dim;
+        let kv_stride = num_kv_heads * head_dim;
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
 
-        let (k_full, v_full) = kv_cache.full_buffers(layer_idx);
-        let total_len = kv_cache.current_total_len();
-        let attn_output = fused_attention_decode_indirect(
+        let mut attn_parts = Vec::with_capacity(batch_size);
+        for (i, &pos) in positions.iter().enumerate() {
+            let q_i = q.slice_view(i * q_stride, &[1, num_heads, head_dim]);
+            let k_i = k.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
+            let v_i = v.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
+
+            paged_kv.append_paged(layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
+
+            let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+            let attn_i = paged_attention_decode(
+                &self.ctx,
+                &q_i,
+                k_pool,
+                v_pool,
+                &[block_tables[i].clone()],
+                paged_kv.block_size(),
+                None,
+                sliding_window,
+            )?;
+
+            attn_parts.push(attn_i.reshape(&[1, num_heads * head_dim]));
+        }
+
+        let attn_output = if batch_size == 1 {
+            attn_parts.into_iter().next().unwrap()
+        } else {
+            let row_size = num_heads * head_dim;
+            let mut output =
+                unsafe { CudaTensor::<T>::uninit(&self.ctx, &[batch_size, row_size])? };
+            let out_slice = output.cuda_slice_mut();
+            for (i, part) in attn_parts.iter().enumerate() {
+                let src = part.cuda_slice().slice(..row_size);
+                let mut dst = out_slice.slice_mut(i * row_size..(i + 1) * row_size);
+                self.ctx.device().dtod_copy(&src, &mut dst)?;
+            }
+            output
+        };
+
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_paged_decode_indirect(
+        &self,
+        hidden: &CudaTensor<T>,
+        layer: &QwenLayerWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        graph_inputs: &BatchedGraphInputs,
+        max_seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+        let attn_output = self.forward_attention_paged_decode_indirect(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            paged_kv,
+            graph_inputs,
+            max_seq_len,
+        )?;
+
+        let (mut hidden, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+        add_inplace(&mut hidden, &mlp_output)?;
+        Ok(hidden)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_paged_decode_indirect(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &QwenAttentionWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        graph_inputs: &BatchedGraphInputs,
+        max_seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let batch_size = hidden.shape()[0];
+        let num_heads = self.tp_num_heads;
+        let num_kv_heads = self.tp_num_kv_heads;
+        let head_dim = self.config.head_dim();
+
+        let mut q = linear(hidden, &weights.q_proj)?;
+        let (mut k, mut v) = match &weights.kv_proj {
+            KvProjWeight::Fused { weight, kv_dim } => {
+                let kv = matmul(hidden, weight)?;
+                if batch_size == 1 {
+                    let k = kv.slice_view(0, &[1, *kv_dim]);
+                    let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
+                    (k, v)
+                } else {
+                    split_kv(&kv, *kv_dim)?
+                }
+            }
+            KvProjWeight::Separate { k_proj, v_proj } => {
+                let k = linear(hidden, k_proj)?;
+                let v = linear(hidden, v_proj)?;
+                (k, v)
+            }
+        };
+
+        if let Some(ref bias) = weights.q_bias {
+            bias_add_inplace(&mut q, bias)?;
+        }
+        if let Some(ref bias) = weights.k_bias {
+            bias_add_inplace(&mut k, bias)?;
+        }
+        if let Some(ref bias) = weights.v_bias {
+            bias_add_inplace(&mut v, bias)?;
+        }
+
+        let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
+        let mut k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
+        let v = v.reshape(&[batch_size, num_kv_heads, head_dim]);
+
+        if let Some(ref q_norm_w) = weights.q_norm {
+            let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
+            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
+        }
+        if let Some(ref k_norm_w) = weights.k_norm {
+            let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
+            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
+        }
+
+        let q = apply_rope_batched_indirect(
             &q,
-            k_full,
-            v_full,
-            total_len,
-            kv_cache.graph_max_seq_len(),
+            &self.cos_cache,
+            &self.sin_cache,
+            graph_inputs.positions(),
+            batch_size,
+        )?;
+        let k = apply_rope_batched_indirect(
+            &k,
+            &self.cos_cache,
+            &self.sin_cache,
+            graph_inputs.positions(),
+            batch_size,
+        )?;
+
+        paged_kv.append_paged_batched(
+            layer_idx,
+            &k,
+            &v,
+            graph_inputs.block_tables(),
+            graph_inputs.positions(),
+            batch_size,
+            graph_inputs.max_blocks_per_seq(),
+        )?;
+
+        let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
+        let attn_output = paged_attention_decode_indirect(
+            &self.ctx,
+            &q,
+            k_pool,
+            v_pool,
+            graph_inputs.block_tables(),
+            graph_inputs.seq_lens(),
+            paged_kv.block_size(),
+            graph_inputs.max_blocks_per_seq(),
+            max_seq_len,
+            None,
+            sliding_window,
+        )?;
+
+        let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_paged_prefill(
+        &self,
+        hidden: &CudaTensor<T>,
+        layer: &QwenLayerWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        block_table: &BlockTable,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+        let attn_output = self.forward_attention_paged_prefill(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            paged_kv,
+            block_table,
+            start_pos,
+            seq_len,
+        )?;
+
+        let (mut hidden, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+        add_inplace(&mut hidden, &mlp_output)?;
+        Ok(hidden)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_paged_prefill(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &QwenAttentionWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        block_table: &BlockTable,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let num_heads = self.tp_num_heads;
+        let num_kv_heads = self.tp_num_kv_heads;
+        let head_dim = self.config.head_dim();
+
+        let mut q = linear(hidden, &weights.q_proj)?;
+        let (mut k, mut v) = match &weights.kv_proj {
+            KvProjWeight::Fused { weight, kv_dim } => {
+                let kv = matmul(hidden, weight)?;
+                split_kv(&kv, *kv_dim)?
+            }
+            KvProjWeight::Separate { k_proj, v_proj } => {
+                let k = linear(hidden, k_proj)?;
+                let v = linear(hidden, v_proj)?;
+                (k, v)
+            }
+        };
+
+        if let Some(ref bias) = weights.q_bias {
+            bias_add_inplace(&mut q, bias)?;
+        }
+        if let Some(ref bias) = weights.k_bias {
+            bias_add_inplace(&mut k, bias)?;
+        }
+        if let Some(ref bias) = weights.v_bias {
+            bias_add_inplace(&mut v, bias)?;
+        }
+
+        let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
+        let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
+        let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
+
+        if let Some(ref q_norm_w) = weights.q_norm {
+            let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
+            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
+        }
+        if let Some(ref k_norm_w) = weights.k_norm {
+            let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
+            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
+        }
+
+        let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, start_pos)?;
+
+        paged_kv.append_paged(layer_idx, block_table, &k, &v, start_pos)?;
+
+        let mut gather_table = block_table.clone();
+        gather_table.advance(seq_len);
+        let (k_contig, v_contig) = gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
+
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
+        let attn_output = fused_attention_prefill(
+            &q,
+            &k_contig,
+            &v_contig,
+            start_pos,
             None,
             None,
             sliding_window,
         )?;
 
-        let attn_output = attn_output.reshape(&[1, num_heads * head_dim]);
+        let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
         let mut out = linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
@@ -1762,36 +1943,33 @@ where
         self.lm_head_forward(&hidden)
     }
 
-    fn forward_with_kv_cache(
+    fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        kv_caches: &mut [KvCache<T>],
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_table: &BlockTable,
+        start_pos: usize,
     ) -> Result<CudaTensor<f32>> {
-        self.forward_with_kv_cache(input_ids, &mut kv_caches[0])
+        self.forward_prefill_paged(input_ids, paged_kvs, block_table, start_pos)
     }
 
-    fn forward_next_token(
+    fn forward_batch_decode(
         &self,
-        token_id: u32,
-        kv_caches: &mut [KvCache<T>],
+        token_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_tables: &[BlockTable],
+        positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token(token_id, &mut kv_caches[0])
+        self.forward_batch_decode(token_ids, paged_kvs, block_tables, positions)
     }
 
-    fn forward_next_token_device(
+    fn forward_batch_decode_indirect(
         &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_caches: &mut [KvCache<T>],
+        graph_inputs: &BatchedGraphInputs,
+        paged_kvs: &mut [PagedKvCache<T>],
+        max_seq_len: usize,
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_device(token_id_gpu, &mut kv_caches[0])
-    }
-
-    fn forward_next_token_indirect(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_caches: &mut [KvCache<T>],
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_indirect(token_id_gpu, &mut kv_caches[0])
+        self.forward_batch_decode_indirect(graph_inputs, paged_kvs, max_seq_len)
     }
 }
 
