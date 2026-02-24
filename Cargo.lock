@@ -966,6 +966,8 @@ name = "infernum-runtime"
 version = "0.1.0"
 dependencies = [
  "infernum",
+ "infernum-llama",
+ "ureq",
 ]
 
 [[package]]

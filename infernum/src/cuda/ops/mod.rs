@@ -12,6 +12,7 @@ mod geglu;
 mod gelu;
 mod matmul;
 mod mul;
+mod paged_attention;
 mod quantized_matmul;
 mod repeat_kv;
 mod rmsnorm;
@@ -37,12 +38,15 @@ pub use geglu::geglu;
 pub use gelu::{gelu, gelu_inplace, gelu_mul};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
 pub use mul::mul;
+pub use paged_attention::{
+    gather_paged_kv, paged_attention_decode, paged_attention_decode_indirect,
+};
 pub use quantized_matmul::quantized_matmul;
 pub use repeat_kv::repeat_kv;
 pub use rmsnorm::{rms_norm, rms_norm_inplace};
 pub use rope::{
-    apply_rope, apply_rope_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
-    RopeScaling,
+    apply_rope, apply_rope_batched, apply_rope_batched_indirect, apply_rope_indirect,
+    precompute_rope_cache, precompute_rope_cache_scaled, RopeScaling,
 };
 pub use sample::sample_top_p;
 pub use scale::scale_inplace;

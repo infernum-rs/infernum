@@ -195,12 +195,11 @@ fn apply_rope_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     let module_name = "rope";
     if !device.has_func(module_name, &kernel_name) {
-        let all_names: Vec<&str> = KERNEL_NAMES
-            .iter()
-            .chain(INDIRECT_KERNEL_NAMES.iter())
-            .copied()
-            .collect();
-        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, &all_names)?;
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &all_kernel_names(),
+        )?;
     }
 
     let func = device.get_func(module_name, &kernel_name).unwrap();
@@ -293,13 +292,11 @@ pub fn apply_rope_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     let module_name = "rope";
     if !device.has_func(module_name, &kernel_name) {
-        // Load both standard and indirect kernels from the same PTX
-        let all_names: Vec<&str> = KERNEL_NAMES
-            .iter()
-            .chain(INDIRECT_KERNEL_NAMES.iter())
-            .copied()
-            .collect();
-        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, &all_names)?;
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &all_kernel_names(),
+        )?;
     }
 
     let func = device.get_func(module_name, &kernel_name).unwrap();
@@ -322,6 +319,170 @@ pub fn apply_rope_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
                 num_heads as i32,
                 head_dim as i32,
                 position.device(),
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
+const BATCHED_KERNEL_NAMES: &[&str] =
+    &["rope_batched_f32", "rope_batched_f16", "rope_batched_bf16"];
+
+/// All kernel names in the RoPE PTX module.
+fn all_kernel_names() -> Vec<&'static str> {
+    KERNEL_NAMES
+        .iter()
+        .chain(INDIRECT_KERNEL_NAMES.iter())
+        .chain(BATCHED_KERNEL_NAMES.iter())
+        .copied()
+        .collect()
+}
+
+/// Apply rotary positional embeddings to a batch of single-token sequences,
+/// each at a different position.
+///
+/// Input shape: `(batch_size, num_heads, head_dim)` — one token per sequence.
+/// `positions` must have length `batch_size`.
+///
+/// # Errors
+/// Returns an error if the kernel launch or GPU allocation fails.
+pub fn apply_rope_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    positions: &[usize],
+) -> Result<CudaTensor<T>> {
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (batch_size, num_heads, head_dim)"
+    );
+
+    let batch_size = shape[0];
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+    assert_eq!(
+        positions.len(),
+        batch_size,
+        "positions length ({}) must match batch_size ({batch_size})",
+        positions.len()
+    );
+
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_batched_{}", kernel_suffix::<T>());
+
+    let module_name = "rope";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &all_kernel_names(),
+        )?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    // Upload positions as i32 array
+    let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+    let positions_gpu = device.htod_sync_copy(&positions_i32)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (batch_size as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                batch_size as i32,
+                num_heads as i32,
+                head_dim as i32,
+                &positions_gpu,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
+/// Apply rotary positional embeddings to a batch of single-token sequences,
+/// reading positions from a pre-allocated GPU buffer.
+///
+/// Identical to [`apply_rope_batched`] but takes a `CudaSlice<i32>` of positions
+/// already on the GPU (e.g., from [`BatchedGraphInputs`](crate::cuda::BatchedGraphInputs)),
+/// avoiding the `htod_sync_copy` that would break CUDA graph capture.
+///
+/// `batch_size` is the number of sequences to process (may be larger than the
+/// logical batch if padding is used for graph capture).
+///
+/// # Errors
+/// Returns an error if the kernel launch or GPU allocation fails.
+pub fn apply_rope_batched_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    positions_gpu: &cudarc::driver::CudaSlice<i32>,
+    batch_size: usize,
+) -> Result<CudaTensor<T>> {
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (batch_size, num_heads, head_dim)"
+    );
+    assert_eq!(shape[0], batch_size);
+
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_batched_{}", kernel_suffix::<T>());
+
+    let module_name = "rope";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &all_kernel_names(),
+        )?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (batch_size as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                batch_size as i32,
+                num_heads as i32,
+                head_dim as i32,
+                positions_gpu,
             ),
         )?;
     }
@@ -603,7 +764,7 @@ mod tests {
             factor,
             original_max_position_embeddings: 4096,
         };
-        let (cos_lin, sin_lin) =
+        let (cos_lin, _sin_lin) =
             precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
 
         let cos_v = cos_lin.to_vec().unwrap();
@@ -620,6 +781,117 @@ mod tests {
             assert!(
                 (cos_v[pos_lin * half_dim + i] - cos_std_v[pos_std * half_dim + i]).abs() < 1e-5,
                 "linear scaling mismatch at dim {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_batched_rope_matches_scalar() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let num_heads = 2;
+        let head_dim = 8;
+        let positions = [5_usize, 12, 0];
+        let batch_size = positions.len();
+
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        // Build batched input: (3, 2, 8)
+        let row_size = num_heads * head_dim;
+        let mut input_data = Vec::with_capacity(batch_size * row_size);
+        for i in 0..batch_size * row_size {
+            input_data.push((i as f32 + 1.0) * 0.1);
+        }
+        let input =
+            CudaTensor::from_slice(&ctx, &[batch_size, num_heads, head_dim], &input_data).unwrap();
+
+        let batched = apply_rope_batched(&input, &cos_cache, &sin_cache, &positions).unwrap();
+        let batched_data = batched.to_vec().unwrap();
+
+        // Compare each row against scalar apply_rope
+        for (i, &pos) in positions.iter().enumerate() {
+            let row_start = i * row_size;
+            let row_input = CudaTensor::from_slice(
+                &ctx,
+                &[1, num_heads, head_dim],
+                &input_data[row_start..row_start + row_size],
+            )
+            .unwrap();
+            let scalar = apply_rope(&row_input, &cos_cache, &sin_cache, pos).unwrap();
+            let scalar_data = scalar.to_vec().unwrap();
+
+            for (j, (&got, &want)) in batched_data[row_start..row_start + row_size]
+                .iter()
+                .zip(scalar_data.iter())
+                .enumerate()
+            {
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "Mismatch at batch={i}, pos={pos}, elem={j}: batched={got}, scalar={want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_batched_rope_single_sequence() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let num_heads = 2;
+        let head_dim = 4;
+
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let input_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &input_data).unwrap();
+
+        let pos = 7;
+        let batched = apply_rope_batched(&input, &cos_cache, &sin_cache, &[pos]).unwrap();
+        let scalar = apply_rope(&input, &cos_cache, &sin_cache, pos).unwrap();
+
+        let batched_data = batched.to_vec().unwrap();
+        let scalar_data = scalar.to_vec().unwrap();
+
+        for (i, (&got, &want)) in batched_data.iter().zip(scalar_data.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "Mismatch at {i}: batched={got}, scalar={want}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_batched_rope_indirect_matches_eager() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let num_heads = 2;
+        let head_dim = 8;
+        let positions = [5_usize, 12, 0];
+        let batch_size = positions.len();
+
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let row_size = num_heads * head_dim;
+        let mut input_data = Vec::with_capacity(batch_size * row_size);
+        for i in 0..batch_size * row_size {
+            input_data.push((i as f32 + 1.0) * 0.1);
+        }
+        let input =
+            CudaTensor::from_slice(&ctx, &[batch_size, num_heads, head_dim], &input_data).unwrap();
+
+        // Eager path
+        let eager = apply_rope_batched(&input, &cos_cache, &sin_cache, &positions).unwrap();
+        let eager_data = eager.to_vec().unwrap();
+
+        // Indirect path: positions pre-uploaded as i32
+        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let positions_gpu = ctx.device().htod_sync_copy(&positions_i32).unwrap();
+        let indirect =
+            apply_rope_batched_indirect(&input, &cos_cache, &sin_cache, &positions_gpu, batch_size)
+                .unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&e, &ind)) in eager_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (e - ind).abs() < 1e-6,
+                "Mismatch at {i}: eager={e}, indirect={ind}"
             );
         }
     }

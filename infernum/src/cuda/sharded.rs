@@ -10,8 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+use super::block_allocator::BlockTable;
 use super::nccl::NcclCommunicator;
-use super::{CudaContext, CudaTensor, KvCache, ShardConfig};
+use super::{CudaContext, CudaTensor, KvCache, PagedKvCache, ShardConfig};
 use crate::model::ShardedLoadable;
 use crate::{Model, Result};
 
@@ -137,9 +138,68 @@ where
             collect_rank0(handles)
         })
     }
+
+    fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        block_tables: &[BlockTable],
+        positions: &[usize],
+    ) -> Result<CudaTensor<f32>> {
+        thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .zip(paged_kvs.iter_mut())
+                .map(|((_, model), kv)| {
+                    s.spawn(move || {
+                        model.forward_batch_decode(
+                            token_ids,
+                            std::slice::from_mut(kv),
+                            block_tables,
+                            positions,
+                        )
+                    })
+                })
+                .collect();
+
+            collect_rank0(handles)
+        })
+    }
+
+    fn forward_prefill_paged(
+        &self,
+        input_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        block_table: &BlockTable,
+        start_pos: usize,
+    ) -> Result<CudaTensor<f32>> {
+        thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .zip(paged_kvs.iter_mut())
+                .map(|((_, model), kv)| {
+                    s.spawn(move || {
+                        model.forward_prefill_paged(
+                            input_ids,
+                            std::slice::from_mut(kv),
+                            block_table,
+                            start_pos,
+                        )
+                    })
+                })
+                .collect();
+
+            collect_rank0(handles)
+        })
+    }
 }
 
-/// Collect results from parallel threads, returning rank 0's value.
+/// Collect results from parallel threads, returning rank 0's `Result`.
+///
+/// Other ranks' results are discarded — NCCL all-reduce has already made
+/// the logits identical across all devices.
 fn collect_rank0<T>(handles: Vec<thread::ScopedJoinHandle<'_, Result<T>>>) -> Result<T> {
     let results: Vec<Result<T>> = handles
         .into_iter()

@@ -906,7 +906,7 @@ where
                 let num_experts_per_tok = config
                     .num_experts_per_tok
                     .expect("MoE requires num_experts_per_tok");
-                let expert_inter = config.moe_expert_intermediate_size();
+                let _expert_inter = config.moe_expert_intermediate_size();
 
                 // Router: replicated
                 let gate_name = format!("{prefix}.mlp.gate.weight");
@@ -958,7 +958,7 @@ where
 
                 // Shared expert: sharded like dense MLP
                 let shared_expert = if config.has_shared_expert() {
-                    let shared_inter = config
+                    let _shared_inter = config
                         .shared_expert_intermediate_size
                         .expect("shared_expert_intermediate_size required");
                     let sp = format!("{prefix}.mlp.shared_expert");

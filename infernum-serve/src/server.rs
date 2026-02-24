@@ -23,7 +23,7 @@ use infernum::{
     ChatMessage, GenerateOptions, Model, ModelConfig, Result as InfernumResult, SamplingParams,
     Tokenizer,
 };
-use infernum_runtime::{Engine, FinishReason, GenerationEvent, TokenSender};
+use infernum_runtime::{BatchConfig, Engine, FinishReason, GenerationEvent, TokenSender};
 
 use crate::types::{
     ChatChoice, ChatChunkChoice, ChatCompletionChunk, ChatCompletionRequest,
@@ -48,10 +48,10 @@ impl TokenSender for TokioTokenSender {
 }
 
 // ---------------------------------------------------------------------------
-// ModelHandle — type-erased model handle
+// ModelHandle
 // ---------------------------------------------------------------------------
 
-/// Type-erased handle to a model, its engine, tokenizer, and chat template.
+/// Handle to a model, its engine, tokenizer, and chat template.
 struct ModelHandle {
     engine: Engine,
     tokenizer: Box<dyn ErasedTokenizer>,
@@ -97,12 +97,12 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
-    /// Create a new model entry.
+    /// Create a new model entry with default batch configuration.
     ///
     /// The model is consumed and moved into a background engine thread.
     ///
     /// # Panics
-    /// Panics if engine creation fails (KV cache allocation).
+    /// Panics if engine creation fails (paged KV cache allocation).
     pub fn new<M, T, C>(name: &str, model: M, tokenizer: T, template: C) -> Self
     where
         M: Model + Send + 'static,
@@ -111,6 +111,38 @@ impl ModelEntry {
     {
         let model_config = model.config();
         let engine = Engine::new(model).expect("Failed to create engine");
+        Self {
+            name: name.to_string(),
+            handle: ModelHandle {
+                engine,
+                tokenizer: Box::new(tokenizer),
+                template: Box::new(template),
+                model_config,
+            },
+        }
+    }
+
+    /// Create a new model entry with custom batch configuration.
+    ///
+    /// Supports concurrent requests with paged KV cache and iteration-level
+    /// scheduling.
+    ///
+    /// # Panics
+    /// Panics if engine creation fails (paged KV cache allocation).
+    pub fn with_config<M, T, C>(
+        name: &str,
+        model: M,
+        tokenizer: T,
+        template: C,
+        batch_config: BatchConfig,
+    ) -> Self
+    where
+        M: Model + Send + 'static,
+        T: Tokenizer + Send + Sync + 'static,
+        C: ChatTemplate + 'static,
+    {
+        let model_config = model.config();
+        let engine = Engine::with_config(model, batch_config).expect("Failed to create engine");
         Self {
             name: name.to_string(),
             handle: ModelHandle {
