@@ -16,9 +16,10 @@ use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect,
     broadcast_to_heads, cast_to_f32, concat_inner_dim, embedding_gather,
     embedding_gather_from_device, fused_attention_decode, fused_attention_decode_indirect,
-    fused_attention_prefill, linear, matmul_bf16_f32, pad_inner_dim, precompute_rope_cache,
-    precompute_rope_cache_scaled, reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim,
-    swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
+    fused_attention_prefill, gather_paged_kv, linear, matmul_bf16_f32, pad_inner_dim,
+    paged_attention_decode, precompute_rope_cache, precompute_rope_cache_scaled,
+    reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim, swiglu, transpose_2d,
+    GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
     CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, KvCache,
@@ -1338,6 +1339,231 @@ where
         Ok(h)
     }
 
+    // --- Paged KV cache support ---
+
+    /// MLA attention for single-sequence prefill with paged KV cache.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn forward_mla_attention_paged_prefill(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &DeepSeekAttentionWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        block_table: &BlockTable,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let num_heads = self.tp_num_heads;
+        let qk_nope_dim = self.config.qk_nope_head_dim;
+        let qk_rope_dim = self.config.qk_rope_head_dim;
+        let qk_head_dim = self.config.qk_head_dim();
+        let v_head_dim = self.config.v_head_dim;
+        let kv_lora_rank = self.config.kv_lora_rank;
+
+        // Q projection (two-stage LoRA)
+        let q_compressed = linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = rms_norm(
+            &q_compressed,
+            &weights.q_a_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = q.reshape(&[seq_len, num_heads, qk_head_dim]);
+        let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
+
+        // KV joint projection
+        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
+        let k_compressed = rms_norm(
+            &k_compressed,
+            &weights.kv_a_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
+        let kv_decompressed =
+            kv_decompressed.reshape(&[seq_len, num_heads, qk_nope_dim + v_head_dim]);
+        let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
+
+        // RoPE (interleaved)
+        let k_rope = k_rope.reshape(&[seq_len, 1, qk_rope_dim]);
+        let q_rope = apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let k_rope = apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
+
+        // Concatenate nope + rope
+        let q = Self::concat_head_dim(&q_nope, &q_rope)?;
+        let k = Self::concat_head_dim(&k_nope, &k_rope)?;
+
+        // Pad V to qk_head_dim
+        let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
+
+        // Write K/V into paged cache
+        paged_kv.append_paged(layer_idx, block_table, &k, &v_padded, start_pos)?;
+
+        // Gather contiguous K/V for fused prefill kernel
+        let mut gather_table = block_table.clone();
+        gather_table.advance(seq_len);
+        let (k_contig, v_contig) = gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
+
+        let attn_output =
+            fused_attention_prefill(&q, &k_contig, &v_contig, start_pos, None, None, None)?;
+
+        // Truncate back to v_head_dim and project
+        let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
+        let attn_output = attn_output.reshape(&[seq_len, num_heads * v_head_dim]);
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
+    }
+
+    /// MLA attention for single-token decode with paged KV cache.
+    fn forward_mla_attention_paged_decode(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &DeepSeekAttentionWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        block_table: &BlockTable,
+        position: usize,
+    ) -> Result<CudaTensor<T>> {
+        let num_heads = self.tp_num_heads;
+        let qk_nope_dim = self.config.qk_nope_head_dim;
+        let qk_rope_dim = self.config.qk_rope_head_dim;
+        let qk_head_dim = self.config.qk_head_dim();
+        let v_head_dim = self.config.v_head_dim;
+        let kv_lora_rank = self.config.kv_lora_rank;
+
+        // Q projection (two-stage LoRA)
+        let q_compressed = linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = rms_norm(
+            &q_compressed,
+            &weights.q_a_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = q.reshape(&[1, num_heads, qk_head_dim]);
+        let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
+
+        // KV joint projection
+        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
+        let k_compressed = rms_norm(
+            &k_compressed,
+            &weights.kv_a_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
+        let kv_decompressed = kv_decompressed.reshape(&[1, num_heads, qk_nope_dim + v_head_dim]);
+        let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
+
+        // RoPE (interleaved)
+        let k_rope = k_rope.reshape(&[1, 1, qk_rope_dim]);
+        let q_rope = apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, position)?;
+        let k_rope = apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, position)?;
+        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
+
+        // Concatenate nope + rope
+        let q = Self::concat_head_dim(&q_nope, &q_rope)?;
+        let k = Self::concat_head_dim(&k_nope, &k_rope)?;
+
+        // Pad V to qk_head_dim
+        let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
+
+        // Append to paged cache
+        paged_kv.append_paged(layer_idx, block_table, &k, &v_padded, position)?;
+
+        // Paged attention decode
+        let mut table_with_current = block_table.clone();
+        table_with_current.advance(1);
+        let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+        let attn_output = paged_attention_decode(
+            &self.ctx,
+            &q,
+            k_pool,
+            v_pool,
+            &[table_with_current],
+            paged_kv.block_size(),
+            None,
+            None,
+        )?;
+
+        // Truncate back to v_head_dim and project
+        let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
+        let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
+    }
+
+    /// Layer forward for paged prefill.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_paged_prefill(
+        &self,
+        hidden: &CudaTensor<T>,
+        layer: &DeepSeekLayerWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        block_table: &BlockTable,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let attn_output = self.forward_mla_attention_paged_prefill(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            paged_kv,
+            block_table,
+            start_pos,
+            seq_len,
+        )?;
+
+        let (mut h, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+        add_inplace(&mut h, &mlp_output)?;
+        Ok(h)
+    }
+
+    /// Layer forward for paged decode (single token).
+    fn forward_layer_paged_decode(
+        &self,
+        hidden: &CudaTensor<T>,
+        layer: &DeepSeekLayerWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        block_table: &BlockTable,
+        position: usize,
+    ) -> Result<CudaTensor<T>> {
+        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let attn_output = self.forward_mla_attention_paged_decode(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            paged_kv,
+            block_table,
+            position,
+        )?;
+
+        let (mut h, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+        add_inplace(&mut h, &mlp_output)?;
+        Ok(h)
+    }
+
     // --- Public forward methods ---
 
     /// Forward pass with KV cache (prefill phase)
@@ -1484,26 +1710,83 @@ where
 
     fn forward_prefill_paged(
         &self,
-        _input_ids: &[u32],
-        _paged_kvs: &mut [PagedKvCache<T>],
-        _block_table: &BlockTable,
-        _start_pos: usize,
+        input_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_table: &BlockTable,
+        start_pos: usize,
     ) -> Result<CudaTensor<f32>> {
-        unimplemented!(
-            "forward_prefill_paged not yet implemented for DeepSeek (MLA paged KV cache pending)"
-        )
+        let seq_len = input_ids.len();
+        let paged_kv = &mut paged_kvs[0];
+
+        let mut hidden = self.embed(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_paged_prefill(
+                &hidden,
+                layer,
+                layer_idx,
+                paged_kv,
+                block_table,
+                start_pos,
+                seq_len,
+            )?;
+        }
+
+        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+
+        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
+        self.lm_head_forward(&last_hidden)
     }
 
     fn forward_batch_decode(
         &self,
-        _token_ids: &[u32],
-        _paged_kvs: &mut [PagedKvCache<T>],
-        _block_tables: &[BlockTable],
-        _positions: &[usize],
+        token_ids: &[u32],
+        paged_kvs: &mut [PagedKvCache<T>],
+        block_tables: &[BlockTable],
+        positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
-        unimplemented!(
-            "forward_batch_decode not yet implemented for DeepSeek (MLA paged KV cache pending)"
-        )
+        let batch_size = token_ids.len();
+        let paged_kv = &mut paged_kvs[0];
+        let hidden_size = self.config.hidden_size;
+
+        // Process each sequence independently through the full MLA pipeline.
+        // MLA's multi-stage projections (Q LoRA, KV joint, per-head decomposition)
+        // make batching non-trivial; per-sequence is correct and simpler.
+        let mut logits_parts = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let mut hidden = self.embed(&token_ids[i..=i])?;
+
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                hidden = self.forward_layer_paged_decode(
+                    &hidden,
+                    layer,
+                    layer_idx,
+                    paged_kv,
+                    &block_tables[i],
+                    positions[i],
+                )?;
+            }
+
+            rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+            let logits = self.lm_head_forward(&hidden.reshape(&[1, hidden_size]))?;
+            logits_parts.push(logits);
+        }
+
+        if batch_size == 1 {
+            return Ok(logits_parts.into_iter().next().unwrap());
+        }
+
+        // Concatenate per-sequence logits into (batch_size, vocab_size)
+        let vocab_size = logits_parts[0].shape()[1];
+        let mut output =
+            unsafe { CudaTensor::<f32>::uninit(&self.ctx, &[batch_size, vocab_size])? };
+        let out_slice = output.cuda_slice_mut();
+        for (i, part) in logits_parts.iter().enumerate() {
+            let src = part.cuda_slice().slice(..vocab_size);
+            let mut dst = out_slice.slice_mut(i * vocab_size..(i + 1) * vocab_size);
+            self.ctx.device().dtod_copy(&src, &mut dst)?;
+        }
+        Ok(output)
     }
 }
 
