@@ -423,7 +423,7 @@ mod tests {
     fn add_request_goes_to_waiting() {
         let mut sched = make_scheduler(4, 16, 64);
         let (tx, _rx) = mpsc::channel();
-        sched.add_request(vec![1, 2, 3], default_options(), Box::new(tx));
+        let _ = sched.add_request(vec![1, 2, 3], default_options(), Box::new(tx));
 
         assert!(!sched.is_idle());
         assert_eq!(sched.num_waiting(), 1);
@@ -437,7 +437,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
 
         // Prompt of 5 tokens → needs ceil(5/4) = 2 blocks
-        sched.add_request(vec![1, 2, 3, 4, 5], default_options(), Box::new(tx));
+        let _ = sched.add_request(vec![1, 2, 3, 4, 5], default_options(), Box::new(tx));
 
         let output = sched.step(&mut alloc);
 
@@ -457,7 +457,7 @@ mod tests {
         let mut alloc = make_allocator(4, 64);
         let (tx, _rx) = mpsc::channel();
 
-        sched.add_request(vec![1, 2, 3], default_options(), Box::new(tx));
+        let _ = sched.add_request(vec![1, 2, 3], default_options(), Box::new(tx));
 
         // Step 1: admit to prefill
         let _ = sched.step(&mut alloc);
@@ -479,7 +479,7 @@ mod tests {
 
         for _ in 0..4 {
             let (tx, _rx) = mpsc::channel();
-            sched.add_request(vec![1, 2], default_options(), Box::new(tx));
+            let _ = sched.add_request(vec![1, 2], default_options(), Box::new(tx));
         }
 
         let output = sched.step(&mut alloc);
@@ -496,11 +496,11 @@ mod tests {
 
         // Request 1: 4 tokens → 1 block
         let (tx1, _rx1) = mpsc::channel();
-        sched.add_request(vec![1, 2, 3, 4], default_options(), Box::new(tx1));
+        let _ = sched.add_request(vec![1, 2, 3, 4], default_options(), Box::new(tx1));
 
         // Request 2: 8 tokens → 2 blocks
         let (tx2, _rx2) = mpsc::channel();
-        sched.add_request(
+        let _ = sched.add_request(
             vec![1, 2, 3, 4, 5, 6, 7, 8],
             default_options(),
             Box::new(tx2),
@@ -508,7 +508,7 @@ mod tests {
 
         // Request 3: 4 tokens → 1 block (only 0 left after first two)
         let (tx3, _rx3) = mpsc::channel();
-        sched.add_request(vec![1, 2, 3, 4], default_options(), Box::new(tx3));
+        let _ = sched.add_request(vec![1, 2, 3, 4], default_options(), Box::new(tx3));
 
         let output = sched.step(&mut alloc);
         // Only first 2 admitted (1 + 2 = 3 blocks, pool exhausted)
@@ -524,7 +524,7 @@ mod tests {
         let mut alloc = make_allocator(4, 64);
         let (tx, rx) = mpsc::channel::<GenerationEvent>();
 
-        sched.add_request(vec![1, 2, 3], default_options(), Box::new(tx));
+        let _ = sched.add_request(vec![1, 2, 3], default_options(), Box::new(tx));
         let _ = sched.step(&mut alloc);
 
         let blocks_before = alloc.num_free();
@@ -549,8 +549,8 @@ mod tests {
 
         let (tx1, _rx1) = mpsc::channel();
         let (tx2, _rx2) = mpsc::channel();
-        sched.add_request(vec![10, 20], default_options(), Box::new(tx1));
-        sched.add_request(vec![30, 40], default_options(), Box::new(tx2));
+        let _ = sched.add_request(vec![10, 20], default_options(), Box::new(tx1));
+        let _ = sched.add_request(vec![30, 40], default_options(), Box::new(tx2));
 
         // Only first request admitted (batch size 1)
         let output = sched.step(&mut alloc);
@@ -579,7 +579,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
 
         // 7-token prompt, chunks of 3: [0..3], [3..6], [6..7]
-        sched.add_request(vec![1, 2, 3, 4, 5, 6, 7], default_options(), Box::new(tx));
+        let _ = sched.add_request(vec![1, 2, 3, 4, 5, 6, 7], default_options(), Box::new(tx));
 
         let output = sched.step(&mut alloc);
         assert_eq!(output.prefill.len(), 1);
@@ -613,7 +613,7 @@ mod tests {
         let mut alloc = make_allocator(4, 4);
         let (tx, _rx) = mpsc::channel();
 
-        sched.add_request(vec![1], default_options(), Box::new(tx));
+        let _ = sched.add_request(vec![1], default_options(), Box::new(tx));
         let _ = sched.step(&mut alloc); // uses 1 block
 
         assert_eq!(alloc.num_free(), 3);
@@ -631,14 +631,14 @@ mod tests {
 
         // Request 1: already decoding
         let (tx1, _rx1) = mpsc::channel();
-        sched.add_request(vec![1, 2], default_options(), Box::new(tx1));
+        let _ = sched.add_request(vec![1, 2], default_options(), Box::new(tx1));
         let _ = sched.step(&mut alloc);
         sched.running_mut()[0].prefill_progress = 2;
         sched.running_mut()[0].phase = SequencePhase::Decode;
 
         // Request 2: new arrival
         let (tx2, _rx2) = mpsc::channel();
-        sched.add_request(vec![10, 20, 30], default_options(), Box::new(tx2));
+        let _ = sched.add_request(vec![10, 20, 30], default_options(), Box::new(tx2));
 
         let output = sched.step(&mut alloc);
         // Should have 1 decode (request 1) and 1 prefill (request 2)
