@@ -1377,6 +1377,7 @@ where
                 &[table_with_current],
                 paged_kv.block_size(),
                 None,
+                None,
                 sliding_window,
             )?;
 
@@ -1533,6 +1534,7 @@ where
             paged_kv.block_size(),
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
+            None,
             None,
             sliding_window,
         )?;

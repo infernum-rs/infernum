@@ -1146,6 +1146,7 @@ where
                 v_pool,
                 &[table_with_current],
                 paged_kv.block_size(),
+                None,
                 self.config.attn_logit_softcapping,
                 sliding_window,
             )?;
@@ -1296,6 +1297,7 @@ where
             paged_kv.block_size(),
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
+            None,
             self.config.attn_logit_softcapping,
             sliding_window,
         )?;

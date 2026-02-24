@@ -1416,8 +1416,15 @@ where
             let q = Self::concat_head_dim(&q_nope, &q_rope)?;
             let k = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
             let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
-            let attn =
-                fused_attention_prefill(&q, &k, &v_padded, position_offset, None, None, None)?;
+            let attn = fused_attention_prefill(
+                &q,
+                &k,
+                &v_padded,
+                position_offset,
+                Some(self.attn_scale),
+                None,
+                None,
+            )?;
             Self::truncate_attn_output(&attn, v_head_dim)?
         };
 
@@ -1829,6 +1836,7 @@ where
             paged_kv.block_size(),
             Some(self.attn_scale),
             None,
+            None,
         )?;
 
         // Absorb V: discard rope portion, decompress via kv_b_proj_v
@@ -2006,6 +2014,7 @@ where
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
             Some(self.attn_scale),
+            None,
             None,
         )?;
 

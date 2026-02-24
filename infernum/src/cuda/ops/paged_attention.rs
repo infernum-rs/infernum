@@ -98,6 +98,7 @@ fn ensure_gather_kernel<T: cudarc::driver::DeviceRepr>(
 /// * `v_pool` — value pool, same shape as `k_pool`
 /// * `block_tables` — per-request block tables
 /// * `block_size` — tokens per block
+/// * `scale` — if `Some(s)`, use `s` as the attention scale; otherwise `1/sqrt(head_dim)`
 /// * `softcap` — if `Some(cap)`, applies `tanh(score/cap)*cap` after scaling
 /// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
@@ -113,6 +114,7 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     v_pool: &CudaTensor<T>,
     block_tables: &[BlockTable],
     block_size: usize,
+    scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
@@ -141,7 +143,7 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
     );
 
-    let mut scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let mut softcap_val = softcap.unwrap_or(0.0);
     let window_size = sliding_window.map_or(0, |w| w as i32);
 
@@ -304,6 +306,7 @@ fn launch_paged_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
 /// * `block_size` — tokens per block
 /// * `max_blocks_per_seq` — max blocks per sequence (stride for block table rows)
 /// * `max_seq_len` — max sequence length (for shared memory sizing)
+/// * `scale` — if `Some(s)`, use `s` as the attention scale; otherwise `1/sqrt(head_dim)`
 /// * `softcap` — if `Some(cap)`, applies `tanh(score/cap)*cap` after scaling
 /// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
@@ -322,6 +325,7 @@ pub fn paged_attention_decode_indirect<
     block_size: usize,
     max_blocks_per_seq: usize,
     max_seq_len: usize,
+    scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
@@ -345,7 +349,7 @@ pub fn paged_attention_decode_indirect<
         "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
     );
 
-    let mut scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let mut softcap_val = softcap.unwrap_or(0.0);
     let window_size = sliding_window.map_or(0, |w| w as i32);
 
@@ -541,6 +545,7 @@ mod tests {
             block_size,
             None,
             None,
+            None,
         )
         .unwrap();
         let actual_vals = actual.to_vec().unwrap();
@@ -628,6 +633,7 @@ mod tests {
             v_pool,
             &[table0.clone(), table1.clone()],
             block_size,
+            None,
             None,
             None,
         )
@@ -760,6 +766,7 @@ mod tests {
             block_size,
             None,
             None,
+            None,
         )
         .unwrap();
         let eager_data = eager.to_vec().unwrap();
@@ -782,6 +789,7 @@ mod tests {
             block_size,
             max_blocks_per_seq,
             table0.seq_len(),
+            None,
             None,
             None,
         )
@@ -863,6 +871,7 @@ mod tests {
             v_pool,
             &[table],
             block_size,
+            None,
             Some(cap),
             None,
         )
@@ -949,6 +958,7 @@ mod tests {
             &[table],
             block_size,
             None,
+            None,
             Some(window),
         )
         .unwrap();
@@ -1009,6 +1019,7 @@ mod tests {
             v_pool,
             &[table0.clone()],
             block_size,
+            None,
             Some(cap),
             None,
         )
@@ -1033,6 +1044,7 @@ mod tests {
             block_size,
             max_blocks_per_seq,
             table0.seq_len(),
+            None,
             Some(cap),
             None,
         )
