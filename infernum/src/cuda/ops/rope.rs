@@ -764,7 +764,7 @@ mod tests {
             factor,
             original_max_position_embeddings: 4096,
         };
-        let (cos_lin, sin_lin) =
+        let (cos_lin, _sin_lin) =
             precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
 
         let cos_v = cos_lin.to_vec().unwrap();
