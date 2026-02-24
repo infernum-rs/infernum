@@ -1120,13 +1120,16 @@ where
 
             paged_kv.append_paged(layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
 
+            let mut table_with_current = block_tables[i].clone();
+            table_with_current.advance(1);
+
             let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
             let attn_i = paged_attention_decode(
                 &self.ctx,
                 &q_i,
                 k_pool,
                 v_pool,
-                &[block_tables[i].clone()],
+                &[table_with_current],
                 paged_kv.block_size(),
                 self.config.attn_logit_softcapping,
                 sliding_window,
