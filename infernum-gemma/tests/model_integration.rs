@@ -196,60 +196,94 @@ mod gemma3_text_tiny_random {
     }
 }
 
-// ─── Gemma 2 2B (gated, ignored, quality check) ────────────────────────────
+// ─── Gemma 2 2B (ungated, ignored, quality check) ──────────────────────────
 
-/// google/gemma-2-2b (gated, ~5GB bf16) — validates Gemma 2 generation quality
-/// with real weights. Requires HF auth and ~10GB VRAM.
+/// unsloth/gemma-2-2b (ungated mirror, ~5GB bf16) — validates Gemma 2
+/// generation quality with real weights. Requires ~10GB VRAM (loaded as f32).
 mod gemma2_2b {
     use super::*;
 
-    const REPO: &str = "google/gemma-2-2b";
-
-    fn model_dir() -> PathBuf {
-        download_model_files(
-            REPO,
-            &[
-                "config.json",
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-                "model.safetensors.index.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-            ],
-        )
-    }
-
-    #[test]
-    #[ignore = "Gated model, requires HF auth and ~10GB VRAM"]
-    fn capital_of_france() {
-        let output = generate_greedy(&model_dir(), "The capital of France is", 30);
-        assert!(
-            output.contains("Paris"),
-            "Expected 'Paris' in output, got: {output}"
-        );
-    }
-}
-
-// ─── Gemma 3 1B (gated, ignored, quality check) ────────────────────────────
-
-/// google/gemma-3-1b-it (gated, ~2GB bf16) — validates Gemma 3 generation
-/// quality with real weights. Requires HF auth and ~4GB VRAM.
-mod gemma3_1b {
-    use super::*;
-
-    const REPO: &str = "google/gemma-3-1b-it";
+    const REPO: &str = "unsloth/gemma-2-2b";
 
     fn model_dir() -> PathBuf {
         download_model(REPO)
     }
 
     #[test]
-    #[ignore = "Gated model, requires HF auth and ~4GB VRAM"]
+    #[ignore = "5GB model, needs ~10GB VRAM — run manually with --ignored"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(
             output.contains("Paris"),
             "Expected 'Paris' in output, got: {output}"
         );
+    }
+
+    #[test]
+    #[ignore = "5GB model, needs ~10GB VRAM — run manually with --ignored"]
+    fn no_nan_in_output() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            GemmaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let input_ids = tokenizer.encode("Hello world", true).unwrap();
+
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+}
+
+// ─── Gemma 3 1B (ungated, ignored, quality check) ──────────────────────────
+
+/// unsloth/gemma-3-1b-it (ungated mirror, ~2GB bf16) — validates Gemma 3
+/// generation quality with real weights. Requires ~4GB VRAM (loaded as f32).
+mod gemma3_1b {
+    use super::*;
+
+    const REPO: &str = "unsloth/gemma-3-1b-it";
+
+    fn model_dir() -> PathBuf {
+        download_model(REPO)
+    }
+
+    #[test]
+    #[ignore = "2GB model, needs ~4GB VRAM — run manually with --ignored"]
+    fn capital_of_france() {
+        let output = generate_greedy(&model_dir(), "The capital of France is", 30);
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in output, got: {output}"
+        );
+    }
+
+    #[test]
+    #[ignore = "2GB model, needs ~4GB VRAM — run manually with --ignored"]
+    fn no_nan_in_output() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            GemmaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let input_ids = tokenizer.encode("Hello world", true).unwrap();
+
+        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 }
