@@ -34,7 +34,8 @@ pub use bias_add::{bias_add, bias_add_inplace};
 pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16, cast_to_f32};
 pub use embed::{embedding_gather, embedding_gather_from_device};
 pub use fused_attention::{
-    fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill,
+    combine_attention_with_lse, fused_attention_decode, fused_attention_decode_indirect,
+    fused_attention_prefill, fused_attention_prefill_with_lse,
 };
 pub use geglu::geglu;
 pub use gelu::{gelu, gelu_inplace, gelu_mul};
