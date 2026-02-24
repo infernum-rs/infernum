@@ -109,7 +109,7 @@ mod tests {
             rank: 0,
             world_size: 3,
         };
-        shard.shard_range(128);
+        let _ = shard.shard_range(128);
     }
 
     #[test]

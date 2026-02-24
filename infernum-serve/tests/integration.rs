@@ -8,7 +8,8 @@
 use std::net::SocketAddr;
 
 use infernum::chat_template::RawTemplate;
-use infernum::cuda::{CudaContext, CudaTensor, KvCache};
+use infernum::cuda::block_allocator::BlockTable;
+use infernum::cuda::{CudaContext, CudaTensor, KvCache, PagedKvCache};
 use infernum::{Model, ModelConfig, Result as InfernumResult, Tokenizer};
 use infernum_serve::{ModelEntry, Server};
 
@@ -107,8 +108,32 @@ impl Model for MockModel {
         _token_id: u32,
         _kv_caches: &mut [KvCache<f32>],
     ) -> InfernumResult<CudaTensor<f32>> {
-        // After a few tokens, emit EOS
         self.make_logits(42)
+    }
+
+    fn forward_prefill_paged(
+        &self,
+        _input_ids: &[u32],
+        _paged_kvs: &mut [PagedKvCache<f32>],
+        _block_table: &BlockTable,
+        _start_pos: usize,
+    ) -> InfernumResult<CudaTensor<f32>> {
+        self.make_logits(42)
+    }
+
+    fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        _paged_kvs: &mut [PagedKvCache<f32>],
+        _block_tables: &[BlockTable],
+        _positions: &[usize],
+    ) -> InfernumResult<CudaTensor<f32>> {
+        let batch_size = token_ids.len();
+        let mut logits = vec![0.0_f32; batch_size * self.vocab_size];
+        for b in 0..batch_size {
+            logits[b * self.vocab_size + 42] = 100.0;
+        }
+        CudaTensor::from_slice(&self.ctx, &[batch_size, self.vocab_size], &logits)
     }
 }
 
@@ -119,7 +144,7 @@ impl Model for MockModel {
 async fn spawn_test_server() -> SocketAddr {
     let ctx = CudaContext::new(0).expect("CUDA context");
     let model = MockModel::new(&ctx);
-    let entry = ModelEntry::new("test-model", model, MockTokenizer, RawTemplate, None);
+    let entry = ModelEntry::new("test-model", model, MockTokenizer, RawTemplate);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

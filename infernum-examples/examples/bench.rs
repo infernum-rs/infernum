@@ -4,7 +4,6 @@
 //! Usage:
 //!   cargo run --release --example bench --features cuda -- models/llama-3.2-1b 256
 //!   cargo run --release --example bench --features cuda -- --dtype bf16 models/llama-3.2-1b 256
-//!   cargo run --release --example bench --features cuda -- --pool models/llama-3.2-1b 256
 
 #![cfg(feature = "cuda")]
 
@@ -35,10 +34,6 @@ struct Cli {
     /// Compute dtype: f32 or bf16 (only for SafeTensors models)
     #[arg(long, default_value = "f32")]
     dtype: String,
-
-    /// Enable buffer pool
-    #[arg(long)]
-    pool: bool,
 
     /// Enable CUDA graph capture/replay for the decode loop
     #[arg(long)]
@@ -73,7 +68,8 @@ fn bench_model<M: Model + Send + 'static>(
     use_cuda_graphs: bool,
     max_seq_len: Option<usize>,
 ) -> infernum::Result<()> {
-    let engine = Engine::with_max_seq_len(model, max_seq_len)?;
+    let _ = max_seq_len; // TODO: re-add max_seq_len support to Engine
+    let engine = Engine::new(model)?;
 
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let options = GenerateOptions {
@@ -131,14 +127,7 @@ fn bench_with_info<M: Model + Send + 'static>(
 
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
-    let mut ctx = CudaContext::new(0)?;
-
-    if cli.pool {
-        ctx.enable_buffer_pool();
-        eprintln!("Buffer pool: ENABLED");
-    } else {
-        eprintln!("Buffer pool: disabled");
-    }
+    let ctx = CudaContext::new(0)?;
 
     if cli.graphs {
         eprintln!("CUDA graphs: ENABLED");

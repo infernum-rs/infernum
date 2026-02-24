@@ -100,6 +100,19 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
         .expect("Generation failed")
 }
 
+/// Load a model and generate text with greedy decoding + CUDA graph capture/replay.
+fn generate_greedy_with_graphs(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
+    let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+    let model = LlamaModel::<f32>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
+
+    let mut opts = greedy_options(max_tokens);
+    opts.use_cuda_graphs = true;
+
+    let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+    runtime.generate(prompt, &opts).expect("Generation failed")
+}
+
 // ─── SafeTensors f32 ─────────────────────────────────────────────────────────
 
 /// SmolLM2-360M (ungated, ~700MB, Llama architecture)
@@ -141,6 +154,54 @@ mod smollm2_360m {
 
         assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+}
+
+// ─── CUDA Graphs ─────────────────────────────────────────────────────────────
+
+/// SmolLM2-360M with CUDA graph capture/replay for the decode loop.
+mod smollm2_360m_cuda_graphs {
+    use super::*;
+
+    const REPO: &str = "HuggingFaceTB/SmolLM2-360M";
+
+    fn model_dir() -> PathBuf {
+        download_model(REPO)
+    }
+
+    #[test]
+    fn capital_of_france() {
+        let output = generate_greedy_with_graphs(&model_dir(), "The capital of France is", 30);
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn matches_eager() {
+        let dir = model_dir();
+        let prompt = "The capital of France is";
+        let eager = generate_greedy(&dir, prompt, 30);
+        let graph = generate_greedy_with_graphs(&dir, prompt, 30);
+
+        assert!(
+            eager.contains("Paris"),
+            "Eager output should contain 'Paris', got: {eager}"
+        );
+        assert!(
+            graph.contains("Paris"),
+            "Graph output should contain 'Paris', got: {graph}"
+        );
+    }
+
+    #[test]
+    fn longer_generation() {
+        let output = generate_greedy_with_graphs(&model_dir(), "Once upon a time", 100);
+        assert!(
+            !output.is_empty(),
+            "Graph-accelerated generation should produce non-empty output"
+        );
     }
 }
 

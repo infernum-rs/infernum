@@ -32,7 +32,7 @@ use infernum::{ChatTemplate, Result};
 use infernum_deepseek::{DeepSeekModel, DeepSeekTemplate};
 use infernum_llama::{Llama3Template, LlamaModel, MistralTemplate};
 use infernum_qwen::{ChatMLTemplate, QwenModel};
-use infernum_serve::{ModelEntry, Server};
+use infernum_serve::{BatchConfig, ModelEntry, Server};
 
 /// Serve a model via the `OpenAI`-compatible Chat Completions API
 #[derive(Parser)]
@@ -50,9 +50,13 @@ struct Cli {
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
 
-    /// Maximum KV cache sequence length (default: min(model max, 4096))
-    #[arg(long)]
-    max_seq_len: Option<usize>,
+    /// Maximum batch size (concurrent sequences)
+    #[arg(long, default_value_t = 32)]
+    max_batch_size: usize,
+
+    /// Number of KV cache blocks
+    #[arg(long, default_value_t = 2048)]
+    num_blocks: usize,
 }
 
 #[derive(Deserialize)]
@@ -107,18 +111,24 @@ async fn main() -> Result<()> {
 
     eprintln!("Model type: {model_type}");
 
+    let batch_config = BatchConfig {
+        max_batch_size: cli.max_batch_size,
+        num_blocks: cli.num_blocks,
+        ..BatchConfig::default()
+    };
+
     let entry = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
             let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            ModelEntry::new(&cli.name, model, tokenizer, template, cli.max_seq_len)
+            ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
             let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            ModelEntry::new(&cli.name, model, tokenizer, template, cli.max_seq_len)
+            ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "deepseek_v3" => {
             let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            ModelEntry::new(&cli.name, model, tokenizer, template, cli.max_seq_len)
+            ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         other => {
             return Err(infernum::Error::UnsupportedModel(format!(

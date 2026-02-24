@@ -22,29 +22,23 @@ pub struct Runtime<T: Tokenizer> {
 impl<T: Tokenizer> Runtime<T> {
     /// Create a new runtime from a model and tokenizer.
     ///
-    /// Uses the default KV cache size (`min(model.max_seq_len, 4096)`).
-    /// Use [`Runtime::with_max_seq_len`] to override.
-    ///
     /// # Errors
-    /// Returns an error if KV cache allocation fails.
+    /// Returns an error if paged KV cache allocation fails.
     pub fn new<M: Model + Send + 'static>(model: M, tokenizer: T) -> Result<Self> {
-        Self::with_max_seq_len(model, tokenizer, None)
+        let engine = Engine::new(model)?;
+        Ok(Self { engine, tokenizer })
     }
 
-    /// Create a new runtime with an explicit KV cache size.
-    ///
-    /// `max_seq_len` caps the KV cache allocation.  When `None`, defaults
-    /// to `min(model.max_position_embeddings, 4096)`.
+    /// Create a new runtime, ignoring `max_seq_len` (kept for API compat).
     ///
     /// # Errors
-    /// Returns an error if KV cache allocation fails.
+    /// Returns an error if paged KV cache allocation fails.
     pub fn with_max_seq_len<M: Model + Send + 'static>(
         model: M,
         tokenizer: T,
-        max_seq_len: Option<usize>,
+        _max_seq_len: Option<usize>,
     ) -> Result<Self> {
-        let engine = Engine::with_max_seq_len(model, max_seq_len)?;
-        Ok(Self { engine, tokenizer })
+        Self::new(model, tokenizer)
     }
 
     /// Get a reference to the underlying engine.

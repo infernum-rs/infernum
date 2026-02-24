@@ -208,7 +208,7 @@ fn run_generate<M: Model + Send + 'static>(
     let start = Instant::now();
 
     let (output_tokens, prompt_len) = if !options.use_kv_cache {
-        let engine = Engine::with_max_seq_len(model, cli.max_seq_len)?;
+        let engine = Engine::new(model)?;
         let input_ids = tokenizer.encode(&cli.prompt, true)?;
         let prompt_len = input_ids.len();
 
