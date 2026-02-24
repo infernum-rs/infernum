@@ -158,6 +158,50 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     let output_shape = [batch_size, num_heads, head_dim];
     let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
 
+    launch_paged_decode::<T>(
+        device,
+        &mut output,
+        q,
+        k_pool,
+        v_pool,
+        &block_tables_gpu,
+        &seq_lens_gpu,
+        &mut scale,
+        &mut softcap_val,
+        block_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_blocks_per_seq,
+        window_size,
+        max_active_len,
+        batch_size,
+    )?;
+
+    Ok(output)
+}
+
+/// Shared kernel launch logic for both eager and indirect paged decode.
+#[allow(clippy::too_many_arguments)]
+fn launch_paged_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    output: &mut CudaTensor<T>,
+    q: &CudaTensor<T>,
+    k_pool: &CudaTensor<T>,
+    v_pool: &CudaTensor<T>,
+    block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
+    seq_lens_gpu: &cudarc::driver::CudaSlice<i32>,
+    scale: &mut f32,
+    softcap_val: &mut f32,
+    block_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_blocks_per_seq: usize,
+    window_size: i32,
+    max_active_len: usize,
+    batch_size: usize,
+) -> Result<()> {
     ensure_paged_decode_kernel::<T>(device)?;
 
     let kernel_name = format!("paged_decode_attention_{}", kernel_suffix::<T>());
@@ -165,8 +209,7 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         .get_func("paged_decode_attention", &kernel_name)
         .unwrap();
 
-    let threads = 256_usize.min(max_active_len.next_power_of_two());
-    let threads = threads.max(1); // at least 1 thread
+    let threads = 256_usize.min(max_active_len.next_power_of_two()).max(1);
 
     // Shared memory: s_q (head_dim) + s_weights (max_active_len) + s_scratch (threads)
     let shared_mem = (head_dim + max_active_len + threads) * std::mem::size_of::<f32>();
@@ -205,8 +248,8 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         std::ptr::from_ref(seq_lens_gpu.device_ptr())
             .cast_mut()
             .cast::<c_void>(),
-        (&raw mut scale).cast::<c_void>(),
-        (&raw mut softcap_val).cast::<c_void>(),
+        (&raw mut *scale).cast::<c_void>(),
+        (&raw mut *softcap_val).cast::<c_void>(),
         (&raw mut bs).cast::<c_void>(),
         (&raw mut nh).cast::<c_void>(),
         (&raw mut nkv).cast::<c_void>(),
@@ -219,7 +262,7 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         func.launch(cfg, &mut args)?;
     }
 
-    Ok(output)
+    Ok(())
 }
 
 /// Batched paged decode attention with GPU-resident block tables and seq lens.
@@ -281,7 +324,6 @@ pub fn paged_attention_decode_indirect<
     let mut scale = 1.0 / (head_dim as f32).sqrt();
     let mut softcap_val = softcap.unwrap_or(0.0);
     let window_size = sliding_window.map_or(0, |w| w as i32);
-    let device = ctx.device();
 
     // Active length accounts for sliding window
     #[allow(clippy::cast_sign_loss)]
@@ -294,65 +336,25 @@ pub fn paged_attention_decode_indirect<
     let output_shape = [batch_size, num_heads, head_dim];
     let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
 
-    ensure_paged_decode_kernel::<T>(device)?;
-
-    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix::<T>());
-    let func = device
-        .get_func("paged_decode_attention", &kernel_name)
-        .unwrap();
-
-    let threads = 256_usize.min(max_active_len.next_power_of_two());
-    let threads = threads.max(1);
-
-    let shared_mem = (head_dim + max_active_len + threads) * std::mem::size_of::<f32>();
-
-    let cfg = LaunchConfig {
-        grid_dim: (num_heads as u32, batch_size as u32, 1),
-        block_dim: (threads as u32, 1, 1),
-        shared_mem_bytes: shared_mem as u32,
-    };
-
-    let out_slice = output.cuda_slice_mut();
-    let q_slice = q.cuda_slice();
-    let k_slice = k_pool.cuda_slice();
-    let v_slice = v_pool.cuda_slice();
-    let mut bs = block_size as i32;
-    let mut nh = num_heads as i32;
-    let mut nkv = num_kv_heads as i32;
-    let mut hd = head_dim as i32;
-    let mut mbps = max_blocks_per_seq as i32;
-    let mut ws = window_size;
-
-    let mut args: Vec<*mut c_void> = vec![
-        std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
-        std::ptr::from_ref(q_slice.device_ptr())
-            .cast_mut()
-            .cast::<c_void>(),
-        std::ptr::from_ref(k_slice.device_ptr())
-            .cast_mut()
-            .cast::<c_void>(),
-        std::ptr::from_ref(v_slice.device_ptr())
-            .cast_mut()
-            .cast::<c_void>(),
-        std::ptr::from_ref(block_tables_gpu.device_ptr())
-            .cast_mut()
-            .cast::<c_void>(),
-        std::ptr::from_ref(seq_lens_gpu.device_ptr())
-            .cast_mut()
-            .cast::<c_void>(),
-        (&raw mut scale).cast::<c_void>(),
-        (&raw mut softcap_val).cast::<c_void>(),
-        (&raw mut bs).cast::<c_void>(),
-        (&raw mut nh).cast::<c_void>(),
-        (&raw mut nkv).cast::<c_void>(),
-        (&raw mut hd).cast::<c_void>(),
-        (&raw mut mbps).cast::<c_void>(),
-        (&raw mut ws).cast::<c_void>(),
-    ];
-
-    unsafe {
-        func.launch(cfg, &mut args)?;
-    }
+    launch_paged_decode::<T>(
+        ctx.device(),
+        &mut output,
+        q,
+        k_pool,
+        v_pool,
+        block_tables_gpu,
+        seq_lens_gpu,
+        &mut scale,
+        &mut softcap_val,
+        block_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_blocks_per_seq,
+        window_size,
+        max_active_len,
+        batch_size,
+    )?;
 
     Ok(output)
 }
