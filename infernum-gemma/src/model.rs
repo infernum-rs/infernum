@@ -1110,7 +1110,7 @@ where
                 v_pool,
                 &[block_tables[i].clone()],
                 paged_kv.block_size(),
-                Some(self.attn_scale),
+                self.config.attn_logit_softcapping,
                 sliding_window,
             )?;
 
@@ -1260,7 +1260,7 @@ where
             paged_kv.block_size(),
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
-            Some(self.attn_scale),
+            self.config.attn_logit_softcapping,
             sliding_window,
         )?;
 
