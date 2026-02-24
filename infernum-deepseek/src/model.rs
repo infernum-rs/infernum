@@ -13,17 +13,17 @@ use std::path::Path;
 
 use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect,
-    broadcast_to_heads, cast_to_f32, concat_inner_dim, embedding_gather,
-    embedding_gather_from_device, fused_attention_decode, fused_attention_decode_indirect,
-    fused_attention_prefill, gather_paged_kv, linear, matmul_bf16_f32, pad_inner_dim,
-    paged_attention_decode, precompute_rope_cache, precompute_rope_cache_scaled,
-    reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim, swiglu, transpose_2d,
-    GemmScalar, LinearWeight, RopeScaling,
+    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_batched_indirect,
+    apply_rope_interleaved_indirect, broadcast_to_heads, cast_to_f32, concat_inner_dim,
+    embedding_gather, embedding_gather_from_device, fused_attention_decode,
+    fused_attention_decode_indirect, fused_attention_prefill, gather_paged_kv, linear,
+    matmul_bf16_f32, pad_inner_dim, paged_attention_decode, paged_attention_decode_indirect,
+    precompute_rope_cache, precompute_rope_cache_scaled, reinterpret_tensor, rms_norm,
+    rms_norm_inplace, split_inner_dim, swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
-    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, KvCache,
-    PagedKvCache, ValidAsZeroBits,
+    BatchedGraphInputs, CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig,
+    KvCache, PagedKvCache, ValidAsZeroBits,
 };
 #[cfg(feature = "nccl")]
 use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig, ShardStrategy};
@@ -1564,6 +1564,183 @@ where
         Ok(h)
     }
 
+    // --- Batched indirect decode (CUDA graph compatible) ---
+
+    /// MLA attention for batched decode using GPU-resident positions, block tables,
+    /// and sequence lengths.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn forward_mla_attention_paged_decode_indirect(
+        &self,
+        hidden: &CudaTensor<T>,
+        weights: &DeepSeekAttentionWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        graph_inputs: &BatchedGraphInputs,
+        max_seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let batch_size = hidden.shape()[0];
+        let num_heads = self.tp_num_heads;
+        let qk_nope_dim = self.config.qk_nope_head_dim;
+        let qk_rope_dim = self.config.qk_rope_head_dim;
+        let qk_head_dim = self.config.qk_head_dim();
+        let v_head_dim = self.config.v_head_dim;
+        let kv_lora_rank = self.config.kv_lora_rank;
+
+        // Q projection (two-stage LoRA)
+        let q_compressed = linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = rms_norm(
+            &q_compressed,
+            &weights.q_a_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = q.reshape(&[batch_size, num_heads, qk_head_dim]);
+        let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
+
+        // KV joint projection
+        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
+        let k_compressed = rms_norm(
+            &k_compressed,
+            &weights.kv_a_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
+        let kv_decompressed =
+            kv_decompressed.reshape(&[batch_size, num_heads, qk_nope_dim + v_head_dim]);
+        let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
+
+        // RoPE (interleaved, batched from GPU-resident positions)
+        let k_rope = k_rope.reshape(&[batch_size, 1, qk_rope_dim]);
+        let q_rope = apply_rope_interleaved_batched_indirect(
+            &q_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            graph_inputs.positions(),
+            batch_size,
+        )?;
+        let k_rope = apply_rope_interleaved_batched_indirect(
+            &k_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            graph_inputs.positions(),
+            batch_size,
+        )?;
+        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
+
+        // Concatenate nope + rope
+        let q = Self::concat_head_dim(&q_nope, &q_rope)?;
+        let k = Self::concat_head_dim(&k_nope, &k_rope)?;
+
+        // Pad V to qk_head_dim
+        let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
+
+        // Batched paged K/V append from GPU-resident block tables + positions
+        paged_kv.append_paged_batched(
+            layer_idx,
+            &k,
+            &v_padded,
+            graph_inputs.block_tables(),
+            graph_inputs.positions(),
+            batch_size,
+            graph_inputs.max_blocks_per_seq(),
+        )?;
+
+        // Paged attention decode from GPU-resident block tables + seq_lens
+        let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+        let attn_output = paged_attention_decode_indirect(
+            &self.ctx,
+            &q,
+            k_pool,
+            v_pool,
+            graph_inputs.block_tables(),
+            graph_inputs.seq_lens(),
+            paged_kv.block_size(),
+            graph_inputs.max_blocks_per_seq(),
+            max_seq_len,
+            None,
+            None,
+        )?;
+
+        // Truncate back to v_head_dim and project
+        let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
+        let attn_output = attn_output.reshape(&[batch_size, num_heads * v_head_dim]);
+        let mut out = linear(&attn_output, &weights.o_proj)?;
+        #[cfg(feature = "nccl")]
+        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        Ok(out)
+    }
+
+    /// Layer forward for batched decode with paged KV cache (indirect).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_paged_decode_indirect(
+        &self,
+        hidden: &CudaTensor<T>,
+        layer: &DeepSeekLayerWeights<T>,
+        layer_idx: usize,
+        paged_kv: &mut PagedKvCache<T>,
+        graph_inputs: &BatchedGraphInputs,
+        max_seq_len: usize,
+    ) -> Result<CudaTensor<T>> {
+        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let attn_output = self.forward_mla_attention_paged_decode_indirect(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            paged_kv,
+            graph_inputs,
+            max_seq_len,
+        )?;
+
+        let (mut h, normed) = add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+        add_inplace(&mut h, &mlp_output)?;
+        Ok(h)
+    }
+
+    /// Batched decode using indirect kernels for CUDA graph capture.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_batch_decode_indirect(
+        &self,
+        graph_inputs: &BatchedGraphInputs,
+        paged_kvs: &mut [PagedKvCache<T>],
+        max_seq_len: usize,
+    ) -> Result<CudaTensor<f32>> {
+        let batch_size = graph_inputs.max_batch_size();
+        let paged_kv = &mut paged_kvs[0];
+
+        // Embed from GPU-resident token IDs
+        let mut hidden = embedding_gather_from_device(
+            &self.ctx,
+            &self.embed_tokens,
+            graph_inputs.token_ids(),
+            batch_size,
+        )?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_paged_decode_indirect(
+                &hidden,
+                layer,
+                layer_idx,
+                paged_kv,
+                graph_inputs,
+                max_seq_len,
+            )?;
+        }
+
+        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+
+        self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
+    }
+
     // --- Public forward methods ---
 
     /// Forward pass with KV cache (prefill phase)
@@ -1787,6 +1964,15 @@ where
             self.ctx.device().dtod_copy(&src, &mut dst)?;
         }
         Ok(output)
+    }
+
+    fn forward_batch_decode_indirect(
+        &self,
+        graph_inputs: &BatchedGraphInputs,
+        paged_kvs: &mut [PagedKvCache<T>],
+        max_seq_len: usize,
+    ) -> Result<CudaTensor<f32>> {
+        self.forward_batch_decode_indirect(graph_inputs, paged_kvs, max_seq_len)
     }
 }
 

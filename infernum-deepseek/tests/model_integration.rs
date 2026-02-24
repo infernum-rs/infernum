@@ -145,4 +145,101 @@ mod deepseek_v3_tiny {
         assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
+
+    /// Tests `forward_batch_decode_indirect` by calling it directly
+    /// with a `BatchedGraphInputs` buffer. This validates the batched
+    /// indirect forward path used by the inflight batching engine.
+    ///
+    /// Note: DeepSeek's MoE routing uses GPU→CPU copies (`to_vec()`),
+    /// which prevents CUDA graph capture. This test exercises the
+    /// indirect kernels (batched RoPE, paged append/attention) without
+    /// actually capturing a CUDA graph.
+    #[test]
+    fn batched_decode_indirect_no_nan() {
+        use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
+        use infernum::cuda::{BatchedGraphInputs, PagedKvCache};
+
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let model_dir = model_dir();
+        let model =
+            DeepSeekModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let model_config = Model::config(&model);
+        let block_size = 16;
+        let num_blocks = 256;
+        let block_config = BlockConfig {
+            block_size,
+            num_blocks,
+        };
+        let mut paged_kvs = vec![PagedKvCache::new(
+            &ctx,
+            model_config.num_layers,
+            &block_config,
+            model_config.num_kv_heads,
+            model_config.head_dim,
+        )
+        .expect("Failed to create paged KV cache")];
+        let mut allocator = BlockAllocator::new(&block_config);
+
+        // Prefill a prompt first
+        let input_ids = tokenizer.encode("The capital of France is", true).unwrap();
+        let num_prompt_blocks = input_ids.len().div_ceil(block_size);
+        let mut bt = BlockTable::new(block_size);
+        for _ in 0..num_prompt_blocks {
+            let block_idx = allocator.allocate().expect("Failed to allocate block");
+            bt.append_block(block_idx);
+        }
+        let _prefill_logits = model
+            .forward_prefill_paged(&input_ids, &mut paged_kvs, &bt, 0)
+            .expect("Prefill failed");
+        bt.advance(input_ids.len());
+
+        // Allocate one more block for the decode token
+        if bt.needs_new_block() {
+            let block_idx = allocator
+                .allocate()
+                .expect("Failed to allocate decode block");
+            bt.append_block(block_idx);
+        }
+
+        // Prepare batched indirect decode step
+        let max_blocks_per_seq = model_config
+            .max_seq_len
+            .div_ceil(block_size)
+            .min(num_blocks);
+        let dummy_block = allocator.allocate().expect("need dummy block");
+        let batch_size = 1;
+        let mut graph_inputs =
+            BatchedGraphInputs::new(ctx.device(), batch_size, max_blocks_per_seq, dummy_block)
+                .expect("Failed to allocate BatchedGraphInputs");
+
+        // Build flattened block table: (1 × max_blocks_per_seq)
+        let mut block_tables_flat: Vec<i32> = bt.blocks().iter().map(|&b| b as i32).collect();
+        block_tables_flat.resize(max_blocks_per_seq, 0);
+
+        let position = input_ids.len() as i32;
+        let seq_len = position + 1; // includes the new token
+        graph_inputs
+            .update(
+                &[2_u32],    // dummy next token id
+                &[position], // position for this decode step
+                &block_tables_flat,
+                &[seq_len], // sequence length after this token
+            )
+            .expect("Failed to update graph inputs");
+
+        let max_seq_len = max_blocks_per_seq * block_size;
+        let logits = model
+            .forward_batch_decode_indirect(&graph_inputs, &mut paged_kvs, max_seq_len)
+            .expect("Batched indirect decode failed");
+
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
 }
