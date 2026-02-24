@@ -19,12 +19,12 @@ use infernum::cuda::ops::{
     fused_attention_decode_indirect, fused_attention_prefill, fused_attention_prefill_with_lse,
     gather_paged_kv, linear, matmul, matmul_bf16_f32, pad_inner_dim, paged_attention_decode,
     paged_attention_decode_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
-    reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim, swiglu, transpose_2d,
-    GemmScalar, LinearWeight, RopeScaling,
+    quantized_matmul, reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim, swiglu,
+    transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
     BatchedGraphInputs, CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig,
-    KvCache, PagedKvCache, ValidAsZeroBits,
+    KvCache, PagedKvCache, QuantizedTensor, ValidAsZeroBits,
 };
 #[cfg(feature = "nccl")]
 use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig, ShardStrategy};
@@ -187,6 +187,53 @@ fn split_kv_b_proj_dense<T: TensorDType + DeviceRepr + Default>(
         CudaTensor::from_slice(ctx, &[num_heads, qk_nope_dim, kv_lora_rank], &k_t_data)?;
 
     Ok((k_tensor, v_tensor, k_t_tensor))
+}
+
+/// Split a quantized `kv_b_proj` by dequantizing to dense first, then splitting.
+///
+/// The quantized weight has shape `(out_features, in_features)` where
+/// `out_features = num_heads * (qk_nope_dim + v_head_dim)` and `in_features = kv_lora_rank`.
+/// We dequantize via identity matmul: `I @ W^T = W^T`, yielding the pre-transposed dense
+/// weight `(kv_lora_rank, out_features)` that `split_kv_b_proj_dense` expects.
+///
+/// This is a one-time cost at model load time.
+fn split_kv_b_proj_quantized<T: TensorDType + DeviceRepr + Default>(
+    ctx: &CudaContext,
+    w: &QuantizedTensor,
+    num_heads: usize,
+    qk_nope_dim: usize,
+    v_head_dim: usize,
+) -> Result<(CudaTensor<T>, CudaTensor<T>, CudaTensor<T>)> {
+    let shape = w.shape();
+    let out_features = shape[0];
+    let kv_lora_rank = shape[1];
+    assert_eq!(
+        out_features,
+        num_heads * (qk_nope_dim + v_head_dim),
+        "split_kv_b_proj_quantized: out_features mismatch"
+    );
+
+    // Build identity matrix on host
+    let mut identity_data = vec![0.0f32; kv_lora_rank * kv_lora_rank];
+    for i in 0..kv_lora_rank {
+        identity_data[i * kv_lora_rank + i] = 1.0;
+    }
+    let identity =
+        CudaTensor::<f32>::from_slice(ctx, &[kv_lora_rank, kv_lora_rank], &identity_data)?;
+
+    // Dequantize: I @ W^T → (kv_lora_rank, out_features) as f32
+    let dense_f32 = quantized_matmul(&identity, w)?;
+
+    // Convert to T and split
+    let dense_t: CudaTensor<T> = match T::DTYPE {
+        infernum::dtype::DType::F32 => reinterpret_tensor(dense_f32),
+        infernum::dtype::DType::BF16 => {
+            reinterpret_tensor(infernum::cuda::ops::cast_f32_to_bf16(&dense_f32)?)
+        }
+        other => panic!("split_kv_b_proj_quantized: unsupported dtype {other}"),
+    };
+
+    split_kv_b_proj_dense(ctx, &dense_t, num_heads, qk_nope_dim, v_head_dim)
 }
 
 // --- Weight structures ---
@@ -385,8 +432,15 @@ where
                     )?;
                     (LinearWeight::Dense(k), v, k_t)
                 }
-                LinearWeight::Quantized(_) => {
-                    panic!("Quantized kv_b_proj splitting not yet implemented")
+                LinearWeight::Quantized(w) => {
+                    let (k, v, k_t) = split_kv_b_proj_quantized(
+                        ctx,
+                        w,
+                        config.num_attention_heads,
+                        config.qk_nope_head_dim,
+                        config.v_head_dim,
+                    )?;
+                    (LinearWeight::Dense(k), v, k_t)
                 }
             };
 
@@ -767,8 +821,15 @@ where
                     )?;
                     (LinearWeight::Dense(k), v, k_t)
                 }
-                LinearWeight::Quantized(_) => {
-                    panic!("Quantized kv_b_proj splitting not yet implemented")
+                LinearWeight::Quantized(w) => {
+                    let (k, v, k_t) = split_kv_b_proj_quantized(
+                        ctx,
+                        w,
+                        tp_num_heads,
+                        config.qk_nope_head_dim,
+                        config.v_head_dim,
+                    )?;
+                    (LinearWeight::Dense(k), v, k_t)
                 }
             };
 
