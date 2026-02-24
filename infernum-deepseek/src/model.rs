@@ -16,10 +16,10 @@ use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_batched_indirect,
     apply_rope_interleaved_indirect, broadcast_to_heads, cast_to_f32, concat_inner_dim,
     embedding_gather, embedding_gather_from_device, fused_attention_decode,
-    fused_attention_decode_indirect, fused_attention_prefill, gather_paged_kv, linear,
-    matmul_bf16_f32, pad_inner_dim, paged_attention_decode, paged_attention_decode_indirect,
-    precompute_rope_cache, precompute_rope_cache_scaled, reinterpret_tensor, rms_norm,
-    rms_norm_inplace, split_inner_dim, swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
+    fused_attention_decode_indirect, fused_attention_prefill, linear, matmul_bf16_f32,
+    pad_inner_dim, paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache,
+    precompute_rope_cache_scaled, reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim,
+    swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
     BatchedGraphInputs, CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig,
@@ -1228,45 +1228,45 @@ where
         let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
 
         // --- RoPE ---
-        // k_rope is [seq, qk_rope_dim], reshape to [seq, 1, qk_rope_dim] for RoPE
         let k_rope = k_rope.reshape(&[seq_len, 1, qk_rope_dim]);
         let q_rope =
             apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, position_offset)?;
         let k_rope =
             apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, position_offset)?;
 
-        // Broadcast k_rope from [seq, 1, rope_dim] → [seq, num_heads, rope_dim]
-        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
-
-        // --- Concatenate nope and rope ---
-        let q = Self::concat_head_dim(&q_nope, &q_rope)?;
-        let k = Self::concat_head_dim(&k_nope, &k_rope)?;
-
-        // --- Pad V to qk_head_dim for fused attention ---
-        let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
-
-        // --- KV cache ---
-        kv_cache.append(layer_idx, &k, &v_padded)?;
+        // --- Write compressed entry to KV cache ---
+        let k_compressed_3d = k_compressed.reshape(&[seq_len, 1, kv_lora_rank]);
+        let cache_entry = concat_inner_dim(&k_compressed_3d, &k_rope)?;
+        kv_cache.append(layer_idx, &cache_entry, &cache_entry)?;
         let total_len = kv_cache.current_len() + seq_len;
-        let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total_len);
 
         // --- Attention ---
         let attn_output = if seq_len == 1 {
-            fused_attention_decode(&q, &k_full, &v_full, None, None, None)?
-        } else {
-            fused_attention_prefill(
-                &q,
-                &k_full,
-                &v_full,
-                kv_cache.current_len(),
-                None,
-                None,
-                None,
-            )?
-        };
+            // Decode: absorbed attention in compressed space
+            let q_nope_flat = q_nope.reshape(&[1, num_heads * qk_nope_dim]);
+            let q_absorbed_nope = linear(&q_nope_flat, &weights.kv_b_proj_k_t)?;
+            let q_absorbed_nope = q_absorbed_nope.reshape(&[1, num_heads, kv_lora_rank]);
+            let q_absorbed = concat_inner_dim(&q_absorbed_nope, &q_rope)?;
 
-        // --- Truncate attention output back to v_head_dim ---
-        let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
+            let (k_full, _v_full) = kv_cache.get_up_to(layer_idx, total_len);
+            let attn_compressed =
+                fused_attention_decode(&q_absorbed, &k_full, &k_full, None, None, None)?;
+
+            // Absorb V: discard rope, decompress
+            let attn_nope = split_inner_dim(&attn_compressed, kv_lora_rank, qk_rope_dim)?.0;
+            let attn_nope_flat = attn_nope.reshape(&[1, num_heads * kv_lora_rank]);
+            let v_output = linear(&attn_nope_flat, &weights.kv_b_proj_v)?;
+            v_output.reshape(&[1, num_heads, v_head_dim])
+        } else {
+            // Prefill: use locally-decompressed K/V
+            let k_rope_broadcast = Self::broadcast_kv_rope(&k_rope, num_heads)?;
+            let q = Self::concat_head_dim(&q_nope, &q_rope)?;
+            let k = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
+            let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
+            let attn =
+                fused_attention_prefill(&q, &k, &v_padded, position_offset, None, None, None)?;
+            Self::truncate_attn_output(&attn, v_head_dim)?
+        };
 
         // --- Output projection ---
         let attn_output = attn_output.reshape(&[seq_len, num_heads * v_head_dim]);
@@ -1302,6 +1302,7 @@ where
         let q = q.reshape(&[1, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
+        // KV joint projection (compressed only)
         let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
         let k_compressed = rms_norm(
@@ -1309,9 +1310,6 @@ where
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
-        let kv_decompressed = kv_decompressed.reshape(&[1, num_heads, qk_nope_dim + v_head_dim]);
-        let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
 
         let k_rope = k_rope.reshape(&[1, 1, qk_rope_dim]);
         let position = kv_cache.current_position();
@@ -1319,19 +1317,24 @@ where
             apply_rope_interleaved_indirect(&q_rope, &self.cos_cache, &self.sin_cache, position)?;
         let k_rope =
             apply_rope_interleaved_indirect(&k_rope, &self.cos_cache, &self.sin_cache, position)?;
-        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
 
-        let q = Self::concat_head_dim(&q_nope, &q_rope)?;
-        let k = Self::concat_head_dim(&k_nope, &k_rope)?;
-        let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
+        // Write compressed entry to KV cache
+        let k_compressed_3d = k_compressed.reshape(&[1, 1, kv_lora_rank]);
+        let cache_entry = concat_inner_dim(&k_compressed_3d, &k_rope)?;
+        kv_cache.append_indirect(layer_idx, &cache_entry, &cache_entry)?;
 
-        kv_cache.append_indirect(layer_idx, &k, &v_padded)?;
-        let (k_full, v_full) = kv_cache.full_buffers(layer_idx);
+        // Absorb K into Q
+        let q_nope_flat = q_nope.reshape(&[1, num_heads * qk_nope_dim]);
+        let q_absorbed_nope = linear(&q_nope_flat, &weights.kv_b_proj_k_t)?;
+        let q_absorbed_nope = q_absorbed_nope.reshape(&[1, num_heads, kv_lora_rank]);
+        let q_absorbed = concat_inner_dim(&q_absorbed_nope, &q_rope)?;
+
+        let (k_full, _v_full) = kv_cache.full_buffers(layer_idx);
         let total_len = kv_cache.current_total_len();
-        let attn_output = fused_attention_decode_indirect(
-            &q,
+        let attn_compressed = fused_attention_decode_indirect(
+            &q_absorbed,
             k_full,
-            v_full,
+            k_full,
             total_len,
             kv_cache.graph_max_seq_len(),
             None,
@@ -1339,8 +1342,11 @@ where
             None,
         )?;
 
-        let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
-        let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
+        // Absorb V: discard rope, decompress
+        let attn_nope = split_inner_dim(&attn_compressed, kv_lora_rank, qk_rope_dim)?.0;
+        let attn_nope_flat = attn_nope.reshape(&[1, num_heads * kv_lora_rank]);
+        let v_output = linear(&attn_nope_flat, &weights.kv_b_proj_v)?;
+        let attn_output = v_output.reshape(&[1, num_heads * v_head_dim]);
         let mut out = linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
@@ -1517,25 +1523,25 @@ where
         let k_rope = k_rope.reshape(&[seq_len, 1, qk_rope_dim]);
         let q_rope = apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
         let k_rope = apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
-        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
 
-        // Concatenate nope + rope
+        // Write compressed entry to paged cache: (seq_len, 1, kv_lora_rank + qk_rope_dim)
+        let k_compressed_3d = k_compressed.reshape(&[seq_len, 1, kv_lora_rank]);
+        let cache_entry = concat_inner_dim(&k_compressed_3d, &k_rope)?;
+        paged_kv.append_paged(
+            layer_idx,
+            block_table,
+            &cache_entry,
+            &cache_entry,
+            start_pos,
+        )?;
+
+        // Local attention uses decompressed K/V (no absorption during prefill)
+        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
         let q = Self::concat_head_dim(&q_nope, &q_rope)?;
         let k = Self::concat_head_dim(&k_nope, &k_rope)?;
-
-        // Pad V to qk_head_dim
         let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
 
-        // Write K/V into paged cache
-        paged_kv.append_paged(layer_idx, block_table, &k, &v_padded, start_pos)?;
-
-        // Gather contiguous K/V for fused prefill kernel
-        let mut gather_table = block_table.clone();
-        gather_table.advance(seq_len);
-        let (k_contig, v_contig) = gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
-
-        let attn_output =
-            fused_attention_prefill(&q, &k_contig, &v_contig, start_pos, None, None, None)?;
+        let attn_output = fused_attention_prefill(&q, &k, &v_padded, start_pos, None, None, None)?;
 
         // Truncate back to v_head_dim and project
         let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
@@ -1574,7 +1580,7 @@ where
         let q = q.reshape(&[1, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
-        // KV joint projection
+        // KV joint projection (compressed only — no decompression for absorbed decode)
         let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
         let k_compressed = rms_norm(
@@ -1582,43 +1588,43 @@ where
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
-        let kv_decompressed = kv_decompressed.reshape(&[1, num_heads, qk_nope_dim + v_head_dim]);
-        let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
 
         // RoPE (interleaved)
         let k_rope = k_rope.reshape(&[1, 1, qk_rope_dim]);
         let q_rope = apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, position)?;
         let k_rope = apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, position)?;
-        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
 
-        // Concatenate nope + rope
-        let q = Self::concat_head_dim(&q_nope, &q_rope)?;
-        let k = Self::concat_head_dim(&k_nope, &k_rope)?;
+        // Write compressed entry to paged cache: (1, 1, kv_lora_rank + qk_rope_dim)
+        let k_compressed_3d = k_compressed.reshape(&[1, 1, kv_lora_rank]);
+        let cache_entry = concat_inner_dim(&k_compressed_3d, &k_rope)?;
+        paged_kv.append_paged(layer_idx, block_table, &cache_entry, &cache_entry, position)?;
 
-        // Pad V to qk_head_dim
-        let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
+        // Absorbed decode attention (Q absorption + paged attention in compressed space)
+        let q_nope_flat = q_nope.reshape(&[1, num_heads * qk_nope_dim]);
+        let q_absorbed_nope = linear(&q_nope_flat, &weights.kv_b_proj_k_t)?;
+        let q_absorbed_nope = q_absorbed_nope.reshape(&[1, num_heads, kv_lora_rank]);
+        let q_absorbed = concat_inner_dim(&q_absorbed_nope, &q_rope)?;
 
-        // Append to paged cache
-        paged_kv.append_paged(layer_idx, block_table, &k, &v_padded, position)?;
-
-        // Paged attention decode
         let mut table_with_current = block_table.clone();
         table_with_current.advance(1);
-        let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+        let (k_pool, _v_pool) = paged_kv.get_pools(layer_idx);
         let attn_output = paged_attention_decode(
             &self.ctx,
-            &q,
+            &q_absorbed,
             k_pool,
-            v_pool,
+            k_pool,
             &[table_with_current],
             paged_kv.block_size(),
             None,
             None,
         )?;
 
-        // Truncate back to v_head_dim and project
-        let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
+        // Absorb V: discard rope portion, decompress via kv_b_proj_v
+        let attn_compressed = split_inner_dim(&attn_output, kv_lora_rank, qk_rope_dim)?.0;
+        let attn_compressed_flat = attn_compressed.reshape(&[1, num_heads * kv_lora_rank]);
+        let v_output = linear(&attn_compressed_flat, &weights.kv_b_proj_v)?;
+        let attn_output = v_output.reshape(&[1, num_heads, v_head_dim]);
+
         let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
         let mut out = linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
@@ -1726,7 +1732,7 @@ where
         let q = q.reshape(&[batch_size, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
-        // KV joint projection
+        // KV joint projection (compressed only — no decompression via kv_b_proj)
         let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
         let k_compressed = rms_norm(
@@ -1734,10 +1740,6 @@ where
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
-        let kv_decompressed =
-            kv_decompressed.reshape(&[batch_size, num_heads, qk_nope_dim + v_head_dim]);
-        let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
 
         // RoPE (interleaved, batched from GPU-resident positions)
         let k_rope = k_rope.reshape(&[batch_size, 1, qk_rope_dim]);
@@ -1755,33 +1757,33 @@ where
             graph_inputs.positions(),
             batch_size,
         )?;
-        let k_rope = Self::broadcast_kv_rope(&k_rope, num_heads)?;
 
-        // Concatenate nope + rope
-        let q = Self::concat_head_dim(&q_nope, &q_rope)?;
-        let k = Self::concat_head_dim(&k_nope, &k_rope)?;
-
-        // Pad V to qk_head_dim
-        let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
-
-        // Batched paged K/V append from GPU-resident block tables + positions
+        // Write compressed entry to paged cache: (batch_size, 1, kv_lora_rank + qk_rope_dim)
+        let k_compressed_3d = k_compressed.reshape(&[batch_size, 1, kv_lora_rank]);
+        let cache_entry = concat_inner_dim(&k_compressed_3d, &k_rope)?;
         paged_kv.append_paged_batched(
             layer_idx,
-            &k,
-            &v_padded,
+            &cache_entry,
+            &cache_entry,
             graph_inputs.block_tables(),
             graph_inputs.positions(),
             batch_size,
             graph_inputs.max_blocks_per_seq(),
         )?;
 
-        // Paged attention decode from GPU-resident block tables + seq_lens
-        let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+        // Absorb K into Q: q_absorbed = concat(q_nope @ kv_b_proj_k_t, q_rope)
+        let q_nope_flat = q_nope.reshape(&[batch_size, num_heads * qk_nope_dim]);
+        let q_absorbed_nope = linear(&q_nope_flat, &weights.kv_b_proj_k_t)?;
+        let q_absorbed_nope = q_absorbed_nope.reshape(&[batch_size, num_heads, kv_lora_rank]);
+        let q_absorbed = concat_inner_dim(&q_absorbed_nope, &q_rope)?;
+
+        // Paged attention in compressed space (K pool = V pool)
+        let (k_pool, _v_pool) = paged_kv.get_pools(layer_idx);
         let attn_output = paged_attention_decode_indirect(
             &self.ctx,
-            &q,
+            &q_absorbed,
             k_pool,
-            v_pool,
+            k_pool,
             graph_inputs.block_tables(),
             graph_inputs.seq_lens(),
             paged_kv.block_size(),
@@ -1791,9 +1793,11 @@ where
             None,
         )?;
 
-        // Truncate back to v_head_dim and project
-        let attn_output = Self::truncate_attn_output(&attn_output, v_head_dim)?;
-        let attn_output = attn_output.reshape(&[batch_size, num_heads * v_head_dim]);
+        // Absorb V: discard rope portion, decompress via kv_b_proj_v
+        let attn_compressed = split_inner_dim(&attn_output, kv_lora_rank, qk_rope_dim)?.0;
+        let attn_compressed_flat = attn_compressed.reshape(&[batch_size, num_heads * kv_lora_rank]);
+        let v_output = linear(&attn_compressed_flat, &weights.kv_b_proj_v)?;
+        let attn_output = v_output.reshape(&[batch_size, num_heads * v_head_dim]);
         let mut out = linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
