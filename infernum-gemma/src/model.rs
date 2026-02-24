@@ -711,7 +711,7 @@ where
                 loader,
                 &format!("{prefix}.self_attn.k_proj.weight"),
                 &shard,
-                ShardStrategy::Row,
+                ShardStrategy::Column,
                 qc,
             )?;
             let v = load_linear_sharded::<T>(
@@ -719,7 +719,7 @@ where
                 loader,
                 &format!("{prefix}.self_attn.v_proj.weight"),
                 &shard,
-                ShardStrategy::Row,
+                ShardStrategy::Column,
                 qc,
             )?;
             let kv_dim = tp_num_kv_heads * config.head_dim;
@@ -753,7 +753,7 @@ where
                 loader,
                 &format!("{prefix}.mlp.gate_proj.weight"),
                 &shard,
-                ShardStrategy::Row,
+                ShardStrategy::Column,
                 qc,
             )?;
             let up = load_linear_sharded::<T>(
@@ -761,7 +761,7 @@ where
                 loader,
                 &format!("{prefix}.mlp.up_proj.weight"),
                 &shard,
-                ShardStrategy::Row,
+                ShardStrategy::Column,
                 qc,
             )?;
             let tp_intermediate = config.intermediate_size / world_size;
@@ -803,7 +803,7 @@ where
                         loader,
                         &format!("{prefix}.self_attn.q_proj.weight"),
                         &shard,
-                        ShardStrategy::Row,
+                        ShardStrategy::Column,
                         qc,
                     )?,
                     kv_proj,
@@ -812,7 +812,7 @@ where
                         loader,
                         &format!("{prefix}.self_attn.o_proj.weight"),
                         &shard,
-                        ShardStrategy::Column,
+                        ShardStrategy::Row,
                         qc,
                     )?,
                     q_norm,
@@ -825,7 +825,7 @@ where
                         loader,
                         &format!("{prefix}.mlp.down_proj.weight"),
                         &shard,
-                        ShardStrategy::Column,
+                        ShardStrategy::Row,
                         qc,
                     )?,
                 },
