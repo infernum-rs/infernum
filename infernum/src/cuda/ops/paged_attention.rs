@@ -134,6 +134,7 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         .unwrap_or(0);
 
     // Active length accounts for sliding window
+    #[allow(clippy::cast_sign_loss)]
     let max_active_len = if window_size > 0 {
         max_seq_len.min(window_size as usize)
     } else {
@@ -188,20 +189,30 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     let mut ws = window_size;
 
     let mut args: Vec<*mut c_void> = vec![
-        out_slice.device_ptr_mut() as *mut _ as *mut c_void,
-        q_slice.device_ptr() as *const _ as *mut c_void,
-        k_slice.device_ptr() as *const _ as *mut c_void,
-        v_slice.device_ptr() as *const _ as *mut c_void,
-        block_tables_gpu.device_ptr() as *const _ as *mut c_void,
-        seq_lens_gpu.device_ptr() as *const _ as *mut c_void,
-        (&mut scale) as *mut f32 as *mut c_void,
-        (&mut softcap_val) as *mut f32 as *mut c_void,
-        (&mut bs) as *mut i32 as *mut c_void,
-        (&mut nh) as *mut i32 as *mut c_void,
-        (&mut nkv) as *mut i32 as *mut c_void,
-        (&mut hd) as *mut i32 as *mut c_void,
-        (&mut mbps) as *mut i32 as *mut c_void,
-        (&mut ws) as *mut i32 as *mut c_void,
+        std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_ref(q_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(k_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(v_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(block_tables_gpu.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(seq_lens_gpu.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        (&raw mut scale).cast::<c_void>(),
+        (&raw mut softcap_val).cast::<c_void>(),
+        (&raw mut bs).cast::<c_void>(),
+        (&raw mut nh).cast::<c_void>(),
+        (&raw mut nkv).cast::<c_void>(),
+        (&raw mut hd).cast::<c_void>(),
+        (&raw mut mbps).cast::<c_void>(),
+        (&raw mut ws).cast::<c_void>(),
     ];
 
     unsafe {
@@ -273,6 +284,7 @@ pub fn paged_attention_decode_indirect<
     let device = ctx.device();
 
     // Active length accounts for sliding window
+    #[allow(clippy::cast_sign_loss)]
     let max_active_len = if window_size > 0 {
         max_seq_len.min(window_size as usize)
     } else {
@@ -312,20 +324,30 @@ pub fn paged_attention_decode_indirect<
     let mut ws = window_size;
 
     let mut args: Vec<*mut c_void> = vec![
-        out_slice.device_ptr_mut() as *mut _ as *mut c_void,
-        q_slice.device_ptr() as *const _ as *mut c_void,
-        k_slice.device_ptr() as *const _ as *mut c_void,
-        v_slice.device_ptr() as *const _ as *mut c_void,
-        block_tables_gpu.device_ptr() as *const _ as *mut c_void,
-        seq_lens_gpu.device_ptr() as *const _ as *mut c_void,
-        (&mut scale) as *mut f32 as *mut c_void,
-        (&mut softcap_val) as *mut f32 as *mut c_void,
-        (&mut bs) as *mut i32 as *mut c_void,
-        (&mut nh) as *mut i32 as *mut c_void,
-        (&mut nkv) as *mut i32 as *mut c_void,
-        (&mut hd) as *mut i32 as *mut c_void,
-        (&mut mbps) as *mut i32 as *mut c_void,
-        (&mut ws) as *mut i32 as *mut c_void,
+        std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_ref(q_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(k_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(v_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(block_tables_gpu.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(seq_lens_gpu.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        (&raw mut scale).cast::<c_void>(),
+        (&raw mut softcap_val).cast::<c_void>(),
+        (&raw mut bs).cast::<c_void>(),
+        (&raw mut nh).cast::<c_void>(),
+        (&raw mut nkv).cast::<c_void>(),
+        (&raw mut hd).cast::<c_void>(),
+        (&raw mut mbps).cast::<c_void>(),
+        (&raw mut ws).cast::<c_void>(),
     ];
 
     unsafe {
