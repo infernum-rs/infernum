@@ -1,8 +1,13 @@
-//! Token-level inference engine
+//! Token-level inference engine with inflight (continuous) batching
 //!
-//! The [`Engine`] manages a model and its KV cache, providing token-level
-//! generation (tokens in, tokens out). It is generic over any [`Model`]
-//! implementation.
+//! The [`Engine`] manages a model and paged KV caches, providing
+//! token-level generation (tokens in, tokens out). Multiple requests
+//! share the GPU, with scheduling decisions made at every decode step.
+//!
+//! Decode steps use `forward_batch_decode` to process all active sequences
+//! in a single forward pass (one weight read). Multi-GPU is supported:
+//! one [`PagedKvCache`] is allocated per device, sharing the same logical
+//! block indices via a single [`BlockAllocator`].
 //!
 //! The engine spawns a long-lived worker thread at construction. Callers
 //! submit generation requests via [`Engine::submit`] and receive tokens
@@ -11,9 +16,16 @@
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
+use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig};
 use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
-use infernum::cuda::{CudaGraph, KvCache};
-use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams};
+use infernum::cuda::{BatchedGraphInputs, CudaGraph, PagedKvCache};
+use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams, Tensor};
+
+use crate::scheduler::{BatchConfig, Scheduler, SequencePhase};
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
 /// Why generation stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,18 +77,22 @@ impl TokenSender for Box<dyn TokenSender> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
+
 /// A generation request submitted to the engine's worker thread.
 struct GenerationRequest {
-    input_ids: Vec<u32>,
+    prompt_ids: Vec<u32>,
     options: GenerateOptions,
     token_tx: Box<dyn TokenSender>,
 }
 
 /// Handle to the engine's worker thread.
 ///
-/// The engine owns a long-lived thread that processes generation requests
-/// sequentially. Callers submit requests via [`Engine::submit`] and receive
-/// tokens through the provided [`TokenSender`].
+/// The engine owns a long-lived thread that runs an iteration loop,
+/// processing multiple requests concurrently via inflight batching
+/// with paged KV caches.
 pub struct Engine {
     request_tx: mpsc::Sender<GenerationRequest>,
     model_config: ModelConfig,
@@ -84,35 +100,51 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Create a new engine wrapping the given model.
+    /// Create a new engine wrapping the given model with default batch
+    /// configuration.
     ///
-    /// Spawns a long-lived worker thread that owns the model and KV caches.
-    /// The thread loops waiting for [`GenerationRequest`]s submitted via
-    /// [`Engine::submit`].
+    /// Uses [`BatchConfig::default()`] which provides sensible defaults
+    /// for single-request usage (batch size 1, 512 blocks of size 16).
     ///
     /// # Errors
-    /// Returns an error if KV cache allocation fails.
+    /// Returns an error if paged KV cache allocation fails.
     pub fn new<M: Model + Send + 'static>(model: M) -> Result<Self> {
+        Self::with_config(model, BatchConfig::default())
+    }
+
+    /// Create a new engine with a custom batch configuration.
+    ///
+    /// Spawns a worker thread that runs the batched iteration loop.
+    ///
+    /// # Errors
+    /// Returns an error if paged KV cache allocation fails.
+    pub fn with_config<M: Model + Send + 'static>(
+        model: M,
+        batch_config: BatchConfig,
+    ) -> Result<Self> {
         infernum::fusion::init();
         let model_config = model.config();
-        let kv_caches = model
-            .devices()
-            .iter()
-            .map(|ctx| {
-                KvCache::new(
-                    ctx,
-                    model_config.num_layers,
-                    model_config.max_seq_len,
-                    model_config.num_kv_heads,
-                    model_config.head_dim,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+
+        let block_config = BlockConfig {
+            block_size: batch_config.block_size,
+            num_blocks: batch_config.num_blocks,
+        };
+        let mut paged_kvs = Vec::new();
+        for ctx in model.devices() {
+            paged_kvs.push(PagedKvCache::new(
+                ctx,
+                model_config.num_layers,
+                &block_config,
+                model_config.num_kv_heads,
+                model_config.head_dim,
+            )?);
+        }
+        let allocator = BlockAllocator::new(&block_config);
 
         let (request_tx, request_rx) = mpsc::channel::<GenerationRequest>();
 
         let worker = thread::spawn(move || {
-            worker_loop(model, kv_caches, request_rx);
+            worker_loop(model, paged_kvs, allocator, batch_config, request_rx);
         });
 
         Ok(Self {
@@ -131,9 +163,9 @@ impl Engine {
     /// Submit a generation request with a caller-provided token sender.
     ///
     /// Tokens are sent through `token_tx` as they are generated. The sender
-    /// receives `Ok(token_id)` for each token, and generation stops when
-    /// either the maximum token count is reached, an EOS token is produced,
-    /// or the sender returns `false` (receiver dropped).
+    /// receives [`GenerationEvent::Token`] for each token, and generation
+    /// stops when either the maximum token count is reached, an EOS token
+    /// is produced, or the sender returns `false` (receiver dropped).
     pub fn submit(
         &self,
         input_ids: Vec<u32>,
@@ -141,7 +173,7 @@ impl Engine {
         token_tx: impl TokenSender + 'static,
     ) {
         let request = GenerationRequest {
-            input_ids,
+            prompt_ids: input_ids,
             options,
             token_tx: Box::new(token_tx),
         };
@@ -152,12 +184,8 @@ impl Engine {
 
     /// Generate tokens, blocking until complete.
     ///
-    /// # Arguments
-    /// * `input_ids` - Prompt token IDs
-    /// * `options` - Generation options (sampling, max tokens, KV cache, etc.)
-    ///
     /// # Returns
-    /// The generated token IDs (not including the prompt).
+    /// The full sequence (prompt + generated tokens).
     ///
     /// # Errors
     /// Returns an error if a forward pass fails.
@@ -184,7 +212,7 @@ impl Engine {
     ///
     /// # Arguments
     /// * `input_ids` - Prompt token IDs
-    /// * `options` - Generation options (sampling, max tokens, KV cache, etc.)
+    /// * `options` - Generation options (sampling, max tokens, etc.)
     /// * `consumer` - Closure that processes tokens from the receiver
     ///
     /// # Returns
@@ -204,224 +232,522 @@ impl Engine {
     }
 }
 
-/// The worker thread's main loop. Processes requests sequentially.
-#[allow(clippy::needless_pass_by_value)]
+// ---------------------------------------------------------------------------
+// Worker loop
+// ---------------------------------------------------------------------------
+
+/// Mutable state for CUDA graph capture/replay during batched decode.
+struct GraphState {
+    /// Pre-allocated GPU buffers for indirect kernels.
+    graph_inputs: BatchedGraphInputs,
+    /// CUDA graph manager (capture/replay).
+    graph: CudaGraph,
+    /// Decode step counter: 0 = first (warmup), 1 = capture, 2+ = replay.
+    decode_step: usize,
+    /// Logits tensor from the captured graph (same device addresses on replay).
+    captured_logits: Option<CudaTensor<f32>>,
+    /// Conservative upper bound for shared memory sizing in paged attention.
+    graph_max_seq_len: usize,
+}
+
+/// The worker loop. Runs one iteration per scheduling step.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn worker_loop<M: Model>(
     model: M,
-    mut kv_caches: Vec<KvCache<M::CacheDtype>>,
+    mut paged_kvs: Vec<PagedKvCache<M::CacheDtype>>,
+    mut allocator: BlockAllocator,
+    batch_config: BatchConfig,
     request_rx: mpsc::Receiver<GenerationRequest>,
 ) {
-    while let Ok(request) = request_rx.recv() {
-        if request.options.use_kv_cache {
-            process_kv_cached(&model, &mut kv_caches, &request);
-        } else {
-            process_naive(&model, &request);
+    let model_config = model.config();
+    let mut scheduler = Scheduler::new(&batch_config);
+
+    // Allocate graph state if CUDA graphs are enabled
+    let mut graph_state = if batch_config.use_cuda_graphs {
+        let device = model.devices()[0].device().clone();
+        let dummy_block = allocator
+            .allocate()
+            .expect("need at least 1 block for CUDA graph padding");
+        let max_blocks_per_seq = model_config
+            .max_seq_len
+            .div_ceil(batch_config.block_size)
+            .min(batch_config.num_blocks);
+        let graph_max_seq_len = max_blocks_per_seq * batch_config.block_size;
+        let graph_inputs = BatchedGraphInputs::new(
+            &device,
+            batch_config.max_batch_size,
+            max_blocks_per_seq,
+            dummy_block,
+        )
+        .expect("failed to allocate BatchedGraphInputs");
+        let graph = CudaGraph::new(&device).expect("failed to allocate CudaGraph");
+        Some(GraphState {
+            graph_inputs,
+            graph,
+            decode_step: 0,
+            captured_logits: None,
+            graph_max_seq_len,
+        })
+    } else {
+        None
+    };
+
+    loop {
+        // 1. Drain all pending requests from the channel
+        while let Ok(req) = request_rx.try_recv() {
+            let _ = scheduler.add_request(req.prompt_ids, req.options, req.token_tx);
+        }
+
+        // 2. If idle, block-wait for the next request
+        if scheduler.is_idle() {
+            match request_rx.recv() {
+                Ok(req) => {
+                    let _ = scheduler.add_request(req.prompt_ids, req.options, req.token_tx);
+                }
+                Err(_) => break,
+            }
+        }
+
+        // 3. Scheduler decides what to process this iteration
+        let output = scheduler.step(&mut allocator);
+
+        // 4. Run prefills (one at a time, sequential)
+        for task in &output.prefill {
+            let idx = task.running_idx;
+            let token_ids = task.token_ids.clone();
+            process_prefill(
+                idx,
+                &token_ids,
+                &model,
+                &mut paged_kvs,
+                &mut allocator,
+                &mut scheduler,
+            );
+        }
+
+        // 5. Run decode steps
+        if !output.decode.is_empty() {
+            if let Some(gs) = &mut graph_state {
+                process_decode_batch_graph(
+                    &output.decode,
+                    &model,
+                    &mut paged_kvs,
+                    &mut allocator,
+                    &mut scheduler,
+                    gs,
+                );
+            } else {
+                process_decode_batch(
+                    &output.decode,
+                    &model,
+                    &mut paged_kvs,
+                    &mut allocator,
+                    &mut scheduler,
+                );
+            }
         }
     }
 }
 
-/// Process a single request using the KV cache (prefill + decode).
-fn process_kv_cached<M: Model>(
+// ---------------------------------------------------------------------------
+// Prefill
+// ---------------------------------------------------------------------------
+
+/// Process a prefill for one sequence.
+fn process_prefill<M: Model>(
+    idx: usize,
+    token_ids: &[u32],
     model: &M,
-    kv_caches: &mut [KvCache<M::CacheDtype>],
-    request: &GenerationRequest,
+    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
+    allocator: &mut BlockAllocator,
+    scheduler: &mut Scheduler,
 ) {
-    let mut run = || -> Result<FinishReason> {
-        for kv in kv_caches.iter_mut() {
-            kv.reset()?;
-        }
-        let mut tokens = request.input_ids.clone();
-        let mut rng_state = request.options.sampling.as_ref().map(|s| s.seed);
-        let sampling = request.options.sampling.as_ref();
-
-        // Prefill: process entire prompt
-        let logits = model.forward_with_kv_cache(&request.input_ids, kv_caches)?;
-        let recent = recent_token_window(&tokens, sampling);
-        let mut next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
-
-        if request.options.eos_token_id == Some(next_token) {
-            return Ok(FinishReason::Stop);
-        }
-        tokens.push(next_token);
-        if !request.token_tx.send(GenerationEvent::Token(next_token)) {
-            return Ok(FinishReason::Cancelled);
-        }
-
-        // CUDA graphs only supported for single-device models
-        if request.options.use_cuda_graphs
-            && request.options.max_new_tokens > 1
-            && kv_caches.len() == 1
-        {
-            stream_decode_loop_graph(
-                model,
-                kv_caches,
-                &mut tokens,
-                &mut next_token,
-                &request.options,
-                &mut rng_state,
-                &*request.token_tx,
-            )
-        } else {
-            stream_decode_loop_eager(
-                model,
-                kv_caches,
-                &mut tokens,
-                &mut next_token,
-                &request.options,
-                &mut rng_state,
-                &*request.token_tx,
-            )
-        }
+    // Run forward pass
+    let (result, num_tokens) = {
+        let seq = &scheduler.running()[idx];
+        let start_pos = seq.block_table.seq_len();
+        let r = model.forward_prefill_paged(token_ids, paged_kvs, &seq.block_table, start_pos);
+        (r, token_ids.len())
     };
 
-    match run() {
-        Ok(reason) => {
-            let _ = request.token_tx.send(GenerationEvent::Finished(reason));
+    match result {
+        Ok(logits) => {
+            let seq = &mut scheduler.running_mut()[idx];
+            seq.block_table.advance(num_tokens);
+            seq.prefill_progress += num_tokens;
+
+            if seq.prefill_progress < seq.prompt_ids.len() {
+                return;
+            }
+
+            // Prefill complete → sample first token
+            seq.phase = SequencePhase::Decode;
+
+            let all_tokens = seq.prompt_ids.clone();
+            let sampling_clone = seq.options.sampling.clone();
+            let sampling = sampling_clone.as_ref();
+            let mut rng_state = sampling.map(|s| s.seed);
+            let recent = recent_token_window(&all_tokens, sampling);
+
+            match select_token(&logits, sampling, &mut rng_state, recent) {
+                Ok(token_id) => {
+                    handle_new_token(idx, token_id, allocator, scheduler);
+                }
+                Err(e) => {
+                    let seq = &mut scheduler.running_mut()[idx];
+                    seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                    let _ = seq.token_tx.send(GenerationEvent::Error(e));
+                }
+            }
         }
         Err(e) => {
-            let _ = request.token_tx.send(GenerationEvent::Error(e));
+            let seq = &mut scheduler.running_mut()[idx];
+            seq.phase = SequencePhase::Finished(FinishReason::Stop);
+            let _ = seq.token_tx.send(GenerationEvent::Error(e));
         }
     }
 }
 
-/// Process a single request without KV cache (recomputes full sequence each step).
-fn process_naive<M: Model>(model: &M, request: &GenerationRequest) {
-    let run = || -> Result<FinishReason> {
-        let mut tokens = request.input_ids.clone();
-        let mut rng_state = request.options.sampling.as_ref().map(|s| s.seed);
-        let sampling = request.options.sampling.as_ref();
+// ---------------------------------------------------------------------------
+// Decode (eager)
+// ---------------------------------------------------------------------------
 
-        for _ in 0..request.options.max_new_tokens {
-            let logits = model.forward(&tokens)?;
-            let recent = recent_token_window(&tokens, sampling);
-            let next_token = select_token(&logits, sampling, &mut rng_state, recent)?;
-
-            if request.options.eos_token_id == Some(next_token) {
-                return Ok(FinishReason::Stop);
-            }
-            tokens.push(next_token);
-            if !request.token_tx.send(GenerationEvent::Token(next_token)) {
-                return Ok(FinishReason::Cancelled);
-            }
-        }
-
-        Ok(FinishReason::Length)
-    };
-
-    match run() {
-        Ok(reason) => {
-            let _ = request.token_tx.send(GenerationEvent::Finished(reason));
-        }
-        Err(e) => {
-            let _ = request.token_tx.send(GenerationEvent::Error(e));
-        }
-    }
-}
-
-/// Streaming decode loop without CUDA graph capture.
-fn stream_decode_loop_eager<M: Model>(
+/// Process all decode tasks in a single batched forward pass.
+fn process_decode_batch<M: Model>(
+    tasks: &[crate::scheduler::DecodeTask],
     model: &M,
-    kv_caches: &mut [KvCache<M::CacheDtype>],
-    tokens: &mut Vec<u32>,
-    next_token: &mut u32,
-    options: &GenerateOptions,
-    rng_state: &mut Option<u64>,
-    tx: &dyn TokenSender,
-) -> Result<FinishReason> {
-    let sampling = options.sampling.as_ref();
-    for _ in 1..options.max_new_tokens {
-        let logits = model.forward_next_token(*next_token, kv_caches)?;
-        let recent = recent_token_window(tokens, sampling);
-        *next_token = select_token(&logits, sampling, rng_state, recent)?;
+    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
+    allocator: &mut BlockAllocator,
+    scheduler: &mut Scheduler,
+) {
+    // Gather tokens, block tables, and positions for all decode sequences
+    let mut token_ids = Vec::with_capacity(tasks.len());
+    let mut block_tables = Vec::with_capacity(tasks.len());
+    let mut positions = Vec::with_capacity(tasks.len());
+    let running_indices: Vec<usize> = tasks.iter().map(|t| t.running_idx).collect();
 
-        if options.eos_token_id == Some(*next_token) {
-            return Ok(FinishReason::Stop);
+    for &idx in &running_indices {
+        let seq = &scheduler.running()[idx];
+        let tok = seq
+            .generated_ids
+            .last()
+            .copied()
+            .unwrap_or_else(|| *seq.prompt_ids.last().unwrap_or(&0));
+        token_ids.push(tok);
+        block_tables.push(seq.block_table.clone());
+        positions.push(seq.block_table.seq_len());
+    }
+
+    let result = model.forward_batch_decode(&token_ids, paged_kvs, &block_tables, &positions);
+
+    match result {
+        Ok(logits) => {
+            // Advance block tables for all decoded tokens
+            for &idx in &running_indices {
+                scheduler.running_mut()[idx].block_table.advance(1);
+            }
+
+            let vocab_size = logits.shape()[1];
+
+            // Sample per-sequence from the batched logits
+            for (batch_pos, &idx) in running_indices.iter().enumerate() {
+                let seq_logits = logits.slice_view(batch_pos * vocab_size, &[1, vocab_size]);
+
+                let (all_tokens, sampling_clone, gen_len) = {
+                    let seq = &scheduler.running()[idx];
+                    let toks: Vec<u32> = seq
+                        .prompt_ids
+                        .iter()
+                        .chain(seq.generated_ids.iter())
+                        .copied()
+                        .collect();
+                    let s = seq.options.sampling.clone();
+                    let gl = seq.generated_ids.len();
+                    (toks, s, gl)
+                };
+                let sampling = sampling_clone.as_ref();
+                let mut rng_state = sampling.map(|s| s.seed ^ (gen_len as u64));
+                let recent = recent_token_window(&all_tokens, sampling);
+
+                match select_token(&seq_logits, sampling, &mut rng_state, recent) {
+                    Ok(token_id) => {
+                        handle_new_token(idx, token_id, allocator, scheduler);
+                    }
+                    Err(e) => {
+                        let seq = &mut scheduler.running_mut()[idx];
+                        seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                        let _ = seq.token_tx.send(GenerationEvent::Error(e));
+                    }
+                }
+            }
         }
-        tokens.push(*next_token);
-        if !tx.send(GenerationEvent::Token(*next_token)) {
-            return Ok(FinishReason::Cancelled);
+        Err(e) => {
+            let msg = format!("{e}");
+            // Send the original error to the first sequence
+            if let Some(&first_idx) = running_indices.first() {
+                let seq = &mut scheduler.running_mut()[first_idx];
+                seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                let _ = seq.token_tx.send(GenerationEvent::Error(e));
+            }
+            // Mark remaining sequences as failed
+            for &idx in running_indices.iter().skip(1) {
+                let seq = &mut scheduler.running_mut()[idx];
+                seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                let _ = seq
+                    .token_tx
+                    .send(GenerationEvent::Error(infernum::Error::InvalidShape(
+                        format!("batched decode failed: {msg}"),
+                    )));
+            }
         }
     }
-    Ok(FinishReason::Length)
 }
 
-/// Streaming decode loop with capture-once CUDA graph.
+// ---------------------------------------------------------------------------
+// Decode (CUDA graph)
+// ---------------------------------------------------------------------------
+
+/// Gather per-sequence data from the scheduler into `BatchedGraphInputs`.
 ///
-/// Step 1 runs eagerly (warmup — ensures all PTX modules are loaded).
-/// Step 2: capture graph using indirect kernels, then launch.
-/// Steps 3+: replay the captured graph (no re-capture).
+/// Collects token IDs, positions, flattened block tables, and sequence
+/// lengths from the running sequences and writes them to the pre-allocated
+/// GPU buffers. Returns the scheduler indices of the real sequences.
+fn gather_graph_inputs(
+    tasks: &[crate::scheduler::DecodeTask],
+    scheduler: &Scheduler,
+    gs: &mut GraphState,
+) -> Result<Vec<usize>> {
+    let running_indices: Vec<usize> = tasks.iter().map(|t| t.running_idx).collect();
+    let actual = running_indices.len();
+    let max_blocks = gs.graph_inputs.max_blocks_per_seq();
+
+    let mut token_ids = Vec::with_capacity(actual);
+    let mut positions = Vec::with_capacity(actual);
+    let mut block_tables_flat = Vec::with_capacity(actual * max_blocks);
+    let mut seq_lens = Vec::with_capacity(actual);
+
+    for &idx in &running_indices {
+        let seq = &scheduler.running()[idx];
+        let tok = seq
+            .generated_ids
+            .last()
+            .copied()
+            .unwrap_or_else(|| *seq.prompt_ids.last().unwrap_or(&0));
+        token_ids.push(tok);
+
+        let pos = seq.block_table.seq_len();
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        positions.push(pos as i32);
+
+        // Flatten block table, padding unused slots with 0
+        let blocks = seq.block_table.blocks();
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        block_tables_flat.extend(blocks.iter().take(max_blocks).map(|&b| b as i32));
+        block_tables_flat.extend(std::iter::repeat_n(
+            0i32,
+            max_blocks.saturating_sub(blocks.len()),
+        ));
+
+        // seq_len for attention = pos + 1 (post-append length)
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        seq_lens.push((pos + 1) as i32);
+    }
+
+    gs.graph_inputs
+        .update(&token_ids, &positions, &block_tables_flat, &seq_lens)?;
+
+    Ok(running_indices)
+}
+
+/// Sample tokens from batched logits for the actual (non-padding) sequences.
+fn sample_from_logits(
+    logits: &CudaTensor<f32>,
+    running_indices: &[usize],
+    allocator: &mut BlockAllocator,
+    scheduler: &mut Scheduler,
+) {
+    // Advance block tables for all decoded sequences
+    for &idx in running_indices {
+        scheduler.running_mut()[idx].block_table.advance(1);
+    }
+
+    let vocab_size = logits.shape()[1];
+
+    for (batch_pos, &idx) in running_indices.iter().enumerate() {
+        let seq_logits = logits.slice_view(batch_pos * vocab_size, &[1, vocab_size]);
+
+        let (all_tokens, sampling_clone, gen_len) = {
+            let seq = &scheduler.running()[idx];
+            let toks: Vec<u32> = seq
+                .prompt_ids
+                .iter()
+                .chain(seq.generated_ids.iter())
+                .copied()
+                .collect();
+            let s = seq.options.sampling.clone();
+            let gl = seq.generated_ids.len();
+            (toks, s, gl)
+        };
+        let sampling = sampling_clone.as_ref();
+        let mut rng_state = sampling.map(|s| s.seed ^ (gen_len as u64));
+        let recent = recent_token_window(&all_tokens, sampling);
+
+        match select_token(&seq_logits, sampling, &mut rng_state, recent) {
+            Ok(token_id) => {
+                handle_new_token(idx, token_id, allocator, scheduler);
+            }
+            Err(e) => {
+                let seq = &mut scheduler.running_mut()[idx];
+                seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                let _ = seq.token_tx.send(GenerationEvent::Error(e));
+            }
+        }
+    }
+}
+
+/// Process decode tasks using CUDA graph capture/replay.
 ///
-/// `kv_cache.advance(1)` is called after each graph launch, outside the
-/// captured region.
+/// - Step 0 (warmup): run `forward_batch_decode_indirect` eagerly to load
+///   all PTX modules.
+/// - Step 1 (capture): `begin_capture` → forward → `end_capture` → `launch`.
+/// - Steps 2+ (replay): `launch` the captured graph.
+///
+/// Between steps, `gather_graph_inputs` writes new token IDs, positions,
+/// block tables, and `seq_lens` into the fixed-address GPU buffers.
 #[allow(clippy::too_many_arguments)]
-fn stream_decode_loop_graph<M: Model>(
+fn process_decode_batch_graph<M: Model>(
+    tasks: &[crate::scheduler::DecodeTask],
     model: &M,
-    kv_caches: &mut [KvCache<M::CacheDtype>],
-    tokens: &mut Vec<u32>,
-    next_token: &mut u32,
-    options: &GenerateOptions,
-    rng_state: &mut Option<u64>,
-    tx: &dyn TokenSender,
-) -> Result<FinishReason> {
-    let sampling = options.sampling.as_ref();
-
-    // Cap the effective max_seq_len for graph-captured kernels
-    let effective_max =
-        (kv_caches[0].current_len() + options.max_new_tokens).min(kv_caches[0].max_seq_len());
-    kv_caches[0].set_graph_max_seq_len(effective_max);
-
-    let device = kv_caches[0].device();
-    let mut graph = CudaGraph::new(&device)?;
-    let mut captured_logits: Option<CudaTensor<f32>> = None;
-
-    for step in 1..options.max_new_tokens {
-        device.htod_copy_into(vec![*next_token], graph.token_input_mut())?;
-
-        if step == 1 {
-            // Warmup: eager (forward_next_token_device calls advance)
-            let logits = model.forward_next_token_device(graph.token_input(), kv_caches)?;
-            let recent = recent_token_window(tokens, sampling);
-            *next_token = select_token(&logits, sampling, rng_state, recent)?;
-        } else if step == 2 {
-            // Capture once using indirect kernels
-            graph.begin_capture()?;
-            let logits = model.forward_next_token_indirect(graph.token_input(), kv_caches)?;
-            graph.end_capture()?;
-
-            graph.launch()?;
-            device.synchronize()?;
-            kv_caches[0].advance(1)?;
-
-            let recent = recent_token_window(tokens, sampling);
-            *next_token = select_token(&logits, sampling, rng_state, recent)?;
-            captured_logits = Some(logits);
-        } else {
-            // Replay captured graph
-            graph.launch()?;
-            device.synchronize()?;
-            kv_caches[0].advance(1)?;
-
-            let logits = captured_logits
-                .as_ref()
-                .expect("graph must be captured before replay");
-            let recent = recent_token_window(tokens, sampling);
-            *next_token = select_token(logits, sampling, rng_state, recent)?;
+    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
+    allocator: &mut BlockAllocator,
+    scheduler: &mut Scheduler,
+    gs: &mut GraphState,
+) {
+    let running_indices = match gather_graph_inputs(tasks, scheduler, gs) {
+        Ok(ri) => ri,
+        Err(e) => {
+            mark_all_failed(tasks, scheduler, e);
+            return;
         }
+    };
 
-        if options.eos_token_id == Some(*next_token) {
-            return Ok(FinishReason::Stop);
+    let max_seq_len = gs.graph_max_seq_len;
+    let step = gs.decode_step;
+    gs.decode_step += 1;
+
+    let device = model.devices()[0].device().clone();
+
+    let result = if step == 0 {
+        // Warmup: run eagerly to load all PTX modules
+        model.forward_batch_decode_indirect(&gs.graph_inputs, paged_kvs, max_seq_len)
+    } else if step == 1 {
+        // Capture the graph
+        (|| -> Result<CudaTensor<f32>> {
+            gs.graph.begin_capture()?;
+            let logits =
+                model.forward_batch_decode_indirect(&gs.graph_inputs, paged_kvs, max_seq_len);
+            gs.graph.end_capture()?;
+            let logits = logits?;
+
+            gs.graph.launch()?;
+            device.synchronize()?;
+
+            gs.captured_logits = Some(logits.clone());
+            Ok(logits)
+        })()
+    } else {
+        // Replay the captured graph
+        (|| -> Result<CudaTensor<f32>> {
+            gs.graph.launch()?;
+            device.synchronize()?;
+            gs.captured_logits
+                .clone()
+                .ok_or_else(|| infernum::Error::CudaGraph("no captured logits for replay".into()))
+        })()
+    };
+
+    match result {
+        Ok(logits) => {
+            sample_from_logits(&logits, &running_indices, allocator, scheduler);
         }
-        tokens.push(*next_token);
-        if !tx.send(GenerationEvent::Token(*next_token)) {
-            return Ok(FinishReason::Cancelled);
+        Err(e) => {
+            mark_all_failed(tasks, scheduler, e);
         }
     }
-    Ok(FinishReason::Length)
+}
+
+/// Mark all decode tasks as failed with an error message.
+fn mark_all_failed(
+    tasks: &[crate::scheduler::DecodeTask],
+    scheduler: &mut Scheduler,
+    error: infernum::Error,
+) {
+    let msg = format!("{error}");
+    // Send the original error to the first task
+    if let Some(first) = tasks.first() {
+        let seq = &mut scheduler.running_mut()[first.running_idx];
+        seq.phase = SequencePhase::Finished(FinishReason::Stop);
+        let _ = seq.token_tx.send(GenerationEvent::Error(error));
+    }
+    // Remaining tasks get a formatted copy
+    for task in tasks.iter().skip(1) {
+        let seq = &mut scheduler.running_mut()[task.running_idx];
+        seq.phase = SequencePhase::Finished(FinishReason::Stop);
+        let _ = seq
+            .token_tx
+            .send(GenerationEvent::Error(infernum::Error::InvalidShape(
+                format!("batched decode failed: {msg}"),
+            )));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Handle a newly sampled token: check EOS/max-tokens, send to channel,
+/// allocate new block if needed.
+fn handle_new_token(
+    idx: usize,
+    token_id: u32,
+    allocator: &mut BlockAllocator,
+    scheduler: &mut Scheduler,
+) {
+    let seq = &mut scheduler.running_mut()[idx];
+
+    if seq.options.eos_token_id == Some(token_id) {
+        seq.phase = SequencePhase::Finished(FinishReason::Stop);
+        let _ = seq
+            .token_tx
+            .send(GenerationEvent::Finished(FinishReason::Stop));
+        return;
+    }
+
+    seq.generated_ids.push(token_id);
+
+    if !seq.token_tx.send(GenerationEvent::Token(token_id)) {
+        seq.phase = SequencePhase::Finished(FinishReason::Cancelled);
+        return;
+    }
+
+    if seq.generated_ids.len() >= seq.options.max_new_tokens {
+        seq.phase = SequencePhase::Finished(FinishReason::Length);
+        let _ = seq
+            .token_tx
+            .send(GenerationEvent::Finished(FinishReason::Length));
+        return;
+    }
+
+    if seq.block_table.needs_new_block() {
+        if let Some(block) = allocator.allocate() {
+            seq.block_table.append_block(block);
+        }
+    }
 }
 
 /// Select the next token from logits, either via greedy argmax or sampling.
 fn select_token(
-    logits: &CudaTensor<f32>,
+    logits: &infernum::CudaTensor<f32>,
     sampling: Option<&SamplingParams>,
     rng_state: &mut Option<u64>,
     recent_tokens: &[u32],

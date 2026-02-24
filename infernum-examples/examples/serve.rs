@@ -49,15 +49,11 @@ struct Cli {
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
 
-    /// Use batched engine (inflight batching) instead of sequential engine
-    #[arg(long)]
-    batched: bool,
-
-    /// Maximum batch size (concurrent sequences) for batched engine
+    /// Maximum batch size (concurrent sequences)
     #[arg(long, default_value_t = 32)]
     max_batch_size: usize,
 
-    /// Number of KV cache blocks for batched engine
+    /// Number of KV cache blocks
     #[arg(long, default_value_t = 2048)]
     num_blocks: usize,
 }
@@ -122,19 +118,11 @@ async fn main() -> Result<()> {
     let entry = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
             let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            if cli.batched {
-                ModelEntry::new_batched(&cli.name, model, tokenizer, template, batch_config)
-            } else {
-                ModelEntry::new(&cli.name, model, tokenizer, template)
-            }
+            ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
             let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
-            if cli.batched {
-                ModelEntry::new_batched(&cli.name, model, tokenizer, template, batch_config)
-            } else {
-                ModelEntry::new(&cli.name, model, tokenizer, template)
-            }
+            ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         other => {
             return Err(infernum::Error::UnsupportedModel(format!(

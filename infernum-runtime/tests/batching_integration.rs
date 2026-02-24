@@ -1,8 +1,7 @@
 //! Integration tests for inflight batching with a real model.
 //!
 //! Uses SmolLM2-360M (same as llama integration tests) to verify the
-//! `BatchedEngine` produces correct output under various concurrency
-//! patterns.
+//! [`Engine`] produces correct output under various concurrency patterns.
 //!
 //! Run with:
 //!   cargo test -p infernum-runtime --features integration -- --test-threads=1
@@ -18,7 +17,7 @@ use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
 use infernum_llama::LlamaModel;
-use infernum_runtime::{BatchConfig, BatchedEngine, Engine, FinishReason, GenerationEvent};
+use infernum_runtime::{BatchConfig, Engine, FinishReason, GenerationEvent};
 
 // ---------------------------------------------------------------------------
 // Test infrastructure (copied from llama integration tests)
@@ -107,11 +106,11 @@ fn collect_tokens(rx: mpsc::Receiver<GenerationEvent>) -> (Vec<u32>, FinishReaso
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: Single request — batched engine matches sequential engine
+// Test 1: Single request — custom config vs default config
 // ---------------------------------------------------------------------------
 
 #[test]
-fn single_request_matches_sequential() {
+fn single_request_matches_default_config() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
@@ -119,28 +118,28 @@ fn single_request_matches_sequential() {
     let input_ids = tokenizer.encode(prompt, true).expect("encode");
     let options = greedy_options(20);
 
-    // Batched engine (paged KV cache + forward_batch_decode)
-    let model_bat = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
-    let bat_engine = BatchedEngine::new(model_bat, batch_config()).expect("bat engine");
-    let bat_result = bat_engine.generate(&input_ids, &options).expect("bat gen");
-    drop(bat_engine);
+    // Engine with custom batch config
+    let model1 = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let engine1 = Engine::with_config(model1, batch_config()).expect("engine1");
+    let result1 = engine1.generate(&input_ids, &options).expect("gen1");
+    drop(engine1);
 
-    let bat_text = tokenizer.decode(&bat_result).expect("decode bat");
+    let text1 = tokenizer.decode(&result1).expect("decode1");
     assert!(
-        bat_text.contains("Paris"),
-        "Expected 'Paris' in batched output: {bat_text}"
+        text1.contains("Paris"),
+        "Expected 'Paris' in custom-config output: {text1}"
     );
 
-    // Sequential engine (contiguous KV cache)
-    let model_seq = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
-    let seq_engine = Engine::new(model_seq).expect("seq engine");
-    let seq_result = seq_engine.generate(&input_ids, &options).expect("seq gen");
-    drop(seq_engine);
+    // Engine with default config
+    let model2 = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let engine2 = Engine::new(model2).expect("engine2");
+    let result2 = engine2.generate(&input_ids, &options).expect("gen2");
+    drop(engine2);
 
-    let seq_text = tokenizer.decode(&seq_result).expect("decode seq");
+    let text2 = tokenizer.decode(&result2).expect("decode2");
     assert!(
-        seq_text.contains("Paris"),
-        "Expected 'Paris' in sequential output: {seq_text}"
+        text2.contains("Paris"),
+        "Expected 'Paris' in default-config output: {text2}"
     );
 }
 
@@ -154,7 +153,7 @@ fn concurrent_identical_requests() {
     let ctx = CudaContext::new(0).expect("CUDA context");
     let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
-    let engine = BatchedEngine::new(model, batch_config()).expect("engine");
+    let engine = Engine::with_config(model, batch_config()).expect("engine");
 
     let prompt = "The capital of France is";
     let input_ids = tokenizer.encode(prompt, true).expect("encode");
@@ -197,7 +196,7 @@ fn concurrent_different_prompts() {
     let ctx = CudaContext::new(0).expect("CUDA context");
     let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
-    let engine = BatchedEngine::new(model, batch_config()).expect("engine");
+    let engine = Engine::with_config(model, batch_config()).expect("engine");
 
     let prompts = [
         "The capital of France is",
@@ -244,7 +243,7 @@ fn staggered_arrival() {
     let ctx = CudaContext::new(0).expect("CUDA context");
     let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
-    let engine = BatchedEngine::new(model, batch_config()).expect("engine");
+    let engine = Engine::with_config(model, batch_config()).expect("engine");
 
     let prompt_a = "The capital of France is";
     let prompt_b = "Water boils at a temperature of";
@@ -285,7 +284,7 @@ fn early_cancellation() {
     let ctx = CudaContext::new(0).expect("CUDA context");
     let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
-    let engine = BatchedEngine::new(model, batch_config()).expect("engine");
+    let engine = Engine::with_config(model, batch_config()).expect("engine");
 
     let input_ids = tokenizer
         .encode("Count from one to one hundred:", true)
@@ -343,7 +342,7 @@ fn memory_pressure() {
         num_blocks: 16, // 16 blocks * 16 tokens = 256 token capacity total
         use_cuda_graphs: false,
     };
-    let engine = BatchedEngine::new(model, config).expect("engine");
+    let engine = Engine::with_config(model, config).expect("engine");
 
     // Submit 3 requests with short prompts
     let input = tokenizer.encode("Hello", true).expect("encode");

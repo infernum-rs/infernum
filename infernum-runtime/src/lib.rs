@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! Runtime<M, T>    ← text in, text out (owns Engine + Tokenizer)
-//!   └── Engine<M>  ← tokens in, tokens out (owns Model + KvCache)
+//!   └── Engine<M>  ← tokens in, tokens out (owns Model + PagedKvCache)
 //!         └── M: Model  ← forward pass only
 //! ```
 //!
@@ -16,15 +16,11 @@
 //! - `cuda` - Enable CUDA GPU support (requires CUDA toolkit)
 
 #[cfg(feature = "cuda")]
-mod batched_engine;
-#[cfg(feature = "cuda")]
 mod engine;
 #[cfg(feature = "cuda")]
 mod runtime;
 mod scheduler;
 
-#[cfg(feature = "cuda")]
-pub use batched_engine::BatchedEngine;
 #[cfg(feature = "cuda")]
 pub use engine::Engine;
 #[cfg(feature = "cuda")]
