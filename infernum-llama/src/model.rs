@@ -1877,8 +1877,15 @@ where
         let (k_contig, v_contig) = gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
 
         let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output =
-            fused_attention_prefill(&q, &k_contig, &v_contig, start_pos, None, None, sliding_window)?;
+        let attn_output = fused_attention_prefill(
+            &q,
+            &k_contig,
+            &v_contig,
+            start_pos,
+            None,
+            None,
+            sliding_window,
+        )?;
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
 
