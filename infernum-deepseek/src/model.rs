@@ -112,6 +112,77 @@ fn load_typed_sharded<T: TensorDType + DeviceRepr>(
     }
 }
 
+// --- kv_b_proj splitting ---
+
+/// Split a pre-transposed dense `kv_b_proj` weight into K-nope and V portions.
+///
+/// Input shape: `(kv_lora_rank, num_heads * (qk_nope_dim + v_head_dim))` (pre-transposed).
+/// Columns are interleaved per head: for head `h`, columns
+/// `[h*stride .. h*stride+qk_nope_dim]` are K-nope, followed by `v_head_dim` V columns.
+///
+/// Returns `(kv_b_proj_k, kv_b_proj_v, kv_b_proj_k_t)`:
+/// - `kv_b_proj_k`: `(kv_lora_rank, num_heads * qk_nope_dim)` — K-nope decompression
+/// - `kv_b_proj_v`: `(kv_lora_rank, num_heads * v_head_dim)` — V decompression
+/// - `kv_b_proj_k_t`: `(num_heads * qk_nope_dim, kv_lora_rank)` — transposed K for Q absorption
+fn split_kv_b_proj_dense<T: TensorDType + DeviceRepr + Default>(
+    ctx: &CudaContext,
+    weight: &CudaTensor<T>,
+    num_heads: usize,
+    qk_nope_dim: usize,
+    v_head_dim: usize,
+) -> Result<(CudaTensor<T>, CudaTensor<T>, CudaTensor<T>)> {
+    let shape = weight.shape();
+    let kv_lora_rank = shape[0];
+    let total_cols = shape[1];
+    let stride = qk_nope_dim + v_head_dim;
+    assert_eq!(
+        total_cols,
+        num_heads * stride,
+        "split_kv_b_proj_dense: expected {} columns, got {total_cols}",
+        num_heads * stride
+    );
+
+    let data = weight.to_vec()?;
+
+    // Extract K-nope columns: shape (kv_lora_rank, num_heads * qk_nope_dim)
+    let k_cols = num_heads * qk_nope_dim;
+    let mut k_data = vec![T::default(); kv_lora_rank * k_cols];
+    for row in 0..kv_lora_rank {
+        for h in 0..num_heads {
+            let src_offset = row * total_cols + h * stride;
+            let dst_offset = row * k_cols + h * qk_nope_dim;
+            k_data[dst_offset..dst_offset + qk_nope_dim]
+                .copy_from_slice(&data[src_offset..src_offset + qk_nope_dim]);
+        }
+    }
+
+    // Extract V columns: shape (kv_lora_rank, num_heads * v_head_dim)
+    let v_cols = num_heads * v_head_dim;
+    let mut v_data = vec![T::default(); kv_lora_rank * v_cols];
+    for row in 0..kv_lora_rank {
+        for h in 0..num_heads {
+            let src_offset = row * total_cols + h * stride + qk_nope_dim;
+            let dst_offset = row * v_cols + h * v_head_dim;
+            v_data[dst_offset..dst_offset + v_head_dim]
+                .copy_from_slice(&data[src_offset..src_offset + v_head_dim]);
+        }
+    }
+
+    // Transpose K: (kv_lora_rank, num_heads * qk_nope_dim) → (num_heads * qk_nope_dim, kv_lora_rank)
+    let mut k_t_data = vec![T::default(); kv_lora_rank * k_cols];
+    for row in 0..kv_lora_rank {
+        for col in 0..k_cols {
+            k_t_data[col * kv_lora_rank + row] = k_data[row * k_cols + col];
+        }
+    }
+
+    let k_tensor = CudaTensor::from_slice(ctx, &[kv_lora_rank, k_cols], &k_data)?;
+    let v_tensor = CudaTensor::from_slice(ctx, &[kv_lora_rank, v_cols], &v_data)?;
+    let k_t_tensor = CudaTensor::from_slice(ctx, &[k_cols, kv_lora_rank], &k_t_data)?;
+
+    Ok((k_tensor, v_tensor, k_t_tensor))
+}
+
 // --- Weight structures ---
 
 /// MLA attention weights (shared by dense and MoE layers)
@@ -122,6 +193,12 @@ struct DeepSeekAttentionWeights<T: TensorDType> {
     kv_a_proj_with_mqa: LinearWeight<T>,
     kv_a_layernorm: CudaTensor<T>,
     kv_b_proj: LinearWeight<T>,
+    /// K-nope decompression columns, pre-transposed: `(kv_lora_rank, num_heads * qk_nope_dim)`
+    kv_b_proj_k: LinearWeight<T>,
+    /// V decompression columns, pre-transposed: `(kv_lora_rank, num_heads * v_head_dim)`
+    kv_b_proj_v: LinearWeight<T>,
+    /// Transpose of `kv_b_proj_k`: `(num_heads * qk_nope_dim, kv_lora_rank)` for Q absorption
+    kv_b_proj_k_t: LinearWeight<T>,
     o_proj: LinearWeight<T>,
 }
 
@@ -283,6 +360,34 @@ where
             let prefix = format!("model.layers.{i}");
 
             // MLA attention weights
+            let kv_b_proj = load_linear::<T>(
+                ctx,
+                loader,
+                &format!("{prefix}.self_attn.kv_b_proj.weight"),
+                qc,
+            )?;
+
+            // Split kv_b_proj into K-nope and V portions for absorbed attention
+            let (kv_b_proj_k, kv_b_proj_v, kv_b_proj_k_t) = match &kv_b_proj {
+                LinearWeight::Dense(w) => {
+                    let (k, v, k_t) = split_kv_b_proj_dense(
+                        ctx,
+                        w,
+                        config.num_attention_heads,
+                        config.qk_nope_head_dim,
+                        config.v_head_dim,
+                    )?;
+                    (
+                        LinearWeight::Dense(k),
+                        LinearWeight::Dense(v),
+                        LinearWeight::Dense(k_t),
+                    )
+                }
+                LinearWeight::Quantized(_) => {
+                    panic!("Quantized kv_b_proj splitting not yet implemented")
+                }
+            };
+
             let attention = DeepSeekAttentionWeights {
                 q_a_proj: load_linear::<T>(
                     ctx,
@@ -312,12 +417,10 @@ where
                     ctx,
                     &format!("{prefix}.self_attn.kv_a_layernorm.weight"),
                 )?,
-                kv_b_proj: load_linear::<T>(
-                    ctx,
-                    loader,
-                    &format!("{prefix}.self_attn.kv_b_proj.weight"),
-                    qc,
-                )?,
+                kv_b_proj,
+                kv_b_proj_k,
+                kv_b_proj_v,
+                kv_b_proj_k_t,
                 o_proj: load_linear::<T>(
                     ctx,
                     loader,
@@ -641,6 +744,36 @@ where
             // q_a_proj, kv_a_proj_with_mqa: replicated (shared bottleneck)
             // q_b_proj, kv_b_proj: column-sharded (output is per-head)
             // o_proj: row-sharded (all-reduce after)
+            let kv_b_proj = load_linear_sharded::<T>(
+                ctx,
+                loader,
+                &format!("{prefix}.self_attn.kv_b_proj.weight"),
+                &shard,
+                ShardStrategy::Column,
+                qc,
+            )?;
+
+            // Split kv_b_proj into K-nope and V portions (using tp_num_heads after sharding)
+            let (kv_b_proj_k, kv_b_proj_v, kv_b_proj_k_t) = match &kv_b_proj {
+                LinearWeight::Dense(w) => {
+                    let (k, v, k_t) = split_kv_b_proj_dense(
+                        ctx,
+                        w,
+                        tp_num_heads,
+                        config.qk_nope_head_dim,
+                        config.v_head_dim,
+                    )?;
+                    (
+                        LinearWeight::Dense(k),
+                        LinearWeight::Dense(v),
+                        LinearWeight::Dense(k_t),
+                    )
+                }
+                LinearWeight::Quantized(_) => {
+                    panic!("Quantized kv_b_proj splitting not yet implemented")
+                }
+            };
+
             let attention = DeepSeekAttentionWeights {
                 q_a_proj: load_linear_sharded::<T>(
                     ctx,
@@ -676,14 +809,10 @@ where
                     ctx,
                     &format!("{prefix}.self_attn.kv_a_layernorm.weight"),
                 )?,
-                kv_b_proj: load_linear_sharded::<T>(
-                    ctx,
-                    loader,
-                    &format!("{prefix}.self_attn.kv_b_proj.weight"),
-                    &shard,
-                    ShardStrategy::Column,
-                    qc,
-                )?,
+                kv_b_proj,
+                kv_b_proj_k,
+                kv_b_proj_v,
+                kv_b_proj_k_t,
                 o_proj: load_linear_sharded::<T>(
                     ctx,
                     loader,
@@ -1998,5 +2127,113 @@ where
         comm: NcclCommunicator,
     ) -> Result<Self> {
         Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_kv_b_proj_shapes() {
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let kv_lora_rank = 16;
+        let num_heads = 4;
+        let qk_nope_dim = 8;
+        let v_head_dim = 8;
+        let total_cols = num_heads * (qk_nope_dim + v_head_dim);
+
+        // Create a dummy pre-transposed kv_b_proj: (kv_lora_rank, total_cols)
+        let data: Vec<f32> = (0..kv_lora_rank * total_cols).map(|i| i as f32).collect();
+        let weight = CudaTensor::from_slice(&ctx, &[kv_lora_rank, total_cols], &data).unwrap();
+
+        let (k, v, k_t) =
+            split_kv_b_proj_dense(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim).unwrap();
+
+        assert_eq!(k.shape(), &[kv_lora_rank, num_heads * qk_nope_dim]);
+        assert_eq!(v.shape(), &[kv_lora_rank, num_heads * v_head_dim]);
+        assert_eq!(k_t.shape(), &[num_heads * qk_nope_dim, kv_lora_rank]);
+    }
+
+    #[test]
+    fn split_kv_b_proj_roundtrip() {
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let kv_lora_rank = 4;
+        let num_heads = 2;
+        let qk_nope_dim = 3;
+        let v_head_dim = 5;
+        let stride = qk_nope_dim + v_head_dim;
+        let total_cols = num_heads * stride;
+
+        let data: Vec<f32> = (0..kv_lora_rank * total_cols)
+            .map(|i| i as f32 * 0.1)
+            .collect();
+        let weight = CudaTensor::from_slice(&ctx, &[kv_lora_rank, total_cols], &data).unwrap();
+
+        let (k, v, _) =
+            split_kv_b_proj_dense(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim).unwrap();
+
+        let k_data = k.to_vec().unwrap();
+        let v_data = v.to_vec().unwrap();
+
+        // Reconstruct the original by interleaving K and V columns back
+        let mut reconstructed = vec![0.0_f32; kv_lora_rank * total_cols];
+        for row in 0..kv_lora_rank {
+            for h in 0..num_heads {
+                // K columns
+                for d in 0..qk_nope_dim {
+                    reconstructed[row * total_cols + h * stride + d] =
+                        k_data[row * (num_heads * qk_nope_dim) + h * qk_nope_dim + d];
+                }
+                // V columns
+                for d in 0..v_head_dim {
+                    reconstructed[row * total_cols + h * stride + qk_nope_dim + d] =
+                        v_data[row * (num_heads * v_head_dim) + h * v_head_dim + d];
+                }
+            }
+        }
+
+        for (i, (&orig, &recon)) in data.iter().zip(reconstructed.iter()).enumerate() {
+            assert!(
+                (orig - recon).abs() < 1e-6,
+                "Mismatch at index {i}: orig={orig}, recon={recon}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_kv_b_proj_k_transpose() {
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let kv_lora_rank = 4;
+        let num_heads = 2;
+        let qk_nope_dim = 3;
+        let v_head_dim = 5;
+        let total_cols = num_heads * (qk_nope_dim + v_head_dim);
+
+        let data: Vec<f32> = (0..kv_lora_rank * total_cols)
+            .map(|i| i as f32 * 0.1)
+            .collect();
+        let weight = CudaTensor::from_slice(&ctx, &[kv_lora_rank, total_cols], &data).unwrap();
+
+        let (k, _, k_t) =
+            split_kv_b_proj_dense(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim).unwrap();
+
+        let k_cols = num_heads * qk_nope_dim;
+        assert_eq!(k_t.shape(), &[k_cols, kv_lora_rank]);
+
+        let k_data = k.to_vec().unwrap();
+        let k_t_data = k_t.to_vec().unwrap();
+
+        // Verify k_t[col][row] == k[row][col]
+        for row in 0..kv_lora_rank {
+            for col in 0..k_cols {
+                let k_val = k_data[row * k_cols + col];
+                let k_t_val = k_t_data[col * kv_lora_rank + row];
+                assert!(
+                    (k_val - k_t_val).abs() < 1e-6,
+                    "Transpose mismatch at ({row}, {col}): k={k_val}, k_t={k_t_val}"
+                );
+            }
+        }
     }
 }
