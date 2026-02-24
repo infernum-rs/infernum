@@ -1629,6 +1629,7 @@ where
             paged_kv.append_paged(layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
 
             let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+            let sliding_window = self.config.effective_sliding_window(layer_idx);
             let attn_i = paged_attention_decode(
                 &self.ctx,
                 &q_i,
@@ -1636,6 +1637,8 @@ where
                 v_pool,
                 &[block_tables[i].clone()],
                 paged_kv.block_size(),
+                None,
+                sliding_window,
             )?;
 
             attn_parts.push(attn_i.reshape(&[1, num_heads * head_dim]));
@@ -1769,6 +1772,7 @@ where
 
         // Paged attention decode from GPU-resident block tables + seq_lens
         let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
         let attn_output = paged_attention_decode_indirect(
             &self.ctx,
             &q,
@@ -1779,6 +1783,8 @@ where
             paged_kv.block_size(),
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
+            None,
+            sliding_window,
         )?;
 
         let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);

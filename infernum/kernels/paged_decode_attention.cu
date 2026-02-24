@@ -3,6 +3,11 @@
 
 #define INFINITY_F __int_as_float(0x7f800000)
 
+// Apply logit soft-capping: tanh(x / cap) * cap
+// Disabled when softcap <= 0.0
+#define MAYBE_SOFTCAP(dot, softcap) \
+    if (softcap > 0.0f) { dot = tanhf(dot / softcap) * softcap; }
+
 // Paged decode attention: one query token per request, K/V in block-table-indexed pool.
 //
 // Grid: (num_heads, batch_size, 1)
@@ -18,12 +23,12 @@
 //
 // Algorithm:
 //   1. Load Q for this (request, head) into shared memory
-//   2. For each token t in [0, seq_len):
+//   2. For each token t in [win_start, seq_len):
 //      - logical_block = t / block_size
 //      - offset_in_block = t % block_size
 //      - physical_block = block_tables[request * max_blocks_per_seq + logical_block]
 //      - k_idx = ((physical_block * block_size + offset_in_block) * num_kv_heads + kv_head) * head_dim
-//      - Compute dot(Q, K), track online softmax
+//      - Compute dot(Q, K), apply optional softcap, track online softmax
 //   3. Accumulate weighted V, write output
 
 extern "C" __global__ void paged_decode_attention_f32(
@@ -34,11 +39,13 @@ extern "C" __global__ void paged_decode_attention_f32(
     const int* __restrict__ block_tables,// (batch_size, max_blocks_per_seq)
     const int* __restrict__ seq_lens,    // (batch_size,)
     const float scale,
+    const float softcap,                 // <= 0 means disabled
     const int block_size,
     const int num_heads,
     const int num_kv_heads,
     const int head_dim,
-    const int max_blocks_per_seq
+    const int max_blocks_per_seq,
+    const int window_size                // <= 0 means full attention (no window)
 ) {
     const int head = blockIdx.x;
     const int req = blockIdx.y;
@@ -48,12 +55,13 @@ extern "C" __global__ void paged_decode_attention_f32(
     if (seq_len == 0) return;
 
     const int kv_head = head * num_kv_heads / num_heads;
-    const int pool_kv_stride = num_kv_heads * head_dim;  // stride between positions in pool
+    const int win_start = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    const int active_len = seq_len - win_start;
 
     extern __shared__ float shared[];
-    float* s_q = shared;                          // head_dim
-    float* s_weights = shared + head_dim;         // seq_len (filled dynamically)
-    float* s_scratch = shared + head_dim + seq_len; // blockDim.x
+    float* s_q = shared;                               // head_dim
+    float* s_weights = shared + head_dim;              // active_len (filled dynamically)
+    float* s_scratch = shared + head_dim + active_len; // blockDim.x
 
     // Load Q
     const int q_base = (req * num_heads + head) * head_dim;
@@ -66,7 +74,8 @@ extern "C" __global__ void paged_decode_attention_f32(
     const int* req_block_table = block_tables + req * max_blocks_per_seq;
     float local_max = -INFINITY_F;
 
-    for (int t = tid; t < seq_len; t += blockDim.x) {
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        const int t = win_start + i;
         const int logical_block = t / block_size;
         const int offset_in_block = t % block_size;
         const int physical_block = req_block_table[logical_block];
@@ -77,7 +86,8 @@ extern "C" __global__ void paged_decode_attention_f32(
             dot += s_q[d] * k_pool[k_base + d];
         }
         dot *= scale;
-        s_weights[t] = dot;
+        MAYBE_SOFTCAP(dot, softcap);
+        s_weights[i] = dot;
         local_max = fmaxf(local_max, dot);
     }
 
@@ -95,9 +105,9 @@ extern "C" __global__ void paged_decode_attention_f32(
 
     // Pass 2: Compute exp and sum
     float local_sum = 0.0f;
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        float w = expf(s_weights[t] - max_val);
-        s_weights[t] = w;
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        float w = expf(s_weights[i] - max_val);
+        s_weights[i] = w;
         local_sum += w;
     }
 
@@ -113,8 +123,8 @@ extern "C" __global__ void paged_decode_attention_f32(
     __syncthreads();
 
     // Normalize weights
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        s_weights[t] *= inv_sum;
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        s_weights[i] *= inv_sum;
     }
     __syncthreads();
 
@@ -122,12 +132,13 @@ extern "C" __global__ void paged_decode_attention_f32(
     const int out_base = (req * num_heads + head) * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < seq_len; t++) {
+        for (int i = 0; i < active_len; i++) {
+            const int t = win_start + i;
             const int logical_block = t / block_size;
             const int offset_in_block = t % block_size;
             const int physical_block = req_block_table[logical_block];
             const int v_idx = ((physical_block * block_size + offset_in_block) * num_kv_heads + kv_head) * head_dim + d;
-            acc += s_weights[t] * v_pool[v_idx];
+            acc += s_weights[i] * v_pool[v_idx];
         }
         output[out_base + d] = acc;
     }
@@ -142,11 +153,13 @@ extern "C" __global__ void paged_decode_attention_f16(
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const float scale,
+    const float softcap,
     const int block_size,
     const int num_heads,
     const int num_kv_heads,
     const int head_dim,
-    const int max_blocks_per_seq
+    const int max_blocks_per_seq,
+    const int window_size
 ) {
     const int head = blockIdx.x;
     const int req = blockIdx.y;
@@ -156,11 +169,13 @@ extern "C" __global__ void paged_decode_attention_f16(
     if (seq_len == 0) return;
 
     const int kv_head = head * num_kv_heads / num_heads;
+    const int win_start = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    const int active_len = seq_len - win_start;
 
     extern __shared__ float shared[];
     float* s_q = shared;
     float* s_weights = shared + head_dim;
-    float* s_scratch = shared + head_dim + seq_len;
+    float* s_scratch = shared + head_dim + active_len;
 
     const int* req_block_table = block_tables + req * max_blocks_per_seq;
     const int q_base = (req * num_heads + head) * head_dim;
@@ -171,7 +186,8 @@ extern "C" __global__ void paged_decode_attention_f16(
     __syncthreads();
 
     float local_max = -INFINITY_F;
-    for (int t = tid; t < seq_len; t += blockDim.x) {
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        const int t = win_start + i;
         const int logical_block = t / block_size;
         const int offset_in_block = t % block_size;
         const int physical_block = req_block_table[logical_block];
@@ -182,7 +198,8 @@ extern "C" __global__ void paged_decode_attention_f16(
             dot += s_q[d] * __half2float(k_pool[k_base + d]);
         }
         dot *= scale;
-        s_weights[t] = dot;
+        MAYBE_SOFTCAP(dot, softcap);
+        s_weights[i] = dot;
         local_max = fmaxf(local_max, dot);
     }
 
@@ -198,9 +215,9 @@ extern "C" __global__ void paged_decode_attention_f16(
     __syncthreads();
 
     float local_sum = 0.0f;
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        float w = expf(s_weights[t] - max_val);
-        s_weights[t] = w;
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        float w = expf(s_weights[i] - max_val);
+        s_weights[i] = w;
         local_sum += w;
     }
     s_scratch[tid] = local_sum;
@@ -214,20 +231,21 @@ extern "C" __global__ void paged_decode_attention_f16(
     float inv_sum = 1.0f / s_scratch[0];
     __syncthreads();
 
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        s_weights[t] *= inv_sum;
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        s_weights[i] *= inv_sum;
     }
     __syncthreads();
 
     const int out_base = (req * num_heads + head) * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < seq_len; t++) {
+        for (int i = 0; i < active_len; i++) {
+            const int t = win_start + i;
             const int logical_block = t / block_size;
             const int offset_in_block = t % block_size;
             const int physical_block = req_block_table[logical_block];
             const int v_idx = ((physical_block * block_size + offset_in_block) * num_kv_heads + kv_head) * head_dim + d;
-            acc += s_weights[t] * __half2float(v_pool[v_idx]);
+            acc += s_weights[i] * __half2float(v_pool[v_idx]);
         }
         output[out_base + d] = __float2half(acc);
     }
@@ -242,11 +260,13 @@ extern "C" __global__ void paged_decode_attention_bf16(
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const float scale,
+    const float softcap,
     const int block_size,
     const int num_heads,
     const int num_kv_heads,
     const int head_dim,
-    const int max_blocks_per_seq
+    const int max_blocks_per_seq,
+    const int window_size
 ) {
     const int head = blockIdx.x;
     const int req = blockIdx.y;
@@ -256,11 +276,13 @@ extern "C" __global__ void paged_decode_attention_bf16(
     if (seq_len == 0) return;
 
     const int kv_head = head * num_kv_heads / num_heads;
+    const int win_start = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    const int active_len = seq_len - win_start;
 
     extern __shared__ float shared[];
     float* s_q = shared;
     float* s_weights = shared + head_dim;
-    float* s_scratch = shared + head_dim + seq_len;
+    float* s_scratch = shared + head_dim + active_len;
 
     const int* req_block_table = block_tables + req * max_blocks_per_seq;
     const int q_base = (req * num_heads + head) * head_dim;
@@ -271,7 +293,8 @@ extern "C" __global__ void paged_decode_attention_bf16(
     __syncthreads();
 
     float local_max = -INFINITY_F;
-    for (int t = tid; t < seq_len; t += blockDim.x) {
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        const int t = win_start + i;
         const int logical_block = t / block_size;
         const int offset_in_block = t % block_size;
         const int physical_block = req_block_table[logical_block];
@@ -282,7 +305,8 @@ extern "C" __global__ void paged_decode_attention_bf16(
             dot += s_q[d] * __bfloat162float(k_pool[k_base + d]);
         }
         dot *= scale;
-        s_weights[t] = dot;
+        MAYBE_SOFTCAP(dot, softcap);
+        s_weights[i] = dot;
         local_max = fmaxf(local_max, dot);
     }
 
@@ -298,9 +322,9 @@ extern "C" __global__ void paged_decode_attention_bf16(
     __syncthreads();
 
     float local_sum = 0.0f;
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        float w = expf(s_weights[t] - max_val);
-        s_weights[t] = w;
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        float w = expf(s_weights[i] - max_val);
+        s_weights[i] = w;
         local_sum += w;
     }
     s_scratch[tid] = local_sum;
@@ -314,20 +338,21 @@ extern "C" __global__ void paged_decode_attention_bf16(
     float inv_sum = 1.0f / s_scratch[0];
     __syncthreads();
 
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        s_weights[t] *= inv_sum;
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        s_weights[i] *= inv_sum;
     }
     __syncthreads();
 
     const int out_base = (req * num_heads + head) * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < seq_len; t++) {
+        for (int i = 0; i < active_len; i++) {
+            const int t = win_start + i;
             const int logical_block = t / block_size;
             const int offset_in_block = t % block_size;
             const int physical_block = req_block_table[logical_block];
             const int v_idx = ((physical_block * block_size + offset_in_block) * num_kv_heads + kv_head) * head_dim + d;
-            acc += s_weights[t] * __bfloat162float(v_pool[v_idx]);
+            acc += s_weights[i] * __bfloat162float(v_pool[v_idx]);
         }
         output[out_base + d] = __float2bfloat16(acc);
     }

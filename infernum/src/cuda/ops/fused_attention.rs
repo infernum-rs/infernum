@@ -1427,6 +1427,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_fused_decode_indirect_softcap() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let num_heads = 2;
+        let head_dim = 8;
+        let total_len = 6;
+        let max_seq_len = 16;
+        let cap = 50.0_f32;
+
+        let q_data: Vec<f32> = (0..num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.3).sin())
+            .collect();
+        let q = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+
+        let k_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.2).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.1).sin())
+            .collect();
+
+        // Direct
+        let k_direct =
+            CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &k_data).unwrap();
+        let v_direct =
+            CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &v_data).unwrap();
+        let direct =
+            fused_attention_decode(&q, &k_direct, &v_direct, None, Some(cap), None).unwrap();
+
+        // Indirect
+        let mut k_full_data = vec![0.0_f32; max_seq_len * num_heads * head_dim];
+        let mut v_full_data = vec![0.0_f32; max_seq_len * num_heads * head_dim];
+        k_full_data[..k_data.len()].copy_from_slice(&k_data);
+        v_full_data[..v_data.len()].copy_from_slice(&v_data);
+        let k_full =
+            CudaTensor::from_slice(&ctx, &[max_seq_len, num_heads, head_dim], &k_full_data)
+                .unwrap();
+        let v_full =
+            CudaTensor::from_slice(&ctx, &[max_seq_len, num_heads, head_dim], &v_full_data)
+                .unwrap();
+
+        let mut pos = crate::cuda::SeqPosition::new(ctx.device()).unwrap();
+        pos.set(total_len, ctx.device()).unwrap();
+
+        let indirect = fused_attention_decode_indirect(
+            &q,
+            &k_full,
+            &v_full,
+            &pos,
+            max_seq_len,
+            None,
+            Some(cap),
+            None,
+        )
+        .unwrap();
+
+        let direct_data = direct.to_vec().unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (d - ind).abs() < 1e-3,
+                "Softcap indirect mismatch at {i}: direct={d}, indirect={ind}"
+            );
+        }
+    }
+
     /// CPU reference for decode attention with optional soft-capping.
     fn cpu_decode_attention_softcap(
         q: &[f32],
