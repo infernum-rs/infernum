@@ -41,6 +41,12 @@ pub struct BatchConfig {
     pub block_size: usize,
     /// Total number of KV cache blocks in the pool.
     pub num_blocks: usize,
+    /// Enable CUDA graph capture/replay for batched decode steps.
+    ///
+    /// When enabled, the first decode iteration runs eagerly (warmup),
+    /// the second captures a CUDA graph, and all subsequent iterations
+    /// replay it. Inputs are always padded to `max_batch_size`.
+    pub use_cuda_graphs: bool,
 }
 
 impl Default for BatchConfig {
@@ -50,6 +56,7 @@ impl Default for BatchConfig {
             max_prefill_tokens: 512,
             block_size: 16,
             num_blocks: 1024,
+            use_cuda_graphs: false,
         }
     }
 }
@@ -392,6 +399,7 @@ mod tests {
             max_prefill_tokens: 512,
             block_size,
             num_blocks,
+            use_cuda_graphs: false,
         })
     }
 
@@ -565,6 +573,7 @@ mod tests {
             max_prefill_tokens: 3, // Very small for testing
             block_size: 4,
             num_blocks: 64,
+            use_cuda_graphs: false,
         });
         let mut alloc = make_allocator(4, 64);
         let (tx, _rx) = mpsc::channel();

@@ -85,6 +85,7 @@ fn batch_config() -> BatchConfig {
         max_prefill_tokens: 512,
         block_size: 16,
         num_blocks: 256,
+        use_cuda_graphs: false,
     }
 }
 
@@ -340,6 +341,7 @@ fn memory_pressure() {
         max_prefill_tokens: 512,
         block_size: 16,
         num_blocks: 16, // 16 blocks * 16 tokens = 256 token capacity total
+        use_cuda_graphs: false,
     };
     let engine = BatchedEngine::new(model, config).expect("engine");
 

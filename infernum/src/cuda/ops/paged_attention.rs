@@ -185,6 +185,105 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     Ok(output)
 }
 
+/// Batched paged decode attention with GPU-resident block tables and seq lens.
+///
+/// Identical to [`paged_attention_decode`] but reads block tables and sequence
+/// lengths from pre-allocated GPU buffers, making this safe for CUDA graph
+/// capture.
+///
+/// # Arguments
+/// * `ctx` — CUDA context
+/// * `q` — query tensor of shape `(batch_size, num_heads, head_dim)`
+/// * `k_pool` / `v_pool` — paged K/V pool tensors
+/// * `block_tables_gpu` — flattened block tables `(batch_size * max_blocks_per_seq,)`
+/// * `seq_lens_gpu` — sequence lengths `(batch_size,)`
+/// * `block_size` — tokens per block
+/// * `max_blocks_per_seq` — max blocks per sequence (stride for block table rows)
+/// * `max_seq_len` — max sequence length (for shared memory sizing)
+///
+/// # Errors
+/// Returns an error if the kernel launch fails.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_decode_indirect<
+    T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits,
+>(
+    ctx: &CudaContext,
+    q: &CudaTensor<T>,
+    k_pool: &CudaTensor<T>,
+    v_pool: &CudaTensor<T>,
+    block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
+    seq_lens_gpu: &cudarc::driver::CudaSlice<i32>,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+) -> Result<CudaTensor<T>> {
+    let q_shape = q.shape();
+    assert_eq!(
+        q_shape.len(),
+        3,
+        "Q must be 3D: (batch_size, num_heads, head_dim)"
+    );
+
+    let batch_size = q_shape[0];
+    let num_heads = q_shape[1];
+    let head_dim = q_shape[2];
+
+    let k_pool_shape = k_pool.shape();
+    assert_eq!(k_pool_shape.len(), 4, "K pool must be 4D");
+    let num_kv_heads = k_pool_shape[2];
+
+    assert!(
+        num_heads.is_multiple_of(num_kv_heads),
+        "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+    );
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let device = ctx.device();
+
+    let output_shape = [batch_size, num_heads, head_dim];
+    let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
+
+    ensure_paged_decode_kernel::<T>(device)?;
+
+    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix::<T>());
+    let func = device
+        .get_func("paged_decode_attention", &kernel_name)
+        .unwrap();
+
+    let threads = 256_usize.min(max_seq_len.next_power_of_two());
+    let threads = threads.max(1);
+
+    let shared_mem = (head_dim + max_seq_len + threads) * std::mem::size_of::<f32>();
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, batch_size as u32, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &q.cuda_slice(),
+                &k_pool.cuda_slice(),
+                &v_pool.cuda_slice(),
+                block_tables_gpu,
+                seq_lens_gpu,
+                scale,
+                block_size as i32,
+                num_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                max_blocks_per_seq as i32,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
 /// Gather paged K/V into contiguous buffers for a single request.
 ///
 /// Copies K/V data from the paged pool into contiguous tensors of shape
@@ -473,5 +572,76 @@ mod tests {
         assert_eq!(k_gathered.shape(), &[seq_len, num_kv_heads, head_dim]);
         assert_eq!(k_gathered.to_vec().unwrap(), k_data);
         assert_eq!(v_gathered.to_vec().unwrap(), v_data);
+    }
+
+    #[test]
+    fn paged_decode_indirect_matches_eager() {
+        let ctx = make_ctx();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let block_size = 4;
+
+        let config = crate::cuda::block_allocator::BlockConfig {
+            block_size,
+            num_blocks: 16,
+        };
+        let mut paged_kv = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = crate::cuda::block_allocator::BlockAllocator::new(&config);
+
+        let b0 = allocator.allocate().unwrap();
+        let mut table0 = BlockTable::new(block_size);
+        table0.append_block(b0);
+        let seq0 = 3;
+        let k0_data: Vec<f32> = (0..(seq0 * num_kv_heads * head_dim))
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+        let v0_data: Vec<f32> = (0..(seq0 * num_kv_heads * head_dim))
+            .map(|i| (i as f32) * 0.05)
+            .collect();
+        let k0 = CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &k0_data).unwrap();
+        let v0 = CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &v0_data).unwrap();
+        paged_kv.append_paged(0, &table0, &k0, &v0, 0).unwrap();
+        table0.advance(seq0);
+
+        let q_data: Vec<f32> = (0..(num_heads * head_dim))
+            .map(|i| ((i as f32) * 0.3).sin())
+            .collect();
+        let q = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+
+        // Eager
+        let (k_pool, v_pool) = paged_kv.get_pools(0);
+        let eager = paged_attention_decode(&ctx, &q, k_pool, v_pool, &[table0.clone()], block_size)
+            .unwrap();
+        let eager_data = eager.to_vec().unwrap();
+
+        // Indirect
+        let max_blocks_per_seq = table0.num_blocks();
+        let flat_tables: Vec<i32> = table0.blocks().iter().map(|&b| b as i32).collect();
+        let seq_lens = [table0.seq_len() as i32];
+        let tables_gpu = ctx.device().htod_sync_copy(&flat_tables).unwrap();
+        let seq_lens_gpu = ctx.device().htod_sync_copy(&seq_lens).unwrap();
+
+        let (k_pool, v_pool) = paged_kv.get_pools(0);
+        let indirect = paged_attention_decode_indirect(
+            &ctx,
+            &q,
+            k_pool,
+            v_pool,
+            &tables_gpu,
+            &seq_lens_gpu,
+            block_size,
+            max_blocks_per_seq,
+            table0.seq_len(),
+        )
+        .unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&e, &ind)) in eager_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (e - ind).abs() < 1e-6,
+                "Mismatch at {i}: eager={e}, indirect={ind}"
+            );
+        }
     }
 }

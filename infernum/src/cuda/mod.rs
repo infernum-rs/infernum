@@ -1,5 +1,6 @@
 //! CUDA backend implementation
 
+mod batched_graph;
 pub mod block_allocator;
 pub mod buffer_pool;
 mod context;
@@ -17,6 +18,7 @@ pub mod shard;
 mod sharded;
 mod tensor;
 
+pub use batched_graph::BatchedGraphInputs;
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use buffer_pool::{BufferPool, PooledSlice};
 pub use context::CudaContext;

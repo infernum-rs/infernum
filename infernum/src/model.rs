@@ -11,6 +11,8 @@ use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
 
 #[cfg(feature = "cuda")]
 use crate::cuda::block_allocator::BlockTable;
+#[cfg(feature = "cuda")]
+use crate::cuda::BatchedGraphInputs;
 #[cfg(feature = "nccl")]
 use crate::cuda::{nccl::NcclCommunicator, ShardConfig};
 #[cfg(feature = "cuda")]
@@ -161,6 +163,30 @@ pub trait Model {
         _positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
         unimplemented!("forward_batch_decode not implemented for this model")
+    }
+
+    /// Batched decode using indirect kernels for CUDA graph capture.
+    ///
+    /// Uses `_indirect` kernel variants that read token IDs, positions,
+    /// block tables, and sequence lengths from GPU-resident buffers in
+    /// [`BatchedGraphInputs`] instead of host slices. This allows a CUDA
+    /// graph to be captured once and replayed on every decode step.
+    ///
+    /// `max_seq_len` is needed for shared memory sizing in attention and
+    /// must be at least as large as the longest sequence in the batch.
+    ///
+    /// The default implementation falls back to [`Self::forward_batch_decode`]
+    /// by downloading the buffers to the host.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    fn forward_batch_decode_indirect(
+        &self,
+        _graph_inputs: &BatchedGraphInputs,
+        _paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        _max_seq_len: usize,
+    ) -> Result<CudaTensor<f32>> {
+        unimplemented!("forward_batch_decode_indirect not implemented for this model")
     }
 
     /// Single-sequence prefill forward pass with paged KV cache.

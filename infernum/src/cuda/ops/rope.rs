@@ -417,6 +417,79 @@ pub fn apply_rope_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(output)
 }
 
+/// Apply rotary positional embeddings to a batch of single-token sequences,
+/// reading positions from a pre-allocated GPU buffer.
+///
+/// Identical to [`apply_rope_batched`] but takes a `CudaSlice<i32>` of positions
+/// already on the GPU (e.g., from [`BatchedGraphInputs`](crate::cuda::BatchedGraphInputs)),
+/// avoiding the `htod_sync_copy` that would break CUDA graph capture.
+///
+/// `batch_size` is the number of sequences to process (may be larger than the
+/// logical batch if padding is used for graph capture).
+///
+/// # Errors
+/// Returns an error if the kernel launch or GPU allocation fails.
+pub fn apply_rope_batched_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    positions_gpu: &cudarc::driver::CudaSlice<i32>,
+    batch_size: usize,
+) -> Result<CudaTensor<T>> {
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (batch_size, num_heads, head_dim)"
+    );
+    assert_eq!(shape[0], batch_size);
+
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_batched_{}", kernel_suffix::<T>());
+
+    let module_name = "rope";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &all_kernel_names(),
+        )?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (batch_size as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                batch_size as i32,
+                num_heads as i32,
+                head_dim as i32,
+                positions_gpu,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +854,44 @@ mod tests {
             assert!(
                 (got - want).abs() < 1e-6,
                 "Mismatch at {i}: batched={got}, scalar={want}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_batched_rope_indirect_matches_eager() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let num_heads = 2;
+        let head_dim = 8;
+        let positions = [5_usize, 12, 0];
+        let batch_size = positions.len();
+
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let row_size = num_heads * head_dim;
+        let mut input_data = Vec::with_capacity(batch_size * row_size);
+        for i in 0..batch_size * row_size {
+            input_data.push((i as f32 + 1.0) * 0.1);
+        }
+        let input =
+            CudaTensor::from_slice(&ctx, &[batch_size, num_heads, head_dim], &input_data).unwrap();
+
+        // Eager path
+        let eager = apply_rope_batched(&input, &cos_cache, &sin_cache, &positions).unwrap();
+        let eager_data = eager.to_vec().unwrap();
+
+        // Indirect path: positions pre-uploaded as i32
+        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let positions_gpu = ctx.device().htod_sync_copy(&positions_i32).unwrap();
+        let indirect =
+            apply_rope_batched_indirect(&input, &cos_cache, &sin_cache, &positions_gpu, batch_size)
+                .unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&e, &ind)) in eager_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (e - ind).abs() < 1e-6,
+                "Mismatch at {i}: eager={e}, indirect={ind}"
             );
         }
     }

@@ -14,8 +14,8 @@ use std::thread::{self, JoinHandle};
 
 use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig};
 use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
-use infernum::cuda::PagedKvCache;
-use infernum::{GenerateOptions, Model, ModelConfig, Result, SamplingParams, Tensor};
+use infernum::cuda::{BatchedGraphInputs, CudaGraph, PagedKvCache};
+use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams, Tensor};
 
 use crate::engine::{FinishReason, GenerationEvent, TokenSender};
 use crate::scheduler::{BatchConfig, Scheduler, SequencePhase};
@@ -138,6 +138,20 @@ impl BatchedEngine {
     }
 }
 
+/// Mutable state for CUDA graph capture/replay during batched decode.
+struct GraphState {
+    /// Pre-allocated GPU buffers for indirect kernels.
+    graph_inputs: BatchedGraphInputs,
+    /// CUDA graph manager (capture/replay).
+    graph: CudaGraph,
+    /// Decode step counter: 0 = first (warmup), 1 = capture, 2+ = replay.
+    decode_step: usize,
+    /// Logits tensor from the captured graph (same device addresses on replay).
+    captured_logits: Option<CudaTensor<f32>>,
+    /// Conservative upper bound for shared memory sizing in paged attention.
+    graph_max_seq_len: usize,
+}
+
 /// The batched worker loop. Runs one iteration per scheduling step.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn batched_worker_loop<M: Model>(
@@ -147,7 +161,38 @@ fn batched_worker_loop<M: Model>(
     batch_config: BatchConfig,
     request_rx: mpsc::Receiver<BatchedRequest>,
 ) {
+    let model_config = model.config();
     let mut scheduler = Scheduler::new(&batch_config);
+
+    // Allocate graph state if CUDA graphs are enabled
+    let mut graph_state = if batch_config.use_cuda_graphs {
+        let device = model.devices()[0].device().clone();
+        let dummy_block = allocator
+            .allocate()
+            .expect("need at least 1 block for CUDA graph padding");
+        let max_blocks_per_seq = model_config
+            .max_seq_len
+            .div_ceil(batch_config.block_size)
+            .min(batch_config.num_blocks);
+        let graph_max_seq_len = max_blocks_per_seq * batch_config.block_size;
+        let graph_inputs = BatchedGraphInputs::new(
+            &device,
+            batch_config.max_batch_size,
+            max_blocks_per_seq,
+            dummy_block,
+        )
+        .expect("failed to allocate BatchedGraphInputs");
+        let graph = CudaGraph::new(&device).expect("failed to allocate CudaGraph");
+        Some(GraphState {
+            graph_inputs,
+            graph,
+            decode_step: 0,
+            captured_logits: None,
+            graph_max_seq_len,
+        })
+    } else {
+        None
+    };
 
     loop {
         // 1. Drain all pending requests from the channel
@@ -184,13 +229,24 @@ fn batched_worker_loop<M: Model>(
 
         // 5. Run decode steps
         if !output.decode.is_empty() {
-            process_decode_batch(
-                &output.decode,
-                &model,
-                &mut paged_kvs,
-                &mut allocator,
-                &mut scheduler,
-            );
+            if let Some(gs) = &mut graph_state {
+                process_decode_batch_graph(
+                    &output.decode,
+                    &model,
+                    &mut paged_kvs,
+                    &mut allocator,
+                    &mut scheduler,
+                    gs,
+                );
+            } else {
+                process_decode_batch(
+                    &output.decode,
+                    &model,
+                    &mut paged_kvs,
+                    &mut allocator,
+                    &mut scheduler,
+                );
+            }
         }
     }
 }
@@ -338,6 +394,200 @@ fn process_decode_batch<M: Model>(
                     )));
             }
         }
+    }
+}
+
+/// Gather per-sequence data from the scheduler into `BatchedGraphInputs`.
+///
+/// Collects token IDs, positions, flattened block tables, and sequence
+/// lengths from the running sequences and writes them to the pre-allocated
+/// GPU buffers. Returns the scheduler indices of the real sequences.
+fn gather_graph_inputs(
+    tasks: &[crate::scheduler::DecodeTask],
+    scheduler: &Scheduler,
+    gs: &mut GraphState,
+) -> Result<Vec<usize>> {
+    let running_indices: Vec<usize> = tasks.iter().map(|t| t.running_idx).collect();
+    let actual = running_indices.len();
+    let max_blocks = gs.graph_inputs.max_blocks_per_seq();
+
+    let mut token_ids = Vec::with_capacity(actual);
+    let mut positions = Vec::with_capacity(actual);
+    let mut block_tables_flat = Vec::with_capacity(actual * max_blocks);
+    let mut seq_lens = Vec::with_capacity(actual);
+
+    for &idx in &running_indices {
+        let seq = &scheduler.running()[idx];
+        let tok = seq
+            .generated_ids
+            .last()
+            .copied()
+            .unwrap_or_else(|| *seq.prompt_ids.last().unwrap_or(&0));
+        token_ids.push(tok);
+
+        let pos = seq.block_table.seq_len();
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        positions.push(pos as i32);
+
+        // Flatten block table, padding unused slots with 0
+        let blocks = seq.block_table.blocks();
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        block_tables_flat.extend(blocks.iter().take(max_blocks).map(|&b| b as i32));
+        block_tables_flat.extend(std::iter::repeat_n(
+            0i32,
+            max_blocks.saturating_sub(blocks.len()),
+        ));
+
+        // seq_len for attention = pos + 1 (post-append length)
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        seq_lens.push((pos + 1) as i32);
+    }
+
+    gs.graph_inputs
+        .update(&token_ids, &positions, &block_tables_flat, &seq_lens)?;
+
+    Ok(running_indices)
+}
+
+/// Sample tokens from batched logits for the actual (non-padding) sequences.
+fn sample_from_logits(
+    logits: &CudaTensor<f32>,
+    running_indices: &[usize],
+    allocator: &mut BlockAllocator,
+    scheduler: &mut Scheduler,
+) {
+    // Advance block tables for all decoded sequences
+    for &idx in running_indices {
+        scheduler.running_mut()[idx].block_table.advance(1);
+    }
+
+    let vocab_size = logits.shape()[1];
+
+    for (batch_pos, &idx) in running_indices.iter().enumerate() {
+        let seq_logits = logits.slice_view(batch_pos * vocab_size, &[1, vocab_size]);
+
+        let (all_tokens, sampling_clone, gen_len) = {
+            let seq = &scheduler.running()[idx];
+            let toks: Vec<u32> = seq
+                .prompt_ids
+                .iter()
+                .chain(seq.generated_ids.iter())
+                .copied()
+                .collect();
+            let s = seq.options.sampling.clone();
+            let gl = seq.generated_ids.len();
+            (toks, s, gl)
+        };
+        let sampling = sampling_clone.as_ref();
+        let mut rng_state = sampling.map(|s| s.seed ^ (gen_len as u64));
+        let recent = recent_token_window(&all_tokens, sampling);
+
+        match select_token(&seq_logits, sampling, &mut rng_state, recent) {
+            Ok(token_id) => {
+                handle_new_token(idx, token_id, allocator, scheduler);
+            }
+            Err(e) => {
+                let seq = &mut scheduler.running_mut()[idx];
+                seq.phase = SequencePhase::Finished(FinishReason::Stop);
+                let _ = seq.token_tx.send(GenerationEvent::Error(e));
+            }
+        }
+    }
+}
+
+/// Process decode tasks using CUDA graph capture/replay.
+///
+/// - Step 0 (warmup): run `forward_batch_decode_indirect` eagerly to load
+///   all PTX modules.
+/// - Step 1 (capture): `begin_capture` → forward → `end_capture` → `launch`.
+/// - Steps 2+ (replay): `launch` the captured graph.
+///
+/// Between steps, `gather_graph_inputs` writes new token IDs, positions,
+/// block tables, and `seq_lens` into the fixed-address GPU buffers.
+#[allow(clippy::too_many_arguments)]
+fn process_decode_batch_graph<M: Model>(
+    tasks: &[crate::scheduler::DecodeTask],
+    model: &M,
+    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
+    allocator: &mut BlockAllocator,
+    scheduler: &mut Scheduler,
+    gs: &mut GraphState,
+) {
+    let running_indices = match gather_graph_inputs(tasks, scheduler, gs) {
+        Ok(ri) => ri,
+        Err(e) => {
+            mark_all_failed(tasks, scheduler, e);
+            return;
+        }
+    };
+
+    let max_seq_len = gs.graph_max_seq_len;
+    let step = gs.decode_step;
+    gs.decode_step += 1;
+
+    let device = model.devices()[0].device().clone();
+
+    let result = if step == 0 {
+        // Warmup: run eagerly to load all PTX modules
+        model.forward_batch_decode_indirect(&gs.graph_inputs, paged_kvs, max_seq_len)
+    } else if step == 1 {
+        // Capture the graph
+        (|| -> Result<CudaTensor<f32>> {
+            gs.graph.begin_capture()?;
+            let logits =
+                model.forward_batch_decode_indirect(&gs.graph_inputs, paged_kvs, max_seq_len);
+            gs.graph.end_capture()?;
+            let logits = logits?;
+
+            gs.graph.launch()?;
+            device.synchronize()?;
+
+            gs.captured_logits = Some(logits.clone());
+            Ok(logits)
+        })()
+    } else {
+        // Replay the captured graph
+        (|| -> Result<CudaTensor<f32>> {
+            gs.graph.launch()?;
+            device.synchronize()?;
+            gs.captured_logits
+                .clone()
+                .ok_or_else(|| infernum::Error::CudaGraph("no captured logits for replay".into()))
+        })()
+    };
+
+    match result {
+        Ok(logits) => {
+            sample_from_logits(&logits, &running_indices, allocator, scheduler);
+        }
+        Err(e) => {
+            mark_all_failed(tasks, scheduler, e);
+        }
+    }
+}
+
+/// Mark all decode tasks as failed with an error message.
+fn mark_all_failed(
+    tasks: &[crate::scheduler::DecodeTask],
+    scheduler: &mut Scheduler,
+    error: infernum::Error,
+) {
+    let msg = format!("{error}");
+    // Send the original error to the first task
+    if let Some(first) = tasks.first() {
+        let seq = &mut scheduler.running_mut()[first.running_idx];
+        seq.phase = SequencePhase::Finished(FinishReason::Stop);
+        let _ = seq.token_tx.send(GenerationEvent::Error(error));
+    }
+    // Remaining tasks get a formatted copy
+    for task in tasks.iter().skip(1) {
+        let seq = &mut scheduler.running_mut()[task.running_idx];
+        seq.phase = SequencePhase::Finished(FinishReason::Stop);
+        let _ = seq
+            .token_tx
+            .send(GenerationEvent::Error(infernum::Error::InvalidShape(
+                format!("batched decode failed: {msg}"),
+            )));
     }
 }
 
