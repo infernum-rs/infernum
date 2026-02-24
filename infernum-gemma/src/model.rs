@@ -157,6 +157,24 @@ fn load_typed<T: TensorDType + DeviceRepr>(
     }
 }
 
+/// Load a Gemma RMSNorm weight and add 1.0 to every element.
+///
+/// Gemma's RMSNorm computes `x_normed * (1 + weight)` (weights initialized to
+/// zeros), unlike Llama's `x_normed * weight` (weights initialized to ones).
+/// By pre-adding 1.0 at load time, we can reuse the standard RMSNorm kernel.
+fn load_gemma_norm<T: TensorDType + DeviceRepr>(
+    loader: &impl WeightLoader,
+    ctx: &CudaContext,
+    name: &str,
+) -> Result<CudaTensor<T>> {
+    let gpu_tensor = load_typed::<T>(loader, ctx, name)?;
+    let mut host: Vec<T> = gpu_tensor.to_vec()?;
+    for v in &mut host {
+        *v = T::from_f32(v.to_f32() + 1.0);
+    }
+    CudaTensor::from_slice(ctx, gpu_tensor.shape(), &host)
+}
+
 #[cfg(feature = "nccl")]
 fn load_typed_sharded<T: TensorDType + DeviceRepr>(
     loader: &impl WeightLoader,
@@ -421,12 +439,12 @@ where
             let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
             let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
             let q_norm = if loader.contains(&q_norm_name) {
-                Some(load_typed::<T>(loader, ctx, &q_norm_name)?)
+                Some(load_gemma_norm::<T>(loader, ctx, &q_norm_name)?)
             } else {
                 None
             };
             let k_norm = if loader.contains(&k_norm_name) {
-                Some(load_typed::<T>(loader, ctx, &k_norm_name)?)
+                Some(load_gemma_norm::<T>(loader, ctx, &k_norm_name)?)
             } else {
                 None
             };
@@ -447,22 +465,22 @@ where
             };
 
             let layer = GemmaLayerWeights {
-                input_layernorm: load_typed::<T>(
+                input_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.input_layernorm.weight"),
                 )?,
-                post_attention_layernorm: load_typed::<T>(
+                post_attention_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                pre_feedforward_layernorm: load_typed::<T>(
+                pre_feedforward_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.pre_feedforward_layernorm.weight"),
                 )?,
-                post_feedforward_layernorm: load_typed::<T>(
+                post_feedforward_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.post_feedforward_layernorm.weight"),
@@ -498,7 +516,7 @@ where
             layers.push(layer);
         }
 
-        let norm = load_typed::<T>(loader, ctx, "model.norm.weight")?;
+        let norm = load_gemma_norm::<T>(loader, ctx, "model.norm.weight")?;
 
         // Tied word embeddings — Gemma always ties lm_head to embed_tokens
         let lm_head = if qc.is_some() {
@@ -720,12 +738,12 @@ where
             let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
             let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
             let q_norm = if loader.contains(&q_norm_name) {
-                Some(load_typed::<T>(loader, ctx, &q_norm_name)?)
+                Some(load_gemma_norm::<T>(loader, ctx, &q_norm_name)?)
             } else {
                 None
             };
             let k_norm = if loader.contains(&k_norm_name) {
-                Some(load_typed::<T>(loader, ctx, &k_norm_name)?)
+                Some(load_gemma_norm::<T>(loader, ctx, &k_norm_name)?)
             } else {
                 None
             };
@@ -759,22 +777,22 @@ where
             };
 
             let layer = GemmaLayerWeights {
-                input_layernorm: load_typed::<T>(
+                input_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.input_layernorm.weight"),
                 )?,
-                post_attention_layernorm: load_typed::<T>(
+                post_attention_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                pre_feedforward_layernorm: load_typed::<T>(
+                pre_feedforward_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.pre_feedforward_layernorm.weight"),
                 )?,
-                post_feedforward_layernorm: load_typed::<T>(
+                post_feedforward_layernorm: load_gemma_norm::<T>(
                     loader,
                     ctx,
                     &format!("{prefix}.post_feedforward_layernorm.weight"),
@@ -816,7 +834,7 @@ where
             layers.push(layer);
         }
 
-        let norm = load_typed::<T>(loader, ctx, "model.norm.weight")?;
+        let norm = load_gemma_norm::<T>(loader, ctx, "model.norm.weight")?;
 
         // Tied embeddings — not sharded for lm_head
         let lm_head = if qc.is_some() {
