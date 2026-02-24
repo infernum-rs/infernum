@@ -1878,7 +1878,7 @@ where
 
         let sliding_window = self.config.effective_sliding_window(layer_idx);
         let attn_output =
-            fused_attention_prefill(&q, &k_contig, &v_contig, start_pos, sliding_window)?;
+            fused_attention_prefill(&q, &k_contig, &v_contig, start_pos, None, None, sliding_window)?;
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
 
