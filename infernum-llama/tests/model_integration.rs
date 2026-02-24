@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
+use infernum::Model;
+use infernum::Tensor;
 use infernum_llama::LlamaModel;
 use infernum_runtime::Runtime;
 
@@ -154,6 +156,109 @@ mod smollm2_360m {
 
         assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+
+    /// Verify paged prefill + decode produces identical tokens as forward().
+    #[test]
+    fn paged_decode_matches_forward() {
+        use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
+        use infernum::cuda::PagedKvCache;
+
+        let model_dir = model_dir();
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+        let prompt_ids = tokenizer.encode("The capital of France is", true).unwrap();
+        let num_decode_steps = 20;
+
+        let model = LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model_cfg = Model::config(&model);
+
+        // forward() reference: greedy decode step-by-step (no KV cache)
+        let mut fwd_ids = prompt_ids.clone();
+        let mut fwd_tokens = Vec::new();
+        for _step in 0..num_decode_steps {
+            let logits = model.forward(&fwd_ids).expect("forward");
+            let logits_vec: Vec<f32> = logits.to_vec().expect("read");
+            let vocab_size = logits.shape()[1];
+            let last_start = (fwd_ids.len() - 1) * vocab_size;
+            let last_logits = &logits_vec[last_start..last_start + vocab_size];
+
+            let next_id = last_logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32;
+            fwd_tokens.push(next_id);
+            fwd_ids.push(next_id);
+        }
+
+        // Paged prefill + decode
+        let block_config = BlockConfig {
+            block_size: 16,
+            num_blocks: 128,
+        };
+        let mut paged_kvs = vec![PagedKvCache::new(
+            &ctx,
+            model_cfg.num_layers,
+            &block_config,
+            model_cfg.num_kv_heads,
+            model_cfg.head_dim,
+        )
+        .expect("paged kv")];
+        let mut allocator = BlockAllocator::new(&block_config);
+        let mut block_table = BlockTable::new(block_config.block_size);
+
+        let blocks_needed = (prompt_ids.len() + num_decode_steps).div_ceil(block_config.block_size);
+        for _ in 0..blocks_needed {
+            block_table.append_block(allocator.allocate().expect("alloc"));
+        }
+
+        let prefill_logits = model
+            .forward_prefill_paged(&prompt_ids, &mut paged_kvs, &block_table, 0)
+            .expect("prefill");
+        block_table.advance(prompt_ids.len());
+
+        let prefill_vec: Vec<f32> = prefill_logits.to_vec().expect("read");
+        let first_token = prefill_vec
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0 as u32;
+
+        let mut decode_tokens = vec![first_token];
+        let mut prev_token = first_token;
+        for _step in 0..num_decode_steps - 1 {
+            let pos = block_table.seq_len();
+            let decode_logits = model
+                .forward_batch_decode(
+                    &[prev_token],
+                    &mut paged_kvs,
+                    &[block_table.clone()],
+                    &[pos],
+                )
+                .expect("decode");
+            block_table.advance(1);
+
+            let decode_vec: Vec<f32> = decode_logits.to_vec().expect("read");
+            let next_id = decode_vec
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32;
+            decode_tokens.push(next_id);
+            prev_token = next_id;
+        }
+
+        let fwd_text = tokenizer.decode(&fwd_tokens).unwrap_or_default();
+        let dec_text = tokenizer.decode(&decode_tokens).unwrap_or_default();
+        assert_eq!(
+            fwd_tokens, decode_tokens,
+            "Paged decode diverged from forward():\n  forward: {fwd_text:?}\n  decode:  {dec_text:?}"
+        );
     }
 }
 

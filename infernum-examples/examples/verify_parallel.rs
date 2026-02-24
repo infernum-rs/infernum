@@ -19,6 +19,7 @@ use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{GenerateOptions, Model as _, Result, ShardedModel};
 use infernum_deepseek::DeepSeekModel;
+use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
 use infernum_runtime::Runtime;
@@ -124,6 +125,17 @@ fn main() -> Result<()> {
     }
 
     let model_type = detect_model_type(&cli.model)?;
+    let family = match model_type.as_str() {
+        "llama" | "mistral" | "mixtral" => "llama",
+        "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+        "deepseek_v3" => "deepseek",
+        "gemma2" | "gemma3_text" => "gemma",
+        other => {
+            return Err(infernum::Error::UnsupportedModel(format!(
+                "Unsupported model_type: \"{other}\""
+            )))
+        }
+    };
 
     {
         let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
@@ -137,8 +149,8 @@ fn main() -> Result<()> {
         let t0 = Instant::now();
         let ctx = CudaContext::new(0)?;
 
-        match model_type.as_str() {
-            "qwen2" | "qwen3" | "qwen3_moe" => {
+        match family {
+            "qwen" => {
                 let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
                 println!(
                     "Loaded in {:.2}s ({} layers, hidden={})",
@@ -148,8 +160,18 @@ fn main() -> Result<()> {
                 );
                 run_single_gpu(model, &cli)?
             }
-            "deepseek_v3" => {
+            "deepseek" => {
                 let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                println!(
+                    "Loaded in {:.2}s ({} layers, hidden={})",
+                    t0.elapsed().as_secs_f64(),
+                    model.config().num_hidden_layers,
+                    model.config().hidden_size,
+                );
+                run_single_gpu(model, &cli)?
+            }
+            "gemma" => {
+                let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
                 println!(
                     "Loaded in {:.2}s ({} layers, hidden={})",
                     t0.elapsed().as_secs_f64(),
@@ -177,8 +199,8 @@ fn main() -> Result<()> {
         println!("\n=== {world_size} GPUs (tensor parallel) ===");
         let t0 = Instant::now();
 
-        match model_type.as_str() {
-            "qwen2" | "qwen3" | "qwen3_moe" => {
+        match family {
+            "qwen" => {
                 let model =
                     ShardedModel::<QwenModel<f32>>::from_pretrained(&cli.model, world_size)?;
                 let cfg = model.config();
@@ -190,9 +212,21 @@ fn main() -> Result<()> {
                 );
                 run_multi_gpu(model, &cli)?
             }
-            "deepseek_v3" => {
+            "deepseek" => {
                 let model =
                     ShardedModel::<DeepSeekModel<f32>>::from_pretrained(&cli.model, world_size)?;
+                let cfg = model.config();
+                println!(
+                    "Loaded in {:.2}s ({} layers, head_dim={})",
+                    t0.elapsed().as_secs_f64(),
+                    cfg.num_layers,
+                    cfg.head_dim,
+                );
+                run_multi_gpu(model, &cli)?
+            }
+            "gemma" => {
+                let model =
+                    ShardedModel::<GemmaModel<f32>>::from_pretrained(&cli.model, world_size)?;
                 let cfg = model.config();
                 println!(
                     "Loaded in {:.2}s ({} layers, head_dim={})",

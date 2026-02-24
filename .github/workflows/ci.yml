@@ -147,7 +147,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/infernum/models
-          key: infernum-models-integration-v1
+          key: infernum-models-integration-v2
 
-      - name: Run integration tests
+      - name: Run integration tests (Llama)
         run: cargo test -p infernum-llama --features integration -- --test-threads=1
+
+      - name: Run integration tests (Qwen)
+        run: cargo test -p infernum-qwen --features integration -- --test-threads=1
+
+      - name: Run integration tests (Gemma)
+        run: cargo test -p infernum-gemma --features integration -- --test-threads=1

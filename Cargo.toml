@@ -3,6 +3,7 @@ members = [
     "infernum",
     "infernum-deepseek",
     "infernum-examples",
+    "infernum-gemma",
     "infernum-llama",
     "infernum-macros",
     "infernum-qwen",

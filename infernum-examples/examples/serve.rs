@@ -30,6 +30,7 @@ use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{ChatTemplate, Result};
 use infernum_deepseek::{DeepSeekModel, DeepSeekTemplate};
+use infernum_gemma::{GemmaModel, GemmaTemplate};
 use infernum_llama::{Llama3Template, LlamaModel, MistralTemplate};
 use infernum_qwen::{ChatMLTemplate, QwenModel};
 use infernum_serve::{BatchConfig, ModelEntry, Server};
@@ -81,6 +82,7 @@ fn select_template(model_type: &str) -> Box<dyn ChatTemplate> {
         "mistral" => Box::new(MistralTemplate),
         "qwen2" | "qwen3" | "qwen3_moe" => Box::new(ChatMLTemplate),
         "deepseek_v3" => Box::new(DeepSeekTemplate),
+        "gemma2" | "gemma3_text" => Box::new(GemmaTemplate),
         _ => Box::new(Llama3Template),
     }
 }
@@ -128,6 +130,10 @@ async fn main() -> Result<()> {
         }
         "deepseek_v3" => {
             let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
+        }
+        "gemma2" | "gemma3_text" => {
+            let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         other => {

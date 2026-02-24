@@ -3,13 +3,18 @@
 
 #define INFINITY __int_as_float(0x7f800000)
 
+// Apply logit soft-capping: tanh(x / cap) * cap
+// Disabled when softcap <= 0.0
+#define MAYBE_SOFTCAP(dot, softcap) \
+    if (softcap > 0.0f) { dot = tanhf(dot / softcap) * softcap; }
+
 extern "C" __global__ void fused_prefill_attention_f32(
     float* __restrict__ output,       // (seq_q, num_heads, head_dim)
     const float* __restrict__ q,      // (seq_q, num_heads, head_dim)
     const float* __restrict__ k,      // (total_len, num_kv_heads, head_dim)
     const float* __restrict__ v,      // (total_len, num_kv_heads, head_dim)
     const float scale,
-    const int seq_q,
+    const float softcap,
     const int total_len,
     const int num_heads,
     const int num_kv_heads,
@@ -44,6 +49,7 @@ extern "C" __global__ void fused_prefill_attention_f32(
             dot += s_q[d] * k_ptr[d];
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         local_max = fmaxf(local_max, dot);
     }
 
@@ -67,6 +73,7 @@ extern "C" __global__ void fused_prefill_attention_f32(
             dot += s_q[d] * k_ptr[d];
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         local_sum += expf(dot - max_val);
     }
 
@@ -92,6 +99,7 @@ extern "C" __global__ void fused_prefill_attention_f32(
                 dot += s_q[dd] * k_ptr[dd];
             }
             dot *= scale;
+            MAYBE_SOFTCAP(dot, softcap);
             float weight = expf(dot - max_val) / sum_val;
 
             const float* v_ptr = v + t * num_kv_heads * head_dim + kv_head * head_dim;
@@ -108,7 +116,7 @@ extern "C" __global__ void fused_prefill_attention_f16(
     const __half* __restrict__ k,
     const __half* __restrict__ v,
     const float scale,
-    const int seq_q,
+    const float softcap,
     const int total_len,
     const int num_heads,
     const int num_kv_heads,
@@ -142,6 +150,7 @@ extern "C" __global__ void fused_prefill_attention_f16(
             dot += s_q[d] * __half2float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         local_max = fmaxf(local_max, dot);
     }
 
@@ -165,6 +174,7 @@ extern "C" __global__ void fused_prefill_attention_f16(
             dot += s_q[d] * __half2float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         local_sum += expf(dot - max_val);
     }
 
@@ -190,6 +200,7 @@ extern "C" __global__ void fused_prefill_attention_f16(
                 dot += s_q[dd] * __half2float(k_ptr[dd]);
             }
             dot *= scale;
+            MAYBE_SOFTCAP(dot, softcap);
             float weight = expf(dot - max_val) / sum_val;
             const __half* v_ptr = v + t * num_kv_heads * head_dim + kv_head * head_dim;
             acc += weight * __half2float(v_ptr[d]);
@@ -205,7 +216,7 @@ extern "C" __global__ void fused_prefill_attention_bf16(
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
     const float scale,
-    const int seq_q,
+    const float softcap,
     const int total_len,
     const int num_heads,
     const int num_kv_heads,
@@ -239,6 +250,7 @@ extern "C" __global__ void fused_prefill_attention_bf16(
             dot += s_q[d] * __bfloat162float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         local_max = fmaxf(local_max, dot);
     }
 
@@ -262,6 +274,7 @@ extern "C" __global__ void fused_prefill_attention_bf16(
             dot += s_q[d] * __bfloat162float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         local_sum += expf(dot - max_val);
     }
 
@@ -287,6 +300,7 @@ extern "C" __global__ void fused_prefill_attention_bf16(
                 dot += s_q[dd] * __bfloat162float(k_ptr[dd]);
             }
             dot *= scale;
+            MAYBE_SOFTCAP(dot, softcap);
             float weight = expf(dot - max_val) / sum_val;
             const __nv_bfloat16* v_ptr = v + t * num_kv_heads * head_dim + kv_head * head_dim;
             acc += weight * __bfloat162float(v_ptr[d]);

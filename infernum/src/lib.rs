@@ -28,13 +28,13 @@ pub use cuda::BufferPool;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaGraph;
 #[cfg(feature = "cuda")]
+pub use cuda::CudaTensor;
+#[cfg(feature = "cuda")]
 pub use cuda::QuantizedTensor;
 #[cfg(feature = "cuda")]
 pub use cuda::SeqPosition;
 #[cfg(feature = "nccl")]
 pub use cuda::{nccl::NcclId, NcclCommunicator, NcclType, ShardedModel};
-#[cfg(feature = "cuda")]
-pub use cuda::{CudaTensor, KvCache};
 #[cfg(feature = "cuda")]
 pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};

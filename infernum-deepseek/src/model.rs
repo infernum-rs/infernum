@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_indirect,
     broadcast_to_heads, cast_to_f32, concat_inner_dim, embedding_gather,
@@ -20,14 +21,14 @@ use infernum::cuda::ops::{
     swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
-    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, ValidAsZeroBits,
+    CudaBlas, CudaContext, CudaSlice, CudaTensor, DeviceRepr, Gemm, GpuConfig, KvCache,
+    PagedKvCache, ValidAsZeroBits,
 };
 #[cfg(feature = "nccl")]
 use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig, ShardStrategy};
 use infernum::dtype::TensorDType;
 use infernum::tensor::Tensor;
 use infernum::weights::{SafeTensorsLoader, WeightLoader};
-use infernum::KvCache;
 use infernum::Result;
 
 use crate::DeepSeekConfig;
@@ -1121,9 +1122,17 @@ where
 
         // --- Attention ---
         let attn_output = if seq_len == 1 {
-            fused_attention_decode(&q, &k_full, &v_full, None)?
+            fused_attention_decode(&q, &k_full, &v_full, None, None, None)?
         } else {
-            fused_attention_prefill(&q, &k_full, &v_full, kv_cache.current_len(), None)?
+            fused_attention_prefill(
+                &q,
+                &k_full,
+                &v_full,
+                kv_cache.current_len(),
+                None,
+                None,
+                None,
+            )?
         };
 
         // --- Truncate attention output back to v_head_dim ---
@@ -1195,6 +1204,8 @@ where
             v_full,
             total_len,
             kv_cache.graph_max_seq_len(),
+            None,
+            None,
             None,
         )?;
 
@@ -1471,36 +1482,28 @@ where
         }
     }
 
-    fn forward_with_kv_cache(
+    fn forward_prefill_paged(
         &self,
-        input_ids: &[u32],
-        kv_caches: &mut [KvCache<T>],
+        _input_ids: &[u32],
+        _paged_kvs: &mut [PagedKvCache<T>],
+        _block_table: &BlockTable,
+        _start_pos: usize,
     ) -> Result<CudaTensor<f32>> {
-        self.forward_with_kv_cache(input_ids, &mut kv_caches[0])
+        unimplemented!(
+            "forward_prefill_paged not yet implemented for DeepSeek (MLA paged KV cache pending)"
+        )
     }
 
-    fn forward_next_token(
+    fn forward_batch_decode(
         &self,
-        token_id: u32,
-        kv_caches: &mut [KvCache<T>],
+        _token_ids: &[u32],
+        _paged_kvs: &mut [PagedKvCache<T>],
+        _block_tables: &[BlockTable],
+        _positions: &[usize],
     ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token(token_id, &mut kv_caches[0])
-    }
-
-    fn forward_next_token_device(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_caches: &mut [KvCache<T>],
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_device(token_id_gpu, &mut kv_caches[0])
-    }
-
-    fn forward_next_token_indirect(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_caches: &mut [KvCache<T>],
-    ) -> Result<CudaTensor<f32>> {
-        self.forward_next_token_indirect(token_id_gpu, &mut kv_caches[0])
+        unimplemented!(
+            "forward_batch_decode not yet implemented for DeepSeek (MLA paged KV cache pending)"
+        )
     }
 }
 

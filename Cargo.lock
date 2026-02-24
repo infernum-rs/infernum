@@ -919,6 +919,7 @@ dependencies = [
  "cudarc",
  "infernum",
  "infernum-deepseek",
+ "infernum-gemma",
  "infernum-llama",
  "infernum-qwen",
  "infernum-runtime",
@@ -926,6 +927,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "infernum-gemma"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "infernum",
+ "infernum-runtime",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

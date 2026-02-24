@@ -17,6 +17,7 @@ use infernum::cuda::CudaContext;
 use infernum::model::Model;
 use infernum::GenerateOptions;
 use infernum_deepseek::DeepSeekModel;
+use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
 use infernum_runtime::Engine;
@@ -141,8 +142,16 @@ fn main() -> infernum::Result<()> {
     } else {
         detect_model_type(&cli.model)?
     };
-    let result = match (cli.dtype.as_str(), model_type.as_str()) {
-        ("f32", "llama" | "mistral" | "mixtral") => {
+    let family = match model_type.as_str() {
+        "llama" | "mistral" | "mixtral" => "llama",
+        "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+        "deepseek_v3" => "deepseek",
+        "gemma2" | "gemma3_text" => "gemma",
+        other => panic!("Unsupported model_type: {other}"),
+    };
+
+    let result = match (cli.dtype.as_str(), family) {
+        ("f32", "llama") => {
             let model = if is_gguf {
                 LlamaModel::from_gguf(&ctx, &cli.model)?
             } else {
@@ -151,7 +160,7 @@ fn main() -> infernum::Result<()> {
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
         }
-        ("bf16", "llama" | "mistral" | "mixtral") => {
+        ("bf16", "llama") => {
             assert!(
                 !is_gguf,
                 "bf16 dtype is only supported for SafeTensors models"
@@ -168,12 +177,12 @@ fn main() -> infernum::Result<()> {
                 cli.max_seq_len,
             )
         }
-        ("f32", "qwen2" | "qwen3" | "qwen3_moe") => {
+        ("f32", "qwen") => {
             let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
         }
-        ("bf16", "qwen2" | "qwen3" | "qwen3_moe") => {
+        ("bf16", "qwen") => {
             let model = QwenModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(
@@ -186,13 +195,31 @@ fn main() -> infernum::Result<()> {
                 cli.max_seq_len,
             )
         }
-        ("f32", "deepseek_v3") => {
+        ("f32", "deepseek") => {
             let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
         }
-        ("bf16", "deepseek_v3") => {
+        ("bf16", "deepseek") => {
             let model = DeepSeekModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(
+                model,
+                nl,
+                hs,
+                "bf16",
+                cli.n_gen,
+                cli.graphs,
+                cli.max_seq_len,
+            )
+        }
+        ("f32", "gemma") => {
+            let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
+        }
+        ("bf16", "gemma") => {
+            let model = GemmaModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(
                 model,

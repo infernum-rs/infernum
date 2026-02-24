@@ -20,6 +20,7 @@ use serde::Deserialize;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{GenerateOptions, Result, SamplingParams, ShardedModel};
 use infernum_deepseek::DeepSeekModel;
+use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
 use infernum_runtime::Runtime;
@@ -177,43 +178,66 @@ fn main() -> Result<()> {
     );
 
     let model_type = detect_model_type(&cli.model)?;
+    let family = match model_type.as_str() {
+        "llama" | "mistral" | "mixtral" => "llama",
+        "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+        "deepseek_v3" => "deepseek",
+        "gemma2" | "gemma3_text" => "gemma",
+        other => {
+            return Err(infernum::Error::UnsupportedModel(format!(
+                "Unsupported model_type: \"{other}\""
+            )))
+        }
+    };
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
 
     let t0 = Instant::now();
 
-    match (cli.dtype.as_str(), model_type.as_str()) {
-        ("f32", "llama" | "mistral" | "mixtral") => {
+    match (cli.dtype.as_str(), family) {
+        ("f32", "llama") => {
             let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&cli.model, world_size)?;
             println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
             run_parallel(model, tokenizer, &cli, world_size)
         }
-        ("bf16", "llama" | "mistral" | "mixtral") => {
+        ("bf16", "llama") => {
             let model = ShardedModel::<LlamaModel<infernum::dtype::BF16>>::from_pretrained(
                 &cli.model, world_size,
             )?;
             println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
             run_parallel(model, tokenizer, &cli, world_size)
         }
-        ("f32", "qwen2" | "qwen3" | "qwen3_moe") => {
+        ("f32", "qwen") => {
             let model = ShardedModel::<QwenModel<f32>>::from_pretrained(&cli.model, world_size)?;
             println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
             run_parallel(model, tokenizer, &cli, world_size)
         }
-        ("bf16", "qwen2" | "qwen3" | "qwen3_moe") => {
+        ("bf16", "qwen") => {
             let model = ShardedModel::<QwenModel<infernum::dtype::BF16>>::from_pretrained(
                 &cli.model, world_size,
             )?;
             println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
             run_parallel(model, tokenizer, &cli, world_size)
         }
-        ("f32", "deepseek_v3") => {
+        ("f32", "deepseek") => {
             let model =
                 ShardedModel::<DeepSeekModel<f32>>::from_pretrained(&cli.model, world_size)?;
             println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
             run_parallel(model, tokenizer, &cli, world_size)
         }
-        ("bf16", "deepseek_v3") => {
+        ("bf16", "deepseek") => {
             let model = ShardedModel::<DeepSeekModel<infernum::dtype::BF16>>::from_pretrained(
+                &cli.model, world_size,
+            )?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        ("f32", "gemma") => {
+            let model = ShardedModel::<GemmaModel<f32>>::from_pretrained(&cli.model, world_size)?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        ("bf16", "gemma") => {
+            let model = ShardedModel::<GemmaModel<infernum::dtype::BF16>>::from_pretrained(
                 &cli.model, world_size,
             )?;
             println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());

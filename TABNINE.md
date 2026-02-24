@@ -34,15 +34,17 @@ The project is in early development (Phase 1). Currently contains a minimal skel
 
 ### Supported Model Families
 
-Llama/Mistral/Mixtral are loaded via `infernum-llama` (architecturally identical, type aliases for API clarity). Qwen models are loaded via `infernum-qwen`. DeepSeek V3/R1 are loaded via `infernum-deepseek`.
+Llama/Mistral/Mixtral are loaded via `infernum-llama` (architecturally identical, type aliases for API clarity). Qwen models are loaded via `infernum-qwen`. DeepSeek V3/R1 are loaded via `infernum-deepseek`. Gemma models use `infernum-gemma`.
 
-| Family | `model_type` | Architecture | Crate | Notes |
-|--------|-------------|--------------|-------|-------|
-| Llama | `llama` | Dense | `infernum-llama` | Llama 2, Llama 3, SmolLM2, CodeLlama, etc. |
-| Mistral | `mistral` | Dense | `infernum-llama` | Mistral v1/v2/v3, Devstral (code fine-tune) |
-| Mixtral | `mixtral` | MoE | `infernum-llama` | Mixtral 8x7B, 8x22B, etc. |
-| Qwen | `qwen2` / `qwen3` / `qwen3_moe` | Dense / MoE | `infernum-qwen` | Qwen2/2.5, Qwen3, Qwen3-MoE |
-| DeepSeek | `deepseek_v3` | MLA + MoE | `infernum-deepseek` | DeepSeek-V3, DeepSeek-R1 |
+| Family | `model_type` | Crate | Architecture | Notes |
+|--------|-------------|-------|--------------|-------|
+| Llama | `llama` | `infernum-llama` | Dense | Llama 2, Llama 3, SmolLM2, CodeLlama, etc. |
+| Mistral | `mistral` | `infernum-llama` | Dense | Mistral v1/v2/v3, Devstral (code fine-tune) |
+| Mixtral | `mixtral` | `infernum-llama` | MoE | Mixtral 8x7B, 8x22B, etc. |
+| Qwen | `qwen2` / `qwen3` / `qwen3_moe` | `infernum-qwen` | Dense / MoE | Qwen2/2.5, Qwen3, Qwen3-MoE |
+| DeepSeek | `deepseek_v3` | `infernum-deepseek` | MLA + MoE | DeepSeek-V3, DeepSeek-R1 |
+| Gemma 2 | `gemma2` | `infernum-gemma` | Dense | Gemma 2 2B/9B/27B |
+| Gemma 3 | `gemma3_text` | `infernum-gemma` | Dense | Gemma 3 1B/4B/12B/27B (text decoder) |
 
 ### Sliding Window Attention
 
@@ -68,6 +70,7 @@ infernum-macros/        # Procedural macros (define_block!, etc.)
 infernum-deepseek/      # DeepSeek model family (V3, R1 — MLA + MoE)
 infernum-llama/         # Llama model family
 infernum-qwen/          # Qwen model family (Qwen2/2.5, Qwen3/3.5, Qwen3-MoE)
+infernum-gemma/         # Gemma model family (Gemma 2, Gemma 3 text)
 infernum-phi/           # Phi model family (later)
 infernum-runtime/       # Execution runtime (scheduler, KV cache, batching)
 infernum-serve/         # HTTP server (Axum, OpenAI-compatible API)
@@ -122,6 +125,9 @@ Most CUDA-dependent code is behind feature flags. The `cuda` feature must be ena
 | `infernum-qwen` | `cuda` | Enables `infernum/cuda` + `infernum-runtime/cuda` |
 | `infernum-qwen` | `nccl` | Multi-GPU (implies `cuda`) |
 | `infernum-qwen` | `integration` | Integration tests — downloads real models (implies `cuda`) |
+| `infernum-gemma` | `cuda` | Enables `infernum/cuda` + `infernum-runtime/cuda` |
+| `infernum-gemma` | `nccl` | Multi-GPU (implies `cuda`) |
+| `infernum-gemma` | `integration` | Integration tests — downloads real models (implies `cuda`) |
 | `infernum-runtime` | `cuda` | Enables `infernum/cuda` |
 | `infernum-runtime` | `nccl` | Multi-GPU (implies `cuda`) |
 | `infernum-examples` | `cuda` | All CUDA deps for examples |
@@ -191,6 +197,9 @@ cargo test -p infernum-qwen --features integration -- --test-threads=1
 
 # DeepSeek family
 cargo test -p infernum-deepseek --features integration -- --test-threads=1
+
+# Gemma family
+cargo test -p infernum-gemma --features integration -- --test-threads=1
 ```
 
 Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
@@ -213,6 +222,11 @@ Models are cached in `~/.cache/infernum/models/` so subsequent runs are fast.
 
 - **DeepSeek-V3-tiny** (`yujiepan/deepseek-v3-tiny-random`, ~8.8MB, random weights) — MLA pipeline (Q LoRA compression, joint KV projection, interleaved RoPE, V padding), sigmoid MoE routing with bias correction and grouped top-k, shared expert, dense→MoE layer transition (`first_k_dense_replace=1`). No NaN/Inf.
 
+**What's tested (infernum-gemma):**
+
+- **Gemma 2 tiny** (`yujiepan/gemma-2-tiny-random`, ~2MB f32, random weights) — architecture plumbing, no NaN/Inf. Tests 4 norms/layer, GeGLU, embedding scaling, attention/final logit soft-capping, alternating sliding/full attention.
+- **Gemma 3 text tiny** (`katuni4ka/tiny-random-gemma3-text`, ~2MB bf16, random weights) — architecture plumbing, no NaN/Inf. Tests QK-norm, dual-theta RoPE, sliding_window_pattern auto-generation, no soft-capping.
+
 **Ignored (large model) tests:**
 
 Some integration tests are marked `#[ignore]` because they require very large model downloads and GPU memory. They are skipped by default and must be run manually:
@@ -229,6 +243,8 @@ Currently ignored:
 
 - **Mistral-7B-Instruct-v0.3** (`mistralai/Mistral-7B-Instruct-v0.3`, ~14.5GB bf16, 3 sharded SafeTensors) — validates `model_type: "mistral"` loads correctly via `MistralModel` alias. Requires ~30GB VRAM (loaded as f32).
 - **laser-dolphin-mixtral-2x7b-dpo** (`macadeliccc/laser-dolphin-mixtral-2x7b-dpo`, ~24GB bf16, 3 sharded SafeTensors) — validates MoE generation quality with real weights. Requires ~48GB VRAM (loaded as f32); fits on a single A100 80GB.
+- **Gemma 2 2B** (`google/gemma-2-2b`, gated, ~5GB bf16) — validates Gemma 2 generation quality. Requires HF auth and ~10GB VRAM.
+- **Gemma 3 1B** (`google/gemma-3-1b-it`, gated, ~2GB bf16) — validates Gemma 3 generation quality. Requires HF auth and ~4GB VRAM.
 
 **Writing new integration tests:**
 

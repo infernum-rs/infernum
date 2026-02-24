@@ -8,6 +8,8 @@ mod bias_add;
 mod cast;
 mod embed;
 mod fused_attention;
+mod geglu;
+mod gelu;
 mod linear;
 mod matmul;
 mod mla_tensor_ops;
@@ -18,6 +20,7 @@ mod repeat_kv;
 mod rmsnorm;
 mod rope;
 mod sample;
+mod scale;
 mod silu;
 mod softmax;
 mod swiglu;
@@ -33,6 +36,8 @@ pub use embed::{embedding_gather, embedding_gather_from_device};
 pub use fused_attention::{
     fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill,
 };
+pub use geglu::geglu;
+pub use gelu::{gelu, gelu_inplace, gelu_mul};
 pub use linear::{linear, reinterpret_tensor, LinearWeight};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
 pub use mla_tensor_ops::{broadcast_to_heads, concat_inner_dim, pad_inner_dim, split_inner_dim};
@@ -49,6 +54,7 @@ pub use rope::{
     precompute_rope_cache_scaled, RopeScaling,
 };
 pub use sample::sample_top_p;
+pub use scale::scale_inplace;
 pub use silu::{silu, silu_inplace, silu_mul};
 pub use softmax::{softmax, softmax_causal};
 pub use swiglu::swiglu;

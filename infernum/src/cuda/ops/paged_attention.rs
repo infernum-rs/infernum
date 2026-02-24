@@ -12,7 +12,8 @@
     clippy::too_many_arguments
 )]
 
-use cudarc::driver::{LaunchAsync, LaunchConfig, ValidAsZeroBits};
+use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig, ValidAsZeroBits};
+use std::ffi::c_void;
 
 use crate::cuda::block_allocator::BlockTable;
 use crate::cuda::paged_kv_cache::PagedKvCache;
@@ -73,6 +74,8 @@ fn ensure_paged_decode_kernel<T: cudarc::driver::DeviceRepr>(
 /// * `v_pool` — value pool, same shape as `k_pool`
 /// * `block_tables` — per-request block tables
 /// * `block_size` — tokens per block
+/// * `softcap` — if `Some(cap)`, applies `tanh(score/cap)*cap` after scaling
+/// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
 /// # Returns
 /// Output tensor of shape `(batch_size, num_heads, head_dim)`
@@ -86,6 +89,8 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     v_pool: &CudaTensor<T>,
     block_tables: &[BlockTable],
     block_size: usize,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
     let q_shape = q.shape();
     assert_eq!(
@@ -112,7 +117,9 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
     );
 
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scale = 1.0 / (head_dim as f32).sqrt();
+    let mut softcap_val = softcap.unwrap_or(0.0);
+    let window_size = sliding_window.map_or(0, |w| w as i32);
 
     // Find max blocks per sequence and max seq_len for shared memory sizing
     let max_blocks_per_seq = block_tables
@@ -125,6 +132,14 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         .map(BlockTable::seq_len)
         .max()
         .unwrap_or(0);
+
+    // Active length accounts for sliding window
+    #[allow(clippy::cast_sign_loss)]
+    let max_active_len = if window_size > 0 {
+        max_seq_len.min(window_size as usize)
+    } else {
+        max_seq_len
+    };
 
     // Flatten block tables into a (batch_size, max_blocks_per_seq) matrix
     let mut flat_block_tables = vec![0i32; batch_size * max_blocks_per_seq];
@@ -143,6 +158,50 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     let output_shape = [batch_size, num_heads, head_dim];
     let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
 
+    launch_paged_decode::<T>(
+        device,
+        &mut output,
+        q,
+        k_pool,
+        v_pool,
+        &block_tables_gpu,
+        &seq_lens_gpu,
+        &mut scale,
+        &mut softcap_val,
+        block_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_blocks_per_seq,
+        window_size,
+        max_active_len,
+        batch_size,
+    )?;
+
+    Ok(output)
+}
+
+/// Shared kernel launch logic for both eager and indirect paged decode.
+#[allow(clippy::too_many_arguments)]
+fn launch_paged_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    output: &mut CudaTensor<T>,
+    q: &CudaTensor<T>,
+    k_pool: &CudaTensor<T>,
+    v_pool: &CudaTensor<T>,
+    block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
+    seq_lens_gpu: &cudarc::driver::CudaSlice<i32>,
+    scale: &mut f32,
+    softcap_val: &mut f32,
+    block_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_blocks_per_seq: usize,
+    window_size: i32,
+    max_active_len: usize,
+    batch_size: usize,
+) -> Result<()> {
     ensure_paged_decode_kernel::<T>(device)?;
 
     let kernel_name = format!("paged_decode_attention_{}", kernel_suffix::<T>());
@@ -150,11 +209,10 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         .get_func("paged_decode_attention", &kernel_name)
         .unwrap();
 
-    let threads = 256_usize.min(max_seq_len.next_power_of_two());
-    let threads = threads.max(1); // at least 1 thread
+    let threads = 256_usize.min(max_active_len.next_power_of_two()).max(1);
 
-    // Shared memory: s_q (head_dim) + s_weights (max_seq_len) + s_scratch (threads)
-    let shared_mem = (head_dim + max_seq_len + threads) * std::mem::size_of::<f32>();
+    // Shared memory: s_q (head_dim) + s_weights (max_active_len) + s_scratch (threads)
+    let shared_mem = (head_dim + max_active_len + threads) * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
         grid_dim: (num_heads as u32, batch_size as u32, 1),
@@ -162,27 +220,49 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         shared_mem_bytes: shared_mem as u32,
     };
 
+    let out_slice = output.cuda_slice_mut();
+    let q_slice = q.cuda_slice();
+    let k_slice = k_pool.cuda_slice();
+    let v_slice = v_pool.cuda_slice();
+    let mut bs = block_size as i32;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut mbps = max_blocks_per_seq as i32;
+    let mut ws = window_size;
+
+    let mut args: Vec<*mut c_void> = vec![
+        std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_ref(q_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(k_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(v_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(block_tables_gpu.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(seq_lens_gpu.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        (&raw mut *scale).cast::<c_void>(),
+        (&raw mut *softcap_val).cast::<c_void>(),
+        (&raw mut bs).cast::<c_void>(),
+        (&raw mut nh).cast::<c_void>(),
+        (&raw mut nkv).cast::<c_void>(),
+        (&raw mut hd).cast::<c_void>(),
+        (&raw mut mbps).cast::<c_void>(),
+        (&raw mut ws).cast::<c_void>(),
+    ];
+
     unsafe {
-        func.launch(
-            cfg,
-            (
-                output.cuda_slice_mut(),
-                &q.cuda_slice(),
-                &k_pool.cuda_slice(),
-                &v_pool.cuda_slice(),
-                &block_tables_gpu,
-                &seq_lens_gpu,
-                scale,
-                block_size as i32,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                max_blocks_per_seq as i32,
-            ),
-        )?;
+        func.launch(cfg, &mut args)?;
     }
 
-    Ok(output)
+    Ok(())
 }
 
 /// Batched paged decode attention with GPU-resident block tables and seq lens.
@@ -200,6 +280,8 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
 /// * `block_size` — tokens per block
 /// * `max_blocks_per_seq` — max blocks per sequence (stride for block table rows)
 /// * `max_seq_len` — max sequence length (for shared memory sizing)
+/// * `softcap` — if `Some(cap)`, applies `tanh(score/cap)*cap` after scaling
+/// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
@@ -216,6 +298,8 @@ pub fn paged_attention_decode_indirect<
     block_size: usize,
     max_blocks_per_seq: usize,
     max_seq_len: usize,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
     let q_shape = q.shape();
     assert_eq!(
@@ -237,49 +321,40 @@ pub fn paged_attention_decode_indirect<
         "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
     );
 
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let device = ctx.device();
+    let mut scale = 1.0 / (head_dim as f32).sqrt();
+    let mut softcap_val = softcap.unwrap_or(0.0);
+    let window_size = sliding_window.map_or(0, |w| w as i32);
+
+    // Active length accounts for sliding window
+    #[allow(clippy::cast_sign_loss)]
+    let max_active_len = if window_size > 0 {
+        max_seq_len.min(window_size as usize)
+    } else {
+        max_seq_len
+    };
 
     let output_shape = [batch_size, num_heads, head_dim];
     let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
 
-    ensure_paged_decode_kernel::<T>(device)?;
-
-    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix::<T>());
-    let func = device
-        .get_func("paged_decode_attention", &kernel_name)
-        .unwrap();
-
-    let threads = 256_usize.min(max_seq_len.next_power_of_two());
-    let threads = threads.max(1);
-
-    let shared_mem = (head_dim + max_seq_len + threads) * std::mem::size_of::<f32>();
-
-    let cfg = LaunchConfig {
-        grid_dim: (num_heads as u32, batch_size as u32, 1),
-        block_dim: (threads as u32, 1, 1),
-        shared_mem_bytes: shared_mem as u32,
-    };
-
-    unsafe {
-        func.launch(
-            cfg,
-            (
-                output.cuda_slice_mut(),
-                &q.cuda_slice(),
-                &k_pool.cuda_slice(),
-                &v_pool.cuda_slice(),
-                block_tables_gpu,
-                seq_lens_gpu,
-                scale,
-                block_size as i32,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                max_blocks_per_seq as i32,
-            ),
-        )?;
-    }
+    launch_paged_decode::<T>(
+        ctx.device(),
+        &mut output,
+        q,
+        k_pool,
+        v_pool,
+        block_tables_gpu,
+        seq_lens_gpu,
+        &mut scale,
+        &mut softcap_val,
+        block_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_blocks_per_seq,
+        window_size,
+        max_active_len,
+        batch_size,
+    )?;
 
     Ok(output)
 }
@@ -375,7 +450,8 @@ mod tests {
         let v_contig =
             CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &v_data).unwrap();
 
-        let expected = fused_attention_decode(&q_contig, &k_contig, &v_contig, None).unwrap();
+        let expected =
+            fused_attention_decode(&q_contig, &k_contig, &v_contig, None, None, None).unwrap();
         let expected_vals = expected.to_vec().unwrap();
 
         // --- Paged path ---
@@ -405,8 +481,17 @@ mod tests {
         // Run paged decode attention
         let q_paged = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
         let (k_pool, v_pool) = paged_kv.get_pools(0);
-        let actual =
-            paged_attention_decode(&ctx, &q_paged, k_pool, v_pool, &[table], block_size).unwrap();
+        let actual = paged_attention_decode(
+            &ctx,
+            &q_paged,
+            k_pool,
+            v_pool,
+            &[table],
+            block_size,
+            None,
+            None,
+        )
+        .unwrap();
         let actual_vals = actual.to_vec().unwrap();
 
         // Compare
@@ -492,6 +577,8 @@ mod tests {
             v_pool,
             &[table0.clone(), table1.clone()],
             block_size,
+            None,
+            None,
         )
         .unwrap();
 
@@ -507,7 +594,8 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &k0_data).unwrap();
         let v0_contig =
             CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &v0_data).unwrap();
-        let expected0 = fused_attention_decode(&q0_gpu, &k0_contig, &v0_contig, None).unwrap();
+        let expected0 =
+            fused_attention_decode(&q0_gpu, &k0_contig, &v0_contig, None, None, None).unwrap();
         let exp0 = expected0.to_vec().unwrap();
         for i in 0..req_size {
             assert!(
@@ -524,7 +612,8 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[seq1, num_kv_heads, head_dim], &k1_data).unwrap();
         let v1_contig =
             CudaTensor::from_slice(&ctx, &[seq1, num_kv_heads, head_dim], &v1_data).unwrap();
-        let expected1 = fused_attention_decode(&q1_gpu, &k1_contig, &v1_contig, None).unwrap();
+        let expected1 =
+            fused_attention_decode(&q1_gpu, &k1_contig, &v1_contig, None, None, None).unwrap();
         let exp1 = expected1.to_vec().unwrap();
         for i in 0..req_size {
             assert!(
@@ -611,8 +700,17 @@ mod tests {
 
         // Eager
         let (k_pool, v_pool) = paged_kv.get_pools(0);
-        let eager = paged_attention_decode(&ctx, &q, k_pool, v_pool, &[table0.clone()], block_size)
-            .unwrap();
+        let eager = paged_attention_decode(
+            &ctx,
+            &q,
+            k_pool,
+            v_pool,
+            &[table0.clone()],
+            block_size,
+            None,
+            None,
+        )
+        .unwrap();
         let eager_data = eager.to_vec().unwrap();
 
         // Indirect
@@ -633,6 +731,8 @@ mod tests {
             block_size,
             max_blocks_per_seq,
             table0.seq_len(),
+            None,
+            None,
         )
         .unwrap();
         let indirect_data = indirect.to_vec().unwrap();
@@ -641,6 +741,257 @@ mod tests {
             assert!(
                 (e - ind).abs() < 1e-6,
                 "Mismatch at {i}: eager={e}, indirect={ind}"
+            );
+        }
+    }
+
+    /// Paged decode with softcap matches contiguous fused decode with softcap.
+    #[test]
+    fn paged_decode_with_softcap() {
+        let ctx = make_ctx();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let block_size = 4;
+        let seq_len = 7;
+        let cap = 50.0_f32;
+
+        let q_data: Vec<f32> = (0..(num_heads * head_dim))
+            .map(|i| ((i as f32) * 0.1).sin())
+            .collect();
+        let kv_len = seq_len * num_kv_heads * head_dim;
+        let k_data: Vec<f32> = (0..kv_len).map(|i| ((i as f32) * 0.07).cos()).collect();
+        let v_data: Vec<f32> = (0..kv_len).map(|i| ((i as f32) * 0.03).sin()).collect();
+
+        // Contiguous reference with softcap
+        let q_contig = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+        let k_contig =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &k_data).unwrap();
+        let v_contig =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &v_data).unwrap();
+        let expected =
+            fused_attention_decode(&q_contig, &k_contig, &v_contig, None, Some(cap), None).unwrap();
+        let expected_vals = expected.to_vec().unwrap();
+
+        // Also compute without softcap to verify softcap changes the result
+        let no_cap =
+            fused_attention_decode(&q_contig, &k_contig, &v_contig, None, None, None).unwrap();
+        assert_ne!(
+            expected_vals,
+            no_cap.to_vec().unwrap(),
+            "Softcap should produce different output"
+        );
+
+        // Paged path with softcap
+        let config = crate::cuda::block_allocator::BlockConfig {
+            block_size,
+            num_blocks: 8,
+        };
+        let mut paged_kv = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = crate::cuda::block_allocator::BlockAllocator::new(&config);
+
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let mut table = BlockTable::new(block_size);
+        table.append_block(b0);
+        table.append_block(b1);
+
+        let k_gpu =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &k_data).unwrap();
+        let v_gpu =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &v_data).unwrap();
+        paged_kv.append_paged(0, &table, &k_gpu, &v_gpu, 0).unwrap();
+        table.advance(seq_len);
+
+        let q_paged = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+        let (k_pool, v_pool) = paged_kv.get_pools(0);
+        let actual = paged_attention_decode(
+            &ctx,
+            &q_paged,
+            k_pool,
+            v_pool,
+            &[table],
+            block_size,
+            Some(cap),
+            None,
+        )
+        .unwrap();
+        let actual_vals = actual.to_vec().unwrap();
+
+        assert_eq!(expected_vals.len(), actual_vals.len());
+        for (i, (e, a)) in expected_vals.iter().zip(actual_vals.iter()).enumerate() {
+            assert!(
+                (e - a).abs() < 1e-4,
+                "Softcap mismatch at index {i}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    /// Paged decode with sliding window matches contiguous fused decode with sliding window.
+    #[test]
+    fn paged_decode_with_sliding_window() {
+        let ctx = make_ctx();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let block_size = 4;
+        let seq_len = 10; // 3 blocks (4 + 4 + 2 tokens)
+        let window = 4;
+
+        let q_data: Vec<f32> = (0..(num_heads * head_dim))
+            .map(|i| ((i as f32) * 0.13).sin())
+            .collect();
+        let kv_len = seq_len * num_kv_heads * head_dim;
+        let k_data: Vec<f32> = (0..kv_len).map(|i| ((i as f32) * 0.09).cos()).collect();
+        let v_data: Vec<f32> = (0..kv_len).map(|i| ((i as f32) * 0.05).sin()).collect();
+
+        // Contiguous reference with sliding window
+        let q_contig = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+        let k_contig =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &k_data).unwrap();
+        let v_contig =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &v_data).unwrap();
+        let expected =
+            fused_attention_decode(&q_contig, &k_contig, &v_contig, None, None, Some(window))
+                .unwrap();
+        let expected_vals = expected.to_vec().unwrap();
+
+        // Also compute without window to verify it changes the result
+        let no_window =
+            fused_attention_decode(&q_contig, &k_contig, &v_contig, None, None, None).unwrap();
+        assert_ne!(
+            expected_vals,
+            no_window.to_vec().unwrap(),
+            "Sliding window should produce different output"
+        );
+
+        // Paged path with sliding window
+        let config = crate::cuda::block_allocator::BlockConfig {
+            block_size,
+            num_blocks: 8,
+        };
+        let mut paged_kv = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = crate::cuda::block_allocator::BlockAllocator::new(&config);
+
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        let mut table = BlockTable::new(block_size);
+        table.append_block(b0);
+        table.append_block(b1);
+        table.append_block(b2);
+
+        let k_gpu =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &k_data).unwrap();
+        let v_gpu =
+            CudaTensor::from_slice(&ctx, &[seq_len, num_kv_heads, head_dim], &v_data).unwrap();
+        paged_kv.append_paged(0, &table, &k_gpu, &v_gpu, 0).unwrap();
+        table.advance(seq_len);
+
+        let q_paged = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+        let (k_pool, v_pool) = paged_kv.get_pools(0);
+        let actual = paged_attention_decode(
+            &ctx,
+            &q_paged,
+            k_pool,
+            v_pool,
+            &[table],
+            block_size,
+            None,
+            Some(window),
+        )
+        .unwrap();
+        let actual_vals = actual.to_vec().unwrap();
+
+        assert_eq!(expected_vals.len(), actual_vals.len());
+        for (i, (e, a)) in expected_vals.iter().zip(actual_vals.iter()).enumerate() {
+            assert!(
+                (e - a).abs() < 1e-4,
+                "Sliding window mismatch at index {i}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    /// Indirect paged decode with softcap matches eager paged decode with softcap.
+    #[test]
+    fn paged_decode_indirect_with_softcap() {
+        let ctx = make_ctx();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let block_size = 4;
+        let cap = 50.0_f32;
+
+        let config = crate::cuda::block_allocator::BlockConfig {
+            block_size,
+            num_blocks: 16,
+        };
+        let mut paged_kv = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut allocator = crate::cuda::block_allocator::BlockAllocator::new(&config);
+
+        let b0 = allocator.allocate().unwrap();
+        let mut table0 = BlockTable::new(block_size);
+        table0.append_block(b0);
+        let seq0 = 3;
+        let k0_data: Vec<f32> = (0..(seq0 * num_kv_heads * head_dim))
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+        let v0_data: Vec<f32> = (0..(seq0 * num_kv_heads * head_dim))
+            .map(|i| (i as f32) * 0.05)
+            .collect();
+        let k0 = CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &k0_data).unwrap();
+        let v0 = CudaTensor::from_slice(&ctx, &[seq0, num_kv_heads, head_dim], &v0_data).unwrap();
+        paged_kv.append_paged(0, &table0, &k0, &v0, 0).unwrap();
+        table0.advance(seq0);
+
+        let q_data: Vec<f32> = (0..(num_heads * head_dim))
+            .map(|i| ((i as f32) * 0.3).sin())
+            .collect();
+        let q = CudaTensor::from_slice(&ctx, &[1, num_heads, head_dim], &q_data).unwrap();
+
+        // Eager with softcap
+        let (k_pool, v_pool) = paged_kv.get_pools(0);
+        let eager = paged_attention_decode(
+            &ctx,
+            &q,
+            k_pool,
+            v_pool,
+            &[table0.clone()],
+            block_size,
+            Some(cap),
+            None,
+        )
+        .unwrap();
+        let eager_data = eager.to_vec().unwrap();
+
+        // Indirect with softcap
+        let max_blocks_per_seq = table0.num_blocks();
+        let flat_tables: Vec<i32> = table0.blocks().iter().map(|&b| b as i32).collect();
+        let seq_lens = [table0.seq_len() as i32];
+        let tables_gpu = ctx.device().htod_sync_copy(&flat_tables).unwrap();
+        let seq_lens_gpu = ctx.device().htod_sync_copy(&seq_lens).unwrap();
+
+        let (k_pool, v_pool) = paged_kv.get_pools(0);
+        let indirect = paged_attention_decode_indirect(
+            &ctx,
+            &q,
+            k_pool,
+            v_pool,
+            &tables_gpu,
+            &seq_lens_gpu,
+            block_size,
+            max_blocks_per_seq,
+            table0.seq_len(),
+            Some(cap),
+            None,
+        )
+        .unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&e, &ind)) in eager_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (e - ind).abs() < 1e-6,
+                "Softcap indirect mismatch at {i}: eager={e}, indirect={ind}"
             );
         }
     }
