@@ -435,9 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn test_uninit_without_pool() {
+    fn test_uninit_pool_enabled_by_default() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        assert!(ctx.buffer_pool().is_none());
+        assert!(ctx.buffer_pool().is_some());
 
         let tensor = unsafe { CudaTensor::<f32>::uninit(&ctx, &[4, 8]).unwrap() };
         assert_eq!(tensor.shape(), &[4, 8]);
@@ -446,9 +446,7 @@ mod tests {
 
     #[test]
     fn test_uninit_with_pool_miss_then_hit() {
-        let mut ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        ctx.enable_buffer_pool();
-
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let pool = ctx.buffer_pool().unwrap();
         assert_eq!(pool.hits(), 0);
         assert_eq!(pool.misses(), 0);
@@ -476,8 +474,7 @@ mod tests {
 
     #[test]
     fn test_pool_roundtrip_data_integrity() {
-        let mut ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        ctx.enable_buffer_pool();
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
 
         // Allocate, write, drop (returns to pool)
         {
@@ -501,8 +498,7 @@ mod tests {
 
     #[test]
     fn test_pool_different_sizes_separate() {
-        let mut ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        ctx.enable_buffer_pool();
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let pool = ctx.buffer_pool().unwrap().clone();
 
         // Allocate two different sizes
@@ -522,8 +518,7 @@ mod tests {
 
     #[test]
     fn test_pool_shared_tensor_no_early_return() {
-        let mut ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        ctx.enable_buffer_pool();
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let pool = ctx.buffer_pool().unwrap().clone();
 
         let t1 = unsafe { CudaTensor::<f32>::uninit(&ctx, &[8]).unwrap() };

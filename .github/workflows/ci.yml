@@ -12,6 +12,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
   # Basic checks that don't require GPU (runs on free runners)
@@ -130,8 +131,11 @@ jobs:
       - name: Run CUDA tests
         run: cargo test --features cuda -- --test-threads=1
 
-      - name: Build examples
+      - name: Build examples (CUDA)
         run: cargo build --features cuda --examples
+
+      - name: Build examples (NCCL)
+        run: cargo build -p infernum-examples --features nccl --examples
 
       - name: Run custom_cuda_op example
         run: cargo run --example custom_cuda_op --features cuda

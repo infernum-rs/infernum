@@ -66,7 +66,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
     Ok(probe.model_type)
 }
 
-fn run_single_gpu<M: infernum::Model + Send>(model: M, cli: &Cli) -> Result<String> {
+fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::new(model, tokenizer)?;
     let t0 = Instant::now();
@@ -86,7 +86,7 @@ fn run_single_gpu<M: infernum::Model + Send>(model: M, cli: &Cli) -> Result<Stri
     Ok(output)
 }
 
-fn run_multi_gpu<M: infernum::Model + Send>(model: M, cli: &Cli) -> Result<String> {
+fn run_multi_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::new(model, tokenizer)?;
     let t0 = Instant::now();

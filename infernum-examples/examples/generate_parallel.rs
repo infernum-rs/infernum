@@ -95,7 +95,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
     Ok(probe.model_type)
 }
 
-fn run_parallel<M: Model + Send>(
+fn run_parallel<M: Model + Send + 'static>(
     model: M,
     tokenizer: LlamaTokenizer,
     cli: &Cli,
