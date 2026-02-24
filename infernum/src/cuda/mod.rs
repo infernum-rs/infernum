@@ -31,7 +31,7 @@ pub use nccl::NcclCommunicator;
 pub use paged_kv_cache::PagedKvCache;
 pub use quantized::QuantizedTensor;
 pub use seq_position::SeqPosition;
-pub use shard::{GpuConfig, ShardConfig, ShardStrategy};
+pub use shard::{shard_strategy_for_weight, GpuConfig, ShardConfig, ShardStrategy};
 #[cfg(feature = "nccl")]
 pub use sharded::ShardedModel;
 pub use tensor::CudaTensor;

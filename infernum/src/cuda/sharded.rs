@@ -12,7 +12,7 @@ use std::thread;
 
 use super::block_allocator::BlockTable;
 use super::nccl::NcclCommunicator;
-use super::{CudaContext, CudaTensor, KvCache, PagedKvCache, ShardConfig};
+use super::{CudaContext, CudaTensor, PagedKvCache, ShardConfig};
 use crate::model::ShardedLoadable;
 use crate::{Model, Result};
 
@@ -93,46 +93,6 @@ where
                 .replicas
                 .iter()
                 .map(|(_, model)| s.spawn(move || model.forward(input_ids)))
-                .collect();
-
-            collect_rank0(handles)
-        })
-    }
-
-    fn forward_with_kv_cache(
-        &self,
-        input_ids: &[u32],
-        kv_caches: &mut [KvCache<Self::CacheDtype>],
-    ) -> Result<CudaTensor<f32>> {
-        thread::scope(|s| {
-            let handles: Vec<_> = self
-                .replicas
-                .iter()
-                .zip(kv_caches.iter_mut())
-                .map(|((_, model), kv)| {
-                    s.spawn(move || {
-                        model.forward_with_kv_cache(input_ids, std::slice::from_mut(kv))
-                    })
-                })
-                .collect();
-
-            collect_rank0(handles)
-        })
-    }
-
-    fn forward_next_token(
-        &self,
-        token_id: u32,
-        kv_caches: &mut [KvCache<Self::CacheDtype>],
-    ) -> Result<CudaTensor<f32>> {
-        thread::scope(|s| {
-            let handles: Vec<_> = self
-                .replicas
-                .iter()
-                .zip(kv_caches.iter_mut())
-                .map(|((_, model), kv)| {
-                    s.spawn(move || model.forward_next_token(token_id, std::slice::from_mut(kv)))
-                })
                 .collect();
 
             collect_rank0(handles)

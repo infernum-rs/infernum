@@ -3,6 +3,11 @@
 
 #define INFINITY __int_as_float(0x7f800000)
 
+// Apply logit soft-capping: tanh(x / cap) * cap
+// Disabled when softcap <= 0.0
+#define MAYBE_SOFTCAP(dot, softcap) \
+    if (softcap > 0.0f) { dot = tanhf(dot / softcap) * softcap; }
+
 // Fused decode attention with score caching
 // Caches attention weights in shared memory to avoid Q·K recomputation in output pass.
 // This reduces compute from 3 passes over head_dim to 2 passes.
@@ -12,6 +17,7 @@ extern "C" __global__ void fused_decode_attention_f32(
     const float* __restrict__ k,      // (total_len, num_kv_heads, head_dim)
     const float* __restrict__ v,      // (total_len, num_kv_heads, head_dim)
     const float scale,
+    const float softcap,             // <= 0 means disabled
     const int total_len,
     const int num_heads,
     const int num_kv_heads,
@@ -47,6 +53,7 @@ extern "C" __global__ void fused_decode_attention_f32(
             dot += s_q[d] * k_ptr[d];
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         s_weights[t] = dot;
         local_max = fmaxf(local_max, dot);
     }
@@ -107,6 +114,7 @@ extern "C" __global__ void fused_decode_attention_indirect_f32(
     const float* __restrict__ k,
     const float* __restrict__ v,
     const float scale,
+    const float softcap,
     const unsigned int* __restrict__ total_len_ptr,
     const int num_heads,
     const int num_kv_heads,
@@ -141,6 +149,7 @@ extern "C" __global__ void fused_decode_attention_indirect_f32(
             dot += s_q[d] * k_ptr[d];
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         s_weights[t] = dot;
         local_max = fmaxf(local_max, dot);
     }
@@ -196,6 +205,7 @@ extern "C" __global__ void fused_decode_attention_f16(
     const __half* __restrict__ k,
     const __half* __restrict__ v,
     const float scale,
+    const float softcap,
     const int total_len,
     const int num_heads,
     const int num_kv_heads,
@@ -229,6 +239,7 @@ extern "C" __global__ void fused_decode_attention_f16(
             dot += s_q[d] * __half2float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         s_weights[t] = dot;
         local_max = fmaxf(local_max, dot);
     }
@@ -283,6 +294,7 @@ extern "C" __global__ void fused_decode_attention_indirect_f16(
     const __half* __restrict__ k,
     const __half* __restrict__ v,
     const float scale,
+    const float softcap,
     const unsigned int* __restrict__ total_len_ptr,
     const int num_heads,
     const int num_kv_heads,
@@ -317,6 +329,7 @@ extern "C" __global__ void fused_decode_attention_indirect_f16(
             dot += s_q[d] * __half2float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         s_weights[t] = dot;
         local_max = fmaxf(local_max, dot);
     }
@@ -372,6 +385,7 @@ extern "C" __global__ void fused_decode_attention_bf16(
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
     const float scale,
+    const float softcap,
     const int total_len,
     const int num_heads,
     const int num_kv_heads,
@@ -405,6 +419,7 @@ extern "C" __global__ void fused_decode_attention_bf16(
             dot += s_q[d] * __bfloat162float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         s_weights[t] = dot;
         local_max = fmaxf(local_max, dot);
     }
@@ -459,6 +474,7 @@ extern "C" __global__ void fused_decode_attention_indirect_bf16(
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
     const float scale,
+    const float softcap,
     const unsigned int* __restrict__ total_len_ptr,
     const int num_heads,
     const int num_kv_heads,
@@ -493,6 +509,7 @@ extern "C" __global__ void fused_decode_attention_indirect_bf16(
             dot += s_q[d] * __bfloat162float(k_ptr[d]);
         }
         dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
         s_weights[t] = dot;
         local_max = fmaxf(local_max, dot);
     }

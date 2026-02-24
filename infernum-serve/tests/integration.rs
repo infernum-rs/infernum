@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 
 use infernum::chat_template::RawTemplate;
 use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::{CudaContext, CudaTensor, KvCache, PagedKvCache};
+use infernum::cuda::{CudaContext, CudaTensor, PagedKvCache};
 use infernum::{Model, ModelConfig, Result as InfernumResult, Tokenizer};
 use infernum_serve::{ModelEntry, Server};
 
@@ -93,22 +93,6 @@ impl Model for MockModel {
         let mut logits = vec![0.0_f32; seq_len * self.vocab_size];
         logits[42] = 100.0;
         CudaTensor::from_slice(&self.ctx, &[seq_len, self.vocab_size], &logits)
-    }
-
-    fn forward_with_kv_cache(
-        &self,
-        _input_ids: &[u32],
-        _kv_caches: &mut [KvCache<f32>],
-    ) -> InfernumResult<CudaTensor<f32>> {
-        self.make_logits(42)
-    }
-
-    fn forward_next_token(
-        &self,
-        _token_id: u32,
-        _kv_caches: &mut [KvCache<f32>],
-    ) -> InfernumResult<CudaTensor<f32>> {
-        self.make_logits(42)
     }
 
     fn forward_prefill_paged(

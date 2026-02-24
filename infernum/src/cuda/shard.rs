@@ -83,6 +83,54 @@ pub enum ShardStrategy {
     Row,
 }
 
+/// Determine the shard strategy for a weight tensor by its name.
+///
+/// Standard transformer projection naming convention:
+/// - Column-parallel (split output dim): `q_proj`, `k_proj`, `v_proj`,
+///   `gate_proj`, `up_proj`
+/// - Row-parallel (split input dim): `o_proj`, `down_proj`
+/// - `MoE` experts: `w1`/`w3` Column, `w2` Row (Mixtral naming)
+/// - Replicate: norms, embeddings, `RoPE` caches, `lm_head`, router gate,
+///   scales, everything else
+#[must_use]
+pub fn shard_strategy_for_weight(name: &str) -> ShardStrategy {
+    // Scale tensors are always replicated (per-tensor scalars)
+    if name.ends_with("_scale") {
+        return ShardStrategy::Replicate;
+    }
+
+    // Column-parallel projections (split along output dimension)
+    if name.ends_with("q_proj.weight")
+        || name.ends_with("k_proj.weight")
+        || name.ends_with("v_proj.weight")
+        || name.ends_with("gate_proj.weight")
+        || name.ends_with("up_proj.weight")
+    {
+        return ShardStrategy::Column;
+    }
+
+    // Row-parallel projections (split along input dimension)
+    if name.ends_with("o_proj.weight") || name.ends_with("down_proj.weight") {
+        return ShardStrategy::Row;
+    }
+
+    // MoE expert projections (Mixtral SafeTensors naming)
+    // w1 = gate_proj (column-parallel), w3 = up_proj (column-parallel)
+    // w2 = down_proj (row-parallel)
+    // Router gate falls through to Replicate below.
+    if name.contains(".block_sparse_moe.experts.") {
+        if name.ends_with(".w1.weight") || name.ends_with(".w3.weight") {
+            return ShardStrategy::Column;
+        }
+        if name.ends_with(".w2.weight") {
+            return ShardStrategy::Row;
+        }
+    }
+
+    // Everything else: norms, embeddings, lm_head, router gate
+    ShardStrategy::Replicate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +176,68 @@ mod tests {
         assert!(config.shard().is_some());
         assert_eq!(config.world_size(), 4);
         assert_eq!(config.shard().unwrap().rank, 1);
+    }
+
+    #[test]
+    fn test_shard_strategy_column_parallel() {
+        let column_names = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.5.self_attn.k_proj.weight",
+            "model.layers.31.self_attn.v_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            // MoE expert projections: w1 = gate_proj, w3 = up_proj
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.7.w3.weight",
+            "model.layers.31.block_sparse_moe.experts.3.w1.weight",
+        ];
+        for name in &column_names {
+            assert!(
+                matches!(shard_strategy_for_weight(name), ShardStrategy::Column),
+                "{name} should be Column"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_strategy_row_parallel() {
+        let row_names = [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.31.mlp.down_proj.weight",
+            // MoE expert projections: w2 = down_proj
+            "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+            "model.layers.31.block_sparse_moe.experts.5.w2.weight",
+        ];
+        for name in &row_names {
+            assert!(
+                matches!(shard_strategy_for_weight(name), ShardStrategy::Row),
+                "{name} should be Row"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_strategy_replicate() {
+        let replicate_names = [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight_scale",
+            // MoE router gate: replicated on all ranks
+            "model.layers.0.block_sparse_moe.gate.weight",
+            // Gemma-specific norms
+            "model.layers.0.pre_feedforward_layernorm.weight",
+            "model.layers.0.post_feedforward_layernorm.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+        ];
+        for name in &replicate_names {
+            assert!(
+                matches!(shard_strategy_for_weight(name), ShardStrategy::Replicate),
+                "{name} should be Replicate"
+            );
+        }
     }
 }
