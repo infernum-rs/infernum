@@ -25,12 +25,14 @@ use infernum::cuda::ops::{
     precompute_rope_cache, quantized_matmul, rms_norm, rms_norm_inplace, scale_inplace,
     transpose_2d, GemmScalar,
 };
+#[cfg(feature = "nccl")]
+use infernum::cuda::{
+    shard_strategy_for_weight, NcclCommunicator, NcclType, ShardConfig, ShardStrategy,
+};
 use infernum::cuda::{
     BatchedGraphInputs, CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, GpuConfig,
     PagedKvCache, QuantizedTensor, ValidAsZeroBits,
 };
-#[cfg(feature = "nccl")]
-use infernum::cuda::{NcclCommunicator, NcclType, ShardConfig, ShardStrategy};
 use infernum::dtype::TensorDType;
 use infernum::tensor::Tensor;
 use infernum::weights::{SafeTensorsLoader, WeightLoader};
@@ -706,20 +708,22 @@ where
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
 
+            let k_name = format!("{prefix}.self_attn.k_proj.weight");
             let k = load_linear_sharded::<T>(
                 ctx,
                 loader,
-                &format!("{prefix}.self_attn.k_proj.weight"),
+                &k_name,
                 &shard,
-                ShardStrategy::Column,
+                shard_strategy_for_weight(&k_name),
                 qc,
             )?;
+            let v_name = format!("{prefix}.self_attn.v_proj.weight");
             let v = load_linear_sharded::<T>(
                 ctx,
                 loader,
-                &format!("{prefix}.self_attn.v_proj.weight"),
+                &v_name,
                 &shard,
-                ShardStrategy::Column,
+                shard_strategy_for_weight(&v_name),
                 qc,
             )?;
             let kv_dim = tp_num_kv_heads * config.head_dim;
@@ -748,20 +752,22 @@ where
                 None
             };
 
+            let gate_name = format!("{prefix}.mlp.gate_proj.weight");
             let gate = load_linear_sharded::<T>(
                 ctx,
                 loader,
-                &format!("{prefix}.mlp.gate_proj.weight"),
+                &gate_name,
                 &shard,
-                ShardStrategy::Column,
+                shard_strategy_for_weight(&gate_name),
                 qc,
             )?;
+            let up_name = format!("{prefix}.mlp.up_proj.weight");
             let up = load_linear_sharded::<T>(
                 ctx,
                 loader,
-                &format!("{prefix}.mlp.up_proj.weight"),
+                &up_name,
                 &shard,
-                ShardStrategy::Column,
+                shard_strategy_for_weight(&up_name),
                 qc,
             )?;
             let tp_intermediate = config.intermediate_size / world_size;
@@ -798,36 +804,45 @@ where
                     &format!("{prefix}.post_feedforward_layernorm.weight"),
                 )?,
                 attention: GemmaAttentionWeights {
-                    q_proj: load_linear_sharded::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.self_attn.q_proj.weight"),
-                        &shard,
-                        ShardStrategy::Column,
-                        qc,
-                    )?,
+                    q_proj: {
+                        let name = format!("{prefix}.self_attn.q_proj.weight");
+                        load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &name,
+                            &shard,
+                            shard_strategy_for_weight(&name),
+                            qc,
+                        )?
+                    },
                     kv_proj,
-                    o_proj: load_linear_sharded::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.self_attn.o_proj.weight"),
-                        &shard,
-                        ShardStrategy::Row,
-                        qc,
-                    )?,
+                    o_proj: {
+                        let name = format!("{prefix}.self_attn.o_proj.weight");
+                        load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &name,
+                            &shard,
+                            shard_strategy_for_weight(&name),
+                            qc,
+                        )?
+                    },
                     q_norm,
                     k_norm,
                 },
                 mlp: GemmaMlpWeights {
                     gate_up,
-                    down_proj: load_linear_sharded::<T>(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.mlp.down_proj.weight"),
-                        &shard,
-                        ShardStrategy::Row,
-                        qc,
-                    )?,
+                    down_proj: {
+                        let name = format!("{prefix}.mlp.down_proj.weight");
+                        load_linear_sharded::<T>(
+                            ctx,
+                            loader,
+                            &name,
+                            &shard,
+                            shard_strategy_for_weight(&name),
+                            qc,
+                        )?
+                    },
                 },
             };
 
