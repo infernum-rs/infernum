@@ -15,8 +15,8 @@ use infernum::cuda::ops::{
     bias_add_inplace, cast_to_f32, embedding_gather, embedding_gather_from_device,
     fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32, mul,
     paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache,
-    precompute_rope_cache_scaled, reinterpret_tensor, rms_norm, rms_norm_inplace, swiglu,
-    transpose_2d, GemmScalar, LinearWeight, RopeScaling,
+    precompute_rope_cache_scaled, reinterpret_tensor, rms_norm, rms_norm_inplace, split_inner_dim,
+    swiglu, transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
     BatchedGraphInputs, CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, GpuConfig,
@@ -81,50 +81,18 @@ fn concat_weights<T: TensorDType + DeviceRepr + Default>(
     CudaTensor::from_slice(a.context(), &[k, n1 + n2], &out)
 }
 
-fn split_gate_up<T: TensorDType + DeviceRepr + Default>(
+fn split_gate_up<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
     fused: &CudaTensor<T>,
     intermediate_size: usize,
 ) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
-    let seq_len = fused.shape()[0];
-    let data = fused.to_vec()?;
-    let stride = 2 * intermediate_size;
-
-    let mut gate_data = vec![T::default(); seq_len * intermediate_size];
-    let mut up_data = vec![T::default(); seq_len * intermediate_size];
-
-    for row in 0..seq_len {
-        gate_data[row * intermediate_size..(row + 1) * intermediate_size]
-            .copy_from_slice(&data[row * stride..row * stride + intermediate_size]);
-        up_data[row * intermediate_size..(row + 1) * intermediate_size]
-            .copy_from_slice(&data[row * stride + intermediate_size..(row + 1) * stride]);
-    }
-
-    let gate = CudaTensor::from_slice(fused.context(), &[seq_len, intermediate_size], &gate_data)?;
-    let up = CudaTensor::from_slice(fused.context(), &[seq_len, intermediate_size], &up_data)?;
-    Ok((gate, up))
+    split_inner_dim(fused, intermediate_size, intermediate_size)
 }
 
-fn split_kv<T: TensorDType + DeviceRepr + Default>(
+fn split_kv<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
     fused: &CudaTensor<T>,
     kv_dim: usize,
 ) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
-    let seq_len = fused.shape()[0];
-    let data = fused.to_vec()?;
-    let stride = 2 * kv_dim;
-
-    let mut k_data = vec![T::default(); seq_len * kv_dim];
-    let mut v_data = vec![T::default(); seq_len * kv_dim];
-
-    for row in 0..seq_len {
-        k_data[row * kv_dim..(row + 1) * kv_dim]
-            .copy_from_slice(&data[row * stride..row * stride + kv_dim]);
-        v_data[row * kv_dim..(row + 1) * kv_dim]
-            .copy_from_slice(&data[row * stride + kv_dim..(row + 1) * stride]);
-    }
-
-    let k = CudaTensor::from_slice(fused.context(), &[seq_len, kv_dim], &k_data)?;
-    let v = CudaTensor::from_slice(fused.context(), &[seq_len, kv_dim], &v_data)?;
-    Ok((k, v))
+    split_inner_dim(fused, kv_dim, kv_dim)
 }
 
 fn load_typed<T: TensorDType + DeviceRepr>(

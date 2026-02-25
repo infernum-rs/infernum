@@ -191,6 +191,9 @@ impl CudaGraph {
 impl Drop for CudaGraph {
     fn drop(&mut self) {
         if let Some(exec) = self.exec.take() {
+            // Ensure any in-flight graph launch has completed before
+            // destroying the executable.
+            let _ = self.device.synchronize();
             let lib = unsafe { sys::lib() };
             unsafe { lib.cuGraphExecDestroy(exec) };
         }

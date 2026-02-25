@@ -2,7 +2,7 @@
 
 use cudarc::cublas::CudaBlas;
 use cudarc::cublaslt::CudaBlasLT;
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use std::sync::{Arc, Mutex};
 
 use super::buffer_pool::BufferPool;
@@ -16,6 +16,8 @@ pub struct CudaContext {
     blas_lt: Arc<CudaBlasLT>,
     /// Cached cuBLASLt workspace buffer (lazily allocated)
     fp8_workspace: Arc<Mutex<Option<CudaSlice<u8>>>>,
+    /// Pre-allocated cuBLAS workspace (avoids cudaMalloc during graph capture)
+    _blas_workspace: Arc<CudaSlice<u8>>,
     /// Cached compute capability (major, minor)
     compute_capability: (i32, i32),
     /// Optional buffer pool for reusing GPU allocations
@@ -33,6 +35,8 @@ impl CudaContext {
         let blas = CudaBlas::new(device.clone())?;
         let blas_lt = CudaBlasLT::new(device.clone())?;
 
+        let blas_workspace = Self::alloc_cublas_workspace(&device, &blas)?;
+
         let major = device
             .attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -50,6 +54,7 @@ impl CudaContext {
             blas: Arc::new(blas),
             blas_lt: Arc::new(blas_lt),
             fp8_workspace: Arc::new(Mutex::new(None)),
+            _blas_workspace: Arc::new(blas_workspace),
             compute_capability: (major, minor),
             buffer_pool: Some(buffer_pool),
         })
@@ -67,6 +72,8 @@ impl CudaContext {
         let blas = CudaBlas::new(device.clone())?;
         let blas_lt = CudaBlasLT::new(device.clone())?;
 
+        let blas_workspace = Self::alloc_cublas_workspace(&device, &blas)?;
+
         let major = device
             .attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -84,9 +91,33 @@ impl CudaContext {
             blas: Arc::new(blas),
             blas_lt: Arc::new(blas_lt),
             fp8_workspace: Arc::new(Mutex::new(None)),
+            _blas_workspace: Arc::new(blas_workspace),
             compute_capability: (major, minor),
             buffer_pool: Some(buffer_pool),
         })
+    }
+
+    /// Allocate a cuBLAS workspace buffer and bind it to the handle.
+    ///
+    /// Without an explicit workspace, cuBLAS may call `cudaMalloc`
+    /// internally, which is not allowed during CUDA graph capture.
+    fn alloc_cublas_workspace(device: &Arc<CudaDevice>, blas: &CudaBlas) -> Result<CudaSlice<u8>> {
+        const WORKSPACE_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+        let workspace = unsafe { device.alloc::<u8>(WORKSPACE_SIZE)? };
+        unsafe {
+            let lib = cudarc::cublas::sys::lib();
+            let status = lib.cublasSetWorkspace_v2(
+                *blas.handle(),
+                *workspace.device_ptr() as *mut std::ffi::c_void,
+                WORKSPACE_SIZE,
+            );
+            assert_eq!(
+                status,
+                cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "cublasSetWorkspace_v2 failed: {status:?}"
+            );
+        }
+        Ok(workspace)
     }
 
     /// Get a reference to the underlying CUDA device

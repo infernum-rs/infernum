@@ -185,7 +185,7 @@ run_llama_bench() {
 }
 
 # Run infernum bench and extract tok/s.
-# Tries --pool --graphs first; falls back to --pool if graphs fail.
+# Tries --graphs first; falls back to no graphs if capture fails.
 # Usage: run_infernum_bench <model_path> [--dtype <dtype>]
 run_infernum_bench() {
     local model_path="$1"
@@ -197,19 +197,38 @@ run_infernum_bench() {
     fi
 
     local output toks
-    # Try with CUDA graphs first
-    output=$(cargo run --release --example bench --features cuda -q -- \
-        "${model_path}" "${N_GEN}" --pool --graphs "${extra_args[@]}" 2>/dev/null || true)
+    # Try with CUDA graphs first (timeout guards against capture hangs)
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
+        "${model_path}" "${N_GEN}" --graphs "${extra_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     if [[ -n "${toks}" ]]; then
         echo "${toks}"
         return
     fi
 
-    # Fallback: pool only (no graphs)
+    # Fallback: no graphs
     log "  (CUDA graphs failed, retrying without)"
-    output=$(cargo run --release --example bench --features cuda -q -- \
-        "${model_path}" "${N_GEN}" --pool "${extra_args[@]}" 2>/dev/null || true)
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
+        "${model_path}" "${N_GEN}" "${extra_args[@]}" 2>/dev/null || true)
+    toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
+    echo "${toks:-ERR}"
+}
+
+# Run infernum bench without CUDA graphs (for quantized formats where
+# graph capture is not yet supported).
+# Usage: run_infernum_bench_no_graphs <model_path> [--dtype <dtype>]
+run_infernum_bench_no_graphs() {
+    local model_path="$1"
+    shift
+    local extra_args=("$@")
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+
+    local output toks
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
+        "${model_path}" "${N_GEN}" "${extra_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     echo "${toks:-ERR}"
 }
@@ -365,26 +384,26 @@ for bench in "${benchmarks[@]}"; do
         FP8)
             log "[${step}/${total}] FP8 — llama.cpp (n/a)"
             results_llama["FP8"]="—"
-            log "[${step}/${total}] FP8 — infernum"
-            results_infernum["FP8"]=$(run_infernum_bench "${FP8_MODEL_DIR}")
+            log "[${step}/${total}] FP8 — infernum (no graphs — not yet supported)"
+            results_infernum["FP8"]=$(run_infernum_bench_no_graphs "${FP8_MODEL_DIR}")
             ;;
         "GGUF Q8_0")
             log "[${step}/${total}] GGUF Q8_0 — llama.cpp"
             results_llama["GGUF Q8_0"]=$(run_llama_bench "${GGUF_Q8}")
-            log "[${step}/${total}] GGUF Q8_0 — infernum"
-            results_infernum["GGUF Q8_0"]=$(run_infernum_bench "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — infernum (no graphs — not yet supported)"
+            results_infernum["GGUF Q8_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q8}")
             ;;
         "GGUF Q4_0")
             log "[${step}/${total}] GGUF Q4_0 — llama.cpp"
             results_llama["GGUF Q4_0"]=$(run_llama_bench "${GGUF_Q4}")
-            log "[${step}/${total}] GGUF Q4_0 — infernum"
-            results_infernum["GGUF Q4_0"]=$(run_infernum_bench "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — infernum (no graphs — not yet supported)"
+            results_infernum["GGUF Q4_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q4}")
             ;;
         "GPTQ INT4")
             log "[${step}/${total}] GPTQ INT4 — llama.cpp (n/a)"
             results_llama["GPTQ INT4"]="—"
-            log "[${step}/${total}] GPTQ INT4 — infernum"
-            results_infernum["GPTQ INT4"]=$(run_infernum_bench "${GPTQ_MODEL_DIR}")
+            log "[${step}/${total}] GPTQ INT4 — infernum (no graphs — not yet supported)"
+            results_infernum["GPTQ INT4"]=$(run_infernum_bench_no_graphs "${GPTQ_MODEL_DIR}")
             ;;
     esac
 done

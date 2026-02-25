@@ -94,9 +94,9 @@ struct GenerationRequest {
 /// processing multiple requests concurrently via inflight batching
 /// with paged KV caches.
 pub struct Engine {
-    request_tx: mpsc::Sender<GenerationRequest>,
+    request_tx: Option<mpsc::Sender<GenerationRequest>>,
     model_config: ModelConfig,
-    _worker: JoinHandle<()>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl Engine {
@@ -148,9 +148,9 @@ impl Engine {
         });
 
         Ok(Self {
-            request_tx,
+            request_tx: Some(request_tx),
             model_config,
-            _worker: worker,
+            worker: Some(worker),
         })
     }
 
@@ -177,9 +177,11 @@ impl Engine {
             options,
             token_tx: Box::new(token_tx),
         };
-        // If the worker thread has panicked, the send will fail.
-        // That's fine — the receiver will see the channel close.
-        let _ = self.request_tx.send(request);
+        // If the worker thread has panicked or the engine is shutting down,
+        // the send will fail. The receiver will see the channel close.
+        if let Some(tx) = &self.request_tx {
+            let _ = tx.send(request);
+        }
     }
 
     /// Generate tokens, blocking until complete.
@@ -232,6 +234,19 @@ impl Engine {
     }
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Drop the sender first so the worker's recv() returns Err,
+        // causing it to exit the loop.
+        self.request_tx.take();
+        // Join the worker thread to ensure all CUDA resources (model weights,
+        // KV caches, graph state) are fully dropped before we return.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Worker loop
 // ---------------------------------------------------------------------------
@@ -272,7 +287,23 @@ fn worker_loop<M: Model>(
             .max_seq_len
             .div_ceil(batch_config.block_size)
             .min(batch_config.num_blocks);
-        let graph_max_seq_len = max_blocks_per_seq * batch_config.block_size;
+        let mut graph_max_seq_len = max_blocks_per_seq * batch_config.block_size;
+
+        // Cap graph_max_seq_len so the paged_decode_attention kernel's shared
+        // memory fits within the device limit. The kernel allocates:
+        //   (head_dim + max_active_len + threads) * sizeof(f32)
+        // where threads ≤ 256.
+        // 48 KB is the default shared memory limit per block on all modern
+        // NVIDIA GPUs (higher requires cudaFuncSetAttribute opt-in).
+        let max_shared: usize = 48 * 1024;
+        let thread_count = 256;
+        let max_floats = max_shared / std::mem::size_of::<f32>();
+        let max_active = max_floats
+            .saturating_sub(model_config.head_dim)
+            .saturating_sub(thread_count);
+        if graph_max_seq_len > max_active {
+            graph_max_seq_len = max_active;
+        }
         let graph_inputs = BatchedGraphInputs::new(
             &device,
             batch_config.max_batch_size,
