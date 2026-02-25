@@ -50,7 +50,7 @@ vLLM is mostly Python, which seems wrong for performance-critical code. But it w
 ```
 Op      → Atomic compute (matmul, softmax, rope, etc.)
 Block   → Composable architecture unit (attention, FFN)  
-Model   → Full model (Llama, Qwen, etc.)
+Model   → Full model (Llama, Qwen, DeepSeek, Gemma, etc.)
 Runtime → Scheduling, batching, KV cache, tokenization, text in/out
 Server  → HTTP, OpenAI-compatible API
 ```
@@ -61,7 +61,7 @@ The tensor type encodes what hardware data lives on. Different hardware = differ
 
 ```
 CudaTensor      → NVIDIA GPU
-MetalTensor     → Apple Silicon
+MetalTensor     → Apple Silicon (future)
 ```
 
 Multi-GPU tensor parallelism is handled at runtime, not in the type system. Each GPU runs the same model code with its own `CudaTensor` weights (sharded at load time), and synchronizes via an `NcclCommunicator` passed to the model.
@@ -72,8 +72,8 @@ Each operation (MatMul, Softmax, RMSNorm, RoPE, Attention, SiLU, etc.) is a trai
 
 Different implementations exist for:
 - Different hardware (CublasMatMul for CUDA, MetalMatMul for Apple)
-- Different algorithms (FlashAttention vs naive attention)
-- Different optimizations (fused vs unfused)
+- Different algorithms (FlashAttention vs naive attention, fused vs unfused)
+- Different data types (f32, f16, bf16, quantized)
 
 Key insight: An Op and a Block can be interchangeable from the outside. Sometimes for optimization you create a new Op that could be implemented as a Block (composition of smaller ops), but it's faster as a single fused kernel.
 
@@ -161,6 +161,7 @@ single-GPU — the only additions are 2 `all_reduce_sum` calls per layer.
 - `NcclCommunicator` provides all-reduce for row-parallel layer outputs
 - Column-parallel layers (Q/K/V, gate, up) split the output dimension — no sync
 - Row-parallel layers (O, down) split the input dimension — need all-reduce
+- `ShardedModel` orchestrates N shards across N GPUs, wrapping them behind the standard `Model` trait
 
 ### Why Not `Parallel<T>`?
 
@@ -171,8 +172,6 @@ plumbing through the entire model or require duplicating single/multi-GPU code
 paths, without meaningful safety benefit. The runtime approach (used by vLLM,
 TensorRT-LLM, and every other major project) is simpler and sufficient.
 
-See `ephemeral-docs/multi-gpu-design.md` for detailed implementation design.
-
 ---
 
 ## Project Structure
@@ -181,52 +180,103 @@ See `ephemeral-docs/multi-gpu-design.md` for detailed implementation design.
 infernum/
 ├── infernum/               # Core crate
 │   ├── tensor.rs          # Tensor trait
-│   ├── dtype.rs           # Data types (F32, F16, BF16, Q8_0, Q4_0)
+│   ├── dtype.rs           # Data types (F32, F16, BF16, F8E4M3, Q8_0, Q4_0, Q6_K, GPTQ_INT4, AWQ_INT4)
 │   ├── error.rs           # Error types
-│   ├── model.rs           # Model trait + ModelConfig
+│   ├── model.rs           # Model trait + ModelConfig + ShardedLoadable
 │   ├── fusion.rs          # Fusion registry (init, FusionInit)
-│   ├── sampling.rs        # Sampling parameters
+│   ├── sampling.rs        # Sampling parameters (temperature, top-p, repetition penalty)
+│   ├── chat_template.rs   # ChatTemplate trait + ChatMessage
 │   ├── cuda/              # CUDA backend
-│   │   ├── tensor.rs      # CudaTensor
-│   │   ├── quantized.rs   # QuantizedTensor (FP8, Q8, Q4)
+│   │   ├── tensor.rs      # CudaTensor<T>
+│   │   ├── quantized.rs   # QuantizedTensor (FP8, GPTQ, AWQ, Q8, Q4, Q6_K)
 │   │   ├── context.rs     # CudaContext (device, cuBLAS, PTX)
-│   │   ├── kv_cache.rs    # KvCache
+│   │   ├── kv_cache.rs    # KvCache<T> (pre-allocated per-layer)
+│   │   ├── paged_kv_cache.rs  # PagedKvCache<T> (block-level allocation)
+│   │   ├── block_allocator.rs # BlockAllocator, BlockTable
+│   │   ├── buffer_pool.rs # BufferPool (GPU memory reuse)
+│   │   ├── graph.rs       # CudaGraph (capture/replay)
+│   │   ├── batched_graph.rs   # BatchedGraphInputs (indirect kernel args)
+│   │   ├── shard.rs       # ShardConfig, GpuConfig, shard strategies
+│   │   ├── sharded.rs     # ShardedModel (multi-GPU wrapper)
+│   │   ├── nccl.rs        # NcclCommunicator (all-reduce, all-gather)
+│   │   ├── moe.rs         # MoE routing utilities
+│   │   ├── seq_position.rs # SeqPosition (offset tracking)
 │   │   └── ops/           # CUDA op implementations
+│   │       ├── matmul.rs          # cuBLAS matmul (f32, f16, bf16)
+│   │       ├── quantized_matmul.rs # Quantized matmul (Q8, Q4, Q6_K, FP8, GPTQ, AWQ)
+│   │       ├── attention.rs       # Causal attention (prefill)
+│   │       ├── fused_attention.rs # Fused prefill attention (single kernel)
+│   │       ├── paged_attention.rs # Paged decode attention
+│   │       ├── rmsnorm.rs         # RMSNorm
+│   │       ├── add_rmsnorm.rs     # Fused residual + RMSNorm
+│   │       ├── rope.rs            # RoPE (standard + interleaved)
+│   │       ├── silu.rs / swiglu.rs / gelu.rs / geglu.rs  # Activations
+│   │       ├── softmax.rs         # Softmax + causal softmax
+│   │       ├── embed.rs           # Token embedding lookup
+│   │       ├── linear.rs          # Linear projection dispatch
+│   │       ├── moe_routing.rs     # MoE expert routing (top-k, sigmoid)
+│   │       ├── mla_tensor_ops.rs  # MLA-specific tensor operations (DeepSeek)
+│   │       └── ...                # cast, scale, transpose, repeat_kv, etc.
 │   ├── tokenizer/         # Tokenizer trait + implementations
 │   │   ├── llama_tokenizer.rs    # HuggingFace tokenizers
 │   │   └── gguf_tokenizer.rs     # Tokenizer from GGUF metadata
 │   └── weights/           # Weight loaders
-│       ├── safetensors.rs # SafeTensors (memory-mapped)
-│       └── gguf.rs        # GGUF format
+│       ├── safetensors.rs # SafeTensors (memory-mapped, sharded)
+│       ├── gguf.rs        # GGUF format (memory-mapped)
+│       └── loader.rs      # Unified loader interface
 │
 ├── infernum-macros/       # Procedural macros (define_block!, define_fusion!)
 │
-├── infernum-llama/        # Llama model family
-│   ├── config.rs          # Parse HF config.json / GGUF metadata
-│   └── model.rs           # LlamaModel (Llama 3.2, GQA)
+├── infernum-llama/        # Llama / Mistral / Mixtral model family
+│   ├── config.rs          # LlamaConfig (HF config.json + GGUF metadata)
+│   ├── model.rs           # LlamaModel (Dense + MoE, GQA, sliding window)
+│   └── chat_templates.rs  # Llama3Template, MistralTemplate
+│
+├── infernum-qwen/         # Qwen model family
+│   ├── config.rs          # QwenConfig (Qwen2/2.5, Qwen3, Qwen3-MoE)
+│   ├── model.rs           # QwenModel (Dense + MoE, QK-norm, sliding window)
+│   └── chat_templates.rs  # ChatMLTemplate, Qwen3Template
+│
+├── infernum-deepseek/     # DeepSeek model family
+│   ├── config.rs          # DeepSeekConfig (V3/R1)
+│   ├── model.rs           # DeepSeekModel (MLA + MoE, sigmoid routing)
+│   └── chat_templates.rs  # DeepSeekTemplate
+│
+├── infernum-gemma/        # Gemma model family
+│   ├── config.rs          # GemmaConfig (Gemma 2, Gemma 3 text)
+│   ├── model.rs           # GemmaModel (soft-capping, dual-theta RoPE)
+│   └── chat_templates.rs  # Gemma2Template, Gemma3Template
 │
 ├── infernum-runtime/      # Execution runtime
-│   ├── engine.rs          # Token-level engine (KV cache, prefill/decode, sampling)
-│   └── runtime.rs         # Text-level runtime (tokenize, generate, stream)
+│   ├── engine.rs          # Engine (paged KV cache, inflight batching, CUDA graphs)
+│   ├── scheduler.rs       # Scheduler (FCFS, block-level memory, chunked prefill)
+│   └── runtime.rs         # Runtime (text-level: tokenize, generate, stream)
 │
-├── infernum-examples/     # Example binaries
-│   └── examples/
-│       └── generate.rs    # CLI text generation
+├── infernum-serve/        # HTTP server
+│   ├── server.rs          # Server + builder (Axum, model registration)
+│   └── types.rs           # OpenAI API types (request/response, SSE chunks)
 │
-├── infernum-qwen/         # Qwen model family (planned)
-├── infernum-phi/          # Phi model family (planned)
-├── infernum-mistral/      # Mistral model family (planned)
-└── infernum-serve/        # HTTP server (planned)
+└── infernum-examples/     # Example binaries
+    └── examples/
+        ├── generate.rs           # CLI text generation (all model families)
+        ├── bench.rs              # Decode throughput benchmark
+        ├── serve.rs              # HTTP server example
+        ├── generate_parallel.rs  # Multi-GPU text generation
+        ├── verify_parallel.rs    # Single vs multi-GPU correctness check
+        ├── custom_cuda_op.rs     # Adding a custom CUDA C kernel
+        └── custom_triton_op.rs   # Adding a custom Triton kernel
 ```
 
 ### Dependency Flow
 
 ```
-infernum-serve (planned)
+infernum-serve
     └── infernum-runtime
             ├── infernum
             ├── infernum-llama
-            └── (other model crates)
+            ├── infernum-qwen
+            ├── infernum-deepseek
+            └── infernum-gemma
 ```
 
 ---
@@ -251,34 +301,56 @@ The **runtime** consumes the trait for text ↔ token conversion, providing text
 The model just sees tensors. It doesn't know about requests, scheduling, or batching.
 
 ```
-Model.forward(tokens, positions, kv_cache) -> logits
+Model.forward_prefill_paged(tokens, paged_kvs, block_table, start_pos) -> logits
+Model.forward_batch_decode(token_ids, paged_kvs, block_tables, positions) -> logits
 ```
 
 ### The Engine Manages State
 
-Currently the engine handles single-request inference:
-- KV cache: pre-allocated per model, reset between requests
-- Prefill/decode loop: full-sequence prefill, then incremental token-by-token decode
-- Sampling: temperature, top-p (nucleus sampling), greedy (argmax)
-- Streaming: token-by-token output via channels
+The engine owns the model and paged KV caches, providing inflight (continuous) batching:
 
-### Future: Batching & Scheduling (Phase 6)
+- **Paged KV cache**: Block-level allocation via `BlockAllocator`, dynamic slot management per request
+- **Scheduler**: FCFS admission with block-level memory accounting, chunked prefill
+- **Inflight batching**: Multiple requests share the GPU, with scheduling decisions at every decode step
+- **Batched decode**: All active sequences processed in a single forward pass (one weight read)
+- **CUDA graphs**: Optional capture/replay for batched decode steps
+- **Multi-GPU**: One `PagedKvCache` per device, sharing logical block indices
+- **Sampling**: Greedy (argmax), nucleus (top-p) with temperature, repetition penalty
+- **Streaming**: Token-by-token output via `TokenSender` trait
 
-When inflight batching is added, the engine will grow:
-- Scheduler trait with pluggable strategies (FCFS, continuous batching, fair, priority)
-- PagedAttention: pre-allocated KV cache blocks, dynamic slot allocation per request
-- Batch assembly: build batched tensors from heterogeneous concurrent requests
-- Metrics: latency, throughput, queue depth
+### Request Lifecycle
+
+```
+Waiting → Prefill → Decode → Finished
+```
+
+- **Waiting**: queued, not yet admitted
+- **Prefill**: prompt tokens are being processed (possibly chunked)
+- **Decode**: generating tokens one at a time
+- **Finished**: EOS, max tokens, or cancelled — blocks freed
 
 ---
 
 ## Weight Loading
 
 Both formats are implemented with memory-mapped loading:
-- **SafeTensors** (HuggingFace standard) — `SafeTensorsLoader`
+- **SafeTensors** (HuggingFace standard) — `SafeTensorsLoader`, supports sharded files
 - **GGUF** (llama.cpp format) — `GgufLoader`, also extracts tokenizer and model config from metadata
 
 Key design: **Load without full host memory**. Files are memory-mapped; weights are copied directly to GPU chunk by chunk without buffering the entire model in RAM.
+
+### Quantization Formats
+
+| Format | Source | Description |
+|--------|--------|-------------|
+| F32, F16, BF16 | SafeTensors / GGUF | Full precision |
+| FP8 (E4M3) | SafeTensors (compressed-tensors) | 8-bit float with per-tensor scale |
+| GPTQ INT4 | SafeTensors | Group-quantized 4-bit (128 elements/group) |
+| AWQ INT4 | SafeTensors | Group-quantized 4-bit (transposed packing) |
+| Q8_0, Q4_0 | GGUF | Block-quantized (32 elements/block) |
+| Q6_K | GGUF | K-quant 6-bit (256 elements/super-block) |
+
+All quantized formats use on-the-fly dequantization during matmul — the full-precision expansion never exists in GPU memory.
 
 ---
 
@@ -290,11 +362,7 @@ Core endpoints:
 - `POST /v1/chat/completions` (with streaming via SSE)
 - `GET /v1/models`
 
-### Reasoning/Thinking
-
-OpenAI doesn't standardize this. DeepSeek added `reasoning_content` field. Anthropic uses block types. 
-
-For Infernum: start with OpenAI compat, add `reasoning_content` field (DeepSeek style) when supporting reasoning models. Don't overthink it.
+The `infernum-serve` crate provides a builder-based server that accepts model registrations and handles chat template application, tokenization, and generation.
 
 ---
 
@@ -327,80 +395,80 @@ Single model on single GPU, end to end.
 - KV cache for incremental decoding (prefill + decode phases)
 - FP8 quantization with quantized matmul kernels
 - GGUF weight loading (memory-mapped, with tokenizer from metadata)
+- Q8_0, Q4_0, Q6_K block-quantized matmul kernels
+- GPTQ INT4 and AWQ INT4 group-quantized matmul kernels
 - `infernum-runtime` crate: Engine (token-level) + Runtime (text-level)
-- Streaming generation with sampling (temperature, top-p)
+- Streaming generation with sampling (temperature, top-p, repetition penalty)
 
-See `docs/phase2-plan.md` for detailed design.
+See `docs/phase2-plan.md` for the original design.
 
 **Milestone**: Streaming generation with KV cache and quantized models. ✅
 
-### Phase 3: Performance Optimization 🔄
-
-*In progress on `optimizer` branch.*
+### Phase 3: Performance Optimization ✅
 
 - `infernum-macros` crate: `define_block!` and `define_fusion!` proc macros
 - Fusion registry with `inventory` for cross-crate registration
 - Feature flags: `force-fuse` / `no-fuse` for testing
 - Fused kernels: attention, add+rmsnorm, SwiGLU
-- Kernel performance tuning and benchmarking
+- Buffer pool for GPU memory reuse
+- CUDA graph capture/replay for decode steps
 
-**Milestone**: Fused kernels match or beat naive implementations in benchmarks.
+**Milestone**: Fused kernels and CUDA graphs for optimized decode throughput. ✅
 
-### Phase 4: Multi-GPU / Tensor Parallelism
-
-Scale to models that don't fit on a single GPU.
+### Phase 4: Multi-GPU / Tensor Parallelism ✅
 
 - NCCL bindings (`NcclCommunicator`: all-reduce, all-gather)
 - `ShardConfig` (rank, world_size) for weight slicing
 - Sharded weight loading (column/row slicing in SafeTensors loader)
+- `ShardedModel` wrapper: orchestrates N shards across N GPUs
 - Model changes: sharded constructors + 2 all-reduce calls per layer
-- Multi-threaded Engine: N model replicas running in lockstep
 
-**Milestone**: 70B-class model running across multiple GPUs.
+**Milestone**: 70B-class models running across multiple GPUs with `generate_parallel` and `verify_parallel` examples. ✅
 
-### Phase 5: More Model Architectures
+### Phase 5: More Model Architectures ✅
 
-Broaden model support beyond Llama.
-
-- **Qwen** (`infernum-qwen`): Qwen 2/2.5 family
-- **Phi** (`infernum-phi`): Phi-3/4 family
-- **Mistral** (`infernum-mistral`): Mistral/Mixtral family
-- Factor out shared patterns (transformer blocks, weight mapping) to reduce per-model boilerplate
+- **Llama/Mistral/Mixtral** (`infernum-llama`): Dense + MoE, GQA, sliding window attention
+- **Qwen** (`infernum-qwen`): Qwen2/2.5, Qwen3 (QK-norm), Qwen3-MoE (decoder_sparse_step)
+- **DeepSeek** (`infernum-deepseek`): V3/R1 with MLA (Q LoRA compression, joint KV projection, interleaved RoPE) + MoE (sigmoid routing with bias correction, shared experts)
+- **Gemma** (`infernum-gemma`): Gemma 2 (soft-capping, GeGLU, alternating attention) + Gemma 3 text (QK-norm, dual-theta RoPE)
 - Chat templates per model family
+- Sliding window attention (per-layer, mask-only phase 1)
 
-**Milestone**: At least two additional model families running end to end.
+**Milestone**: Five model families running end to end. ✅
 
-### Phase 6: Inflight Batching
+### Phase 6: Inflight Batching ✅
 
-Serve multiple concurrent requests efficiently.
+- Paged KV cache: block-level allocation with `BlockAllocator`
+- Scheduler with FCFS admission and block-level memory accounting
+- Chunked prefill (configurable `max_prefill_tokens`)
+- Batched decode: all active sequences in a single forward pass
+- CUDA graph support for batched decode (optional)
+- Request lifecycle: Waiting → Prefill → Decode → Finished
+- `TokenSender` trait for flexible output delivery
 
-- PagedAttention: pre-allocated KV cache blocks, dynamic slot allocation
-- Scheduler trait with pluggable strategies (FCFS, continuous batching, fair, priority)
-- Batch assembly: build batched tensors from heterogeneous requests
-- Request preemption and memory sharing
-- Metrics: latency, throughput, queue depth
+**Milestone**: Sustained throughput under concurrent load with inflight batching. ✅
 
-**Milestone**: Sustained throughput under concurrent load with bounded latency.
+### Phase 7: HTTP Server ✅
 
-### Phase 7: HTTP Server (`infernum-serve`)
-
-OpenAI-compatible API for production serving.
-
-- Axum HTTP server
+- `infernum-serve` crate with Axum
 - `POST /v1/chat/completions` with SSE streaming
 - `GET /v1/models`
-- TOML configuration
-- Works with OpenAI Python client
-- `reasoning_content` field for reasoning models (DeepSeek style)
+- Builder-based server with model registration (`ModelEntry`)
+- Configurable `BatchConfig` per model
+- CORS support, graceful shutdown
+- `serve` example binary
 
-**Milestone**: HTTP server serving models with OpenAI-compatible API.
+**Milestone**: HTTP server serving models with OpenAI-compatible API. ✅
 
 ### Future
 
-- Benchmarking harness (compare custom vs baseline, memory profiling, report generation)
-- Researcher DX: documentation, examples, "implement a paper in an afternoon"
+- Ring-buffer KV cache for sliding window (memory savings from O(seq_len) to O(W))
 - Speculative decoding
 - Metal backend (Apple Silicon)
+- More scheduling strategies (fair, priority)
+- Request preemption and memory sharing
+- Benchmarking harness (compare custom vs baseline, memory profiling, report generation)
+- Researcher DX: documentation, examples, "implement a paper in an afternoon"
 - Deployment / containerization
 
 ---
@@ -414,16 +482,8 @@ OpenAI-compatible API for production serving.
 | TP approach | Runtime (NCCL + `ShardConfig`) | Simple, proven, 2 sync points per layer |
 | Op granularity | Traits per operation | Swappable implementations |
 | Graph optimization | Macro-based | Code is source of truth, graph derived |
+| KV cache | Paged blocks | Dynamic allocation, memory-efficient batching |
 | Tokenization | In core crate | Trait in `infernum`, consumed by runtime |
 | Error handling | Panics (for now) | Simpler, bugs should crash |
 | API | OpenAI-compatible | Industry standard |
 | First model | Llama 3.2 1B | Small, well-documented, covers most architectures |
-
----
-
-## What This Document Doesn't Cover (Needs Elaboration)
-
-- PagedAttention implementation details
-- Speculative decoding
-- Memory management details for large-scale serving
-- Deployment / containerization
