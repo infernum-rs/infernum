@@ -11,25 +11,47 @@ A Rust-based LLM inference server designed to be researcher-friendly, type-safe,
 
 ## Status
 
-Phase 1 implementation complete - single GPU Llama inference.
+Active development — single and multi-GPU inference with continuous batching, paged KV cache, and an OpenAI-compatible HTTP server.
 
 See `docs/plan.md` for the design document and roadmap.
 
+## Supported Models
+
+| Family | `model_type` | Crate | Architecture | Notes |
+|--------|-------------|-------|--------------|-------|
+| Llama | `llama` | `infernum-llama` | Dense | Llama 2, Llama 3, SmolLM2, CodeLlama, etc. |
+| Mistral | `mistral` | `infernum-llama` | Dense | Mistral v1/v2/v3, Devstral |
+| Mixtral | `mixtral` | `infernum-llama` | MoE | Mixtral 8x7B, 8x22B |
+| Qwen | `qwen2` / `qwen3` / `qwen3_moe` | `infernum-qwen` | Dense / MoE | Qwen2/2.5, Qwen3, Qwen3-MoE |
+| DeepSeek | `deepseek_v3` | `infernum-deepseek` | MLA + MoE | DeepSeek-V3, DeepSeek-R1 |
+| Gemma 2 | `gemma2` | `infernum-gemma` | Dense | Gemma 2 2B/9B/27B |
+| Gemma 3 | `gemma3_text` | `infernum-gemma` | Dense | Gemma 3 1B/4B/12B/27B (text decoder) |
+
+Model family is auto-detected from `config.json`.
+
 ## Features
 
-- **Tensor Foundation**: `CudaTensor` with GPU memory management and host/device transfers
-- **Core Ops**: MatMul (cuBLAS), RMSNorm, RoPE, SiLU, Softmax, Attention
+- **Tensor Foundation**: `CudaTensor` with GPU memory management, host/device transfers, and buffer pooling
+- **Core Ops**: MatMul (cuBLAS), RMSNorm, RoPE (standard and interleaved), SiLU, GeGLU, Softmax, Attention, MLA tensor ops, MoE routing
 - **Block Fusion**: `define_block!`/`define_fusion!` macros for automatic kernel fusion with feature-flag control
-- **Weight Loading**: SafeTensors with memory-mapped loading
-- **Llama Model**: Full Llama 3.2 architecture with GQA support
-- **Tokenizer**: HuggingFace tokenizers integration
-- **Generation**: Greedy decoding with CLI example
+- **Quantization**: FP8 (E4M3), GPTQ INT4, AWQ INT4, Q8_0, Q4_0, Q6_K — all with on-the-fly dequantization during matmul
+- **Weight Loading**: SafeTensors (memory-mapped, sharded) and GGUF (with tokenizer from metadata)
+- **KV Cache**: Pre-allocated per-layer cache for incremental decoding, plus paged KV cache for continuous batching
+- **Paged Attention**: Block-level KV cache allocation with dynamic slot management
+- **Continuous Batching**: Inflight batching with FCFS scheduling, chunked prefill, and iteration-level preemption
+- **CUDA Graphs**: Capture/replay for batched decode steps (optional)
+- **Multi-GPU**: Tensor parallelism via NCCL (all-reduce), sharded weight loading
+- **Sliding Window Attention**: Per-layer window configuration (Mistral, Qwen3, Gemma)
+- **Sampling**: Greedy (argmax), nucleus (top-p) with temperature, repetition penalty
+- **Chat Templates**: Per-model-family templates (Llama 3, ChatML, Gemma, DeepSeek)
+- **HTTP Server**: OpenAI-compatible `/v1/chat/completions` (streaming + non-streaming) and `/v1/models`
+- **Tokenizer**: HuggingFace tokenizers and GGUF-embedded tokenizer
 
 ## Prerequisites
 
 - Rust stable toolchain
 - CUDA Toolkit (12.x recommended)
-- A Llama model in HuggingFace SafeTensors format
+- Model weights in HuggingFace SafeTensors or GGUF format
 
 ## Building
 
@@ -43,85 +65,88 @@ cargo build --features cuda
 # Run tests
 cargo test --all
 
-# Run linting
+# Run linting (pedantic)
 cargo clippy -- -W clippy::pedantic
+
+# Format
+cargo fmt --all
 ```
 
 ## Usage
 
-### Text Generation Example
+### Text Generation
 
 ```bash
-# Download a Llama model (e.g., Llama 3.2 1B)
-# Place it in a directory with config.json, tokenizer.json, and *.safetensors files
+# SafeTensors directory (auto-detects model family)
+cargo run --example generate --features cuda -- -m /path/to/model "Hello"
 
-# Run generation
-cargo run --example generate --features cuda -- \
-  --model /path/to/llama-3.2-1b \
-  "Hello, my name is"
+# GGUF file
+cargo run --example generate --features cuda -- -m model.gguf "Hello"
 
-# Or set the model path via environment variable
-export LLAMA_MODEL_PATH=/path/to/llama-3.2-1b
-cargo run --example generate --features cuda -- "Once upon a time"
+# Greedy decoding
+cargo run --example generate --features cuda -- -m /path/to/model --greedy "Hello"
+
+# Custom sampling
+cargo run --example generate --features cuda -- -m /path/to/model -t 0.8 -p 0.95 "Hello"
 ```
 
-### Options
-
-```
-Usage: generate [OPTIONS] [PROMPT]
-
-Options:
-  -m, --model <PATH>       Path to model directory
-  -n, --max-tokens <N>     Maximum tokens to generate (default: 100)
-  -h, --help               Show help message
-```
-
-### Block Fusion Example
-
-The fusion framework lets you define blocks with decomposed implementations and
-register optimized fused replacements. See `docs/fusion.md` for a full guide.
+### HTTP Server
 
 ```bash
-# Debug build — always uses decomposed path
-cargo run --example fusion_example
+# Start the server
+cargo run --example serve --features cuda -- -m /path/to/model
 
-# Release build — uses fused kernels after fusion::init()
-cargo run --example fusion_example --release
+# Non-streaming request
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","messages":[{"role":"user","content":"Hello"}]}'
 
-# Force fused even in debug
-cargo run --example fusion_example --features force-fuse
-
-# Force decomposed even in release
-cargo run --example fusion_example --features no-fuse --release
+# Streaming
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
+
+### Multi-GPU
+
+```bash
+# Tensor-parallel generation across 2 GPUs
+cargo run --example generate_parallel --features nccl -- \
+  -m /path/to/model --gpus 2 "Hello"
+
+# Verify single-GPU and multi-GPU produce identical output
+cargo run --example verify_parallel --features nccl -- \
+  -m /path/to/model --gpus 2
+```
+
+### Benchmarking
+
+```bash
+# Decode throughput (tokens/sec)
+cargo run --release --example bench --features cuda -- /path/to/model 128
+
+# With buffer pool and CUDA graphs
+cargo run --release --example bench --features cuda -- /path/to/model 128 --pool --graphs
+
+# Compare against llama.cpp across quantization formats
+./bench_comparison.sh
+```
+
+See `infernum-examples/README.md` for full details.
 
 ## Architecture
 
 ```
-infernum/
-├── cuda/           # CUDA backend (CudaContext, CudaTensor)
-├── ops/            # CUDA kernels (matmul, rmsnorm, rope, silu, softmax, attention)
-├── llama/          # Llama model implementation
-├── weights/        # SafeTensors weight loading
-├── tokenizer/      # Tokenizer integration
-├── dtype.rs        # Data types (F32, F16, BF16)
-├── tensor.rs       # Tensor trait definition
-└── error.rs        # Error types
+infernum/               # Core crate (tensor traits, ops, CUDA impls, blocks, weight loading)
+infernum-macros/        # Procedural macros (define_block!, define_fusion!)
+infernum-llama/         # Llama / Mistral / Mixtral models
+infernum-qwen/          # Qwen2, Qwen3, Qwen3-MoE models
+infernum-deepseek/      # DeepSeek-V3/R1 (MLA + MoE)
+infernum-gemma/         # Gemma 2, Gemma 3 text models
+infernum-runtime/       # Engine (token-level) + Scheduler (continuous batching)
+infernum-serve/         # HTTP server (Axum, OpenAI-compatible API)
+infernum-examples/      # Example binaries (generate, bench, serve, multi-GPU, custom kernels)
 ```
-
-## Current Limitations
-
-- No KV cache (recomputes full sequence each step)
-- Single GPU only
-- Greedy decoding only (no sampling)
-- F32 inference only (no quantization)
-
-## Next Steps (Phase 2)
-
-- KV cache for efficient generation
-- Continuous batching
-- HTTP server with OpenAI-compatible API
-- Multi-GPU support
 
 ## License
 
