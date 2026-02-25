@@ -222,8 +222,6 @@ mod tests {
     /// using DeepSeek V3 parameters: 256 experts, 8 groups, topk_group=4, top_k=8.
     #[test]
     fn test_sigmoid_routing_gpu_matches_cpu() {
-        use crate::cuda::moe::moe_route_sigmoid;
-
         let ctx = CudaContext::new(0).expect("CUDA context");
 
         let num_experts = 256;
