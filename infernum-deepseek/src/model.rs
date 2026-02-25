@@ -2326,8 +2326,7 @@ impl infernum::Model for DeepSeekModel {
         let out_slice = output.cuda_slice_mut();
         for (i, part) in logits_parts.iter().enumerate() {
             let src = part.cuda_slice().slice(..vocab_size * elem);
-            let mut dst =
-                out_slice.slice_mut(i * vocab_size * elem..(i + 1) * vocab_size * elem);
+            let mut dst = out_slice.slice_mut(i * vocab_size * elem..(i + 1) * vocab_size * elem);
             self.ctx.device().dtod_copy(&src, &mut dst)?;
         }
         Ok(output)

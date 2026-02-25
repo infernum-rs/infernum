@@ -188,7 +188,9 @@ pub fn broadcast_to_heads(tensor: &CudaTensor, num_heads: usize) -> Result<CudaT
         let dst_offset = s * num_heads * dim * elem;
         let n = num_heads * dim;
 
-        let src_slice = tensor.cuda_slice().slice(src_offset..src_offset + dim * elem);
+        let src_slice = tensor
+            .cuda_slice()
+            .slice(src_offset..src_offset + dim * elem);
         let dst_slice = &mut output
             .cuda_slice_mut()
             .slice_mut(dst_offset..dst_offset + n * elem);

@@ -1336,8 +1336,7 @@ impl QwenModel {
             let out_slice = output.cuda_slice_mut();
             for (i, part) in attn_parts.iter().enumerate() {
                 let src = part.cuda_slice().slice(..row_size * elem);
-                let mut dst =
-                    out_slice.slice_mut(i * row_size * elem..(i + 1) * row_size * elem);
+                let mut dst = out_slice.slice_mut(i * row_size * elem..(i + 1) * row_size * elem);
                 self.ctx.device().dtod_copy(&src, &mut dst)?;
             }
             output
