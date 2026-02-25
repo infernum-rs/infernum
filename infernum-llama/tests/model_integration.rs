@@ -148,7 +148,7 @@ mod smollm2_360m {
 
         // Run a raw forward pass and check logits for NaN/Inf
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -204,6 +204,7 @@ mod smollm2_360m {
             &block_config,
             model_cfg.num_kv_heads,
             model_cfg.head_dim,
+            model.dtype(),
         )
         .expect("paged kv")];
         let mut allocator = BlockAllocator::new(&block_config);
@@ -341,7 +342,7 @@ mod llama_fp8 {
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -388,7 +389,7 @@ mod llama_gptq {
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -427,7 +428,7 @@ mod mixtral_moe_tiny {
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -487,7 +488,7 @@ mod mixtral_2x7b {
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -617,7 +618,7 @@ mod mistral_7b {
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();

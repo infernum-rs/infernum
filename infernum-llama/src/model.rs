@@ -1911,10 +1911,8 @@ impl LlamaModel {
         // Final layer norm (in-place: hidden is consumed)
         rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
-        // Project to vocabulary
-        let logits = linear(&hidden, &self.lm_head)?;
-
-        Ok(logits)
+        // Project to vocabulary (cast to f32 for consistent output dtype)
+        self.lm_head_forward(&hidden)
     }
 
     /// Forward pass through a single transformer layer (no KV cache)

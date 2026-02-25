@@ -190,6 +190,7 @@ mod gemma2_tiny_random {
             &block_config,
             model_cfg.num_kv_heads,
             model_cfg.head_dim,
+            model_ref.dtype(),
         )
         .expect("paged kv")];
         let mut allocator = BlockAllocator::new(&block_config);
@@ -349,6 +350,7 @@ mod gemma3_text_tiny_random {
             &block_config,
             model_cfg.num_kv_heads,
             model_cfg.head_dim,
+            model_ref.dtype(),
         )
         .expect("paged kv")];
         let mut allocator = BlockAllocator::new(&block_config);
@@ -518,6 +520,7 @@ mod gemma2_2b {
             &block_config,
             model_cfg.num_kv_heads,
             model_cfg.head_dim,
+            model.dtype(),
         )
         .expect("paged kv")];
         let mut allocator = BlockAllocator::new(&block_config);

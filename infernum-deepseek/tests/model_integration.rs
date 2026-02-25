@@ -176,6 +176,7 @@ mod deepseek_v3_tiny {
             &block_config,
             model_config.num_kv_heads,
             model_config.head_dim,
+            model.dtype(),
         )
         .expect("Failed to create paged KV cache")];
         let mut allocator = BlockAllocator::new(&block_config);
