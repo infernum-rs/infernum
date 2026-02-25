@@ -1080,6 +1080,12 @@ impl QwenModel {
         &self.config
     }
 
+    /// Get the model's compute dtype
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
     fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> Result<CudaTensor> {
         if seq_len == 1 {
             return Ok(hidden.reshape(&[1, self.config.hidden_size]));

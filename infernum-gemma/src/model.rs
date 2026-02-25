@@ -1483,6 +1483,12 @@ impl GemmaModel {
     pub fn config(&self) -> &GemmaConfig {
         &self.config
     }
+
+    /// Get the model's compute dtype
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
 }
 
 /// Convert f32 RoPE caches to model dtype

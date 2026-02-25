@@ -305,6 +305,12 @@ impl DeepSeekModel {
         &self.config
     }
 
+    /// Get the model's compute dtype
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
     // --- Weight loading ---
 
     #[allow(clippy::too_many_lines)]

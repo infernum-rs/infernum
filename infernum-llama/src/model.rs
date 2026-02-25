@@ -1052,6 +1052,12 @@ impl LlamaModel {
         &self.config
     }
 
+    /// Get the model's compute dtype
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
     /// Forward pass with KV cache (prefill phase)
     ///
     /// Extract the last row from a (seq_len, hidden_size) tensor
