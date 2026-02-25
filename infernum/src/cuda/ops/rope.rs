@@ -326,6 +326,232 @@ pub fn apply_rope_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(output)
 }
 
+// --- Interleaved RoPE (DeepSeek V3) ---
+
+const INTERLEAVED_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/kernels/rope_interleaved.ptx"));
+const INTERLEAVED_KERNEL_NAMES: &[&str] = &[
+    "rope_interleaved_f32",
+    "rope_interleaved_f16",
+    "rope_interleaved_bf16",
+    "rope_interleaved_indirect_f32",
+    "rope_interleaved_indirect_f16",
+    "rope_interleaved_indirect_bf16",
+    "rope_interleaved_batched_f32",
+    "rope_interleaved_batched_f16",
+    "rope_interleaved_batched_bf16",
+];
+
+/// Apply rotary positional embeddings with **interleaved** pairing convention.
+///
+/// Pairs adjacent elements `(x[2i], x[2i+1])` instead of the Llama split-half
+/// convention `(x[i], x[i + head_dim/2])`. Used by DeepSeek V3/R1.
+///
+/// # Arguments
+/// * `input` - Input tensor of shape (seq_len, num_heads, head_dim)
+/// * `cos_cache` - Precomputed cos cache of shape (max_seq_len, head_dim/2)
+/// * `sin_cache` - Precomputed sin cache of shape (max_seq_len, head_dim/2)
+/// * `position_offset` - Starting position (for incremental decoding)
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn apply_rope_interleaved<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    position_offset: usize,
+) -> Result<CudaTensor<T>> {
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (seq_len, num_heads, head_dim)"
+    );
+
+    let seq_len = shape[0];
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_interleaved_{}", kernel_suffix::<T>());
+
+    let module_name = "rope_interleaved";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(INTERLEAVED_PTX),
+            module_name,
+            INTERLEAVED_KERNEL_NAMES,
+        )?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                seq_len as i32,
+                num_heads as i32,
+                head_dim as i32,
+                position_offset as i32,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
+/// Apply interleaved RoPE using a GPU-resident position offset.
+///
+/// Identical to [`apply_rope_interleaved`] but reads `position_offset` from
+/// the [`SeqPosition`]'s device pointer for CUDA graph capture.
+///
+/// # Errors
+/// Returns an error if the kernel launch fails.
+pub fn apply_rope_interleaved_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    position: &crate::cuda::SeqPosition,
+) -> Result<CudaTensor<T>> {
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (seq_len, num_heads, head_dim)"
+    );
+
+    let seq_len = shape[0];
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_interleaved_indirect_{}", kernel_suffix::<T>());
+
+    let module_name = "rope_interleaved";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(INTERLEAVED_PTX),
+            module_name,
+            INTERLEAVED_KERNEL_NAMES,
+        )?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                seq_len as i32,
+                num_heads as i32,
+                head_dim as i32,
+                position.device(),
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
+/// Apply interleaved RoPE to a batch of single-token sequences, reading
+/// positions from a pre-allocated GPU buffer.
+///
+/// Identical to [`apply_rope_batched_indirect`] but uses interleaved pairing
+/// `(x[2i], x[2i+1])` instead of split-half. Used by DeepSeek V3/R1 for
+/// batched decode with CUDA graph capture.
+///
+/// # Errors
+/// Returns an error if the kernel launch or GPU allocation fails.
+pub fn apply_rope_interleaved_batched_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
+    input: &CudaTensor<T>,
+    cos_cache: &CudaTensor<T>,
+    sin_cache: &CudaTensor<T>,
+    positions_gpu: &cudarc::driver::CudaSlice<i32>,
+    batch_size: usize,
+) -> Result<CudaTensor<T>> {
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (batch_size, num_heads, head_dim)"
+    );
+    assert_eq!(shape[0], batch_size);
+
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+
+    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_interleaved_batched_{}", kernel_suffix::<T>());
+
+    let module_name = "rope_interleaved";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(INTERLEAVED_PTX),
+            module_name,
+            INTERLEAVED_KERNEL_NAMES,
+        )?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (batch_size as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                batch_size as i32,
+                num_heads as i32,
+                head_dim as i32,
+                positions_gpu,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
 const BATCHED_KERNEL_NAMES: &[&str] =
     &["rope_batched_f32", "rope_batched_f16", "rope_batched_bf16"];
 
@@ -893,6 +1119,183 @@ mod tests {
                 (e - ind).abs() < 1e-6,
                 "Mismatch at {i}: eager={e}, indirect={ind}"
             );
+        }
+    }
+
+    // --- Interleaved RoPE tests ---
+
+    #[test]
+    fn test_rope_interleaved_identity_at_zero() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        // At position 0, cos=1, sin=0 → output should equal input
+        let input_data = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
+
+        let output = apply_rope_interleaved(&input, &cos_cache, &sin_cache, 0).unwrap();
+        let result = output.to_vec().unwrap();
+
+        for (i, (&got, &want)) in result.iter().zip(input_data.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "pos=0 mismatch at {i}: got {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_interleaved_convention() {
+        // Verify interleaved convention: pairs are (x[2i], x[2i+1])
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let base = 10000.0_f32;
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, base).unwrap();
+
+        // Use position 1
+        // freq_0 = 1 / 10000^(0/4) = 1.0,  angle_0 = 1.0
+        // freq_1 = 1 / 10000^(2/4) = 0.01,  angle_1 = 0.01
+        let cos0 = 1.0_f32.cos();
+        let sin0 = 1.0_f32.sin();
+        let cos1 = 0.01_f32.cos();
+        let sin1 = 0.01_f32.sin();
+
+        // input: [a, b, c, d]
+        // Interleaved: (a,b) rotated by freq_0, (c,d) rotated by freq_1
+        //   out[0] = a*cos0 - b*sin0
+        //   out[1] = a*sin0 + b*cos0
+        //   out[2] = c*cos1 - d*sin1
+        //   out[3] = c*sin1 + d*cos1
+        let a = 1.0_f32;
+        let b = 2.0;
+        let c = 3.0;
+        let d = 4.0;
+        let input_data = vec![a, b, c, d];
+
+        let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
+        let output = apply_rope_interleaved(&input, &cos_cache, &sin_cache, 1).unwrap();
+        let result = output.to_vec().unwrap();
+
+        let expected = [
+            a * cos0 - b * sin0,
+            a * sin0 + b * cos0,
+            c * cos1 - d * sin1,
+            c * sin1 + d * cos1,
+        ];
+
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "Mismatch at index {i}: got {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_interleaved_differs_from_split_half() {
+        // Given the same input and frequencies, interleaved and split-half
+        // should produce different outputs (sanity check).
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let input_data = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
+
+        let split_half = apply_rope(&input, &cos_cache, &sin_cache, 1).unwrap();
+        let interleaved = apply_rope_interleaved(&input, &cos_cache, &sin_cache, 1).unwrap();
+
+        let sh = split_half.to_vec().unwrap();
+        let il = interleaved.to_vec().unwrap();
+
+        assert_ne!(
+            sh, il,
+            "Interleaved and split-half should produce different outputs"
+        );
+    }
+
+    #[test]
+    fn test_rope_interleaved_indirect_matches_direct() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let head_dim = 4;
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let input_data = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let input = CudaTensor::from_slice(&ctx, &[1, 2, head_dim], &input_data).unwrap();
+
+        let position = 7;
+        let direct = apply_rope_interleaved(&input, &cos_cache, &sin_cache, position).unwrap();
+
+        let mut pos = crate::cuda::SeqPosition::new(ctx.device()).unwrap();
+        pos.set(position, ctx.device()).unwrap();
+        let indirect =
+            apply_rope_interleaved_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
+
+        let direct_data = direct.to_vec().unwrap();
+        let indirect_data = indirect.to_vec().unwrap();
+
+        for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
+            assert!(
+                (d - ind).abs() < 1e-6,
+                "Mismatch at {i}: direct={d}, indirect={ind}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_interleaved_batched_matches_sequential() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let num_heads = 2;
+        let head_dim = 8;
+        let positions = [5_usize, 12, 0];
+        let batch_size = positions.len();
+
+        let (cos_cache, sin_cache) = precompute_rope_cache(&ctx, 128, head_dim, 10000.0).unwrap();
+
+        let row_size = num_heads * head_dim;
+        let mut input_data = Vec::with_capacity(batch_size * row_size);
+        for i in 0..batch_size * row_size {
+            input_data.push((i as f32 + 1.0) * 0.1);
+        }
+        let input =
+            CudaTensor::from_slice(&ctx, &[batch_size, num_heads, head_dim], &input_data).unwrap();
+
+        // Batched indirect path
+        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let positions_gpu = ctx.device().htod_sync_copy(&positions_i32).unwrap();
+        let batched = apply_rope_interleaved_batched_indirect(
+            &input,
+            &cos_cache,
+            &sin_cache,
+            &positions_gpu,
+            batch_size,
+        )
+        .unwrap();
+        let batched_data = batched.to_vec().unwrap();
+
+        // Compare each row against sequential apply_rope_interleaved
+        for (i, &pos) in positions.iter().enumerate() {
+            let row_start = i * row_size;
+            let row_input = CudaTensor::from_slice(
+                &ctx,
+                &[1, num_heads, head_dim],
+                &input_data[row_start..row_start + row_size],
+            )
+            .unwrap();
+            let scalar = apply_rope_interleaved(&row_input, &cos_cache, &sin_cache, pos).unwrap();
+            let scalar_data = scalar.to_vec().unwrap();
+
+            for (j, (&got, &want)) in batched_data[row_start..row_start + row_size]
+                .iter()
+                .zip(scalar_data.iter())
+                .enumerate()
+            {
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "Mismatch at batch={i}, pos={pos}, elem={j}: batched={got}, scalar={want}"
+                );
+            }
         }
     }
 }

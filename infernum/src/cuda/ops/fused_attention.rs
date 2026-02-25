@@ -17,7 +17,9 @@
     clippy::manual_div_ceil
 )]
 
-use cudarc::driver::{LaunchAsync, LaunchConfig};
+use std::ffi::c_void;
+
+use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
 use crate::dtype::TensorDType;
@@ -479,6 +481,274 @@ infernum_macros::define_fusion! {
             fused_attention_prefill(q, &k_full, &v_full, kv_cache.current_len(), None, None, None)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prefill attention with log-sum-exp output (for multi-chunk prefill combining)
+// ---------------------------------------------------------------------------
+
+const FUSED_PREFILL_WITH_LSE_PTX: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/kernels/fused_prefill_attention_with_lse.ptx"
+));
+
+const FUSED_PREFILL_WITH_LSE_KERNEL_NAMES: &[&str] = &[
+    "fused_prefill_attention_with_lse_f32",
+    "fused_prefill_attention_with_lse_f16",
+    "fused_prefill_attention_with_lse_bf16",
+];
+
+fn ensure_fused_prefill_with_lse_kernel<T: cudarc::driver::DeviceRepr>(
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Result<()> {
+    let module_name = "fused_prefill_attention_with_lse";
+    let kernel_name = format!("fused_prefill_attention_with_lse_{}", kernel_suffix::<T>());
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(FUSED_PREFILL_WITH_LSE_PTX),
+            module_name,
+            FUSED_PREFILL_WITH_LSE_KERNEL_NAMES,
+        )?;
+    }
+    Ok(())
+}
+
+/// Fused attention for multi-token prefill with causal masking, returning
+/// both the attention output and per-head log-sum-exp (LSE).
+///
+/// Identical to [`fused_attention_prefill`] but additionally outputs
+/// `lse[qpos, head] = log(sum(exp(scores)))` for numerically-stable
+/// combining of attention over disjoint key ranges (multi-chunk prefill).
+///
+/// # Arguments
+/// * `q` — query tensor of shape `(seq_q, num_heads, head_dim)`
+/// * `k` — full keys of shape `(total_len, num_kv_heads, head_dim)`
+/// * `v` — full values of shape `(total_len, num_kv_heads, head_dim)`
+/// * `offset` — position offset for causal mask
+/// * `scale` — attention scale; `None` uses `1/sqrt(head_dim)`
+/// * `softcap` — optional logit soft-capping
+/// * `sliding_window` — optional sliding window size
+///
+/// # Returns
+/// `(output, lse)` where output is `(seq_q, num_heads, head_dim)` and
+/// lse is `(seq_q, num_heads)` as f32.
+///
+/// # Errors
+/// Returns an error if the kernel launch fails
+pub fn fused_attention_prefill_with_lse<T: TensorDType + cudarc::driver::DeviceRepr>(
+    q: &CudaTensor<T>,
+    k: &CudaTensor<T>,
+    v: &CudaTensor<T>,
+    offset: usize,
+    scale: Option<f32>,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
+) -> Result<(CudaTensor<T>, CudaTensor<f32>)> {
+    let q_shape = q.shape();
+    let k_shape = k.shape();
+    let v_shape = v.shape();
+
+    assert_eq!(
+        q_shape.len(),
+        3,
+        "Q must be 3D: (seq_q, num_heads, head_dim)"
+    );
+    assert_eq!(
+        k_shape.len(),
+        3,
+        "K must be 3D: (total_len, num_kv_heads, head_dim)"
+    );
+    assert_eq!(
+        v_shape.len(),
+        3,
+        "V must be 3D: (total_len, num_kv_heads, head_dim)"
+    );
+
+    let seq_q = q_shape[0];
+    let num_heads = q_shape[1];
+    let head_dim = q_shape[2];
+    let total_len = k_shape[0];
+    let num_kv_heads = k_shape[1];
+
+    assert_eq!(k_shape[2], head_dim, "K head_dim must match Q");
+    assert_eq!(v_shape, k_shape, "V shape must match K");
+    assert!(
+        num_heads.is_multiple_of(num_kv_heads),
+        "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+    );
+
+    let mut scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+    let mut softcap_val = softcap.unwrap_or(0.0);
+    let mut output =
+        unsafe { CudaTensor::<T>::uninit(q.context(), &[seq_q, num_heads, head_dim])? };
+    let mut lse = unsafe { CudaTensor::<f32>::uninit(q.context(), &[seq_q, num_heads])? };
+
+    let device = q.context().device();
+    ensure_fused_prefill_with_lse_kernel::<T>(device)?;
+
+    let kernel_name = format!("fused_prefill_attention_with_lse_{}", kernel_suffix::<T>());
+    let func = device
+        .get_func("fused_prefill_attention_with_lse", &kernel_name)
+        .unwrap();
+
+    let block_size = 256_usize.min(total_len.next_power_of_two());
+    let shared_mem = (head_dim + block_size) * std::mem::size_of::<f32>();
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, seq_q as u32, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    let mut window_size = sliding_window.map_or(-1, |w| w as i32);
+    let mut total_len_i32 = total_len as i32;
+    let mut num_heads_i32 = num_heads as i32;
+    let mut num_kv_heads_i32 = num_kv_heads as i32;
+    let mut head_dim_i32 = head_dim as i32;
+    let mut offset_i32 = offset as i32;
+
+    let out_slice = output.cuda_slice_mut();
+    let lse_slice = lse.cuda_slice_mut();
+    let q_slice = q.cuda_slice();
+    let k_slice = k.cuda_slice();
+    let v_slice = v.cuda_slice();
+
+    let mut args: Vec<*mut c_void> = vec![
+        std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_mut(lse_slice.device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_ref(q_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(k_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(v_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        (&raw mut scale).cast::<c_void>(),
+        (&raw mut softcap_val).cast::<c_void>(),
+        (&raw mut total_len_i32).cast::<c_void>(),
+        (&raw mut num_heads_i32).cast::<c_void>(),
+        (&raw mut num_kv_heads_i32).cast::<c_void>(),
+        (&raw mut head_dim_i32).cast::<c_void>(),
+        (&raw mut offset_i32).cast::<c_void>(),
+        (&raw mut window_size).cast::<c_void>(),
+    ];
+
+    unsafe {
+        func.launch(cfg, &mut args)?;
+    }
+
+    Ok((output, lse))
+}
+
+// ---------------------------------------------------------------------------
+// Combine two attention outputs using log-sum-exp correction
+// ---------------------------------------------------------------------------
+
+const COMBINE_LSE_PTX: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/kernels/combine_attention_lse.ptx"
+));
+
+const COMBINE_LSE_KERNEL_NAMES: &[&str] = &[
+    "combine_attention_lse_f32",
+    "combine_attention_lse_f16",
+    "combine_attention_lse_bf16",
+];
+
+fn ensure_combine_lse_kernel<T: cudarc::driver::DeviceRepr>(
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Result<()> {
+    let module_name = "combine_attention_lse";
+    let kernel_name = format!("combine_attention_lse_{}", kernel_suffix::<T>());
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(COMBINE_LSE_PTX),
+            module_name,
+            COMBINE_LSE_KERNEL_NAMES,
+        )?;
+    }
+    Ok(())
+}
+
+/// Combine two attention outputs using numerically-stable log-sum-exp correction.
+///
+/// Given two `(output, lse)` pairs from attention over disjoint key ranges,
+/// produces the combined result as if attention had been computed over the
+/// union of both key ranges.
+///
+/// # Arguments
+/// * `out1` — attention output from range 1: `(N, num_heads, head_dim)`
+/// * `lse1` — per-head LSE from range 1: `(N, num_heads)`, f32
+/// * `out2` — attention output from range 2: `(N, num_heads, head_dim)`
+/// * `lse2` — per-head LSE from range 2: `(N, num_heads)`, f32
+///
+/// # Returns
+/// Combined output: `(N, num_heads, head_dim)`
+///
+/// # Errors
+/// Returns an error if the kernel launch fails
+pub fn combine_attention_with_lse<T: TensorDType + cudarc::driver::DeviceRepr>(
+    out1: &CudaTensor<T>,
+    lse1: &CudaTensor<f32>,
+    out2: &CudaTensor<T>,
+    lse2: &CudaTensor<f32>,
+) -> Result<CudaTensor<T>> {
+    let shape1 = out1.shape();
+    let shape2 = out2.shape();
+    assert_eq!(shape1.len(), 3, "out1 must be 3D: (N, num_heads, head_dim)");
+    assert_eq!(shape1, shape2, "out1 and out2 must have the same shape");
+    assert_eq!(
+        lse1.shape(),
+        lse2.shape(),
+        "lse1 and lse2 must have the same shape"
+    );
+
+    let n = shape1[0];
+    let num_heads = shape1[1];
+    let head_dim = shape1[2];
+
+    assert_eq!(
+        lse1.shape(),
+        &[n, num_heads],
+        "LSE shape must be (N, num_heads)"
+    );
+
+    let mut combined = unsafe { CudaTensor::<T>::uninit(out1.context(), shape1)? };
+
+    let device = out1.context().device();
+    ensure_combine_lse_kernel::<T>(device)?;
+
+    let kernel_name = format!("combine_attention_lse_{}", kernel_suffix::<T>());
+    let func = device
+        .get_func("combine_attention_lse", &kernel_name)
+        .unwrap();
+
+    let block_size = 256_usize.min(head_dim.next_power_of_two());
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, n as u32, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                combined.cuda_slice_mut(),
+                &out1.cuda_slice(),
+                &lse1.cuda_slice(),
+                &out2.cuda_slice(),
+                &lse2.cuda_slice(),
+                num_heads as i32,
+                head_dim as i32,
+            ),
+        )?;
+    }
+
+    Ok(combined)
 }
 
 #[cfg(test)]
@@ -1718,6 +1988,113 @@ mod tests {
             assert!(
                 (g - r).abs() < 1e-3,
                 "Default scale mismatch at {i}: gpu={g}, cpu={r}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_prefill_with_lse_matches_without() {
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let num_heads = 2;
+        let head_dim = 8;
+        let seq_q = 4;
+        let total_len = 4;
+
+        let q_data: Vec<f32> = (0..seq_q * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.3).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.2).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * num_heads * head_dim)
+            .map(|x| ((x as f32) * 0.1).sin())
+            .collect();
+
+        let q = CudaTensor::from_slice(&ctx, &[seq_q, num_heads, head_dim], &q_data).unwrap();
+        let k = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &k_data).unwrap();
+        let v = CudaTensor::from_slice(&ctx, &[total_len, num_heads, head_dim], &v_data).unwrap();
+
+        let without = fused_attention_prefill(&q, &k, &v, 0, None, None, None).unwrap();
+        let (with_out, lse) =
+            fused_attention_prefill_with_lse(&q, &k, &v, 0, None, None, None).unwrap();
+
+        let without_data = without.to_vec().unwrap();
+        let with_data = with_out.to_vec().unwrap();
+        let lse_data = lse.to_vec().unwrap();
+
+        for (i, (&a, &b)) in without_data.iter().zip(with_data.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "prefill_with_lse output mismatch at {i}: without={a}, with={b}"
+            );
+        }
+
+        assert_eq!(lse_data.len(), seq_q * num_heads);
+        for (i, &l) in lse_data.iter().enumerate() {
+            assert!(l.is_finite(), "LSE is not finite at {i}: {l}");
+        }
+    }
+
+    #[test]
+    fn combine_lse_equal_weights() {
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let n = 2;
+        let num_heads = 2;
+        let head_dim = 4;
+
+        let out1_data: Vec<f32> = (0..n * num_heads * head_dim)
+            .map(|x| x as f32 * 0.1)
+            .collect();
+        let out2_data: Vec<f32> = (0..n * num_heads * head_dim)
+            .map(|x| x as f32 * 0.2)
+            .collect();
+        let lse_data: Vec<f32> = vec![1.0; n * num_heads];
+
+        let out1 = CudaTensor::from_slice(&ctx, &[n, num_heads, head_dim], &out1_data).unwrap();
+        let out2 = CudaTensor::from_slice(&ctx, &[n, num_heads, head_dim], &out2_data).unwrap();
+        let lse1 = CudaTensor::from_slice(&ctx, &[n, num_heads], &lse_data).unwrap();
+        let lse2 = CudaTensor::from_slice(&ctx, &[n, num_heads], &lse_data).unwrap();
+
+        let combined = combine_attention_with_lse(&out1, &lse1, &out2, &lse2).unwrap();
+        let result = combined.to_vec().unwrap();
+
+        for (i, (&r, (&a, &b))) in result
+            .iter()
+            .zip(out1_data.iter().zip(out2_data.iter()))
+            .enumerate()
+        {
+            let expected = (a + b) / 2.0;
+            assert!(
+                (r - expected).abs() < 1e-5,
+                "combine_lse equal mismatch at {i}: got={r}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn combine_lse_dominated_by_one_side() {
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let n = 1;
+        let num_heads = 2;
+        let head_dim = 4;
+
+        let out1_data: Vec<f32> = vec![1.0; n * num_heads * head_dim];
+        let out2_data: Vec<f32> = vec![2.0; n * num_heads * head_dim];
+        let lse1_data: Vec<f32> = vec![100.0; n * num_heads];
+        let lse2_data: Vec<f32> = vec![0.0; n * num_heads];
+
+        let out1 = CudaTensor::from_slice(&ctx, &[n, num_heads, head_dim], &out1_data).unwrap();
+        let out2 = CudaTensor::from_slice(&ctx, &[n, num_heads, head_dim], &out2_data).unwrap();
+        let lse1 = CudaTensor::from_slice(&ctx, &[n, num_heads], &lse1_data).unwrap();
+        let lse2 = CudaTensor::from_slice(&ctx, &[n, num_heads], &lse2_data).unwrap();
+
+        let combined = combine_attention_with_lse(&out1, &lse1, &out2, &lse2).unwrap();
+        let result = combined.to_vec().unwrap();
+
+        for (i, &r) in result.iter().enumerate() {
+            assert!(
+                (r - 1.0).abs() < 1e-5,
+                "combine_lse dominated mismatch at {i}: got={r}, expected=1.0"
             );
         }
     }

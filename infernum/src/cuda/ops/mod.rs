@@ -10,7 +10,10 @@ mod embed;
 mod fused_attention;
 mod geglu;
 mod gelu;
+mod linear;
 mod matmul;
+mod mla_tensor_ops;
+mod moe_routing;
 mod mul;
 mod paged_attention;
 mod quantized_matmul;
@@ -32,12 +35,16 @@ pub use bias_add::{bias_add, bias_add_inplace};
 pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16, cast_to_f32};
 pub use embed::{embedding_gather, embedding_gather_from_device};
 pub use fused_attention::{
-    fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill,
+    combine_attention_with_lse, fused_attention_decode, fused_attention_decode_indirect,
+    fused_attention_prefill, fused_attention_prefill_with_lse,
 };
 pub use geglu::geglu;
 pub use gelu::{gelu, gelu_inplace, gelu_mul};
+pub use linear::{linear, reinterpret_tensor, LinearWeight};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
-pub use mul::mul;
+pub use mla_tensor_ops::{broadcast_to_heads, concat_inner_dim, pad_inner_dim, split_inner_dim};
+pub use moe_routing::{moe_route_sigmoid_gpu, GpuRouting, GpuRoutingBuffers};
+pub use mul::{mul, scale_f32_inplace};
 pub use paged_attention::{
     gather_paged_kv, paged_attention_decode, paged_attention_decode_indirect,
 };
@@ -46,7 +53,9 @@ pub use repeat_kv::repeat_kv;
 pub use rmsnorm::{rms_norm, rms_norm_inplace};
 pub use rope::{
     apply_rope, apply_rope_batched, apply_rope_batched_indirect, apply_rope_indirect,
-    precompute_rope_cache, precompute_rope_cache_scaled, RopeScaling,
+    apply_rope_interleaved, apply_rope_interleaved_batched_indirect,
+    apply_rope_interleaved_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
+    RopeScaling,
 };
 pub use sample::sample_top_p;
 pub use scale::scale_inplace;

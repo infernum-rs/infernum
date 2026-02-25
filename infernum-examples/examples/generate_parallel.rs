@@ -19,6 +19,7 @@ use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{GenerateOptions, Result, SamplingParams, ShardedModel};
+use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
@@ -76,6 +77,10 @@ struct Cli {
     /// Number of recent tokens to consider for repetition penalty
     #[arg(long, default_value_t = 64)]
     repetition_penalty_window: usize,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -137,7 +142,7 @@ fn run_parallel<M: Model + Send + 'static>(
         println!("Decoding: greedy (argmax)");
     }
 
-    let runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
 
     print!("{}", cli.prompt);
     io::stdout().flush()?;
@@ -176,6 +181,7 @@ fn main() -> Result<()> {
     let family = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => "llama",
         "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+        "deepseek_v3" => "deepseek",
         "gemma2" | "gemma3_text" => "gemma",
         other => {
             return Err(infernum::Error::UnsupportedModel(format!(
@@ -207,6 +213,19 @@ fn main() -> Result<()> {
         }
         ("bf16", "qwen") => {
             let model = ShardedModel::<QwenModel<infernum::dtype::BF16>>::from_pretrained(
+                &cli.model, world_size,
+            )?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        ("f32", "deepseek") => {
+            let model =
+                ShardedModel::<DeepSeekModel<f32>>::from_pretrained(&cli.model, world_size)?;
+            println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
+            run_parallel(model, tokenizer, &cli, world_size)
+        }
+        ("bf16", "deepseek") => {
+            let model = ShardedModel::<DeepSeekModel<infernum::dtype::BF16>>::from_pretrained(
                 &cli.model, world_size,
             )?;
             println!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());

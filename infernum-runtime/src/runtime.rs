@@ -23,10 +23,22 @@ impl<T: Tokenizer> Runtime<T> {
     /// Create a new runtime from a model and tokenizer.
     ///
     /// # Errors
-    /// Returns an error if KV cache allocation fails.
+    /// Returns an error if paged KV cache allocation fails.
     pub fn new<M: Model + Send + 'static>(model: M, tokenizer: T) -> Result<Self> {
         let engine = Engine::new(model)?;
         Ok(Self { engine, tokenizer })
+    }
+
+    /// Create a new runtime, ignoring `max_seq_len` (kept for API compat).
+    ///
+    /// # Errors
+    /// Returns an error if paged KV cache allocation fails.
+    pub fn with_max_seq_len<M: Model + Send + 'static>(
+        model: M,
+        tokenizer: T,
+        _max_seq_len: Option<usize>,
+    ) -> Result<Self> {
+        Self::new(model, tokenizer)
     }
 
     /// Get a reference to the underlying engine.

@@ -900,12 +900,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "infernum-deepseek"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "infernum",
+ "infernum-runtime",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "infernum-examples"
 version = "0.1.0"
 dependencies = [
  "clap",
  "cudarc",
  "infernum",
+ "infernum-deepseek",
  "infernum-gemma",
  "infernum-llama",
  "infernum-qwen",

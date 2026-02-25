@@ -157,20 +157,36 @@ impl<T: TensorDType + DeviceRepr> CudaTensor<T> {
 
     /// Create a tensor filled with zeros
     ///
+    /// When the context has an active buffer pool, this reuses a pooled
+    /// allocation and zeros it via `cuMemsetD8`, avoiding `cuMemAlloc`.
+    ///
     /// # Errors
     /// Returns an error if GPU memory allocation fails
     pub fn zeros(ctx: &CudaContext, shape: &[usize]) -> Result<Self>
     where
         T: ValidAsZeroBits,
     {
-        let numel: usize = shape.iter().product();
-        let data = ctx.device().alloc_zeros::<T>(numel)?;
-        Ok(Self {
-            data: Arc::new(PoolableBuffer::unpooled(data)),
-            offset: 0,
-            shape: shape.to_vec(),
-            ctx: ctx.clone(),
-        })
+        if ctx.buffer_pool().is_some() {
+            let mut t = unsafe { Self::uninit(ctx, shape)? };
+            let byte_count = t.numel() * std::mem::size_of::<T>();
+            let ptr = *t.cuda_slice_mut().device_ptr_mut();
+            let result = unsafe { cudarc::driver::sys::lib().cuMemsetD8_v2(ptr, 0, byte_count) };
+            assert_eq!(
+                result,
+                cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                "cuMemsetD8 failed"
+            );
+            Ok(t)
+        } else {
+            let numel: usize = shape.iter().product();
+            let data = ctx.device().alloc_zeros::<T>(numel)?;
+            Ok(Self {
+                data: Arc::new(PoolableBuffer::unpooled(data)),
+                offset: 0,
+                shape: shape.to_vec(),
+                ctx: ctx.clone(),
+            })
+        }
     }
 
     /// Copy tensor data back to the host
@@ -531,5 +547,40 @@ mod tests {
         // Drop the last reference — buffer returns to pool
         drop(t2);
         assert_eq!(pool.free_bytes(), 8 * 4);
+    }
+
+    #[test]
+    fn test_zeros_pool_aware() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let pool = ctx.buffer_pool().unwrap().clone();
+        pool.reset_stats();
+
+        // First zeros: pool miss (allocates fresh, then zeros)
+        let t1 = CudaTensor::<f32>::zeros(&ctx, &[2, 4]).unwrap();
+        assert_eq!(pool.misses(), 1);
+        let data = t1.to_vec().unwrap();
+        assert!(data.iter().all(|&x| x == 0.0));
+
+        let ptr1 = t1.as_ptr();
+        drop(t1);
+
+        // Second zeros of same shape: pool hit + correctly zeroed
+        let t2 = CudaTensor::<f32>::zeros(&ctx, &[2, 4]).unwrap();
+        assert_eq!(pool.hits(), 1);
+        assert_eq!(t2.as_ptr(), ptr1);
+        let data = t2.to_vec().unwrap();
+        assert!(data.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_pool_report() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let pool = ctx.buffer_pool().unwrap().clone();
+        pool.reset_stats();
+
+        let _ = unsafe { CudaTensor::<f32>::uninit(&ctx, &[4]).unwrap() };
+        let report = pool.report();
+        assert!(report.contains("0 hits"));
+        assert!(report.contains("1 misses"));
     }
 }

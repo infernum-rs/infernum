@@ -16,6 +16,7 @@ use serde::Deserialize;
 use infernum::cuda::CudaContext;
 use infernum::model::Model;
 use infernum::GenerateOptions;
+use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
@@ -38,6 +39,10 @@ struct Cli {
     /// Enable CUDA graph capture/replay for the decode loop
     #[arg(long)]
     graphs: bool,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -62,7 +67,9 @@ fn bench_model<M: Model + Send + 'static>(
     model: M,
     n_gen: usize,
     use_cuda_graphs: bool,
+    max_seq_len: Option<usize>,
 ) -> infernum::Result<()> {
+    let _ = max_seq_len; // TODO: re-add max_seq_len support to Engine
     let engine = Engine::new(model)?;
 
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -110,12 +117,13 @@ fn bench_with_info<M: Model + Send + 'static>(
     dtype: &str,
     n_gen: usize,
     use_cuda_graphs: bool,
+    max_seq_len: Option<usize>,
 ) -> infernum::Result<()> {
     eprintln!(
         "Model loaded: {} layers, {} hidden, dtype={}",
         num_layers, hidden_size, dtype,
     );
-    bench_model(model, n_gen, use_cuda_graphs)
+    bench_model(model, n_gen, use_cuda_graphs, max_seq_len)
 }
 
 fn main() -> infernum::Result<()> {
@@ -137,6 +145,7 @@ fn main() -> infernum::Result<()> {
     let family = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => "llama",
         "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+        "deepseek_v3" => "deepseek",
         "gemma2" | "gemma3_text" => "gemma",
         other => panic!("Unsupported model_type: {other}"),
     };
@@ -149,7 +158,7 @@ fn main() -> infernum::Result<()> {
                 LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?
             };
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
         }
         ("bf16", "llama") => {
             assert!(
@@ -158,27 +167,69 @@ fn main() -> infernum::Result<()> {
             );
             let model = LlamaModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
+            bench_with_info(
+                model,
+                nl,
+                hs,
+                "bf16",
+                cli.n_gen,
+                cli.graphs,
+                cli.max_seq_len,
+            )
         }
         ("f32", "qwen") => {
             let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
         }
         ("bf16", "qwen") => {
             let model = QwenModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
+            bench_with_info(
+                model,
+                nl,
+                hs,
+                "bf16",
+                cli.n_gen,
+                cli.graphs,
+                cli.max_seq_len,
+            )
+        }
+        ("f32", "deepseek") => {
+            let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
+        }
+        ("bf16", "deepseek") => {
+            let model = DeepSeekModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
+            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
+            bench_with_info(
+                model,
+                nl,
+                hs,
+                "bf16",
+                cli.n_gen,
+                cli.graphs,
+                cli.max_seq_len,
+            )
         }
         ("f32", "gemma") => {
             let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs)
+            bench_with_info(model, nl, hs, "f32", cli.n_gen, cli.graphs, cli.max_seq_len)
         }
         ("bf16", "gemma") => {
             let model = GemmaModel::<infernum::dtype::BF16>::from_pretrained(&ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, "bf16", cli.n_gen, cli.graphs)
+            bench_with_info(
+                model,
+                nl,
+                hs,
+                "bf16",
+                cli.n_gen,
+                cli.graphs,
+                cli.max_seq_len,
+            )
         }
         (other, _) => panic!("Unsupported dtype: {other}. Use f32 or bf16."),
     };

@@ -140,6 +140,33 @@ impl BufferPool {
         self.inner.lock().unwrap().free.len()
     }
 
+    /// Return a human-readable summary of pool statistics.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn report(&self) -> String {
+        let pool = self.inner.lock().unwrap();
+        let total = pool.hits + pool.misses;
+        let hit_rate = if total > 0 {
+            pool.hits as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "Pool: {} hits, {} misses ({hit_rate:.1}%), {} size classes, {} bytes free",
+            pool.hits,
+            pool.misses,
+            pool.free.len(),
+            pool.free_bytes,
+        )
+    }
+
+    /// Reset hit/miss counters to zero (does not affect cached buffers).
+    pub fn reset_stats(&self) {
+        let mut pool = self.inner.lock().unwrap();
+        pool.hits = 0;
+        pool.misses = 0;
+    }
+
     /// Clear all cached buffers, freeing GPU memory.
     pub fn clear(&self) {
         let mut pool = self.inner.lock().unwrap();

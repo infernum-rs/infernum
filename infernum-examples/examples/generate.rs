@@ -21,6 +21,7 @@ use infernum::cuda::CudaContext;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Model, Result, SamplingParams};
+use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
@@ -79,6 +80,10 @@ struct Cli {
     /// Number of recent tokens to consider for repetition penalty
     #[arg(long, default_value_t = 64)]
     repetition_penalty_window: usize,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 /// Abstraction over tokenizer backends so we can use either one.
@@ -221,7 +226,7 @@ fn run_generate<M: Model + Send + 'static>(
 
         (tokens, prompt_len)
     } else {
-        let runtime = Runtime::new(model, tokenizer)?;
+        let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
         let prompt_len = runtime.tokenizer().encode(&cli.prompt, true)?.len();
         let tokens = runtime.generate_stream(&cli.prompt, &options)?;
         (tokens, prompt_len)
@@ -276,6 +281,12 @@ fn main() -> Result<()> {
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
+            "deepseek_v3" => {
+                let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let num_layers = model.config().num_hidden_layers;
+                let hidden_size = model.config().hidden_size;
+                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
+            }
             "gemma2" | "gemma3_text" => {
                 let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
@@ -283,7 +294,7 @@ fn main() -> Result<()> {
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
             other => Err(infernum::Error::UnsupportedModel(format!(
-                "Unsupported model_type: \"{other}\". Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
+                "Unsupported model_type: \"{other}\". Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, deepseek_v3, gemma2, gemma3_text"
             ))),
         }
     }

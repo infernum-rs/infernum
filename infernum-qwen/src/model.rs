@@ -13,9 +13,10 @@ use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
     bias_add_inplace, cast_to_f32, embedding_gather, embedding_gather_from_device,
-    fused_attention_prefill, gather_paged_kv, matmul, matmul_bf16_f32, mul, paged_attention_decode,
-    paged_attention_decode_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
-    quantized_matmul, rms_norm, rms_norm_inplace, swiglu, transpose_2d, GemmScalar, RopeScaling,
+    fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32, mul,
+    paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache,
+    precompute_rope_cache_scaled, reinterpret_tensor, rms_norm, rms_norm_inplace, swiglu,
+    transpose_2d, GemmScalar, LinearWeight, RopeScaling,
 };
 use infernum::cuda::{
     BatchedGraphInputs, CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, GpuConfig,
@@ -175,25 +176,7 @@ fn load_typed_sharded<T: TensorDType + DeviceRepr>(
     }
 }
 
-fn reinterpret_tensor<A: TensorDType + DeviceRepr, B: TensorDType + DeviceRepr>(
-    tensor: CudaTensor<A>,
-) -> CudaTensor<B> {
-    assert_eq!(
-        std::mem::size_of::<A>(),
-        std::mem::size_of::<B>(),
-        "reinterpret_tensor: size mismatch between {} and {}",
-        A::DTYPE,
-        B::DTYPE,
-    );
-    unsafe { tensor.reinterpret() }
-}
-
 // --- Weight structures ---
-
-enum LinearWeight<T: TensorDType> {
-    Dense(CudaTensor<T>),
-    Quantized(QuantizedTensor),
-}
 
 enum KvProjWeight<T: TensorDType> {
     Fused {
@@ -1394,6 +1377,7 @@ where
                 &[table_with_current],
                 paged_kv.block_size(),
                 None,
+                None,
                 sliding_window,
             )?;
 
@@ -1550,6 +1534,7 @@ where
             paged_kv.block_size(),
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
+            None,
             None,
             sliding_window,
         )?;
@@ -1826,25 +1811,6 @@ where
             return Ok(unsafe { logits_t.reinterpret() });
         }
         cast_to_f32(&logits_t)
-    }
-}
-
-fn linear<T>(input: &CudaTensor<T>, weight: &LinearWeight<T>) -> Result<CudaTensor<T>>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default,
-    CudaBlas: Gemm<T>,
-{
-    match weight {
-        LinearWeight::Dense(w) => matmul(input, w),
-        LinearWeight::Quantized(w) => {
-            let input_f32 = if T::DTYPE == infernum::dtype::DType::F32 {
-                reinterpret_tensor(input.slice_view(0, input.shape()))
-            } else {
-                cast_to_f32(input)?
-            };
-            let output_f32 = quantized_matmul(&input_f32, w)?;
-            Ok(reinterpret_tensor(output_f32))
-        }
     }
 }
 

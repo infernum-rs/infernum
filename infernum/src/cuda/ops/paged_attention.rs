@@ -28,6 +28,15 @@ const PAGED_DECODE_PTX: &str = include_str!(concat!(
     "/kernels/paged_decode_attention.ptx"
 ));
 
+const GATHER_PAGED_KV_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/kernels/gather_paged_kv.ptx"));
+
+const GATHER_PAGED_KV_KERNEL_NAMES: &[&str] = &[
+    "gather_paged_kv_f32",
+    "gather_paged_kv_f16",
+    "gather_paged_kv_bf16",
+];
+
 const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
     "paged_decode_attention_f32",
     "paged_decode_attention_f16",
@@ -62,6 +71,21 @@ fn ensure_paged_decode_kernel<T: cudarc::driver::DeviceRepr>(
     Ok(())
 }
 
+fn ensure_gather_kernel<T: cudarc::driver::DeviceRepr>(
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Result<()> {
+    let module_name = "gather_paged_kv";
+    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix::<T>());
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(GATHER_PAGED_KV_PTX),
+            module_name,
+            GATHER_PAGED_KV_KERNEL_NAMES,
+        )?;
+    }
+    Ok(())
+}
+
 /// Batched paged decode attention.
 ///
 /// Each request has one query token. K/V data is in a paged pool, accessed
@@ -74,6 +98,7 @@ fn ensure_paged_decode_kernel<T: cudarc::driver::DeviceRepr>(
 /// * `v_pool` — value pool, same shape as `k_pool`
 /// * `block_tables` — per-request block tables
 /// * `block_size` — tokens per block
+/// * `scale` — if `Some(s)`, use `s` as the attention scale; otherwise `1/sqrt(head_dim)`
 /// * `softcap` — if `Some(cap)`, applies `tanh(score/cap)*cap` after scaling
 /// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
@@ -89,6 +114,7 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     v_pool: &CudaTensor<T>,
     block_tables: &[BlockTable],
     block_size: usize,
+    scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
@@ -117,7 +143,7 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
         "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
     );
 
-    let mut scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let mut softcap_val = softcap.unwrap_or(0.0);
     let window_size = sliding_window.map_or(0, |w| w as i32);
 
@@ -280,6 +306,7 @@ fn launch_paged_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
 /// * `block_size` — tokens per block
 /// * `max_blocks_per_seq` — max blocks per sequence (stride for block table rows)
 /// * `max_seq_len` — max sequence length (for shared memory sizing)
+/// * `scale` — if `Some(s)`, use `s` as the attention scale; otherwise `1/sqrt(head_dim)`
 /// * `softcap` — if `Some(cap)`, applies `tanh(score/cap)*cap` after scaling
 /// * `sliding_window` — if `Some(w)`, restrict attention to the last `w` positions
 ///
@@ -298,6 +325,7 @@ pub fn paged_attention_decode_indirect<
     block_size: usize,
     max_blocks_per_seq: usize,
     max_seq_len: usize,
+    scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
 ) -> Result<CudaTensor<T>> {
@@ -321,7 +349,7 @@ pub fn paged_attention_decode_indirect<
         "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
     );
 
-    let mut scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let mut softcap_val = softcap.unwrap_or(0.0);
     let window_size = sliding_window.map_or(0, |w| w as i32);
 
@@ -377,40 +405,67 @@ pub fn gather_paged_kv<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
     let head_dim = paged_kv.head_dim();
     let block_size = paged_kv.block_size();
     let ctx = paged_kv.context();
+    let device = ctx.device();
+
+    ensure_gather_kernel::<T>(device)?;
 
     let shape = [seq_len, num_kv_heads, head_dim];
     let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
 
-    // Read entire pool to host, gather the relevant blocks, upload contiguous result.
-    // This is simple and correct. A GPU gather kernel would be faster for large sequences
-    // but this path is only used for prefill (Step 10 profiles whether to optimize).
-    let k_all = k_pool.to_vec()?;
-    let v_all = v_pool.to_vec()?;
+    // Upload block table to GPU
+    let block_table_i32: Vec<i32> = block_table.blocks().iter().map(|&b| b as i32).collect();
+    let block_table_gpu = device.htod_sync_copy(&block_table_i32)?;
 
-    let token_stride = num_kv_heads * head_dim;
-    let block_stride = block_size * token_stride;
+    let total = seq_len * num_kv_heads * head_dim;
+    let threads = 256;
+    let blocks = total.div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
-    let mut k_gathered = vec![T::default(); seq_len * token_stride];
-    let mut v_gathered = vec![T::default(); seq_len * token_stride];
+    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix::<T>());
 
-    for t in 0..seq_len {
-        let logical_block = t / block_size;
-        let offset_in_block = t % block_size;
-        let physical_block = block_table.blocks()[logical_block];
-
-        let src_offset = physical_block * block_stride + offset_in_block * token_stride;
-        let dst_offset = t * token_stride;
-
-        k_gathered[dst_offset..dst_offset + token_stride]
-            .copy_from_slice(&k_all[src_offset..src_offset + token_stride]);
-        v_gathered[dst_offset..dst_offset + token_stride]
-            .copy_from_slice(&v_all[src_offset..src_offset + token_stride]);
+    let mut k_out = unsafe { CudaTensor::<T>::uninit(ctx, &shape)? };
+    let func = device
+        .get_func("gather_paged_kv", &kernel_name)
+        .expect("gather kernel not loaded");
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                k_out.cuda_slice_mut(),
+                &k_pool.cuda_slice(),
+                &block_table_gpu,
+                seq_len as i32,
+                block_size as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+            ),
+        )?;
     }
 
-    let k_contig = CudaTensor::from_slice(ctx, &shape, &k_gathered)?;
-    let v_contig = CudaTensor::from_slice(ctx, &shape, &v_gathered)?;
+    let mut v_out = unsafe { CudaTensor::<T>::uninit(ctx, &shape)? };
+    let func = device
+        .get_func("gather_paged_kv", &kernel_name)
+        .expect("gather kernel not loaded");
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                v_out.cuda_slice_mut(),
+                &v_pool.cuda_slice(),
+                &block_table_gpu,
+                seq_len as i32,
+                block_size as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+            ),
+        )?;
+    }
 
-    Ok((k_contig, v_contig))
+    Ok((k_out, v_out))
 }
 
 #[cfg(test)]
@@ -488,6 +543,7 @@ mod tests {
             v_pool,
             &[table],
             block_size,
+            None,
             None,
             None,
         )
@@ -577,6 +633,7 @@ mod tests {
             v_pool,
             &[table0.clone(), table1.clone()],
             block_size,
+            None,
             None,
             None,
         )
@@ -709,6 +766,7 @@ mod tests {
             block_size,
             None,
             None,
+            None,
         )
         .unwrap();
         let eager_data = eager.to_vec().unwrap();
@@ -731,6 +789,7 @@ mod tests {
             block_size,
             max_blocks_per_seq,
             table0.seq_len(),
+            None,
             None,
             None,
         )
@@ -812,6 +871,7 @@ mod tests {
             v_pool,
             &[table],
             block_size,
+            None,
             Some(cap),
             None,
         )
@@ -898,6 +958,7 @@ mod tests {
             &[table],
             block_size,
             None,
+            None,
             Some(window),
         )
         .unwrap();
@@ -958,6 +1019,7 @@ mod tests {
             v_pool,
             &[table0.clone()],
             block_size,
+            None,
             Some(cap),
             None,
         )
@@ -982,6 +1044,7 @@ mod tests {
             block_size,
             max_blocks_per_seq,
             table0.seq_len(),
+            None,
             Some(cap),
             None,
         )

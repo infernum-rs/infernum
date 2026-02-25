@@ -18,6 +18,7 @@ use serde::Deserialize;
 use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{GenerateOptions, Model as _, Result, ShardedModel};
+use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
@@ -47,6 +48,10 @@ struct Cli {
     /// Maximum tokens to generate
     #[arg(short = 'n', long, default_value_t = 20)]
     max_tokens: usize,
+
+    /// Maximum KV cache sequence length (default: min(model max, 4096))
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -69,7 +74,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
 
 fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-    let runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
     let output = runtime.generate(
         &cli.prompt,
@@ -89,7 +94,7 @@ fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> R
 
 fn run_multi_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
-    let runtime = Runtime::new(model, tokenizer)?;
+    let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
     let output = runtime.generate(
         &cli.prompt,
@@ -123,6 +128,7 @@ fn main() -> Result<()> {
     let family = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => "llama",
         "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+        "deepseek_v3" => "deepseek",
         "gemma2" | "gemma3_text" => "gemma",
         other => {
             return Err(infernum::Error::UnsupportedModel(format!(
@@ -146,6 +152,16 @@ fn main() -> Result<()> {
         match family {
             "qwen" => {
                 let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                println!(
+                    "Loaded in {:.2}s ({} layers, hidden={})",
+                    t0.elapsed().as_secs_f64(),
+                    model.config().num_hidden_layers,
+                    model.config().hidden_size,
+                );
+                run_single_gpu(model, &cli)?
+            }
+            "deepseek" => {
+                let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
                 println!(
                     "Loaded in {:.2}s ({} layers, hidden={})",
                     t0.elapsed().as_secs_f64(),
@@ -187,6 +203,18 @@ fn main() -> Result<()> {
             "qwen" => {
                 let model =
                     ShardedModel::<QwenModel<f32>>::from_pretrained(&cli.model, world_size)?;
+                let cfg = model.config();
+                println!(
+                    "Loaded in {:.2}s ({} layers, head_dim={})",
+                    t0.elapsed().as_secs_f64(),
+                    cfg.num_layers,
+                    cfg.head_dim,
+                );
+                run_multi_gpu(model, &cli)?
+            }
+            "deepseek" => {
+                let model =
+                    ShardedModel::<DeepSeekModel<f32>>::from_pretrained(&cli.model, world_size)?;
                 let cfg = model.config();
                 println!(
                     "Loaded in {:.2}s ({} layers, head_dim={})",

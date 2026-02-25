@@ -100,6 +100,8 @@ impl ModelEntry {
     /// Create a new model entry with default batch configuration.
     ///
     /// The model is consumed and moved into a background engine thread.
+    /// `max_seq_len` caps the KV cache allocation; `None` uses the default
+    /// (`min(model.max_position_embeddings, 4096)`).
     ///
     /// # Panics
     /// Panics if engine creation fails (paged KV cache allocation).
