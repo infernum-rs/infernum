@@ -689,12 +689,12 @@ where
         let world_size = shard.world_size;
 
         assert!(
-            config.num_attention_heads % world_size == 0,
+            config.num_attention_heads.is_multiple_of(world_size),
             "num_attention_heads ({}) must be divisible by world_size ({world_size})",
             config.num_attention_heads
         );
         assert!(
-            config.num_key_value_heads % world_size == 0,
+            config.num_key_value_heads.is_multiple_of(world_size),
             "num_key_value_heads ({}) must be divisible by world_size ({world_size})",
             config.num_key_value_heads
         );
