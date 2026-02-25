@@ -20,7 +20,7 @@ use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
 use infernum_qwen::QwenModel;
-use infernum_runtime::Engine;
+use infernum_runtime::{BatchConfig, Engine};
 
 #[derive(Parser)]
 #[command(name = "bench")]
@@ -70,7 +70,11 @@ fn bench_model<M: Model + Send + 'static>(
     max_seq_len: Option<usize>,
 ) -> infernum::Result<()> {
     let _ = max_seq_len; // TODO: re-add max_seq_len support to Engine
-    let engine = Engine::new(model)?;
+    let config = BatchConfig {
+        use_cuda_graphs,
+        ..BatchConfig::default()
+    };
+    let engine = Engine::with_config(model, config)?;
 
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let options = GenerateOptions {
