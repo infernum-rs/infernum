@@ -73,12 +73,7 @@ impl<M: ShardedLoadable> ShardedModel<M> {
     }
 }
 
-impl<M: Model + Send + Sync> Model for ShardedModel<M>
-where
-    M::CacheDtype: Send,
-{
-    type CacheDtype = M::CacheDtype;
-
+impl<M: Model + Send + Sync> Model for ShardedModel<M> {
     fn config(&self) -> crate::model::ModelConfig {
         self.replicas[0].1.config()
     }
@@ -87,7 +82,7 @@ where
         self.replicas.iter().map(|(ctx, _)| ctx).collect()
     }
 
-    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
+    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         thread::scope(|s| {
             let handles: Vec<_> = self
                 .replicas
@@ -102,10 +97,10 @@ where
     fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        paged_kvs: &mut [PagedKvCache],
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         thread::scope(|s| {
             let handles: Vec<_> = self
                 .replicas
@@ -130,10 +125,10 @@ where
     fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        paged_kvs: &mut [PagedKvCache],
         block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         thread::scope(|s| {
             let handles: Vec<_> = self
                 .replicas

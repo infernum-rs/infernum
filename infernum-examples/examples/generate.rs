@@ -270,25 +270,25 @@ fn main() -> Result<()> {
 
         match model_type.as_str() {
             "llama" | "mistral" | "mixtral" => {
-                let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let model = LlamaModel::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
             "qwen2" | "qwen3" | "qwen3_moe" => {
-                let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
             "deepseek_v3" => {
-                let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
             "gemma2" | "gemma3_text" => {
-                let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+                let model = GemmaModel::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)

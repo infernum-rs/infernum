@@ -11,10 +11,10 @@
     clippy::manual_div_ceil
 )]
 
-use cudarc::driver::{DeviceRepr, LaunchAsync, LaunchConfig, ValidAsZeroBits};
+use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::{DType, TensorDType};
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -65,19 +65,20 @@ fn launch_cfg(n: usize) -> LaunchConfig {
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn split_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    tensor: &CudaTensor<T>,
+pub fn split_inner_dim(
+    tensor: &CudaTensor,
     dim1: usize,
     dim2: usize,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+) -> Result<(CudaTensor, CudaTensor)> {
+    let dtype = tensor.dtype();
     let shape = tensor.shape();
     assert_eq!(shape.len(), 2, "split_inner_dim: expected 2D tensor");
     let outer = shape[0];
     let total = shape[1];
     assert_eq!(total, dim1 + dim2, "split_inner_dim: dim mismatch");
 
-    let mut out_a = unsafe { CudaTensor::<T>::uninit(tensor.context(), &[outer, dim1])? };
-    let mut out_b = unsafe { CudaTensor::<T>::uninit(tensor.context(), &[outer, dim2])? };
+    let mut out_a = unsafe { CudaTensor::uninit(tensor.context(), &[outer, dim1], dtype)? };
+    let mut out_b = unsafe { CudaTensor::uninit(tensor.context(), &[outer, dim2], dtype)? };
 
     let device = tensor.context().device();
     ensure_mla_kernel(device)?;
@@ -109,10 +110,8 @@ pub fn split_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn concat_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn concat_inner_dim(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = a.dtype();
     let shape_a = a.shape();
     let shape_b = b.shape();
     assert_eq!(shape_a.len(), 2, "concat_inner_dim: expected 2D tensor (a)");
@@ -123,7 +122,7 @@ pub fn concat_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
     let dim2 = shape_b[1];
     let total = dim1 + dim2;
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(a.context(), &[outer, total])? };
+    let mut output = unsafe { CudaTensor::uninit(a.context(), &[outer, total], dtype)? };
 
     let device = a.context().device();
     ensure_mla_kernel(device)?;
@@ -158,10 +157,8 @@ pub fn concat_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn broadcast_to_heads<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    tensor: &CudaTensor<T>,
-    num_heads: usize,
-) -> Result<CudaTensor<T>> {
+pub fn broadcast_to_heads(tensor: &CudaTensor, num_heads: usize) -> Result<CudaTensor> {
+    let dtype = tensor.dtype();
     let shape = tensor.shape();
     assert_eq!(shape.len(), 3, "broadcast_to_heads: expected 3D tensor");
     assert_eq!(shape[1], 1, "broadcast_to_heads: expected 1 head in input");
@@ -169,7 +166,7 @@ pub fn broadcast_to_heads<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
     let dim = shape[2];
 
     let mut output =
-        unsafe { CudaTensor::<T>::uninit(tensor.context(), &[seq_len, num_heads, dim])? };
+        unsafe { CudaTensor::uninit(tensor.context(), &[seq_len, num_heads, dim], dtype)? };
 
     let device = tensor.context().device();
     ensure_mla_kernel(device)?;
@@ -212,10 +209,8 @@ pub fn broadcast_to_heads<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn pad_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    tensor: &CudaTensor<T>,
-    dst_dim: usize,
-) -> Result<CudaTensor<T>> {
+pub fn pad_inner_dim(tensor: &CudaTensor, dst_dim: usize) -> Result<CudaTensor> {
+    let dtype = tensor.dtype();
     let shape = tensor.shape();
     assert_eq!(shape.len(), 2, "pad_inner_dim: expected 2D tensor");
     let outer = shape[0];
@@ -229,7 +224,7 @@ pub fn pad_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
         return Ok(tensor.slice_view(0, tensor.shape()));
     }
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(tensor.context(), &[outer, dst_dim])? };
+    let mut output = unsafe { CudaTensor::uninit(tensor.context(), &[outer, dst_dim], dtype)? };
 
     let device = tensor.context().device();
     ensure_mla_kernel(device)?;

@@ -10,6 +10,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -22,7 +23,7 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/softmax.ptx"))
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn softmax(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+pub fn softmax(input: &CudaTensor) -> Result<CudaTensor> {
     let shape = input.shape();
     let row_size = *shape
         .last()
@@ -30,7 +31,7 @@ pub fn softmax(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     let num_rows: usize = shape[..shape.len() - 1].iter().product();
     let num_rows = if num_rows == 0 { 1 } else { num_rows };
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, DType::F32)? };
 
     let device = input.context().device();
 
@@ -80,17 +81,17 @@ pub fn softmax(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 /// # Errors
 /// Returns an error if the operation fails
 pub fn softmax_causal(
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     query_idx: usize,
     position_offset: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
     let shape = input.shape();
     assert_eq!(shape.len(), 2, "Expected (num_heads, seq_len)");
 
     let num_heads = shape[0];
     let row_size = shape[1];
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, DType::F32)? };
 
     let device = input.context().device();
 

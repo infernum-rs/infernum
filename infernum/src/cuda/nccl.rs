@@ -6,10 +6,9 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
-use cudarc::nccl::safe::{Comm, Id, NcclType, ReduceOp};
+use cudarc::nccl::safe::{Comm, Id, ReduceOp};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -86,14 +85,12 @@ impl NcclCommunicator {
     ///
     /// # Errors
     /// Returns an error if the NCCL all-reduce fails.
-    pub fn all_reduce_sum_inplace<T>(&self, tensor: &mut CudaTensor<T>) -> Result<()>
-    where
-        T: TensorDType + cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + NcclType,
-    {
+    pub fn all_reduce_sum_inplace(&self, tensor: &mut CudaTensor) -> Result<()> {
         let shape = tensor.shape().to_vec();
+        let dtype = tensor.dtype();
 
         // Allocate a temporary output buffer for the reduction
-        let mut recv = unsafe { CudaTensor::<T>::uninit(tensor.context(), &shape)? };
+        let mut recv = unsafe { CudaTensor::uninit(tensor.context(), &shape, dtype)? };
 
         let send = tensor.cuda_slice();
         self.comm

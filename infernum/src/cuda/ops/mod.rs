@@ -32,7 +32,7 @@ pub use add_rmsnorm::add_rmsnorm;
 pub use argmax::{argmax_last, argmax_last_scalar};
 pub use attention::{attention, attention_kv};
 pub use bias_add::{bias_add, bias_add_inplace};
-pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16, cast_to_f32};
+pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16, cast_f32_to_f16, cast_from_f32, cast_to_f32};
 pub use embed::{embedding_gather, embedding_gather_from_device};
 pub use fused_attention::{
     combine_attention_with_lse, fused_attention_decode, fused_attention_decode_indirect,
@@ -40,8 +40,8 @@ pub use fused_attention::{
 };
 pub use geglu::geglu;
 pub use gelu::{gelu, gelu_inplace, gelu_mul};
-pub use linear::{linear, reinterpret_tensor, LinearWeight};
-pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
+pub use linear::{linear, LinearWeight};
+pub use matmul::{matmul, matmul_bf16_f32};
 pub use mla_tensor_ops::{broadcast_to_heads, concat_inner_dim, pad_inner_dim, split_inner_dim};
 pub use moe_routing::{moe_route_sigmoid_gpu, GpuRouting, GpuRoutingBuffers};
 pub use mul::{mul, scale_f32_inplace};

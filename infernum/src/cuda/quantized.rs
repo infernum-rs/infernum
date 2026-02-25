@@ -45,7 +45,7 @@ fn transpose_bytes(data: &[u8], rows: usize, cols: usize, elem_size: usize) -> V
 
 /// A tensor stored in a quantized format on the GPU.
 ///
-/// Unlike [`CudaTensor<T>`](super::CudaTensor), this is not parameterized by
+/// Unlike [`CudaTensor`](super::CudaTensor), this is not parameterized by
 /// element type — the `dtype` field determines how the raw bytes are interpreted.
 ///
 /// For block-quantized formats (`Q8_0`, `Q4_0`):

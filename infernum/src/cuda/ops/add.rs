@@ -11,7 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -26,33 +26,27 @@ const KERNEL_NAMES: &[&str] = &[
 ];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for add: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
 /// Add two tensors element-wise (generic version)
-fn add_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+fn add_generic(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = a.dtype();
     assert_eq!(a.shape(), b.shape(), "Shapes must match for addition");
 
     let shape = a.shape();
     let n = a.numel();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(a.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(a.context(), shape, dtype)? };
 
     let device = a.context().device();
-    let kernel_name = format!("add_{}", kernel_suffix::<T>());
+    let kernel_name = format!("add_{}", kernel_suffix(dtype));
 
     let module_name = "add";
     if !device.has_func(module_name, &kernel_name) {
@@ -86,15 +80,13 @@ fn add_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
 }
 
 /// Add tensor `b` into `a` in place (generic version)
-fn add_inplace_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &mut CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<()> {
+fn add_inplace_generic(a: &mut CudaTensor, b: &CudaTensor) -> Result<()> {
+    let dtype = a.dtype();
     assert_eq!(a.shape(), b.shape(), "Shapes must match for addition");
 
     let n = a.numel();
     let device = a.context().device();
-    let kernel_name = format!("add_inplace_{}", kernel_suffix::<T>());
+    let kernel_name = format!("add_inplace_{}", kernel_suffix(dtype));
 
     let module_name = "add";
     if !device.has_func(module_name, &kernel_name) {
@@ -126,10 +118,7 @@ fn add_inplace_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn add<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn add(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
     add_generic(a, b)
 }
 
@@ -140,10 +129,7 @@ pub fn add<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn add_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &mut CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<()> {
+pub fn add_inplace(a: &mut CudaTensor, b: &CudaTensor) -> Result<()> {
     add_inplace_generic(a, b)
 }
 

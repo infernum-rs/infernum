@@ -1,37 +1,16 @@
-use crate::cuda::ops::{cast_f32_to_bf16, cast_to_f32, matmul, quantized_matmul, GemmScalar};
+use crate::cuda::ops::{cast_f32_to_bf16, cast_to_f32, matmul, quantized_matmul};
 use crate::cuda::{CudaTensor, QuantizedTensor};
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
-use cudarc::cublas::{CudaBlas, Gemm};
-use cudarc::driver::DeviceRepr;
 
 /// A linear layer weight that is either a dense matrix (pre-transposed for
 /// standard matmul) or a quantized tensor (dequantized on-the-fly in the kernel).
-pub enum LinearWeight<T: TensorDType> {
+pub enum LinearWeight {
     /// Pre-transposed dense weight: shape `(in_features, out_features)`.
-    Dense(CudaTensor<T>),
+    Dense(CudaTensor),
     /// Quantized weight: shape `(out_features, in_features)` — transposed inside kernel.
     Quantized(QuantizedTensor),
-}
-
-/// Reinterpret a `CudaTensor<A>` as `CudaTensor<B>` when both have the same
-/// in-memory layout (same byte size per element). Zero-cost: no copy, no kernel.
-///
-/// # Panics
-/// Panics if `size_of::<A>() != size_of::<B>()`.
-#[must_use]
-pub fn reinterpret_tensor<A: TensorDType + DeviceRepr, B: TensorDType + DeviceRepr>(
-    tensor: CudaTensor<A>,
-) -> CudaTensor<B> {
-    assert_eq!(
-        std::mem::size_of::<A>(),
-        std::mem::size_of::<B>(),
-        "reinterpret_tensor: size mismatch between {} and {}",
-        A::DTYPE,
-        B::DTYPE,
-    );
-    unsafe { tensor.reinterpret() }
 }
 
 /// Applies a linear layer: `output = input × weight`.
@@ -44,23 +23,20 @@ pub fn reinterpret_tensor<A: TensorDType + DeviceRepr, B: TensorDType + DeviceRe
 ///
 /// # Panics
 /// Panics if `Quantized` variant is used with a dtype other than f32 or bf16.
-pub fn linear<T>(input: &CudaTensor<T>, weight: &LinearWeight<T>) -> Result<CudaTensor<T>>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default,
-    CudaBlas: Gemm<T>,
-{
+pub fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
     match weight {
         LinearWeight::Dense(w) => matmul(input, w),
         LinearWeight::Quantized(w) => {
-            let input_f32 = if T::DTYPE == crate::dtype::DType::F32 {
-                reinterpret_tensor(input.slice_view(0, input.shape()))
+            let dtype = input.dtype();
+            let input_f32 = if dtype == DType::F32 {
+                input.slice_view(0, input.shape())
             } else {
                 cast_to_f32(input)?
             };
             let output_f32 = quantized_matmul(&input_f32, w)?;
-            match T::DTYPE {
-                crate::dtype::DType::F32 => Ok(reinterpret_tensor(output_f32)),
-                crate::dtype::DType::BF16 => Ok(reinterpret_tensor(cast_f32_to_bf16(&output_f32)?)),
+            match dtype {
+                DType::F32 => Ok(output_f32),
+                DType::BF16 => cast_f32_to_bf16(&output_f32),
                 other => panic!("Quantized matmul not supported for dtype {other}"),
             }
         }
@@ -71,7 +47,6 @@ where
 mod tests {
     use super::*;
     use crate::cuda::CudaContext;
-    use crate::dtype::DType;
 
     /// Pack f32 weights into GPTQ INT4 format on the host.
     fn pack_gptq_test(
@@ -158,7 +133,7 @@ mod tests {
 
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, 2]);
-        let result = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec().unwrap();
         assert!((result[0] - 4.0).abs() < 1e-4); // 1+3
         assert!((result[1] - 6.0).abs() < 1e-4); // 2+4
     }
@@ -179,14 +154,10 @@ mod tests {
 
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, 2]);
-        let result: Vec<f32> = output
-            .to_vec()
-            .unwrap()
-            .into_iter()
-            .map(half::bf16::to_f32)
-            .collect();
-        assert!((result[0] - 4.0).abs() < 0.1);
-        assert!((result[1] - 6.0).abs() < 0.1);
+        let result: Vec<half::bf16> = output.to_vec().unwrap();
+        let result_f32: Vec<f32> = result.into_iter().map(half::bf16::to_f32).collect();
+        assert!((result_f32[0] - 4.0).abs() < 0.1);
+        assert!((result_f32[1] - 6.0).abs() < 0.1);
     }
 
     #[test]
@@ -216,7 +187,7 @@ mod tests {
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, n]);
 
-        let result = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec().unwrap();
         for &v in &result {
             assert!(
                 v.is_finite(),
@@ -236,7 +207,7 @@ mod tests {
         let w_data = vec![1.0_f32; n * k];
         let (qw, sc, qz) = pack_gptq_test(&w_data, n, k, group_size);
 
-        let weight: LinearWeight<half::bf16> = LinearWeight::Quantized(
+        let weight: LinearWeight = LinearWeight::Quantized(
             QuantizedTensor::from_gptq_raw(
                 &ctx,
                 &[n, k],
@@ -257,13 +228,9 @@ mod tests {
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, n]);
 
-        let result: Vec<f32> = output
-            .to_vec()
-            .unwrap()
-            .into_iter()
-            .map(half::bf16::to_f32)
-            .collect();
-        for &v in &result {
+        let result: Vec<half::bf16> = output.to_vec().unwrap();
+        let result_f32: Vec<f32> = result.into_iter().map(half::bf16::to_f32).collect();
+        for &v in &result_f32 {
             assert!(
                 v.is_finite(),
                 "non-finite value in quantized bf16 output: {v}"

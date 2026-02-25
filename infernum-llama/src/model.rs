@@ -12,41 +12,21 @@ use std::path::Path;
 use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
-    attention, cast_to_f32, embedding_gather, embedding_gather_from_device,
+    attention, cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
     fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32,
-    paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache,
-    reinterpret_tensor, repeat_kv, rms_norm, rms_norm_inplace, split_inner_dim, swiglu,
-    transpose_2d, GemmScalar, LinearWeight,
+    paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache, repeat_kv,
+    rms_norm, rms_norm_inplace, split_inner_dim, swiglu, transpose_2d, LinearWeight,
 };
 #[cfg(feature = "nccl")]
+use infernum::cuda::{shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy};
 use infernum::cuda::{
-    shard_strategy_for_weight, NcclCommunicator, NcclType, ShardConfig, ShardStrategy,
+    BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
 };
-use infernum::cuda::{
-    BatchedGraphInputs, CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, GpuConfig,
-    PagedKvCache, QuantizedTensor, ValidAsZeroBits,
-};
-use infernum::dtype::TensorDType;
+use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 
-/// When NCCL is enabled, `MaybeNcclType` is `NcclType` — only types that
-/// support NCCL all-reduce satisfy it. When NCCL is disabled, it's a blanket
-/// trait so all tensor types work without NCCL-specific bounds.
 #[cfg(feature = "nccl")]
-trait MaybeNcclType: NcclType {}
-#[cfg(feature = "nccl")]
-impl<T: NcclType> MaybeNcclType for T {}
-
-#[cfg(not(feature = "nccl"))]
-trait MaybeNcclType {}
-#[cfg(not(feature = "nccl"))]
-impl<T> MaybeNcclType for T {}
-
-#[cfg(feature = "nccl")]
-fn nccl_all_reduce<T>(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor<T>) -> Result<()>
-where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + NcclType,
-{
+fn nccl_all_reduce(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor) -> Result<()> {
     if let Some(comm) = comm {
         comm.all_reduce_sum_inplace(tensor)?;
     }
@@ -60,7 +40,7 @@ use crate::LlamaConfig;
 
 /// Transpose a weight matrix once, for use in pre-transposed linear projections.
 /// (out_features, in_features) -> (in_features, out_features)
-fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+fn pretranspose_weight(weight: &CudaTensor) -> Result<CudaTensor> {
     transpose_2d(weight)
 }
 
@@ -68,35 +48,32 @@ fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 /// (output features) dimension: `(K, N1)` + `(K, N2)` → `(K, N1+N2)`.
 ///
 /// Both matrices must share the same first dimension (in_features).
-fn concat_weights<T: TensorDType + DeviceRepr + Default>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
     let k = a.shape()[0];
     assert_eq!(k, b.shape()[0], "concat_weights: K dimension mismatch");
+    assert_eq!(a.dtype(), b.dtype(), "concat_weights: dtype mismatch");
     let n1 = a.shape()[1];
     let n2 = b.shape()[1];
+    let elem = a.dtype().size_in_bytes();
 
-    let a_data = a.to_vec()?;
-    let b_data = b.to_vec()?;
-    let mut out = vec![T::default(); k * (n1 + n2)];
+    let a_data = a.to_raw_bytes()?;
+    let b_data = b.to_raw_bytes()?;
+    let mut out = vec![0u8; k * (n1 + n2) * elem];
     for row in 0..k {
-        out[row * (n1 + n2)..row * (n1 + n2) + n1]
-            .copy_from_slice(&a_data[row * n1..(row + 1) * n1]);
-        out[row * (n1 + n2) + n1..row * (n1 + n2) + n1 + n2]
-            .copy_from_slice(&b_data[row * n2..(row + 1) * n2]);
+        let out_off = row * (n1 + n2) * elem;
+        out[out_off..out_off + n1 * elem]
+            .copy_from_slice(&a_data[row * n1 * elem..(row + 1) * n1 * elem]);
+        out[out_off + n1 * elem..out_off + (n1 + n2) * elem]
+            .copy_from_slice(&b_data[row * n2 * elem..(row + 1) * n2 * elem]);
     }
-    CudaTensor::from_slice(a.context(), &[k, n1 + n2], &out)
+    CudaTensor::from_raw_bytes(a.context(), &[k, n1 + n2], a.dtype(), &out)
 }
 
 /// Split a `(seq_len, 2 * intermediate)` tensor into two `(seq_len, intermediate)`
 /// tensors (gate and up) by deinterleaving rows.
 ///
 /// Each row of the input is `[gate(intermediate), up(intermediate)]`.
-fn split_gate_up<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    fused: &CudaTensor<T>,
-    intermediate_size: usize,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+fn split_gate_up(fused: &CudaTensor, intermediate_size: usize) -> Result<(CudaTensor, CudaTensor)> {
     split_inner_dim(fused, intermediate_size, intermediate_size)
 }
 
@@ -105,10 +82,7 @@ fn split_gate_up<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// Each row of the input is `[k(kv_dim), v(kv_dim)]`.
 /// Uses a host roundtrip — only called during prefill, not the hot decode path.
-fn split_kv<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    fused: &CudaTensor<T>,
-    kv_dim: usize,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+fn split_kv(fused: &CudaTensor, kv_dim: usize) -> Result<(CudaTensor, CudaTensor)> {
     split_inner_dim(fused, kv_dim, kv_dim)
 }
 
@@ -116,7 +90,7 @@ fn split_kv<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// GGUF files interleave each head's rows: `[h0, h_half, h1, h_{half+1}, ...]`.
 /// This restores the HuggingFace sequential-half layout: `[h0..h_{half-1}, h_half..h_{dim-1}]`.
-fn unpermute_f32(weight: &CudaTensor<f32>, n_head: usize) -> Result<CudaTensor<f32>> {
+fn unpermute_f32(weight: &CudaTensor, n_head: usize) -> Result<CudaTensor> {
     let shape = weight.shape();
     let n_rows = shape[0];
     let n_cols = shape[1];
@@ -140,144 +114,122 @@ fn unpermute_f32(weight: &CudaTensor<f32>, n_head: usize) -> Result<CudaTensor<f
     CudaTensor::from_slice(weight.context(), &[n_rows, n_cols], &out)
 }
 
-/// Load a tensor from a `WeightLoader` in the model's native dtype `T`.
+/// Load a tensor from a `WeightLoader` in the specified dtype.
 ///
-/// Dispatches to `load_f32`, `load_f16`, or `load_bf16` based on `T::DTYPE`.
-fn load_typed<T: TensorDType + DeviceRepr>(
+/// Dispatches to `load_f32`, `load_f16`, or `load_bf16` based on `dtype`.
+fn load_typed(
+    dtype: DType,
     loader: &impl WeightLoader,
     ctx: &CudaContext,
     name: &str,
-) -> Result<CudaTensor<T>> {
-    use infernum::dtype::DType;
-    match T::DTYPE {
-        DType::F32 => {
-            let t = loader.load_f32(ctx, name)?;
-            // SAFETY: T is f32, so CudaTensor<f32> and CudaTensor<T> are the same type.
-            // We use a ptr cast to avoid requiring T: Pod.
-            Ok(reinterpret_tensor(t))
-        }
-        DType::F16 => {
-            let t = loader.load_f16(ctx, name)?;
-            Ok(reinterpret_tensor(t))
-        }
-        DType::BF16 => {
-            let t = loader.load_bf16(ctx, name)?;
-            Ok(reinterpret_tensor(t))
-        }
+) -> Result<CudaTensor> {
+    match dtype {
+        DType::F32 => loader.load_f32(ctx, name),
+        DType::F16 => loader.load_f16(ctx, name),
+        DType::BF16 => loader.load_bf16(ctx, name),
         other => panic!("Unsupported dtype for load_typed: {other}"),
     }
 }
 
-/// Load a tensor with sharding, dispatching by `T::DTYPE`.
+/// Load a tensor with sharding, dispatching by `dtype`.
 #[cfg(feature = "nccl")]
-fn load_typed_sharded<T: TensorDType + DeviceRepr>(
+fn load_typed_sharded(
+    dtype: DType,
     loader: &impl WeightLoader,
     ctx: &CudaContext,
     name: &str,
     shard: &ShardConfig,
     strategy: ShardStrategy,
-) -> Result<CudaTensor<T>> {
-    use infernum::dtype::DType;
-    match T::DTYPE {
-        DType::F32 => {
-            let t = loader.load_f32_sharded(ctx, name, shard, strategy)?;
-            Ok(reinterpret_tensor(t))
-        }
-        DType::F16 => {
-            let t = loader.load_f16_sharded(ctx, name, shard, strategy)?;
-            Ok(reinterpret_tensor(t))
-        }
-        DType::BF16 => {
-            let t = loader.load_bf16_sharded(ctx, name, shard, strategy)?;
-            Ok(reinterpret_tensor(t))
-        }
+) -> Result<CudaTensor> {
+    match dtype {
+        DType::F32 => loader.load_f32_sharded(ctx, name, shard, strategy),
+        DType::F16 => loader.load_f16_sharded(ctx, name, shard, strategy),
+        DType::BF16 => loader.load_bf16_sharded(ctx, name, shard, strategy),
         other => panic!("Unsupported dtype for load_typed_sharded: {other}"),
     }
 }
 
 /// K+V projection storage: fused for dense weights, separate for quantized.
-enum KvProjWeight<T: TensorDType> {
+enum KvProjWeight {
     /// K and V weights concatenated into a single (hidden, 2*kv_dim) dense
     /// tensor. After matmul the output columns split as `[k(kv_dim), v(kv_dim)]`.
-    Fused {
-        weight: CudaTensor<T>,
-        kv_dim: usize,
-    },
+    Fused { weight: CudaTensor, kv_dim: usize },
     /// Separate K and V projections (used for quantized weights).
     Separate {
-        k_proj: Box<LinearWeight<T>>,
-        v_proj: Box<LinearWeight<T>>,
+        k_proj: Box<LinearWeight>,
+        v_proj: Box<LinearWeight>,
     },
 }
 
 /// Weights for a single Llama attention layer
-struct LlamaAttentionWeights<T: TensorDType> {
-    q_proj: LinearWeight<T>,
-    kv_proj: KvProjWeight<T>,
-    o_proj: LinearWeight<T>,
+struct LlamaAttentionWeights {
+    q_proj: LinearWeight,
+    kv_proj: KvProjWeight,
+    o_proj: LinearWeight,
 }
 
 /// Gate+Up projection storage: fused for dense weights, separate for quantized.
-enum GateUpWeight<T: TensorDType> {
+enum GateUpWeight {
     /// Gate and up weights concatenated into a single (hidden, 2*intermediate)
     /// dense tensor. After matmul the output columns split as
     /// `[gate(intermediate), up(intermediate)]`.
     Fused {
-        weight: CudaTensor<T>,
+        weight: CudaTensor,
         intermediate_size: usize,
     },
     /// Separate gate and up projections (used for quantized weights).
     Separate {
-        gate_proj: Box<LinearWeight<T>>,
-        up_proj: Box<LinearWeight<T>>,
+        gate_proj: Box<LinearWeight>,
+        up_proj: Box<LinearWeight>,
     },
 }
 
 /// Weights for a single Llama MLP layer
-struct LlamaMlpWeights<T: TensorDType> {
-    gate_up: GateUpWeight<T>,
-    down_proj: LinearWeight<T>,
+struct LlamaMlpWeights {
+    gate_up: GateUpWeight,
+    down_proj: LinearWeight,
 }
 
 /// Weights for a single `MoE` expert (same structure as a dense MLP).
-struct MoeExpertWeights<T: TensorDType> {
-    mlp: LlamaMlpWeights<T>,
+struct MoeExpertWeights {
+    mlp: LlamaMlpWeights,
 }
 
 /// Feed-forward network weights: either a single dense MLP or a Mixture-of-Experts layer.
-enum FfnWeights<T: TensorDType> {
+enum FfnWeights {
     /// Standard dense MLP (Llama, etc.)
-    Dense(Box<LlamaMlpWeights<T>>),
+    Dense(Box<LlamaMlpWeights>),
     /// Mixture-of-Experts (Mixtral, etc.)
     Moe {
         /// Router gate weight, pre-transposed: shape `[hidden_size, num_experts]`
-        gate: CudaTensor<T>,
+        gate: CudaTensor,
         /// Per-expert MLP weights
-        experts: Vec<MoeExpertWeights<T>>,
+        experts: Vec<MoeExpertWeights>,
         /// How many experts to activate per token
         num_experts_per_tok: usize,
     },
 }
 
 /// Weights for a single Llama decoder layer
-struct LlamaLayerWeights<T: TensorDType> {
-    input_layernorm: CudaTensor<T>,
-    attention: LlamaAttentionWeights<T>,
-    post_attention_layernorm: CudaTensor<T>,
-    ffn: FfnWeights<T>,
+struct LlamaLayerWeights {
+    input_layernorm: CudaTensor,
+    attention: LlamaAttentionWeights,
+    post_attention_layernorm: CudaTensor,
+    ffn: FfnWeights,
 }
 
 /// Complete Llama model, generic over the compute dtype `T`.
 ///
 /// `T` is the dtype for activations, weights, and KV cache. Supported: `f32`, `f16`, `bf16`.
 ///
-/// - `LlamaModel<f32>`: standard f32 model (also supports GGUF quantized weights)
-/// - `LlamaModel<half::bf16>`: bf16 model (SafeTensors only)
-/// - `LlamaModel<half::f16>`: f16 model (SafeTensors only)
+/// - `LlamaModel`: standard f32 model (also supports GGUF quantized weights)
+/// - `LlamaModel`: bf16 model (SafeTensors only)
+/// - `LlamaModel`: f16 model (SafeTensors only)
 ///
-/// Logits are always returned as `CudaTensor<f32>` (cast at the lm_head output).
-pub struct LlamaModel<T: TensorDType> {
+/// Logits are always returned as `CudaTensor` (cast at the lm_head output).
+pub struct LlamaModel {
     config: LlamaConfig,
+    dtype: DType,
     ctx: CudaContext,
     #[allow(dead_code)]
     gpu_config: GpuConfig,
@@ -290,28 +242,23 @@ pub struct LlamaModel<T: TensorDType> {
     tp_num_kv_heads: usize,
 
     // Embeddings
-    embed_tokens: CudaTensor<T>,
+    embed_tokens: CudaTensor,
 
     // Transformer layers
-    layers: Vec<LlamaLayerWeights<T>>,
+    layers: Vec<LlamaLayerWeights>,
 
     // Final layer norm
-    norm: CudaTensor<T>,
+    norm: CudaTensor,
 
     // Output projection (may be tied to embed_tokens)
-    lm_head: LinearWeight<T>,
+    lm_head: LinearWeight,
 
     // RoPE caches (stored in model dtype)
-    cos_cache: CudaTensor<T>,
-    sin_cache: CudaTensor<T>,
+    cos_cache: CudaTensor,
+    sin_cache: CudaTensor,
 }
 
-#[allow(private_bounds)]
-impl<T> LlamaModel<T>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
-    CudaBlas: Gemm<T>,
-{
+impl LlamaModel {
     /// Load a Llama model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
@@ -364,12 +311,13 @@ where
         ///
         /// When `quant_config` is `Some`, uses GPTQ or AWQ loading instead of
         /// the generic `load_quantized` path.
-        fn load_linear<T: TensorDType + DeviceRepr>(
+        fn load_linear(
+            model_dtype: DType,
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
             quant_config: Option<&crate::QuantizationConfig>,
-        ) -> Result<LinearWeight<T>> {
+        ) -> Result<LinearWeight> {
             // GPTQ/AWQ: load via dedicated loader using the layer prefix
             if let Some(qc) = quant_config {
                 let prefix = name
@@ -391,8 +339,8 @@ where
                 }
             }
 
-            let dtype = loader.get_dtype(name)?;
-            if dtype.is_quantized() {
+            let file_dtype = loader.get_dtype(name)?;
+            if file_dtype.is_quantized() {
                 let mut qt = loader.load_quantized(ctx, name)?;
 
                 // FP8 models store a scale as a sibling tensor
@@ -412,52 +360,54 @@ where
                 }
 
                 Ok(LinearWeight::Quantized(qt))
-            } else {
-                // Load as f32 for pretranspose (transpose_2d is f32-only),
-                // then convert to T.
+            } else if model_dtype == DType::F32 {
+                // f32 path: load as f32, transpose on GPU
                 let f32_weight = loader.load_f32(ctx, name)?;
-                let transposed = pretranspose_weight(&f32_weight)?;
-                if T::DTYPE == infernum::dtype::DType::F32 {
-                    Ok(LinearWeight::Dense(reinterpret_tensor(transposed)))
-                } else {
-                    // Load directly in native dtype (already transposed shape)
-                    // Re-load in native dtype and transpose on host
-                    let native = load_typed::<T>(loader, ctx, name)?;
-                    let shape = native.shape().to_vec();
-                    let data = native.to_vec()?;
-                    // Transpose on host: (out_features, in_features) -> (in_features, out_features)
-                    let rows = shape[0];
-                    let cols = shape[1];
-                    let mut transposed_data = vec![T::default(); data.len()];
-                    for r in 0..rows {
-                        for c in 0..cols {
-                            transposed_data[c * rows + r] = data[r * cols + c];
-                        }
+                Ok(LinearWeight::Dense(pretranspose_weight(&f32_weight)?))
+            } else {
+                // Non-f32 path: load in native dtype and transpose on host
+                // (transpose_2d kernel is f32-only)
+                let native = load_typed(model_dtype, loader, ctx, name)?;
+                let shape = native.shape().to_vec();
+                let rows = shape[0];
+                let cols = shape[1];
+                let elem = model_dtype.size_in_bytes();
+                let data = native.to_raw_bytes()?;
+                let mut transposed_data = vec![0u8; data.len()];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let src = (r * cols + c) * elem;
+                        let dst = (c * rows + r) * elem;
+                        transposed_data[dst..dst + elem].copy_from_slice(&data[src..src + elem]);
                     }
-                    Ok(LinearWeight::Dense(CudaTensor::from_slice(
-                        ctx,
-                        &[cols, rows],
-                        &transposed_data,
-                    )?))
                 }
+                Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
+                    ctx,
+                    &[cols, rows],
+                    model_dtype,
+                    &transposed_data,
+                )?))
             }
         }
 
         /// Load a dense MLP (gate_proj, up_proj, down_proj) for a single layer.
-        fn load_dense_mlp<T: TensorDType + DeviceRepr>(
+        fn load_dense_mlp(
+            dtype: DType,
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             layer_prefix: &str,
             config: &LlamaConfig,
             qc: Option<&crate::QuantizationConfig>,
-        ) -> Result<LlamaMlpWeights<T>> {
-            let gate = load_linear::<T>(
+        ) -> Result<LlamaMlpWeights> {
+            let gate = load_linear(
+                dtype,
                 ctx,
                 loader,
                 &format!("{layer_prefix}.mlp.gate_proj.weight"),
                 qc,
             )?;
-            let up = load_linear::<T>(
+            let up = load_linear(
+                dtype,
                 ctx,
                 loader,
                 &format!("{layer_prefix}.mlp.up_proj.weight"),
@@ -475,7 +425,8 @@ where
             };
             Ok(LlamaMlpWeights {
                 gate_up,
-                down_proj: load_linear::<T>(
+                down_proj: load_linear(
+                    dtype,
                     ctx,
                     loader,
                     &format!("{layer_prefix}.mlp.down_proj.weight"),
@@ -491,13 +442,14 @@ where
         /// - `{prefix}.block_sparse_moe.experts.{e}.w1.weight` — gate_proj
         /// - `{prefix}.block_sparse_moe.experts.{e}.w2.weight` — down_proj
         /// - `{prefix}.block_sparse_moe.experts.{e}.w3.weight` — up_proj
-        fn load_moe_weights<T: TensorDType + DeviceRepr>(
+        fn load_moe_weights(
+            dtype: DType,
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             layer_prefix: &str,
             config: &LlamaConfig,
             qc: Option<&crate::QuantizationConfig>,
-        ) -> Result<FfnWeights<T>> {
+        ) -> Result<FfnWeights> {
             let num_experts = config
                 .num_local_experts
                 .expect("MoE requires num_local_experts");
@@ -509,21 +461,15 @@ where
             let gate_name = format!("{layer_prefix}.block_sparse_moe.gate.weight");
             let gate_f32 = loader.load_f32(ctx, &gate_name)?;
             let gate_transposed = pretranspose_weight(&gate_f32)?;
-            let gate = if T::DTYPE == infernum::dtype::DType::F32 {
-                reinterpret_tensor(gate_transposed)
-            } else {
-                let data_f32 = gate_transposed.to_vec()?;
-                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
-                CudaTensor::from_slice(ctx, gate_transposed.shape(), &data_t)?
-            };
+            let gate = cast_from_f32(&gate_transposed, dtype)?;
 
             // Load each expert's MLP
             let mut experts = Vec::with_capacity(num_experts);
             for e in 0..num_experts {
                 let ep = format!("{layer_prefix}.block_sparse_moe.experts.{e}");
                 // w1 = gate_proj, w2 = down_proj, w3 = up_proj
-                let gate_proj = load_linear::<T>(ctx, loader, &format!("{ep}.w1.weight"), qc)?;
-                let up_proj = load_linear::<T>(ctx, loader, &format!("{ep}.w3.weight"), qc)?;
+                let gate_proj = load_linear(dtype, ctx, loader, &format!("{ep}.w1.weight"), qc)?;
+                let up_proj = load_linear(dtype, ctx, loader, &format!("{ep}.w3.weight"), qc)?;
                 let gate_up = match (gate_proj, up_proj) {
                     (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
                         weight: concat_weights(&g, &u)?,
@@ -534,7 +480,7 @@ where
                         up_proj: Box::new(u),
                     },
                 };
-                let down_proj = load_linear::<T>(ctx, loader, &format!("{ep}.w2.weight"), qc)?;
+                let down_proj = load_linear(dtype, ctx, loader, &format!("{ep}.w2.weight"), qc)?;
                 experts.push(MoeExpertWeights {
                     mlp: LlamaMlpWeights { gate_up, down_proj },
                 });
@@ -549,8 +495,16 @@ where
 
         let qc = config.quantization_config.as_ref();
 
+        // Determine model dtype from the embedding tensor
+        let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+        let dtype = if embed_dtype.is_quantized() {
+            DType::F32
+        } else {
+            embed_dtype
+        };
+
         // Load embeddings
-        let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
+        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
 
         // Load transformer layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -558,19 +512,22 @@ where
             let prefix = format!("model.layers.{i}");
 
             let layer = LlamaLayerWeights {
-                input_layernorm: load_typed::<T>(
+                input_layernorm: load_typed(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.input_layernorm.weight"),
                 )?,
                 attention: {
-                    let k = load_linear::<T>(
+                    let k = load_linear(
+                        dtype,
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.k_proj.weight"),
                         qc,
                     )?;
-                    let v = load_linear::<T>(
+                    let v = load_linear(
+                        dtype,
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.v_proj.weight"),
@@ -589,14 +546,16 @@ where
                         },
                     };
                     LlamaAttentionWeights {
-                        q_proj: load_linear::<T>(
+                        q_proj: load_linear(
+                            dtype,
                             ctx,
                             loader,
                             &format!("{prefix}.self_attn.q_proj.weight"),
                             qc,
                         )?,
                         kv_proj,
-                        o_proj: load_linear::<T>(
+                        o_proj: load_linear(
+                            dtype,
                             ctx,
                             loader,
                             &format!("{prefix}.self_attn.o_proj.weight"),
@@ -604,16 +563,17 @@ where
                         )?,
                     }
                 },
-                post_attention_layernorm: load_typed::<T>(
+                post_attention_layernorm: load_typed(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
                 ffn: if config.is_moe() {
-                    load_moe_weights::<T>(ctx, loader, &prefix, &config, qc)?
+                    load_moe_weights(dtype, ctx, loader, &prefix, &config, qc)?
                 } else {
-                    FfnWeights::Dense(Box::new(load_dense_mlp::<T>(
-                        ctx, loader, &prefix, &config, qc,
+                    FfnWeights::Dense(Box::new(load_dense_mlp(
+                        dtype, ctx, loader, &prefix, &config, qc,
                     )?))
                 },
             };
@@ -622,7 +582,7 @@ where
         }
 
         // Load final norm
-        let norm = load_typed::<T>(loader, ctx, "model.norm.weight")?;
+        let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
 
         // Load or tie lm_head
         // For quantized models (GPTQ, AWQ, FP8), quantize lm_head to Q8_0
@@ -641,17 +601,10 @@ where
             } else {
                 let embed_f32 = cast_to_f32(&embed_tokens)?;
                 let transposed = pretranspose_weight(&embed_f32)?;
-                if T::DTYPE == infernum::dtype::DType::F32 {
-                    LinearWeight::Dense(reinterpret_tensor(transposed))
-                } else {
-                    let shape = transposed.shape().to_vec();
-                    let data_f32 = transposed.to_vec()?;
-                    let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
-                    LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
-                }
+                LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
             }
         } else {
-            let lw = load_linear::<T>(ctx, loader, "lm_head.weight", None)?;
+            let lw = load_linear(dtype, ctx, loader, "lm_head.weight", None)?;
             if qc.is_some() {
                 if let LinearWeight::Dense(ref w) = lw {
                     let f32_w = cast_to_f32(w)?;
@@ -679,26 +632,20 @@ where
             }
         };
 
-        // Precompute RoPE cache in f32, then convert to T
+        // Precompute RoPE cache in f32, then convert to model dtype
         let (cos_f32, sin_f32) = precompute_rope_cache(
             ctx,
             config.max_position_embeddings,
             config.head_dim(),
             config.rope_theta,
         )?;
-        let (cos_cache, sin_cache) = if T::DTYPE == infernum::dtype::DType::F32 {
-            (reinterpret_tensor(cos_f32), reinterpret_tensor(sin_f32))
-        } else {
-            let cos_data: Vec<T> = cos_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
-            let sin_data: Vec<T> = sin_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
-            let cos = CudaTensor::from_slice(ctx, cos_f32.shape(), &cos_data)?;
-            let sin = CudaTensor::from_slice(ctx, sin_f32.shape(), &sin_data)?;
-            (cos, sin)
-        };
+        let cos_cache = cast_from_f32(&cos_f32, dtype)?;
+        let sin_cache = cast_from_f32(&sin_f32, dtype)?;
 
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
             tp_num_kv_heads: config.num_kv_heads(),
+            dtype,
             config,
             ctx: ctx.clone(),
             gpu_config: GpuConfig::Single,
@@ -729,14 +676,15 @@ where
     ) -> Result<Self> {
         /// Load a sharded linear weight. Quantized weights fall back to
         /// `Replicate` (sharding quantized formats is unsupported).
-        fn load_linear_sharded<T: TensorDType + DeviceRepr>(
+        fn load_linear_sharded(
+            model_dtype: DType,
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
             shard: &ShardConfig,
             strategy: ShardStrategy,
             quant_config: Option<&crate::QuantizationConfig>,
-        ) -> Result<LinearWeight<T>> {
+        ) -> Result<LinearWeight> {
             // GPTQ/AWQ: load via dedicated sharded loader
             if let Some(qc) = quant_config {
                 let prefix = name
@@ -770,8 +718,8 @@ where
                 }
             }
 
-            let dtype = loader.get_dtype(name)?;
-            if dtype.is_quantized() {
+            let file_dtype = loader.get_dtype(name)?;
+            if file_dtype.is_quantized() {
                 let mut qt =
                     loader.load_quantized_sharded(ctx, name, shard, ShardStrategy::Replicate)?;
                 let scale_name = format!("{name}_scale");
@@ -781,29 +729,30 @@ where
                     qt.set_weight_scale(ctx, scale_val[0])?;
                 }
                 Ok(LinearWeight::Quantized(qt))
-            } else {
+            } else if model_dtype == DType::F32 {
                 let f32_weight = loader.load_f32_sharded(ctx, name, shard, strategy)?;
-                let transposed = pretranspose_weight(&f32_weight)?;
-                if T::DTYPE == infernum::dtype::DType::F32 {
-                    Ok(LinearWeight::Dense(reinterpret_tensor(transposed)))
-                } else {
-                    let native = load_typed_sharded::<T>(loader, ctx, name, shard, strategy)?;
-                    let shape = native.shape().to_vec();
-                    let data = native.to_vec()?;
-                    let rows = shape[0];
-                    let cols = shape[1];
-                    let mut transposed_data = vec![T::default(); data.len()];
-                    for r in 0..rows {
-                        for c in 0..cols {
-                            transposed_data[c * rows + r] = data[r * cols + c];
-                        }
+                Ok(LinearWeight::Dense(pretranspose_weight(&f32_weight)?))
+            } else {
+                let native = load_typed_sharded(model_dtype, loader, ctx, name, shard, strategy)?;
+                let shape = native.shape().to_vec();
+                let rows = shape[0];
+                let cols = shape[1];
+                let elem = model_dtype.size_in_bytes();
+                let data = native.to_raw_bytes()?;
+                let mut transposed_data = vec![0u8; data.len()];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let src = (r * cols + c) * elem;
+                        let dst = (c * rows + r) * elem;
+                        transposed_data[dst..dst + elem].copy_from_slice(&data[src..src + elem]);
                     }
-                    Ok(LinearWeight::Dense(CudaTensor::from_slice(
-                        ctx,
-                        &[cols, rows],
-                        &transposed_data,
-                    )?))
                 }
+                Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
+                    ctx,
+                    &[cols, rows],
+                    model_dtype,
+                    &transposed_data,
+                )?))
             }
         }
 
@@ -812,14 +761,15 @@ where
         /// Each expert's MLP weights are sharded the same way as a dense MLP:
         /// `w1`/`w3` (gate/up) are column-parallel, `w2` (down) is row-parallel.
         /// The router gate is replicated on all ranks.
-        fn load_moe_weights_sharded<T: TensorDType + DeviceRepr>(
+        fn load_moe_weights_sharded(
+            dtype: DType,
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             layer_prefix: &str,
             config: &LlamaConfig,
             shard: &ShardConfig,
             qc: Option<&crate::QuantizationConfig>,
-        ) -> Result<FfnWeights<T>> {
+        ) -> Result<FfnWeights> {
             let num_experts = config
                 .num_local_experts
                 .expect("MoE requires num_local_experts");
@@ -832,20 +782,15 @@ where
             let gate_name = format!("{layer_prefix}.block_sparse_moe.gate.weight");
             let gate_f32 = loader.load_f32(ctx, &gate_name)?;
             let gate_transposed = pretranspose_weight(&gate_f32)?;
-            let gate = if T::DTYPE == infernum::dtype::DType::F32 {
-                reinterpret_tensor(gate_transposed)
-            } else {
-                let data_f32 = gate_transposed.to_vec()?;
-                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
-                CudaTensor::from_slice(ctx, gate_transposed.shape(), &data_t)?
-            };
+            let gate = cast_from_f32(&gate_transposed, dtype)?;
 
             // Load each expert's MLP with sharded weights
             let mut experts = Vec::with_capacity(num_experts);
             for e in 0..num_experts {
                 let ep = format!("{layer_prefix}.block_sparse_moe.experts.{e}");
                 // w1 = gate_proj (column-parallel), w3 = up_proj (column-parallel)
-                let gate_proj = load_linear_sharded::<T>(
+                let gate_proj = load_linear_sharded(
+                    dtype,
                     ctx,
                     loader,
                     &format!("{ep}.w1.weight"),
@@ -853,7 +798,8 @@ where
                     ShardStrategy::Column,
                     qc,
                 )?;
-                let up_proj = load_linear_sharded::<T>(
+                let up_proj = load_linear_sharded(
+                    dtype,
                     ctx,
                     loader,
                     &format!("{ep}.w3.weight"),
@@ -869,7 +815,8 @@ where
                 };
 
                 // w2 = down_proj (row-parallel)
-                let down_proj = load_linear_sharded::<T>(
+                let down_proj = load_linear_sharded(
+                    dtype,
                     ctx,
                     loader,
                     &format!("{ep}.w2.weight"),
@@ -919,8 +866,16 @@ where
 
         let qc = config.quantization_config.as_ref();
 
+        // Determine model dtype from the embedding tensor
+        let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+        let dtype = if embed_dtype.is_quantized() {
+            DType::F32
+        } else {
+            embed_dtype
+        };
+
         // Embeddings and norms are replicated
-        let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
+        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
 
         let tp_num_heads = config.num_attention_heads / world_size;
         let tp_num_kv_heads = config.num_kv_heads() / world_size;
@@ -930,7 +885,8 @@ where
             let prefix = format!("model.layers.{i}");
 
             let layer = LlamaLayerWeights {
-                input_layernorm: load_typed::<T>(
+                input_layernorm: load_typed(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.input_layernorm.weight"),
@@ -941,7 +897,8 @@ where
                     let v_name = format!("{prefix}.self_attn.v_proj.weight");
                     let o_name = format!("{prefix}.self_attn.o_proj.weight");
 
-                    let q_proj = load_linear_sharded::<T>(
+                    let q_proj = load_linear_sharded(
+                        dtype,
                         ctx,
                         loader,
                         &q_name,
@@ -949,7 +906,8 @@ where
                         shard_strategy_for_weight(&q_name),
                         qc,
                     )?;
-                    let k_proj = load_linear_sharded::<T>(
+                    let k_proj = load_linear_sharded(
+                        dtype,
                         ctx,
                         loader,
                         &k_name,
@@ -957,7 +915,8 @@ where
                         shard_strategy_for_weight(&k_name),
                         qc,
                     )?;
-                    let v_proj = load_linear_sharded::<T>(
+                    let v_proj = load_linear_sharded(
+                        dtype,
                         ctx,
                         loader,
                         &v_name,
@@ -976,7 +935,8 @@ where
                     LlamaAttentionWeights {
                         q_proj,
                         kv_proj,
-                        o_proj: load_linear_sharded::<T>(
+                        o_proj: load_linear_sharded(
+                            dtype,
                             ctx,
                             loader,
                             &o_name,
@@ -986,19 +946,21 @@ where
                         )?,
                     }
                 },
-                post_attention_layernorm: load_typed::<T>(
+                post_attention_layernorm: load_typed(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
                 ffn: if config.is_moe() {
-                    load_moe_weights_sharded::<T>(ctx, loader, &prefix, &config, &shard, qc)?
+                    load_moe_weights_sharded(dtype, ctx, loader, &prefix, &config, &shard, qc)?
                 } else {
                     let gate_name = format!("{prefix}.mlp.gate_proj.weight");
                     let up_name = format!("{prefix}.mlp.up_proj.weight");
                     let down_name = format!("{prefix}.mlp.down_proj.weight");
 
-                    let gate = load_linear_sharded::<T>(
+                    let gate = load_linear_sharded(
+                        dtype,
                         ctx,
                         loader,
                         &gate_name,
@@ -1006,7 +968,8 @@ where
                         shard_strategy_for_weight(&gate_name),
                         qc,
                     )?;
-                    let up = load_linear_sharded::<T>(
+                    let up = load_linear_sharded(
+                        dtype,
                         ctx,
                         loader,
                         &up_name,
@@ -1023,7 +986,8 @@ where
 
                     FfnWeights::Dense(Box::new(LlamaMlpWeights {
                         gate_up,
-                        down_proj: load_linear_sharded::<T>(
+                        down_proj: load_linear_sharded(
+                            dtype,
                             ctx,
                             loader,
                             &down_name,
@@ -1039,20 +1003,14 @@ where
         }
 
         // Final norm and lm_head are replicated
-        let norm = load_typed::<T>(loader, ctx, "model.norm.weight")?;
+        let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
         let lm_head = if config.tie_word_embeddings {
             let embed_f32 = cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
-            if T::DTYPE == infernum::dtype::DType::F32 {
-                LinearWeight::Dense(reinterpret_tensor(transposed))
-            } else {
-                let shape = transposed.shape().to_vec();
-                let data_f32 = transposed.to_vec()?;
-                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
-                LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
-            }
+            LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         } else {
-            load_linear_sharded::<T>(
+            load_linear_sharded(
+                dtype,
                 ctx,
                 loader,
                 "lm_head.weight",
@@ -1068,19 +1026,13 @@ where
             config.head_dim(),
             config.rope_theta,
         )?;
-        let (cos_cache, sin_cache) = if T::DTYPE == infernum::dtype::DType::F32 {
-            (reinterpret_tensor(cos_f32), reinterpret_tensor(sin_f32))
-        } else {
-            let cos_data: Vec<T> = cos_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
-            let sin_data: Vec<T> = sin_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
-            let cos = CudaTensor::from_slice(ctx, cos_f32.shape(), &cos_data)?;
-            let sin = CudaTensor::from_slice(ctx, sin_f32.shape(), &sin_data)?;
-            (cos, sin)
-        };
+        let cos_cache = cast_from_f32(&cos_f32, dtype)?;
+        let sin_cache = cast_from_f32(&sin_f32, dtype)?;
 
         Ok(Self {
             tp_num_heads,
             tp_num_kv_heads,
+            dtype,
             config,
             ctx: ctx.clone(),
             gpu_config,
@@ -1103,13 +1055,13 @@ where
     /// Forward pass with KV cache (prefill phase)
     ///
     /// Extract the last row from a (seq_len, hidden_size) tensor
-    fn extract_last_row(&self, hidden: &CudaTensor<T>, seq_len: usize) -> Result<CudaTensor<T>> {
+    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> Result<CudaTensor> {
         if seq_len == 1 {
             return Ok(hidden.reshape(&[1, self.config.hidden_size]));
         }
         let hidden_size = hidden.shape()[1];
         let flat = hidden.reshape(&[seq_len * hidden_size]);
-        let mut out = unsafe { CudaTensor::<T>::uninit(&self.ctx, &[1, hidden_size])? };
+        let mut out = unsafe { CudaTensor::uninit(&self.ctx, &[1, hidden_size], self.dtype)? };
         let device = self.ctx.device();
         let src = flat.cuda_slice();
         let last_offset = (seq_len - 1) * hidden_size;
@@ -1119,7 +1071,7 @@ where
     }
 
     /// Embed token IDs
-    fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor<T>> {
+    fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
     }
 
@@ -1134,10 +1086,10 @@ where
     pub fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         let batch_size = token_ids.len();
         let paged_kv = &mut paged_kvs[0];
 
@@ -1178,9 +1130,9 @@ where
     pub fn forward_batch_decode_indirect(
         &self,
         graph_inputs: &BatchedGraphInputs,
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         max_seq_len: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         let batch_size = graph_inputs.max_batch_size();
         let paged_kv = &mut paged_kvs[0];
 
@@ -1218,10 +1170,10 @@ where
     pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         let seq_len = input_ids.len();
         let paged_kv = &mut paged_kvs[0];
 
@@ -1248,13 +1200,13 @@ where
     /// Transformer layer forward pass for batched decode with paged KV cache.
     fn forward_layer_paged_decode(
         &self,
-        hidden: &CudaTensor<T>,
-        layer: &LlamaLayerWeights<T>,
+        hidden: &CudaTensor,
+        layer: &LlamaLayerWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode(
@@ -1286,13 +1238,13 @@ where
     /// collected into a single output via O-projection batching.
     fn forward_attention_paged_decode(
         &self,
-        hidden: &CudaTensor<T>,
-        weights: &LlamaAttentionWeights<T>,
+        hidden: &CudaTensor,
+        weights: &LlamaAttentionWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let batch_size = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
@@ -1365,7 +1317,7 @@ where
         } else {
             let row_size = num_heads * head_dim;
             let mut output =
-                unsafe { CudaTensor::<T>::uninit(&self.ctx, &[batch_size, row_size])? };
+                unsafe { CudaTensor::uninit(&self.ctx, &[batch_size, row_size], self.dtype)? };
             let out_slice = output.cuda_slice_mut();
             for (i, part) in attn_parts.iter().enumerate() {
                 let src = part.cuda_slice().slice(..row_size);
@@ -1387,13 +1339,13 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_paged_decode_indirect(
         &self,
-        hidden: &CudaTensor<T>,
-        layer: &LlamaLayerWeights<T>,
+        hidden: &CudaTensor,
+        layer: &LlamaLayerWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
         max_seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode_indirect(
@@ -1422,13 +1374,13 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_attention_paged_decode_indirect(
         &self,
-        hidden: &CudaTensor<T>,
-        weights: &LlamaAttentionWeights<T>,
+        hidden: &CudaTensor,
+        weights: &LlamaAttentionWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
         max_seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let batch_size = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
@@ -1517,14 +1469,14 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_paged_prefill(
         &self,
-        hidden: &CudaTensor<T>,
-        layer: &LlamaLayerWeights<T>,
+        hidden: &CudaTensor,
+        layer: &LlamaLayerWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_prefill(
@@ -1556,14 +1508,14 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_attention_paged_prefill(
         &self,
-        hidden: &CudaTensor<T>,
-        weights: &LlamaAttentionWeights<T>,
+        hidden: &CudaTensor,
+        weights: &LlamaAttentionWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
@@ -1621,11 +1573,7 @@ where
     /// Transformer layer forward pass using indirect kernels.
     /// Forward pass through MLP (SwiGLU)
     #[allow(clippy::unused_self)]
-    fn forward_mlp(
-        &self,
-        hidden: &CudaTensor<T>,
-        weights: &LlamaMlpWeights<T>,
-    ) -> Result<CudaTensor<T>> {
+    fn forward_mlp(&self, hidden: &CudaTensor, weights: &LlamaMlpWeights) -> Result<CudaTensor> {
         let (gate, up) = match &weights.gate_up {
             GateUpWeight::Fused {
                 weight,
@@ -1669,9 +1617,9 @@ where
     #[allow(clippy::unused_self)]
     fn forward_mlp_no_reduce(
         &self,
-        hidden: &CudaTensor<T>,
-        weights: &LlamaMlpWeights<T>,
-    ) -> Result<CudaTensor<T>> {
+        hidden: &CudaTensor,
+        weights: &LlamaMlpWeights,
+    ) -> Result<CudaTensor> {
         let (gate, up) = match &weights.gate_up {
             GateUpWeight::Fused {
                 weight,
@@ -1699,7 +1647,7 @@ where
     }
 
     /// Dispatch to dense MLP or MoE forward pass.
-    fn forward_ffn(&self, hidden: &CudaTensor<T>, ffn: &FfnWeights<T>) -> Result<CudaTensor<T>> {
+    fn forward_ffn(&self, hidden: &CudaTensor, ffn: &FfnWeights) -> Result<CudaTensor> {
         match ffn {
             FfnWeights::Dense(mlp) => self.forward_mlp(hidden, mlp),
             FfnWeights::Moe {
@@ -1717,11 +1665,11 @@ where
     /// and a single all-reduce is applied to the combined result.
     fn forward_moe(
         &self,
-        hidden: &CudaTensor<T>,
-        gate: &CudaTensor<T>,
-        experts: &[MoeExpertWeights<T>],
+        hidden: &CudaTensor,
+        gate: &CudaTensor,
+        experts: &[MoeExpertWeights],
         num_experts_per_tok: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let mut out = infernum::cuda::moe::moe_forward(
             hidden,
             gate,
@@ -1738,29 +1686,23 @@ where
     }
 
     /// Project hidden states to vocabulary logits (always f32)
-    fn lm_head_forward(&self, hidden: &CudaTensor<T>) -> Result<CudaTensor<f32>> {
+    fn lm_head_forward(&self, hidden: &CudaTensor) -> Result<CudaTensor> {
         // bf16 + dense weight: use mixed-precision matmul to skip the cast kernel
-        if T::DTYPE == infernum::dtype::DType::BF16 {
+        if self.dtype == DType::BF16 {
             if let LinearWeight::Dense(w) = &self.lm_head {
-                // Zero-copy reinterpret via slice_view (shared Arc, no GPU copy)
-                let h_bf16: CudaTensor<half::bf16> =
-                    unsafe { hidden.slice_view(0, hidden.shape()).reinterpret() };
-                let w_bf16: CudaTensor<half::bf16> =
-                    unsafe { w.slice_view(0, w.shape()).reinterpret() };
-                return matmul_bf16_f32(&h_bf16, &w_bf16);
+                return matmul_bf16_f32(hidden, w);
             }
         }
         let logits_t = linear(hidden, &self.lm_head)?;
-        if T::DTYPE == infernum::dtype::DType::F32 {
-            // T is f32 — zero-copy reinterpret (same layout, no GPU op)
-            return Ok(unsafe { logits_t.reinterpret() });
+        if self.dtype == DType::F32 {
+            return Ok(logits_t);
         }
         cast_to_f32(&logits_t)
     }
 }
 
-/// Methods only available for `LlamaModel<f32>` (GGUF loading, non-cached forward)
-impl LlamaModel<f32> {
+/// Methods only available for `LlamaModel` (GGUF loading, non-cached forward)
+impl LlamaModel {
     /// Load a Llama model from a GGUF file containing quantized weights
     ///
     /// # Errors
@@ -1783,11 +1725,7 @@ impl LlamaModel<f32> {
     ) -> Result<Self> {
         /// Load a linear weight — quantized if the tensor uses a quantized dtype,
         /// otherwise f32 (pre-transposed).
-        fn load_linear(
-            ctx: &CudaContext,
-            loader: &GgufLoader,
-            name: &str,
-        ) -> Result<LinearWeight<f32>> {
+        fn load_linear(ctx: &CudaContext, loader: &GgufLoader, name: &str) -> Result<LinearWeight> {
             let dtype = loader.get_dtype(name)?;
             if dtype.is_quantized() {
                 Ok(LinearWeight::Quantized(loader.load_quantized(ctx, name)?))
@@ -1805,7 +1743,7 @@ impl LlamaModel<f32> {
             loader: &GgufLoader,
             name: &str,
             n_head: usize,
-        ) -> Result<LinearWeight<f32>> {
+        ) -> Result<LinearWeight> {
             let dtype = loader.get_dtype(name)?;
             if dtype.is_quantized() {
                 Ok(LinearWeight::Quantized(
@@ -1926,6 +1864,7 @@ impl LlamaModel<f32> {
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
             tp_num_kv_heads: config.num_kv_heads(),
+            dtype: DType::F32,
             config,
             ctx: ctx.clone(),
             gpu_config: GpuConfig::Single,
@@ -1950,7 +1889,7 @@ impl LlamaModel<f32> {
     ///
     /// # Errors
     /// Returns an error if forward pass fails
-    pub fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
+    pub fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         let _seq_len = input_ids.len();
 
         // Embed tokens: (seq_len,) -> (seq_len, hidden_size)
@@ -1971,11 +1910,7 @@ impl LlamaModel<f32> {
     }
 
     /// Forward pass through a single transformer layer (no KV cache)
-    fn forward_layer(
-        &self,
-        hidden: &CudaTensor<f32>,
-        layer: &LlamaLayerWeights<f32>,
-    ) -> Result<CudaTensor<f32>> {
+    fn forward_layer(&self, hidden: &CudaTensor, layer: &LlamaLayerWeights) -> Result<CudaTensor> {
         let _seq_len = hidden.shape()[0];
         let _hidden_size = self.config.hidden_size;
 
@@ -2004,9 +1939,9 @@ impl LlamaModel<f32> {
     /// Forward pass through attention (no KV cache, f32 only)
     fn forward_attention(
         &self,
-        hidden: &CudaTensor<f32>,
-        weights: &LlamaAttentionWeights<f32>,
-    ) -> Result<CudaTensor<f32>> {
+        hidden: &CudaTensor,
+        weights: &LlamaAttentionWeights,
+    ) -> Result<CudaTensor> {
         let seq_len = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
@@ -2058,14 +1993,7 @@ impl LlamaModel<f32> {
     }
 }
 
-#[allow(private_bounds)]
-impl<T> infernum::Model for LlamaModel<T>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
-    CudaBlas: Gemm<T>,
-{
-    type CacheDtype = T;
-
+impl infernum::Model for LlamaModel {
     fn config(&self) -> infernum::ModelConfig {
         let config = self.config();
         infernum::ModelConfig {
@@ -2081,7 +2009,7 @@ where
         vec![&self.ctx]
     }
 
-    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
+    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         // Non-KV-cache forward: compute in T, cast logits to f32 at the end.
         let mut hidden = self.embed(input_ids)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -2141,47 +2069,35 @@ where
     fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         self.forward_batch_decode(token_ids, paged_kvs, block_tables, positions)
     }
 
     fn forward_batch_decode_indirect(
         &self,
         graph_inputs: &BatchedGraphInputs,
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         max_seq_len: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         self.forward_batch_decode_indirect(graph_inputs, paged_kvs, max_seq_len)
     }
 
     fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         self.forward_prefill_paged(input_ids, paged_kvs, block_table, start_pos)
     }
 }
 
 #[cfg(feature = "nccl")]
-#[allow(private_bounds)]
-impl<T> infernum::ShardedLoadable for LlamaModel<T>
-where
-    T: TensorDType
-        + DeviceRepr
-        + GemmScalar
-        + Default
-        + ValidAsZeroBits
-        + MaybeNcclType
-        + Send
-        + Sync,
-    CudaBlas: Gemm<T>,
-{
+impl infernum::ShardedLoadable for LlamaModel {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,
@@ -2349,7 +2265,7 @@ mod tests {
     }
 
     impl WeightLoader for MockWeightLoader {
-        fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>> {
+        fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
             let (shape, data) = self
                 .tensors
                 .get(name)
@@ -2357,21 +2273,13 @@ mod tests {
             CudaTensor::from_slice(ctx, shape, data)
         }
 
-        fn load_f16(
-            &self,
-            _ctx: &CudaContext,
-            name: &str,
-        ) -> Result<CudaTensor<infernum::dtype::F16>> {
+        fn load_f16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
             Err(infernum::Error::UnsupportedDtype(format!(
                 "MockWeightLoader: load_f16 not supported (tensor: {name})"
             )))
         }
 
-        fn load_bf16(
-            &self,
-            _ctx: &CudaContext,
-            name: &str,
-        ) -> Result<CudaTensor<infernum::dtype::BF16>> {
+        fn load_bf16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
             Err(infernum::Error::UnsupportedDtype(format!(
                 "MockWeightLoader: load_bf16 not supported (tensor: {name})"
             )))
@@ -2521,10 +2429,10 @@ mod tests {
         loader
     }
 
-    fn build_tiny_model(ctx: &CudaContext) -> LlamaModel<f32> {
+    fn build_tiny_model(ctx: &CudaContext) -> LlamaModel {
         let config = tiny_config();
         let loader = tiny_weight_loader(&config);
-        LlamaModel::<f32>::load_weights(ctx, config, &loader).expect("Failed to build tiny model")
+        LlamaModel::load_weights(ctx, config, &loader).expect("Failed to build tiny model")
     }
 
     /// Pack f32 weights into GPTQ INT4 format on the host.
@@ -2723,11 +2631,10 @@ mod tests {
         loader
     }
 
-    fn build_tiny_gptq_model(ctx: &CudaContext) -> LlamaModel<f32> {
+    fn build_tiny_gptq_model(ctx: &CudaContext) -> LlamaModel {
         let config = tiny_gptq_config();
         let loader = tiny_gptq_weight_loader(&config);
-        LlamaModel::<f32>::load_weights(ctx, config, &loader)
-            .expect("Failed to build tiny GPTQ model")
+        LlamaModel::load_weights(ctx, config, &loader).expect("Failed to build tiny GPTQ model")
     }
 
     #[test]

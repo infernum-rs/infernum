@@ -23,7 +23,7 @@ use syn::{parse_macro_input, Ident, ItemFn};
 ///
 /// ```ignore
 /// define_block! {
-///     pub fn swiglu(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+///     pub fn swiglu(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
 ///         let activated = silu(gate)?;
 ///         mul(&activated, up)
 ///     }
@@ -140,7 +140,7 @@ impl syn::parse::Parse for DefineFusionInput {
 /// ```ignore
 /// define_fusion! {
 ///     name: "swiglu",
-///     pub fn swiglu_fused(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+///     pub fn swiglu_fused(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
 ///         silu_mul_kernel(gate, up)
 ///     }
 /// }

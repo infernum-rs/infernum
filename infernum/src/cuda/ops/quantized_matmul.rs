@@ -55,7 +55,7 @@ const SCALE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/scale.pt
 /// Everything runs on the GPU — no CPU↔GPU synchronization.
 fn quantize_activations_to_fp8(
     ctx: &CudaContext,
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     numel: usize,
 ) -> Result<(CudaSlice<u8>, CudaSlice<f32>)> {
     let device = ctx.device();
@@ -126,7 +126,7 @@ fn execute_fp8_gemm(
     m: usize,
     n: usize,
     k: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
     // Resolve weight scale from the tensor
     let d_scale_b_owned;
     let d_scale_b = if let Some(s) = weight.d_weight_scale() {
@@ -149,7 +149,7 @@ fn execute_fp8_gemm_with_scale(
     m: usize,
     n: usize,
     k: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
     use cudarc::cublaslt::{result as lt_result, sys as lt_sys};
 
     let blas_lt = ctx.blas_lt();
@@ -221,7 +221,7 @@ fn execute_fp8_gemm_with_scale(
         )?
     };
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(ctx, &[m, n])? };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[m, n], DType::F32)? };
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
@@ -264,12 +264,12 @@ fn execute_fp8_gemm_with_scale(
 /// No CPU↔GPU synchronization on the hot path.
 fn quantized_matmul_fp8_cublas(
     ctx: &CudaContext,
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     weight: &QuantizedTensor,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
     let (act_fp8, d_inv_scale_a) = quantize_activations_to_fp8(ctx, input, m * k)?;
 
     if let Some(channel_scales) = weight.d_channel_scales() {
@@ -323,7 +323,7 @@ fn quantized_matmul_fp8_cublas(
 /// step has populated the pool).
 fn quantize_activations_to_q8_1(
     ctx: &CudaContext,
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     k: usize,
 ) -> Result<(PooledSlice<i8>, PooledSlice<f32>, PooledSlice<f32>)> {
     assert_eq!(k % 32, 0, "K must be divisible by 32 for Q8_1 quantization");
@@ -386,11 +386,12 @@ fn quantize_activations_to_q8_1(
 /// products for ~4× compute throughput and ~4× bandwidth reduction vs f32.
 #[allow(clippy::too_many_lines)]
 fn quantized_gemv(
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     weight: &QuantizedTensor,
     n: usize,
     k: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     // Multi-warp GEMV: NWARPS warps per output row, K-split across all threads
     const NWARPS: u32 = 4;
 
@@ -400,7 +401,7 @@ fn quantized_gemv(
     // Quantize activations: f32 [K] → Q8_1 (int8 data + f32 scales + f32 sums)
     let (act_data, act_scales, act_sums) = quantize_activations_to_q8_1(ctx, input, k)?;
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(ctx, &[1, n])? };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[1, n], DType::F32)? };
 
     let module_name = "quantized_matmul";
 
@@ -517,10 +518,7 @@ fn quantized_gemv(
 ///
 /// # Errors
 /// Returns an error if kernel compilation or launch fails.
-pub fn quantized_matmul(
-    input: &CudaTensor<f32>,
-    weight: &QuantizedTensor,
-) -> Result<CudaTensor<f32>> {
+pub fn quantized_matmul(input: &CudaTensor, weight: &QuantizedTensor) -> Result<CudaTensor> {
     let w_shape = weight.shape();
     assert_eq!(w_shape.len(), 2, "Quantized weight must be 2D (N, K)");
     let n = w_shape[0]; // out_features
@@ -555,12 +553,13 @@ pub fn quantized_matmul(
 
 #[allow(clippy::too_many_lines)]
 fn quantized_matmul_2d(
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     weight: &QuantizedTensor,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let device = input.context().device();
 
     let module_name = "quantized_matmul";
@@ -593,7 +592,7 @@ fn quantized_matmul_2d(
         return quantized_gemv(input, weight, n, k);
     }
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), &[m, n])? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), &[m, n], DType::F32)? };
 
     let block_x = 16;
     let block_y = 16;

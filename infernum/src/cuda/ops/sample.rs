@@ -34,7 +34,7 @@ use crate::Result;
 /// # Errors
 /// Returns an error if the GPU → CPU transfer fails.
 pub fn sample_top_p(
-    logits: &CudaTensor<f32>,
+    logits: &CudaTensor,
     temperature: f32,
     top_p: f32,
     rng_seed: u64,

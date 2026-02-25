@@ -260,7 +260,7 @@ struct GraphState {
     /// Decode step counter: 0 = first (warmup), 1 = capture, 2+ = replay.
     decode_step: usize,
     /// Logits tensor from the captured graph (same device addresses on replay).
-    captured_logits: Option<CudaTensor<f32>>,
+    captured_logits: Option<CudaTensor>,
     /// Conservative upper bound for shared memory sizing in paged attention.
     graph_max_seq_len: usize,
 }
@@ -269,7 +269,7 @@ struct GraphState {
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn worker_loop<M: Model>(
     model: M,
-    mut paged_kvs: Vec<PagedKvCache<M::CacheDtype>>,
+    mut paged_kvs: Vec<PagedKvCache>,
     mut allocator: BlockAllocator,
     batch_config: BatchConfig,
     request_rx: mpsc::Receiver<GenerationRequest>,
@@ -389,7 +389,7 @@ fn process_prefill<M: Model>(
     idx: usize,
     token_ids: &[u32],
     model: &M,
-    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
+    paged_kvs: &mut [PagedKvCache],
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
 ) {
@@ -447,7 +447,7 @@ fn process_prefill<M: Model>(
 fn process_decode_batch<M: Model>(
     tasks: &[crate::scheduler::DecodeTask],
     model: &M,
-    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
+    paged_kvs: &mut [PagedKvCache],
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
 ) {
@@ -592,7 +592,7 @@ fn gather_graph_inputs(
 
 /// Sample tokens from batched logits for the actual (non-padding) sequences.
 fn sample_from_logits(
-    logits: &CudaTensor<f32>,
+    logits: &CudaTensor,
     running_indices: &[usize],
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
@@ -649,7 +649,7 @@ fn sample_from_logits(
 fn process_decode_batch_graph<M: Model>(
     tasks: &[crate::scheduler::DecodeTask],
     model: &M,
-    paged_kvs: &mut [PagedKvCache<M::CacheDtype>],
+    paged_kvs: &mut [PagedKvCache],
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
     gs: &mut GraphState,
@@ -673,7 +673,7 @@ fn process_decode_batch_graph<M: Model>(
         model.forward_batch_decode_indirect(&gs.graph_inputs, paged_kvs, max_seq_len)
     } else if step == 1 {
         // Capture the graph
-        (|| -> Result<CudaTensor<f32>> {
+        (|| -> Result<CudaTensor> {
             gs.graph.begin_capture()?;
             let logits =
                 model.forward_batch_decode_indirect(&gs.graph_inputs, paged_kvs, max_seq_len);
@@ -688,7 +688,7 @@ fn process_decode_batch_graph<M: Model>(
         })()
     } else {
         // Replay the captured graph
-        (|| -> Result<CudaTensor<f32>> {
+        (|| -> Result<CudaTensor> {
             gs.graph.launch()?;
             device.synchronize()?;
             gs.captured_logits
@@ -778,7 +778,7 @@ fn handle_new_token(
 
 /// Select the next token from logits, either via greedy argmax or sampling.
 fn select_token(
-    logits: &infernum::CudaTensor<f32>,
+    logits: &infernum::CudaTensor,
     sampling: Option<&SamplingParams>,
     rng_state: &mut Option<u64>,
     recent_tokens: &[u32],

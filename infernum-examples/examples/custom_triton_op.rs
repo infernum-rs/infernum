@@ -25,7 +25,7 @@ use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use infernum::cuda::CudaContext;
 use infernum::tensor::Tensor;
-use infernum::{CudaTensor, Result};
+use infernum::{CudaTensor, DType, Result};
 
 // ---------- Step 1: Load the pre-compiled PTX ----------
 //
@@ -53,9 +53,9 @@ const TRITON_NUM_THREADS: u32 = 128;
 //   ones (launch metadata and global scratch). Pass null (0u64) for both.
 
 /// Apply GELU activation element-wise: out[i] = 0.5 * x * (1 + erf(x / √2))
-fn gelu(x: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+fn gelu(x: &CudaTensor) -> Result<CudaTensor> {
     let n = x.numel();
-    let mut output = unsafe { CudaTensor::<f32>::uninit(x.context(), x.shape())? };
+    let mut output = unsafe { CudaTensor::uninit(x.context(), x.shape(), DType::F32)? };
 
     let device = x.context().device();
 

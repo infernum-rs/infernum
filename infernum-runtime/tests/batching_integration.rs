@@ -119,7 +119,7 @@ fn single_request_matches_default_config() {
     let options = greedy_options(20);
 
     // Engine with custom batch config
-    let model1 = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model1 = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let engine1 = Engine::with_config(model1, batch_config()).expect("engine1");
     let result1 = engine1.generate(&input_ids, &options).expect("gen1");
     drop(engine1);
@@ -131,7 +131,7 @@ fn single_request_matches_default_config() {
     );
 
     // Engine with default config
-    let model2 = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model2 = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let engine2 = Engine::new(model2).expect("engine2");
     let result2 = engine2.generate(&input_ids, &options).expect("gen2");
     drop(engine2);
@@ -151,7 +151,7 @@ fn single_request_matches_default_config() {
 fn concurrent_identical_requests() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -194,7 +194,7 @@ fn concurrent_identical_requests() {
 fn concurrent_different_prompts() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -241,7 +241,7 @@ fn concurrent_different_prompts() {
 fn staggered_arrival() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -282,7 +282,7 @@ fn staggered_arrival() {
 fn early_cancellation() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -331,7 +331,7 @@ fn early_cancellation() {
 fn memory_pressure() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     // Very small block pool — enough for about 2 short sequences
@@ -371,7 +371,7 @@ fn memory_pressure() {
 fn sequential_engine_regression() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     let engine = Engine::new(model).expect("engine");

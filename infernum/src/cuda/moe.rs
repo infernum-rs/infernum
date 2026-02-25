@@ -8,15 +8,12 @@
     clippy::doc_markdown
 )]
 
-use cudarc::cublas::{CudaBlas, Gemm};
-use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
-
 use super::ops::{
-    add_inplace, cast_f32_to_bf16, cast_to_f32, matmul, reinterpret_tensor, scale_f32_inplace,
-    GpuRouting, GpuRoutingBuffers,
+    add_inplace, cast_f32_to_bf16, cast_to_f32, matmul, scale_f32_inplace, GpuRouting,
+    GpuRoutingBuffers,
 };
 use super::CudaTensor;
-use crate::dtype::{DType, TensorDType};
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -54,6 +51,22 @@ fn renormalize(selections: &mut [(usize, f32)]) {
     }
 }
 
+/// Read logits to host as f32 values, regardless of tensor dtype.
+fn logits_to_f32_host(logits: &CudaTensor) -> Result<Vec<f32>> {
+    match logits.dtype() {
+        DType::F32 => logits.to_vec::<f32>(),
+        DType::BF16 => {
+            let v: Vec<half::bf16> = logits.to_vec()?;
+            Ok(v.into_iter().map(half::bf16::to_f32).collect())
+        }
+        DType::F16 => {
+            let v: Vec<half::f16> = logits.to_vec()?;
+            Ok(v.into_iter().map(half::f16::to_f32).collect())
+        }
+        other => panic!("Unsupported dtype for MoE routing: {other}"),
+    }
+}
+
 /// Compute MoE routing: `hidden @ gate_weight → softmax → topk → renormalize`.
 ///
 /// # Arguments
@@ -69,19 +82,15 @@ fn renormalize(selections: &mut [(usize, f32)]) {
 ///
 /// # Errors
 /// Returns an error if the matmul or device-to-host copy fails.
-pub fn moe_route<T>(
-    hidden: &CudaTensor<T>,
-    gate_weight: &CudaTensor<T>,
+pub fn moe_route(
+    hidden: &CudaTensor,
+    gate_weight: &CudaTensor,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
-) -> Result<Vec<TokenRouting>>
-where
-    T: TensorDType + DeviceRepr + super::ops::GemmScalar + Default,
-    CudaBlas: Gemm<T>,
-{
+) -> Result<Vec<TokenRouting>> {
     // [seq_len, hidden_size] @ [hidden_size, num_experts] → [seq_len, num_experts]
     let logits = matmul(hidden, gate_weight)?;
-    let logits_host = logits.to_vec()?;
+    let logits_host = logits_to_f32_host(&logits)?;
 
     let seq_len = hidden.shape()[0];
     let num_experts = gate_weight.shape()[1];
@@ -89,10 +98,7 @@ where
     let mut routing = Vec::with_capacity(seq_len);
     for tok in 0..seq_len {
         let start = tok * num_experts;
-        let mut row: Vec<f32> = logits_host[start..start + num_experts]
-            .iter()
-            .map(|v| v.to_f32())
-            .collect();
+        let mut row: Vec<f32> = logits_host[start..start + num_experts].to_vec();
         softmax_inplace(&mut row);
         let mut selected = topk(&row, num_experts_per_tok);
         if norm_topk_prob {
@@ -120,18 +126,16 @@ where
 ///
 /// # Errors
 /// Returns an error if routing, expert computation, or tensor operations fail.
-pub fn moe_forward<T, F>(
-    hidden: &CudaTensor<T>,
-    gate_weight: &CudaTensor<T>,
+pub fn moe_forward<F>(
+    hidden: &CudaTensor,
+    gate_weight: &CudaTensor,
     num_experts: usize,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     expert_fn: F,
-) -> Result<CudaTensor<T>>
+) -> Result<CudaTensor>
 where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default + super::ops::GemmScalar,
-    CudaBlas: Gemm<T>,
-    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+    F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
 {
     let seq_len = hidden.shape()[0];
     let hidden_size = hidden.shape()[1];
@@ -149,19 +153,19 @@ where
 /// Decode fast path: single token, run each selected expert and weighted-sum.
 ///
 /// Accumulates on GPU in f32 to avoid GPU↔CPU round trips per expert.
-fn decode_moe<T, F>(
-    hidden: &CudaTensor<T>,
+fn decode_moe<F>(
+    hidden: &CudaTensor,
     assignments: &[(usize, f32)],
     expert_fn: &F,
-) -> Result<CudaTensor<T>>
+) -> Result<CudaTensor>
 where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default,
-    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+    F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
 {
+    let dtype = hidden.dtype();
     let hidden_size = hidden.shape()[1];
     let ctx = hidden.context();
 
-    let mut accum: CudaTensor<f32> = CudaTensor::zeros(ctx, &[1, hidden_size])?;
+    let mut accum = CudaTensor::zeros(ctx, &[1, hidden_size], DType::F32)?;
 
     for &(expert_idx, weight) in assignments {
         let expert_out = expert_fn(expert_idx, hidden)?;
@@ -170,9 +174,9 @@ where
         add_inplace(&mut accum, &out_f32)?;
     }
 
-    match T::DTYPE {
-        DType::F32 => Ok(reinterpret_tensor(accum)),
-        DType::BF16 => Ok(reinterpret_tensor(cast_f32_to_bf16(&accum)?)),
+    match dtype {
+        DType::F32 => Ok(accum),
+        DType::BF16 => cast_f32_to_bf16(&accum),
         other => panic!("MoE decode not supported for dtype {other}"),
     }
 }
@@ -180,19 +184,15 @@ where
 /// Decode fast path using GPU-computed routing results.
 ///
 /// Same as `decode_moe` but takes `GpuRouting` (indices as `u32`) directly.
-fn decode_moe_gpu<T, F>(
-    hidden: &CudaTensor<T>,
-    routing: &GpuRouting,
-    expert_fn: &F,
-) -> Result<CudaTensor<T>>
+fn decode_moe_gpu<F>(hidden: &CudaTensor, routing: &GpuRouting, expert_fn: &F) -> Result<CudaTensor>
 where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default,
-    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+    F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
 {
+    let dtype = hidden.dtype();
     let hidden_size = hidden.shape()[1];
     let ctx = hidden.context();
 
-    let mut accum: CudaTensor<f32> = CudaTensor::zeros(ctx, &[1, hidden_size])?;
+    let mut accum = CudaTensor::zeros(ctx, &[1, hidden_size], DType::F32)?;
 
     for (&expert_idx, &weight) in routing.expert_indices.iter().zip(&routing.expert_weights) {
         let expert_out = expert_fn(expert_idx as usize, hidden)?;
@@ -201,30 +201,30 @@ where
         add_inplace(&mut accum, &out_f32)?;
     }
 
-    match T::DTYPE {
-        DType::F32 => Ok(reinterpret_tensor(accum)),
-        DType::BF16 => Ok(reinterpret_tensor(cast_f32_to_bf16(&accum)?)),
+    match dtype {
+        DType::F32 => Ok(accum),
+        DType::BF16 => cast_f32_to_bf16(&accum),
         other => panic!("MoE decode not supported for dtype {other}"),
     }
 }
 
 /// Prefill path: group tokens by expert, gather rows, run experts, scatter-add.
-fn prefill_moe<T, F>(
-    hidden: &CudaTensor<T>,
+fn prefill_moe<F>(
+    hidden: &CudaTensor,
     routing: &[TokenRouting],
     num_experts: usize,
     hidden_size: usize,
     expert_fn: &F,
-) -> Result<CudaTensor<T>>
+) -> Result<CudaTensor>
 where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default,
-    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+    F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
 {
     let seq_len = routing.len();
     let ctx = hidden.context();
+    let dtype = hidden.dtype();
 
-    // Read all hidden states to CPU for gather/scatter
-    let hidden_host = hidden.to_vec()?;
+    // Read all hidden states to CPU as f32 for gather/scatter
+    let hidden_host_f32 = logits_to_f32_host(hidden)?;
     let mut output_host = vec![0.0_f32; seq_len * hidden_size];
 
     for expert_idx in 0..num_experts {
@@ -244,31 +244,54 @@ where
             continue;
         }
 
-        // Gather: build input tensor for this expert
+        // Gather: build input tensor for this expert (in original dtype)
         let num_tokens = assignments.len();
-        let mut gathered = vec![T::default(); num_tokens * hidden_size];
+        let mut gathered_f32 = vec![0.0_f32; num_tokens * hidden_size];
         for (local_idx, &(tok_idx, _)) in assignments.iter().enumerate() {
-            let src = &hidden_host[tok_idx * hidden_size..(tok_idx + 1) * hidden_size];
-            gathered[local_idx * hidden_size..(local_idx + 1) * hidden_size].copy_from_slice(src);
+            let src = &hidden_host_f32[tok_idx * hidden_size..(tok_idx + 1) * hidden_size];
+            gathered_f32[local_idx * hidden_size..(local_idx + 1) * hidden_size]
+                .copy_from_slice(src);
         }
 
-        let expert_input = CudaTensor::from_slice(ctx, &[num_tokens, hidden_size], &gathered)?;
+        let expert_input =
+            upload_f32_as_dtype(ctx, &[num_tokens, hidden_size], &gathered_f32, dtype)?;
         let expert_output = expert_fn(expert_idx, &expert_input)?;
-        let expert_host = expert_output.to_vec()?;
+        let expert_host_f32 = logits_to_f32_host(&expert_output)?;
 
         // Scatter-add: accumulate weighted expert output back to token positions
         for (local_idx, &(tok_idx, weight)) in assignments.iter().enumerate() {
             let src_start = local_idx * hidden_size;
             let dst_start = tok_idx * hidden_size;
             for i in 0..hidden_size {
-                output_host[dst_start + i] += weight * expert_host[src_start + i].to_f32();
+                output_host[dst_start + i] += weight * expert_host_f32[src_start + i];
             }
         }
     }
 
-    // Convert f32 accumulator back to T
-    let result_data: Vec<T> = output_host.iter().map(|v| T::from_f32(*v)).collect();
-    CudaTensor::from_slice(ctx, &[seq_len, hidden_size], &result_data)
+    // Convert f32 accumulator back to the original dtype
+    upload_f32_as_dtype(ctx, &[seq_len, hidden_size], &output_host, dtype)
+}
+
+/// Upload f32 host data to GPU as the specified dtype.
+fn upload_f32_as_dtype(
+    ctx: &super::CudaContext,
+    shape: &[usize],
+    data: &[f32],
+    dtype: DType,
+) -> Result<CudaTensor> {
+    match dtype {
+        DType::F32 => CudaTensor::from_slice(ctx, shape, data),
+        DType::BF16 => {
+            let converted: Vec<half::bf16> =
+                data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            CudaTensor::from_slice(ctx, shape, &converted)
+        }
+        DType::F16 => {
+            let converted: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            CudaTensor::from_slice(ctx, shape, &converted)
+        }
+        other => panic!("Unsupported dtype for MoE: {other}"),
+    }
 }
 
 // --- Sigmoid routing (DeepSeek V3) ---
@@ -303,22 +326,18 @@ fn sigmoid(x: f32) -> f32 {
 /// # Errors
 /// Returns an error if the matmul or device-to-host copy fails.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_route_sigmoid<T>(
-    hidden: &CudaTensor<T>,
-    gate_weight: &CudaTensor<T>,
+pub fn moe_route_sigmoid(
+    hidden: &CudaTensor,
+    gate_weight: &CudaTensor,
     e_score_correction_bias: &[f32],
     num_experts_per_tok: usize,
     n_group: usize,
     topk_group: usize,
     norm_topk_prob: bool,
     routed_scaling_factor: f32,
-) -> Result<Vec<TokenRouting>>
-where
-    T: TensorDType + DeviceRepr + super::ops::GemmScalar + Default,
-    CudaBlas: Gemm<T>,
-{
+) -> Result<Vec<TokenRouting>> {
     let logits = matmul(hidden, gate_weight)?;
-    let logits_host = logits.to_vec()?;
+    let logits_host = logits_to_f32_host(&logits)?;
 
     let seq_len = hidden.shape()[0];
     let num_experts = gate_weight.shape()[1];
@@ -329,7 +348,7 @@ where
         let start = tok * num_experts;
         let scores: Vec<f32> = logits_host[start..start + num_experts]
             .iter()
-            .map(|v| sigmoid(v.to_f32()))
+            .map(|&v| sigmoid(v))
             .collect();
 
         // Biased scores for selection only
@@ -398,9 +417,9 @@ where
 /// # Errors
 /// Returns an error if routing, expert computation, or tensor operations fail.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_forward_sigmoid<T, F>(
-    hidden: &CudaTensor<T>,
-    gate_weight: &CudaTensor<T>,
+pub fn moe_forward_sigmoid<F>(
+    hidden: &CudaTensor,
+    gate_weight: &CudaTensor,
     e_score_correction_bias: &[f32],
     num_experts: usize,
     num_experts_per_tok: usize,
@@ -409,11 +428,9 @@ pub fn moe_forward_sigmoid<T, F>(
     norm_topk_prob: bool,
     routed_scaling_factor: f32,
     expert_fn: F,
-) -> Result<CudaTensor<T>>
+) -> Result<CudaTensor>
 where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default + super::ops::GemmScalar,
-    CudaBlas: Gemm<T>,
-    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+    F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
 {
     let seq_len = hidden.shape()[0];
     let routing = moe_route_sigmoid(
@@ -445,11 +462,11 @@ where
 /// # Errors
 /// Returns an error if routing, expert computation, or tensor operations fail.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_forward_sigmoid_gpu<T, F>(
-    hidden: &CudaTensor<T>,
-    gate_weight: &CudaTensor<T>,
+pub fn moe_forward_sigmoid_gpu<F>(
+    hidden: &CudaTensor,
+    gate_weight: &CudaTensor,
     e_score_correction_bias: &[f32],
-    e_score_correction_bias_gpu: &CudaTensor<f32>,
+    e_score_correction_bias_gpu: &CudaTensor,
     num_experts: usize,
     num_experts_per_tok: usize,
     n_group: usize,
@@ -458,19 +475,18 @@ pub fn moe_forward_sigmoid_gpu<T, F>(
     routed_scaling_factor: f32,
     routing_bufs: &mut GpuRoutingBuffers,
     expert_fn: F,
-) -> Result<CudaTensor<T>>
+) -> Result<CudaTensor>
 where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default + super::ops::GemmScalar,
-    CudaBlas: Gemm<T>,
-    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+    F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
 {
     let seq_len = hidden.shape()[0];
+    let dtype = hidden.dtype();
 
     if seq_len == 1 {
         // GPU decode path: gate matmul → f32 → GPU routing kernel
         let gate_logits = matmul(hidden, gate_weight)?;
-        let gate_logits_f32: CudaTensor<f32> = if T::DTYPE == DType::F32 {
-            reinterpret_tensor(gate_logits)
+        let gate_logits_f32 = if dtype == DType::F32 {
+            gate_logits
         } else {
             cast_to_f32(&gate_logits)?
         };

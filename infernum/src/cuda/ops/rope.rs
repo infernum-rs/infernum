@@ -11,7 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::{CudaContext, CudaTensor};
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -36,7 +36,7 @@ pub fn precompute_rope_cache(
     max_seq_len: usize,
     head_dim: usize,
     base: f32,
-) -> Result<(CudaTensor<f32>, CudaTensor<f32>)> {
+) -> Result<(CudaTensor, CudaTensor)> {
     let half_dim = head_dim / 2;
 
     let mut cos_data = vec![0.0_f32; max_seq_len * half_dim];
@@ -97,7 +97,7 @@ pub fn precompute_rope_cache_scaled(
     head_dim: usize,
     base: f32,
     scaling: &RopeScaling,
-) -> Result<(CudaTensor<f32>, CudaTensor<f32>)> {
+) -> Result<(CudaTensor, CudaTensor)> {
     let half_dim = head_dim / 2;
     let factor = scaling.factor;
     let orig_max_pos = scaling.original_max_position_embeddings as f32;
@@ -155,26 +155,23 @@ pub fn precompute_rope_cache_scaled(
 }
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for rope: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
 /// Apply rotary positional embeddings (generic version)
-fn apply_rope_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+fn apply_rope_generic(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     position_offset: usize,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -188,10 +185,10 @@ fn apply_rope_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     assert_eq!(head_dim % 2, 0, "head_dim must be even");
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("rope_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rope_{}", kernel_suffix(dtype));
 
     let module_name = "rope";
     if !device.has_func(module_name, &kernel_name) {
@@ -241,12 +238,12 @@ fn apply_rope_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn apply_rope<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+pub fn apply_rope(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     position_offset: usize,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
     apply_rope_generic(input, cos_cache, sin_cache, position_offset)
 }
 
@@ -266,12 +263,13 @@ const INDIRECT_KERNEL_NAMES: &[&str] = &[
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn apply_rope_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+pub fn apply_rope_indirect(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     position: &crate::cuda::SeqPosition,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -285,10 +283,10 @@ pub fn apply_rope_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     assert_eq!(head_dim % 2, 0, "head_dim must be even");
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("rope_indirect_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rope_indirect_{}", kernel_suffix(dtype));
 
     let module_name = "rope";
     if !device.has_func(module_name, &kernel_name) {
@@ -355,12 +353,13 @@ const INTERLEAVED_KERNEL_NAMES: &[&str] = &[
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn apply_rope_interleaved<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+pub fn apply_rope_interleaved(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     position_offset: usize,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -374,10 +373,10 @@ pub fn apply_rope_interleaved<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     assert_eq!(head_dim % 2, 0, "head_dim must be even");
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("rope_interleaved_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rope_interleaved_{}", kernel_suffix(dtype));
 
     let module_name = "rope_interleaved";
     if !device.has_func(module_name, &kernel_name) {
@@ -422,12 +421,13 @@ pub fn apply_rope_interleaved<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn apply_rope_interleaved_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+pub fn apply_rope_interleaved_indirect(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     position: &crate::cuda::SeqPosition,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -441,10 +441,10 @@ pub fn apply_rope_interleaved_indirect<T: TensorDType + cudarc::driver::DeviceRe
 
     assert_eq!(head_dim % 2, 0, "head_dim must be even");
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("rope_interleaved_indirect_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rope_interleaved_indirect_{}", kernel_suffix(dtype));
 
     let module_name = "rope_interleaved";
     if !device.has_func(module_name, &kernel_name) {
@@ -491,13 +491,14 @@ pub fn apply_rope_interleaved_indirect<T: TensorDType + cudarc::driver::DeviceRe
 ///
 /// # Errors
 /// Returns an error if the kernel launch or GPU allocation fails.
-pub fn apply_rope_interleaved_batched_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+pub fn apply_rope_interleaved_batched_indirect(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     positions_gpu: &cudarc::driver::CudaSlice<i32>,
     batch_size: usize,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -511,10 +512,10 @@ pub fn apply_rope_interleaved_batched_indirect<T: TensorDType + cudarc::driver::
 
     assert_eq!(head_dim % 2, 0, "head_dim must be even");
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("rope_interleaved_batched_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rope_interleaved_batched_{}", kernel_suffix(dtype));
 
     let module_name = "rope_interleaved";
     if !device.has_func(module_name, &kernel_name) {
@@ -573,12 +574,13 @@ fn all_kernel_names() -> Vec<&'static str> {
 ///
 /// # Errors
 /// Returns an error if the kernel launch or GPU allocation fails.
-pub fn apply_rope_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+pub fn apply_rope_batched(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     positions: &[usize],
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -598,10 +600,10 @@ pub fn apply_rope_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
         positions.len()
     );
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("rope_batched_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rope_batched_{}", kernel_suffix(dtype));
 
     let module_name = "rope";
     if !device.has_func(module_name, &kernel_name) {
@@ -655,13 +657,14 @@ pub fn apply_rope_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch or GPU allocation fails.
-pub fn apply_rope_batched_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    cos_cache: &CudaTensor<T>,
-    sin_cache: &CudaTensor<T>,
+pub fn apply_rope_batched_indirect(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
     positions_gpu: &cudarc::driver::CudaSlice<i32>,
     batch_size: usize,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(
         shape.len(),
@@ -675,10 +678,10 @@ pub fn apply_rope_batched_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     assert_eq!(head_dim % 2, 0, "head_dim must be even");
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("rope_batched_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rope_batched_{}", kernel_suffix(dtype));
 
     let module_name = "rope";
     if !device.has_func(module_name, &kernel_name) {

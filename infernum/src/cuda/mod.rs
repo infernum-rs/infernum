@@ -22,8 +22,6 @@ pub use batched_graph::BatchedGraphInputs;
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use buffer_pool::{BufferPool, PooledSlice};
 pub use context::CudaContext;
-#[cfg(feature = "nccl")]
-pub use cudarc::nccl::safe::NcclType;
 pub use graph::CudaGraph;
 pub use kv_cache::KvCache;
 #[cfg(feature = "nccl")]

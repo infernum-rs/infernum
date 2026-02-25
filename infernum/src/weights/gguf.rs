@@ -1,7 +1,7 @@
 //! GGUF file format loader
 //!
 //! Parses the GGUF binary format used by llama.cpp and loads tensors
-//! as either `CudaTensor<f32>` (for unquantized weights) or
+//! as either `CudaTensor` (for unquantized weights) or
 //! `QuantizedTensor` (for Q8_0, Q4_0, etc.).
 //!
 //! Reference: <https://github.com/ggerganov/ggml/blob/master/docs/gguf.md>
@@ -412,7 +412,7 @@ impl GgufLoader {
 }
 
 impl WeightLoader for GgufLoader {
-    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>> {
+    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let info = self
             .tensors
             .get(name)
@@ -573,7 +573,7 @@ impl WeightLoader for GgufLoader {
         CudaTensor::from_slice(ctx, &info.shape, &f32_data)
     }
 
-    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::f16>> {
+    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let info = self
             .tensors
             .get(name)
@@ -617,7 +617,7 @@ impl WeightLoader for GgufLoader {
         CudaTensor::from_slice(ctx, &info.shape, &f16_data)
     }
 
-    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::bf16>> {
+    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let info = self
             .tensors
             .get(name)

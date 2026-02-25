@@ -11,7 +11,7 @@
 )]
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::Result;
 
 infernum_macros::define_block! {
@@ -22,17 +22,17 @@ infernum_macros::define_block! {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn geglu<T: TensorDType + cudarc::driver::DeviceRepr>(
-        gate: &CudaTensor<T>,
-        up: &CudaTensor<T>,
-    ) -> Result<CudaTensor<T>> {
+    pub fn geglu(
+        gate: &CudaTensor,
+        up: &CudaTensor,
+    ) -> Result<CudaTensor> {
         super::gelu_mul(gate, up)
     }
 }
 
 infernum_macros::define_fusion! {
     name: "geglu",
-    fn geglu_fused_f32(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+    fn geglu_fused_f32(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
         super::gelu_mul(gate, up)
     }
 }

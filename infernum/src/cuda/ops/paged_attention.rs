@@ -12,14 +12,14 @@
     clippy::too_many_arguments
 )]
 
-use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig, ValidAsZeroBits};
+use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
 use std::ffi::c_void;
 
 use crate::cuda::block_allocator::BlockTable;
 use crate::cuda::paged_kv_cache::PagedKvCache;
 use crate::cuda::CudaContext;
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -43,24 +43,18 @@ const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
     "paged_decode_attention_bf16",
 ];
 
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for paged_attention: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
-fn ensure_paged_decode_kernel<T: cudarc::driver::DeviceRepr>(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-) -> Result<()> {
+fn ensure_paged_decode_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "paged_decode_attention";
-    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix::<T>());
+    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix(dtype));
     if !device.has_func(module_name, &kernel_name) {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(PAGED_DECODE_PTX),
@@ -71,11 +65,9 @@ fn ensure_paged_decode_kernel<T: cudarc::driver::DeviceRepr>(
     Ok(())
 }
 
-fn ensure_gather_kernel<T: cudarc::driver::DeviceRepr>(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-) -> Result<()> {
+fn ensure_gather_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "gather_paged_kv";
-    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix::<T>());
+    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix(dtype));
     if !device.has_func(module_name, &kernel_name) {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(GATHER_PAGED_KV_PTX),
@@ -107,17 +99,18 @@ fn ensure_gather_kernel<T: cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+pub fn paged_attention_decode(
     ctx: &CudaContext,
-    q: &CudaTensor<T>,
-    k_pool: &CudaTensor<T>,
-    v_pool: &CudaTensor<T>,
+    q: &CudaTensor,
+    k_pool: &CudaTensor,
+    v_pool: &CudaTensor,
     block_tables: &[BlockTable],
     block_size: usize,
     scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = q.dtype();
     let q_shape = q.shape();
     assert_eq!(
         q_shape.len(),
@@ -182,9 +175,9 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
     let seq_lens_gpu = device.htod_sync_copy(&seq_lens)?;
 
     let output_shape = [batch_size, num_heads, head_dim];
-    let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &output_shape, dtype)? };
 
-    launch_paged_decode::<T>(
+    launch_paged_decode(
         device,
         &mut output,
         q,
@@ -209,12 +202,12 @@ pub fn paged_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr + Vali
 
 /// Shared kernel launch logic for both eager and indirect paged decode.
 #[allow(clippy::too_many_arguments)]
-fn launch_paged_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits>(
+fn launch_paged_decode(
     device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-    output: &mut CudaTensor<T>,
-    q: &CudaTensor<T>,
-    k_pool: &CudaTensor<T>,
-    v_pool: &CudaTensor<T>,
+    output: &mut CudaTensor,
+    q: &CudaTensor,
+    k_pool: &CudaTensor,
+    v_pool: &CudaTensor,
     block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
     seq_lens_gpu: &cudarc::driver::CudaSlice<i32>,
     scale: &mut f32,
@@ -228,9 +221,9 @@ fn launch_paged_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
     max_active_len: usize,
     batch_size: usize,
 ) -> Result<()> {
-    ensure_paged_decode_kernel::<T>(device)?;
+    ensure_paged_decode_kernel(device)?;
 
-    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix::<T>());
+    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix(dtype));
     let func = device
         .get_func("paged_decode_attention", &kernel_name)
         .unwrap();
@@ -313,13 +306,11 @@ fn launch_paged_decode<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
 /// # Errors
 /// Returns an error if the kernel launch fails.
 #[allow(clippy::too_many_arguments)]
-pub fn paged_attention_decode_indirect<
-    T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits,
->(
+pub fn paged_attention_decode_indirect(
     ctx: &CudaContext,
-    q: &CudaTensor<T>,
-    k_pool: &CudaTensor<T>,
-    v_pool: &CudaTensor<T>,
+    q: &CudaTensor,
+    k_pool: &CudaTensor,
+    v_pool: &CudaTensor,
     block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
     seq_lens_gpu: &cudarc::driver::CudaSlice<i32>,
     block_size: usize,
@@ -328,7 +319,8 @@ pub fn paged_attention_decode_indirect<
     scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = q.dtype();
     let q_shape = q.shape();
     assert_eq!(
         q_shape.len(),
@@ -362,9 +354,9 @@ pub fn paged_attention_decode_indirect<
     };
 
     let output_shape = [batch_size, num_heads, head_dim];
-    let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &output_shape, dtype)? };
 
-    launch_paged_decode::<T>(
+    launch_paged_decode(
         ctx.device(),
         &mut output,
         q,
@@ -395,11 +387,11 @@ pub fn paged_attention_decode_indirect<
 ///
 /// # Errors
 /// Returns an error if GPU memory allocation or copy fails.
-pub fn gather_paged_kv<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits>(
-    paged_kv: &PagedKvCache<T>,
+pub fn gather_paged_kv(
+    paged_kv: &PagedKvCache,
     layer_idx: usize,
     block_table: &BlockTable,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+) -> Result<(CudaTensor, CudaTensor)> {
     let seq_len = block_table.seq_len();
     let num_kv_heads = paged_kv.num_kv_heads();
     let head_dim = paged_kv.head_dim();
@@ -407,7 +399,7 @@ pub fn gather_paged_kv<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
     let ctx = paged_kv.context();
     let device = ctx.device();
 
-    ensure_gather_kernel::<T>(device)?;
+    ensure_gather_kernel(device)?;
 
     let shape = [seq_len, num_kv_heads, head_dim];
     let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
@@ -425,9 +417,9 @@ pub fn gather_paged_kv<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
         shared_mem_bytes: 0,
     };
 
-    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix::<T>());
+    let kernel_name = format!("gather_paged_kv_{}", kernel_suffix(dtype));
 
-    let mut k_out = unsafe { CudaTensor::<T>::uninit(ctx, &shape)? };
+    let mut k_out = unsafe { CudaTensor::uninit(ctx, &shape, dtype)? };
     let func = device
         .get_func("gather_paged_kv", &kernel_name)
         .expect("gather kernel not loaded");
@@ -446,7 +438,7 @@ pub fn gather_paged_kv<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZero
         )?;
     }
 
-    let mut v_out = unsafe { CudaTensor::<T>::uninit(ctx, &shape)? };
+    let mut v_out = unsafe { CudaTensor::uninit(ctx, &shape, dtype)? };
     let func = device
         .get_func("gather_paged_kv", &kernel_name)
         .expect("gather kernel not loaded");

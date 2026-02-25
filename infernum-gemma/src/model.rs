@@ -19,44 +19,26 @@ use std::path::Path;
 
 use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
-    add_inplace, apply_rope, apply_rope_batched, apply_rope_batched_indirect, cast_to_f32,
-    embedding_gather, embedding_gather_from_device, fused_attention_prefill, gather_paged_kv,
-    geglu, matmul, matmul_bf16_f32, paged_attention_decode, paged_attention_decode_indirect,
-    precompute_rope_cache, quantized_matmul, rms_norm, rms_norm_inplace, scale_inplace,
-    split_inner_dim, transpose_2d, GemmScalar,
+    add_inplace, apply_rope, apply_rope_batched, apply_rope_batched_indirect, cast_from_f32,
+    cast_to_f32, embedding_gather, embedding_gather_from_device, fused_attention_prefill,
+    gather_paged_kv, geglu, matmul, matmul_bf16_f32, paged_attention_decode,
+    paged_attention_decode_indirect, precompute_rope_cache, quantized_matmul, rms_norm,
+    rms_norm_inplace, scale_inplace, split_inner_dim, transpose_2d,
 };
 #[cfg(feature = "nccl")]
+use infernum::cuda::{shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy};
 use infernum::cuda::{
-    shard_strategy_for_weight, NcclCommunicator, NcclType, ShardConfig, ShardStrategy,
+    BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
 };
-use infernum::cuda::{
-    BatchedGraphInputs, CudaBlas, CudaContext, CudaTensor, DeviceRepr, Gemm, GpuConfig,
-    PagedKvCache, QuantizedTensor, ValidAsZeroBits,
-};
-use infernum::dtype::TensorDType;
+use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::weights::{SafeTensorsLoader, WeightLoader};
 use infernum::Result;
 
 use crate::GemmaConfig;
 
-// --- NCCL conditional trait bounds ---
-
 #[cfg(feature = "nccl")]
-trait MaybeNcclType: NcclType {}
-#[cfg(feature = "nccl")]
-impl<T: NcclType> MaybeNcclType for T {}
-
-#[cfg(not(feature = "nccl"))]
-trait MaybeNcclType {}
-#[cfg(not(feature = "nccl"))]
-impl<T> MaybeNcclType for T {}
-
-#[cfg(feature = "nccl")]
-fn nccl_all_reduce<T>(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor<T>) -> Result<()>
-where
-    T: TensorDType + DeviceRepr + ValidAsZeroBits + NcclType,
-{
+fn nccl_all_reduce(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor) -> Result<()> {
     if let Some(comm) = comm {
         comm.all_reduce_sum_inplace(tensor)?;
     }
@@ -65,64 +47,50 @@ where
 
 // --- Weight helpers ---
 
-fn pretranspose_weight(weight: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+fn pretranspose_weight(weight: &CudaTensor) -> Result<CudaTensor> {
     transpose_2d(weight)
 }
 
-fn concat_weights<T: TensorDType + DeviceRepr + Default>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = a.dtype();
+    let elem = dtype.size_in_bytes();
     let k = a.shape()[0];
     assert_eq!(k, b.shape()[0], "concat_weights: K dimension mismatch");
     let n1 = a.shape()[1];
     let n2 = b.shape()[1];
 
-    let a_data = a.to_vec()?;
-    let b_data = b.to_vec()?;
-    let mut out = vec![T::default(); k * (n1 + n2)];
+    let a_bytes = a.to_raw_bytes();
+    let b_bytes = b.to_raw_bytes();
+    let mut out = vec![0u8; k * (n1 + n2) * elem];
     for row in 0..k {
-        out[row * (n1 + n2)..row * (n1 + n2) + n1]
-            .copy_from_slice(&a_data[row * n1..(row + 1) * n1]);
-        out[row * (n1 + n2) + n1..row * (n1 + n2) + n1 + n2]
-            .copy_from_slice(&b_data[row * n2..(row + 1) * n2]);
+        let out_off = row * (n1 + n2) * elem;
+        let a_off = row * n1 * elem;
+        let b_off = row * n2 * elem;
+        out[out_off..out_off + n1 * elem].copy_from_slice(&a_bytes[a_off..a_off + n1 * elem]);
+        out[out_off + n1 * elem..out_off + (n1 + n2) * elem]
+            .copy_from_slice(&b_bytes[b_off..b_off + n2 * elem]);
     }
-    CudaTensor::from_slice(a.context(), &[k, n1 + n2], &out)
+    CudaTensor::from_raw_bytes(a.context(), &[k, n1 + n2], dtype, &out)
 }
 
-fn split_gate_up<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    fused: &CudaTensor<T>,
-    intermediate_size: usize,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+fn split_gate_up(fused: &CudaTensor, intermediate_size: usize) -> Result<(CudaTensor, CudaTensor)> {
     split_inner_dim(fused, intermediate_size, intermediate_size)
 }
 
-fn split_kv<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    fused: &CudaTensor<T>,
-    kv_dim: usize,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+fn split_kv(fused: &CudaTensor, kv_dim: usize) -> Result<(CudaTensor, CudaTensor)> {
     split_inner_dim(fused, kv_dim, kv_dim)
 }
 
-fn load_typed<T: TensorDType + DeviceRepr>(
+fn load_typed(
+    dtype: DType,
     loader: &impl WeightLoader,
     ctx: &CudaContext,
     name: &str,
-) -> Result<CudaTensor<T>> {
-    use infernum::dtype::DType;
-    match T::DTYPE {
-        DType::F32 => {
-            let t = loader.load_f32(ctx, name)?;
-            Ok(reinterpret_tensor(t))
-        }
-        DType::F16 => {
-            let t = loader.load_f16(ctx, name)?;
-            Ok(reinterpret_tensor(t))
-        }
-        DType::BF16 => {
-            let t = loader.load_bf16(ctx, name)?;
-            Ok(reinterpret_tensor(t))
-        }
+) -> Result<CudaTensor> {
+    match dtype {
+        DType::F32 => loader.load_f32(ctx, name),
+        DType::F16 => loader.load_f16(ctx, name),
+        DType::BF16 => loader.load_bf16(ctx, name),
         other => panic!("Unsupported dtype for load_typed: {other}"),
     }
 }
@@ -132,111 +100,92 @@ fn load_typed<T: TensorDType + DeviceRepr>(
 /// Gemma's RMSNorm computes `x_normed * (1 + weight)` (weights initialized to
 /// zeros), unlike Llama's `x_normed * weight` (weights initialized to ones).
 /// By pre-adding 1.0 at load time, we can reuse the standard RMSNorm kernel.
-fn load_gemma_norm<T: TensorDType + DeviceRepr>(
+fn load_gemma_norm(
+    dtype: DType,
     loader: &impl WeightLoader,
     ctx: &CudaContext,
     name: &str,
-) -> Result<CudaTensor<T>> {
-    let gpu_tensor = load_typed::<T>(loader, ctx, name)?;
-    let mut host: Vec<T> = gpu_tensor.to_vec()?;
+) -> Result<CudaTensor> {
+    let gpu_tensor = load_typed(dtype, loader, ctx, name)?;
+    let f32_tensor = cast_to_f32(&gpu_tensor)?;
+    let mut host: Vec<f32> = f32_tensor.to_vec()?;
     for v in &mut host {
-        *v = T::from_f32(v.to_f32() + 1.0);
+        *v += 1.0;
     }
-    CudaTensor::from_slice(ctx, gpu_tensor.shape(), &host)
+    let adjusted = CudaTensor::from_slice(ctx, gpu_tensor.shape(), &host)?;
+    cast_from_f32(&adjusted, dtype)
 }
 
 #[cfg(feature = "nccl")]
-fn load_typed_sharded<T: TensorDType + DeviceRepr>(
+fn load_typed_sharded(
+    dtype: DType,
     loader: &impl WeightLoader,
     ctx: &CudaContext,
     name: &str,
     shard: &ShardConfig,
     strategy: ShardStrategy,
-) -> Result<CudaTensor<T>> {
-    use infernum::dtype::DType;
-    match T::DTYPE {
-        DType::F32 => {
-            let t = loader.load_f32_sharded(ctx, name, shard, strategy)?;
-            Ok(reinterpret_tensor(t))
-        }
-        DType::F16 => {
-            let t = loader.load_f16_sharded(ctx, name, shard, strategy)?;
-            Ok(reinterpret_tensor(t))
-        }
-        DType::BF16 => {
-            let t = loader.load_bf16_sharded(ctx, name, shard, strategy)?;
-            Ok(reinterpret_tensor(t))
-        }
+) -> Result<CudaTensor> {
+    match dtype {
+        DType::F32 => loader.load_f32_sharded(ctx, name, shard, strategy),
+        DType::F16 => loader.load_f16_sharded(ctx, name, shard, strategy),
+        DType::BF16 => loader.load_bf16_sharded(ctx, name, shard, strategy),
         other => panic!("Unsupported dtype for load_typed_sharded: {other}"),
     }
 }
 
-fn reinterpret_tensor<A: TensorDType + DeviceRepr, B: TensorDType + DeviceRepr>(
-    tensor: CudaTensor<A>,
-) -> CudaTensor<B> {
-    assert_eq!(
-        std::mem::size_of::<A>(),
-        std::mem::size_of::<B>(),
-        "reinterpret_tensor: size mismatch between {} and {}",
-        A::DTYPE,
-        B::DTYPE,
-    );
-    unsafe { tensor.reinterpret() }
-}
-
 // --- Weight structures ---
 
-enum LinearWeight<T: TensorDType> {
-    Dense(CudaTensor<T>),
+enum LinearWeight {
+    Dense(CudaTensor),
     Quantized(QuantizedTensor),
 }
 
-enum KvProjWeight<T: TensorDType> {
+enum KvProjWeight {
     Fused {
-        weight: CudaTensor<T>,
+        weight: CudaTensor,
         kv_dim: usize,
     },
     Separate {
-        k_proj: Box<LinearWeight<T>>,
-        v_proj: Box<LinearWeight<T>>,
+        k_proj: Box<LinearWeight>,
+        v_proj: Box<LinearWeight>,
     },
 }
 
-enum GateUpWeight<T: TensorDType> {
+enum GateUpWeight {
     Fused {
-        weight: CudaTensor<T>,
+        weight: CudaTensor,
         intermediate_size: usize,
     },
     Separate {
-        gate_proj: Box<LinearWeight<T>>,
-        up_proj: Box<LinearWeight<T>>,
+        gate_proj: Box<LinearWeight>,
+        up_proj: Box<LinearWeight>,
     },
 }
 
-struct GemmaAttentionWeights<T: TensorDType> {
-    q_proj: LinearWeight<T>,
-    kv_proj: KvProjWeight<T>,
-    o_proj: LinearWeight<T>,
-    q_norm: Option<CudaTensor<T>>,
-    k_norm: Option<CudaTensor<T>>,
+struct GemmaAttentionWeights {
+    q_proj: LinearWeight,
+    kv_proj: KvProjWeight,
+    o_proj: LinearWeight,
+    q_norm: Option<CudaTensor>,
+    k_norm: Option<CudaTensor>,
 }
 
-struct GemmaMlpWeights<T: TensorDType> {
-    gate_up: GateUpWeight<T>,
-    down_proj: LinearWeight<T>,
+struct GemmaMlpWeights {
+    gate_up: GateUpWeight,
+    down_proj: LinearWeight,
 }
 
-struct GemmaLayerWeights<T: TensorDType> {
-    input_layernorm: CudaTensor<T>,
-    post_attention_layernorm: CudaTensor<T>,
-    pre_feedforward_layernorm: CudaTensor<T>,
-    post_feedforward_layernorm: CudaTensor<T>,
-    attention: GemmaAttentionWeights<T>,
-    mlp: GemmaMlpWeights<T>,
+struct GemmaLayerWeights {
+    input_layernorm: CudaTensor,
+    post_attention_layernorm: CudaTensor,
+    pre_feedforward_layernorm: CudaTensor,
+    post_feedforward_layernorm: CudaTensor,
+    attention: GemmaAttentionWeights,
+    mlp: GemmaMlpWeights,
 }
 
 /// Gemma model supporting both Gemma 2 and Gemma 3 text architectures.
-pub struct GemmaModel<T: TensorDType> {
+pub struct GemmaModel {
     config: GemmaConfig,
     ctx: CudaContext,
     #[allow(dead_code)]
@@ -247,11 +196,12 @@ pub struct GemmaModel<T: TensorDType> {
 
     tp_num_heads: usize,
     tp_num_kv_heads: usize,
+    dtype: DType,
 
-    embed_tokens: CudaTensor<T>,
-    layers: Vec<GemmaLayerWeights<T>>,
-    norm: CudaTensor<T>,
-    lm_head: LinearWeight<T>,
+    embed_tokens: CudaTensor,
+    layers: Vec<GemmaLayerWeights>,
+    norm: CudaTensor,
+    lm_head: LinearWeight,
 
     /// Embedding scale factor: sqrt(hidden_size)
     embed_scale: f32,
@@ -260,19 +210,14 @@ pub struct GemmaModel<T: TensorDType> {
     attn_scale: f32,
 
     // RoPE caches — Gemma 2: single set, Gemma 3: two sets (local + global)
-    cos_cache: CudaTensor<T>,
-    sin_cache: CudaTensor<T>,
+    cos_cache: CudaTensor,
+    sin_cache: CudaTensor,
     // Gemma 3 dual-theta RoPE: separate cache for full-attention layers
-    cos_cache_global: Option<CudaTensor<T>>,
-    sin_cache_global: Option<CudaTensor<T>>,
+    cos_cache_global: Option<CudaTensor>,
+    sin_cache_global: Option<CudaTensor>,
 }
 
-#[allow(private_bounds)]
-impl<T> GemmaModel<T>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
-    CudaBlas: Gemm<T>,
-{
+impl GemmaModel {
     /// Load a Gemma model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
@@ -309,12 +254,13 @@ where
         config: GemmaConfig,
         loader: &impl WeightLoader,
     ) -> Result<Self> {
-        fn load_linear<T: TensorDType + DeviceRepr>(
+        fn load_linear(
+            model_dtype: DType,
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
             quant_config: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<LinearWeight<T>> {
+        ) -> Result<LinearWeight> {
             if let Some(qc) = quant_config {
                 let prefix = name
                     .strip_suffix(".weight")
@@ -349,24 +295,28 @@ where
             } else {
                 let f32_weight = loader.load_f32(ctx, name)?;
                 let transposed = pretranspose_weight(&f32_weight)?;
-                if T::DTYPE == infernum::dtype::DType::F32 {
-                    Ok(LinearWeight::Dense(reinterpret_tensor(transposed)))
+                if model_dtype == DType::F32 {
+                    Ok(LinearWeight::Dense(transposed))
                 } else {
-                    let native = load_typed::<T>(loader, ctx, name)?;
-                    let shape = native.shape().to_vec();
-                    let data = native.to_vec()?;
+                    let native = load_typed(model_dtype, loader, ctx, name)?;
+                    let raw = native.to_raw_bytes();
+                    let shape = native.shape();
                     let rows = shape[0];
                     let cols = shape[1];
-                    let mut transposed_data = vec![T::default(); data.len()];
+                    let elem = model_dtype.size_in_bytes();
+                    let mut buf = vec![0u8; raw.len()];
                     for r in 0..rows {
                         for c in 0..cols {
-                            transposed_data[c * rows + r] = data[r * cols + c];
+                            let src = (r * cols + c) * elem;
+                            let dst = (c * rows + r) * elem;
+                            buf[dst..dst + elem].copy_from_slice(&raw[src..src + elem]);
                         }
                     }
-                    Ok(LinearWeight::Dense(CudaTensor::from_slice(
+                    Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
                         ctx,
                         &[cols, rows],
-                        &transposed_data,
+                        model_dtype,
+                        &buf,
                     )?))
                 }
             }
@@ -374,20 +324,29 @@ where
 
         let qc = config.quantization_config.as_ref();
 
-        let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
+        let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+        let dtype = if embed_dtype.is_quantized() {
+            DType::F32
+        } else {
+            embed_dtype
+        };
+
+        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
 
             // Load attention weights
-            let k = load_linear::<T>(
+            let k = load_linear(
+                dtype,
                 ctx,
                 loader,
                 &format!("{prefix}.self_attn.k_proj.weight"),
                 qc,
             )?;
-            let v = load_linear::<T>(
+            let v = load_linear(
+                dtype,
                 ctx,
                 loader,
                 &format!("{prefix}.self_attn.v_proj.weight"),
@@ -409,20 +368,31 @@ where
             let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
             let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
             let q_norm = if loader.contains(&q_norm_name) {
-                Some(load_gemma_norm::<T>(loader, ctx, &q_norm_name)?)
+                Some(load_gemma_norm(dtype, loader, ctx, &q_norm_name)?)
             } else {
                 None
             };
             let k_norm = if loader.contains(&k_norm_name) {
-                Some(load_gemma_norm::<T>(loader, ctx, &k_norm_name)?)
+                Some(load_gemma_norm(dtype, loader, ctx, &k_norm_name)?)
             } else {
                 None
             };
 
             // Load MLP weights (GeGLU: gate_proj, up_proj, down_proj)
-            let gate =
-                load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.gate_proj.weight"), qc)?;
-            let up = load_linear::<T>(ctx, loader, &format!("{prefix}.mlp.up_proj.weight"), qc)?;
+            let gate = load_linear(
+                dtype,
+                ctx,
+                loader,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                qc,
+            )?;
+            let up = load_linear(
+                dtype,
+                ctx,
+                loader,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                qc,
+            )?;
             let gate_up = match (gate, up) {
                 (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
                     weight: concat_weights(&g, &u)?,
@@ -435,35 +405,41 @@ where
             };
 
             let layer = GemmaLayerWeights {
-                input_layernorm: load_gemma_norm::<T>(
+                input_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.input_layernorm.weight"),
                 )?,
-                post_attention_layernorm: load_gemma_norm::<T>(
+                post_attention_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                pre_feedforward_layernorm: load_gemma_norm::<T>(
+                pre_feedforward_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.pre_feedforward_layernorm.weight"),
                 )?,
-                post_feedforward_layernorm: load_gemma_norm::<T>(
+                post_feedforward_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.post_feedforward_layernorm.weight"),
                 )?,
                 attention: GemmaAttentionWeights {
-                    q_proj: load_linear::<T>(
+                    q_proj: load_linear(
+                        dtype,
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.q_proj.weight"),
                         qc,
                     )?,
                     kv_proj,
-                    o_proj: load_linear::<T>(
+                    o_proj: load_linear(
+                        dtype,
                         ctx,
                         loader,
                         &format!("{prefix}.self_attn.o_proj.weight"),
@@ -474,7 +450,8 @@ where
                 },
                 mlp: GemmaMlpWeights {
                     gate_up,
-                    down_proj: load_linear::<T>(
+                    down_proj: load_linear(
+                        dtype,
                         ctx,
                         loader,
                         &format!("{prefix}.mlp.down_proj.weight"),
@@ -486,7 +463,7 @@ where
             layers.push(layer);
         }
 
-        let norm = load_gemma_norm::<T>(loader, ctx, "model.norm.weight")?;
+        let norm = load_gemma_norm(dtype, loader, ctx, "model.norm.weight")?;
 
         // Tied word embeddings — Gemma always ties lm_head to embed_tokens
         let lm_head = if qc.is_some() {
@@ -500,14 +477,7 @@ where
         } else {
             let embed_f32 = cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
-            if T::DTYPE == infernum::dtype::DType::F32 {
-                LinearWeight::Dense(reinterpret_tensor(transposed))
-            } else {
-                let shape = transposed.shape().to_vec();
-                let data_f32 = transposed.to_vec()?;
-                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
-                LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
-            }
+            LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         };
 
         // Precompute RoPE caches
@@ -521,7 +491,7 @@ where
             local_theta,
         )?;
 
-        let (cos_cache, sin_cache) = convert_rope_cache::<T>(ctx, &cos_f32, &sin_f32)?;
+        let (cos_cache, sin_cache) = convert_rope_cache(dtype, ctx, &cos_f32, &sin_f32)?;
 
         let (cos_cache_global, sin_cache_global) = if config.rope_local_base_freq.is_some() {
             let (cos_g_f32, sin_g_f32) = precompute_rope_cache(
@@ -530,7 +500,7 @@ where
                 config.head_dim,
                 config.rope_theta,
             )?;
-            let (cos_g, sin_g) = convert_rope_cache::<T>(ctx, &cos_g_f32, &sin_g_f32)?;
+            let (cos_g, sin_g) = convert_rope_cache(dtype, ctx, &cos_g_f32, &sin_g_f32)?;
             (Some(cos_g), Some(sin_g))
         } else {
             (None, None)
@@ -542,6 +512,7 @@ where
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
             tp_num_kv_heads: config.num_key_value_heads,
+            dtype,
             config,
             ctx: ctx.clone(),
             gpu_config: GpuConfig::Single,
@@ -571,14 +542,15 @@ where
         gpu_config: GpuConfig,
         nccl_comm: NcclCommunicator,
     ) -> Result<Self> {
-        fn load_linear_sharded<T: TensorDType + DeviceRepr>(
+        fn load_linear_sharded(
+            model_dtype: DType,
             ctx: &CudaContext,
             loader: &impl WeightLoader,
             name: &str,
             shard: &ShardConfig,
             strategy: ShardStrategy,
             quant_config: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<LinearWeight<T>> {
+        ) -> Result<LinearWeight> {
             if let Some(qc) = quant_config {
                 let prefix = name
                     .strip_suffix(".weight")
@@ -625,24 +597,29 @@ where
             } else {
                 let f32_weight = loader.load_f32_sharded(ctx, name, shard, strategy)?;
                 let transposed = pretranspose_weight(&f32_weight)?;
-                if T::DTYPE == infernum::dtype::DType::F32 {
-                    Ok(LinearWeight::Dense(reinterpret_tensor(transposed)))
+                if model_dtype == DType::F32 {
+                    Ok(LinearWeight::Dense(transposed))
                 } else {
-                    let native = load_typed_sharded::<T>(loader, ctx, name, shard, strategy)?;
-                    let shape = native.shape().to_vec();
-                    let data = native.to_vec()?;
+                    let native =
+                        load_typed_sharded(model_dtype, loader, ctx, name, shard, strategy)?;
+                    let raw = native.to_raw_bytes();
+                    let shape = native.shape();
                     let rows = shape[0];
                     let cols = shape[1];
-                    let mut transposed_data = vec![T::default(); data.len()];
+                    let elem = model_dtype.size_in_bytes();
+                    let mut buf = vec![0u8; raw.len()];
                     for r in 0..rows {
                         for c in 0..cols {
-                            transposed_data[c * rows + r] = data[r * cols + c];
+                            let src = (r * cols + c) * elem;
+                            let dst = (c * rows + r) * elem;
+                            buf[dst..dst + elem].copy_from_slice(&raw[src..src + elem]);
                         }
                     }
-                    Ok(LinearWeight::Dense(CudaTensor::from_slice(
+                    Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
                         ctx,
                         &[cols, rows],
-                        &transposed_data,
+                        model_dtype,
+                        &buf,
                     )?))
                 }
             }
@@ -670,14 +647,22 @@ where
         let tp_num_heads = config.num_attention_heads / world_size;
         let tp_num_kv_heads = config.num_key_value_heads / world_size;
 
-        let embed_tokens = load_typed::<T>(loader, ctx, "model.embed_tokens.weight")?;
+        let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+        let dtype = if embed_dtype.is_quantized() {
+            DType::F32
+        } else {
+            embed_dtype
+        };
+
+        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
 
             let k_name = format!("{prefix}.self_attn.k_proj.weight");
-            let k = load_linear_sharded::<T>(
+            let k = load_linear_sharded(
+                dtype,
                 ctx,
                 loader,
                 &k_name,
@@ -686,7 +671,8 @@ where
                 qc,
             )?;
             let v_name = format!("{prefix}.self_attn.v_proj.weight");
-            let v = load_linear_sharded::<T>(
+            let v = load_linear_sharded(
+                dtype,
                 ctx,
                 loader,
                 &v_name,
@@ -710,18 +696,19 @@ where
             let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
             let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
             let q_norm = if loader.contains(&q_norm_name) {
-                Some(load_gemma_norm::<T>(loader, ctx, &q_norm_name)?)
+                Some(load_gemma_norm(dtype, loader, ctx, &q_norm_name)?)
             } else {
                 None
             };
             let k_norm = if loader.contains(&k_norm_name) {
-                Some(load_gemma_norm::<T>(loader, ctx, &k_norm_name)?)
+                Some(load_gemma_norm(dtype, loader, ctx, &k_norm_name)?)
             } else {
                 None
             };
 
             let gate_name = format!("{prefix}.mlp.gate_proj.weight");
-            let gate = load_linear_sharded::<T>(
+            let gate = load_linear_sharded(
+                dtype,
                 ctx,
                 loader,
                 &gate_name,
@@ -730,7 +717,8 @@ where
                 qc,
             )?;
             let up_name = format!("{prefix}.mlp.up_proj.weight");
-            let up = load_linear_sharded::<T>(
+            let up = load_linear_sharded(
+                dtype,
                 ctx,
                 loader,
                 &up_name,
@@ -751,22 +739,26 @@ where
             };
 
             let layer = GemmaLayerWeights {
-                input_layernorm: load_gemma_norm::<T>(
+                input_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.input_layernorm.weight"),
                 )?,
-                post_attention_layernorm: load_gemma_norm::<T>(
+                post_attention_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                pre_feedforward_layernorm: load_gemma_norm::<T>(
+                pre_feedforward_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.pre_feedforward_layernorm.weight"),
                 )?,
-                post_feedforward_layernorm: load_gemma_norm::<T>(
+                post_feedforward_layernorm: load_gemma_norm(
+                    dtype,
                     loader,
                     ctx,
                     &format!("{prefix}.post_feedforward_layernorm.weight"),
@@ -774,7 +766,8 @@ where
                 attention: GemmaAttentionWeights {
                     q_proj: {
                         let name = format!("{prefix}.self_attn.q_proj.weight");
-                        load_linear_sharded::<T>(
+                        load_linear_sharded(
+                            dtype,
                             ctx,
                             loader,
                             &name,
@@ -786,7 +779,8 @@ where
                     kv_proj,
                     o_proj: {
                         let name = format!("{prefix}.self_attn.o_proj.weight");
-                        load_linear_sharded::<T>(
+                        load_linear_sharded(
+                            dtype,
                             ctx,
                             loader,
                             &name,
@@ -802,7 +796,8 @@ where
                     gate_up,
                     down_proj: {
                         let name = format!("{prefix}.mlp.down_proj.weight");
-                        load_linear_sharded::<T>(
+                        load_linear_sharded(
+                            dtype,
                             ctx,
                             loader,
                             &name,
@@ -817,7 +812,7 @@ where
             layers.push(layer);
         }
 
-        let norm = load_gemma_norm::<T>(loader, ctx, "model.norm.weight")?;
+        let norm = load_gemma_norm(dtype, loader, ctx, "model.norm.weight")?;
 
         // Tied embeddings — not sharded for lm_head
         let lm_head = if qc.is_some() {
@@ -831,14 +826,7 @@ where
         } else {
             let embed_f32 = cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
-            if T::DTYPE == infernum::dtype::DType::F32 {
-                LinearWeight::Dense(reinterpret_tensor(transposed))
-            } else {
-                let shape = transposed.shape().to_vec();
-                let data_f32 = transposed.to_vec()?;
-                let data_t: Vec<T> = data_f32.iter().map(|&v| T::from_f32(v)).collect();
-                LinearWeight::Dense(CudaTensor::from_slice(ctx, &shape, &data_t)?)
-            }
+            LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         };
 
         let local_theta = config.rope_local_base_freq.unwrap_or(config.rope_theta);
@@ -848,7 +836,7 @@ where
             config.head_dim,
             local_theta,
         )?;
-        let (cos_cache, sin_cache) = convert_rope_cache::<T>(ctx, &cos_f32, &sin_f32)?;
+        let (cos_cache, sin_cache) = convert_rope_cache(dtype, ctx, &cos_f32, &sin_f32)?;
 
         let (cos_cache_global, sin_cache_global) = if config.rope_local_base_freq.is_some() {
             let (cos_g_f32, sin_g_f32) = precompute_rope_cache(
@@ -857,7 +845,7 @@ where
                 config.head_dim,
                 config.rope_theta,
             )?;
-            let (cos_g, sin_g) = convert_rope_cache::<T>(ctx, &cos_g_f32, &sin_g_f32)?;
+            let (cos_g, sin_g) = convert_rope_cache(dtype, ctx, &cos_g_f32, &sin_g_f32)?;
             (Some(cos_g), Some(sin_g))
         } else {
             (None, None)
@@ -869,6 +857,7 @@ where
         Ok(Self {
             tp_num_heads,
             tp_num_kv_heads,
+            dtype,
             config,
             ctx: ctx.clone(),
             gpu_config: GpuConfig::Sharded(shard),
@@ -898,10 +887,10 @@ where
     pub fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         let batch_size = token_ids.len();
         let paged_kv = &mut paged_kvs[0];
 
@@ -930,9 +919,9 @@ where
     pub fn forward_batch_decode_indirect(
         &self,
         graph_inputs: &BatchedGraphInputs,
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         max_seq_len: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         let batch_size = graph_inputs.max_batch_size();
         let paged_kv = &mut paged_kvs[0];
 
@@ -966,10 +955,10 @@ where
     pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         let seq_len = input_ids.len();
         let paged_kv = &mut paged_kvs[0];
 
@@ -995,13 +984,13 @@ where
 
     fn forward_layer_paged_decode(
         &self,
-        hidden: &CudaTensor<T>,
-        layer: &GemmaLayerWeights<T>,
+        hidden: &CudaTensor,
+        layer: &GemmaLayerWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode(
@@ -1041,13 +1030,13 @@ where
 
     fn forward_attention_paged_decode(
         &self,
-        hidden: &CudaTensor<T>,
-        weights: &GemmaAttentionWeights<T>,
+        hidden: &CudaTensor,
+        weights: &GemmaAttentionWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let batch_size = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
@@ -1127,7 +1116,7 @@ where
         } else {
             let row_size = num_heads * head_dim;
             let mut output =
-                unsafe { CudaTensor::<T>::uninit(&self.ctx, &[batch_size, row_size])? };
+                unsafe { CudaTensor::uninit(&self.ctx, &[batch_size, row_size], self.dtype)? };
             let out_slice = output.cuda_slice_mut();
             for (i, part) in attn_parts.iter().enumerate() {
                 let src = part.cuda_slice().slice(..row_size);
@@ -1146,13 +1135,13 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_paged_decode_indirect(
         &self,
-        hidden: &CudaTensor<T>,
-        layer: &GemmaLayerWeights<T>,
+        hidden: &CudaTensor,
+        layer: &GemmaLayerWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
         max_seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode_indirect(
@@ -1193,13 +1182,13 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_attention_paged_decode_indirect(
         &self,
-        hidden: &CudaTensor<T>,
-        weights: &GemmaAttentionWeights<T>,
+        hidden: &CudaTensor,
+        weights: &GemmaAttentionWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
         max_seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let batch_size = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
@@ -1280,14 +1269,14 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_paged_prefill(
         &self,
-        hidden: &CudaTensor<T>,
-        layer: &GemmaLayerWeights<T>,
+        hidden: &CudaTensor,
+        layer: &GemmaLayerWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_prefill(
@@ -1329,14 +1318,14 @@ where
     #[allow(clippy::too_many_arguments)]
     fn forward_attention_paged_prefill(
         &self,
-        hidden: &CudaTensor<T>,
-        weights: &GemmaAttentionWeights<T>,
+        hidden: &CudaTensor,
+        weights: &GemmaAttentionWeights,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache<T>,
+        paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor<T>> {
+    ) -> Result<CudaTensor> {
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim;
@@ -1397,7 +1386,7 @@ where
         Ok(out)
     }
 
-    fn rope_caches_for_layer(&self, layer_idx: usize) -> (&CudaTensor<T>, &CudaTensor<T>) {
+    fn rope_caches_for_layer(&self, layer_idx: usize) -> (&CudaTensor, &CudaTensor) {
         // Gemma 3: full-attention layers use the global RoPE cache
         if let (Some(ref cos_g), Some(ref sin_g)) = (&self.cos_cache_global, &self.sin_cache_global)
         {
@@ -1409,11 +1398,7 @@ where
     }
 
     #[allow(clippy::unused_self)]
-    fn forward_mlp(
-        &self,
-        hidden: &CudaTensor<T>,
-        weights: &GemmaMlpWeights<T>,
-    ) -> Result<CudaTensor<T>> {
+    fn forward_mlp(&self, hidden: &CudaTensor, weights: &GemmaMlpWeights) -> Result<CudaTensor> {
         let (gate, up) = match &weights.gate_up {
             GateUpWeight::Fused {
                 weight,
@@ -1443,13 +1428,13 @@ where
         Ok(out)
     }
 
-    fn extract_last_row(&self, hidden: &CudaTensor<T>, seq_len: usize) -> Result<CudaTensor<T>> {
+    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> Result<CudaTensor> {
         if seq_len == 1 {
             return Ok(hidden.reshape(&[1, self.config.hidden_size]));
         }
         let hidden_size = hidden.shape()[1];
         let flat = hidden.reshape(&[seq_len * hidden_size]);
-        let mut out = unsafe { CudaTensor::<T>::uninit(&self.ctx, &[1, hidden_size])? };
+        let mut out = unsafe { CudaTensor::uninit(&self.ctx, &[1, hidden_size], self.dtype)? };
         let device = self.ctx.device();
         let src = flat.cuda_slice();
         let last_offset = (seq_len - 1) * hidden_size;
@@ -1458,26 +1443,22 @@ where
         Ok(out)
     }
 
-    fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor<T>> {
+    fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
     }
 
-    fn lm_head_forward(&self, hidden: &CudaTensor<T>) -> Result<CudaTensor<f32>> {
+    fn lm_head_forward(&self, hidden: &CudaTensor) -> Result<CudaTensor> {
         // bf16 fast path
-        if T::DTYPE == infernum::dtype::DType::BF16 {
+        if self.dtype == DType::BF16 {
             if let LinearWeight::Dense(w) = &self.lm_head {
-                let h_bf16: CudaTensor<half::bf16> =
-                    unsafe { hidden.slice_view(0, hidden.shape()).reinterpret() };
-                let w_bf16: CudaTensor<half::bf16> =
-                    unsafe { w.slice_view(0, w.shape()).reinterpret() };
-                let mut logits = matmul_bf16_f32(&h_bf16, &w_bf16)?;
+                let mut logits = matmul_bf16_f32(hidden, w)?;
                 self.apply_final_softcap(&mut logits)?;
                 return Ok(logits);
             }
         }
         let logits_t = linear(hidden, &self.lm_head)?;
-        let mut logits = if T::DTYPE == infernum::dtype::DType::F32 {
-            unsafe { logits_t.reinterpret() }
+        let mut logits = if self.dtype == DType::F32 {
+            logits_t
         } else {
             cast_to_f32(&logits_t)?
         };
@@ -1486,7 +1467,7 @@ where
     }
 
     /// Apply final logit soft-capping (Gemma 2 only): tanh(logits / cap) * cap
-    fn apply_final_softcap(&self, logits: &mut CudaTensor<f32>) -> Result<()> {
+    fn apply_final_softcap(&self, logits: &mut CudaTensor) -> Result<()> {
         if let Some(cap) = self.config.final_logit_softcapping {
             let data = logits.to_vec()?;
             let capped: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
@@ -1502,41 +1483,33 @@ where
     }
 }
 
-/// Convert f32 RoPE caches to model dtype T
-fn convert_rope_cache<T: TensorDType + DeviceRepr + Default>(
-    ctx: &CudaContext,
-    cos_f32: &CudaTensor<f32>,
-    sin_f32: &CudaTensor<f32>,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
-    if T::DTYPE == infernum::dtype::DType::F32 {
-        Ok((
-            reinterpret_tensor(cos_f32.slice_view(0, cos_f32.shape())),
-            reinterpret_tensor(sin_f32.slice_view(0, sin_f32.shape())),
-        ))
-    } else {
-        let cos_data: Vec<T> = cos_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
-        let sin_data: Vec<T> = sin_f32.to_vec()?.iter().map(|&v| T::from_f32(v)).collect();
-        let cos = CudaTensor::from_slice(ctx, cos_f32.shape(), &cos_data)?;
-        let sin = CudaTensor::from_slice(ctx, sin_f32.shape(), &sin_data)?;
-        Ok((cos, sin))
-    }
+/// Convert f32 RoPE caches to model dtype
+fn convert_rope_cache(
+    dtype: DType,
+    cos_f32: &CudaTensor,
+    sin_f32: &CudaTensor,
+) -> Result<(CudaTensor, CudaTensor)> {
+    Ok((
+        cast_from_f32(cos_f32, dtype)?,
+        cast_from_f32(sin_f32, dtype)?,
+    ))
 }
 
-fn linear<T>(input: &CudaTensor<T>, weight: &LinearWeight<T>) -> Result<CudaTensor<T>>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default,
-    CudaBlas: Gemm<T>,
-{
+fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
     match weight {
         LinearWeight::Dense(w) => matmul(input, w),
         LinearWeight::Quantized(w) => {
-            let input_f32 = if T::DTYPE == infernum::dtype::DType::F32 {
-                reinterpret_tensor(input.slice_view(0, input.shape()))
+            let input_f32 = if input.dtype() == DType::F32 {
+                input.slice_view(0, input.shape())
             } else {
                 cast_to_f32(input)?
             };
             let output_f32 = quantized_matmul(&input_f32, w)?;
-            Ok(reinterpret_tensor(output_f32))
+            if input.dtype() == DType::F32 {
+                Ok(output_f32)
+            } else {
+                cast_from_f32(&output_f32, input.dtype())
+            }
         }
     }
 }
@@ -1544,13 +1517,7 @@ where
 // --- Model trait implementation ---
 
 #[allow(private_bounds)]
-impl<T> infernum::Model for GemmaModel<T>
-where
-    T: TensorDType + DeviceRepr + GemmScalar + Default + ValidAsZeroBits + MaybeNcclType,
-    CudaBlas: Gemm<T>,
-{
-    type CacheDtype = T;
-
+impl infernum::Model for GemmaModel {
     fn config(&self) -> infernum::ModelConfig {
         infernum::ModelConfig {
             num_layers: self.config.num_hidden_layers,
@@ -1565,7 +1532,7 @@ where
         vec![&self.ctx]
     }
 
-    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>> {
+    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         let seq_len = input_ids.len();
         let mut hidden = self.embed(input_ids)?;
         scale_inplace(&mut hidden, self.embed_scale)?;
@@ -1657,48 +1624,35 @@ where
     fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         self.forward_prefill_paged(input_ids, paged_kvs, block_table, start_pos)
     }
 
     fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         self.forward_batch_decode(token_ids, paged_kvs, block_tables, positions)
     }
 
     fn forward_batch_decode_indirect(
         &self,
         graph_inputs: &BatchedGraphInputs,
-        paged_kvs: &mut [PagedKvCache<T>],
+        paged_kvs: &mut [PagedKvCache],
         max_seq_len: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         self.forward_batch_decode_indirect(graph_inputs, paged_kvs, max_seq_len)
     }
 }
 
 #[cfg(feature = "nccl")]
-#[allow(private_bounds)]
-impl<T> infernum::ShardedLoadable for GemmaModel<T>
-where
-    T: TensorDType
-        + DeviceRepr
-        + GemmScalar
-        + Default
-        + ValidAsZeroBits
-        + MaybeNcclType
-        + Send
-        + Sync
-        + 'static,
-    CudaBlas: Gemm<T>,
-{
+impl infernum::ShardedLoadable for GemmaModel {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,

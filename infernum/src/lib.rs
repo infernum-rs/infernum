@@ -34,7 +34,7 @@ pub use cuda::QuantizedTensor;
 #[cfg(feature = "cuda")]
 pub use cuda::SeqPosition;
 #[cfg(feature = "nccl")]
-pub use cuda::{nccl::NcclId, NcclCommunicator, NcclType, ShardedModel};
+pub use cuda::{nccl::NcclId, NcclCommunicator, ShardedModel};
 #[cfg(feature = "cuda")]
 pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};

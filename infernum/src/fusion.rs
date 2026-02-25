@@ -22,7 +22,7 @@ static REGISTRY: LazyLock<RwLock<RegistryMap>> = LazyLock::new(|| RwLock::new(Ha
 /// Register a fused function pointer for a named block.
 ///
 /// `T` is the concrete function pointer type, e.g.
-/// `fn(&CudaTensor<f32>, &CudaTensor<f32>) -> Result<CudaTensor<f32>>`.
+/// `fn(&CudaTensor, &CudaTensor) -> Result<CudaTensor>`.
 ///
 /// Subsequent calls to [`get::<T>(name)`](get) will return this pointer.
 /// If a fusion for the same `(name, T)` is already registered, it is

@@ -11,6 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -37,7 +38,7 @@ fn ensure_transpose_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) 
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn transpose_2d(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+pub fn transpose_2d(tensor: &CudaTensor) -> Result<CudaTensor> {
     let shape = tensor.shape();
     assert_eq!(shape.len(), 2, "Expected 2D tensor");
 
@@ -46,7 +47,7 @@ pub fn transpose_2d(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     let n = rows * cols;
 
     let output_shape = [cols, rows];
-    let mut output = unsafe { CudaTensor::<f32>::uninit(tensor.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(tensor.context(), &output_shape, DType::F32)? };
 
     let device = tensor.context().device();
     ensure_transpose_kernel(device)?;
@@ -81,7 +82,7 @@ pub fn transpose_2d(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn transpose_2d_bf16(tensor: &CudaTensor<half::bf16>) -> Result<CudaTensor<half::bf16>> {
+pub fn transpose_2d_bf16(tensor: &CudaTensor) -> Result<CudaTensor> {
     let shape = tensor.shape();
     assert_eq!(shape.len(), 2, "Expected 2D tensor");
 
@@ -90,7 +91,7 @@ pub fn transpose_2d_bf16(tensor: &CudaTensor<half::bf16>) -> Result<CudaTensor<h
     let n = rows * cols;
 
     let output_shape = [cols, rows];
-    let mut output = unsafe { CudaTensor::<half::bf16>::uninit(tensor.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(tensor.context(), &output_shape, DType::BF16)? };
 
     let device = tensor.context().device();
     ensure_transpose_kernel(device)?;
@@ -125,7 +126,7 @@ pub fn transpose_2d_bf16(tensor: &CudaTensor<half::bf16>) -> Result<CudaTensor<h
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn transpose_012_to_102(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+pub fn transpose_012_to_102(tensor: &CudaTensor) -> Result<CudaTensor> {
     let shape = tensor.shape();
     assert_eq!(shape.len(), 3, "Expected 3D tensor");
 
@@ -135,7 +136,7 @@ pub fn transpose_012_to_102(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>>
     let n = a * b * c;
 
     let output_shape = [b, a, c];
-    let mut output = unsafe { CudaTensor::<f32>::uninit(tensor.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(tensor.context(), &output_shape, DType::F32)? };
 
     let device = tensor.context().device();
     ensure_transpose_kernel(device)?;
@@ -173,7 +174,7 @@ pub fn transpose_012_to_102(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>>
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn transpose_last_two(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+pub fn transpose_last_two(tensor: &CudaTensor) -> Result<CudaTensor> {
     let shape = tensor.shape();
     assert_eq!(shape.len(), 3, "Expected 3D tensor");
 
@@ -183,7 +184,7 @@ pub fn transpose_last_two(tensor: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     let n = a * b * c;
 
     let output_shape = [a, c, b];
-    let mut output = unsafe { CudaTensor::<f32>::uninit(tensor.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(tensor.context(), &output_shape, DType::F32)? };
 
     let device = tensor.context().device();
     ensure_transpose_kernel(device)?;

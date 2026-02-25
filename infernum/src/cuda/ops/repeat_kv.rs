@@ -11,6 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -23,7 +24,7 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/repeat_kv.ptx"
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn repeat_kv(tensor: &CudaTensor<f32>, num_repeats: usize) -> Result<CudaTensor<f32>> {
+pub fn repeat_kv(tensor: &CudaTensor, num_repeats: usize) -> Result<CudaTensor> {
     if num_repeats == 1 {
         return Ok(tensor.reshape(tensor.shape()));
     }
@@ -43,7 +44,7 @@ pub fn repeat_kv(tensor: &CudaTensor<f32>, num_repeats: usize) -> Result<CudaTen
     let output_shape = [seq_len, new_num_heads, head_dim];
     let n = seq_len * new_num_heads * head_dim;
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(tensor.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(tensor.context(), &output_shape, DType::F32)? };
 
     let device = tensor.context().device();
 

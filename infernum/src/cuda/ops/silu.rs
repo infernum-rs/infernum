@@ -11,7 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -29,30 +29,30 @@ const KERNEL_NAMES: &[&str] = &[
 ];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for silu: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
-/// Apply SiLU activation (generic version)
-fn silu_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+/// Apply SiLU (Swish) activation: output = x * sigmoid(x)
+///
+/// Supports F32, F16, and BF16 tensor types.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn silu(input: &CudaTensor) -> Result<CudaTensor> {
     let shape = input.shape();
     let n = input.numel();
+    let dtype = input.dtype();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("silu_{}", kernel_suffix::<T>());
+    let kernel_name = format!("silu_{}", kernel_suffix(dtype));
 
     let module_name = "silu";
     if !device.has_func(module_name, &kernel_name) {
@@ -80,13 +80,17 @@ fn silu_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(output)
 }
 
-/// Apply SiLU inplace (generic version)
-fn silu_inplace_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &mut CudaTensor<T>,
-) -> Result<()> {
+/// Apply SiLU (Swish) activation in place: x = x * sigmoid(x)
+///
+/// Supports F32, F16, and BF16 tensor types.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn silu_inplace(input: &mut CudaTensor) -> Result<()> {
     let n = input.numel();
+    let dtype = input.dtype();
     let device = input.context().device();
-    let kernel_name = format!("silu_inplace_{}", kernel_suffix::<T>());
+    let kernel_name = format!("silu_inplace_{}", kernel_suffix(dtype));
 
     let module_name = "silu";
     if !device.has_func(module_name, &kernel_name) {
@@ -111,20 +115,23 @@ fn silu_inplace_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(())
 }
 
-/// Fused SiLU + multiply (generic version)
-fn silu_mul_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
-    gate: &CudaTensor<T>,
-    up: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+/// Fused SiLU + multiply for SwiGLU: output = silu(gate) * up
+///
+/// Supports F32, F16, and BF16 tensor types.
+///
+/// # Errors
+/// Returns an error if the operation fails
+pub fn silu_mul(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
     assert_eq!(gate.shape(), up.shape(), "gate and up must have same shape");
 
     let shape = gate.shape();
     let n = gate.numel();
+    let dtype = gate.dtype();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(gate.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(gate.context(), shape, dtype)? };
 
     let device = gate.context().device();
-    let kernel_name = format!("silu_mul_{}", kernel_suffix::<T>());
+    let kernel_name = format!("silu_mul_{}", kernel_suffix(dtype));
 
     let module_name = "silu";
     if !device.has_func(module_name, &kernel_name) {
@@ -157,43 +164,6 @@ fn silu_mul_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(output)
 }
 
-/// Apply SiLU (Swish) activation: output = x * sigmoid(x)
-///
-/// Supports F32, F16, and BF16 tensor types.
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn silu<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
-    silu_generic(input)
-}
-
-/// Apply SiLU (Swish) activation in place: x = x * sigmoid(x)
-///
-/// Supports F32, F16, and BF16 tensor types.
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn silu_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &mut CudaTensor<T>,
-) -> Result<()> {
-    silu_inplace_generic(input)
-}
-
-/// Fused SiLU + multiply for SwiGLU: output = silu(gate) * up
-///
-/// Supports F32, F16, and BF16 tensor types.
-///
-/// # Errors
-/// Returns an error if the operation fails
-pub fn silu_mul<T: TensorDType + cudarc::driver::DeviceRepr>(
-    gate: &CudaTensor<T>,
-    up: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
-    silu_mul_generic(gate, up)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,7 +177,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         let output = silu(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec().unwrap();
 
         // SiLU(x) = x * sigmoid(x)
         for (i, &x) in input_data.iter().enumerate() {
@@ -230,7 +200,7 @@ mod tests {
         let mut input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         silu_inplace(&mut input).unwrap();
-        let result = input.to_vec().unwrap();
+        let result: Vec<f32> = input.to_vec().unwrap();
 
         for (i, &x) in input_data.iter().enumerate() {
             let expected = x / (1.0 + (-x).exp());
@@ -255,7 +225,7 @@ mod tests {
         let up = CudaTensor::from_slice(&ctx, &[4], &up_data).unwrap();
 
         let output = silu_mul(&gate, &up).unwrap();
-        let result = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec().unwrap();
 
         for i in 0..4 {
             let silu_gate = gate_data[i] / (1.0 + (-gate_data[i]).exp());

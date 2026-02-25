@@ -597,7 +597,7 @@ fn slice_2d_columns(
 }
 
 impl WeightLoader for SafeTensorsLoader {
-    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>> {
+    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let meta = self
             .tensors
             .get(name)
@@ -643,7 +643,7 @@ impl WeightLoader for SafeTensorsLoader {
         CudaTensor::from_slice(ctx, &meta.shape, &f32_data)
     }
 
-    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::f16>> {
+    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let meta = self
             .tensors
             .get(name)
@@ -679,7 +679,7 @@ impl WeightLoader for SafeTensorsLoader {
         CudaTensor::from_slice(ctx, &meta.shape, &f16_data)
     }
 
-    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::bf16>> {
+    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let meta = self
             .tensors
             .get(name)

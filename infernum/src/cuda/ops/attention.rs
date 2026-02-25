@@ -16,6 +16,7 @@ use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use super::matmul;
 use crate::cuda::CudaTensor;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -46,11 +47,11 @@ const CAUSAL_SOFTMAX_OFFSET_PTX: &str = include_str!(concat!(
 /// # Errors
 /// Returns an error if the operation fails
 pub fn attention(
-    q: &CudaTensor<f32>,
-    k: &CudaTensor<f32>,
-    v: &CudaTensor<f32>,
+    q: &CudaTensor,
+    k: &CudaTensor,
+    v: &CudaTensor,
     causal: bool,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
     let q_shape = q.shape();
     let k_shape = k.shape();
     let v_shape = v.shape();
@@ -139,12 +140,12 @@ infernum_macros::define_block! {
     /// # Errors
     /// Returns an error if the operation fails
     pub fn attention_kv(
-        q: &CudaTensor<f32>,
+        q: &CudaTensor,
         kv_cache: &mut crate::cuda::KvCache,
         layer_idx: usize,
-        k_new: &CudaTensor<f32>,
-        v_new: &CudaTensor<f32>,
-    ) -> Result<CudaTensor<f32>> {
+        k_new: &CudaTensor,
+        v_new: &CudaTensor,
+    ) -> Result<CudaTensor> {
         let q_shape = q.shape();
         assert_eq!(
             q_shape.len(),
@@ -205,7 +206,7 @@ infernum_macros::define_block! {
 }
 
 /// Scale tensor in place
-fn scale_inplace(tensor: &mut CudaTensor<f32>, scale: f32) -> Result<()> {
+fn scale_inplace(tensor: &mut CudaTensor, scale: f32) -> Result<()> {
     let n = tensor.numel();
     let device = tensor.context().device();
 
@@ -239,7 +240,7 @@ fn scale_inplace(tensor: &mut CudaTensor<f32>, scale: f32) -> Result<()> {
 
 /// Softmax over batched attention scores
 /// Input: (batch, seq_q, seq_k), output: (batch, seq_q, seq_k)
-fn softmax_batched(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+fn softmax_batched(scores: &CudaTensor) -> Result<CudaTensor> {
     let shape = scores.shape();
     let batch = shape[0];
     let seq_q = shape[1];
@@ -253,7 +254,7 @@ fn softmax_batched(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 
 /// Causal softmax for attention
 /// Input: (batch, seq, seq), applies causal mask entirely on GPU
-fn causal_softmax(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+fn causal_softmax(scores: &CudaTensor) -> Result<CudaTensor> {
     let shape = scores.shape();
     let batch = shape[0];
     let seq = shape[1];
@@ -261,7 +262,7 @@ fn causal_softmax(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     // One block per (batch, query) row
     let num_rows = batch * seq;
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(scores.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(scores.context(), shape, DType::F32)? };
 
     let device = scores.context().device();
 
@@ -307,17 +308,17 @@ fn causal_softmax(scores: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 /// Input: `(batch, seq_q, seq_k)` — query position `i` attends to key `[0..offset + i + 1)`,
 /// further restricted by `sliding_window`.
 fn causal_softmax_with_offset(
-    scores: &CudaTensor<f32>,
+    scores: &CudaTensor,
     offset: usize,
     sliding_window: Option<usize>,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
     let shape = scores.shape();
     let batch = shape[0];
     let seq_q = shape[1];
     let seq_k = shape[2];
 
     let num_rows = batch * seq_q;
-    let mut output = unsafe { CudaTensor::<f32>::uninit(scores.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(scores.context(), shape, DType::F32)? };
 
     let device = scores.context().device();
 

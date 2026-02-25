@@ -12,7 +12,7 @@
 )]
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::Result;
 
 infernum_macros::define_block! {
@@ -23,17 +23,17 @@ infernum_macros::define_block! {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn swiglu<T: TensorDType + cudarc::driver::DeviceRepr>(
-        gate: &CudaTensor<T>,
-        up: &CudaTensor<T>,
-    ) -> Result<CudaTensor<T>> {
+    pub fn swiglu(
+        gate: &CudaTensor,
+        up: &CudaTensor,
+    ) -> Result<CudaTensor> {
         super::silu_mul(gate, up)
     }
 }
 
 infernum_macros::define_fusion! {
     name: "swiglu",
-    fn swiglu_fused_f32(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+    fn swiglu_fused_f32(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
         super::silu_mul(gate, up)
     }
 }

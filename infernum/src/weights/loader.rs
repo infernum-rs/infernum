@@ -23,14 +23,14 @@ pub trait WeightLoader {
     ///
     /// # Errors
     /// Returns an error if the tensor is not found or loading fails
-    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>>;
+    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor>;
 
     /// Load a tensor by name as f16 (no conversion if already f16)
     ///
     /// # Errors
     /// Returns an error if the tensor is not found or loading fails.
     /// The default implementation returns `UnsupportedDtype`.
-    fn load_f16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor<f16>> {
+    fn load_f16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let dtype = self.get_dtype(name)?;
         Err(Error::UnsupportedDtype(format!(
             "load_f16 not supported for dtype {dtype}"
@@ -42,7 +42,7 @@ pub trait WeightLoader {
     /// # Errors
     /// Returns an error if the tensor is not found or loading fails.
     /// The default implementation returns `UnsupportedDtype`.
-    fn load_bf16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor<bf16>> {
+    fn load_bf16(&self, _ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let dtype = self.get_dtype(name)?;
         Err(Error::UnsupportedDtype(format!(
             "load_bf16 not supported for dtype {dtype}"
@@ -148,7 +148,7 @@ pub trait WeightLoader {
         name: &str,
         shard: &ShardConfig,
         strategy: ShardStrategy,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         let full = self.load_f32(ctx, name)?;
         shard_tensor_on_host(&full, shard, strategy)
     }
@@ -160,7 +160,7 @@ pub trait WeightLoader {
         name: &str,
         shard: &ShardConfig,
         strategy: ShardStrategy,
-    ) -> Result<CudaTensor<f16>> {
+    ) -> Result<CudaTensor> {
         let full = self.load_f16(ctx, name)?;
         shard_tensor_on_host(&full, shard, strategy)
     }
@@ -172,7 +172,7 @@ pub trait WeightLoader {
         name: &str,
         shard: &ShardConfig,
         strategy: ShardStrategy,
-    ) -> Result<CudaTensor<bf16>> {
+    ) -> Result<CudaTensor> {
         let full = self.load_bf16(ctx, name)?;
         shard_tensor_on_host(&full, shard, strategy)
     }
@@ -216,10 +216,10 @@ pub trait WeightLoader {
 /// This is the generic fallback used by the default `load_*_sharded` methods.
 #[cfg(feature = "cuda")]
 fn shard_tensor_on_host<T>(
-    tensor: &CudaTensor<T>,
+    tensor: &CudaTensor,
     shard: &ShardConfig,
     strategy: ShardStrategy,
-) -> Result<CudaTensor<T>>
+) -> Result<CudaTensor>
 where
     T: crate::dtype::TensorDType + cudarc::driver::DeviceRepr + Default + Copy,
 {
