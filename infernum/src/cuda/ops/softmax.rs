@@ -144,7 +144,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
 
         let output = softmax(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Row 0: softmax([1, 2, 3, 4])
         let max0 = 4.0_f32;
@@ -186,7 +186,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4, 8], &input_data).unwrap();
 
         let output = softmax(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Each row should sum to 1
         for row in 0..4 {
@@ -212,7 +212,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
 
         let output = softmax_causal(&input, 1, 0).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Positions 2 and 3 should be masked (zero)
         for head in 0..2 {
@@ -243,7 +243,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[1, 3], &input_data).unwrap();
 
         let output = softmax_causal(&input, 0, 0).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Only position 0 is valid -> softmax of single element = 1.0
         assert!(

@@ -177,7 +177,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         let output = silu(&input).unwrap();
-        let result: Vec<f32> = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec::<f32>().unwrap();
 
         // SiLU(x) = x * sigmoid(x)
         for (i, &x) in input_data.iter().enumerate() {
@@ -200,7 +200,7 @@ mod tests {
         let mut input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         silu_inplace(&mut input).unwrap();
-        let result: Vec<f32> = input.to_vec().unwrap();
+        let result: Vec<f32> = input.to_vec::<f32>().unwrap();
 
         for (i, &x) in input_data.iter().enumerate() {
             let expected = x / (1.0 + (-x).exp());
@@ -225,7 +225,7 @@ mod tests {
         let up = CudaTensor::from_slice(&ctx, &[4], &up_data).unwrap();
 
         let output = silu_mul(&gate, &up).unwrap();
-        let result: Vec<f32> = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec::<f32>().unwrap();
 
         for i in 0..4 {
             let silu_gate = gate_data[i] / (1.0 + (-gate_data[i]).exp());

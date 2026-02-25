@@ -250,16 +250,16 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let device = ctx.device().clone();
 
-        let a = CudaTensor::<f32>::from_slice(&ctx, &[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
-        let mut b = CudaTensor::<f32>::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+        let a = CudaTensor::from_slice(&ctx, &[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let mut b = CudaTensor::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
 
         // Eagerly run once so the PTX module for `add` is loaded
         add_inplace(&mut b, &a).unwrap();
-        let warmup = b.to_vec().unwrap();
+        let warmup = b.to_vec::<f32>().unwrap();
         assert_eq!(warmup, vec![11.0, 22.0, 33.0, 44.0]);
 
         // Reset b for the graph capture
-        let mut b = CudaTensor::<f32>::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+        let mut b = CudaTensor::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
 
         let mut graph = CudaGraph::new(&device).unwrap();
 
@@ -274,7 +274,7 @@ mod tests {
         graph.launch().unwrap();
         device.synchronize().unwrap();
 
-        let result = b.to_vec().unwrap();
+        let result = b.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0]);
     }
 
@@ -283,8 +283,8 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let device = ctx.device().clone();
 
-        let a = CudaTensor::<f32>::from_slice(&ctx, &[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
-        let mut b = CudaTensor::<f32>::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+        let a = CudaTensor::from_slice(&ctx, &[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let mut b = CudaTensor::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
 
         // Warmup to load PTX
         add_inplace(&mut b, &a).unwrap();
@@ -292,18 +292,18 @@ mod tests {
         let mut graph = CudaGraph::new(&device).unwrap();
 
         // First capture + launch
-        let mut b = CudaTensor::<f32>::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+        let mut b = CudaTensor::from_slice(&ctx, &[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
         graph.begin_capture().unwrap();
         add_inplace(&mut b, &a).unwrap();
         graph.end_capture().unwrap();
 
         graph.launch().unwrap();
         device.synchronize().unwrap();
-        assert_eq!(b.to_vec().unwrap(), vec![11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(b.to_vec::<f32>().unwrap(), vec![11.0, 22.0, 33.0, 44.0]);
 
         // Second capture with different data — re-capture + update
-        let a2 = CudaTensor::<f32>::from_slice(&ctx, &[4], &[100.0, 200.0, 300.0, 400.0]).unwrap();
-        let mut b2 = CudaTensor::<f32>::from_slice(&ctx, &[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let a2 = CudaTensor::from_slice(&ctx, &[4], &[100.0, 200.0, 300.0, 400.0]).unwrap();
+        let mut b2 = CudaTensor::from_slice(&ctx, &[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
 
         graph.begin_capture().unwrap();
         add_inplace(&mut b2, &a2).unwrap();
@@ -314,6 +314,9 @@ mod tests {
 
         graph.launch().unwrap();
         device.synchronize().unwrap();
-        assert_eq!(b2.to_vec().unwrap(), vec![101.0, 202.0, 303.0, 404.0]);
+        assert_eq!(
+            b2.to_vec::<f32>().unwrap(),
+            vec![101.0, 202.0, 303.0, 404.0]
+        );
     }
 }

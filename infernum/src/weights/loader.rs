@@ -10,8 +10,6 @@ use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use crate::dtype::DType;
 #[cfg(feature = "cuda")]
 use crate::{Error, Result};
-#[cfg(feature = "cuda")]
-use half::{bf16, f16};
 
 /// Trait for loading model weights from various formats
 #[cfg(feature = "cuda")]
@@ -213,17 +211,18 @@ pub trait WeightLoader {
 
 /// Shard a 2D tensor on the host by downloading, slicing, and re-uploading.
 ///
-/// This is the generic fallback used by the default `load_*_sharded` methods.
+/// This is the untyped fallback used by the default `load_*_sharded` methods.
+/// It operates on raw bytes, using `dtype.size_in_bytes()` for element addressing.
 #[cfg(feature = "cuda")]
-fn shard_tensor_on_host<T>(
+fn shard_tensor_on_host(
     tensor: &CudaTensor,
     shard: &ShardConfig,
     strategy: ShardStrategy,
-) -> Result<CudaTensor>
-where
-    T: crate::dtype::TensorDType + cudarc::driver::DeviceRepr + Default + Copy,
-{
+) -> Result<CudaTensor> {
     use crate::tensor::Tensor;
+
+    let dtype = tensor.dtype();
+    let elem = dtype.size_in_bytes();
 
     match strategy {
         ShardStrategy::Replicate => {
@@ -237,10 +236,16 @@ where
             let (rows, cols) = (shape[0], shape[1]);
             let (start_row, shard_rows) = shard.shard_range(rows);
 
-            let data = tensor.to_vec()?;
-            let shard_data: Vec<T> =
-                data[start_row * cols..(start_row + shard_rows) * cols].to_vec();
-            CudaTensor::from_slice(tensor.context(), &[shard_rows, cols], &shard_data)
+            let data = tensor.to_raw_bytes()?;
+            let row_bytes = cols * elem;
+            let start = start_row * row_bytes;
+            let end = start + shard_rows * row_bytes;
+            CudaTensor::from_raw_bytes(
+                tensor.context(),
+                &[shard_rows, cols],
+                dtype,
+                &data[start..end],
+            )
         }
         ShardStrategy::Row => {
             // Split along dim 1 (columns)
@@ -249,14 +254,16 @@ where
             let (rows, cols) = (shape[0], shape[1]);
             let (start_col, shard_cols) = shard.shard_range(cols);
 
-            let data = tensor.to_vec()?;
-            let mut shard_data = vec![T::default(); rows * shard_cols];
+            let data = tensor.to_raw_bytes()?;
+            let mut shard_data = vec![0u8; rows * shard_cols * elem];
             for r in 0..rows {
-                shard_data[r * shard_cols..(r + 1) * shard_cols].copy_from_slice(
-                    &data[r * cols + start_col..r * cols + start_col + shard_cols],
-                );
+                let src_start = (r * cols + start_col) * elem;
+                let dst_start = r * shard_cols * elem;
+                let chunk = shard_cols * elem;
+                shard_data[dst_start..dst_start + chunk]
+                    .copy_from_slice(&data[src_start..src_start + chunk]);
             }
-            CudaTensor::from_slice(tensor.context(), &[rows, shard_cols], &shard_data)
+            CudaTensor::from_raw_bytes(tensor.context(), &[rows, shard_cols], dtype, &shard_data)
         }
     }
 }
@@ -279,7 +286,7 @@ mod tests {
 
         let result = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Replicate).unwrap();
         assert_eq!(result.shape(), &[2, 3]);
-        assert_eq!(result.to_vec().unwrap(), data);
+        assert_eq!(result.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -296,11 +303,17 @@ mod tests {
 
         let r0 = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Column).unwrap();
         assert_eq!(r0.shape(), &[2, 3]);
-        assert_eq!(r0.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            r0.to_vec::<f32>().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
 
         let r1 = shard_tensor_on_host(&tensor, &shard(1, 2), ShardStrategy::Column).unwrap();
         assert_eq!(r1.shape(), &[2, 3]);
-        assert_eq!(r1.to_vec().unwrap(), vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(
+            r1.to_vec::<f32>().unwrap(),
+            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        );
     }
 
     #[test]
@@ -316,11 +329,17 @@ mod tests {
 
         let r0 = shard_tensor_on_host(&tensor, &shard(0, 2), ShardStrategy::Row).unwrap();
         assert_eq!(r0.shape(), &[3, 2]);
-        assert_eq!(r0.to_vec().unwrap(), vec![1.0, 2.0, 5.0, 6.0, 9.0, 10.0]);
+        assert_eq!(
+            r0.to_vec::<f32>().unwrap(),
+            vec![1.0, 2.0, 5.0, 6.0, 9.0, 10.0]
+        );
 
         let r1 = shard_tensor_on_host(&tensor, &shard(1, 2), ShardStrategy::Row).unwrap();
         assert_eq!(r1.shape(), &[3, 2]);
-        assert_eq!(r1.to_vec().unwrap(), vec![3.0, 4.0, 7.0, 8.0, 11.0, 12.0]);
+        assert_eq!(
+            r1.to_vec::<f32>().unwrap(),
+            vec![3.0, 4.0, 7.0, 8.0, 11.0, 12.0]
+        );
     }
 
     #[test]
@@ -331,7 +350,7 @@ mod tests {
 
         let result = shard_tensor_on_host(&tensor, &shard(0, 1), ShardStrategy::Column).unwrap();
         assert_eq!(result.shape(), &[2, 3]);
-        assert_eq!(result.to_vec().unwrap(), data);
+        assert_eq!(result.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -342,7 +361,7 @@ mod tests {
 
         let result = shard_tensor_on_host(&tensor, &shard(0, 1), ShardStrategy::Row).unwrap();
         assert_eq!(result.shape(), &[2, 3]);
-        assert_eq!(result.to_vec().unwrap(), data);
+        assert_eq!(result.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -357,7 +376,10 @@ mod tests {
                 shard_tensor_on_host(&tensor, &shard(rank, 4), ShardStrategy::Column).unwrap();
             assert_eq!(result.shape(), &[2, 2]);
             let start = rank * 4;
-            assert_eq!(result.to_vec().unwrap(), data[start..start + 4].to_vec());
+            assert_eq!(
+                result.to_vec::<f32>().unwrap(),
+                data[start..start + 4].to_vec()
+            );
         }
     }
 
@@ -373,11 +395,11 @@ mod tests {
 
         let r0 = shard_tensor_on_host(&tensor, &shard(0, 4), ShardStrategy::Row).unwrap();
         assert_eq!(r0.shape(), &[2, 2]);
-        assert_eq!(r0.to_vec().unwrap(), vec![1.0, 2.0, 9.0, 10.0]);
+        assert_eq!(r0.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 9.0, 10.0]);
 
         let r3 = shard_tensor_on_host(&tensor, &shard(3, 4), ShardStrategy::Row).unwrap();
         assert_eq!(r3.shape(), &[2, 2]);
-        assert_eq!(r3.to_vec().unwrap(), vec![7.0, 8.0, 15.0, 16.0]);
+        assert_eq!(r3.to_vec::<f32>().unwrap(), vec![7.0, 8.0, 15.0, 16.0]);
     }
 
     #[test]

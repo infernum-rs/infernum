@@ -100,7 +100,7 @@ mod tests {
         let repeated = repeat_kv(&tensor, 1).unwrap();
         assert_eq!(repeated.shape(), &[1, 2, 3]);
 
-        let result = repeated.to_vec().unwrap();
+        let result = repeated.to_vec::<f32>().unwrap();
         assert_eq!(result, data);
     }
 
@@ -122,7 +122,7 @@ mod tests {
 
         assert_eq!(repeated.shape(), &[2, 4, 3]);
 
-        let result = repeated.to_vec().unwrap();
+        let result = repeated.to_vec::<f32>().unwrap();
 
         // Each KV head repeated twice
         assert_eq!(result[0..3], [1.0, 2.0, 3.0]); // seq=0, head=0

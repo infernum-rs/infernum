@@ -7,9 +7,6 @@
 use std::path::Path;
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
-
-#[cfg(feature = "cuda")]
 use crate::cuda::block_allocator::BlockTable;
 #[cfg(feature = "cuda")]
 use crate::cuda::BatchedGraphInputs;
@@ -18,7 +15,7 @@ use crate::cuda::{nccl::NcclCommunicator, ShardConfig};
 #[cfg(feature = "cuda")]
 use crate::cuda::{CudaContext, CudaTensor, PagedKvCache};
 #[cfg(feature = "cuda")]
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 #[cfg(feature = "cuda")]
 use crate::Result;
 
@@ -35,6 +32,9 @@ pub struct ModelConfig {
     pub head_dim: usize,
     /// End-of-sequence token ID
     pub eos_token_id: u32,
+    /// Data type for KV cache entries
+    #[cfg(feature = "cuda")]
+    pub cache_dtype: DType,
 }
 
 /// Trait for LLM models that can be used with the Engine.

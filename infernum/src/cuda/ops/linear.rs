@@ -133,7 +133,7 @@ mod tests {
 
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, 2]);
-        let result: Vec<f32> = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec::<f32>().unwrap();
         assert!((result[0] - 4.0).abs() < 1e-4); // 1+3
         assert!((result[1] - 6.0).abs() < 1e-4); // 2+4
     }
@@ -154,7 +154,7 @@ mod tests {
 
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, 2]);
-        let result: Vec<half::bf16> = output.to_vec().unwrap();
+        let result: Vec<half::bf16> = output.to_vec::<half::bf16>().unwrap();
         let result_f32: Vec<f32> = result.into_iter().map(half::bf16::to_f32).collect();
         assert!((result_f32[0] - 4.0).abs() < 0.1);
         assert!((result_f32[1] - 6.0).abs() < 0.1);
@@ -187,7 +187,7 @@ mod tests {
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, n]);
 
-        let result: Vec<f32> = output.to_vec().unwrap();
+        let result: Vec<f32> = output.to_vec::<f32>().unwrap();
         for &v in &result {
             assert!(
                 v.is_finite(),
@@ -228,7 +228,7 @@ mod tests {
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, n]);
 
-        let result: Vec<half::bf16> = output.to_vec().unwrap();
+        let result: Vec<half::bf16> = output.to_vec::<half::bf16>().unwrap();
         let result_f32: Vec<f32> = result.into_iter().map(half::bf16::to_f32).collect();
         for &v in &result_f32 {
             assert!(

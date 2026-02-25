@@ -260,7 +260,7 @@ impl QwenModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     if scale_val.len() == 1 {
                         qt.set_weight_scale(ctx, scale_val[0])?;
                     } else {
@@ -524,7 +524,7 @@ impl QwenModel {
         let lm_head = if config.tie_word_embeddings {
             if qc.is_some() {
                 let embed_f32 = cast_to_f32(&embed_tokens)?;
-                let data = embed_f32.to_vec()?;
+                let data = embed_f32.to_vec::<f32>()?;
                 LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
                     ctx,
                     embed_f32.shape(),
@@ -540,7 +540,7 @@ impl QwenModel {
             if qc.is_some() {
                 if let LinearWeight::Dense(ref w) = lw {
                     let f32_w = cast_to_f32(w)?;
-                    let data = f32_w.to_vec()?;
+                    let data = f32_w.to_vec::<f32>()?;
                     let k = f32_w.shape()[0];
                     let n = f32_w.shape()[1];
                     let mut row_major = vec![0.0_f32; data.len()];
@@ -661,7 +661,7 @@ impl QwenModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     qt.set_weight_scale(ctx, scale_val[0])?;
                 }
                 Ok(LinearWeight::Quantized(qt))
@@ -1713,7 +1713,7 @@ impl QwenModel {
             let shared_out = self.forward_mlp_no_reduce(hidden, shared_mlp)?;
 
             if let Some(gate_weight) = shared_expert_gate {
-                let gate_data = cast_to_f32(gate_weight)?.to_vec()?;
+                let gate_data: Vec<f32> = cast_to_f32(gate_weight)?.to_vec::<f32>()?;
                 let gate_val = 1.0 / (1.0 + (-gate_data[0]).exp());
                 let gate_f32 = CudaTensor::from_slice(&self.ctx, &[1], &[gate_val])?;
                 let gate_t = cast_from_f32(&gate_f32, self.dtype)?;
@@ -1752,6 +1752,7 @@ impl infernum::Model for QwenModel {
             num_kv_heads: self.tp_num_kv_heads,
             head_dim: config.head_dim(),
             eos_token_id: config.eos_token_id,
+            cache_dtype: self.dtype,
         }
     }
 

@@ -77,7 +77,7 @@ mod tests {
 
         scale_inplace(&mut tensor, 2.5).unwrap();
 
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![2.5, 5.0, 7.5, 10.0]);
     }
 
@@ -97,9 +97,13 @@ mod tests {
 
         scale_inplace(&mut tensor, 2.0).unwrap();
 
-        let result = tensor.to_vec().unwrap();
-        let result_f32: Vec<f32> = result.iter().map(|x| x.to_f32()).collect();
-        assert_eq!(result_f32, vec![2.0, 4.0, 6.0, 8.0]);
+        let result: Vec<f32> = tensor
+            .to_vec::<bf16>()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
+        assert_eq!(result, vec![2.0, 4.0, 6.0, 8.0]);
     }
 
     #[test]
@@ -111,7 +115,7 @@ mod tests {
 
         scale_inplace(&mut tensor, 1.0).unwrap();
 
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![1.0, 2.0, 3.0]);
     }
 }

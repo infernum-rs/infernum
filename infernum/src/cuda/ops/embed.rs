@@ -183,7 +183,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[3, 3]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         // token 2, token 0, token 3
         let expected: Vec<f32> = vec![2.1, 2.2, 2.3, 0.1, 0.2, 0.3, 3.1, 3.2, 3.3];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
@@ -209,7 +209,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[3, 3]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         let expected: Vec<f32> = vec![2.1, 2.2, 2.3, 0.1, 0.2, 0.3, 3.1, 3.2, 3.3];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((got - exp).abs() < 1e-5, "Mismatch at {i}: {got} vs {exp}");
@@ -231,7 +231,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[1, 3]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         let expected: Vec<f32> = vec![1.1, 1.2, 1.3];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((got - exp).abs() < 1e-5, "Mismatch at {i}: {got} vs {exp}");

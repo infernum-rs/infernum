@@ -84,7 +84,7 @@ pub fn split_inner_dim(
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("split_inner_dim", T::DTYPE))
+        .get_func(MODULE, &kernel_name("split_inner_dim", dtype))
         .unwrap();
 
     let n = outer * total;
@@ -128,7 +128,7 @@ pub fn concat_inner_dim(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("concat_inner_dim", T::DTYPE))
+        .get_func(MODULE, &kernel_name("concat_inner_dim", dtype))
         .unwrap();
 
     let n = outer * total;
@@ -172,7 +172,7 @@ pub fn broadcast_to_heads(tensor: &CudaTensor, num_heads: usize) -> Result<CudaT
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("broadcast_to_heads", T::DTYPE))
+        .get_func(MODULE, &kernel_name("broadcast_to_heads", dtype))
         .unwrap();
 
     // The kernel broadcasts [dim] → [num_heads * dim].
@@ -230,7 +230,7 @@ pub fn pad_inner_dim(tensor: &CudaTensor, dst_dim: usize) -> Result<CudaTensor> 
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("pad_inner_dim", T::DTYPE))
+        .get_func(MODULE, &kernel_name("pad_inner_dim", dtype))
         .unwrap();
 
     let n = outer * dst_dim;
@@ -268,8 +268,11 @@ mod tests {
 
         assert_eq!(a.shape(), &[2, 3]);
         assert_eq!(b.shape(), &[2, 2]);
-        assert_eq!(a.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 6.0, 7.0, 8.0]);
-        assert_eq!(b.to_vec().unwrap(), vec![4.0, 5.0, 9.0, 10.0]);
+        assert_eq!(
+            a.to_vec::<f32>().unwrap(),
+            vec![1.0, 2.0, 3.0, 6.0, 7.0, 8.0]
+        );
+        assert_eq!(b.to_vec::<f32>().unwrap(), vec![4.0, 5.0, 9.0, 10.0]);
     }
 
     #[test]
@@ -283,7 +286,7 @@ mod tests {
 
         assert_eq!(out.shape(), &[2, 5]);
         assert_eq!(
-            out.to_vec().unwrap(),
+            out.to_vec::<f32>().unwrap(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
         );
     }
@@ -297,7 +300,7 @@ mod tests {
         let out = broadcast_to_heads(&tensor, 4).unwrap();
 
         assert_eq!(out.shape(), &[2, 4, 3]);
-        let result = out.to_vec().unwrap();
+        let result = out.to_vec::<f32>().unwrap();
         // seq=0: [1,2,3] repeated 4 times
         for h in 0..4 {
             assert_eq!(&result[h * 3..(h + 1) * 3], &[1.0, 2.0, 3.0]);
@@ -319,7 +322,7 @@ mod tests {
 
         assert_eq!(out.shape(), &[2, 5]);
         assert_eq!(
-            out.to_vec().unwrap(),
+            out.to_vec::<f32>().unwrap(),
             vec![1.0, 2.0, 3.0, 0.0, 0.0, 4.0, 5.0, 6.0, 0.0, 0.0]
         );
     }
@@ -332,7 +335,7 @@ mod tests {
         let out = pad_inner_dim(&tensor, 3).unwrap();
 
         assert_eq!(out.shape(), &[2, 3]);
-        assert_eq!(out.to_vec().unwrap(), data);
+        assert_eq!(out.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -345,6 +348,6 @@ mod tests {
         let restored = concat_inner_dim(&a, &b).unwrap();
 
         assert_eq!(restored.shape(), &[5, 6]);
-        assert_eq!(restored.to_vec().unwrap(), data);
+        assert_eq!(restored.to_vec::<f32>().unwrap(), data);
     }
 }

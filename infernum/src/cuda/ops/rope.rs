@@ -747,7 +747,7 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[seq_len, num_heads, head_dim], &input_data).unwrap();
 
         let output = apply_rope(&input, &cos_cache, &sin_cache, 0).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Position 0: cos(0) = 1, sin(0) = 0, so x' = x
         // Position 1 will have rotation applied
@@ -790,7 +790,7 @@ mod tests {
 
         let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
         let output = apply_rope(&input, &cos_cache, &sin_cache, 1).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let expected = [
             a * cos0 - c * sin0,
@@ -823,8 +823,8 @@ mod tests {
         pos.set(0, ctx.device()).unwrap();
         let indirect = apply_rope_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
 
-        let direct_data = direct.to_vec().unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let direct_data = direct.to_vec::<f32>().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -850,8 +850,8 @@ mod tests {
         pos.set(position, ctx.device()).unwrap();
         let indirect = apply_rope_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
 
-        let direct_data = direct.to_vec().unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let direct_data = direct.to_vec::<f32>().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -882,10 +882,10 @@ mod tests {
         let out10 = apply_rope_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
         let ref10 = apply_rope(&input, &cos_cache, &sin_cache, 10).unwrap();
 
-        let out5_data = out5.to_vec().unwrap();
-        let ref5_data = ref5.to_vec().unwrap();
-        let out10_data = out10.to_vec().unwrap();
-        let ref10_data = ref10.to_vec().unwrap();
+        let out5_data = out5.to_vec::<f32>().unwrap();
+        let ref5_data = ref5.to_vec::<f32>().unwrap();
+        let out10_data = out10.to_vec::<f32>().unwrap();
+        let ref10_data = ref10.to_vec::<f32>().unwrap();
 
         // Results at different positions should differ
         assert_ne!(
@@ -920,10 +920,10 @@ mod tests {
         let (cos_yarn, sin_yarn) =
             precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
 
-        let cos_std_v = cos_std.to_vec().unwrap();
-        let sin_std_v = sin_std.to_vec().unwrap();
-        let cos_yarn_v = cos_yarn.to_vec().unwrap();
-        let sin_yarn_v = sin_yarn.to_vec().unwrap();
+        let cos_std_v = cos_std.to_vec::<f32>().unwrap();
+        let sin_std_v = sin_std.to_vec::<f32>().unwrap();
+        let cos_yarn_v = cos_yarn.to_vec::<f32>().unwrap();
+        let sin_yarn_v = sin_yarn.to_vec::<f32>().unwrap();
 
         // scale = sqrt(1 + 0.1 * ln(1.0)) = sqrt(1.0) = 1.0
         for (i, (&a, &b)) in cos_std_v.iter().zip(cos_yarn_v.iter()).enumerate() {
@@ -957,8 +957,8 @@ mod tests {
         let (cos_yarn, sin_yarn) =
             precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
 
-        let cos_v = cos_yarn.to_vec().unwrap();
-        let sin_v = sin_yarn.to_vec().unwrap();
+        let cos_v = cos_yarn.to_vec::<f32>().unwrap();
+        let sin_v = sin_yarn.to_vec::<f32>().unwrap();
 
         let expected_scale = (1.0 + 0.1 * factor.ln()).sqrt();
 
@@ -996,13 +996,13 @@ mod tests {
         let (cos_lin, _sin_lin) =
             precompute_rope_cache_scaled(&ctx, max_seq, head_dim, base, &scaling).unwrap();
 
-        let cos_v = cos_lin.to_vec().unwrap();
+        let cos_v = cos_lin.to_vec::<f32>().unwrap();
         let half_dim = head_dim / 2;
 
         // Position p with linear scaling should match position p/factor in standard
         // cos_lin[pos=4, dim=0] should equal cos_std[pos=2, dim=0]
         let (cos_std, _) = precompute_rope_cache(&ctx, max_seq, head_dim, base).unwrap();
-        let cos_std_v = cos_std.to_vec().unwrap();
+        let cos_std_v = cos_std.to_vec::<f32>().unwrap();
 
         let pos_lin = 4;
         let pos_std = 2; // 4 / factor
@@ -1034,7 +1034,7 @@ mod tests {
             CudaTensor::from_slice(&ctx, &[batch_size, num_heads, head_dim], &input_data).unwrap();
 
         let batched = apply_rope_batched(&input, &cos_cache, &sin_cache, &positions).unwrap();
-        let batched_data = batched.to_vec().unwrap();
+        let batched_data = batched.to_vec::<f32>().unwrap();
 
         // Compare each row against scalar apply_rope
         for (i, &pos) in positions.iter().enumerate() {
@@ -1046,7 +1046,7 @@ mod tests {
             )
             .unwrap();
             let scalar = apply_rope(&row_input, &cos_cache, &sin_cache, pos).unwrap();
-            let scalar_data = scalar.to_vec().unwrap();
+            let scalar_data = scalar.to_vec::<f32>().unwrap();
 
             for (j, (&got, &want)) in batched_data[row_start..row_start + row_size]
                 .iter()
@@ -1076,8 +1076,8 @@ mod tests {
         let batched = apply_rope_batched(&input, &cos_cache, &sin_cache, &[pos]).unwrap();
         let scalar = apply_rope(&input, &cos_cache, &sin_cache, pos).unwrap();
 
-        let batched_data = batched.to_vec().unwrap();
-        let scalar_data = scalar.to_vec().unwrap();
+        let batched_data = batched.to_vec::<f32>().unwrap();
+        let scalar_data = scalar.to_vec::<f32>().unwrap();
 
         for (i, (&got, &want)) in batched_data.iter().zip(scalar_data.iter()).enumerate() {
             assert!(
@@ -1107,7 +1107,7 @@ mod tests {
 
         // Eager path
         let eager = apply_rope_batched(&input, &cos_cache, &sin_cache, &positions).unwrap();
-        let eager_data = eager.to_vec().unwrap();
+        let eager_data = eager.to_vec::<f32>().unwrap();
 
         // Indirect path: positions pre-uploaded as i32
         let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
@@ -1115,7 +1115,7 @@ mod tests {
         let indirect =
             apply_rope_batched_indirect(&input, &cos_cache, &sin_cache, &positions_gpu, batch_size)
                 .unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&e, &ind)) in eager_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -1138,7 +1138,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
 
         let output = apply_rope_interleaved(&input, &cos_cache, &sin_cache, 0).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for (i, (&got, &want)) in result.iter().zip(input_data.iter()).enumerate() {
             assert!(
@@ -1178,7 +1178,7 @@ mod tests {
 
         let input = CudaTensor::from_slice(&ctx, &[1, 1, head_dim], &input_data).unwrap();
         let output = apply_rope_interleaved(&input, &cos_cache, &sin_cache, 1).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let expected = [
             a * cos0 - b * sin0,
@@ -1209,8 +1209,8 @@ mod tests {
         let split_half = apply_rope(&input, &cos_cache, &sin_cache, 1).unwrap();
         let interleaved = apply_rope_interleaved(&input, &cos_cache, &sin_cache, 1).unwrap();
 
-        let sh = split_half.to_vec().unwrap();
-        let il = interleaved.to_vec().unwrap();
+        let sh = split_half.to_vec::<f32>().unwrap();
+        let il = interleaved.to_vec::<f32>().unwrap();
 
         assert_ne!(
             sh, il,
@@ -1235,8 +1235,8 @@ mod tests {
         let indirect =
             apply_rope_interleaved_indirect(&input, &cos_cache, &sin_cache, &pos).unwrap();
 
-        let direct_data = direct.to_vec().unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let direct_data = direct.to_vec::<f32>().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -1275,7 +1275,7 @@ mod tests {
             batch_size,
         )
         .unwrap();
-        let batched_data = batched.to_vec().unwrap();
+        let batched_data = batched.to_vec::<f32>().unwrap();
 
         // Compare each row against sequential apply_rope_interleaved
         for (i, &pos) in positions.iter().enumerate() {
@@ -1287,7 +1287,7 @@ mod tests {
             )
             .unwrap();
             let scalar = apply_rope_interleaved(&row_input, &cos_cache, &sin_cache, pos).unwrap();
-            let scalar_data = scalar.to_vec().unwrap();
+            let scalar_data = scalar.to_vec::<f32>().unwrap();
 
             for (j, (&got, &want)) in batched_data[row_start..row_start + row_size]
                 .iter()

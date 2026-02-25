@@ -137,6 +137,7 @@ impl Engine {
                 &block_config,
                 model_config.num_kv_heads,
                 model_config.head_dim,
+                model_config.cache_dtype,
             )?);
         }
         let allocator = BlockAllocator::new(&block_config);

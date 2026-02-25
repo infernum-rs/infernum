@@ -81,8 +81,8 @@ fn gelu(x: &CudaTensor) -> Result<CudaTensor> {
     // Triton kernels expect raw device pointers (u64), not CudaSlice wrappers.
     // They also take two extra trailing u64 parameters (null pointers for
     // launch metadata and global scratch buffer).
-    let out_ptr = output.as_mut_ptr() as u64;
-    let x_ptr = x.as_ptr() as u64;
+    let out_ptr = output.device_ptr_mut();
+    let x_ptr = x.device_ptr();
     let null_ptr: u64 = 0;
 
     unsafe {
@@ -124,7 +124,7 @@ fn main() -> Result<()> {
     println!("Input:    {data:?}");
 
     let y = gelu(&x)?;
-    let result = y.to_vec()?;
+    let result = y.to_vec::<f32>()?;
     let expected: Vec<f32> = data.iter().map(|&v| gelu_reference(v)).collect();
 
     println!("GELU:     {result:?}");

@@ -218,7 +218,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4], &data).unwrap();
 
         let output = cast_to_f32(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, data);
     }
 
@@ -231,7 +231,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4], &bf16_data).unwrap();
 
         let output = cast_to_f32(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for (i, (&got, &expected)) in result.iter().zip(f32_data.iter()).enumerate() {
             assert!(
@@ -249,7 +249,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4], &f16_data).unwrap();
 
         let output = cast_to_f32(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for (i, (&got, &expected)) in result.iter().zip(f32_data.iter()).enumerate() {
             assert!(
@@ -272,7 +272,7 @@ mod tests {
         let back = cast_bf16_to_f32(&bf16).unwrap();
         assert_eq!(back.shape(), &[2, 3]);
 
-        let result = back.to_vec().unwrap();
+        let result = back.to_vec::<f32>().unwrap();
         for (i, (&orig, &got)) in data.iter().zip(result.iter()).enumerate() {
             let tol = orig.abs() * 0.01 + 1e-3;
             assert!((orig - got).abs() < tol, "Mismatch at {i}: {orig} vs {got}");

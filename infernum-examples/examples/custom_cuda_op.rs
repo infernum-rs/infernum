@@ -81,7 +81,7 @@ fn main() -> Result<()> {
     println!("Input:  {:?}", data);
 
     let y = relu(&x)?;
-    let result = y.to_vec()?;
+    let result = y.to_vec::<f32>()?;
 
     println!("ReLU:   {result:?}");
     assert_eq!(result, vec![0.0, 0.0, 0.0, 1.0, 3.0, 0.0, 2.5, 0.0]);

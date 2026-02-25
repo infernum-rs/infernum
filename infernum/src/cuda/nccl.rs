@@ -169,7 +169,7 @@ mod tests {
                         comm.all_reduce_sum_inplace(&mut tensor).unwrap();
                         ctx.synchronize().unwrap();
 
-                        let result = tensor.to_vec().unwrap();
+                        let result = tensor.to_vec::<f32>().unwrap();
                         let expected = (1..=n_devices).sum::<usize>() as f32;
                         for val in &result {
                             assert!(

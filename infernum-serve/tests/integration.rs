@@ -78,6 +78,7 @@ impl Model for MockModel {
             num_kv_heads: 1,
             head_dim: 4,
             eos_token_id: 99,
+            cache_dtype: infernum::DType::F32,
         }
     }
 

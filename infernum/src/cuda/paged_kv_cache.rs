@@ -458,8 +458,8 @@ mod tests {
 
         // Read back the block from the pool and verify
         let (k_pool, v_pool) = cache.get_pools(0);
-        let k_all: Vec<f32> = k_pool.to_vec().unwrap();
-        let v_all: Vec<f32> = v_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
+        let v_all: Vec<f32> = v_pool.to_vec::<f32>().unwrap();
 
         // The data should be at physical block `block_idx`, offset 0
         let base = block_idx * block_size * num_kv_heads * head_dim;
@@ -512,7 +512,7 @@ mod tests {
 
         // Verify data in both blocks
         let (k_pool, _) = cache.get_pools(0);
-        let k_all: Vec<f32> = k_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
 
         let stride = block_size * num_kv_heads * head_dim; // elements per block
                                                            // Block b0: tokens 0 and 1
@@ -559,8 +559,8 @@ mod tests {
 
         // Verify: block b0 has tokens 0-3, block b1 has tokens 4-5
         let (k_pool, v_pool) = cache.get_pools(0);
-        let k_all: Vec<f32> = k_pool.to_vec().unwrap();
-        let v_all: Vec<f32> = v_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
+        let v_all: Vec<f32> = v_pool.to_vec::<f32>().unwrap();
 
         let stride = block_size * num_kv_heads * head_dim;
         // Block b0: tokens 0-3 → elements 0..8
@@ -607,12 +607,12 @@ mod tests {
         let stride = block_size * num_kv_heads * head_dim;
 
         let (k_pool_0, _) = cache.get_pools(0);
-        let k_all_0: Vec<f32> = k_pool_0.to_vec().unwrap();
+        let k_all_0: Vec<f32> = k_pool_0.to_vec::<f32>().unwrap();
         assert_eq!(k_all_0[b0 * stride], 1.0);
         assert_eq!(k_all_0[b0 * stride + 1], 2.0);
 
         let (k_pool_1, _) = cache.get_pools(1);
-        let k_all_1: Vec<f32> = k_pool_1.to_vec().unwrap();
+        let k_all_1: Vec<f32> = k_pool_1.to_vec::<f32>().unwrap();
         assert_eq!(k_all_1[b0 * stride], 5.0);
         assert_eq!(k_all_1[b0 * stride + 1], 6.0);
     }
@@ -651,8 +651,8 @@ mod tests {
         cache.append_paged(0, &table, &k, &v, 0).unwrap();
 
         let (k_pool, v_pool) = cache.get_pools(0);
-        let k_all: Vec<f32> = k_pool.to_vec().unwrap();
-        let v_all: Vec<f32> = v_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
+        let v_all: Vec<f32> = v_pool.to_vec::<f32>().unwrap();
         let stride = block_size * num_kv_heads * head_dim;
         assert_eq!(k_all[b2 * stride], 99.0);
         assert_eq!(v_all[b2 * stride], 77.0);
@@ -697,8 +697,8 @@ mod tests {
         cache_ref.append_paged(0, &table1, &k1, &v1, 5).unwrap();
 
         let (k_ref, v_ref) = cache_ref.get_pools(0);
-        let k_ref_data: Vec<f32> = k_ref.to_vec().unwrap();
-        let v_ref_data: Vec<f32> = v_ref.to_vec().unwrap();
+        let k_ref_data: Vec<f32> = k_ref.to_vec::<f32>().unwrap();
+        let v_ref_data: Vec<f32> = v_ref.to_vec::<f32>().unwrap();
 
         // --- Batched ---
         let mut cache_bat =
@@ -734,8 +734,8 @@ mod tests {
             .unwrap();
 
         let (k_bat_pool, v_bat_pool) = cache_bat.get_pools(0);
-        let k_bat_data: Vec<f32> = k_bat_pool.to_vec().unwrap();
-        let v_bat_data: Vec<f32> = v_bat_pool.to_vec().unwrap();
+        let k_bat_data: Vec<f32> = k_bat_pool.to_vec::<f32>().unwrap();
+        let v_bat_data: Vec<f32> = v_bat_pool.to_vec::<f32>().unwrap();
 
         // Verify the blocks written match
         let stride = block_size * num_kv_heads * head_dim;

@@ -59,8 +59,8 @@ fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
     let n1 = a.shape()[1];
     let n2 = b.shape()[1];
 
-    let a_bytes = a.to_raw_bytes();
-    let b_bytes = b.to_raw_bytes();
+    let a_bytes = a.to_raw_bytes()?;
+    let b_bytes = b.to_raw_bytes()?;
     let mut out = vec![0u8; k * (n1 + n2) * elem];
     for row in 0..k {
         let out_off = row * (n1 + n2) * elem;
@@ -108,7 +108,7 @@ fn load_gemma_norm(
 ) -> Result<CudaTensor> {
     let gpu_tensor = load_typed(dtype, loader, ctx, name)?;
     let f32_tensor = cast_to_f32(&gpu_tensor)?;
-    let mut host: Vec<f32> = f32_tensor.to_vec()?;
+    let mut host: Vec<f32> = f32_tensor.to_vec::<f32>()?;
     for v in &mut host {
         *v += 1.0;
     }
@@ -284,7 +284,7 @@ impl GemmaModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     if scale_val.len() == 1 {
                         qt.set_weight_scale(ctx, scale_val[0])?;
                     } else {
@@ -299,7 +299,7 @@ impl GemmaModel {
                     Ok(LinearWeight::Dense(transposed))
                 } else {
                     let native = load_typed(model_dtype, loader, ctx, name)?;
-                    let raw = native.to_raw_bytes();
+                    let raw = native.to_raw_bytes()?;
                     let shape = native.shape();
                     let rows = shape[0];
                     let cols = shape[1];
@@ -468,7 +468,7 @@ impl GemmaModel {
         // Tied word embeddings — Gemma always ties lm_head to embed_tokens
         let lm_head = if qc.is_some() {
             let embed_f32 = cast_to_f32(&embed_tokens)?;
-            let data = embed_f32.to_vec()?;
+            let data = embed_f32.to_vec::<f32>()?;
             LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
                 ctx,
                 embed_f32.shape(),
@@ -491,7 +491,7 @@ impl GemmaModel {
             local_theta,
         )?;
 
-        let (cos_cache, sin_cache) = convert_rope_cache(dtype, ctx, &cos_f32, &sin_f32)?;
+        let (cos_cache, sin_cache) = convert_rope_cache(dtype, &cos_f32, &sin_f32)?;
 
         let (cos_cache_global, sin_cache_global) = if config.rope_local_base_freq.is_some() {
             let (cos_g_f32, sin_g_f32) = precompute_rope_cache(
@@ -500,7 +500,7 @@ impl GemmaModel {
                 config.head_dim,
                 config.rope_theta,
             )?;
-            let (cos_g, sin_g) = convert_rope_cache(dtype, ctx, &cos_g_f32, &sin_g_f32)?;
+            let (cos_g, sin_g) = convert_rope_cache(dtype, &cos_g_f32, &sin_g_f32)?;
             (Some(cos_g), Some(sin_g))
         } else {
             (None, None)
@@ -586,7 +586,7 @@ impl GemmaModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     if scale_val.len() == 1 {
                         qt.set_weight_scale(ctx, scale_val[0])?;
                     } else {
@@ -602,7 +602,7 @@ impl GemmaModel {
                 } else {
                     let native =
                         load_typed_sharded(model_dtype, loader, ctx, name, shard, strategy)?;
-                    let raw = native.to_raw_bytes();
+                    let raw = native.to_raw_bytes()?;
                     let shape = native.shape();
                     let rows = shape[0];
                     let cols = shape[1];
@@ -817,7 +817,7 @@ impl GemmaModel {
         // Tied embeddings — not sharded for lm_head
         let lm_head = if qc.is_some() {
             let embed_f32 = cast_to_f32(&embed_tokens)?;
-            let data = embed_f32.to_vec()?;
+            let data = embed_f32.to_vec::<f32>()?;
             LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
                 ctx,
                 embed_f32.shape(),
@@ -836,7 +836,7 @@ impl GemmaModel {
             config.head_dim,
             local_theta,
         )?;
-        let (cos_cache, sin_cache) = convert_rope_cache(dtype, ctx, &cos_f32, &sin_f32)?;
+        let (cos_cache, sin_cache) = convert_rope_cache(dtype, &cos_f32, &sin_f32)?;
 
         let (cos_cache_global, sin_cache_global) = if config.rope_local_base_freq.is_some() {
             let (cos_g_f32, sin_g_f32) = precompute_rope_cache(
@@ -845,7 +845,7 @@ impl GemmaModel {
                 config.head_dim,
                 config.rope_theta,
             )?;
-            let (cos_g, sin_g) = convert_rope_cache(dtype, ctx, &cos_g_f32, &sin_g_f32)?;
+            let (cos_g, sin_g) = convert_rope_cache(dtype, &cos_g_f32, &sin_g_f32)?;
             (Some(cos_g), Some(sin_g))
         } else {
             (None, None)
@@ -1469,7 +1469,7 @@ impl GemmaModel {
     /// Apply final logit soft-capping (Gemma 2 only): tanh(logits / cap) * cap
     fn apply_final_softcap(&self, logits: &mut CudaTensor) -> Result<()> {
         if let Some(cap) = self.config.final_logit_softcapping {
-            let data = logits.to_vec()?;
+            let data: Vec<f32> = logits.to_vec::<f32>()?;
             let capped: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
             *logits = CudaTensor::from_slice(&self.ctx, logits.shape(), &capped)?;
         }
@@ -1525,6 +1525,7 @@ impl infernum::Model for GemmaModel {
             num_kv_heads: self.tp_num_kv_heads,
             head_dim: self.config.head_dim,
             eos_token_id: self.config.eos_token_id,
+            cache_dtype: self.dtype,
         }
     }
 

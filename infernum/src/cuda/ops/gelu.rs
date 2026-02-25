@@ -187,7 +187,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         let output = gelu(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for (i, &x) in input_data.iter().enumerate() {
             let expected = gelu_ref(x);
@@ -209,7 +209,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[3], &input_data).unwrap();
 
         let output = gelu(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         assert!(
             result[0].abs() < 1e-6,
@@ -236,7 +236,7 @@ mod tests {
         let mut input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         gelu_inplace(&mut input).unwrap();
-        let result = input.to_vec().unwrap();
+        let result = input.to_vec::<f32>().unwrap();
 
         for (i, &x) in input_data.iter().enumerate() {
             let expected = gelu_ref(x);
@@ -261,7 +261,7 @@ mod tests {
         let up = CudaTensor::from_slice(&ctx, &[4], &up_data).unwrap();
 
         let output = gelu_mul(&gate, &up).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for i in 0..4 {
             let expected = gelu_ref(gate_data[i]) * up_data[i];
@@ -291,12 +291,17 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         let output = gelu(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result: Vec<f32> = output
+            .to_vec::<bf16>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
 
         let ref_data: Vec<f32> = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         for (i, &x) in ref_data.iter().enumerate() {
             let expected = gelu_ref(x);
-            let actual = result[i].to_f32();
+            let actual = result[i];
             assert!(
                 (actual - expected).abs() < 0.05,
                 "BF16 mismatch at {}: {} vs {}",

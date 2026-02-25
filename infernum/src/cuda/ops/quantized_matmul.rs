@@ -391,7 +391,6 @@ fn quantized_gemv(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor> {
-    let dtype = input.dtype();
     // Multi-warp GEMV: NWARPS warps per output row, K-split across all threads
     const NWARPS: u32 = 4;
 
@@ -559,7 +558,6 @@ fn quantized_matmul_2d(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor> {
-    let dtype = input.dtype();
     let device = input.context().device();
 
     let module_name = "quantized_matmul";
@@ -1038,7 +1036,7 @@ mod tests {
         let output = quantized_matmul(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[m, n]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Expected: row0 = [sum(1..32), 2*sum(1..32)] = [528, 1056]
         //           row1 = [sum(33..64), 2*sum(33..64)] = [1552, 3104]
@@ -1091,7 +1089,7 @@ mod tests {
             QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q4_0, &q_data, &q_scales).unwrap();
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Expected: 32 * 2.0 = 64.0, but Q4 has lower precision
         let expected = 64.0_f32;
@@ -1123,7 +1121,7 @@ mod tests {
         let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::F8E4M3, &w_fp8, &[]).unwrap();
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Expected: 1+2+3+4 = 10.0
         assert!(
@@ -1172,7 +1170,7 @@ mod tests {
         let weight =
             QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q8_0, &q_data, &q_scales).unwrap();
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Q8 should match within ~1e-2 relative error
         for i in 0..m * n {
@@ -1213,7 +1211,7 @@ mod tests {
         let output = quantized_matmul(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[batch, m, n]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         // Each batch: 32 * 1.0 = 32.0
         for &v in &result {
             assert!((v - 32.0).abs() < 1.0, "3D result: {} vs 32.0", v);
@@ -1258,7 +1256,7 @@ mod tests {
         let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q6_K, &q_data, &[]).unwrap();
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Expected: 256 * 2.0 = 512.0 (Q6_K has multi-level quantization so allow more error)
         let expected = 512.0_f32;
@@ -1310,7 +1308,7 @@ mod tests {
         let q_data = quantize_q6k_host(&w_data);
         let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q6_K, &q_data, &[]).unwrap();
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Q6_K has multi-level quantization so allow more error than Q8
         for i in 0..m * n {
@@ -1351,7 +1349,7 @@ mod tests {
 
         // M=1 → should dispatch to GEMV
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let expected = 512.0_f32;
         assert!(
@@ -1388,14 +1386,14 @@ mod tests {
         // M=1 path (GEMV)
         let input_1 = CudaTensor::from_slice(&ctx, &[1, k], &input_row).unwrap();
         let out_gemv = quantized_matmul(&input_1, &weight).unwrap();
-        let gemv_result = out_gemv.to_vec().unwrap();
+        let gemv_result = out_gemv.to_vec::<f32>().unwrap();
 
         // M=2 path (tiled matmul) — duplicate the row
         let mut input_2_data = input_row.clone();
         input_2_data.extend_from_slice(&input_row);
         let input_2 = CudaTensor::from_slice(&ctx, &[2, k], &input_2_data).unwrap();
         let out_tiled = quantized_matmul(&input_2, &weight).unwrap();
-        let tiled_result = out_tiled.to_vec().unwrap();
+        let tiled_result = out_tiled.to_vec::<f32>().unwrap();
 
         // Compute f32 reference: input_row @ dequant(w)^T
         let mut expected = vec![0.0_f32; n];
@@ -1455,7 +1453,7 @@ mod tests {
         let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q6_K, &q_data, &[]).unwrap();
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         assert_eq!(result.len(), n);
         for (i, &v) in result.iter().enumerate() {
@@ -1514,7 +1512,7 @@ mod tests {
         let weight =
             QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q4_0, &q_data, &q_scales).unwrap();
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Should match closely (only f32 rounding differences)
         for i in 0..m * n {
@@ -1629,13 +1627,13 @@ mod tests {
         }
         let w_gpu = CudaTensor::from_slice(&ctx, &[k, n], &w_transposed).unwrap();
         let expected_gpu = matmul(&input, &w_gpu).unwrap();
-        let expected = expected_gpu.to_vec().unwrap();
+        let expected = expected_gpu.to_vec::<f32>().unwrap();
 
         // Run quantized matmul
         let weight =
             QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q4_0, &q_data, &q_scales).unwrap();
         let result_gpu = quantized_matmul(&input, &weight).unwrap();
-        let result = result_gpu.to_vec().unwrap();
+        let result = result_gpu.to_vec::<f32>().unwrap();
 
         // Should match exactly (both use same dequantized values)
         for i in 0..m * n {
@@ -1731,7 +1729,7 @@ mod tests {
         let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::F8E4M3, &w_fp8, &[]).unwrap();
 
         let output = quantized_matmul_fp8_cublas(&ctx, &input, &weight, m, n, k).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let expected = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);
 
@@ -1778,7 +1776,7 @@ mod tests {
         weight.set_weight_scale(&ctx, weight_scale).unwrap();
 
         let output = quantized_matmul_fp8_cublas(&ctx, &input, &weight, m, n, k).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Reference: weight_scale multiplies the dequantized weights
         let ref_unscaled = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);
@@ -1823,7 +1821,7 @@ mod tests {
         let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::F8E4M3, &w_fp8, &[]).unwrap();
 
         let output = quantized_matmul_fp8_cublas(&ctx, &input, &weight, m, n, k).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let expected = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);
 
@@ -1867,7 +1865,7 @@ mod tests {
         let weight = QuantizedTensor::from_raw(&ctx, &[n, k], DType::F8E4M3, &w_fp8, &[]).unwrap();
 
         let output = quantized_matmul_fp8_cublas(&ctx, &input, &weight, m, n, k).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let expected = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);
 
@@ -1947,7 +1945,7 @@ mod tests {
         }
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result.len(), n);
 
         for i in 0..n {
@@ -2041,7 +2039,7 @@ mod tests {
         let weight =
             QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q4_0, &q4_data, &q4_scales).unwrap();
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result.len(), n);
 
         for i in 0..n {
@@ -2088,7 +2086,7 @@ mod tests {
         let input_m1 = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
         let gemv_result = quantized_matmul(&input_m1, &weight)
             .unwrap()
-            .to_vec()
+            .to_vec::<f32>()
             .unwrap();
 
         // M=2 with identical rows → uses GEMM path (f32 activations)
@@ -2100,7 +2098,7 @@ mod tests {
         let input_m2 = CudaTensor::from_slice(&ctx, &[2, k], &input_m2_data).unwrap();
         let gemm_result = quantized_matmul(&input_m2, &weight)
             .unwrap()
-            .to_vec()
+            .to_vec::<f32>()
             .unwrap();
 
         for i in 0..n {
@@ -2370,7 +2368,7 @@ mod tests {
         let output = quantized_matmul(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[m, n]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Expected: 128 * 2.0 = 256.0 (INT4 quantization adds some error)
         let expected = 256.0_f32;
@@ -2424,7 +2422,7 @@ mod tests {
         .unwrap();
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for i in 0..m * n {
             let diff = (result[i] - expected[i]).abs();
@@ -2482,7 +2480,7 @@ mod tests {
         let output = quantized_matmul(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, n]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for i in 0..n {
             let diff = (result[i] - expected[i]).abs();
@@ -2669,7 +2667,7 @@ mod tests {
         let output = quantized_matmul(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[m, n]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let expected = 256.0_f32;
         for (i, &v) in result.iter().enumerate() {
@@ -2721,7 +2719,7 @@ mod tests {
         .unwrap();
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for i in 0..m * n {
             let diff = (result[i] - expected[i]).abs();
@@ -2765,7 +2763,7 @@ mod tests {
         weight.set_channel_scales(&ctx, &channel_scales).unwrap();
 
         let output = quantized_matmul(&input, &weight).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Reference: matmul then per-channel scale
         let ref_unscaled = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);
@@ -2817,7 +2815,7 @@ mod tests {
         weight.set_channel_scales(&ctx, &channel_scales).unwrap();
 
         let output = quantized_matmul_fp8_cublas(&ctx, &input, &weight, m, n, k).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Reference: matmul then per-channel scale
         let ref_unscaled = fp8_matmul_reference(&input_data, &w_fp8, m, n, k);

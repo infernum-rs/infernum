@@ -400,7 +400,7 @@ mod tests {
         let v = CudaTensor::from_slice(&ctx, &[1, 1, 4], &[0.5, 0.5, 0.5, 0.5]).unwrap();
 
         let output = attention(&q, &k, &v, true).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Should output exactly V since there's only one token
         for (i, &val) in result.iter().enumerate() {
@@ -422,7 +422,8 @@ mod tests {
         let head_dim = 8;
         let seq_len = 4;
 
-        let mut kv_cache = crate::cuda::KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim).unwrap();
+        let mut kv_cache =
+            crate::cuda::KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim, DType::F32).unwrap();
 
         let q_data: Vec<f32> = (0..seq_len * num_heads * head_dim)
             .map(|x| (x as f32) * 0.01)
@@ -451,7 +452,8 @@ mod tests {
         let head_dim = 8;
         let prefill_len = 3;
 
-        let mut kv_cache = crate::cuda::KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim).unwrap();
+        let mut kv_cache =
+            crate::cuda::KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Prefill
         let q_data: Vec<f32> = (0..prefill_len * num_heads * head_dim)
@@ -499,13 +501,16 @@ mod tests {
         let v = CudaTensor::from_slice(&ctx, &[1, 1, 4], &[0.5, 0.5, 0.5, 0.5]).unwrap();
 
         // Regular attention
-        let expected = attention(&q, &k, &v, true).unwrap().to_vec().unwrap();
+        let expected = attention(&q, &k, &v, true)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
 
         // KV-cache attention
-        let mut kv_cache = crate::cuda::KvCache::new(&ctx, 1, 32, 1, 4).unwrap();
+        let mut kv_cache = crate::cuda::KvCache::new(&ctx, 1, 32, 1, 4, DType::F32).unwrap();
         let actual = attention_kv(&q, &mut kv_cache, 0, &k, &v)
             .unwrap()
-            .to_vec()
+            .to_vec::<f32>()
             .unwrap();
 
         for (i, (&e, &a)) in expected.iter().zip(actual.iter()).enumerate() {

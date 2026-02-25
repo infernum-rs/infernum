@@ -234,7 +234,7 @@ mod tests {
 
         assert_eq!(transposed.shape(), &[3, 2]);
 
-        let result = transposed.to_vec().unwrap();
+        let result = transposed.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 
@@ -257,7 +257,7 @@ mod tests {
 
         assert_eq!(transposed.shape(), &[3, 2, 2]);
 
-        let result = transposed.to_vec().unwrap();
+        let result = transposed.to_vec::<f32>().unwrap();
         // (b, a, c): (0,0,*)=1,2  (0,1,*)=7,8  (1,0,*)=3,4  (1,1,*)=9,10  (2,0,*)=5,6  (2,1,*)=11,12
         assert_eq!(
             result,
@@ -277,7 +277,7 @@ mod tests {
 
         assert_eq!(transposed.shape(), &[2, 4, 3]);
 
-        let result = transposed.to_vec().unwrap();
+        let result = transposed.to_vec::<f32>().unwrap();
 
         // Verify a few elements:
         // src(0, 0, 0) = 0.0 -> dst(0, 0, 0) = 0.0
@@ -298,7 +298,7 @@ mod tests {
         let roundtrip = transpose_2d(&transpose_2d(&tensor).unwrap()).unwrap();
 
         assert_eq!(roundtrip.shape(), &[3, 4]);
-        assert_eq!(roundtrip.to_vec().unwrap(), data);
+        assert_eq!(roundtrip.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
         let roundtrip = transpose_012_to_102(&transpose_012_to_102(&tensor).unwrap()).unwrap();
 
         assert_eq!(roundtrip.shape(), &[2, 3, 4]);
-        assert_eq!(roundtrip.to_vec().unwrap(), data);
+        assert_eq!(roundtrip.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -324,7 +324,7 @@ mod tests {
         let roundtrip = transpose_last_two(&transpose_last_two(&tensor).unwrap()).unwrap();
 
         assert_eq!(roundtrip.shape(), &[2, 3, 4]);
-        assert_eq!(roundtrip.to_vec().unwrap(), data);
+        assert_eq!(roundtrip.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -341,7 +341,7 @@ mod tests {
 
         assert_eq!(transposed.shape(), &[3, 2]);
 
-        let result = transposed.to_vec().unwrap();
+        let result = transposed.to_vec::<half::bf16>().unwrap();
         let expected: Vec<half::bf16> = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
             .into_iter()
             .map(half::bf16::from_f32)
@@ -359,6 +359,6 @@ mod tests {
         let roundtrip = transpose_2d_bf16(&transpose_2d_bf16(&tensor).unwrap()).unwrap();
 
         assert_eq!(roundtrip.shape(), &[3, 4]);
-        assert_eq!(roundtrip.to_vec().unwrap(), data);
+        assert_eq!(roundtrip.to_vec::<half::bf16>().unwrap(), data);
     }
 }

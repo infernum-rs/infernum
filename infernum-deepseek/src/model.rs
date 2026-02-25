@@ -114,7 +114,7 @@ fn split_kv_b_proj_dense(
         num_heads * stride
     );
 
-    let data = weight.to_raw_bytes();
+    let data = weight.to_raw_bytes()?;
 
     // Extract K-nope columns: shape (kv_lora_rank, num_heads * qk_nope_dim)
     let k_cols = num_heads * qk_nope_dim;
@@ -343,7 +343,7 @@ impl DeepSeekModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     if scale_val.len() == 1 {
                         qt.set_weight_scale(ctx, scale_val[0])?;
                     } else {
@@ -358,7 +358,7 @@ impl DeepSeekModel {
                     Ok(LinearWeight::Dense(transposed))
                 } else {
                     let native = load_typed(model_dtype, loader, ctx, name)?;
-                    let raw = native.to_raw_bytes();
+                    let raw = native.to_raw_bytes()?;
                     let shape = native.shape();
                     let rows = shape[0];
                     let cols = shape[1];
@@ -492,7 +492,7 @@ impl DeepSeekModel {
                 // Bias correction
                 let bias_name = format!("{prefix}.mlp.gate.e_score_correction_bias");
                 let e_score_correction_bias = if loader.contains(&bias_name) {
-                    loader.load_f32(ctx, &bias_name)?.to_vec()?
+                    loader.load_f32(ctx, &bias_name)?.to_vec::<f32>()?
                 } else {
                     vec![0.0_f32; num_experts]
                 };
@@ -731,7 +731,7 @@ impl DeepSeekModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     if scale_val.len() == 1 {
                         qt.set_weight_scale(ctx, scale_val[0])?;
                     } else {
@@ -747,7 +747,7 @@ impl DeepSeekModel {
                 } else {
                     let native =
                         load_typed_sharded(model_dtype, loader, ctx, name, shard, strategy)?;
-                    let raw = native.to_raw_bytes();
+                    let raw = native.to_raw_bytes()?;
                     let shape = native.shape();
                     let rows = shape[0];
                     let cols = shape[1];
@@ -911,7 +911,7 @@ impl DeepSeekModel {
                 // Bias correction: replicated
                 let bias_name = format!("{prefix}.mlp.gate.e_score_correction_bias");
                 let e_score_correction_bias = if loader.contains(&bias_name) {
-                    loader.load_f32(ctx, &bias_name)?.to_vec()?
+                    loader.load_f32(ctx, &bias_name)?.to_vec::<f32>()?
                 } else {
                     vec![0.0_f32; num_experts]
                 };
@@ -1296,7 +1296,7 @@ impl DeepSeekModel {
         for b in 0..batch_size {
             let q_b = q_nope.slice_view(b * item_elems, &[num_heads, 1, d]);
             let out_b = matmul(&q_b, kv_b_proj_k_t)?; // (H, 1, R)
-            all_bytes.extend_from_slice(&out_b.to_raw_bytes());
+            all_bytes.extend_from_slice(&out_b.to_raw_bytes()?);
         }
         CudaTensor::from_raw_bytes(
             q_nope.context(),
@@ -1327,7 +1327,7 @@ impl DeepSeekModel {
         for b in 0..batch_size {
             let a_b = attn_nope.slice_view(b * item_elems, &[num_heads, 1, r]);
             let out_b = matmul(&a_b, kv_b_proj_v)?; // (H, 1, V)
-            all_bytes.extend_from_slice(&out_b.to_raw_bytes());
+            all_bytes.extend_from_slice(&out_b.to_raw_bytes()?);
         }
         CudaTensor::from_raw_bytes(
             attn_nope.context(),
@@ -2208,6 +2208,7 @@ impl infernum::Model for DeepSeekModel {
             num_kv_heads: 1,
             head_dim: config.kv_lora_rank + config.qk_rope_head_dim,
             eos_token_id: config.eos_token_id,
+            cache_dtype: self.dtype,
         }
     }
 
@@ -2394,8 +2395,8 @@ mod tests {
         let (k, v, _) =
             split_kv_b_proj_dense(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim).unwrap();
 
-        let k_data = k.to_vec().unwrap();
-        let v_data = v.to_vec().unwrap();
+        let k_data = k.to_vec::<f32>().unwrap();
+        let v_data = v.to_vec::<f32>().unwrap();
 
         // Reconstruct the original by interleaving K and V columns back
         // K is (kv_lora_rank, num_heads * qk_nope_dim), V is (num_heads, kv_lora_rank, v_head_dim)
@@ -2443,8 +2444,8 @@ mod tests {
         let k_cols = num_heads * qk_nope_dim;
         assert_eq!(k_t.shape(), &[num_heads, qk_nope_dim, kv_lora_rank]);
 
-        let k_data = k.to_vec().unwrap();
-        let k_t_data = k_t.to_vec().unwrap();
+        let k_data = k.to_vec::<f32>().unwrap();
+        let k_t_data = k_t.to_vec::<f32>().unwrap();
 
         // Verify k_t[h][d][r] == k[r][h * qk_nope_dim + d] (per-head transpose)
         for h in 0..num_heads {

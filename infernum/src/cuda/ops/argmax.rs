@@ -11,6 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::{CudaContext, CudaTensor};
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -35,7 +36,7 @@ pub fn argmax_last(input: &CudaTensor) -> Result<Vec<u32>> {
     let ctx = input.context();
 
     let output = argmax_last_gpu(ctx, input, num_rows, row_size)?;
-    output.to_vec()
+    output.to_vec::<u32>()
 }
 
 /// Compute argmax of the **last row** of a 2D logits tensor, returning a

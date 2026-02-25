@@ -23,11 +23,11 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/add_rmsnorm.pt
 
 const KERNEL_NAMES: &[&str] = &["add_rmsnorm_f32", "add_rmsnorm_f16", "add_rmsnorm_bf16"];
 
-fn kernel_suffix() -> &'static str {
-    match T::DTYPE {
-        crate::dtype::DType::F32 => "f32",
-        crate::dtype::DType::F16 => "f16",
-        crate::dtype::DType::BF16 => "bf16",
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
         other => panic!("add_rmsnorm not supported for dtype: {other}"),
     }
 }
@@ -124,8 +124,8 @@ mod tests {
 
         let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
 
-        let sum_result = sum.to_vec().unwrap();
-        let normed_result = normed.to_vec().unwrap();
+        let sum_result = sum.to_vec::<f32>().unwrap();
+        let normed_result = normed.to_vec::<f32>().unwrap();
 
         for i in 0..8 {
             let expected = residual_data[i] + x_data[i];
@@ -176,9 +176,14 @@ mod tests {
 
         let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
 
-        let sum_result: Vec<f32> = sum.to_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let sum_result: Vec<f32> = sum
+            .to_vec::<half::bf16>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         let normed_result: Vec<f32> = normed
-            .to_vec()
+            .to_vec::<half::bf16>()
             .unwrap()
             .iter()
             .map(|v| v.to_f32())
@@ -228,8 +233,8 @@ mod tests {
 
         let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
 
-        let sum_result = sum.to_vec().unwrap();
-        let normed_result = normed.to_vec().unwrap();
+        let sum_result = sum.to_vec::<f32>().unwrap();
+        let normed_result = normed.to_vec::<f32>().unwrap();
 
         let expected_sum: Vec<f32> = residual_data
             .iter()

@@ -565,8 +565,8 @@ mod tests {
         assert_eq!(k_out.shape(), &[1, num_kv_heads, head_dim]);
         assert_eq!(v_out.shape(), &[1, num_kv_heads, head_dim]);
 
-        let k_result: Vec<f32> = k_out.to_vec().unwrap();
-        let v_result: Vec<f32> = v_out.to_vec().unwrap();
+        let k_result: Vec<f32> = k_out.to_vec::<f32>().unwrap();
+        let v_result: Vec<f32> = v_out.to_vec::<f32>().unwrap();
         assert_eq!(k_result, k_data);
         assert_eq!(v_result, v_data);
     }
@@ -598,8 +598,8 @@ mod tests {
         let (k_out, v_out) = cache.get(0);
         assert_eq!(k_out.shape(), &[3, num_kv_heads, head_dim]);
 
-        let k_result: Vec<f32> = k_out.to_vec().unwrap();
-        let v_result: Vec<f32> = v_out.to_vec().unwrap();
+        let k_result: Vec<f32> = k_out.to_vec::<f32>().unwrap();
+        let v_result: Vec<f32> = v_out.to_vec::<f32>().unwrap();
         assert_eq!(k_result, k_data);
         assert_eq!(v_result, v_data);
     }
@@ -628,10 +628,10 @@ mod tests {
         let (k_out, v_out) = cache.get(0);
         assert_eq!(k_out.shape(), &[2, 1, 2]);
 
-        let k_result: Vec<f32> = k_out.to_vec().unwrap();
+        let k_result: Vec<f32> = k_out.to_vec::<f32>().unwrap();
         assert_eq!(k_result, vec![1.0, 2.0, 3.0, 4.0]);
 
-        let v_result: Vec<f32> = v_out.to_vec().unwrap();
+        let v_result: Vec<f32> = v_out.to_vec::<f32>().unwrap();
         assert_eq!(v_result, vec![10.0, 20.0, 30.0, 40.0]);
     }
 

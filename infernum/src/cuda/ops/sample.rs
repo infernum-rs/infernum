@@ -10,6 +10,8 @@
     clippy::missing_panics_doc
 )]
 
+use cudarc::driver::DevicePtr;
+
 use crate::cuda::CudaTensor;
 use crate::tensor::Tensor;
 use crate::Result;
@@ -52,12 +54,22 @@ pub fn sample_top_p(
     let seq_len = logits.shape()[0];
     let vocab_size = logits.shape()[1];
 
-    // Copy only the last row from GPU to CPU
-    let last_row_offset = (seq_len - 1) * vocab_size;
+    // Copy only the last row from GPU to CPU (logits are always f32)
+    let elem_size = std::mem::size_of::<f32>();
+    let last_row_byte_offset = (seq_len - 1) * vocab_size * elem_size;
+    let last_row_bytes = vocab_size * elem_size;
     let last_row_gpu = logits
         .cuda_slice()
-        .slice(last_row_offset..seq_len * vocab_size);
-    let last_row = logits.context().device().dtoh_sync_copy(&last_row_gpu)?;
+        .slice(last_row_byte_offset..last_row_byte_offset + last_row_bytes);
+    let raw_ptr = *last_row_gpu.device_ptr();
+    let typed_slice: cudarc::driver::CudaSlice<f32> = unsafe {
+        logits
+            .context()
+            .device()
+            .upgrade_device_ptr(raw_ptr, vocab_size)
+    };
+    let last_row = logits.context().device().dtoh_sync_copy(&typed_slice)?;
+    std::mem::forget(typed_slice);
 
     Ok(sample_from_logits(
         &last_row,

@@ -152,7 +152,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 3]);
 
-        let result = c.to_vec().unwrap();
+        let result = c.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
     }
 
@@ -168,7 +168,7 @@ mod tests {
         let b = CudaTensor::from_slice(&ctx, &[n], &b_data).unwrap();
 
         let c = add(&a, &b).unwrap();
-        let result = c.to_vec().unwrap();
+        let result = c.to_vec::<f32>().unwrap();
 
         for i in 0..n {
             assert!(
@@ -192,7 +192,7 @@ mod tests {
 
         assert_eq!(a.shape(), &[2, 3]);
 
-        let result = a.to_vec().unwrap();
+        let result = a.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
     }
 }

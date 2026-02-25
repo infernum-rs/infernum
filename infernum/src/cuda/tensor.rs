@@ -222,11 +222,11 @@ impl CudaTensor {
         let view = slice.slice(self.offset_bytes..self.offset_bytes + byte_size);
         // Reinterpret u8 view as typed for dtoh copy
         let raw_ptr = *view.device_ptr();
-        let typed_view: cudarc::driver::CudaView<'_, T> =
+        let typed_slice: cudarc::driver::CudaSlice<T> =
             unsafe { self.ctx.device().upgrade_device_ptr(raw_ptr, self.numel()) };
-        let data = self.ctx.device().dtoh_sync_copy(&typed_view)?;
-        // Leak the upgraded view — we don't own this memory
-        std::mem::forget(typed_view);
+        let data = self.ctx.device().dtoh_sync_copy(&typed_slice)?;
+        // Leak the upgraded slice — we don't own this memory
+        std::mem::forget(typed_slice);
         Ok(data)
     }
 
@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(tensor.numel(), 6);
         assert_eq!(tensor.ndim(), 2);
 
-        let result: Vec<f32> = tensor.to_vec().expect("Failed to copy back to host");
+        let result: Vec<f32> = tensor.to_vec::<f32>().expect("Failed to copy back to host");
         assert_eq!(result, data);
     }
 
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(tensor.shape(), &[3, 4]);
         assert_eq!(tensor.numel(), 12);
 
-        let result: Vec<f32> = tensor.to_vec().expect("Failed to copy back");
+        let result: Vec<f32> = tensor.to_vec::<f32>().expect("Failed to copy back");
         assert!(result.iter().all(|&x| x == 0.0));
     }
 
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(reshaped.shape(), &[6, 4]);
         assert_eq!(reshaped.numel(), 24);
 
-        let result: Vec<f32> = reshaped.to_vec().expect("Failed to copy back");
+        let result: Vec<f32> = reshaped.to_vec::<f32>().expect("Failed to copy back");
         assert_eq!(result, data);
     }
 
@@ -569,7 +569,7 @@ mod tests {
             .htod_sync_copy_into(src_bytes, t.cuda_slice_mut())
             .unwrap();
 
-        let result: Vec<f32> = t.to_vec().unwrap();
+        let result: Vec<f32> = t.to_vec::<f32>().unwrap();
         assert_eq!(result, src);
     }
 
@@ -619,7 +619,7 @@ mod tests {
         // First zeros: pool miss (allocates fresh, then zeros)
         let t1 = CudaTensor::zeros(&ctx, &[2, 4], DType::F32).unwrap();
         assert_eq!(pool.misses(), 1);
-        let data: Vec<f32> = t1.to_vec().unwrap();
+        let data: Vec<f32> = t1.to_vec::<f32>().unwrap();
         assert!(data.iter().all(|&x| x == 0.0));
 
         let ptr1 = t1.device_ptr();
@@ -629,7 +629,7 @@ mod tests {
         let t2 = CudaTensor::zeros(&ctx, &[2, 4], DType::F32).unwrap();
         assert_eq!(pool.hits(), 1);
         assert_eq!(t2.device_ptr(), ptr1);
-        let data: Vec<f32> = t2.to_vec().unwrap();
+        let data: Vec<f32> = t2.to_vec::<f32>().unwrap();
         assert!(data.iter().all(|&x| x == 0.0));
     }
 

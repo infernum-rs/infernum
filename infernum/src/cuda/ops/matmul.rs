@@ -274,7 +274,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 4]);
 
-        let result: Vec<f32> = c.to_vec().unwrap();
+        let result: Vec<f32> = c.to_vec::<f32>().unwrap();
 
         let expected: Vec<f32> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0];
         assert_eq!(result, expected);
@@ -294,7 +294,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 1, 1]);
 
-        let result: Vec<f32> = c.to_vec().unwrap();
+        let result: Vec<f32> = c.to_vec::<f32>().unwrap();
         assert!((result[0] - 11.0).abs() < 1e-4);
         assert!((result[1] - 83.0).abs() < 1e-4);
     }
@@ -322,7 +322,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 2, 2]);
 
-        let result: Vec<f32> = c.to_vec().unwrap();
+        let result: Vec<f32> = c.to_vec::<f32>().unwrap();
         assert!((result[0] - 1.0).abs() < 1e-4);
         assert!((result[1] - 2.0).abs() < 1e-4);
         assert!((result[2] - 3.0).abs() < 1e-4);
@@ -347,7 +347,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 3]);
 
-        let result: Vec<f32> = c.to_vec().unwrap();
+        let result: Vec<f32> = c.to_vec::<f32>().unwrap();
         for (idx, (&got, &exp)) in result.iter().zip(a_data.iter()).enumerate() {
             assert!(
                 (got - exp).abs() < 1e-5,
@@ -378,7 +378,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 4]);
 
-        let result: Vec<f32> = c.to_vec().unwrap();
+        let result: Vec<f32> = c.to_vec::<f32>().unwrap();
         let expected: Vec<f32> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((got - exp).abs() < 0.5, "Mismatch at {i}: {got} vs {exp}");
@@ -407,7 +407,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 4]);
 
-        let result: Vec<half::f16> = c.to_vec().unwrap();
+        let result: Vec<half::f16> = c.to_vec::<half::f16>().unwrap();
         let expected: Vec<half::f16> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]
             .into_iter()
             .map(half::f16::from_f32)
@@ -443,7 +443,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 4]);
 
-        let result: Vec<half::bf16> = c.to_vec().unwrap();
+        let result: Vec<half::bf16> = c.to_vec::<half::bf16>().unwrap();
         let expected: Vec<half::bf16> = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]
             .into_iter()
             .map(half::bf16::from_f32)

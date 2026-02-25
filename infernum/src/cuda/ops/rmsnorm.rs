@@ -25,11 +25,11 @@ const KERNEL_NAMES: &[&str] = &[
     "rmsnorm_inplace_bf16",
 ];
 
-fn kernel_suffix() -> &'static str {
-    match T::DTYPE {
-        crate::dtype::DType::F32 => "f32",
-        crate::dtype::DType::F16 => "f16",
-        crate::dtype::DType::BF16 => "bf16",
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
         other => panic!("RMS norm not supported for dtype: {other}"),
     }
 }
@@ -182,7 +182,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[2, 4]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Row 0: rms = sqrt((1+4+9+16)/4) = sqrt(7.5) ≈ 2.739
         // Row 0 normalized: [0.365, 0.730, 1.095, 1.461]
@@ -215,7 +215,7 @@ mod tests {
         let weight = CudaTensor::from_slice(&ctx, &[hidden_size], &weight_data).unwrap();
 
         let output = rms_norm(&input, &weight, 1e-6).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let sum_sq: f32 = input_data.iter().map(|x| x * x).sum();
         let rms = (sum_sq / hidden_size as f32).sqrt();
@@ -246,14 +246,14 @@ mod tests {
         let weight = CudaTensor::from_slice(&ctx, &[4], &weight_data).unwrap();
         let expected = rms_norm(&input_ref, &weight, 1e-6)
             .unwrap()
-            .to_vec()
+            .to_vec::<f32>()
             .unwrap();
 
         // Compute with in-place version
         let mut input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
         rms_norm_inplace(&mut input, &weight, 1e-6).unwrap();
 
-        let result = input.to_vec().unwrap();
+        let result = input.to_vec::<f32>().unwrap();
 
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(

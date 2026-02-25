@@ -97,7 +97,7 @@ fn unpermute_f32(weight: &CudaTensor, n_head: usize) -> Result<CudaTensor> {
     let head_dim = n_rows / n_head;
     let half_dim = head_dim / 2;
 
-    let data = weight.to_vec()?;
+    let data = weight.to_vec::<f32>()?;
     let mut out = vec![0.0_f32; data.len()];
 
     for h in 0..n_head {
@@ -349,7 +349,7 @@ impl LlamaModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     if scale_val.len() == 1 {
                         // Per-tensor scale (single scalar)
                         qt.set_weight_scale(ctx, scale_val[0])?;
@@ -592,7 +592,7 @@ impl LlamaModel {
                 // Quantize embedding table to Q8_0 for fast decode GEMV.
                 // Shape is [vocab_size, hidden_dim] — already (N, K) for quantized_matmul.
                 let embed_f32 = cast_to_f32(&embed_tokens)?;
-                let data = embed_f32.to_vec()?;
+                let data = embed_f32.to_vec::<f32>()?;
                 LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
                     ctx,
                     embed_f32.shape(),
@@ -608,7 +608,7 @@ impl LlamaModel {
             if qc.is_some() {
                 if let LinearWeight::Dense(ref w) = lw {
                     let f32_w = cast_to_f32(w)?;
-                    let data = f32_w.to_vec()?;
+                    let data = f32_w.to_vec::<f32>()?;
                     // Untranspose: dense lm_head is [K, N] (pretransposed),
                     // but quantized_matmul expects [N, K] (row-major weights).
                     let k = f32_w.shape()[0];
@@ -725,7 +725,7 @@ impl LlamaModel {
                 let scale_name = format!("{name}_scale");
                 if loader.contains(&scale_name) {
                     let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec()?;
+                    let scale_val = scale_tensor.to_vec::<f32>()?;
                     qt.set_weight_scale(ctx, scale_val[0])?;
                 }
                 Ok(LinearWeight::Quantized(qt))
@@ -2002,6 +2002,7 @@ impl infernum::Model for LlamaModel {
             num_kv_heads: self.tp_num_kv_heads,
             head_dim: config.head_dim(),
             eos_token_id: config.eos_token_id,
+            cache_dtype: self.dtype,
         }
     }
 
@@ -2136,7 +2137,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[2, 4]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         // row 0: [1, 2, 3, 6], row 1: [4, 5, 6, 15]
         assert!((result[0] - 1.0).abs() < 1e-4);
         assert!((result[1] - 2.0).abs() < 1e-4);
@@ -2181,7 +2182,7 @@ mod tests {
         assert_eq!(output.shape(), &[2, 4]);
 
         let result: Vec<f32> = output
-            .to_vec()
+            .to_vec::<half::bf16>()
             .unwrap()
             .into_iter()
             .map(half::bf16::to_f32)
@@ -2669,7 +2670,7 @@ mod tests {
         let output = linear(&input, &weight).unwrap();
         assert_eq!(output.shape(), &[1, n]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         let expected = 32.0_f32;
         for (i, &v) in result.iter().enumerate() {
             assert!(
@@ -2698,7 +2699,7 @@ mod tests {
         let logits = model.forward(&[0]).expect("Forward pass failed");
         assert_eq!(logits.shape(), &[1, 64]);
 
-        let data = logits.to_vec().unwrap();
+        let data = logits.to_vec::<f32>().unwrap();
         assert!(
             data.iter().all(|x| x.is_finite()),
             "Logits contain non-finite values"
@@ -2711,8 +2712,8 @@ mod tests {
         let model = build_tiny_gptq_model(&ctx);
 
         let input_ids: Vec<u32> = vec![1, 5, 10];
-        let logits1 = model.forward(&input_ids).unwrap().to_vec().unwrap();
-        let logits2 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+        let logits1 = model.forward(&input_ids).unwrap().to_vec::<f32>().unwrap();
+        let logits2 = model.forward(&input_ids).unwrap().to_vec::<f32>().unwrap();
 
         for (i, (a, b)) in logits1.iter().zip(logits2.iter()).enumerate() {
             assert!(
@@ -2766,7 +2767,7 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 64]);
 
         // Logits should be finite
-        let data = logits.to_vec().unwrap();
+        let data = logits.to_vec::<f32>().unwrap();
         assert!(
             data.iter().all(|x| x.is_finite()),
             "Logits contain non-finite values"
@@ -2779,8 +2780,8 @@ mod tests {
         let model = build_tiny_model(&ctx);
 
         let input_ids: Vec<u32> = vec![1, 5, 10];
-        let logits1 = model.forward(&input_ids).unwrap().to_vec().unwrap();
-        let logits2 = model.forward(&input_ids).unwrap().to_vec().unwrap();
+        let logits1 = model.forward(&input_ids).unwrap().to_vec::<f32>().unwrap();
+        let logits2 = model.forward(&input_ids).unwrap().to_vec::<f32>().unwrap();
 
         for (i, (a, b)) in logits1.iter().zip(logits2.iter()).enumerate() {
             assert!(
@@ -2947,7 +2948,10 @@ mod tests {
         );
         let input_data: Vec<f32> = (0..k).map(|i| i as f32 * 0.1).collect();
         let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
-        let full_output = linear(&input, &full_weight).unwrap().to_vec().unwrap();
+        let full_output = linear(&input, &full_weight)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
 
         // Column-sharded: split qweight, scales, qzeros along N
         let mut shard_outputs = Vec::new();
@@ -2974,7 +2978,10 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let shard_out = linear(&input, &shard_weight).unwrap().to_vec().unwrap();
+            let shard_out = linear(&input, &shard_weight)
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
             assert_eq!(shard_out.len(), n_shard);
             shard_outputs.extend(shard_out);
         }
@@ -3018,7 +3025,10 @@ mod tests {
         );
         let input_data: Vec<f32> = (0..k).map(|i| i as f32 * 0.1).collect();
         let input = CudaTensor::from_slice(&ctx, &[1, k], &input_data).unwrap();
-        let full_output = linear(&input, &full_weight).unwrap().to_vec().unwrap();
+        let full_output = linear(&input, &full_weight)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
 
         // Row-sharded: split qweight, scales, qzeros along K
         let mut summed = vec![0.0_f32; n];
@@ -3054,7 +3064,7 @@ mod tests {
                 CudaTensor::from_slice(&ctx, &[1, k_shard], &input_shard_data).unwrap();
             let shard_out = linear(&input_shard, &shard_weight)
                 .unwrap()
-                .to_vec()
+                .to_vec::<f32>()
                 .unwrap();
 
             for (j, v) in shard_out.iter().enumerate() {

@@ -166,7 +166,7 @@ mod tests {
         let output = bias_add(&input, &bias).unwrap();
 
         assert_eq!(output.shape(), &[2, 3]);
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
     }
 
@@ -181,7 +181,7 @@ mod tests {
         let bias = CudaTensor::from_slice(&ctx, &[3], &bias_data).unwrap();
 
         let output = bias_add(&input, &bias).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, input_data);
     }
 
@@ -196,7 +196,7 @@ mod tests {
         let bias = CudaTensor::from_slice(&ctx, &[4], &bias_data).unwrap();
 
         let output = bias_add(&input, &bias).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![1.5, 1.5, 4.0, 3.0]);
     }
 
@@ -213,7 +213,7 @@ mod tests {
         bias_add_inplace(&mut input, &bias).unwrap();
 
         assert_eq!(input.shape(), &[2, 3]);
-        let result = input.to_vec().unwrap();
+        let result = input.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
     }
 
@@ -230,7 +230,7 @@ mod tests {
         let bias = CudaTensor::from_slice(&ctx, &[cols], &bias_data).unwrap();
 
         let output = bias_add(&input, &bias).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for r in 0..rows {
             for c in 0..cols {

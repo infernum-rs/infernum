@@ -137,8 +137,8 @@ fn launch_routing_kernel(
     }
 
     // Small DtoH: only top_k values (e.g. 8 × 4 + 8 × 4 = 64 bytes)
-    let indices = out_indices.to_vec()?;
-    let weights = out_weights.to_vec()?;
+    let indices: Vec<u32> = out_indices.to_vec()?;
+    let weights: Vec<f32> = out_weights.to_vec()?;
 
     Ok(GpuRouting {
         expert_indices: indices,

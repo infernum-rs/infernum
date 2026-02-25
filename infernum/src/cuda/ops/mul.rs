@@ -133,7 +133,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 3]);
 
-        let result = c.to_vec().unwrap();
+        let result = c.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![10.0, 40.0, 90.0, 160.0, 250.0, 360.0]);
     }
 
@@ -149,7 +149,7 @@ mod tests {
         let b = CudaTensor::from_slice(&ctx, &[n], &b_data).unwrap();
 
         let c = mul(&a, &b).unwrap();
-        let result = c.to_vec().unwrap();
+        let result = c.to_vec::<f32>().unwrap();
 
         for i in 0..n {
             let expected = (i as f32) * (i as f32 * 2.0);
