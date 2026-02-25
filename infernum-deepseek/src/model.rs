@@ -266,6 +266,10 @@ struct DenseMlpWeights<T: TensorDType> {
 struct MoeWeights<T: TensorDType> {
     gate_weight: CudaTensor<T>,
     e_score_correction_bias: Vec<f32>,
+    /// GPU-resident copy of the bias for the sigmoid routing kernel.
+    e_score_correction_bias_gpu: CudaTensor<f32>,
+    /// Pre-allocated GPU buffers for routing output, reused across decode steps.
+    routing_bufs: std::sync::Mutex<infernum::cuda::ops::GpuRoutingBuffers>,
     experts: Vec<DenseMlpWeights<T>>,
     shared_expert: DenseMlpWeights<T>,
 }
@@ -555,9 +559,21 @@ where
                     )?,
                 };
 
+                let e_score_correction_bias_gpu = CudaTensor::from_slice(
+                    ctx,
+                    &[e_score_correction_bias.len()],
+                    &e_score_correction_bias,
+                )?;
+
+                let routing_bufs = std::sync::Mutex::new(
+                    infernum::cuda::ops::GpuRoutingBuffers::new(ctx, config.num_experts_per_tok)?,
+                );
+
                 FfnWeights::Moe(Box::new(MoeWeights {
                     gate_weight,
                     e_score_correction_bias,
+                    e_score_correction_bias_gpu,
+                    routing_bufs,
                     experts,
                     shared_expert,
                 }))
@@ -969,9 +985,21 @@ where
                     )?,
                 };
 
+                let e_score_correction_bias_gpu = CudaTensor::from_slice(
+                    ctx,
+                    &[e_score_correction_bias.len()],
+                    &e_score_correction_bias,
+                )?;
+
+                let routing_bufs = std::sync::Mutex::new(
+                    infernum::cuda::ops::GpuRoutingBuffers::new(ctx, config.num_experts_per_tok)?,
+                );
+
                 FfnWeights::Moe(Box::new(MoeWeights {
                     gate_weight,
                     e_score_correction_bias,
+                    e_score_correction_bias_gpu,
+                    routing_bufs,
                     experts,
                     shared_expert,
                 }))
@@ -1547,16 +1575,19 @@ where
     ) -> Result<CudaTensor<T>> {
         let num_experts = moe_weights.experts.len();
 
-        let mut routed_output = infernum::cuda::moe::moe_forward_sigmoid(
+        let mut routing_bufs = moe_weights.routing_bufs.lock().unwrap();
+        let mut routed_output = infernum::cuda::moe::moe_forward_sigmoid_gpu(
             hidden,
             &moe_weights.gate_weight,
             &moe_weights.e_score_correction_bias,
+            &moe_weights.e_score_correction_bias_gpu,
             num_experts,
             self.config.num_experts_per_tok,
             self.config.n_group,
             self.config.topk_group,
             self.config.norm_topk_prob,
             self.config.routed_scaling_factor,
+            &mut routing_bufs,
             |expert_idx, expert_input| {
                 self.forward_mlp_no_reduce(expert_input, &moe_weights.experts[expert_idx])
             },

@@ -13,6 +13,7 @@ mod gelu;
 mod linear;
 mod matmul;
 mod mla_tensor_ops;
+mod moe_routing;
 mod mul;
 mod paged_attention;
 mod quantized_matmul;
@@ -42,6 +43,7 @@ pub use gelu::{gelu, gelu_inplace, gelu_mul};
 pub use linear::{linear, reinterpret_tensor, LinearWeight};
 pub use matmul::{matmul, matmul_bf16_f32, GemmScalar};
 pub use mla_tensor_ops::{broadcast_to_heads, concat_inner_dim, pad_inner_dim, split_inner_dim};
+pub use moe_routing::{moe_route_sigmoid_gpu, GpuRouting, GpuRoutingBuffers};
 pub use mul::{mul, scale_f32_inplace};
 pub use paged_attention::{
     gather_paged_kv, paged_attention_decode, paged_attention_decode_indirect,

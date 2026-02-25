@@ -13,6 +13,7 @@ use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
 
 use super::ops::{
     add_inplace, cast_f32_to_bf16, cast_to_f32, matmul, reinterpret_tensor, scale_f32_inplace,
+    GpuRouting, GpuRoutingBuffers,
 };
 use super::CudaTensor;
 use crate::dtype::{DType, TensorDType};
@@ -164,6 +165,37 @@ where
 
     for &(expert_idx, weight) in assignments {
         let expert_out = expert_fn(expert_idx, hidden)?;
+        let mut out_f32 = cast_to_f32(&expert_out)?;
+        scale_f32_inplace(&mut out_f32, weight)?;
+        add_inplace(&mut accum, &out_f32)?;
+    }
+
+    match T::DTYPE {
+        DType::F32 => Ok(reinterpret_tensor(accum)),
+        DType::BF16 => Ok(reinterpret_tensor(cast_f32_to_bf16(&accum)?)),
+        other => panic!("MoE decode not supported for dtype {other}"),
+    }
+}
+
+/// Decode fast path using GPU-computed routing results.
+///
+/// Same as `decode_moe` but takes `GpuRouting` (indices as `u32`) directly.
+fn decode_moe_gpu<T, F>(
+    hidden: &CudaTensor<T>,
+    routing: &GpuRouting,
+    expert_fn: &F,
+) -> Result<CudaTensor<T>>
+where
+    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default,
+    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+{
+    let hidden_size = hidden.shape()[1];
+    let ctx = hidden.context();
+
+    let mut accum: CudaTensor<f32> = CudaTensor::zeros(ctx, &[1, hidden_size])?;
+
+    for (&expert_idx, &weight) in routing.expert_indices.iter().zip(&routing.expert_weights) {
+        let expert_out = expert_fn(expert_idx as usize, hidden)?;
         let mut out_f32 = cast_to_f32(&expert_out)?;
         scale_f32_inplace(&mut out_f32, weight)?;
         add_inplace(&mut accum, &out_f32)?;
@@ -398,6 +430,74 @@ where
     if seq_len == 1 {
         decode_moe(hidden, &routing[0], &expert_fn)
     } else {
+        let hidden_size = hidden.shape()[1];
+        prefill_moe(hidden, &routing, num_experts, hidden_size, &expert_fn)
+    }
+}
+
+/// Run MoE forward with sigmoid routing, using GPU routing for decode.
+///
+/// For single-token decode (seq_len == 1), performs routing entirely on GPU
+/// via a fused kernel. Reuses `routing_bufs` across layers to eliminate
+/// per-layer GPU allocations. For prefill (seq_len > 1), falls back to the
+/// CPU routing path.
+///
+/// # Errors
+/// Returns an error if routing, expert computation, or tensor operations fail.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_forward_sigmoid_gpu<T, F>(
+    hidden: &CudaTensor<T>,
+    gate_weight: &CudaTensor<T>,
+    e_score_correction_bias: &[f32],
+    e_score_correction_bias_gpu: &CudaTensor<f32>,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    n_group: usize,
+    topk_group: usize,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f32,
+    routing_bufs: &mut GpuRoutingBuffers,
+    expert_fn: F,
+) -> Result<CudaTensor<T>>
+where
+    T: TensorDType + DeviceRepr + ValidAsZeroBits + Default + super::ops::GemmScalar,
+    CudaBlas: Gemm<T>,
+    F: Fn(usize, &CudaTensor<T>) -> Result<CudaTensor<T>>,
+{
+    let seq_len = hidden.shape()[0];
+
+    if seq_len == 1 {
+        // GPU decode path: gate matmul → f32 → GPU routing kernel
+        let gate_logits = matmul(hidden, gate_weight)?;
+        let gate_logits_f32: CudaTensor<f32> = if T::DTYPE == DType::F32 {
+            reinterpret_tensor(gate_logits)
+        } else {
+            cast_to_f32(&gate_logits)?
+        };
+
+        let routing = routing_bufs.route(
+            &gate_logits_f32,
+            e_score_correction_bias_gpu,
+            num_experts_per_tok,
+            n_group,
+            topk_group,
+            norm_topk_prob,
+            routed_scaling_factor,
+        )?;
+
+        decode_moe_gpu(hidden, &routing, &expert_fn)
+    } else {
+        // Prefill: use existing CPU routing
+        let routing = moe_route_sigmoid(
+            hidden,
+            gate_weight,
+            e_score_correction_bias,
+            num_experts_per_tok,
+            n_group,
+            topk_group,
+            norm_topk_prob,
+            routed_scaling_factor,
+        )?;
         let hidden_size = hidden.shape()[1];
         prefill_moe(hidden, &routing, num_experts, hidden_size, &expert_fn)
     }

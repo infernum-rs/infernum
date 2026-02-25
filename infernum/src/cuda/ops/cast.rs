@@ -49,21 +49,10 @@ pub fn cast_to_f32<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     match T::DTYPE {
         DType::F32 => {
-            // T is f32 — copy via host roundtrip. This path is rarely taken;
-            // callers should use the tensor directly when T = f32.
-            let host = input.to_vec()?;
-            assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<f32>());
-            let mut f32_data = Vec::<f32>::with_capacity(host.len());
-            // SAFETY: T::DTYPE is F32, so T and f32 have identical layout
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    host.as_ptr().cast::<f32>(),
-                    f32_data.as_mut_ptr(),
-                    host.len(),
-                );
-                f32_data.set_len(host.len());
-            }
-            CudaTensor::from_slice(input.context(), shape, &f32_data)
+            // T is f32 — clone (GPU dtod copy) + reinterpret (zero-cost type cast).
+            let cloned = input.clone();
+            // SAFETY: T::DTYPE is F32, so T and f32 have identical layout.
+            Ok(unsafe { cloned.reinterpret() })
         }
         DType::F16 => launch_cast_kernel(input, "cast_f16_to_f32", n, shape),
         DType::BF16 => launch_cast_kernel(input, "cast_bf16_to_f32", n, shape),
