@@ -352,7 +352,7 @@ mod tests {
 
         // Gemma 3 pattern: every 6th layer is full
         assert_eq!(cfg.layer_types.len(), 18);
-        for i in 0..18 {
+        for i in 0_usize..18 {
             if (i + 1).is_multiple_of(6) {
                 assert_eq!(cfg.layer_types[i], "full_attention", "layer {i}");
             } else {
