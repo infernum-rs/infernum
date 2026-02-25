@@ -70,11 +70,12 @@ pub fn argmax_last_scalar(input: &CudaTensor) -> Result<u32> {
     // Single-element output on GPU
     let mut out_device = device.alloc_zeros::<u32>(1)?;
 
-    // Point the kernel at the last row
-    let last_row_offset = (num_rows - 1) * row_size;
+    // Point the kernel at the last row (byte offsets — cuda_slice() is raw u8)
+    let elem = input.dtype().size_in_bytes();
+    let last_row_byte_offset = (num_rows - 1) * row_size * elem;
     let last_row = input
         .cuda_slice()
-        .slice(last_row_offset..num_rows * row_size);
+        .slice(last_row_byte_offset..num_rows * row_size * elem);
 
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),

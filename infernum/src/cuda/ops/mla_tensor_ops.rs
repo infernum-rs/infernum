@@ -182,15 +182,16 @@ pub fn broadcast_to_heads(tensor: &CudaTensor, num_heads: usize) -> Result<CudaT
     // seq position. Since the kernel works on flat [dim] → [num_heads * dim],
     // we can treat it as outer=seq with each position being independent.
     // Launch seq separate kernels or flatten. For simplicity, loop over seq.
+    let elem = tensor.dtype().size_in_bytes();
     for s in 0..seq_len {
-        let src_offset = s * dim;
-        let dst_offset = s * num_heads * dim;
+        let src_offset = s * dim * elem;
+        let dst_offset = s * num_heads * dim * elem;
         let n = num_heads * dim;
 
-        let src_slice = tensor.cuda_slice().slice(src_offset..src_offset + dim);
+        let src_slice = tensor.cuda_slice().slice(src_offset..src_offset + dim * elem);
         let dst_slice = &mut output
             .cuda_slice_mut()
-            .slice_mut(dst_offset..dst_offset + n);
+            .slice_mut(dst_offset..dst_offset + n * elem);
 
         unsafe {
             func.clone().launch(

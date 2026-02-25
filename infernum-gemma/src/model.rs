@@ -1115,12 +1115,14 @@ impl GemmaModel {
             attn_parts.into_iter().next().unwrap()
         } else {
             let row_size = num_heads * head_dim;
+            let elem = self.dtype.size_in_bytes();
             let mut output =
                 unsafe { CudaTensor::uninit(&self.ctx, &[batch_size, row_size], self.dtype)? };
             let out_slice = output.cuda_slice_mut();
             for (i, part) in attn_parts.iter().enumerate() {
-                let src = part.cuda_slice().slice(..row_size);
-                let mut dst = out_slice.slice_mut(i * row_size..(i + 1) * row_size);
+                let src = part.cuda_slice().slice(..row_size * elem);
+                let mut dst =
+                    out_slice.slice_mut(i * row_size * elem..(i + 1) * row_size * elem);
                 self.ctx.device().dtod_copy(&src, &mut dst)?;
             }
             output
@@ -1433,12 +1435,13 @@ impl GemmaModel {
             return Ok(hidden.reshape(&[1, self.config.hidden_size]));
         }
         let hidden_size = hidden.shape()[1];
+        let elem = self.dtype.size_in_bytes();
         let flat = hidden.reshape(&[seq_len * hidden_size]);
         let mut out = unsafe { CudaTensor::uninit(&self.ctx, &[1, hidden_size], self.dtype)? };
         let device = self.ctx.device();
         let src = flat.cuda_slice();
-        let last_offset = (seq_len - 1) * hidden_size;
-        let src_sub = src.slice(last_offset..seq_len * hidden_size);
+        let last_offset = (seq_len - 1) * hidden_size * elem;
+        let src_sub = src.slice(last_offset..seq_len * hidden_size * elem);
         device.dtod_copy(&src_sub, out.cuda_slice_mut())?;
         Ok(out)
     }

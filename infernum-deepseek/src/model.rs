@@ -1129,12 +1129,13 @@ impl DeepSeekModel {
             return Ok(hidden.reshape(&[1, self.config.hidden_size]));
         }
         let hidden_size = hidden.shape()[1];
+        let elem = self.dtype.size_in_bytes();
         let flat = hidden.reshape(&[seq_len * hidden_size]);
         let mut out = unsafe { CudaTensor::uninit(&self.ctx, &[1, hidden_size], self.dtype)? };
         let device = self.ctx.device();
         let src = flat.cuda_slice();
-        let last_offset = (seq_len - 1) * hidden_size;
-        let src_sub = src.slice(last_offset..seq_len * hidden_size);
+        let last_offset = (seq_len - 1) * hidden_size * elem;
+        let src_sub = src.slice(last_offset..seq_len * hidden_size * elem);
         device.dtod_copy(&src_sub, out.cuda_slice_mut())?;
         Ok(out)
     }
@@ -2319,12 +2320,14 @@ impl infernum::Model for DeepSeekModel {
 
         // Concatenate per-sequence logits into (batch_size, vocab_size)
         let vocab_size = logits_parts[0].shape()[1];
+        let elem = DType::F32.size_in_bytes();
         let mut output =
             unsafe { CudaTensor::uninit(&self.ctx, &[batch_size, vocab_size], DType::F32)? };
         let out_slice = output.cuda_slice_mut();
         for (i, part) in logits_parts.iter().enumerate() {
-            let src = part.cuda_slice().slice(..vocab_size);
-            let mut dst = out_slice.slice_mut(i * vocab_size..(i + 1) * vocab_size);
+            let src = part.cuda_slice().slice(..vocab_size * elem);
+            let mut dst =
+                out_slice.slice_mut(i * vocab_size * elem..(i + 1) * vocab_size * elem);
             self.ctx.device().dtod_copy(&src, &mut dst)?;
         }
         Ok(output)
