@@ -671,7 +671,6 @@ impl QwenModel {
                 if model_dtype == DType::F32 {
                     Ok(LinearWeight::Dense(transposed))
                 } else {
-                    let raw = transposed.to_raw_bytes();
                     let shape = transposed.shape();
                     let rows = shape[0];
                     let cols = shape[1];
