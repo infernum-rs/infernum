@@ -12,10 +12,10 @@ use std::path::Path;
 use infernum::cuda::block_allocator::BlockTable;
 use infernum::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
-    attention, cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
+    cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
     fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32,
-    paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache, repeat_kv,
-    rms_norm, rms_norm_inplace, split_inner_dim, swiglu, transpose_2d, LinearWeight,
+    paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache, rms_norm,
+    rms_norm_inplace, split_inner_dim, swiglu, transpose_2d, LinearWeight,
 };
 #[cfg(feature = "nccl")]
 use infernum::cuda::{shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy};
@@ -1942,7 +1942,7 @@ impl LlamaModel {
         Ok(hidden)
     }
 
-    /// Forward pass through attention (no KV cache, f32 only)
+    /// Forward pass through attention (no KV cache)
     fn forward_attention(
         &self,
         hidden: &CudaTensor,
@@ -1976,17 +1976,8 @@ impl LlamaModel {
         let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
         let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
 
-        // Expand K, V for GQA if needed
-        let (k, v) = if num_kv_heads < num_heads {
-            let k = repeat_kv(&k, num_heads / num_kv_heads)?;
-            let v = repeat_kv(&v, num_heads / num_kv_heads)?;
-            (k, v)
-        } else {
-            (k, v)
-        };
-
-        // Compute attention
-        let attn_output = attention(&q, &k, &v, true)?;
+        // Fused attention handles GQA and supports BF16/F16
+        let attn_output = fused_attention_prefill(&q, &k, &v, 0, None, None, None)?;
 
         // Reshape back: (seq_len, num_heads, head_dim) -> (seq_len, num_heads * head_dim)
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
