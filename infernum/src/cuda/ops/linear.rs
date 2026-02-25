@@ -1,4 +1,4 @@
-use crate::cuda::ops::{cast_f32_to_bf16, cast_to_f32, matmul, quantized_matmul};
+use crate::cuda::ops::{cast_f32_to_bf16, cast_f32_to_f16, cast_to_f32, matmul, quantized_matmul};
 use crate::cuda::{CudaTensor, QuantizedTensor};
 use crate::dtype::DType;
 use crate::tensor::Tensor;
@@ -22,7 +22,7 @@ pub enum LinearWeight {
 /// Returns an error if the underlying matmul or cast operation fails.
 ///
 /// # Panics
-/// Panics if `Quantized` variant is used with a dtype other than f32 or bf16.
+/// Panics if `Quantized` variant is used with a dtype other than f32, bf16, or f16.
 pub fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
     match weight {
         LinearWeight::Dense(w) => matmul(input, w),
@@ -37,6 +37,7 @@ pub fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
             match dtype {
                 DType::F32 => Ok(output_f32),
                 DType::BF16 => cast_f32_to_bf16(&output_f32),
+                DType::F16 => cast_f32_to_f16(&output_f32),
                 other => panic!("Quantized matmul not supported for dtype {other}"),
             }
         }
