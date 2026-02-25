@@ -831,6 +831,7 @@ impl DeepSeekModel {
                 }
                 LinearWeight::Quantized(w) => {
                     let (k, v, k_t) = split_kv_b_proj_quantized(
+                        dtype,
                         ctx,
                         w,
                         tp_num_heads,

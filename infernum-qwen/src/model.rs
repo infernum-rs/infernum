@@ -677,7 +677,7 @@ impl QwenModel {
                     let cols = shape[1];
                     let native =
                         load_typed_sharded(model_dtype, loader, ctx, name, shard, strategy)?;
-                    let native_bytes = native.to_raw_bytes();
+                    let native_bytes = native.to_raw_bytes()?;
                     let elem = model_dtype.size_in_bytes();
                     let mut buf = vec![0u8; native_bytes.len()];
                     for r in 0..rows {
