@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-cuda = ["infernum-cuda", "infernum-runtime/cuda"]
+cuda = ["infernum-cuda", "infernum-cuda/cuda", "infernum-runtime/cuda"]
 nccl = ["cuda", "infernum-cuda/nccl", "infernum-runtime/nccl"]
 
 [dependencies]

@@ -7,7 +7,7 @@ build = "build.rs"
 
 [features]
 default = []
-cuda = ["dep:cudarc", "infernum-cuda", "infernum-deepseek/cuda", "infernum-gemma/cuda", "infernum-llama/cuda", "infernum-qwen/cuda", "infernum-runtime/cuda", "infernum-serve/cuda"]
+cuda = ["dep:cudarc", "infernum-cuda", "infernum-cuda/cuda", "infernum-deepseek/cuda", "infernum-gemma/cuda", "infernum-llama/cuda", "infernum-qwen/cuda", "infernum-runtime/cuda", "infernum-serve/cuda"]
 nccl = ["cuda", "infernum-cuda/nccl", "infernum-deepseek/nccl", "infernum-gemma/nccl", "infernum-llama/nccl", "infernum-qwen/nccl", "infernum-runtime/nccl"]
 
 [dependencies]
