@@ -21,6 +21,10 @@ mod engine;
 mod runtime;
 mod scheduler;
 
+mod engine2;
+mod runtime2;
+mod scheduler2;
+
 #[cfg(feature = "cuda")]
 pub use engine::Engine;
 #[cfg(feature = "cuda")]
@@ -31,4 +35,12 @@ pub use scheduler::BatchConfig;
 #[cfg(feature = "cuda")]
 pub use scheduler::{
     DecodeTask, PrefillTask, Scheduler, SchedulerOutput, SequencePhase, SequenceState,
+};
+
+pub use engine2::Engine2;
+pub use runtime2::Runtime2;
+pub use scheduler2::BatchConfig as BatchConfig2;
+pub use scheduler2::{
+    FinishReason as FinishReason2, GenerationEvent as GenerationEvent2, Scheduler2,
+    TokenSender as TokenSender2,
 };
