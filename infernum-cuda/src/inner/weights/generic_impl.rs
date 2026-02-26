@@ -1,5 +1,6 @@
 //! Implements the generic `infernum::WeightLoader<CudaBackend>` trait
-//! for the CUDA-specific format loaders (`SafeTensorsLoader`, `GgufLoader`).
+//! for any format loader (`SafeTensorsLoader`, `GgufLoader`, etc.) via
+//! a blanket impl over `FormatLoader`.
 //!
 //! `CudaWeightLoader` wraps a format loader + `CudaContext` and provides
 //! the high-level `load_linear` logic (GPTQ/AWQ, FP8 scales, transpose).
@@ -13,9 +14,7 @@
 use crate::cuda::ops::{transpose_2d, LinearWeight};
 use crate::cuda::{CudaContext, CudaTensor};
 use crate::inner::backend_impl::CudaBackend;
-use crate::inner::weights::gguf::GgufLoader;
 use crate::inner::weights::loader::WeightLoader as FormatLoader;
-use crate::inner::weights::SafeTensorsLoader;
 
 use infernum::dtype::DType;
 use infernum::shard::{ShardConfig, ShardStrategy};
@@ -111,7 +110,7 @@ impl<F: FormatLoader> CudaWeightLoader<F> {
     }
 }
 
-impl WeightLoader<CudaBackend> for CudaWeightLoader<SafeTensorsLoader> {
+impl<F: FormatLoader> WeightLoader<CudaBackend> for CudaWeightLoader<F> {
     fn load_tensor(&self, name: &str, dtype: DType) -> Result<CudaTensor> {
         self.load_typed(name, dtype)
     }
@@ -122,7 +121,7 @@ impl WeightLoader<CudaBackend> for CudaWeightLoader<SafeTensorsLoader> {
         model_dtype: DType,
         quant_config: Option<&QuantizationConfig>,
     ) -> Result<LinearWeight> {
-        // GPTQ/AWQ: load via dedicated loader
+        // GPTQ/AWQ: load via dedicated loader (errors for formats that don't support it)
         if let Some(qc) = quant_config {
             let prefix = name
                 .strip_suffix(".weight")
@@ -249,76 +248,6 @@ impl WeightLoader<CudaBackend> for CudaWeightLoader<SafeTensorsLoader> {
         strategy: ShardStrategy,
     ) -> Result<CudaTensor> {
         self.load_typed_sharded(name, dtype, shard, strategy)
-    }
-
-    fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
-        self.inner.get_shape(name)
-    }
-
-    fn get_dtype(&self, name: &str) -> Result<DType> {
-        self.inner.get_dtype(name)
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.inner.contains(name)
-    }
-
-    fn tensor_names(&self) -> Vec<String> {
-        self.inner.tensor_names()
-    }
-}
-
-impl WeightLoader<CudaBackend> for CudaWeightLoader<GgufLoader> {
-    fn load_tensor(&self, name: &str, dtype: DType) -> Result<CudaTensor> {
-        self.load_typed(name, dtype)
-    }
-
-    fn load_linear(
-        &self,
-        name: &str,
-        model_dtype: DType,
-        quant_config: Option<&QuantizationConfig>,
-    ) -> Result<LinearWeight> {
-        // GGUF doesn't use GPTQ/AWQ
-        let _ = quant_config;
-
-        let file_dtype = self.inner.get_dtype(name)?;
-        if file_dtype.is_quantized() {
-            Ok(LinearWeight::Quantized(
-                self.inner.load_quantized(&self.ctx, name)?,
-            ))
-        } else if model_dtype == DType::F32 {
-            let f32_weight = self.inner.load_f32(&self.ctx, name)?;
-            Ok(LinearWeight::Dense(transpose_2d(&f32_weight)?))
-        } else {
-            let native = self.load_typed(name, model_dtype)?;
-            self.host_transpose_to_linear(&native, model_dtype)
-        }
-    }
-
-    fn load_linear_sharded(
-        &self,
-        _name: &str,
-        _model_dtype: DType,
-        _quant_config: Option<&QuantizationConfig>,
-        _shard: &ShardConfig,
-        _strategy: ShardStrategy,
-    ) -> Result<LinearWeight> {
-        Err(infernum::Error::UnsupportedDtype(
-            "GGUF does not support sharded loading".into(),
-        ))
-    }
-
-    fn load_tensor_sharded(
-        &self,
-        _name: &str,
-        _dtype: DType,
-        _shard: &ShardConfig,
-        _strategy: ShardStrategy,
-    ) -> Result<CudaTensor> {
-        Err(infernum::Error::UnsupportedDtype(
-            "GGUF does not support sharded loading".into(),
-        ))
     }
 
     fn get_shape(&self, name: &str) -> Result<Vec<usize>> {
