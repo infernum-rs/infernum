@@ -13,6 +13,21 @@ pub trait Tensor: Sized {
     /// Returns the data type of tensor elements
     fn dtype(&self) -> DType;
 
+    /// Create a view with a different shape (same data, same number of elements).
+    ///
+    /// # Panics
+    /// Panics if the new shape has a different number of elements.
+    #[must_use]
+    fn reshape(&self, shape: &[usize]) -> Self;
+
+    /// Create a zero-copy sub-slice view starting at element `offset` with the
+    /// given `shape`.
+    ///
+    /// # Panics
+    /// Panics if the view extends beyond the backing allocation.
+    #[must_use]
+    fn slice_view(&self, offset: usize, shape: &[usize]) -> Self;
+
     /// Returns the total number of elements in the tensor
     fn numel(&self) -> usize {
         self.shape().iter().product()
@@ -49,6 +64,7 @@ mod tests {
     use super::*;
     use crate::dtype::DType;
 
+    #[derive(Clone)]
     struct FakeTensor {
         shape: Vec<usize>,
         dtype: DType,
@@ -61,6 +77,22 @@ mod tests {
 
         fn dtype(&self) -> DType {
             self.dtype
+        }
+
+        fn reshape(&self, shape: &[usize]) -> Self {
+            let new_numel: usize = shape.iter().product();
+            assert_eq!(self.numel(), new_numel);
+            Self {
+                shape: shape.to_vec(),
+                dtype: self.dtype,
+            }
+        }
+
+        fn slice_view(&self, _offset: usize, shape: &[usize]) -> Self {
+            Self {
+                shape: shape.to_vec(),
+                dtype: self.dtype,
+            }
         }
     }
 
