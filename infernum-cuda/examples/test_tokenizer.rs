@@ -1,12 +1,6 @@
-#[cfg(not(feature = "cuda"))]
-fn main() {
-    eprintln!("This example requires the `cuda` feature: cargo run --example test_tokenizer --features cuda");
-}
-
-#[cfg(feature = "cuda")]
 fn main() -> infernum::Result<()> {
     use infernum::tokenizer::GgufTokenizer;
-    use infernum::GgufLoader;
+    use infernum_cuda::GgufLoader;
     let loader = GgufLoader::from_file("models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf")?;
     let tokenizer = GgufTokenizer::from_gguf_metadata(loader.metadata())?;
 
@@ -41,10 +35,17 @@ fn main() -> infernum::Result<()> {
         }
     }
 
-    println!("\nPassed: {}, Failed: {}", passed, failed);
+    println!(
+        "
+Passed: {}, Failed: {}",
+        passed, failed
+    );
 
     // Test decode
-    println!("\nDecode test:");
+    println!(
+        "
+Decode test:"
+    );
     let tokens = vec![1, 450, 6593, 310, 2834];
     let decoded = tokenizer.decode(&tokens)?;
     println!("decode({:?}) = '{}'", tokens, decoded);

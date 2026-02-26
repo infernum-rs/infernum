@@ -16,5 +16,6 @@ pub use inner::*;
 
 // Re-export infernum core types that are commonly used alongside CUDA types
 pub use infernum::DType;
+pub use infernum::Error;
 pub use infernum::Result;
 pub use infernum::Tensor;

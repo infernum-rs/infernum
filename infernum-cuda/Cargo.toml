@@ -41,3 +41,7 @@ serde_json = "1.0"
 
 [dev-dependencies]
 approx = "0.5"
+
+[[example]]
+name = "test_tokenizer"
+required-features = ["cuda"]
