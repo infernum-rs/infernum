@@ -3,10 +3,13 @@
 //! This crate contains all CUDA-specific code: tensors, ops, kernels,
 //! KV caches, weight loaders, the `Model` trait, and NCCL sharding.
 
+mod backend_impl;
 pub mod cuda;
 mod error;
 pub mod model;
 pub mod weights;
+
+pub use backend_impl::CudaBackend;
 
 pub use cuda::ops::LinearWeight;
 pub use cuda::BatchedGraphInputs;

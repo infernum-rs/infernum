@@ -6,6 +6,7 @@
 // Allow proc macros to use `::infernum::` paths from within this crate.
 extern crate self as infernum;
 
+pub mod backend;
 pub mod block_allocator;
 pub mod chat_template;
 pub mod dtype;
@@ -18,6 +19,7 @@ pub mod shard;
 pub mod tensor;
 pub mod tokenizer;
 
+pub use backend::{ArithOps, Backend, CastOps, GegluOps, MatmulOps, NormOps, SwigluOps, TensorOps};
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};
 pub use error::{Error, Result};
