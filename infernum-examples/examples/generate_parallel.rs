@@ -18,7 +18,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::{GenerateOptions, Result, SamplingParams};
+use infernum::{GenerateOptions, Model, Result, SamplingParams};
 use infernum_cuda::{CudaBackend, ShardedModel};
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
