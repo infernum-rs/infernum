@@ -9,8 +9,10 @@
     unused_mut
 )]
 
+use std::marker::PhantomData;
 use std::path::Path;
 
+use infernum::backend::Backend;
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::Result;
@@ -32,6 +34,7 @@ use infernum_cuda::cuda::{
 use infernum_cuda::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
 use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
 use infernum_cuda::BlockTable;
+use infernum_cuda::CudaBackend;
 
 use crate::DeepSeekConfig;
 
@@ -262,7 +265,7 @@ struct DeepSeekLayerWeights {
 }
 
 /// Complete DeepSeek V3/R1 model.
-pub struct DeepSeekModel {
+pub struct DeepSeekModel<B: Backend> {
     config: DeepSeekConfig,
     ctx: CudaContext,
     #[allow(dead_code)]
@@ -274,19 +277,21 @@ pub struct DeepSeekModel {
     tp_num_heads: usize,
     dtype: DType,
 
-    embed_tokens: CudaTensor,
+    embed_tokens: B::Tensor,
     layers: Vec<DeepSeekLayerWeights>,
-    norm: CudaTensor,
+    norm: B::Tensor,
     lm_head: LinearWeight,
 
-    cos_cache: CudaTensor,
-    sin_cache: CudaTensor,
+    cos_cache: B::Tensor,
+    sin_cache: B::Tensor,
 
     /// Pre-computed attention scale (includes YaRN mscale adjustment)
     attn_scale: f32,
+
+    _backend: PhantomData<B>,
 }
 
-impl DeepSeekModel {
+impl DeepSeekModel<CudaBackend> {
     /// Load a DeepSeek model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
@@ -664,6 +669,7 @@ impl DeepSeekModel {
             cos_cache,
             sin_cache,
             attn_scale,
+            _backend: PhantomData,
         })
     }
 
@@ -1122,6 +1128,7 @@ impl DeepSeekModel {
             cos_cache,
             sin_cache,
             attn_scale,
+            _backend: PhantomData,
         })
     }
 
@@ -2210,7 +2217,7 @@ impl DeepSeekModel {
 
 // --- Model trait implementation ---
 
-impl infernum_cuda::Model for DeepSeekModel {
+impl infernum_cuda::Model for DeepSeekModel<CudaBackend> {
     fn config(&self) -> infernum::ModelConfig {
         let config = &self.config;
         infernum::ModelConfig {
@@ -2354,7 +2361,7 @@ impl infernum_cuda::Model for DeepSeekModel {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum_cuda::ShardedLoadable for DeepSeekModel {
+impl infernum_cuda::ShardedLoadable for DeepSeekModel<CudaBackend> {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,
