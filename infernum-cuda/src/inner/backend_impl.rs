@@ -1,8 +1,10 @@
 //! `CudaBackend` — implements the infernum `Backend` + op traits for CUDA.
 
 use infernum::backend::{
-    ArithOps, Backend, CastOps, GegluOps, MatmulOps, NormOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
+    NormOps, PagedAttentionOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
+use infernum::block_allocator::BlockTable;
 use infernum::{DType, Result};
 
 use crate::cuda::ops;
@@ -22,6 +24,8 @@ impl Backend for CudaBackend {
     type Logits = CudaLogits;
 }
 
+// ---- Arithmetic ----
+
 impl ArithOps for CudaBackend {
     fn add(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
         ops::add(a, b)
@@ -40,6 +44,8 @@ impl ArithOps for CudaBackend {
     }
 }
 
+// ---- Matmul ----
+
 impl MatmulOps for CudaBackend {
     type LinearWeight = LinearWeight;
 
@@ -51,6 +57,14 @@ impl MatmulOps for CudaBackend {
         ops::linear(input, weight)
     }
 }
+
+impl MatmulExtOps for CudaBackend {
+    fn matmul_bf16_f32(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+        ops::matmul_bf16_f32(a, b)
+    }
+}
+
+// ---- Normalization ----
 
 impl NormOps for CudaBackend {
     fn rms_norm(input: &CudaTensor, weight: &CudaTensor, eps: f32) -> Result<CudaTensor> {
@@ -71,6 +85,8 @@ impl NormOps for CudaBackend {
     }
 }
 
+// ---- Activations ----
+
 impl SwigluOps for CudaBackend {
     fn swiglu(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
         ops::swiglu(gate, up)
@@ -83,6 +99,8 @@ impl GegluOps for CudaBackend {
     }
 }
 
+// ---- Cast ----
+
 impl CastOps for CudaBackend {
     fn cast_to_f32(input: &CudaTensor) -> Result<CudaTensor> {
         ops::cast_to_f32(input)
@@ -93,8 +111,166 @@ impl CastOps for CudaBackend {
     }
 }
 
+// ---- Embedding ----
+
+impl EmbedOps for CudaBackend {
+    fn embedding_gather(table: &CudaTensor, indices: &[u32]) -> Result<CudaTensor> {
+        ops::embedding_gather(table.context(), table, indices)
+    }
+}
+
+// ---- Bias ----
+
+impl BiasOps for CudaBackend {
+    fn bias_add_inplace(input: &mut CudaTensor, bias: &CudaTensor) -> Result<()> {
+        ops::bias_add_inplace(input, bias)
+    }
+}
+
+// ---- Tensor manipulation ----
+
 impl TensorOps for CudaBackend {
     fn transpose_2d(input: &CudaTensor) -> Result<CudaTensor> {
         ops::transpose_2d(input)
+    }
+
+    fn split_inner_dim(
+        tensor: &CudaTensor,
+        dim1: usize,
+        dim2: usize,
+    ) -> Result<(CudaTensor, CudaTensor)> {
+        ops::split_inner_dim(tensor, dim1, dim2)
+    }
+
+    fn concat_inner_dim(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+        ops::concat_inner_dim(a, b)
+    }
+
+    fn pad_inner_dim(tensor: &CudaTensor, new_width: usize) -> Result<CudaTensor> {
+        ops::pad_inner_dim(tensor, new_width)
+    }
+
+    fn broadcast_to_heads(tensor: &CudaTensor, num_heads: usize) -> Result<CudaTensor> {
+        ops::broadcast_to_heads(tensor, num_heads)
+    }
+
+    fn repeat_kv(tensor: &CudaTensor, num_repeats: usize) -> Result<CudaTensor> {
+        ops::repeat_kv(tensor, num_repeats)
+    }
+}
+
+// ---- RoPE ----
+
+impl RopeOps for CudaBackend {
+    fn apply_rope(
+        input: &CudaTensor,
+        cos_cache: &CudaTensor,
+        sin_cache: &CudaTensor,
+        position_offset: usize,
+    ) -> Result<CudaTensor> {
+        ops::apply_rope(input, cos_cache, sin_cache, position_offset)
+    }
+
+    fn apply_rope_batched(
+        input: &CudaTensor,
+        cos_cache: &CudaTensor,
+        sin_cache: &CudaTensor,
+        positions: &[usize],
+    ) -> Result<CudaTensor> {
+        ops::apply_rope_batched(input, cos_cache, sin_cache, positions)
+    }
+}
+
+impl RopeInterleavedOps for CudaBackend {
+    fn apply_rope_interleaved(
+        input: &CudaTensor,
+        cos_cache: &CudaTensor,
+        sin_cache: &CudaTensor,
+        position_offset: usize,
+    ) -> Result<CudaTensor> {
+        ops::apply_rope_interleaved(input, cos_cache, sin_cache, position_offset)
+    }
+}
+
+// ---- Attention ----
+
+impl AttentionOps for CudaBackend {
+    fn fused_attention_prefill(
+        q: &CudaTensor,
+        k: &CudaTensor,
+        v: &CudaTensor,
+        offset: usize,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<CudaTensor> {
+        ops::fused_attention_prefill(q, k, v, offset, scale, softcap, sliding_window)
+    }
+
+    fn fused_attention_decode(
+        q: &CudaTensor,
+        k: &CudaTensor,
+        v: &CudaTensor,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<CudaTensor> {
+        ops::fused_attention_decode(q, k, v, scale, softcap, sliding_window)
+    }
+
+    fn fused_attention_prefill_with_lse(
+        q: &CudaTensor,
+        k: &CudaTensor,
+        v: &CudaTensor,
+        offset: usize,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<(CudaTensor, CudaTensor)> {
+        ops::fused_attention_prefill_with_lse(q, k, v, offset, scale, softcap, sliding_window)
+    }
+
+    fn combine_attention_with_lse(
+        out1: &CudaTensor,
+        lse1: &CudaTensor,
+        out2: &CudaTensor,
+        lse2: &CudaTensor,
+    ) -> Result<CudaTensor> {
+        ops::combine_attention_with_lse(out1, lse1, out2, lse2)
+    }
+}
+
+// ---- Paged attention ----
+
+impl PagedAttentionOps for CudaBackend {
+    fn paged_attention_decode(
+        q: &CudaTensor,
+        k_pool: &CudaTensor,
+        v_pool: &CudaTensor,
+        block_tables: &[BlockTable],
+        block_size: usize,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<CudaTensor> {
+        ops::paged_attention_decode(
+            q.context(),
+            q,
+            k_pool,
+            v_pool,
+            block_tables,
+            block_size,
+            scale,
+            softcap,
+            sliding_window,
+        )
+    }
+
+    fn gather_paged_kv(
+        paged_kv: &crate::cuda::PagedKvCache,
+        layer_idx: usize,
+        block_table: &BlockTable,
+    ) -> Result<(CudaTensor, CudaTensor)> {
+        ops::gather_paged_kv(paged_kv, layer_idx, block_table)
     }
 }

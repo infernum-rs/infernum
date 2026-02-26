@@ -17,6 +17,7 @@
 //! - **Activations are split** into `SwigluOps` and `GegluOps`. Models
 //!   specify exactly which they need via where-clauses.
 
+use crate::block_allocator::BlockTable;
 use crate::logits::Logits;
 use crate::runtime_state::RuntimeStateInit;
 use crate::tensor::Tensor;
@@ -121,8 +122,159 @@ pub trait CastOps: Backend {
     fn cast_from_f32(input: &Self::Tensor, target: DType) -> Result<Self::Tensor>;
 }
 
+/// Embedding lookup.
+pub trait EmbedOps: Backend {
+    /// Gather rows from an embedding table by token IDs.
+    ///
+    /// `table` has shape `(vocab_size, hidden_size)`.
+    /// Returns a tensor of shape `(indices.len(), hidden_size)`.
+    fn embedding_gather(table: &Self::Tensor, indices: &[u32]) -> Result<Self::Tensor>;
+}
+
+/// Bias addition.
+pub trait BiasOps: Backend {
+    /// In-place bias addition: `input[row, col] += bias[col]`.
+    fn bias_add_inplace(input: &mut Self::Tensor, bias: &Self::Tensor) -> Result<()>;
+}
+
 /// Tensor reshaping and manipulation.
 pub trait TensorOps: Backend {
     /// Transpose a 2D tensor.
     fn transpose_2d(input: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Split the inner dimension of a 2D tensor into two parts.
+    ///
+    /// `(outer, dim1+dim2)` → `((outer, dim1), (outer, dim2))`
+    fn split_inner_dim(
+        tensor: &Self::Tensor,
+        dim1: usize,
+        dim2: usize,
+    ) -> Result<(Self::Tensor, Self::Tensor)>;
+
+    /// Concatenate two 2D tensors along the inner (column) dimension.
+    ///
+    /// `(outer, d1)` + `(outer, d2)` → `(outer, d1+d2)`
+    fn concat_inner_dim(a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Zero-pad the inner dimension of a 2D tensor.
+    ///
+    /// `(outer, width)` → `(outer, new_width)` with `new_width >= width`.
+    fn pad_inner_dim(tensor: &Self::Tensor, new_width: usize) -> Result<Self::Tensor>;
+
+    /// Broadcast a `(batch, 1, head_dim)` tensor to `(batch, num_heads, head_dim)`.
+    fn broadcast_to_heads(tensor: &Self::Tensor, num_heads: usize) -> Result<Self::Tensor>;
+
+    /// Repeat each KV head `num_repeats` times to match the number of query heads.
+    ///
+    /// `(seq, num_kv_heads, head_dim)` → `(seq, num_kv_heads * repeats, head_dim)`
+    fn repeat_kv(tensor: &Self::Tensor, num_repeats: usize) -> Result<Self::Tensor>;
+}
+
+// ---- RoPE ----
+
+/// Rotary positional embedding (half-rotation layout, used by Llama/Qwen/Gemma).
+pub trait RopeOps: Backend {
+    /// Apply RoPE to a 3D tensor `(seq, heads, head_dim)`.
+    fn apply_rope(
+        input: &Self::Tensor,
+        cos_cache: &Self::Tensor,
+        sin_cache: &Self::Tensor,
+        position_offset: usize,
+    ) -> Result<Self::Tensor>;
+
+    /// Apply RoPE with per-token positions (for batched decode).
+    fn apply_rope_batched(
+        input: &Self::Tensor,
+        cos_cache: &Self::Tensor,
+        sin_cache: &Self::Tensor,
+        positions: &[usize],
+    ) -> Result<Self::Tensor>;
+}
+
+/// Rotary positional embedding (interleaved layout, used by DeepSeek).
+pub trait RopeInterleavedOps: Backend {
+    /// Apply interleaved RoPE to a 3D tensor.
+    fn apply_rope_interleaved(
+        input: &Self::Tensor,
+        cos_cache: &Self::Tensor,
+        sin_cache: &Self::Tensor,
+        position_offset: usize,
+    ) -> Result<Self::Tensor>;
+}
+
+// ---- Attention ----
+
+/// Fused attention kernels (prefill and single-sequence decode).
+pub trait AttentionOps: Backend {
+    /// Fused causal attention for prefill.
+    ///
+    /// Q: `(seq, heads, head_dim)`, K/V: `(kv_len, kv_heads, head_dim)`.
+    fn fused_attention_prefill(
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        offset: usize,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<Self::Tensor>;
+
+    /// Fused causal attention for single-token decode.
+    fn fused_attention_decode(
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<Self::Tensor>;
+
+    /// Fused prefill attention returning both output and log-sum-exp (for MLA).
+    fn fused_attention_prefill_with_lse(
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        offset: usize,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<(Self::Tensor, Self::Tensor)>;
+
+    /// Combine two attention outputs using their log-sum-exp values (for MLA).
+    fn combine_attention_with_lse(
+        out1: &Self::Tensor,
+        lse1: &Self::Tensor,
+        out2: &Self::Tensor,
+        lse2: &Self::Tensor,
+    ) -> Result<Self::Tensor>;
+}
+
+/// Paged KV cache attention.
+pub trait PagedAttentionOps: Backend {
+    /// Paged attention decode: batched decode against block-structured KV cache.
+    fn paged_attention_decode(
+        q: &Self::Tensor,
+        k_pool: &Self::Tensor,
+        v_pool: &Self::Tensor,
+        block_tables: &[BlockTable],
+        block_size: usize,
+        scale: Option<f32>,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> Result<Self::Tensor>;
+
+    /// Gather K/V from paged cache into contiguous tensors for a single sequence.
+    fn gather_paged_kv(
+        paged_kv: &Self::PagedKvCache,
+        layer_idx: usize,
+        block_table: &BlockTable,
+    ) -> Result<(Self::Tensor, Self::Tensor)>;
+}
+
+// ---- Extended matmul ----
+
+/// Extended matrix multiplication (mixed precision).
+pub trait MatmulExtOps: Backend {
+    /// Matmul with bf16 inputs producing f32 output (for MLA).
+    fn matmul_bf16_f32(a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
 }
