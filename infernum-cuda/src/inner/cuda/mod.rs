@@ -27,7 +27,7 @@ pub use paged_kv_cache::PagedKvCache;
 pub use quantized::QuantizedTensor;
 pub use seq_position::SeqPosition;
 #[cfg(feature = "nccl")]
-pub use sharded::ShardedModel;
+pub use sharded::{ShardedKvCache, ShardedModel};
 pub use tensor::CudaTensor;
 
 // Re-export from infernum core (pure data types, no CUDA dependency)

@@ -13,6 +13,9 @@ use std::thread;
 use super::nccl::NcclCommunicator;
 use super::BlockTable;
 use super::{CudaContext, CudaTensor, PagedKvCache, ShardConfig};
+use crate::inner::backend_impl::CudaBackend;
+use crate::inner::cuda_logits::CudaLogits;
+use crate::inner::cuda_runtime_state::CudaRuntimeState;
 use crate::model::{Model, ShardedLoadable};
 use infernum::Result;
 
@@ -148,6 +151,119 @@ impl<M: Model + Send + Sync> Model for ShardedModel<M> {
 
             collect_rank0(handles)
         })
+    }
+}
+
+// --- infernum::Model trait implementation (backend-generic) ---
+
+/// Per-replica KV cache wrapper for sharded models.
+///
+/// `ShardedModel`'s `infernum::Model::KvCache` wraps one inner cache
+/// per GPU replica. The engine sees it as an opaque single cache.
+pub struct ShardedKvCache<K> {
+    inner: Vec<K>,
+}
+
+impl<K: Send> ShardedKvCache<K> {
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut K> {
+        self.inner.iter_mut()
+    }
+}
+
+unsafe impl<K: Send> Send for ShardedKvCache<K> {}
+
+impl<M> infernum::Model for ShardedModel<M>
+where
+    M: Model + infernum::Model<B = CudaBackend, KvCache = PagedKvCache> + Send + Sync,
+{
+    type B = CudaBackend;
+    type KvCache = ShardedKvCache<PagedKvCache>;
+
+    fn config(&self) -> infernum::ModelConfig {
+        Model::config(&self.replicas[0].1)
+    }
+
+    fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
+        let mut caches = Vec::with_capacity(self.replicas.len());
+        for (_, model) in &self.replicas {
+            caches.push(infernum::Model::allocate_kv_cache(model, block_config)?);
+        }
+        Ok(ShardedKvCache { inner: caches })
+    }
+
+    fn forward(&self, input_ids: &[u32]) -> Result<CudaLogits> {
+        let tensor: CudaTensor = thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .map(|(_, model)| s.spawn(move || Model::forward(model, input_ids)))
+                .collect();
+
+            collect_rank0(handles)
+        })?;
+        Ok(CudaLogits::new(tensor))
+    }
+
+    fn forward_prefill(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut CudaRuntimeState,
+        block_table: &infernum::BlockTable,
+        start_pos: usize,
+    ) -> Result<CudaLogits> {
+        let tensor: CudaTensor = thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .zip(kv_cache.iter_mut())
+                .map(|((_, model), kv)| {
+                    s.spawn(move || {
+                        Model::forward_prefill_paged(
+                            model,
+                            input_ids,
+                            std::slice::from_mut(kv),
+                            block_table,
+                            start_pos,
+                        )
+                    })
+                })
+                .collect();
+
+            collect_rank0(handles)
+        })?;
+        Ok(CudaLogits::new(tensor))
+    }
+
+    fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut CudaRuntimeState,
+        block_tables: &[infernum::BlockTable],
+        positions: &[usize],
+    ) -> Result<CudaLogits> {
+        let tensor: CudaTensor = thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .zip(kv_cache.iter_mut())
+                .map(|((_, model), kv)| {
+                    s.spawn(move || {
+                        Model::forward_batch_decode(
+                            model,
+                            token_ids,
+                            std::slice::from_mut(kv),
+                            block_tables,
+                            positions,
+                        )
+                    })
+                })
+                .collect();
+
+            collect_rank0(handles)
+        })?;
+        Ok(CudaLogits::new(tensor))
     }
 }
 
