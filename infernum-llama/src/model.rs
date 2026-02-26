@@ -2130,6 +2130,68 @@ impl infernum_cuda::ShardedLoadable for LlamaModel<CudaBackend> {
     }
 }
 
+// --- infernum::Model trait implementation (backend-generic) ---
+
+impl infernum::Model for LlamaModel<CudaBackend> {
+    type B = CudaBackend;
+    type KvCache = PagedKvCache;
+
+    fn config(&self) -> infernum::ModelConfig {
+        infernum_cuda::Model::config(self)
+    }
+
+    fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
+        let mc = infernum_cuda::Model::config(self);
+        PagedKvCache::new(
+            &self.ctx,
+            mc.num_layers,
+            block_config,
+            mc.num_kv_heads,
+            mc.head_dim,
+            mc.cache_dtype,
+        )
+    }
+
+    fn forward(&self, input_ids: &[u32]) -> Result<infernum_cuda::CudaLogits> {
+        let tensor = infernum_cuda::Model::forward(self, input_ids)?;
+        Ok(infernum_cuda::CudaLogits::new(tensor))
+    }
+
+    fn forward_prefill(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
+        block_table: &infernum::BlockTable,
+        start_pos: usize,
+    ) -> Result<infernum_cuda::CudaLogits> {
+        let tensor = self.forward_prefill_paged(
+            input_ids,
+            std::slice::from_mut(kv_cache),
+            block_table,
+            start_pos,
+        )?;
+        Ok(infernum_cuda::CudaLogits::new(tensor))
+    }
+
+    fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
+        block_tables: &[infernum::BlockTable],
+        positions: &[usize],
+    ) -> Result<infernum_cuda::CudaLogits> {
+        let tensor = self.forward_batch_decode(
+            token_ids,
+            std::slice::from_mut(kv_cache),
+            block_tables,
+            positions,
+        )?;
+        Ok(infernum_cuda::CudaLogits::new(tensor))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
