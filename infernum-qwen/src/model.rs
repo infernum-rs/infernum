@@ -10,16 +10,16 @@
 use std::marker::PhantomData;
 use std::path::Path;
 
-use infernum::backend::{Backend, MatmulOps};
+use infernum::backend::{
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, MatmulExtOps, MatmulOps, MoeOps,
+    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
+};
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::Result;
 use infernum_cuda::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
-    bias_add_inplace, cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
-    fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32, mul,
-    paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache,
-    precompute_rope_cache_scaled, rms_norm, rms_norm_inplace, split_inner_dim, swiglu,
+    apply_rope_batched_indirect, cast_from_f32, cast_to_f32, embedding_gather_from_device,
+    paged_attention_decode_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
     transpose_2d, LinearWeight, RopeScaling,
 };
 use infernum_cuda::cuda::{
@@ -66,14 +66,6 @@ fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
             .copy_from_slice(&b_data[row * n2 * elem..(row + 1) * n2 * elem]);
     }
     CudaTensor::from_raw_bytes(a.context(), &[k, n1 + n2], dtype, &out)
-}
-
-fn split_gate_up(fused: &CudaTensor, intermediate_size: usize) -> Result<(CudaTensor, CudaTensor)> {
-    split_inner_dim(fused, intermediate_size, intermediate_size)
-}
-
-fn split_kv(fused: &CudaTensor, kv_dim: usize) -> Result<(CudaTensor, CudaTensor)> {
-    split_inner_dim(fused, kv_dim, kv_dim)
 }
 
 fn load_typed(
@@ -532,7 +524,7 @@ impl QwenModel<CudaBackend> {
 
         let lm_head = if config.tie_word_embeddings {
             if qc.is_some() {
-                let embed_f32 = cast_to_f32(&embed_tokens)?;
+                let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
                 let data = embed_f32.to_vec::<f32>()?;
                 LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
                     ctx,
@@ -540,7 +532,7 @@ impl QwenModel<CudaBackend> {
                     &data,
                 )?)
             } else {
-                let embed_f32 = cast_to_f32(&embed_tokens)?;
+                let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
                 let transposed = pretranspose_weight(&embed_f32)?;
                 LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
             }
@@ -1026,7 +1018,7 @@ impl QwenModel<CudaBackend> {
 
         let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
         let lm_head = if config.tie_word_embeddings {
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
             LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         } else {
@@ -1097,24 +1089,17 @@ impl QwenModel<CudaBackend> {
         self.dtype
     }
 
-    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> Result<CudaTensor> {
-        if seq_len == 1 {
-            return Ok(hidden.reshape(&[1, self.config.hidden_size]));
-        }
+    #[allow(clippy::unused_self)]
+    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> CudaTensor {
         let hidden_size = hidden.shape()[1];
-        let elem = self.dtype.size_in_bytes();
-        let flat = hidden.reshape(&[seq_len * hidden_size]);
-        let mut out = unsafe { CudaTensor::uninit(&self.ctx, &[1, hidden_size], self.dtype)? };
-        let device = self.ctx.device();
-        let src = flat.cuda_slice();
-        let last_offset = (seq_len - 1) * hidden_size * elem;
-        let src_sub = src.slice(last_offset..seq_len * hidden_size * elem);
-        device.dtod_copy(&src_sub, out.cuda_slice_mut())?;
-        Ok(out)
+        if seq_len == 1 {
+            return hidden.reshape(&[1, hidden_size]);
+        }
+        hidden.slice_view((seq_len - 1) * hidden_size, &[1, hidden_size])
     }
 
     fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor> {
-        embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
+        CudaBackend::embedding_gather(&self.embed_tokens, input_ids)
     }
 
     // --- Paged KV cache methods ---
@@ -1146,7 +1131,7 @@ impl QwenModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
 
@@ -1181,7 +1166,7 @@ impl QwenModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
 
@@ -1213,8 +1198,8 @@ impl QwenModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        let last_hidden = self.extract_last_row(&hidden, seq_len);
         self.lm_head_forward(&last_hidden)
     }
 
@@ -1227,7 +1212,8 @@ impl QwenModel<CudaBackend> {
         block_tables: &[BlockTable],
         positions: &[usize],
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode(
             &normed,
@@ -1238,7 +1224,7 @@ impl QwenModel<CudaBackend> {
             positions,
         )?;
 
-        let (mut hidden, normed) = add_rmsnorm(
+        let (mut hidden, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1246,7 +1232,7 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut hidden, &mlp_output)?;
+        CudaBackend::add_inplace(&mut hidden, &mlp_output)?;
         Ok(hidden)
     }
 
@@ -1264,33 +1250,33 @@ impl QwenModel<CudaBackend> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let mut q = linear(hidden, &weights.q_proj)?;
+        let mut q = CudaBackend::linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
             KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
-                let kv = matmul(hidden, weight)?;
+                let kv = CudaBackend::matmul(hidden, weight)?;
                 if batch_size == 1 {
                     let k = kv.slice_view(0, &[1, *kv_dim]);
                     let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
                     (k, v)
                 } else {
-                    split_kv(&kv, *kv_dim)?
+                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
                 }
             }
             KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
+                let k = CudaBackend::linear(hidden, k_proj)?;
+                let v = CudaBackend::linear(hidden, v_proj)?;
                 (k, v)
             }
         };
 
         if let Some(ref bias) = weights.q_bias {
-            bias_add_inplace(&mut q, bias)?;
+            CudaBackend::bias_add_inplace(&mut q, bias)?;
         }
         if let Some(ref bias) = weights.k_bias {
-            bias_add_inplace(&mut k, bias)?;
+            CudaBackend::bias_add_inplace(&mut k, bias)?;
         }
         if let Some(ref bias) = weights.v_bias {
-            bias_add_inplace(&mut v, bias)?;
+            CudaBackend::bias_add_inplace(&mut v, bias)?;
         }
 
         let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
@@ -1299,17 +1285,17 @@ impl QwenModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
         }
 
-        let q = apply_rope_batched(&q, &self.cos_cache, &self.sin_cache, positions)?;
-        let k = apply_rope_batched(&k, &self.cos_cache, &self.sin_cache, positions)?;
+        let q = CudaBackend::apply_rope_batched(&q, &self.cos_cache, &self.sin_cache, positions)?;
+        let k = CudaBackend::apply_rope_batched(&k, &self.cos_cache, &self.sin_cache, positions)?;
 
         let q_stride = num_heads * head_dim;
         let kv_stride = num_kv_heads * head_dim;
@@ -1321,19 +1307,18 @@ impl QwenModel<CudaBackend> {
             let k_i = k.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
             let v_i = v.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
 
-            paged_kv.append_paged(layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
+            CudaBackend::append_paged(paged_kv, layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
 
             let mut table_with_current = block_tables[i].clone();
             table_with_current.advance(1);
 
-            let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
-            let attn_i = paged_attention_decode(
-                &self.ctx,
+            let (k_pool, v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
+            let attn_i = CudaBackend::paged_attention_decode(
                 &q_i,
                 k_pool,
                 v_pool,
                 &[table_with_current],
-                paged_kv.block_size(),
+                CudaBackend::block_size(paged_kv),
                 None,
                 None,
                 sliding_window,
@@ -1342,23 +1327,9 @@ impl QwenModel<CudaBackend> {
             attn_parts.push(attn_i.reshape(&[1, num_heads * head_dim]));
         }
 
-        let attn_output = if batch_size == 1 {
-            attn_parts.into_iter().next().unwrap()
-        } else {
-            let row_size = num_heads * head_dim;
-            let elem = self.dtype.size_in_bytes();
-            let mut output =
-                unsafe { CudaTensor::uninit(&self.ctx, &[batch_size, row_size], self.dtype)? };
-            let out_slice = output.cuda_slice_mut();
-            for (i, part) in attn_parts.iter().enumerate() {
-                let src = part.cuda_slice().slice(..row_size * elem);
-                let mut dst = out_slice.slice_mut(i * row_size * elem..(i + 1) * row_size * elem);
-                self.ctx.device().dtod_copy(&src, &mut dst)?;
-            }
-            output
-        };
+        let attn_output = CudaBackend::concat_rows(&attn_parts)?;
 
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1374,7 +1345,8 @@ impl QwenModel<CudaBackend> {
         graph_inputs: &BatchedGraphInputs,
         max_seq_len: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode_indirect(
             &normed,
@@ -1385,7 +1357,7 @@ impl QwenModel<CudaBackend> {
             max_seq_len,
         )?;
 
-        let (mut hidden, normed) = add_rmsnorm(
+        let (mut hidden, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1393,7 +1365,7 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut hidden, &mlp_output)?;
+        CudaBackend::add_inplace(&mut hidden, &mlp_output)?;
         Ok(hidden)
     }
 
@@ -1412,33 +1384,33 @@ impl QwenModel<CudaBackend> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let mut q = linear(hidden, &weights.q_proj)?;
+        let mut q = CudaBackend::linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
             KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
-                let kv = matmul(hidden, weight)?;
+                let kv = CudaBackend::matmul(hidden, weight)?;
                 if batch_size == 1 {
                     let k = kv.slice_view(0, &[1, *kv_dim]);
                     let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
                     (k, v)
                 } else {
-                    split_kv(&kv, *kv_dim)?
+                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
                 }
             }
             KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
+                let k = CudaBackend::linear(hidden, k_proj)?;
+                let v = CudaBackend::linear(hidden, v_proj)?;
                 (k, v)
             }
         };
 
         if let Some(ref bias) = weights.q_bias {
-            bias_add_inplace(&mut q, bias)?;
+            CudaBackend::bias_add_inplace(&mut q, bias)?;
         }
         if let Some(ref bias) = weights.k_bias {
-            bias_add_inplace(&mut k, bias)?;
+            CudaBackend::bias_add_inplace(&mut k, bias)?;
         }
         if let Some(ref bias) = weights.v_bias {
-            bias_add_inplace(&mut v, bias)?;
+            CudaBackend::bias_add_inplace(&mut v, bias)?;
         }
 
         let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
@@ -1447,12 +1419,12 @@ impl QwenModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
         }
 
@@ -1499,7 +1471,7 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1516,7 +1488,8 @@ impl QwenModel<CudaBackend> {
         start_pos: usize,
         seq_len: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_prefill(
             &normed,
@@ -1528,7 +1501,7 @@ impl QwenModel<CudaBackend> {
             seq_len,
         )?;
 
-        let (mut hidden, normed) = add_rmsnorm(
+        let (mut hidden, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1536,7 +1509,7 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut hidden, &mlp_output)?;
+        CudaBackend::add_inplace(&mut hidden, &mlp_output)?;
         Ok(hidden)
     }
 
@@ -1555,27 +1528,27 @@ impl QwenModel<CudaBackend> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let mut q = linear(hidden, &weights.q_proj)?;
+        let mut q = CudaBackend::linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
             KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
-                let kv = matmul(hidden, weight)?;
-                split_kv(&kv, *kv_dim)?
+                let kv = CudaBackend::matmul(hidden, weight)?;
+                CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
             }
             KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
+                let k = CudaBackend::linear(hidden, k_proj)?;
+                let v = CudaBackend::linear(hidden, v_proj)?;
                 (k, v)
             }
         };
 
         if let Some(ref bias) = weights.q_bias {
-            bias_add_inplace(&mut q, bias)?;
+            CudaBackend::bias_add_inplace(&mut q, bias)?;
         }
         if let Some(ref bias) = weights.k_bias {
-            bias_add_inplace(&mut k, bias)?;
+            CudaBackend::bias_add_inplace(&mut k, bias)?;
         }
         if let Some(ref bias) = weights.v_bias {
-            bias_add_inplace(&mut v, bias)?;
+            CudaBackend::bias_add_inplace(&mut v, bias)?;
         }
 
         let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
@@ -1584,26 +1557,27 @@ impl QwenModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
         }
 
-        let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, start_pos)?;
-        let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let q = CudaBackend::apply_rope(&q, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let k = CudaBackend::apply_rope(&k, &self.cos_cache, &self.sin_cache, start_pos)?;
 
-        paged_kv.append_paged(layer_idx, block_table, &k, &v, start_pos)?;
+        CudaBackend::append_paged(paged_kv, layer_idx, block_table, &k, &v, start_pos)?;
 
         let mut gather_table = block_table.clone();
         gather_table.advance(seq_len);
-        let (k_contig, v_contig) = gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
+        let (k_contig, v_contig) =
+            CudaBackend::gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
 
         let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output = fused_attention_prefill(
+        let attn_output = CudaBackend::fused_attention_prefill(
             &q,
             &k_contig,
             &v_contig,
@@ -1614,7 +1588,7 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1660,23 +1634,23 @@ impl QwenModel<CudaBackend> {
                 intermediate_size,
             } => {
                 let seq_len = hidden.shape()[0];
-                let gate_up = matmul(hidden, weight)?;
+                let gate_up = CudaBackend::matmul(hidden, weight)?;
                 if seq_len == 1 {
                     let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
                     let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
                     (gate, up)
                 } else {
-                    split_gate_up(&gate_up, *intermediate_size)?
+                    CudaBackend::split_inner_dim(&gate_up, *intermediate_size, *intermediate_size)?
                 }
             }
             GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
-                let gate = linear(hidden, gate_proj)?;
-                let up = linear(hidden, up_proj)?;
+                let gate = CudaBackend::linear(hidden, gate_proj)?;
+                let up = CudaBackend::linear(hidden, up_proj)?;
                 (gate, up)
             }
         };
-        let intermediate = swiglu(&gate, &up)?;
-        let mut out = linear(&intermediate, &weights.down_proj)?;
+        let intermediate = CudaBackend::swiglu(&gate, &up)?;
+        let mut out = CudaBackend::linear(&intermediate, &weights.down_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1694,23 +1668,23 @@ impl QwenModel<CudaBackend> {
                 intermediate_size,
             } => {
                 let seq_len = hidden.shape()[0];
-                let gate_up = matmul(hidden, weight)?;
+                let gate_up = CudaBackend::matmul(hidden, weight)?;
                 if seq_len == 1 {
                     let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
                     let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
                     (gate, up)
                 } else {
-                    split_gate_up(&gate_up, *intermediate_size)?
+                    CudaBackend::split_inner_dim(&gate_up, *intermediate_size, *intermediate_size)?
                 }
             }
             GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
-                let gate = linear(hidden, gate_proj)?;
-                let up = linear(hidden, up_proj)?;
+                let gate = CudaBackend::linear(hidden, gate_proj)?;
+                let up = CudaBackend::linear(hidden, up_proj)?;
                 (gate, up)
             }
         };
-        let intermediate = swiglu(&gate, &up)?;
-        linear(&intermediate, &weights.down_proj)
+        let intermediate = CudaBackend::swiglu(&gate, &up)?;
+        CudaBackend::linear(&intermediate, &weights.down_proj)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1724,7 +1698,7 @@ impl QwenModel<CudaBackend> {
         shared_expert: Option<&QwenMlpWeights<CudaBackend>>,
         shared_expert_gate: Option<&CudaTensor>,
     ) -> Result<CudaTensor> {
-        let mut out = infernum_cuda::cuda::moe::moe_forward(
+        let mut out = CudaBackend::moe_forward_softmax(
             hidden,
             gate,
             experts.len(),
@@ -1743,10 +1717,10 @@ impl QwenModel<CudaBackend> {
                 let gate_val = 1.0 / (1.0 + (-gate_data[0]).exp());
                 let gate_f32 = CudaTensor::from_slice(&self.ctx, &[1], &[gate_val])?;
                 let gate_t = cast_from_f32(&gate_f32, self.dtype)?;
-                let gated = mul(&shared_out, &gate_t)?;
-                add_inplace(&mut out, &gated)?;
+                let gated = CudaBackend::mul(&shared_out, &gate_t)?;
+                CudaBackend::add_inplace(&mut out, &gated)?;
             } else {
-                add_inplace(&mut out, &shared_out)?;
+                CudaBackend::add_inplace(&mut out, &shared_out)?;
             }
         }
 
@@ -1758,14 +1732,14 @@ impl QwenModel<CudaBackend> {
     fn lm_head_forward(&self, hidden: &CudaTensor) -> Result<CudaTensor> {
         if self.dtype == DType::BF16 {
             if let LinearWeight::Dense(w) = &self.lm_head {
-                return matmul_bf16_f32(hidden, w);
+                return CudaBackend::matmul_bf16_f32(hidden, w);
             }
         }
-        let logits_t = linear(hidden, &self.lm_head)?;
+        let logits_t = CudaBackend::linear(hidden, &self.lm_head)?;
         if self.dtype == DType::F32 {
             return Ok(logits_t);
         }
-        cast_to_f32(&logits_t)
+        CudaBackend::cast_to_f32(&logits_t)
     }
 }
 
@@ -1809,33 +1783,34 @@ impl QwenModel<CudaBackend> {
         let mut hidden = self.embed(input_ids)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let normed = rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+            let normed =
+                CudaBackend::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             let num_heads = self.tp_num_heads;
             let num_kv_heads = self.tp_num_kv_heads;
             let head_dim = self.config.head_dim();
 
-            let mut q = linear(&normed, &layer.attention.q_proj)?;
+            let mut q = CudaBackend::linear(&normed, &layer.attention.q_proj)?;
             let (mut k, mut v) = match &layer.attention.kv_proj {
                 KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
-                    let kv = matmul(&normed, weight)?;
-                    split_kv(&kv, *kv_dim)?
+                    let kv = CudaBackend::matmul(&normed, weight)?;
+                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
                 }
                 KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
-                    let k = linear(&normed, k_proj)?;
-                    let v = linear(&normed, v_proj)?;
+                    let k = CudaBackend::linear(&normed, k_proj)?;
+                    let v = CudaBackend::linear(&normed, v_proj)?;
                     (k, v)
                 }
             };
 
             if let Some(ref bias) = layer.attention.q_bias {
-                bias_add_inplace(&mut q, bias)?;
+                CudaBackend::bias_add_inplace(&mut q, bias)?;
             }
             if let Some(ref bias) = layer.attention.k_bias {
-                bias_add_inplace(&mut k, bias)?;
+                CudaBackend::bias_add_inplace(&mut k, bias)?;
             }
             if let Some(ref bias) = layer.attention.v_bias {
-                bias_add_inplace(&mut v, bias)?;
+                CudaBackend::bias_add_inplace(&mut v, bias)?;
             }
 
             let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
@@ -1844,26 +1819,27 @@ impl QwenModel<CudaBackend> {
 
             if let Some(ref q_norm_w) = layer.attention.q_norm {
                 let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-                let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+                let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
                 q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
             }
             if let Some(ref k_norm_w) = layer.attention.k_norm {
                 let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-                let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+                let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
                 k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
             }
 
-            let q = apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
-            let k = apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
+            let q = CudaBackend::apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
+            let k = CudaBackend::apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
 
             let sliding_window = self.config.effective_sliding_window(layer_idx);
-            let attn_output = fused_attention_prefill(&q, &k, &v, 0, None, None, sliding_window)?;
+            let attn_output =
+                CudaBackend::fused_attention_prefill(&q, &k, &v, 0, None, None, sliding_window)?;
             let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-            let mut attn_output = linear(&attn_output, &layer.attention.o_proj)?;
+            let mut attn_output = CudaBackend::linear(&attn_output, &layer.attention.o_proj)?;
             #[cfg(feature = "nccl")]
             nccl_all_reduce(self.nccl_comm.as_ref(), &mut attn_output)?;
 
-            let (mut h, normed) = add_rmsnorm(
+            let (mut h, normed) = CudaBackend::add_rmsnorm(
                 &hidden,
                 &attn_output,
                 &layer.post_attention_layernorm,
@@ -1871,11 +1847,11 @@ impl QwenModel<CudaBackend> {
             )?;
 
             let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-            add_inplace(&mut h, &mlp_output)?;
+            CudaBackend::add_inplace(&mut h, &mlp_output)?;
             hidden = h;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden)
     }
 }

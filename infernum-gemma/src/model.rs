@@ -18,16 +18,16 @@
 use std::marker::PhantomData;
 use std::path::Path;
 
-use infernum::backend::Backend;
+use infernum::backend::{
+    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, GegluOps, MatmulExtOps, NormOps,
+    PagedAttentionOps, PagedKvCacheOps, RopeOps, TensorOps,
+};
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::Result;
 use infernum_cuda::cuda::ops::{
-    add_inplace, apply_rope, apply_rope_batched, apply_rope_batched_indirect, cast_from_f32,
-    cast_to_f32, embedding_gather, embedding_gather_from_device, fused_attention_prefill,
-    gather_paged_kv, geglu, matmul, matmul_bf16_f32, paged_attention_decode,
-    paged_attention_decode_indirect, precompute_rope_cache, quantized_matmul, rms_norm,
-    rms_norm_inplace, scale_inplace, split_inner_dim, transpose_2d,
+    apply_rope_batched_indirect, cast_from_f32, embedding_gather_from_device, matmul,
+    paged_attention_decode_indirect, precompute_rope_cache, quantized_matmul, transpose_2d,
 };
 #[cfg(feature = "nccl")]
 use infernum_cuda::cuda::{
@@ -78,14 +78,6 @@ fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
     CudaTensor::from_raw_bytes(a.context(), &[k, n1 + n2], dtype, &out)
 }
 
-fn split_gate_up(fused: &CudaTensor, intermediate_size: usize) -> Result<(CudaTensor, CudaTensor)> {
-    split_inner_dim(fused, intermediate_size, intermediate_size)
-}
-
-fn split_kv(fused: &CudaTensor, kv_dim: usize) -> Result<(CudaTensor, CudaTensor)> {
-    split_inner_dim(fused, kv_dim, kv_dim)
-}
-
 fn load_typed(
     dtype: DType,
     loader: &impl WeightLoader,
@@ -112,7 +104,7 @@ fn load_gemma_norm(
     name: &str,
 ) -> Result<CudaTensor> {
     let gpu_tensor = load_typed(dtype, loader, ctx, name)?;
-    let f32_tensor = cast_to_f32(&gpu_tensor)?;
+    let f32_tensor = CudaBackend::cast_to_f32(&gpu_tensor)?;
     let mut host: Vec<f32> = f32_tensor.to_vec::<f32>()?;
     for v in &mut host {
         *v += 1.0;
@@ -474,7 +466,7 @@ impl GemmaModel<CudaBackend> {
 
         // Tied word embeddings — Gemma always ties lm_head to embed_tokens
         let lm_head = if qc.is_some() {
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
             let data = embed_f32.to_vec::<f32>()?;
             LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
                 ctx,
@@ -482,7 +474,7 @@ impl GemmaModel<CudaBackend> {
                 &data,
             )?)
         } else {
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
             LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         };
@@ -824,7 +816,7 @@ impl GemmaModel<CudaBackend> {
 
         // Tied embeddings — not sharded for lm_head
         let lm_head = if qc.is_some() {
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
             let data = embed_f32.to_vec::<f32>()?;
             LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
                 ctx,
@@ -832,7 +824,7 @@ impl GemmaModel<CudaBackend> {
                 &data,
             )?)
         } else {
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
             LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         };
@@ -904,7 +896,7 @@ impl GemmaModel<CudaBackend> {
         let paged_kv = &mut paged_kvs[0];
 
         let mut hidden = self.embed(token_ids)?;
-        scale_inplace(&mut hidden, self.embed_scale)?;
+        CudaBackend::scale_inplace(&mut hidden, self.embed_scale)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer_paged_decode(
@@ -917,7 +909,7 @@ impl GemmaModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
 
@@ -940,7 +932,7 @@ impl GemmaModel<CudaBackend> {
             graph_inputs.token_ids(),
             batch_size,
         )?;
-        scale_inplace(&mut hidden, self.embed_scale)?;
+        CudaBackend::scale_inplace(&mut hidden, self.embed_scale)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer_paged_decode_indirect(
@@ -953,7 +945,7 @@ impl GemmaModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
 
@@ -972,7 +964,7 @@ impl GemmaModel<CudaBackend> {
         let paged_kv = &mut paged_kvs[0];
 
         let mut hidden = self.embed(input_ids)?;
-        scale_inplace(&mut hidden, self.embed_scale)?;
+        CudaBackend::scale_inplace(&mut hidden, self.embed_scale)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer_paged_prefill(
@@ -986,8 +978,8 @@ impl GemmaModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        let last_hidden = self.extract_last_row(&hidden, seq_len);
         self.lm_head_forward(&last_hidden)
     }
 
@@ -1000,7 +992,8 @@ impl GemmaModel<CudaBackend> {
         block_tables: &[BlockTable],
         positions: &[usize],
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode(
             &normed,
@@ -1011,15 +1004,15 @@ impl GemmaModel<CudaBackend> {
             positions,
         )?;
 
-        let post_attn = rms_norm(
+        let post_attn = CudaBackend::rms_norm(
             &attn_output,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
         )?;
         let mut hidden = hidden.clone();
-        add_inplace(&mut hidden, &post_attn)?;
+        CudaBackend::add_inplace(&mut hidden, &post_attn)?;
 
-        let normed_ffn = rms_norm(
+        let normed_ffn = CudaBackend::rms_norm(
             &hidden,
             &layer.pre_feedforward_layernorm,
             self.config.rms_norm_eps,
@@ -1027,12 +1020,12 @@ impl GemmaModel<CudaBackend> {
 
         let mlp_output = self.forward_mlp(&normed_ffn, &layer.mlp)?;
 
-        let post_ffn = rms_norm(
+        let post_ffn = CudaBackend::rms_norm(
             &mlp_output,
             &layer.post_feedforward_layernorm,
             self.config.rms_norm_eps,
         )?;
-        add_inplace(&mut hidden, &post_ffn)?;
+        CudaBackend::add_inplace(&mut hidden, &post_ffn)?;
 
         Ok(hidden)
     }
@@ -1051,7 +1044,7 @@ impl GemmaModel<CudaBackend> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim;
 
-        let q = linear(hidden, &weights.q_proj)?;
+        let q = gemma_linear(hidden, &weights.q_proj)?;
         let (k, v) = match &weights.kv_proj {
             KvProjWeight::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
@@ -1060,12 +1053,12 @@ impl GemmaModel<CudaBackend> {
                     let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
                     (k, v)
                 } else {
-                    split_kv(&kv, *kv_dim)?
+                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
                 }
             }
             KvProjWeight::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
+                let k = gemma_linear(hidden, k_proj)?;
+                let v = gemma_linear(hidden, v_proj)?;
                 (k, v)
             }
         };
@@ -1076,18 +1069,18 @@ impl GemmaModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
         }
 
         let (cos, sin) = self.rope_caches_for_layer(layer_idx);
-        let q = apply_rope_batched(&q, cos, sin, positions)?;
-        let k = apply_rope_batched(&k, cos, sin, positions)?;
+        let q = CudaBackend::apply_rope_batched(&q, cos, sin, positions)?;
+        let k = CudaBackend::apply_rope_batched(&k, cos, sin, positions)?;
 
         let q_stride = num_heads * head_dim;
         let kv_stride = num_kv_heads * head_dim;
@@ -1099,19 +1092,18 @@ impl GemmaModel<CudaBackend> {
             let k_i = k.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
             let v_i = v.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
 
-            paged_kv.append_paged(layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
+            CudaBackend::append_paged(paged_kv, layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
 
             let mut table_with_current = block_tables[i].clone();
             table_with_current.advance(1);
 
-            let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
-            let attn_i = paged_attention_decode(
-                &self.ctx,
+            let (k_pool, v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
+            let attn_i = CudaBackend::paged_attention_decode(
                 &q_i,
                 k_pool,
                 v_pool,
                 &[table_with_current],
-                paged_kv.block_size(),
+                CudaBackend::block_size(paged_kv),
                 None,
                 self.config.attn_logit_softcapping,
                 sliding_window,
@@ -1120,23 +1112,9 @@ impl GemmaModel<CudaBackend> {
             attn_parts.push(attn_i.reshape(&[1, num_heads * head_dim]));
         }
 
-        let attn_output = if batch_size == 1 {
-            attn_parts.into_iter().next().unwrap()
-        } else {
-            let row_size = num_heads * head_dim;
-            let elem = self.dtype.size_in_bytes();
-            let mut output =
-                unsafe { CudaTensor::uninit(&self.ctx, &[batch_size, row_size], self.dtype)? };
-            let out_slice = output.cuda_slice_mut();
-            for (i, part) in attn_parts.iter().enumerate() {
-                let src = part.cuda_slice().slice(..row_size * elem);
-                let mut dst = out_slice.slice_mut(i * row_size * elem..(i + 1) * row_size * elem);
-                self.ctx.device().dtod_copy(&src, &mut dst)?;
-            }
-            output
-        };
+        let attn_output = CudaBackend::concat_rows(&attn_parts)?;
 
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = gemma_linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1152,7 +1130,8 @@ impl GemmaModel<CudaBackend> {
         graph_inputs: &BatchedGraphInputs,
         max_seq_len: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_decode_indirect(
             &normed,
@@ -1163,15 +1142,15 @@ impl GemmaModel<CudaBackend> {
             max_seq_len,
         )?;
 
-        let post_attn = rms_norm(
+        let post_attn = CudaBackend::rms_norm(
             &attn_output,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
         )?;
         let mut hidden = hidden.clone();
-        add_inplace(&mut hidden, &post_attn)?;
+        CudaBackend::add_inplace(&mut hidden, &post_attn)?;
 
-        let normed_ffn = rms_norm(
+        let normed_ffn = CudaBackend::rms_norm(
             &hidden,
             &layer.pre_feedforward_layernorm,
             self.config.rms_norm_eps,
@@ -1179,12 +1158,12 @@ impl GemmaModel<CudaBackend> {
 
         let mlp_output = self.forward_mlp(&normed_ffn, &layer.mlp)?;
 
-        let post_ffn = rms_norm(
+        let post_ffn = CudaBackend::rms_norm(
             &mlp_output,
             &layer.post_feedforward_layernorm,
             self.config.rms_norm_eps,
         )?;
-        add_inplace(&mut hidden, &post_ffn)?;
+        CudaBackend::add_inplace(&mut hidden, &post_ffn)?;
 
         Ok(hidden)
     }
@@ -1204,7 +1183,7 @@ impl GemmaModel<CudaBackend> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim;
 
-        let q = linear(hidden, &weights.q_proj)?;
+        let q = gemma_linear(hidden, &weights.q_proj)?;
         let (k, v) = match &weights.kv_proj {
             KvProjWeight::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
@@ -1213,12 +1192,12 @@ impl GemmaModel<CudaBackend> {
                     let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
                     (k, v)
                 } else {
-                    split_kv(&kv, *kv_dim)?
+                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
                 }
             }
             KvProjWeight::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
+                let k = gemma_linear(hidden, k_proj)?;
+                let v = gemma_linear(hidden, v_proj)?;
                 (k, v)
             }
         };
@@ -1229,12 +1208,12 @@ impl GemmaModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
         }
 
@@ -1252,7 +1231,7 @@ impl GemmaModel<CudaBackend> {
             graph_inputs.max_blocks_per_seq(),
         )?;
 
-        let (k_pool, v_pool) = paged_kv.get_pools(layer_idx);
+        let (k_pool, v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
         let sliding_window = self.config.effective_sliding_window(layer_idx);
         let attn_output = paged_attention_decode_indirect(
             &self.ctx,
@@ -1261,7 +1240,7 @@ impl GemmaModel<CudaBackend> {
             v_pool,
             graph_inputs.block_tables(),
             graph_inputs.seq_lens(),
-            paged_kv.block_size(),
+            CudaBackend::block_size(paged_kv),
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
             None,
@@ -1270,7 +1249,7 @@ impl GemmaModel<CudaBackend> {
         )?;
 
         let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = gemma_linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1287,7 +1266,8 @@ impl GemmaModel<CudaBackend> {
         start_pos: usize,
         seq_len: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_prefill(
             &normed,
@@ -1299,15 +1279,15 @@ impl GemmaModel<CudaBackend> {
             seq_len,
         )?;
 
-        let post_attn = rms_norm(
+        let post_attn = CudaBackend::rms_norm(
             &attn_output,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
         )?;
         let mut hidden = hidden.clone();
-        add_inplace(&mut hidden, &post_attn)?;
+        CudaBackend::add_inplace(&mut hidden, &post_attn)?;
 
-        let normed_ffn = rms_norm(
+        let normed_ffn = CudaBackend::rms_norm(
             &hidden,
             &layer.pre_feedforward_layernorm,
             self.config.rms_norm_eps,
@@ -1315,12 +1295,12 @@ impl GemmaModel<CudaBackend> {
 
         let mlp_output = self.forward_mlp(&normed_ffn, &layer.mlp)?;
 
-        let post_ffn = rms_norm(
+        let post_ffn = CudaBackend::rms_norm(
             &mlp_output,
             &layer.post_feedforward_layernorm,
             self.config.rms_norm_eps,
         )?;
-        add_inplace(&mut hidden, &post_ffn)?;
+        CudaBackend::add_inplace(&mut hidden, &post_ffn)?;
 
         Ok(hidden)
     }
@@ -1340,15 +1320,15 @@ impl GemmaModel<CudaBackend> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim;
 
-        let q = linear(hidden, &weights.q_proj)?;
+        let q = gemma_linear(hidden, &weights.q_proj)?;
         let (k, v) = match &weights.kv_proj {
             KvProjWeight::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
-                split_kv(&kv, *kv_dim)?
+                CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
             }
             KvProjWeight::Separate { k_proj, v_proj } => {
-                let k = linear(hidden, k_proj)?;
-                let v = linear(hidden, v_proj)?;
+                let k = gemma_linear(hidden, k_proj)?;
+                let v = gemma_linear(hidden, v_proj)?;
                 (k, v)
             }
         };
@@ -1359,27 +1339,28 @@ impl GemmaModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-            let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-            let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
         }
 
         let (cos, sin) = self.rope_caches_for_layer(layer_idx);
-        let q = apply_rope(&q, cos, sin, start_pos)?;
-        let k = apply_rope(&k, cos, sin, start_pos)?;
+        let q = CudaBackend::apply_rope(&q, cos, sin, start_pos)?;
+        let k = CudaBackend::apply_rope(&k, cos, sin, start_pos)?;
 
-        paged_kv.append_paged(layer_idx, block_table, &k, &v, start_pos)?;
+        CudaBackend::append_paged(paged_kv, layer_idx, block_table, &k, &v, start_pos)?;
 
         let mut gather_table = block_table.clone();
         gather_table.advance(seq_len);
-        let (k_contig, v_contig) = gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
+        let (k_contig, v_contig) =
+            CudaBackend::gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
 
         let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output = fused_attention_prefill(
+        let attn_output = CudaBackend::fused_attention_prefill(
             &q,
             &k_contig,
             &v_contig,
@@ -1390,7 +1371,7 @@ impl GemmaModel<CudaBackend> {
         )?;
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = gemma_linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1421,57 +1402,50 @@ impl GemmaModel<CudaBackend> {
                     let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
                     (gate, up)
                 } else {
-                    split_gate_up(&gate_up, *intermediate_size)?
+                    CudaBackend::split_inner_dim(&gate_up, *intermediate_size, *intermediate_size)?
                 }
             }
             GateUpWeight::Separate { gate_proj, up_proj } => {
-                let gate = linear(hidden, gate_proj)?;
-                let up = linear(hidden, up_proj)?;
+                let gate = gemma_linear(hidden, gate_proj)?;
+                let up = gemma_linear(hidden, up_proj)?;
                 (gate, up)
             }
         };
         // GeGLU: gelu(gate) * up
-        let intermediate = geglu(&gate, &up)?;
-        let mut out = linear(&intermediate, &weights.down_proj)?;
+        let intermediate = CudaBackend::geglu(&gate, &up)?;
+        let mut out = gemma_linear(&intermediate, &weights.down_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
     }
 
-    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> Result<CudaTensor> {
-        if seq_len == 1 {
-            return Ok(hidden.reshape(&[1, self.config.hidden_size]));
-        }
+    #[allow(clippy::unused_self)]
+    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> CudaTensor {
         let hidden_size = hidden.shape()[1];
-        let elem = self.dtype.size_in_bytes();
-        let flat = hidden.reshape(&[seq_len * hidden_size]);
-        let mut out = unsafe { CudaTensor::uninit(&self.ctx, &[1, hidden_size], self.dtype)? };
-        let device = self.ctx.device();
-        let src = flat.cuda_slice();
-        let last_offset = (seq_len - 1) * hidden_size * elem;
-        let src_sub = src.slice(last_offset..seq_len * hidden_size * elem);
-        device.dtod_copy(&src_sub, out.cuda_slice_mut())?;
-        Ok(out)
+        if seq_len == 1 {
+            return hidden.reshape(&[1, hidden_size]);
+        }
+        hidden.slice_view((seq_len - 1) * hidden_size, &[1, hidden_size])
     }
 
     fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor> {
-        embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
+        CudaBackend::embedding_gather(&self.embed_tokens, input_ids)
     }
 
     fn lm_head_forward(&self, hidden: &CudaTensor) -> Result<CudaTensor> {
         // bf16 fast path
         if self.dtype == DType::BF16 {
             if let LinearWeight::Dense(w) = &self.lm_head {
-                let mut logits = matmul_bf16_f32(hidden, w)?;
+                let mut logits = CudaBackend::matmul_bf16_f32(hidden, w)?;
                 self.apply_final_softcap(&mut logits)?;
                 return Ok(logits);
             }
         }
-        let logits_t = linear(hidden, &self.lm_head)?;
+        let logits_t = gemma_linear(hidden, &self.lm_head)?;
         let mut logits = if self.dtype == DType::F32 {
             logits_t
         } else {
-            cast_to_f32(&logits_t)?
+            CudaBackend::cast_to_f32(&logits_t)?
         };
         self.apply_final_softcap(&mut logits)?;
         Ok(logits)
@@ -1512,14 +1486,17 @@ fn convert_rope_cache(
     ))
 }
 
-fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
+/// Linear projection that handles both dense and quantized weights.
+///
+/// Quantized weights are computed in f32 and cast back to the input dtype.
+fn gemma_linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
     match weight {
         LinearWeight::Dense(w) => matmul(input, w),
         LinearWeight::Quantized(w) => {
             let input_f32 = if input.dtype() == DType::F32 {
                 input.slice_view(0, input.shape())
             } else {
-                cast_to_f32(input)?
+                CudaBackend::cast_to_f32(input)?
             };
             let output_f32 = quantized_matmul(&input_f32, w)?;
             if input.dtype() == DType::F32 {
@@ -1571,25 +1548,26 @@ impl GemmaModel<CudaBackend> {
     pub fn forward_full(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         let seq_len = input_ids.len();
         let mut hidden = self.embed(input_ids)?;
-        scale_inplace(&mut hidden, self.embed_scale)?;
+        CudaBackend::scale_inplace(&mut hidden, self.embed_scale)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let normed = rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+            let normed =
+                CudaBackend::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             let num_heads = self.tp_num_heads;
             let num_kv_heads = self.tp_num_kv_heads;
             let head_dim = self.config.head_dim;
             let sliding_window = self.config.effective_sliding_window(layer_idx);
 
-            let q = linear(&normed, &layer.attention.q_proj)?;
+            let q = gemma_linear(&normed, &layer.attention.q_proj)?;
             let (k, v) = match &layer.attention.kv_proj {
                 KvProjWeight::Fused { weight, kv_dim } => {
                     let kv = matmul(&normed, weight)?;
-                    split_kv(&kv, *kv_dim)?
+                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
                 }
                 KvProjWeight::Separate { k_proj, v_proj } => {
-                    let k = linear(&normed, k_proj)?;
-                    let v = linear(&normed, v_proj)?;
+                    let k = gemma_linear(&normed, k_proj)?;
+                    let v = gemma_linear(&normed, v_proj)?;
                     (k, v)
                 }
             };
@@ -1600,20 +1578,20 @@ impl GemmaModel<CudaBackend> {
 
             if let Some(ref q_norm_w) = layer.attention.q_norm {
                 let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-                let normed_q = rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+                let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
                 q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
             }
             if let Some(ref k_norm_w) = layer.attention.k_norm {
                 let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-                let normed_k = rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+                let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
                 k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
             }
 
             let (cos, sin) = self.rope_caches_for_layer(layer_idx);
-            let q = apply_rope(&q, cos, sin, 0)?;
-            let k = apply_rope(&k, cos, sin, 0)?;
+            let q = CudaBackend::apply_rope(&q, cos, sin, 0)?;
+            let k = CudaBackend::apply_rope(&k, cos, sin, 0)?;
 
-            let attn_output = fused_attention_prefill(
+            let attn_output = CudaBackend::fused_attention_prefill(
                 &q,
                 &k,
                 &v,
@@ -1623,20 +1601,20 @@ impl GemmaModel<CudaBackend> {
                 sliding_window,
             )?;
             let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-            let mut attn_output = linear(&attn_output, &layer.attention.o_proj)?;
+            let mut attn_output = gemma_linear(&attn_output, &layer.attention.o_proj)?;
             #[cfg(feature = "nccl")]
             nccl_all_reduce(self.nccl_comm.as_ref(), &mut attn_output)?;
 
             // Post-attention norm + residual
-            let post_attn = rms_norm(
+            let post_attn = CudaBackend::rms_norm(
                 &attn_output,
                 &layer.post_attention_layernorm,
                 self.config.rms_norm_eps,
             )?;
-            add_inplace(&mut hidden, &post_attn)?;
+            CudaBackend::add_inplace(&mut hidden, &post_attn)?;
 
             // Pre-feedforward norm
-            let normed_ffn = rms_norm(
+            let normed_ffn = CudaBackend::rms_norm(
                 &hidden,
                 &layer.pre_feedforward_layernorm,
                 self.config.rms_norm_eps,
@@ -1645,15 +1623,15 @@ impl GemmaModel<CudaBackend> {
             let mlp_output = self.forward_mlp(&normed_ffn, &layer.mlp)?;
 
             // Post-feedforward norm + residual
-            let post_ffn = rms_norm(
+            let post_ffn = CudaBackend::rms_norm(
                 &mlp_output,
                 &layer.post_feedforward_layernorm,
                 self.config.rms_norm_eps,
             )?;
-            add_inplace(&mut hidden, &post_ffn)?;
+            CudaBackend::add_inplace(&mut hidden, &post_ffn)?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden)
     }
 }

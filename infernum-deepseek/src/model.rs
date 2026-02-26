@@ -12,19 +12,18 @@
 use std::marker::PhantomData;
 use std::path::Path;
 
-use infernum::backend::Backend;
+use infernum::backend::{
+    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, MatmulExtOps, MatmulOps, NormOps,
+    PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, SwigluOps, TensorOps,
+};
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::Result;
 use infernum_cuda::cuda::ops::{
-    add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_batched_indirect,
-    apply_rope_interleaved_indirect, broadcast_to_heads, cast_from_f32, cast_to_f32,
-    combine_attention_with_lse, concat_inner_dim, embedding_gather, embedding_gather_from_device,
-    fused_attention_decode, fused_attention_decode_indirect, fused_attention_prefill,
-    fused_attention_prefill_with_lse, gather_paged_kv, linear, matmul, matmul_bf16_f32,
-    pad_inner_dim, paged_attention_decode, paged_attention_decode_indirect, precompute_rope_cache,
-    precompute_rope_cache_scaled, quantized_matmul, rms_norm, rms_norm_inplace, split_inner_dim,
-    swiglu, transpose_2d, LinearWeight, RopeScaling,
+    apply_rope_interleaved_batched_indirect, apply_rope_interleaved_indirect, cast_from_f32,
+    embedding_gather_from_device, fused_attention_decode_indirect, paged_attention_decode_indirect,
+    precompute_rope_cache, precompute_rope_cache_scaled, quantized_matmul, transpose_2d,
+    LinearWeight, RopeScaling,
 };
 use infernum_cuda::cuda::{
     BatchedGraphInputs, CudaContext, CudaSlice, CudaTensor, GpuConfig, KvCache, PagedKvCache,
@@ -619,7 +618,7 @@ impl DeepSeekModel<CudaBackend> {
         let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
 
         let lm_head = if config.tie_word_embeddings {
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
             LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         } else {
@@ -1072,7 +1071,7 @@ impl DeepSeekModel<CudaBackend> {
         let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
 
         let lm_head = if config.tie_word_embeddings {
-            let embed_f32 = cast_to_f32(&embed_tokens)?;
+            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
             let transposed = pretranspose_weight(&embed_f32)?;
             LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
         } else {
@@ -1135,40 +1134,33 @@ impl DeepSeekModel<CudaBackend> {
     // --- Forward pass ---
 
     fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor> {
-        embedding_gather(&self.ctx, &self.embed_tokens, input_ids)
+        CudaBackend::embedding_gather(&self.embed_tokens, input_ids)
     }
 
     fn embed_from_device(&self, token_id_gpu: &CudaSlice<u32>) -> Result<CudaTensor> {
         embedding_gather_from_device(&self.ctx, &self.embed_tokens, token_id_gpu, 1)
     }
 
-    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> Result<CudaTensor> {
-        if seq_len == 1 {
-            return Ok(hidden.reshape(&[1, self.config.hidden_size]));
-        }
+    #[allow(clippy::unused_self)]
+    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> CudaTensor {
         let hidden_size = hidden.shape()[1];
-        let elem = self.dtype.size_in_bytes();
-        let flat = hidden.reshape(&[seq_len * hidden_size]);
-        let mut out = unsafe { CudaTensor::uninit(&self.ctx, &[1, hidden_size], self.dtype)? };
-        let device = self.ctx.device();
-        let src = flat.cuda_slice();
-        let last_offset = (seq_len - 1) * hidden_size * elem;
-        let src_sub = src.slice(last_offset..seq_len * hidden_size * elem);
-        device.dtod_copy(&src_sub, out.cuda_slice_mut())?;
-        Ok(out)
+        if seq_len == 1 {
+            return hidden.reshape(&[1, hidden_size]);
+        }
+        hidden.slice_view((seq_len - 1) * hidden_size, &[1, hidden_size])
     }
 
     fn lm_head_forward(&self, hidden: &CudaTensor) -> Result<CudaTensor> {
         if self.dtype == DType::BF16 {
             if let LinearWeight::Dense(w) = &self.lm_head {
-                return matmul_bf16_f32(hidden, w);
+                return CudaBackend::matmul_bf16_f32(hidden, w);
             }
         }
-        let logits_t = linear(hidden, &self.lm_head)?;
+        let logits_t = CudaBackend::linear(hidden, &self.lm_head)?;
         if self.dtype == DType::F32 {
             return Ok(logits_t);
         }
-        cast_to_f32(&logits_t)
+        CudaBackend::cast_to_f32(&logits_t)
     }
 
     // --- MLA attention ---
@@ -1188,7 +1180,7 @@ impl DeepSeekModel<CudaBackend> {
             let b = tensor.slice_view(dim1, &[1, dim2]);
             Ok((a, b))
         } else {
-            split_inner_dim(tensor, dim1, dim2)
+            CudaBackend::split_inner_dim(tensor, dim1, dim2)
         }
     }
 
@@ -1205,7 +1197,7 @@ impl DeepSeekModel<CudaBackend> {
 
         let outer = seq_len * num_heads;
         let flat = tensor.reshape(&[outer, total]);
-        let (a_flat, b_flat) = split_inner_dim(&flat, dim1, dim2)?;
+        let (a_flat, b_flat) = CudaBackend::split_inner_dim(&flat, dim1, dim2)?;
         let a = a_flat.reshape(&[seq_len, num_heads, dim1]);
         let b = b_flat.reshape(&[seq_len, num_heads, dim2]);
         Ok((a, b))
@@ -1223,13 +1215,13 @@ impl DeepSeekModel<CudaBackend> {
         let outer = seq_len * num_heads;
         let a_flat = a.reshape(&[outer, dim1]);
         let b_flat = b.reshape(&[outer, dim2]);
-        let out_flat = concat_inner_dim(&a_flat, &b_flat)?;
+        let out_flat = CudaBackend::concat_inner_dim(&a_flat, &b_flat)?;
         Ok(out_flat.reshape(&[seq_len, num_heads, dim1 + dim2]))
     }
 
     /// Broadcast `[seq, 1, rope_dim]` to `[seq, num_heads, rope_dim]`.
     fn broadcast_kv_rope(k_rope: &CudaTensor, num_heads: usize) -> Result<CudaTensor> {
-        broadcast_to_heads(k_rope, num_heads)
+        CudaBackend::broadcast_to_heads(k_rope, num_heads)
     }
 
     /// Pad V from `[seq, num_heads, v_head_dim]` to `[seq, num_heads, qk_head_dim]`.
@@ -1243,7 +1235,7 @@ impl DeepSeekModel<CudaBackend> {
 
         let outer = seq_len * num_heads;
         let flat = v.reshape(&[outer, v_dim]);
-        let padded = pad_inner_dim(&flat, qk_head_dim)?;
+        let padded = CudaBackend::pad_inner_dim(&flat, qk_head_dim)?;
         Ok(padded.reshape(&[seq_len, num_heads, qk_head_dim]))
     }
 
@@ -1260,7 +1252,7 @@ impl DeepSeekModel<CudaBackend> {
         let outer = seq_len * num_heads;
         let flat = attn_out.reshape(&[outer, qk_dim]);
         let discard_dim = qk_dim - v_head_dim;
-        let (kept, _) = split_inner_dim(&flat, v_head_dim, discard_dim)?;
+        let (kept, _) = CudaBackend::split_inner_dim(&flat, v_head_dim, discard_dim)?;
         Ok(kept.reshape(&[seq_len, num_heads, v_head_dim]))
     }
 
@@ -1275,7 +1267,7 @@ impl DeepSeekModel<CudaBackend> {
         let kv_lora_rank = kv_b_proj_k_t.shape()[2];
         // (num_heads, 1, D) @ (num_heads, D, R) → (num_heads, 1, R) → (1, H, R)
         let q = q_nope.reshape(&[num_heads, 1, d]);
-        let out = matmul(&q, kv_b_proj_k_t)?;
+        let out = CudaBackend::matmul(&q, kv_b_proj_k_t)?;
         Ok(out.reshape(&[1, num_heads, kv_lora_rank]))
     }
 
@@ -1290,7 +1282,7 @@ impl DeepSeekModel<CudaBackend> {
         let v_head_dim = kv_b_proj_v.shape()[2];
         // (num_heads, 1, R) @ (num_heads, R, V) → (num_heads, 1, V) → (1, H, V)
         let a = attn_nope.reshape(&[num_heads, 1, r]);
-        let out = matmul(&a, kv_b_proj_v)?;
+        let out = CudaBackend::matmul(&a, kv_b_proj_v)?;
         Ok(out.reshape(&[1, num_heads, v_head_dim]))
     }
 
@@ -1314,7 +1306,7 @@ impl DeepSeekModel<CudaBackend> {
         let mut all_bytes: Vec<u8> = Vec::with_capacity(batch_size * out_elems * elem);
         for b in 0..batch_size {
             let q_b = q_nope.slice_view(b * item_elems, &[num_heads, 1, d]);
-            let out_b = matmul(&q_b, kv_b_proj_k_t)?; // (H, 1, R)
+            let out_b = CudaBackend::matmul(&q_b, kv_b_proj_k_t)?; // (H, 1, R)
             all_bytes.extend_from_slice(&out_b.to_raw_bytes()?);
         }
         CudaTensor::from_raw_bytes(
@@ -1345,7 +1337,7 @@ impl DeepSeekModel<CudaBackend> {
         let mut all_bytes: Vec<u8> = Vec::with_capacity(batch_size * out_elems * elem);
         for b in 0..batch_size {
             let a_b = attn_nope.slice_view(b * item_elems, &[num_heads, 1, r]);
-            let out_b = matmul(&a_b, kv_b_proj_v)?; // (H, 1, V)
+            let out_b = CudaBackend::matmul(&a_b, kv_b_proj_v)?; // (H, 1, V)
             all_bytes.extend_from_slice(&out_b.to_raw_bytes()?);
         }
         CudaTensor::from_raw_bytes(
@@ -1376,15 +1368,15 @@ impl DeepSeekModel<CudaBackend> {
 
         // --- Q projection: two-stage LoRA ---
         // q_compressed = hidden @ q_a_proj → [seq, q_lora_rank]
-        let q_compressed = linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
         // RMSNorm
-        let q_compressed = rms_norm(
+        let q_compressed = CudaBackend::rms_norm(
             &q_compressed,
             &weights.q_a_layernorm,
             self.config.rms_norm_eps,
         )?;
         // q = q_compressed @ q_b_proj → [seq, num_heads * qk_head_dim]
-        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
 
         // Reshape to [seq, num_heads, qk_head_dim]
         let q = q.reshape(&[seq_len, num_heads, qk_head_dim]);
@@ -1393,19 +1385,19 @@ impl DeepSeekModel<CudaBackend> {
 
         // --- KV joint projection ---
         // kv = hidden @ kv_a_proj → [seq, kv_lora_rank + qk_rope_head_dim]
-        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
         // Split into compressed KV and k_rope
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
 
         // RMSNorm the compressed KV
-        let k_compressed = rms_norm(
+        let k_compressed = CudaBackend::rms_norm(
             &k_compressed,
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
         )?;
 
         // Decompress: kv_decompressed = k_compressed @ kv_b_proj → [seq, num_heads * (qk_nope_dim + v_head_dim)]
-        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
+        let kv_decompressed = CudaBackend::linear(&k_compressed, &weights.kv_b_proj)?;
 
         // Reshape to [seq, num_heads, qk_nope_dim + v_head_dim] and split
         let kv_decompressed =
@@ -1414,14 +1406,22 @@ impl DeepSeekModel<CudaBackend> {
 
         // --- RoPE ---
         let k_rope = k_rope.reshape(&[seq_len, 1, qk_rope_dim]);
-        let q_rope =
-            apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, position_offset)?;
-        let k_rope =
-            apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, position_offset)?;
+        let q_rope = CudaBackend::apply_rope_interleaved(
+            &q_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            position_offset,
+        )?;
+        let k_rope = CudaBackend::apply_rope_interleaved(
+            &k_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            position_offset,
+        )?;
 
         // --- Write compressed entry to KV cache ---
         let k_rope_2d = k_rope.reshape(&[seq_len, qk_rope_dim]);
-        let cache_entry_2d = concat_inner_dim(&k_compressed, &k_rope_2d)?;
+        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
         let cache_entry = cache_entry_2d.reshape(&[seq_len, 1, kv_lora_rank + qk_rope_dim]);
         kv_cache.append(layer_idx, &cache_entry, &cache_entry)?;
         let total_len = kv_cache.current_len() + seq_len;
@@ -1433,7 +1433,7 @@ impl DeepSeekModel<CudaBackend> {
             let q_absorbed = Self::concat_head_dim(&q_absorbed_nope, &q_rope)?;
 
             let (k_full, _v_full) = kv_cache.get_up_to(layer_idx, total_len);
-            let attn_compressed = fused_attention_decode(
+            let attn_compressed = CudaBackend::fused_attention_decode(
                 &q_absorbed,
                 &k_full,
                 &k_full,
@@ -1451,7 +1451,7 @@ impl DeepSeekModel<CudaBackend> {
             let q = Self::concat_head_dim(&q_nope, &q_rope)?;
             let k = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
             let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
-            let attn = fused_attention_prefill(
+            let attn = CudaBackend::fused_attention_prefill(
                 &q,
                 &k,
                 &v_padded,
@@ -1465,7 +1465,7 @@ impl DeepSeekModel<CudaBackend> {
 
         // --- Output projection ---
         let attn_output = attn_output.reshape(&[seq_len, num_heads * v_head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1487,20 +1487,20 @@ impl DeepSeekModel<CudaBackend> {
         let v_head_dim = self.config.v_head_dim;
         let kv_lora_rank = self.config.kv_lora_rank;
 
-        let q_compressed = linear(hidden, &weights.q_a_proj)?;
-        let q_compressed = rms_norm(
+        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = CudaBackend::rms_norm(
             &q_compressed,
             &weights.q_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
         let q = q.reshape(&[1, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
         // KV joint projection (compressed only)
-        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-        let k_compressed = rms_norm(
+        let k_compressed = CudaBackend::rms_norm(
             &k_compressed,
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
@@ -1515,7 +1515,7 @@ impl DeepSeekModel<CudaBackend> {
 
         // Write compressed entry to KV cache
         let k_rope_2d = k_rope.reshape(&[1, qk_rope_dim]);
-        let cache_entry_2d = concat_inner_dim(&k_compressed, &k_rope_2d)?;
+        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
         let cache_entry = cache_entry_2d.reshape(&[1, 1, kv_lora_rank + qk_rope_dim]);
         kv_cache.append_indirect(layer_idx, &cache_entry, &cache_entry)?;
 
@@ -1540,7 +1540,7 @@ impl DeepSeekModel<CudaBackend> {
         let (attn_nope, _) = Self::split_head_dim(&attn_compressed, kv_lora_rank, qk_rope_dim)?;
         let attn_output = Self::absorb_v(&attn_nope, &weights.kv_b_proj_v)?;
         let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1550,10 +1550,10 @@ impl DeepSeekModel<CudaBackend> {
 
     #[allow(clippy::unused_self)]
     fn forward_mlp(&self, hidden: &CudaTensor, weights: &DenseMlpWeights) -> Result<CudaTensor> {
-        let gate = linear(hidden, &weights.gate_proj)?;
-        let up = linear(hidden, &weights.up_proj)?;
-        let intermediate = swiglu(&gate, &up)?;
-        let mut out = linear(&intermediate, &weights.down_proj)?;
+        let gate = CudaBackend::linear(hidden, &weights.gate_proj)?;
+        let up = CudaBackend::linear(hidden, &weights.up_proj)?;
+        let intermediate = CudaBackend::swiglu(&gate, &up)?;
+        let mut out = CudaBackend::linear(&intermediate, &weights.down_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1565,10 +1565,10 @@ impl DeepSeekModel<CudaBackend> {
         hidden: &CudaTensor,
         weights: &DenseMlpWeights,
     ) -> Result<CudaTensor> {
-        let gate = linear(hidden, &weights.gate_proj)?;
-        let up = linear(hidden, &weights.up_proj)?;
-        let intermediate = swiglu(&gate, &up)?;
-        linear(&intermediate, &weights.down_proj)
+        let gate = CudaBackend::linear(hidden, &weights.gate_proj)?;
+        let up = CudaBackend::linear(hidden, &weights.up_proj)?;
+        let intermediate = CudaBackend::swiglu(&gate, &up)?;
+        CudaBackend::linear(&intermediate, &weights.down_proj)
     }
 
     fn forward_moe(&self, hidden: &CudaTensor, moe_weights: &MoeWeights) -> Result<CudaTensor> {
@@ -1594,7 +1594,7 @@ impl DeepSeekModel<CudaBackend> {
 
         // Add shared expert output
         let shared_output = self.forward_mlp_no_reduce(hidden, &moe_weights.shared_expert)?;
-        add_inplace(&mut routed_output, &shared_output)?;
+        CudaBackend::add_inplace(&mut routed_output, &shared_output)?;
 
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut routed_output)?;
@@ -1618,7 +1618,8 @@ impl DeepSeekModel<CudaBackend> {
         kv_cache: &mut KvCache,
         position_offset: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
         let attn_output = self.forward_mla_attention(
             &normed,
             &layer.attention,
@@ -1627,7 +1628,7 @@ impl DeepSeekModel<CudaBackend> {
             position_offset,
         )?;
 
-        let (mut h, normed) = add_rmsnorm(
+        let (mut h, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1635,7 +1636,7 @@ impl DeepSeekModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut h, &mlp_output)?;
+        CudaBackend::add_inplace(&mut h, &mlp_output)?;
         Ok(h)
     }
 
@@ -1646,11 +1647,12 @@ impl DeepSeekModel<CudaBackend> {
         layer_idx: usize,
         kv_cache: &mut KvCache,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
         let attn_output =
             self.forward_mla_attention_indirect(&normed, &layer.attention, layer_idx, kv_cache)?;
 
-        let (mut h, normed) = add_rmsnorm(
+        let (mut h, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1658,7 +1660,7 @@ impl DeepSeekModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut h, &mlp_output)?;
+        CudaBackend::add_inplace(&mut h, &mlp_output)?;
         Ok(h)
     }
 
@@ -1684,39 +1686,50 @@ impl DeepSeekModel<CudaBackend> {
         let kv_lora_rank = self.config.kv_lora_rank;
 
         // Q projection (two-stage LoRA)
-        let q_compressed = linear(hidden, &weights.q_a_proj)?;
-        let q_compressed = rms_norm(
+        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = CudaBackend::rms_norm(
             &q_compressed,
             &weights.q_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
         let q = q.reshape(&[seq_len, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
         // KV joint projection
-        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-        let k_compressed = rms_norm(
+        let k_compressed = CudaBackend::rms_norm(
             &k_compressed,
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let kv_decompressed = linear(&k_compressed, &weights.kv_b_proj)?;
+        let kv_decompressed = CudaBackend::linear(&k_compressed, &weights.kv_b_proj)?;
         let kv_decompressed =
             kv_decompressed.reshape(&[seq_len, num_heads, qk_nope_dim + v_head_dim]);
         let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
 
         // RoPE (interleaved)
         let k_rope = k_rope.reshape(&[seq_len, 1, qk_rope_dim]);
-        let q_rope = apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
-        let k_rope = apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let q_rope = CudaBackend::apply_rope_interleaved(
+            &q_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            start_pos,
+        )?;
+        let k_rope = CudaBackend::apply_rope_interleaved(
+            &k_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            start_pos,
+        )?;
 
         // Write compressed entry to paged cache: (seq_len, 1, kv_lora_rank + qk_rope_dim)
         let k_rope_2d = k_rope.reshape(&[seq_len, qk_rope_dim]);
-        let cache_entry_2d = concat_inner_dim(&k_compressed, &k_rope_2d)?;
+        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
         let cache_entry = cache_entry_2d.reshape(&[seq_len, 1, kv_lora_rank + qk_rope_dim]);
-        paged_kv.append_paged(
+        CudaBackend::append_paged(
+            paged_kv,
             layer_idx,
             block_table,
             &cache_entry,
@@ -1732,7 +1745,7 @@ impl DeepSeekModel<CudaBackend> {
             let k_full = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
             let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
 
-            let out = fused_attention_prefill(
+            let out = CudaBackend::fused_attention_prefill(
                 &q_full,
                 &k_full,
                 &v_padded,
@@ -1754,9 +1767,10 @@ impl DeepSeekModel<CudaBackend> {
                 kv_lora_rank,
             )?;
             let q_absorbed = Self::concat_head_dim(&q_absorbed_nope, &q_rope)?;
-            let (cached_k, _cached_v) = gather_paged_kv(paged_kv, layer_idx, block_table)?;
+            let (cached_k, _cached_v) =
+                CudaBackend::gather_paged_kv(paged_kv, layer_idx, block_table)?;
             // cached_k: (start_pos, 1, kv_lora_rank + qk_rope_dim) — no causal mask needed
-            let (out_cached, lse_cached) = fused_attention_prefill_with_lse(
+            let (out_cached, lse_cached) = CudaBackend::fused_attention_prefill_with_lse(
                 &q_absorbed,
                 &cached_k,
                 &cached_k,
@@ -1781,7 +1795,7 @@ impl DeepSeekModel<CudaBackend> {
             let q_full = Self::concat_head_dim(&q_nope, &q_rope)?;
             let k_full = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
             let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
-            let (out_local, lse_local) = fused_attention_prefill_with_lse(
+            let (out_local, lse_local) = CudaBackend::fused_attention_prefill_with_lse(
                 &q_full,
                 &k_full,
                 &v_padded,
@@ -1793,10 +1807,15 @@ impl DeepSeekModel<CudaBackend> {
             let out_local_v = Self::truncate_attn_output(&out_local, v_head_dim)?;
 
             // Combine with numerically-stable LSE correction
-            combine_attention_with_lse(&out_cached_v, &lse_cached, &out_local_v, &lse_local)?
+            CudaBackend::combine_attention_with_lse(
+                &out_cached_v,
+                &lse_cached,
+                &out_local_v,
+                &lse_local,
+            )?
         };
         let attn_output = attn_output.reshape(&[seq_len, num_heads * v_head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1820,20 +1839,20 @@ impl DeepSeekModel<CudaBackend> {
         let kv_lora_rank = self.config.kv_lora_rank;
 
         // Q projection (two-stage LoRA)
-        let q_compressed = linear(hidden, &weights.q_a_proj)?;
-        let q_compressed = rms_norm(
+        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = CudaBackend::rms_norm(
             &q_compressed,
             &weights.q_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
         let q = q.reshape(&[1, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
         // KV joint projection (compressed only — no decompression for absorbed decode)
-        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-        let k_compressed = rms_norm(
+        let k_compressed = CudaBackend::rms_norm(
             &k_compressed,
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
@@ -1841,14 +1860,31 @@ impl DeepSeekModel<CudaBackend> {
 
         // RoPE (interleaved)
         let k_rope = k_rope.reshape(&[1, 1, qk_rope_dim]);
-        let q_rope = apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, position)?;
-        let k_rope = apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, position)?;
+        let q_rope = CudaBackend::apply_rope_interleaved(
+            &q_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            position,
+        )?;
+        let k_rope = CudaBackend::apply_rope_interleaved(
+            &k_rope,
+            &self.cos_cache,
+            &self.sin_cache,
+            position,
+        )?;
 
         // Write compressed entry to paged cache: (1, 1, kv_lora_rank + qk_rope_dim)
         let k_rope_2d = k_rope.reshape(&[1, qk_rope_dim]);
-        let cache_entry_2d = concat_inner_dim(&k_compressed, &k_rope_2d)?;
+        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
         let cache_entry = cache_entry_2d.reshape(&[1, 1, kv_lora_rank + qk_rope_dim]);
-        paged_kv.append_paged(layer_idx, block_table, &cache_entry, &cache_entry, position)?;
+        CudaBackend::append_paged(
+            paged_kv,
+            layer_idx,
+            block_table,
+            &cache_entry,
+            &cache_entry,
+            position,
+        )?;
 
         // Absorbed decode attention (Q absorption + paged attention in compressed space)
         let q_absorbed_nope = Self::absorb_k_into_q(&q_nope, &weights.kv_b_proj_k_t)?;
@@ -1856,14 +1892,13 @@ impl DeepSeekModel<CudaBackend> {
 
         let mut table_with_current = block_table.clone();
         table_with_current.advance(1);
-        let (k_pool, _v_pool) = paged_kv.get_pools(layer_idx);
-        let attn_output = paged_attention_decode(
-            &self.ctx,
+        let (k_pool, _v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
+        let attn_output = CudaBackend::paged_attention_decode(
             &q_absorbed,
             k_pool,
             k_pool,
             &[table_with_current],
-            paged_kv.block_size(),
+            CudaBackend::block_size(paged_kv),
             Some(self.attn_scale),
             None,
             None,
@@ -1874,7 +1909,7 @@ impl DeepSeekModel<CudaBackend> {
         let attn_output = Self::absorb_v(&attn_nope, &weights.kv_b_proj_v)?;
 
         let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -1892,7 +1927,8 @@ impl DeepSeekModel<CudaBackend> {
         start_pos: usize,
         seq_len: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
         let attn_output = self.forward_mla_attention_paged_prefill(
             &normed,
             &layer.attention,
@@ -1903,7 +1939,7 @@ impl DeepSeekModel<CudaBackend> {
             seq_len,
         )?;
 
-        let (mut h, normed) = add_rmsnorm(
+        let (mut h, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1911,7 +1947,7 @@ impl DeepSeekModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut h, &mlp_output)?;
+        CudaBackend::add_inplace(&mut h, &mlp_output)?;
         Ok(h)
     }
 
@@ -1925,7 +1961,8 @@ impl DeepSeekModel<CudaBackend> {
         block_table: &BlockTable,
         position: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
         let attn_output = self.forward_mla_attention_paged_decode(
             &normed,
             &layer.attention,
@@ -1935,7 +1972,7 @@ impl DeepSeekModel<CudaBackend> {
             position,
         )?;
 
-        let (mut h, normed) = add_rmsnorm(
+        let (mut h, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1943,7 +1980,7 @@ impl DeepSeekModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut h, &mlp_output)?;
+        CudaBackend::add_inplace(&mut h, &mlp_output)?;
         Ok(h)
     }
 
@@ -1970,20 +2007,20 @@ impl DeepSeekModel<CudaBackend> {
         let kv_lora_rank = self.config.kv_lora_rank;
 
         // Q projection (two-stage LoRA)
-        let q_compressed = linear(hidden, &weights.q_a_proj)?;
-        let q_compressed = rms_norm(
+        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = CudaBackend::rms_norm(
             &q_compressed,
             &weights.q_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let q = linear(&q_compressed, &weights.q_b_proj)?;
+        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
         let q = q.reshape(&[batch_size, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
         // KV joint projection (compressed only — no decompression via kv_b_proj)
-        let kv = linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-        let k_compressed = rms_norm(
+        let k_compressed = CudaBackend::rms_norm(
             &k_compressed,
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
@@ -2008,7 +2045,7 @@ impl DeepSeekModel<CudaBackend> {
 
         // Write compressed entry to paged cache: (batch_size, 1, kv_lora_rank + qk_rope_dim)
         let k_rope_2d = k_rope.reshape(&[batch_size, qk_rope_dim]);
-        let cache_entry_2d = concat_inner_dim(&k_compressed, &k_rope_2d)?;
+        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
         let cache_entry = cache_entry_2d.reshape(&[batch_size, 1, kv_lora_rank + qk_rope_dim]);
         paged_kv.append_paged_batched(
             layer_idx,
@@ -2032,7 +2069,7 @@ impl DeepSeekModel<CudaBackend> {
         let q_absorbed = Self::concat_head_dim(&q_absorbed_nope, &q_rope)?;
 
         // Paged attention in compressed space (K pool = V pool)
-        let (k_pool, _v_pool) = paged_kv.get_pools(layer_idx);
+        let (k_pool, _v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
         let attn_output = paged_attention_decode_indirect(
             &self.ctx,
             &q_absorbed,
@@ -2040,7 +2077,7 @@ impl DeepSeekModel<CudaBackend> {
             k_pool,
             graph_inputs.block_tables(),
             graph_inputs.seq_lens(),
-            paged_kv.block_size(),
+            CudaBackend::block_size(paged_kv),
             graph_inputs.max_blocks_per_seq(),
             max_seq_len,
             Some(self.attn_scale),
@@ -2058,7 +2095,7 @@ impl DeepSeekModel<CudaBackend> {
             v_head_dim,
         )?;
         let attn_output = attn_output.reshape(&[batch_size, num_heads * v_head_dim]);
-        let mut out = linear(&attn_output, &weights.o_proj)?;
+        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
         Ok(out)
@@ -2075,7 +2112,8 @@ impl DeepSeekModel<CudaBackend> {
         graph_inputs: &BatchedGraphInputs,
         max_seq_len: usize,
     ) -> Result<CudaTensor> {
-        let normed = rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        let normed =
+            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
         let attn_output = self.forward_mla_attention_paged_decode_indirect(
             &normed,
             &layer.attention,
@@ -2085,7 +2123,7 @@ impl DeepSeekModel<CudaBackend> {
             max_seq_len,
         )?;
 
-        let (mut h, normed) = add_rmsnorm(
+        let (mut h, normed) = CudaBackend::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -2093,7 +2131,7 @@ impl DeepSeekModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        add_inplace(&mut h, &mlp_output)?;
+        CudaBackend::add_inplace(&mut h, &mlp_output)?;
         Ok(h)
     }
 
@@ -2129,7 +2167,7 @@ impl DeepSeekModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
@@ -2155,9 +2193,9 @@ impl DeepSeekModel<CudaBackend> {
         }
 
         kv_cache.advance(seq_len)?;
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
-        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
+        let last_hidden = self.extract_last_row(&hidden, seq_len);
         self.lm_head_forward(&last_hidden)
     }
 
@@ -2187,7 +2225,7 @@ impl DeepSeekModel<CudaBackend> {
         }
 
         kv_cache.advance(1)?;
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
         self.lm_head_forward(&last_hidden)
@@ -2208,7 +2246,7 @@ impl DeepSeekModel<CudaBackend> {
             hidden = self.forward_layer_kv_indirect(&hidden, layer, layer_idx, kv_cache)?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
         self.lm_head_forward(&last_hidden)
@@ -2259,10 +2297,11 @@ impl DeepSeekModel<CudaBackend> {
         let mut hidden = self.embed(input_ids)?;
 
         for layer in &self.layers {
-            let normed = rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+            let normed =
+                CudaBackend::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             // Simplified: skip attention, just do FFN
-            let (mut h, normed) = add_rmsnorm(
+            let (mut h, normed) = CudaBackend::add_rmsnorm(
                 &hidden,
                 &normed,
                 &layer.post_attention_layernorm,
@@ -2270,14 +2309,14 @@ impl DeepSeekModel<CudaBackend> {
             )?;
 
             let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-            add_inplace(&mut h, &mlp_output)?;
+            CudaBackend::add_inplace(&mut h, &mlp_output)?;
             hidden = h;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         if seq_len > 1 {
-            let last = self.extract_last_row(&hidden, seq_len)?;
+            let last = self.extract_last_row(&hidden, seq_len);
             self.lm_head_forward(&last)
         } else {
             self.lm_head_forward(&hidden)
@@ -2312,9 +2351,9 @@ impl DeepSeekModel<CudaBackend> {
             )?;
         }
 
-        rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
-        let last_hidden = self.extract_last_row(&hidden, seq_len)?;
+        let last_hidden = self.extract_last_row(&hidden, seq_len);
         self.lm_head_forward(&last_hidden)
     }
 
@@ -2354,7 +2393,7 @@ impl DeepSeekModel<CudaBackend> {
                 )?;
             }
 
-            rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+            CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
             let logits = self.lm_head_forward(&hidden.reshape(&[1, hidden_size]))?;
             logits_parts.push(logits);
         }
@@ -2364,17 +2403,7 @@ impl DeepSeekModel<CudaBackend> {
         }
 
         // Concatenate per-sequence logits into (batch_size, vocab_size)
-        let vocab_size = logits_parts[0].shape()[1];
-        let elem = DType::F32.size_in_bytes();
-        let mut output =
-            unsafe { CudaTensor::uninit(&self.ctx, &[batch_size, vocab_size], DType::F32)? };
-        let out_slice = output.cuda_slice_mut();
-        for (i, part) in logits_parts.iter().enumerate() {
-            let src = part.cuda_slice().slice(..vocab_size * elem);
-            let mut dst = out_slice.slice_mut(i * vocab_size * elem..(i + 1) * vocab_size * elem);
-            self.ctx.device().dtod_copy(&src, &mut dst)?;
-        }
-        Ok(output)
+        CudaBackend::concat_rows(&logits_parts)
     }
 }
 
