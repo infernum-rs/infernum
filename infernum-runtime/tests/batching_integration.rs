@@ -388,3 +388,104 @@ fn sequential_engine_regression() {
         "Sequential engine regression: expected 'Paris' in output: {text}"
     );
 }
+
+// ===========================================================================
+// Engine2 tests (backend-generic Model trait)
+// ===========================================================================
+
+use infernum_runtime::{BatchConfig2, Engine2, FinishReason2, GenerationEvent2};
+
+fn batch_config2() -> BatchConfig2 {
+    BatchConfig2 {
+        max_batch_size: 8,
+        max_prefill_tokens: 512,
+        block_size: 16,
+        num_blocks: 256,
+    }
+}
+
+fn collect_tokens2(rx: mpsc::Receiver<GenerationEvent2>) -> (Vec<u32>, FinishReason2) {
+    let mut tokens = Vec::new();
+    let mut reason = FinishReason2::Length;
+    for event in rx {
+        match event {
+            GenerationEvent2::Token(id) => tokens.push(id),
+            GenerationEvent2::Finished(r) => {
+                reason = r;
+                break;
+            }
+            GenerationEvent2::Error(e) => panic!("Engine2 generation error: {e}"),
+        }
+    }
+    (tokens, reason)
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Engine2 single request — greedy generation correctness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn engine2_single_request() {
+    let dir = model_dir();
+    let ctx = CudaContext::new(0).expect("CUDA context");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
+
+    let engine = Engine2::with_config(model, batch_config2()).expect("engine2");
+    let input_ids = tokenizer
+        .encode("The capital of France is", true)
+        .expect("encode");
+    let result = engine
+        .generate(&input_ids, &greedy_options(20))
+        .expect("gen");
+
+    let text = tokenizer.decode(&result).expect("decode");
+    assert!(
+        text.contains("Paris"),
+        "Engine2 single request: expected 'Paris' in output: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Engine2 concurrent identical requests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn engine2_concurrent_identical_requests() {
+    let dir = model_dir();
+    let ctx = CudaContext::new(0).expect("CUDA context");
+    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
+    let engine = Engine2::with_config(model, batch_config2()).expect("engine2");
+
+    let prompt = "The capital of France is";
+    let input_ids = tokenizer.encode(prompt, true).expect("encode");
+    let options = greedy_options(15);
+
+    let num_concurrent = 4;
+    let mut receivers = Vec::new();
+
+    for _ in 0..num_concurrent {
+        let (tx, rx) = mpsc::channel();
+        engine.submit(input_ids.clone(), options.clone(), tx);
+        receivers.push(rx);
+    }
+
+    let results: Vec<(Vec<u32>, FinishReason2)> =
+        receivers.into_iter().map(collect_tokens2).collect();
+
+    // All should produce the same tokens (greedy, deterministic)
+    let first = &results[0].0;
+    for (i, (tokens, _)) in results.iter().enumerate().skip(1) {
+        assert_eq!(
+            first, tokens,
+            "Engine2 request {i} produced different tokens than request 0"
+        );
+    }
+
+    let text = tokenizer.decode(first).expect("decode");
+    assert!(
+        !text.is_empty(),
+        "Engine2 concurrent requests should produce non-empty output"
+    );
+}
