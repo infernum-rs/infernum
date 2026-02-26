@@ -2874,7 +2874,7 @@ mod tests {
         }
     }
 
-    fn build_tiny_engine(ctx: &CudaContext) -> infernum_runtime::Engine {
+    fn build_tiny_engine(ctx: &CudaContext) -> infernum_runtime::Engine<LlamaModel<CudaBackend>> {
         let model = build_tiny_model(ctx);
         infernum_runtime::Engine::new(model).expect("Failed to build engine")
     }

@@ -73,7 +73,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
     Ok(probe.model_type)
 }
 
-fn run_single_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
+fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
@@ -84,7 +84,6 @@ fn run_single_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli)
             eos_token_id: None,
             sampling: None,
             use_kv_cache: true,
-            use_cuda_graphs: false,
         },
     )?;
     let elapsed = t0.elapsed();
@@ -93,7 +92,7 @@ fn run_single_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli)
     Ok(output)
 }
 
-fn run_multi_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
+fn run_multi_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
@@ -104,7 +103,6 @@ fn run_multi_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli) 
             eos_token_id: None,
             sampling: None,
             use_kv_cache: true,
-            use_cuda_graphs: false,
         },
     )?;
     let elapsed = t0.elapsed();

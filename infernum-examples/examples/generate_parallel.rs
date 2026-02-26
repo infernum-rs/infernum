@@ -131,7 +131,6 @@ fn run_parallel<M: Model + Send + 'static>(
             })
         },
         use_kv_cache: true,
-        use_cuda_graphs: false,
     };
 
     if let Some(ref params) = options.sampling {
@@ -166,8 +165,6 @@ fn run_parallel<M: Model + Send + 'static>(
 
     Ok(())
 }
-
-use infernum_cuda::Model;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();

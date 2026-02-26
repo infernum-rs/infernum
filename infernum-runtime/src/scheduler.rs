@@ -1,32 +1,72 @@
-//! Request scheduling for inflight (continuous) batching
+//! Backend-generic request scheduling for inflight (continuous) batching.
 //!
-//! The [`Scheduler`] tracks per-request state and decides which requests to
+//! [`Scheduler`] tracks per-request state and decides which requests to
 //! process at each iteration. It implements FCFS admission with block-level
 //! memory accounting.
 //!
-//! # Lifecycle
-//!
-//! ```text
-//! Waiting → Prefill → Decode → Finished
-//! ```
-//!
-//! - **Waiting:** queued, not yet admitted
-//! - **Prefill:** prompt tokens are being processed (possibly chunked)
-//! - **Decode:** generating tokens one at a time
-//! - **Finished:** EOS, max tokens, or cancelled — blocks freed
+//! This module is the backend-agnostic replacement for [`Scheduler`](super::Scheduler).
+//! No CUDA-specific imports — all types use `infernum` core.
 
 #![allow(clippy::module_name_repetitions, clippy::missing_panics_doc)]
 
-#[cfg(feature = "cuda")]
 use std::collections::VecDeque;
+use std::sync::mpsc;
 
-#[cfg(feature = "cuda")]
-use infernum::GenerateOptions;
-#[cfg(feature = "cuda")]
-use infernum_cuda::{BlockAllocator, BlockTable};
+use infernum::{BlockAllocator, BlockTable, GenerateOptions};
 
-#[cfg(feature = "cuda")]
-use crate::engine::{FinishReason, TokenSender};
+// ---------------------------------------------------------------------------
+// Public types (moved from engine, no CUDA dependency)
+// ---------------------------------------------------------------------------
+
+/// Why generation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Model produced the end-of-sequence token.
+    Stop,
+    /// Reached the maximum number of tokens.
+    Length,
+    /// The receiver was dropped (client disconnect).
+    Cancelled,
+}
+
+/// An event produced by the engine during generation.
+///
+/// Sent through a single channel so ordering is guaranteed:
+/// zero or more `Token`s, then exactly one terminal event
+/// (`Finished` or `Error`).
+pub enum GenerationEvent {
+    /// A newly generated token.
+    Token(u32),
+    /// An error occurred during generation.
+    Error(infernum::Error),
+    /// Generation completed with the given reason.
+    Finished(FinishReason),
+}
+
+/// Trait for sending generation events from the engine to the caller.
+///
+/// Abstracted so callers can provide either a sync or async sender.
+/// Return `false` to signal that the receiver has been dropped and
+/// generation should stop.
+pub trait TokenSender: Send {
+    /// Send a generation event to the receiver.
+    ///
+    /// Returns `false` if the receiver has been dropped, signalling the
+    /// engine to abort generation early.
+    fn send(&self, event: GenerationEvent) -> bool;
+}
+
+impl TokenSender for mpsc::Sender<GenerationEvent> {
+    fn send(&self, event: GenerationEvent) -> bool {
+        mpsc::Sender::send(self, event).is_ok()
+    }
+}
+
+impl TokenSender for Box<dyn TokenSender> {
+    fn send(&self, event: GenerationEvent) -> bool {
+        (**self).send(event)
+    }
+}
 
 /// Configuration for the batched engine / scheduler.
 #[derive(Debug, Clone)]
@@ -41,12 +81,6 @@ pub struct BatchConfig {
     pub block_size: usize,
     /// Total number of KV cache blocks in the pool.
     pub num_blocks: usize,
-    /// Enable CUDA graph capture/replay for batched decode steps.
-    ///
-    /// When enabled, the first decode iteration runs eagerly (warmup),
-    /// the second captures a CUDA graph, and all subsequent iterations
-    /// replay it. Inputs are always padded to `max_batch_size`.
-    pub use_cuda_graphs: bool,
 }
 
 impl Default for BatchConfig {
@@ -56,13 +90,11 @@ impl Default for BatchConfig {
             max_prefill_tokens: 512,
             block_size: 16,
             num_blocks: 1024,
-            use_cuda_graphs: false,
         }
     }
 }
 
 /// Phase of a sequence's lifecycle.
-#[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequencePhase {
     /// Waiting in the queue, not yet started.
@@ -76,7 +108,6 @@ pub enum SequencePhase {
 }
 
 /// Per-request state tracked by the scheduler.
-#[cfg(feature = "cuda")]
 pub struct SequenceState {
     /// Unique request ID.
     pub id: u64,
@@ -96,7 +127,6 @@ pub struct SequenceState {
     pub prefill_progress: usize,
 }
 
-#[cfg(feature = "cuda")]
 impl SequenceState {
     /// Create a new sequence in the `Waiting` phase.
     #[must_use]
@@ -134,7 +164,6 @@ impl SequenceState {
 }
 
 /// A prefill task for one sequence in a single iteration.
-#[cfg(feature = "cuda")]
 pub struct PrefillTask {
     /// Index into the scheduler's `running` list.
     pub running_idx: usize,
@@ -143,14 +172,12 @@ pub struct PrefillTask {
 }
 
 /// A decode task for one sequence in a single iteration.
-#[cfg(feature = "cuda")]
 pub struct DecodeTask {
     /// Index into the scheduler's `running` list.
     pub running_idx: usize,
 }
 
 /// Output of one scheduling step.
-#[cfg(feature = "cuda")]
 pub struct SchedulerOutput {
     /// Sequences to prefill this iteration (one chunk each).
     pub prefill: Vec<PrefillTask>,
@@ -161,13 +188,12 @@ pub struct SchedulerOutput {
     pub finished_indices: Vec<usize>,
 }
 
-/// Iteration-level scheduler for inflight batching.
+/// Backend-generic iteration-level scheduler for inflight batching.
 ///
 /// Manages a waiting queue and a running batch. At each step, it:
 /// 1. Identifies finished sequences
 /// 2. Continues all decode-phase sequences
 /// 3. Admits new requests from the waiting queue (FCFS) if blocks are available
-#[cfg(feature = "cuda")]
 pub struct Scheduler {
     /// Requests waiting to be admitted.
     waiting: VecDeque<SequenceState>,
@@ -183,7 +209,6 @@ pub struct Scheduler {
     next_id: u64,
 }
 
-#[cfg(feature = "cuda")]
 impl Scheduler {
     /// Create a new scheduler.
     #[must_use]
@@ -378,12 +403,10 @@ impl Scheduler {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-
     use super::*;
-    use crate::engine::GenerationEvent;
+    use infernum::BlockConfig;
 
     fn default_options() -> GenerateOptions {
         GenerateOptions {
@@ -399,12 +422,10 @@ mod tests {
             max_prefill_tokens: 512,
             block_size,
             num_blocks,
-            use_cuda_graphs: false,
         })
     }
 
     fn make_allocator(block_size: usize, num_blocks: usize) -> BlockAllocator {
-        use infernum_cuda::BlockConfig;
         BlockAllocator::new(&BlockConfig {
             block_size,
             num_blocks,
@@ -573,7 +594,6 @@ mod tests {
             max_prefill_tokens: 3, // Very small for testing
             block_size: 4,
             num_blocks: 64,
-            use_cuda_graphs: false,
         });
         let mut alloc = make_allocator(4, 64);
         let (tx, _rx) = mpsc::channel();

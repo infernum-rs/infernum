@@ -108,11 +108,10 @@ fn generate_greedy_with_graphs(model_dir: &PathBuf, prompt: &str, max_tokens: us
     let model = LlamaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
-    let mut opts = greedy_options(max_tokens);
-    opts.use_cuda_graphs = true;
-
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
-    runtime.generate(prompt, &opts).expect("Generation failed")
+    runtime
+        .generate(prompt, &greedy_options(max_tokens))
+        .expect("Generation failed")
 }
 
 // ─── SafeTensors f32 ─────────────────────────────────────────────────────────

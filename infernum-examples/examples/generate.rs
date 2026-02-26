@@ -21,7 +21,6 @@ use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::Model;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -151,7 +150,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
 }
 
 /// Run generation with a model that implements the `Model` trait.
-fn run_generate<M: Model + Send + 'static>(
+fn run_generate<M: infernum::Model + Send + 'static>(
     model: M,
     tokenizer: Tokenizer,
     num_layers: usize,
@@ -180,7 +179,6 @@ fn run_generate<M: Model + Send + 'static>(
             })
         },
         use_kv_cache: !cli.no_kv_cache,
-        use_cuda_graphs: false,
     };
 
     if let Some(ref params) = options.sampling {
