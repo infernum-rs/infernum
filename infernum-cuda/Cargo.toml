@@ -5,7 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = ["cuda"]
+default = []
 cuda = ["cudarc"]
 nccl = ["cuda", "cudarc/nccl", "infernum/nccl-errors"]
 # Force fused kernels even in debug builds
