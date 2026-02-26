@@ -253,6 +253,7 @@ pub trait AttentionOps: Backend {
 }
 
 /// Paged KV cache attention.
+#[allow(clippy::too_many_arguments)]
 pub trait PagedAttentionOps: Backend {
     /// Paged attention decode: batched decode against block-structured KV cache.
     fn paged_attention_decode(
