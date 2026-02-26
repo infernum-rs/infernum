@@ -15,7 +15,6 @@ use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::Model;
 use infernum_qwen::QwenModel;
 use infernum_runtime::Runtime;
 
@@ -129,7 +128,7 @@ mod qwen2_5_0_5b {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
@@ -153,13 +152,13 @@ mod qwen2_5_0_5b {
         let num_decode_steps = 20;
 
         let model = QwenModel::from_pretrained(&ctx, &model_dir).expect("load model");
-        let model_cfg = Model::config(&model);
+        let model_cfg = model.model_config();
 
         // forward() reference: greedy decode step-by-step (no KV cache)
         let mut fwd_ids = prompt_ids.clone();
         let mut fwd_tokens = Vec::new();
         for _step in 0..num_decode_steps {
-            let logits = model.forward(&fwd_ids).expect("forward");
+            let logits = model.forward_full(&fwd_ids).expect("forward");
             let logits_vec: Vec<f32> = logits.to_vec().expect("read");
             let vocab_size = logits.shape()[1];
             let last_start = (fwd_ids.len() - 1) * vocab_size;
@@ -275,7 +274,7 @@ mod qwen3_0_6b {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
@@ -322,7 +321,7 @@ mod qwen3_moe_tiny {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();

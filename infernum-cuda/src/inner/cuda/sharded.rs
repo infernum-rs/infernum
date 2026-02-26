@@ -1,31 +1,30 @@
 //! Generic sharded model wrapper for tensor-parallel inference.
 //!
 //! [`ShardedModel`] wraps N copies of any [`ShardedLoadable`] model (one per
-//! GPU) and implements [`Model`] by running all replicas in lock-step via
-//! scoped threads. NCCL all-reduce happens inside each replica's forward
-//! call; `ShardedModel` itself is only responsible for thread dispatch and
-//! returning rank 0's logits.
+//! GPU) and implements [`infernum::Model`] by running all replicas in
+//! lock-step via scoped threads. NCCL all-reduce happens inside each
+//! replica's forward call; `ShardedModel` itself is only responsible for
+//! thread dispatch and returning rank 0's logits.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
 use super::nccl::NcclCommunicator;
-use super::BlockTable;
-use super::{CudaContext, CudaTensor, PagedKvCache, ShardConfig};
+use super::{CudaContext, PagedKvCache, ShardConfig};
 use crate::inner::backend_impl::CudaBackend;
 use crate::inner::cuda_logits::CudaLogits;
 use crate::inner::cuda_runtime_state::CudaRuntimeState;
-use crate::model::{Model, ShardedLoadable};
+use crate::model::ShardedLoadable;
 use infernum::Result;
 
 /// A model sharded across multiple GPUs for tensor-parallel inference.
 ///
 /// Wraps N replicas of `M`, each holding a shard of the model weights on a
-/// different GPU. Implements [`Model`] so it can be used with a standard
-/// [`Engine`](infernum_runtime::Engine) — the caller doesn't need to know
-/// about sharding.
-pub struct ShardedModel<M: Model> {
+/// different GPU. Implements [`infernum::Model`] so it can be used with a
+/// standard [`Engine`](infernum_runtime::Engine) — the caller doesn't need
+/// to know about sharding.
+pub struct ShardedModel<M: Send> {
     replicas: Vec<(CudaContext, M)>,
 }
 
@@ -41,10 +40,6 @@ impl<M: ShardedLoadable> ShardedModel<M> {
     #[allow(clippy::missing_panics_doc)]
     pub fn from_pretrained(model_path: impl AsRef<Path>, num_gpus: usize) -> Result<Self> {
         let model_path = model_path.as_ref();
-        // Generate a shared NCCL ID on the main thread, then let each worker
-        // thread create its own CudaContext + NcclCommunicator via from_rank.
-        // This ensures each comm is initialised on the same thread (and CUDA
-        // context) that will later call all-reduce, avoiding ncclInvalidUsage.
         let nccl_id = super::nccl::NcclId::new()?;
 
         let replicas: Vec<(CudaContext, M)> = thread::scope(|s| {
@@ -76,85 +71,7 @@ impl<M: ShardedLoadable> ShardedModel<M> {
     }
 }
 
-impl<M: Model + Send + Sync> Model for ShardedModel<M> {
-    fn config(&self) -> crate::model::ModelConfig {
-        self.replicas[0].1.config()
-    }
-
-    fn devices(&self) -> Vec<&CudaContext> {
-        self.replicas.iter().map(|(ctx, _)| ctx).collect()
-    }
-
-    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor> {
-        thread::scope(|s| {
-            let handles: Vec<_> = self
-                .replicas
-                .iter()
-                .map(|(_, model)| s.spawn(move || model.forward(input_ids)))
-                .collect();
-
-            collect_rank0(handles)
-        })
-    }
-
-    fn forward_batch_decode(
-        &self,
-        token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
-        block_tables: &[BlockTable],
-        positions: &[usize],
-    ) -> Result<CudaTensor> {
-        thread::scope(|s| {
-            let handles: Vec<_> = self
-                .replicas
-                .iter()
-                .zip(paged_kvs.iter_mut())
-                .map(|((_, model), kv)| {
-                    s.spawn(move || {
-                        model.forward_batch_decode(
-                            token_ids,
-                            std::slice::from_mut(kv),
-                            block_tables,
-                            positions,
-                        )
-                    })
-                })
-                .collect();
-
-            collect_rank0(handles)
-        })
-    }
-
-    fn forward_prefill_paged(
-        &self,
-        input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
-        block_table: &BlockTable,
-        start_pos: usize,
-    ) -> Result<CudaTensor> {
-        thread::scope(|s| {
-            let handles: Vec<_> = self
-                .replicas
-                .iter()
-                .zip(paged_kvs.iter_mut())
-                .map(|((_, model), kv)| {
-                    s.spawn(move || {
-                        model.forward_prefill_paged(
-                            input_ids,
-                            std::slice::from_mut(kv),
-                            block_table,
-                            start_pos,
-                        )
-                    })
-                })
-                .collect();
-
-            collect_rank0(handles)
-        })
-    }
-}
-
-// --- infernum::Model trait implementation (backend-generic) ---
+// --- infernum::Model implementation ---
 
 /// Per-replica KV cache wrapper for sharded models.
 ///
@@ -174,13 +91,13 @@ unsafe impl<K: Send> Send for ShardedKvCache<K> {}
 
 impl<M> infernum::Model for ShardedModel<M>
 where
-    M: Model + infernum::Model<B = CudaBackend, KvCache = PagedKvCache> + Send + Sync,
+    M: infernum::Model<B = CudaBackend, KvCache = PagedKvCache> + Send + Sync,
 {
     type B = CudaBackend;
     type KvCache = ShardedKvCache<PagedKvCache>;
 
     fn config(&self) -> infernum::ModelConfig {
-        Model::config(&self.replicas[0].1)
+        infernum::Model::config(&self.replicas[0].1)
     }
 
     fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
@@ -192,16 +109,15 @@ where
     }
 
     fn forward(&self, input_ids: &[u32]) -> Result<CudaLogits> {
-        let tensor: CudaTensor = thread::scope(|s| {
+        thread::scope(|s| {
             let handles: Vec<_> = self
                 .replicas
                 .iter()
-                .map(|(_, model)| s.spawn(move || Model::forward(model, input_ids)))
+                .map(|(_, model)| s.spawn(move || infernum::Model::forward(model, input_ids)))
                 .collect();
 
             collect_rank0(handles)
-        })?;
-        Ok(CudaLogits::new(tensor))
+        })
     }
 
     fn forward_prefill(
@@ -212,17 +128,19 @@ where
         block_table: &infernum::BlockTable,
         start_pos: usize,
     ) -> Result<CudaLogits> {
-        let tensor: CudaTensor = thread::scope(|s| {
+        thread::scope(|s| {
             let handles: Vec<_> = self
                 .replicas
                 .iter()
                 .zip(kv_cache.iter_mut())
                 .map(|((_, model), kv)| {
                     s.spawn(move || {
-                        Model::forward_prefill_paged(
+                        let mut state = CudaRuntimeState::new_placeholder();
+                        infernum::Model::forward_prefill(
                             model,
                             input_ids,
-                            std::slice::from_mut(kv),
+                            kv,
+                            &mut state,
                             block_table,
                             start_pos,
                         )
@@ -231,8 +149,7 @@ where
                 .collect();
 
             collect_rank0(handles)
-        })?;
-        Ok(CudaLogits::new(tensor))
+        })
     }
 
     fn forward_batch_decode(
@@ -243,17 +160,19 @@ where
         block_tables: &[infernum::BlockTable],
         positions: &[usize],
     ) -> Result<CudaLogits> {
-        let tensor: CudaTensor = thread::scope(|s| {
+        thread::scope(|s| {
             let handles: Vec<_> = self
                 .replicas
                 .iter()
                 .zip(kv_cache.iter_mut())
                 .map(|((_, model), kv)| {
                     s.spawn(move || {
-                        Model::forward_batch_decode(
+                        let mut state = CudaRuntimeState::new_placeholder();
+                        infernum::Model::forward_batch_decode(
                             model,
                             token_ids,
-                            std::slice::from_mut(kv),
+                            kv,
+                            &mut state,
                             block_tables,
                             positions,
                         )
@@ -262,8 +181,7 @@ where
                 .collect();
 
             collect_rank0(handles)
-        })?;
-        Ok(CudaLogits::new(tensor))
+        })
     }
 }
 

@@ -16,9 +16,10 @@ use cudarc::driver::CudaDevice;
 use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
+use infernum::Model as _;
 use infernum::{GenerateOptions, Result};
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::{CudaBackend, Model as _, ShardedModel};
+use infernum_cuda::{CudaBackend, ShardedModel};
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;

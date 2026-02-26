@@ -1769,24 +1769,42 @@ impl QwenModel<CudaBackend> {
     }
 }
 
-impl infernum_cuda::Model for QwenModel<CudaBackend> {
-    fn config(&self) -> infernum::ModelConfig {
-        let config = self.config();
+#[cfg(feature = "nccl")]
+impl infernum_cuda::ShardedLoadable for QwenModel<CudaBackend> {
+    fn load_shard(
+        ctx: &CudaContext,
+        model_path: &Path,
+        shard: ShardConfig,
+        comm: NcclCommunicator,
+    ) -> Result<Self> {
+        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
+    }
+}
+
+// --- Public helpers & infernum::Model implementation ---
+
+impl QwenModel<CudaBackend> {
+    /// Build the runtime-facing [`ModelConfig`](infernum::ModelConfig).
+    #[must_use]
+    pub fn model_config(&self) -> infernum::ModelConfig {
+        let c = self.config();
         infernum::ModelConfig {
-            num_layers: config.num_hidden_layers,
-            max_seq_len: config.max_position_embeddings,
+            num_layers: c.num_hidden_layers,
+            max_seq_len: c.max_position_embeddings,
             num_kv_heads: self.tp_num_kv_heads,
-            head_dim: config.head_dim(),
-            eos_token_id: config.eos_token_id,
+            head_dim: c.head_dim(),
+            eos_token_id: c.eos_token_id,
             cache_dtype: self.dtype,
         }
     }
 
-    fn devices(&self) -> Vec<&CudaContext> {
-        vec![&self.ctx]
-    }
-
-    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor> {
+    /// Full forward pass without KV cache (recomputes everything).
+    ///
+    /// Returns raw logits as a [`CudaTensor`] of shape `(seq_len, vocab_size)`.
+    ///
+    /// # Errors
+    /// Returns an error if any GPU operation fails.
+    pub fn forward_full(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         let seq_len = input_ids.len();
         let mut hidden = self.embed(input_ids)?;
 
@@ -1860,61 +1878,18 @@ impl infernum_cuda::Model for QwenModel<CudaBackend> {
         rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden)
     }
-
-    fn forward_prefill_paged(
-        &self,
-        input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
-        block_table: &BlockTable,
-        start_pos: usize,
-    ) -> Result<CudaTensor> {
-        self.forward_prefill_paged(input_ids, paged_kvs, block_table, start_pos)
-    }
-
-    fn forward_batch_decode(
-        &self,
-        token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
-        block_tables: &[BlockTable],
-        positions: &[usize],
-    ) -> Result<CudaTensor> {
-        self.forward_batch_decode(token_ids, paged_kvs, block_tables, positions)
-    }
-
-    fn forward_batch_decode_indirect(
-        &self,
-        graph_inputs: &BatchedGraphInputs,
-        paged_kvs: &mut [PagedKvCache],
-        max_seq_len: usize,
-    ) -> Result<CudaTensor> {
-        self.forward_batch_decode_indirect(graph_inputs, paged_kvs, max_seq_len)
-    }
 }
-
-#[cfg(feature = "nccl")]
-impl infernum_cuda::ShardedLoadable for QwenModel<CudaBackend> {
-    fn load_shard(
-        ctx: &CudaContext,
-        model_path: &Path,
-        shard: ShardConfig,
-        comm: NcclCommunicator,
-    ) -> Result<Self> {
-        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
-    }
-}
-
-// --- infernum::Model trait implementation (backend-generic) ---
 
 impl infernum::Model for QwenModel<CudaBackend> {
     type B = CudaBackend;
     type KvCache = PagedKvCache;
 
     fn config(&self) -> infernum::ModelConfig {
-        infernum_cuda::Model::config(self)
+        self.model_config()
     }
 
     fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
-        let mc = infernum_cuda::Model::config(self);
+        let mc = self.model_config();
         PagedKvCache::new(
             &self.ctx,
             mc.num_layers,
@@ -1926,8 +1901,9 @@ impl infernum::Model for QwenModel<CudaBackend> {
     }
 
     fn forward(&self, input_ids: &[u32]) -> Result<infernum_cuda::CudaLogits> {
-        let tensor = infernum_cuda::Model::forward(self, input_ids)?;
-        Ok(infernum_cuda::CudaLogits::new(tensor))
+        Ok(infernum_cuda::CudaLogits::new(
+            self.forward_full(input_ids)?,
+        ))
     }
 
     fn forward_prefill(

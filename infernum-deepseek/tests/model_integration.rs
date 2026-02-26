@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::Model;
 use infernum_deepseek::DeepSeekModel;
 use infernum_runtime::Runtime;
 
@@ -134,7 +133,7 @@ mod deepseek_v3_tiny {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
@@ -163,7 +162,7 @@ mod deepseek_v3_tiny {
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
-        let model_config = Model::config(&model);
+        let model_config = model.model_config();
         let block_size = 16;
         let num_blocks = 256;
         let block_config = BlockConfig {
