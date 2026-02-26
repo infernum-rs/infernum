@@ -21,11 +21,12 @@ pub mod sampling;
 pub mod shard;
 pub mod tensor;
 pub mod tokenizer;
+pub mod weights;
 
 pub use backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, KvCacheOps,
     MatmulExtOps, MatmulOps, MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};
@@ -39,5 +40,6 @@ pub use shard::{shard_strategy_for_weight, GpuConfig, ShardConfig, ShardStrategy
 pub use tensor::Tensor;
 pub use tokenizer::GgufTokenizer;
 pub use tokenizer::Tokenizer;
+pub use weights::{QuantizationConfig, WeightLoader};
 
 pub use chat_template::{ChatMessage, ChatTemplate, RawTemplate};

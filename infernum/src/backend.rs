@@ -31,6 +31,13 @@ pub trait Backend: 'static {
     /// The tensor type for this backend (e.g., `CudaTensor`).
     type Tensor: Tensor + Clone;
 
+    /// Opaque device handle for this backend.
+    ///
+    /// Models store this and pass it to ops that need device context
+    /// (KV cache allocation, tensor creation). For CUDA this is
+    /// `CudaContext`; for CPU it might be `()`.
+    type DeviceHandle: Clone + Send + Sync;
+
     /// Paged KV cache — block-based cache used by most attention mechanisms.
     /// Models that use standard multi-head or grouped-query attention
     /// set their `Model::KvCache` to this type.
@@ -56,6 +63,31 @@ pub trait Backend: 'static {
 }
 
 // ---- Op traits ----
+
+/// Creating tensors from host data.
+///
+/// Enables generic model code to create tensors (RoPE cache, constants, etc.)
+/// without knowing the backend. The backend handles device upload internally.
+pub trait TensorFactory: Backend {
+    /// Create a tensor from an `f32` slice on the host.
+    ///
+    /// The backend uploads the data to its device (GPU, etc.).
+    fn from_f32_slice(
+        device: &Self::DeviceHandle,
+        shape: &[usize],
+        data: &[f32],
+    ) -> Result<Self::Tensor>;
+
+    /// Create a tensor from raw bytes on the host with a specified dtype.
+    ///
+    /// Used by weight loaders and format-specific loading code.
+    fn from_raw_bytes(
+        device: &Self::DeviceHandle,
+        shape: &[usize],
+        dtype: DType,
+        data: &[u8],
+    ) -> Result<Self::Tensor>;
+}
 
 /// Core tensor arithmetic.
 pub trait ArithOps: Backend {
@@ -279,6 +311,19 @@ pub trait PagedAttentionOps: Backend {
 
 /// Paged KV cache operations (append, query pools).
 pub trait PagedKvCacheOps: Backend {
+    /// Allocate a paged KV cache.
+    ///
+    /// `block_config` specifies block size and count. The backend handles
+    /// device-specific allocation (e.g., GPU memory pools).
+    fn allocate_paged_kv_cache(
+        device: &Self::DeviceHandle,
+        num_layers: usize,
+        block_config: &crate::block_allocator::BlockConfig,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cache_dtype: DType,
+    ) -> Result<Self::PagedKvCache>;
+
     /// Append K/V tensors to the paged cache at the given position.
     fn append_paged(
         cache: &mut Self::PagedKvCache,

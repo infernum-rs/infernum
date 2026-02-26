@@ -3,9 +3,9 @@
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, KvCacheOps,
     MatmulExtOps, MatmulOps, MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };
-use infernum::block_allocator::BlockTable;
+use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::{DType, Result};
 
 use crate::cuda::ops;
@@ -19,10 +19,32 @@ pub struct CudaBackend;
 
 impl Backend for CudaBackend {
     type Tensor = CudaTensor;
+    type DeviceHandle = crate::cuda::CudaContext;
     type PagedKvCache = crate::cuda::PagedKvCache;
     type KvCache = crate::cuda::KvCache;
     type RuntimeState = CudaRuntimeState;
     type Logits = CudaLogits;
+}
+
+// ---- Tensor factory ----
+
+impl TensorFactory for CudaBackend {
+    fn from_f32_slice(
+        device: &crate::cuda::CudaContext,
+        shape: &[usize],
+        data: &[f32],
+    ) -> Result<CudaTensor> {
+        CudaTensor::from_slice(device, shape, data)
+    }
+
+    fn from_raw_bytes(
+        device: &crate::cuda::CudaContext,
+        shape: &[usize],
+        dtype: DType,
+        data: &[u8],
+    ) -> Result<CudaTensor> {
+        CudaTensor::from_raw_bytes(device, shape, dtype, data)
+    }
 }
 
 // ---- Arithmetic ----
@@ -302,6 +324,24 @@ impl PagedAttentionOps for CudaBackend {
 // ---- KV cache management ----
 
 impl PagedKvCacheOps for CudaBackend {
+    fn allocate_paged_kv_cache(
+        device: &crate::cuda::CudaContext,
+        num_layers: usize,
+        block_config: &BlockConfig,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cache_dtype: DType,
+    ) -> Result<crate::cuda::PagedKvCache> {
+        crate::cuda::PagedKvCache::new(
+            device,
+            num_layers,
+            block_config,
+            num_kv_heads,
+            head_dim,
+            cache_dtype,
+        )
+    }
+
     fn append_paged(
         cache: &mut crate::cuda::PagedKvCache,
         layer_idx: usize,
