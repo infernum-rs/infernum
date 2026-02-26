@@ -5,12 +5,11 @@ edition = "2021"
 
 [features]
 default = []
-cuda = ["infernum-cuda", "infernum-cuda/cuda", "infernum-runtime/cuda"]
+cuda = ["infernum-cuda/cuda", "infernum-runtime/cuda"]
 nccl = ["cuda", "infernum-cuda/nccl", "infernum-runtime/nccl"]
 
 [dependencies]
 infernum = { path = "../infernum" }
-infernum-cuda = { path = "../infernum-cuda", optional = true }
 infernum-runtime = { path = "../infernum-runtime" }
 
 axum = { version = "0.8", features = ["json"] }
@@ -22,5 +21,6 @@ serde_json = "1.0"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+infernum-cuda = { path = "../infernum-cuda" }
 infernum-llama = { path = "../infernum-llama" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

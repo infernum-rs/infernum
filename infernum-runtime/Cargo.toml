@@ -5,14 +5,14 @@ edition = "2021"
 
 [features]
 default = []
-cuda = ["infernum-cuda", "infernum-cuda/cuda"]
-nccl = ["cuda", "infernum-cuda/nccl"]
-integration = ["cuda", "infernum-llama/cuda"]
+cuda = []
+nccl = ["cuda"]
+integration = ["cuda", "infernum-llama/cuda", "infernum-cuda/cuda"]
 
 [dependencies]
 infernum = { path = "../infernum" }
-infernum-cuda = { path = "../infernum-cuda", optional = true }
 
 [dev-dependencies]
+infernum-cuda = { path = "../infernum-cuda" }
 infernum-llama = { path = "../infernum-llama" }
 ureq = { version = "3", features = ["json"] }
