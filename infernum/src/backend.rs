@@ -17,6 +17,8 @@
 //! - **Activations are split** into `SwigluOps` and `GegluOps`. Models
 //!   specify exactly which they need via where-clauses.
 
+use crate::logits::Logits;
+use crate::runtime_state::RuntimeStateInit;
 use crate::tensor::Tensor;
 use crate::DType;
 use crate::Result;
@@ -27,6 +29,29 @@ use crate::Result;
 pub trait Backend: 'static {
     /// The tensor type for this backend (e.g., `CudaTensor`).
     type Tensor: Tensor + Clone;
+
+    /// Paged KV cache — block-based cache used by most attention mechanisms.
+    /// Models that use standard multi-head or grouped-query attention
+    /// set their `Model::KvCache` to this type.
+    type PagedKvCache: Send;
+
+    /// Contiguous KV cache — non-paged cache used by specialised attention
+    /// like DeepSeek's MLA. Models that need both paged and contiguous
+    /// caches compose them in their `Model::KvCache` associated type.
+    type KvCache: Send;
+
+    /// Opaque runtime state managed by the backend.
+    ///
+    /// Holds backend-specific optimisation state that persists across
+    /// forward calls (e.g., CUDA graph capture/replay state, buffer
+    /// pools). The engine allocates it via `RuntimeStateInit::new()`
+    /// and passes `&mut` into forward calls — it never inspects the
+    /// contents.
+    type RuntimeState: RuntimeStateInit;
+
+    /// Backend-specific logits type returned by forward passes.
+    /// Must implement the `Logits` trait so the engine can sample from it.
+    type Logits: Logits;
 }
 
 // ---- Op traits ----

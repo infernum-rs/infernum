@@ -1,7 +1,7 @@
 //! CUDA backend for Infernum
 //!
 //! This crate contains all CUDA-specific code: tensors, ops, kernels,
-//! KV caches, weight loaders, the `Model` trait, and NCCL sharding.
+//! KV caches, weight loaders, and NCCL sharding.
 //!
 //! Without the `cuda` feature the crate compiles as an empty shell, which
 //! lets `cargo clippy --all` succeed on CI without a CUDA toolkit.

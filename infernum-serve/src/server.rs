@@ -1,7 +1,7 @@
-//! HTTP server implementation
+//! Backend-generic HTTP server implementation.
 //!
 //! Provides the [`Server`] builder for registering models and running
-//! the `OpenAI`-compatible API.
+//! the OpenAI-compatible API. No CUDA-specific imports.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,9 +20,9 @@ use tower_http::cors::CorsLayer;
 
 use infernum::chat_template::ChatTemplate;
 use infernum::{
-    ChatMessage, GenerateOptions, ModelConfig, Result as InfernumResult, SamplingParams, Tokenizer,
+    ChatMessage, GenerateOptions, Model, ModelConfig, Result as InfernumResult, SamplingParams,
+    Tokenizer,
 };
-use infernum_cuda::Model;
 use infernum_runtime::{BatchConfig, Engine, FinishReason, GenerationEvent, TokenSender};
 
 use crate::types::{
@@ -48,16 +48,8 @@ impl TokenSender for TokioTokenSender {
 }
 
 // ---------------------------------------------------------------------------
-// ModelHandle
+// ModelHandle (type-erased engine + tokenizer + template)
 // ---------------------------------------------------------------------------
-
-/// Handle to a model, its engine, tokenizer, and chat template.
-struct ModelHandle {
-    engine: Engine,
-    tokenizer: Box<dyn ErasedTokenizer>,
-    template: Box<dyn ChatTemplate>,
-    model_config: ModelConfig,
-}
 
 /// Object-safe subset of [`Tokenizer`] needed by the server.
 #[allow(dead_code)]
@@ -83,6 +75,36 @@ impl<T: Tokenizer + Send + Sync> ErasedTokenizer for T {
     }
 }
 
+/// Object-safe engine interface for submitting generation requests.
+#[allow(dead_code)]
+trait ErasedEngine: Send + Sync {
+    fn submit(&self, input_ids: Vec<u32>, options: GenerateOptions, token_tx: Box<dyn TokenSender>);
+    fn model_config(&self) -> &ModelConfig;
+}
+
+impl<M: Model> ErasedEngine for Engine<M> {
+    fn submit(
+        &self,
+        input_ids: Vec<u32>,
+        options: GenerateOptions,
+        token_tx: Box<dyn TokenSender>,
+    ) {
+        Engine::submit(self, input_ids, options, token_tx);
+    }
+
+    fn model_config(&self) -> &ModelConfig {
+        Engine::model_config(self)
+    }
+}
+
+/// Handle to a model, its engine, tokenizer, and chat template.
+struct ModelHandle {
+    engine: Box<dyn ErasedEngine>,
+    tokenizer: Box<dyn ErasedTokenizer>,
+    template: Box<dyn ChatTemplate>,
+    model_config: ModelConfig,
+}
+
 // ---------------------------------------------------------------------------
 // ModelEntry — user-facing model registration
 // ---------------------------------------------------------------------------
@@ -100,14 +122,12 @@ impl ModelEntry {
     /// Create a new model entry with default batch configuration.
     ///
     /// The model is consumed and moved into a background engine thread.
-    /// `max_seq_len` caps the KV cache allocation; `None` uses the default
-    /// (`min(model.max_position_embeddings, 4096)`).
     ///
     /// # Panics
     /// Panics if engine creation fails (paged KV cache allocation).
     pub fn new<M, T, C>(name: &str, model: M, tokenizer: T, template: C) -> Self
     where
-        M: Model + Send + 'static,
+        M: Model,
         T: Tokenizer + Send + Sync + 'static,
         C: ChatTemplate + 'static,
     {
@@ -116,7 +136,7 @@ impl ModelEntry {
         Self {
             name: name.to_string(),
             handle: ModelHandle {
-                engine,
+                engine: Box::new(engine),
                 tokenizer: Box::new(tokenizer),
                 template: Box::new(template),
                 model_config,
@@ -125,9 +145,6 @@ impl ModelEntry {
     }
 
     /// Create a new model entry with custom batch configuration.
-    ///
-    /// Supports concurrent requests with paged KV cache and iteration-level
-    /// scheduling.
     ///
     /// # Panics
     /// Panics if engine creation fails (paged KV cache allocation).
@@ -139,7 +156,7 @@ impl ModelEntry {
         batch_config: BatchConfig,
     ) -> Self
     where
-        M: Model + Send + 'static,
+        M: Model,
         T: Tokenizer + Send + Sync + 'static,
         C: ChatTemplate + 'static,
     {
@@ -148,7 +165,7 @@ impl ModelEntry {
         Self {
             name: name.to_string(),
             handle: ModelHandle {
-                engine,
+                engine: Box::new(engine),
                 tokenizer: Box::new(tokenizer),
                 template: Box::new(template),
                 model_config,
@@ -161,7 +178,7 @@ impl ModelEntry {
 // AppState — shared server state
 // ---------------------------------------------------------------------------
 
-struct AppState {
+struct AppState2 {
     models: HashMap<String, Arc<ModelHandle>>,
 }
 
@@ -169,10 +186,10 @@ struct AppState {
 // Server + Builder
 // ---------------------------------------------------------------------------
 
-/// The HTTP server.
+/// Backend-generic HTTP server.
 pub struct Server {
     bind_addr: SocketAddr,
-    state: Arc<AppState>,
+    state: Arc<AppState2>,
 }
 
 /// Builder for constructing a [`Server`].
@@ -211,7 +228,7 @@ impl Server {
         self,
         listener: tokio::net::TcpListener,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let app = build_router(self.state);
+        let app = build_router2(self.state);
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
@@ -239,7 +256,7 @@ impl ServerBuilder {
     pub fn build(self) -> Server {
         Server {
             bind_addr: self.bind_addr,
-            state: Arc::new(AppState {
+            state: Arc::new(AppState2 {
                 models: self.models,
             }),
         }
@@ -250,10 +267,10 @@ impl ServerBuilder {
 // Router
 // ---------------------------------------------------------------------------
 
-fn build_router(state: Arc<AppState>) -> Router {
+fn build_router2(state: Arc<AppState2>) -> Router {
     Router::new()
-        .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/v1/models", get(list_models_handler))
+        .route("/v1/chat/completions", post(chat_completions_handler2))
+        .route("/v1/models", get(list_models_handler2))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -262,7 +279,7 @@ fn build_router(state: Arc<AppState>) -> Router {
 // GET /v1/models
 // ---------------------------------------------------------------------------
 
-async fn list_models_handler(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
+async fn list_models_handler2(State(state): State<Arc<AppState2>>) -> Json<ModelListResponse> {
     let now = unix_timestamp();
     let data = state
         .models
@@ -284,8 +301,8 @@ async fn list_models_handler(State(state): State<Arc<AppState>>) -> Json<ModelLi
 // POST /v1/chat/completions
 // ---------------------------------------------------------------------------
 
-async fn chat_completions_handler(
-    State(state): State<Arc<AppState>>,
+async fn chat_completions_handler2(
+    State(state): State<Arc<AppState2>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     // Look up model
@@ -341,14 +358,14 @@ async fn chat_completions_handler(
     let prompt_tokens = input_ids.len();
 
     // Build generation options
-    let options = build_generate_options(&request, &handle);
+    let options = build_generate_options2(&request, &handle);
 
     let stream = request.stream.unwrap_or(false);
 
     if stream {
-        handle_streaming(handle, input_ids, options, &request.model).into_response()
+        handle_streaming2(handle, input_ids, options, &request.model).into_response()
     } else {
-        handle_non_streaming(handle, input_ids, options, prompt_tokens, &request.model)
+        handle_non_streaming2(handle, input_ids, options, prompt_tokens, &request.model)
             .await
             .into_response()
     }
@@ -358,7 +375,7 @@ async fn chat_completions_handler(
 // Non-streaming response
 // ---------------------------------------------------------------------------
 
-async fn handle_non_streaming(
+async fn handle_non_streaming2(
     handle: Arc<ModelHandle>,
     input_ids: Vec<u32>,
     options: GenerateOptions,
@@ -368,7 +385,7 @@ async fn handle_non_streaming(
     let (tx, mut rx) = tokio_mpsc::channel::<GenerationEvent>(256);
     handle
         .engine
-        .submit(input_ids, options, TokioTokenSender(tx));
+        .submit(input_ids, options, Box::new(TokioTokenSender(tx)));
 
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut finish_reason = "length";
@@ -438,7 +455,7 @@ async fn handle_non_streaming(
 // Streaming (SSE) response
 // ---------------------------------------------------------------------------
 
-fn handle_streaming(
+fn handle_streaming2(
     handle: Arc<ModelHandle>,
     input_ids: Vec<u32>,
     options: GenerateOptions,
@@ -447,7 +464,7 @@ fn handle_streaming(
     let (engine_tx, mut engine_rx) = tokio_mpsc::channel::<GenerationEvent>(256);
     handle
         .engine
-        .submit(input_ids, options, TokioTokenSender(engine_tx));
+        .submit(input_ids, options, Box::new(TokioTokenSender(engine_tx)));
 
     let (sse_tx, sse_rx) = tokio_mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
 
@@ -549,7 +566,7 @@ async fn send_sse_chunk(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_generate_options(
+fn build_generate_options2(
     request: &ChatCompletionRequest,
     handle: &ModelHandle,
 ) -> GenerateOptions {
@@ -572,7 +589,6 @@ fn build_generate_options(
         eos_token_id: Some(handle.model_config.eos_token_id),
         sampling,
         use_kv_cache: true,
-        use_cuda_graphs: false,
     }
 }
 
@@ -609,5 +625,8 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to install CTRL+C handler");
-    eprintln!("\nShutting down...");
+    eprintln!(
+        "
+Shutting down..."
+    );
 }

@@ -25,11 +25,8 @@
 //! }
 //! ```
 
-#[cfg(feature = "cuda")]
 mod server;
 pub mod types;
 
-#[cfg(feature = "cuda")]
 pub use infernum_runtime::BatchConfig;
-#[cfg(feature = "cuda")]
 pub use server::{ModelEntry, Server, ServerBuilder};

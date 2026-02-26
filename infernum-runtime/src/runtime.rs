@@ -1,32 +1,40 @@
-//! Text-level inference runtime
+//! Backend-generic text-level inference runtime.
 //!
-//! The [`Runtime`] wraps an [`Engine`] and a [`Tokenizer`], providing
-//! a text-in, text-out interface for generation.
+//! [`Runtime`] wraps an [`Engine`] and a [`Tokenizer`], providing
+//! a text-in, text-out interface for generation. No CUDA-specific imports.
 
 use std::io::{self, Write};
 
-use infernum::{GenerateOptions, ModelConfig, Result, Tokenizer};
-use infernum_cuda::Model;
+use infernum::{GenerateOptions, Model, ModelConfig, Result, Tokenizer};
 
-use crate::engine::GenerationEvent;
-use crate::Engine;
+use crate::engine::Engine;
+use crate::scheduler::{BatchConfig, GenerationEvent};
 
-/// Text-level inference runtime.
+/// Backend-generic text-level inference runtime.
 ///
-/// Combines a model (via Engine) with a tokenizer to provide text-in, text-out
-/// generation. Each Runtime instance serves one model.
-pub struct Runtime<T: Tokenizer> {
-    engine: Engine,
+/// Combines a model (via `Engine`) with a tokenizer to provide text-in,
+/// text-out generation. Each `Runtime` instance serves one model.
+pub struct Runtime<M: Model, T: Tokenizer> {
+    engine: Engine<M>,
     tokenizer: T,
 }
 
-impl<T: Tokenizer> Runtime<T> {
+impl<M: Model, T: Tokenizer> Runtime<M, T> {
     /// Create a new runtime from a model and tokenizer.
     ///
     /// # Errors
     /// Returns an error if paged KV cache allocation fails.
-    pub fn new<M: Model + Send + 'static>(model: M, tokenizer: T) -> Result<Self> {
+    pub fn new(model: M, tokenizer: T) -> Result<Self> {
         let engine = Engine::new(model)?;
+        Ok(Self { engine, tokenizer })
+    }
+
+    /// Create a new runtime with a custom batch configuration.
+    ///
+    /// # Errors
+    /// Returns an error if paged KV cache allocation fails.
+    pub fn with_config(model: M, tokenizer: T, batch_config: BatchConfig) -> Result<Self> {
+        let engine = Engine::with_config(model, batch_config)?;
         Ok(Self { engine, tokenizer })
     }
 
@@ -34,17 +42,13 @@ impl<T: Tokenizer> Runtime<T> {
     ///
     /// # Errors
     /// Returns an error if paged KV cache allocation fails.
-    pub fn with_max_seq_len<M: Model + Send + 'static>(
-        model: M,
-        tokenizer: T,
-        _max_seq_len: Option<usize>,
-    ) -> Result<Self> {
+    pub fn with_max_seq_len(model: M, tokenizer: T, _max_seq_len: Option<usize>) -> Result<Self> {
         Self::new(model, tokenizer)
     }
 
     /// Get a reference to the underlying engine.
     #[must_use]
-    pub fn engine(&self) -> &Engine {
+    pub fn engine(&self) -> &Engine<M> {
         &self.engine
     }
 
@@ -64,7 +68,7 @@ impl<T: Tokenizer> Runtime<T> {
     ///
     /// # Arguments
     /// * `prompt` - Input text
-    /// * `options` - Generation options (sampling, max tokens, KV cache, etc.)
+    /// * `options` - Generation options (sampling, max tokens, etc.)
     ///
     /// # Returns
     /// The generated text (prompt + completion)
@@ -82,7 +86,7 @@ impl<T: Tokenizer> Runtime<T> {
     ///
     /// # Arguments
     /// * `prompt` - Input text
-    /// * `options` - Generation options (sampling, max tokens, KV cache, etc.)
+    /// * `options` - Generation options (sampling, max tokens, etc.)
     ///
     /// # Returns
     /// The full generated token sequence (prompt + completion)

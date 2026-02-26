@@ -8,12 +8,18 @@ use infernum::{DType, Result};
 use crate::cuda::ops;
 use crate::cuda::ops::LinearWeight;
 use crate::cuda::CudaTensor;
+use crate::cuda_logits::CudaLogits;
+use crate::cuda_runtime_state::CudaRuntimeState;
 
 /// Marker type for the CUDA backend.
 pub struct CudaBackend;
 
 impl Backend for CudaBackend {
     type Tensor = CudaTensor;
+    type PagedKvCache = crate::cuda::PagedKvCache;
+    type KvCache = crate::cuda::KvCache;
+    type RuntimeState = CudaRuntimeState;
+    type Logits = CudaLogits;
 }
 
 impl ArithOps for CudaBackend {

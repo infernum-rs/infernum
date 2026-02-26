@@ -14,7 +14,6 @@ use serde::Deserialize;
 
 use infernum::GenerateOptions;
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::Model;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -30,10 +29,6 @@ struct Cli {
     /// Number of tokens to generate
     #[arg(default_value_t = 128)]
     n_gen: usize,
-
-    /// Enable CUDA graph capture/replay for the decode loop
-    #[arg(long)]
-    graphs: bool,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -64,10 +59,9 @@ fn detect_model_type(model_path: &str) -> infernum::Result<String> {
     Ok(probe.model_type)
 }
 
-fn bench_model<M: Model + Send + 'static>(
+fn bench_model<M: infernum::Model + Send + 'static>(
     model: M,
     n_gen: usize,
-    use_cuda_graphs: bool,
 ) -> infernum::Result<()> {
     let prompt = vec![1u32, 15043, 29892, 920, 526, 366, 2599, 13];
 
@@ -75,7 +69,6 @@ fn bench_model<M: Model + Send + 'static>(
 
     let options = GenerateOptions {
         max_new_tokens: n_gen,
-        use_cuda_graphs,
         ..GenerateOptions::default()
     };
 
@@ -95,30 +88,23 @@ fn bench_model<M: Model + Send + 'static>(
     Ok(())
 }
 
-fn bench_with_info<M: Model + Send + 'static>(
+fn bench_with_info<M: infernum::Model + Send + 'static>(
     model: M,
     num_layers: usize,
     hidden_size: usize,
     dtype: &str,
     n_gen: usize,
-    use_cuda_graphs: bool,
 ) -> infernum::Result<()> {
     eprintln!(
         "Model loaded: {} layers, {} hidden, dtype={}",
         num_layers, hidden_size, dtype,
     );
-    bench_model(model, n_gen, use_cuda_graphs)
+    bench_model(model, n_gen)
 }
 
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
     let ctx = CudaContext::new(0)?;
-
-    if cli.graphs {
-        eprintln!("CUDA graphs: ENABLED");
-    } else {
-        eprintln!("CUDA graphs: disabled");
-    }
 
     let is_gguf = cli.model.ends_with(".gguf");
     let model_type = if is_gguf {
@@ -143,25 +129,25 @@ fn main() -> infernum::Result<()> {
             };
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen, cli.graphs)
+            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "qwen" => {
             let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen, cli.graphs)
+            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "deepseek" => {
             let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen, cli.graphs)
+            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "gemma" => {
             let model = GemmaModel::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen, cli.graphs)
+            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         other => panic!("Unsupported family: {other}"),
     };

@@ -8,10 +8,10 @@
 use std::net::SocketAddr;
 
 use infernum::chat_template::RawTemplate;
+use infernum::BlockTable;
 use infernum::{ModelConfig, Result as InfernumResult, Tokenizer};
 use infernum_cuda::cuda::{CudaContext, CudaTensor, PagedKvCache};
-use infernum_cuda::BlockTable;
-use infernum_cuda::Model;
+use infernum_cuda::{CudaBackend, CudaLogits, CudaRuntimeState};
 use infernum_serve::{ModelEntry, Server};
 
 // ---------------------------------------------------------------------------
@@ -64,14 +64,19 @@ impl MockModel {
         }
     }
 
-    fn make_logits(&self, next_token: u32) -> InfernumResult<CudaTensor> {
-        let mut logits = vec![0.0_f32; self.vocab_size];
-        logits[next_token as usize] = 100.0;
-        CudaTensor::from_slice(&self.ctx, &[1, self.vocab_size], &logits)
+    fn make_logits_tensor(&self, batch_size: usize, next_token: u32) -> InfernumResult<CudaTensor> {
+        let mut logits = vec![0.0_f32; batch_size * self.vocab_size];
+        for b in 0..batch_size {
+            logits[b * self.vocab_size + next_token as usize] = 100.0;
+        }
+        CudaTensor::from_slice(&self.ctx, &[batch_size, self.vocab_size], &logits)
     }
 }
 
-impl Model for MockModel {
+impl infernum::Model for MockModel {
+    type B = CudaBackend;
+    type KvCache = PagedKvCache;
+
     fn config(&self) -> ModelConfig {
         ModelConfig {
             num_layers: 1,
@@ -83,41 +88,46 @@ impl Model for MockModel {
         }
     }
 
-    fn devices(&self) -> Vec<&CudaContext> {
-        vec![&self.ctx]
+    fn allocate_kv_cache(
+        &self,
+        block_config: &infernum::BlockConfig,
+    ) -> InfernumResult<Self::KvCache> {
+        let mc = self.config();
+        PagedKvCache::new(
+            &self.ctx,
+            mc.num_layers,
+            block_config,
+            mc.num_kv_heads,
+            mc.head_dim,
+            mc.cache_dtype,
+        )
     }
 
-    fn forward(&self, _input_ids: &[u32]) -> InfernumResult<CudaTensor> {
-        // Return logits with token 42 as the argmax
-        let seq_len = 1;
-        let mut logits = vec![0.0_f32; seq_len * self.vocab_size];
-        logits[42] = 100.0;
-        CudaTensor::from_slice(&self.ctx, &[seq_len, self.vocab_size], &logits)
+    fn forward(&self, _input_ids: &[u32]) -> InfernumResult<CudaLogits> {
+        Ok(CudaLogits::new(self.make_logits_tensor(1, 42)?))
     }
 
-    fn forward_prefill_paged(
+    fn forward_prefill(
         &self,
         _input_ids: &[u32],
-        _paged_kvs: &mut [PagedKvCache],
+        _kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut CudaRuntimeState,
         _block_table: &BlockTable,
         _start_pos: usize,
-    ) -> InfernumResult<CudaTensor> {
-        self.make_logits(42)
+    ) -> InfernumResult<CudaLogits> {
+        Ok(CudaLogits::new(self.make_logits_tensor(1, 42)?))
     }
 
     fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        _paged_kvs: &mut [PagedKvCache],
+        _kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut CudaRuntimeState,
         _block_tables: &[BlockTable],
         _positions: &[usize],
-    ) -> InfernumResult<CudaTensor> {
+    ) -> InfernumResult<CudaLogits> {
         let batch_size = token_ids.len();
-        let mut logits = vec![0.0_f32; batch_size * self.vocab_size];
-        for b in 0..batch_size {
-            logits[b * self.vocab_size + 42] = 100.0;
-        }
-        CudaTensor::from_slice(&self.ctx, &[batch_size, self.vocab_size], &logits)
+        Ok(CudaLogits::new(self.make_logits_tensor(batch_size, 42)?))
     }
 }
 

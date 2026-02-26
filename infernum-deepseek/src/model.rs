@@ -2217,8 +2217,24 @@ impl DeepSeekModel<CudaBackend> {
 
 // --- Model trait implementation ---
 
-impl infernum_cuda::Model for DeepSeekModel<CudaBackend> {
-    fn config(&self) -> infernum::ModelConfig {
+#[cfg(feature = "nccl")]
+impl infernum_cuda::ShardedLoadable for DeepSeekModel<CudaBackend> {
+    fn load_shard(
+        ctx: &CudaContext,
+        model_path: &Path,
+        shard: ShardConfig,
+        comm: NcclCommunicator,
+    ) -> Result<Self> {
+        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
+    }
+}
+
+// --- Public helpers & infernum::Model implementation ---
+
+impl DeepSeekModel<CudaBackend> {
+    /// Build the runtime-facing [`ModelConfig`](infernum::ModelConfig).
+    #[must_use]
+    pub fn model_config(&self) -> infernum::ModelConfig {
         let config = &self.config;
         infernum::ModelConfig {
             num_layers: config.num_hidden_layers,
@@ -2231,21 +2247,21 @@ impl infernum_cuda::Model for DeepSeekModel<CudaBackend> {
         }
     }
 
-    fn devices(&self) -> Vec<&CudaContext> {
-        vec![&self.ctx]
-    }
-
-    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor> {
+    /// Full forward pass without KV cache.
+    ///
+    /// MLA attention is skipped (not meaningful without cache); only the FFN
+    /// path is exercised. Use paged forward methods for real inference.
+    ///
+    /// # Errors
+    /// Returns an error if any GPU operation fails.
+    pub fn forward_full(&self, input_ids: &[u32]) -> Result<CudaTensor> {
         let seq_len = input_ids.len();
         let mut hidden = self.embed(input_ids)?;
 
-        // Full-recompute forward is not meaningful without KV cache for MLA,
-        // but we provide a minimal implementation that doesn't use cache.
-        // This path is not used in production — prefer forward_with_kv_cache.
         for layer in &self.layers {
             let normed = rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
-            // Simplified: skip attention, just do FFN (for trait compliance)
+            // Simplified: skip attention, just do FFN
             let (mut h, normed) = add_rmsnorm(
                 &hidden,
                 &normed,
@@ -2268,7 +2284,11 @@ impl infernum_cuda::Model for DeepSeekModel<CudaBackend> {
         }
     }
 
-    fn forward_prefill_paged(
+    /// Prefill forward pass with paged KV cache.
+    ///
+    /// # Errors
+    /// Returns an error if any GPU operation fails.
+    pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
         paged_kvs: &mut [PagedKvCache],
@@ -2298,7 +2318,14 @@ impl infernum_cuda::Model for DeepSeekModel<CudaBackend> {
         self.lm_head_forward(&last_hidden)
     }
 
-    fn forward_batch_decode(
+    /// Batched decode forward pass with paged KV cache.
+    ///
+    /// # Errors
+    /// Returns an error if any GPU operation fails.
+    ///
+    /// # Panics
+    /// Panics if `token_ids` is empty (batch size 0).
+    pub fn forward_batch_decode(
         &self,
         token_ids: &[u32],
         paged_kvs: &mut [PagedKvCache],
@@ -2349,26 +2376,66 @@ impl infernum_cuda::Model for DeepSeekModel<CudaBackend> {
         }
         Ok(output)
     }
-
-    fn forward_batch_decode_indirect(
-        &self,
-        graph_inputs: &BatchedGraphInputs,
-        paged_kvs: &mut [PagedKvCache],
-        max_seq_len: usize,
-    ) -> Result<CudaTensor> {
-        self.forward_batch_decode_indirect(graph_inputs, paged_kvs, max_seq_len)
-    }
 }
 
-#[cfg(feature = "nccl")]
-impl infernum_cuda::ShardedLoadable for DeepSeekModel<CudaBackend> {
-    fn load_shard(
-        ctx: &CudaContext,
-        model_path: &Path,
-        shard: ShardConfig,
-        comm: NcclCommunicator,
-    ) -> Result<Self> {
-        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
+impl infernum::Model for DeepSeekModel<CudaBackend> {
+    type B = CudaBackend;
+    type KvCache = PagedKvCache;
+
+    fn config(&self) -> infernum::ModelConfig {
+        self.model_config()
+    }
+
+    fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
+        let mc = self.model_config();
+        PagedKvCache::new(
+            &self.ctx,
+            mc.num_layers,
+            block_config,
+            mc.num_kv_heads,
+            mc.head_dim,
+            mc.cache_dtype,
+        )
+    }
+
+    fn forward(&self, input_ids: &[u32]) -> Result<infernum_cuda::CudaLogits> {
+        Ok(infernum_cuda::CudaLogits::new(
+            self.forward_full(input_ids)?,
+        ))
+    }
+
+    fn forward_prefill(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
+        block_table: &infernum::BlockTable,
+        start_pos: usize,
+    ) -> Result<infernum_cuda::CudaLogits> {
+        let tensor = self.forward_prefill_paged(
+            input_ids,
+            std::slice::from_mut(kv_cache),
+            block_table,
+            start_pos,
+        )?;
+        Ok(infernum_cuda::CudaLogits::new(tensor))
+    }
+
+    fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
+        block_tables: &[infernum::BlockTable],
+        positions: &[usize],
+    ) -> Result<infernum_cuda::CudaLogits> {
+        let tensor = self.forward_batch_decode(
+            token_ids,
+            std::slice::from_mut(kv_cache),
+            block_tables,
+            positions,
+        )?;
+        Ok(infernum_cuda::CudaLogits::new(tensor))
     }
 }
 

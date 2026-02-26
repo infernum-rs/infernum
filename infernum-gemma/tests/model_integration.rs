@@ -15,7 +15,6 @@ use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::Model;
 use infernum_gemma::GemmaModel;
 use infernum_runtime::Runtime;
 
@@ -135,7 +134,7 @@ mod gemma2_tiny_random {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
@@ -165,7 +164,7 @@ mod gemma2_tiny_random {
 
         // --- Reference: greedy decode via forward() ---
         let model_ref = GemmaModel::from_pretrained(&ctx, &model_dir).expect("load model");
-        let ref_logits = model_ref.forward(&prompt_ids).expect("forward");
+        let ref_logits = model_ref.forward_full(&prompt_ids).expect("forward");
         let ref_vec: Vec<f32> = ref_logits.to_vec().expect("read logits");
         let vocab_size = ref_logits.shape()[1];
 
@@ -179,7 +178,7 @@ mod gemma2_tiny_random {
             .0 as u32;
 
         // --- Paged path ---
-        let model_cfg = Model::config(&model_ref);
+        let model_cfg = model_ref.model_config();
         let block_config = BlockConfig {
             block_size: 16,
             num_blocks: 64,
@@ -302,7 +301,7 @@ mod gemma3_text_tiny_random {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
@@ -326,7 +325,7 @@ mod gemma3_text_tiny_random {
 
         // --- Reference: greedy decode via forward() ---
         let model_ref = GemmaModel::from_pretrained(&ctx, &model_dir).expect("load model");
-        let ref_logits = model_ref.forward(&prompt_ids).expect("forward");
+        let ref_logits = model_ref.forward_full(&prompt_ids).expect("forward");
         let ref_vec: Vec<f32> = ref_logits.to_vec().expect("read logits");
         let vocab_size = ref_logits.shape()[1];
 
@@ -339,7 +338,7 @@ mod gemma3_text_tiny_random {
             .0 as u32;
 
         // --- Paged path ---
-        let model_cfg = Model::config(&model_ref);
+        let model_cfg = model_ref.model_config();
         let block_config = BlockConfig {
             block_size: 16,
             num_blocks: 64,
@@ -462,7 +461,7 @@ mod gemma2_2b {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
@@ -487,13 +486,13 @@ mod gemma2_2b {
         let num_decode_steps = 20;
 
         let model = GemmaModel::from_pretrained(&ctx, &model_dir).expect("load model");
-        let model_cfg = Model::config(&model);
+        let model_cfg = model.model_config();
 
         // forward() reference: greedy decode step-by-step (no KV cache)
         let mut fwd_ids = prompt_ids.clone();
         let mut fwd_tokens = Vec::new();
         for _step in 0..num_decode_steps {
-            let logits = model.forward(&fwd_ids).expect("forward");
+            let logits = model.forward_full(&fwd_ids).expect("forward");
             let logits_vec: Vec<f32> = logits.to_vec().expect("read");
             let vocab_size = logits.shape()[1];
             let last_start = (fwd_ids.len() - 1) * vocab_size;
@@ -613,7 +612,7 @@ mod gemma3_1b {
 
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
-        let logits = model.forward(&input_ids).expect("Forward pass failed");
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
         let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
