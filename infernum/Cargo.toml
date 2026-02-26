@@ -2,27 +2,23 @@
 name = "infernum"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 
 [features]
 default = []
-# Enable CUDA support - requires CUDA toolkit installed
-cuda = ["cudarc"]
-# Enable NCCL for multi-GPU tensor parallelism (requires libnccl)
-nccl = ["cuda", "cudarc/nccl"]
+# Enable From impls for cudarc error types → infernum::Error.
+# Activated automatically by infernum-cuda; keeps infernum CUDA-free by default.
+cuda-errors = ["dep:cudarc", "dep:safetensors"]
+# Enable From impl for NCCL errors (implies cuda-errors).
+nccl-errors = ["cuda-errors", "cudarc/nccl"]
 # Force fused kernels even in debug builds
 force-fuse = []
 # Disable fused kernels even in release builds
 no-fuse = []
 
 [dependencies]
-# CUDA bindings (optional - enable with `--features cuda`)
-# When building with CUDA, set CUDA_PATH or use a specific version feature
+# CUDA error types (optional — only for From impls, no GPU code)
 cudarc = { version = "0.12", features = ["cublas", "cublaslt", "f16", "cuda-12060"], optional = true }
-
-# Weight loading
-safetensors = "0.4"
-memmap2 = "0.9"
+safetensors = { version = "0.4", optional = true }
 
 # Tokenizer
 tokenizers = "0.20"

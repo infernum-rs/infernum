@@ -11,11 +11,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
-use infernum::Model;
 use infernum::Tensor;
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::Model;
 use infernum_llama::LlamaModel;
 use infernum_runtime::Runtime;
 
@@ -160,8 +160,8 @@ mod smollm2_360m {
     /// Verify paged prefill + decode produces identical tokens as forward().
     #[test]
     fn paged_decode_matches_forward() {
-        use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
-        use infernum::cuda::PagedKvCache;
+        use infernum_cuda::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
+        use infernum_cuda::cuda::PagedKvCache;
 
         let model_dir = model_dir();
         let ctx = CudaContext::new(0).expect("CUDA context");

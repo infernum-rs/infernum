@@ -15,9 +15,10 @@ use clap::Parser;
 use cudarc::driver::CudaDevice;
 use serde::Deserialize;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::{GenerateOptions, Model as _, Result, ShardedModel};
+use infernum::{GenerateOptions, Result};
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::{Model as _, ShardedModel};
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -72,7 +73,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
     Ok(probe.model_type)
 }
 
-fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
+fn run_single_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
@@ -92,7 +93,7 @@ fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> R
     Ok(output)
 }
 
-fn run_multi_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
+fn run_multi_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();

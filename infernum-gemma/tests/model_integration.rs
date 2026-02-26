@@ -11,11 +11,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
-use infernum::Model;
 use infernum::Tensor;
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::Model;
 use infernum_gemma::GemmaModel;
 use infernum_runtime::Runtime;
 
@@ -153,8 +153,8 @@ mod gemma2_tiny_random {
     /// (e.g. attn_scale instead of softcap).
     #[test]
     fn paged_decode_matches_forward() {
-        use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
-        use infernum::cuda::PagedKvCache;
+        use infernum_cuda::cuda::PagedKvCache;
+        use infernum_cuda::{BlockAllocator, BlockConfig, BlockTable};
 
         let model_dir = model_dir();
         let ctx = CudaContext::new(0).expect("CUDA context");
@@ -314,8 +314,8 @@ mod gemma3_text_tiny_random {
 
     #[test]
     fn paged_decode_matches_forward() {
-        use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
-        use infernum::cuda::PagedKvCache;
+        use infernum_cuda::cuda::PagedKvCache;
+        use infernum_cuda::{BlockAllocator, BlockConfig, BlockTable};
 
         let model_dir = model_dir();
         let ctx = CudaContext::new(0).expect("CUDA context");
@@ -475,8 +475,8 @@ mod gemma2_2b {
     #[test]
     #[ignore = "5GB model, needs ~10GB VRAM — run manually with --ignored"]
     fn paged_decode_matches_forward() {
-        use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
-        use infernum::cuda::PagedKvCache;
+        use infernum_cuda::cuda::PagedKvCache;
+        use infernum_cuda::{BlockAllocator, BlockConfig, BlockTable};
 
         let model_dir = model_dir();
         let ctx = CudaContext::new(0).expect("CUDA context");

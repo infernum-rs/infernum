@@ -18,7 +18,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::{GenerateOptions, Result, SamplingParams, ShardedModel};
+use infernum::{GenerateOptions, Result, SamplingParams};
+use infernum_cuda::ShardedModel;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -166,7 +167,7 @@ fn run_parallel<M: Model + Send + 'static>(
     Ok(())
 }
 
-use infernum::model::Model;
+use infernum_cuda::Model;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();

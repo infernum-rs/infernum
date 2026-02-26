@@ -21,9 +21,9 @@
 use std::collections::VecDeque;
 
 #[cfg(feature = "cuda")]
-use infernum::cuda::block_allocator::{BlockAllocator, BlockTable};
-#[cfg(feature = "cuda")]
 use infernum::GenerateOptions;
+#[cfg(feature = "cuda")]
+use infernum_cuda::{BlockAllocator, BlockTable};
 
 #[cfg(feature = "cuda")]
 use crate::engine::{FinishReason, TokenSender};
@@ -404,7 +404,7 @@ mod tests {
     }
 
     fn make_allocator(block_size: usize, num_blocks: usize) -> BlockAllocator {
-        use infernum::cuda::block_allocator::BlockConfig;
+        use infernum_cuda::BlockConfig;
         BlockAllocator::new(&BlockConfig {
             block_size,
             num_blocks,

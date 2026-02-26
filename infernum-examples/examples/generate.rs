@@ -17,10 +17,11 @@ use std::time::Instant;
 use clap::Parser;
 use serde::Deserialize;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
-use infernum::{GenerateOptions, Model, Result, SamplingParams};
+use infernum::{GenerateOptions, Result, SamplingParams};
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::Model;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -259,7 +260,7 @@ fn main() -> Result<()> {
     if is_gguf {
         // GGUF is Llama-family only
         let model = LlamaModel::from_gguf(&ctx, &cli.model)?;
-        let gguf_loader = infernum::GgufLoader::from_file(&cli.model)?;
+        let gguf_loader = infernum_cuda::GgufLoader::from_file(&cli.model)?;
         let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(gguf_loader.metadata())?);
         let num_layers = model.config().num_hidden_layers;
         let hidden_size = model.config().hidden_size;

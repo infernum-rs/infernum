@@ -8,9 +8,10 @@
 use std::net::SocketAddr;
 
 use infernum::chat_template::RawTemplate;
-use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::{CudaContext, CudaTensor, PagedKvCache};
-use infernum::{Model, ModelConfig, Result as InfernumResult, Tokenizer};
+use infernum::{ModelConfig, Result as InfernumResult, Tokenizer};
+use infernum_cuda::cuda::{CudaContext, CudaTensor, PagedKvCache};
+use infernum_cuda::BlockTable;
+use infernum_cuda::Model;
 use infernum_serve::{ModelEntry, Server};
 
 // ---------------------------------------------------------------------------

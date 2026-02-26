@@ -1,55 +1,32 @@
 //! Infernum: A Rust-based LLM inference server
 //!
-//! This crate provides the core functionality for running LLM inference on CUDA GPUs.
-//!
-//! # Features
-//!
-//! - `cuda` - Enable CUDA GPU support (requires CUDA toolkit)
+//! This crate provides the core types and traits for LLM inference.
+//! Backend-specific implementations (CUDA, CPU, etc.) are in separate crates.
 
 // Allow proc macros to use `::infernum::` paths from within this crate.
 extern crate self as infernum;
 
+pub mod block_allocator;
 pub mod chat_template;
-#[cfg(feature = "cuda")]
-pub mod cuda;
 pub mod dtype;
 pub mod error;
 pub mod fusion;
+pub mod gguf_meta;
 pub mod model;
 pub mod sampling;
+pub mod shard;
 pub mod tensor;
 pub mod tokenizer;
-pub mod weights;
 
-#[cfg(feature = "cuda")]
-pub use cuda::ops::LinearWeight;
-#[cfg(feature = "cuda")]
-pub use cuda::BufferPool;
-#[cfg(feature = "cuda")]
-pub use cuda::CudaGraph;
-#[cfg(feature = "cuda")]
-pub use cuda::CudaTensor;
-#[cfg(feature = "cuda")]
-pub use cuda::QuantizedTensor;
-#[cfg(feature = "cuda")]
-pub use cuda::SeqPosition;
-#[cfg(feature = "nccl")]
-pub use cuda::{nccl::NcclId, NcclCommunicator, ShardedModel};
-#[cfg(feature = "cuda")]
-pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
+pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};
 pub use error::{Error, Result};
-#[cfg(feature = "cuda")]
-pub use model::Model;
+pub use gguf_meta::GgufValue;
 pub use model::ModelConfig;
-#[cfg(feature = "nccl")]
-pub use model::ShardedLoadable;
 pub use sampling::{GenerateOptions, SamplingParams};
+pub use shard::{shard_strategy_for_weight, GpuConfig, ShardConfig, ShardStrategy};
 pub use tensor::Tensor;
-#[cfg(feature = "cuda")]
 pub use tokenizer::GgufTokenizer;
 pub use tokenizer::Tokenizer;
-#[cfg(feature = "cuda")]
-pub use weights::GgufLoader;
 
 pub use chat_template::{ChatMessage, ChatTemplate, RawTemplate};

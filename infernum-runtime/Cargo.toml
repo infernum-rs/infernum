@@ -5,12 +5,13 @@ edition = "2021"
 
 [features]
 default = []
-cuda = ["infernum/cuda"]
-nccl = ["cuda", "infernum/nccl"]
+cuda = ["infernum-cuda"]
+nccl = ["cuda", "infernum-cuda/nccl"]
 integration = ["cuda", "infernum-llama/cuda"]
 
 [dependencies]
 infernum = { path = "../infernum" }
+infernum-cuda = { path = "../infernum-cuda", optional = true }
 
 [dev-dependencies]
 infernum-llama = { path = "../infernum-llama" }

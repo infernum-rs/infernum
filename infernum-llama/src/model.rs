@@ -9,8 +9,9 @@
 
 use std::path::Path;
 
-use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::ops::{
+use infernum::dtype::DType;
+use infernum::tensor::Tensor;
+use infernum_cuda::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
     cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
     fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32,
@@ -18,12 +19,13 @@ use infernum::cuda::ops::{
     rms_norm_inplace, split_inner_dim, swiglu, transpose_2d, LinearWeight,
 };
 #[cfg(feature = "nccl")]
-use infernum::cuda::{shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy};
-use infernum::cuda::{
+use infernum_cuda::cuda::{
+    shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy,
+};
+use infernum_cuda::cuda::{
     BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
 };
-use infernum::dtype::DType;
-use infernum::tensor::Tensor;
+use infernum_cuda::BlockTable;
 
 #[cfg(feature = "nccl")]
 fn nccl_all_reduce(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor) -> Result<()> {
@@ -33,8 +35,8 @@ fn nccl_all_reduce(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor) -> 
     Ok(())
 }
 
-use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 use infernum::Result;
+use infernum_cuda::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 
 use crate::LlamaConfig;
 
@@ -1678,7 +1680,7 @@ impl LlamaModel {
         experts: &[MoeExpertWeights],
         num_experts_per_tok: usize,
     ) -> Result<CudaTensor> {
-        let mut out = infernum::cuda::moe::moe_forward(
+        let mut out = infernum_cuda::cuda::moe::moe_forward(
             hidden,
             gate,
             experts.len(),
@@ -1990,7 +1992,7 @@ impl LlamaModel {
     }
 }
 
-impl infernum::Model for LlamaModel {
+impl infernum_cuda::Model for LlamaModel {
     fn config(&self) -> infernum::ModelConfig {
         let config = self.config();
         infernum::ModelConfig {
@@ -2095,7 +2097,7 @@ impl infernum::Model for LlamaModel {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum::ShardedLoadable for LlamaModel {
+impl infernum_cuda::ShardedLoadable for LlamaModel {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,

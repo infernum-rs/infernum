@@ -9,8 +9,10 @@
 
 use std::path::Path;
 
-use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::ops::{
+use infernum::dtype::DType;
+use infernum::tensor::Tensor;
+use infernum::Result;
+use infernum_cuda::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
     bias_add_inplace, cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
     fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32, mul,
@@ -18,15 +20,13 @@ use infernum::cuda::ops::{
     precompute_rope_cache_scaled, rms_norm, rms_norm_inplace, split_inner_dim, swiglu,
     transpose_2d, LinearWeight, RopeScaling,
 };
-use infernum::cuda::{
+use infernum_cuda::cuda::{
     BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
 };
 #[cfg(feature = "nccl")]
-use infernum::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
-use infernum::dtype::DType;
-use infernum::tensor::Tensor;
-use infernum::weights::{SafeTensorsLoader, WeightLoader};
-use infernum::Result;
+use infernum_cuda::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
+use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
+use infernum_cuda::BlockTable;
 
 use crate::QwenConfig;
 
@@ -1705,7 +1705,7 @@ impl QwenModel {
         shared_expert: Option<&QwenMlpWeights>,
         shared_expert_gate: Option<&CudaTensor>,
     ) -> Result<CudaTensor> {
-        let mut out = infernum::cuda::moe::moe_forward(
+        let mut out = infernum_cuda::cuda::moe::moe_forward(
             hidden,
             gate,
             experts.len(),
@@ -1750,7 +1750,7 @@ impl QwenModel {
     }
 }
 
-impl infernum::Model for QwenModel {
+impl infernum_cuda::Model for QwenModel {
     fn config(&self) -> infernum::ModelConfig {
         let config = self.config();
         infernum::ModelConfig {
@@ -1873,7 +1873,7 @@ impl infernum::Model for QwenModel {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum::ShardedLoadable for QwenModel {
+impl infernum_cuda::ShardedLoadable for QwenModel {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,

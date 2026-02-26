@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::weights::GgufValue;
+use crate::gguf_meta::GgufValue;
 use crate::{Error, Result};
 
 /// A tokenizer built from GGUF metadata (`tokenizer.ggml.*` keys).

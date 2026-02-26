@@ -16,10 +16,12 @@
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig};
-use infernum::cuda::ops::{argmax_last_scalar, sample_top_p};
-use infernum::cuda::{BatchedGraphInputs, CudaGraph, PagedKvCache};
-use infernum::{CudaTensor, GenerateOptions, Model, ModelConfig, Result, SamplingParams, Tensor};
+use infernum::{GenerateOptions, ModelConfig, Result, SamplingParams, Tensor};
+use infernum_cuda::cuda::ops::{argmax_last_scalar, sample_top_p};
+use infernum_cuda::cuda::{BatchedGraphInputs, CudaGraph, PagedKvCache};
+use infernum_cuda::CudaTensor;
+use infernum_cuda::Model;
+use infernum_cuda::{BlockAllocator, BlockConfig};
 
 use crate::scheduler::{BatchConfig, Scheduler, SequencePhase};
 
@@ -779,7 +781,7 @@ fn handle_new_token(
 
 /// Select the next token from logits, either via greedy argmax or sampling.
 fn select_token(
-    logits: &infernum::CudaTensor,
+    logits: &infernum_cuda::CudaTensor,
     sampling: Option<&SamplingParams>,
     rng_state: &mut Option<u64>,
     recent_tokens: &[u32],
