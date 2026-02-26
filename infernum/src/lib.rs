@@ -6,6 +6,7 @@
 // Allow proc macros to use `::infernum::` paths from within this crate.
 extern crate self as infernum;
 
+#[allow(clippy::missing_errors_doc, clippy::doc_markdown)]
 pub mod backend;
 pub mod block_allocator;
 pub mod chat_template;
