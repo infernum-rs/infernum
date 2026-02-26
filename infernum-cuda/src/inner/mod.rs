@@ -28,7 +28,7 @@ pub use cuda::{nccl::NcclId, NcclCommunicator, ShardedModel};
 pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
 #[cfg(feature = "nccl")]
 pub use model::ShardedLoadable;
-pub use weights::{GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
+pub use weights::{CudaWeightLoader, GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
 
 // Re-export cudarc types/traits needed by downstream generic model code
 pub use cudarc::cublas::{CudaBlas, Gemm};
