@@ -40,7 +40,7 @@ pub struct Engine2<M: Model> {
     request_tx: Option<mpsc::Sender<GenerationRequest>>,
     model_config: ModelConfig,
     worker: Option<JoinHandle<()>>,
-    _phantom: std::marker::PhantomData<M>,
+    _phantom: std::marker::PhantomData<fn() -> M>,
 }
 
 impl<M: Model> Engine2<M> {
