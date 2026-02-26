@@ -160,8 +160,8 @@ mod smollm2_360m {
     /// Verify paged prefill + decode produces identical tokens as forward().
     #[test]
     fn paged_decode_matches_forward() {
-        use infernum_cuda::cuda::{BlockAllocator, BlockConfig, BlockTable};
         use infernum_cuda::cuda::PagedKvCache;
+        use infernum_cuda::cuda::{BlockAllocator, BlockConfig, BlockTable};
 
         let model_dir = model_dir();
         let ctx = CudaContext::new(0).expect("CUDA context");
