@@ -22,21 +22,17 @@ use std::ffi::c_void;
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for fused_attention: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
@@ -95,12 +91,9 @@ const FUSED_PREFILL_KERNEL_NAMES: &[&str] = &[
     "fused_prefill_attention_bf16",
 ];
 
-fn ensure_fused_decode_kernel<T: cudarc::driver::DeviceRepr>(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-) -> Result<()> {
+fn ensure_fused_decode_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "fused_decode_attention";
-    let kernel_name = format!("fused_decode_attention_{}", kernel_suffix::<T>());
-    if !device.has_func(module_name, &kernel_name) {
+    if !device.has_func(module_name, "fused_decode_attention_f32") {
         let all_names: Vec<&str> = FUSED_DECODE_KERNEL_NAMES
             .iter()
             .chain(FUSED_DECODE_INDIRECT_KERNEL_NAMES.iter())
@@ -115,12 +108,9 @@ fn ensure_fused_decode_kernel<T: cudarc::driver::DeviceRepr>(
     Ok(())
 }
 
-fn ensure_fused_prefill_kernel<T: cudarc::driver::DeviceRepr>(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-) -> Result<()> {
+fn ensure_fused_prefill_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "fused_prefill_attention";
-    let kernel_name = format!("fused_prefill_attention_{}", kernel_suffix::<T>());
-    if !device.has_func(module_name, &kernel_name) {
+    if !device.has_func(module_name, "fused_prefill_attention_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(FUSED_PREFILL_PTX),
             module_name,
@@ -149,14 +139,15 @@ fn ensure_fused_prefill_kernel<T: cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
-pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
-    q: &CudaTensor<T>,
-    k: &CudaTensor<T>,
-    v: &CudaTensor<T>,
+pub fn fused_attention_decode(
+    q: &CudaTensor,
+    k: &CudaTensor,
+    v: &CudaTensor,
     scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = q.dtype();
     let q_shape = q.shape();
     let k_shape = k.shape();
     let v_shape = v.shape();
@@ -189,12 +180,12 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let softcap_val = softcap.unwrap_or(0.0);
     let output_shape = [1, num_heads, head_dim];
-    let mut output = unsafe { CudaTensor::<T>::uninit(q.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(q.context(), &output_shape, dtype)? };
 
     let device = q.context().device();
-    ensure_fused_decode_kernel::<T>(device)?;
+    ensure_fused_decode_kernel(device)?;
 
-    let kernel_name = format!("fused_decode_attention_{}", kernel_suffix::<T>());
+    let kernel_name = format!("fused_decode_attention_{}", kernel_suffix(dtype));
     let func = device
         .get_func("fused_decode_attention", &kernel_name)
         .unwrap();
@@ -253,15 +244,16 @@ pub fn fused_attention_decode<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
-pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
-    q: &CudaTensor<T>,
-    k: &CudaTensor<T>,
-    v: &CudaTensor<T>,
+pub fn fused_attention_prefill(
+    q: &CudaTensor,
+    k: &CudaTensor,
+    v: &CudaTensor,
     offset: usize,
     scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = q.dtype();
     let q_shape = q.shape();
     let k_shape = k.shape();
     let v_shape = v.shape();
@@ -298,12 +290,12 @@ pub fn fused_attention_prefill<T: TensorDType + cudarc::driver::DeviceRepr>(
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let softcap_val = softcap.unwrap_or(0.0);
     let output_shape = [seq_q, num_heads, head_dim];
-    let mut output = unsafe { CudaTensor::<T>::uninit(q.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(q.context(), &output_shape, dtype)? };
 
     let device = q.context().device();
-    ensure_fused_prefill_kernel::<T>(device)?;
+    ensure_fused_prefill_kernel(device)?;
 
-    let kernel_name = format!("fused_prefill_attention_{}", kernel_suffix::<T>());
+    let kernel_name = format!("fused_prefill_attention_{}", kernel_suffix(dtype));
     let func = device
         .get_func("fused_prefill_attention", &kernel_name)
         .unwrap();
@@ -371,16 +363,17 @@ const FUSED_DECODE_INDIRECT_KERNEL_NAMES: &[&str] = &[
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
-pub fn fused_attention_decode_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
-    q: &CudaTensor<T>,
-    k: &CudaTensor<T>,
-    v: &CudaTensor<T>,
+pub fn fused_attention_decode_indirect(
+    q: &CudaTensor,
+    k: &CudaTensor,
+    v: &CudaTensor,
     position: &crate::cuda::SeqPosition,
     max_seq_len: usize,
     scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = q.dtype();
     let q_shape = q.shape();
     assert_eq!(q_shape.len(), 3, "Q must be 3D: (1, num_heads, head_dim)");
     assert_eq!(q_shape[0], 1, "Q seq_len must be 1 for decode");
@@ -398,13 +391,13 @@ pub fn fused_attention_decode_indirect<T: TensorDType + cudarc::driver::DeviceRe
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let softcap_val = softcap.unwrap_or(0.0);
     let output_shape = [1, num_heads, head_dim];
-    let mut output = unsafe { CudaTensor::<T>::uninit(q.context(), &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(q.context(), &output_shape, dtype)? };
 
     let device = q.context().device();
 
     // Ensure both standard and indirect kernels are loaded
     let module_name = "fused_decode_attention";
-    let indirect_name = format!("fused_decode_attention_indirect_{}", kernel_suffix::<T>());
+    let indirect_name = format!("fused_decode_attention_indirect_{}", kernel_suffix(dtype));
     if !device.has_func(module_name, &indirect_name) {
         let all_names: Vec<&str> = FUSED_DECODE_KERNEL_NAMES
             .iter()
@@ -459,12 +452,12 @@ pub fn fused_attention_decode_indirect<T: TensorDType + cudarc::driver::DeviceRe
 infernum_macros::define_fusion! {
     name: "attention_kv",
     fn attention_kv_fused(
-        q: &CudaTensor<f32>,
+        q: &CudaTensor,
         kv_cache: &mut crate::cuda::KvCache,
         layer_idx: usize,
-        k_new: &CudaTensor<f32>,
-        v_new: &CudaTensor<f32>,
-    ) -> crate::Result<CudaTensor<f32>> {
+        k_new: &CudaTensor,
+        v_new: &CudaTensor,
+    ) -> crate::Result<CudaTensor> {
         let q_shape = q.shape();
         let new_seq_len = q_shape[0];
 
@@ -498,12 +491,11 @@ const FUSED_PREFILL_WITH_LSE_KERNEL_NAMES: &[&str] = &[
     "fused_prefill_attention_with_lse_bf16",
 ];
 
-fn ensure_fused_prefill_with_lse_kernel<T: cudarc::driver::DeviceRepr>(
+fn ensure_fused_prefill_with_lse_kernel(
     device: &std::sync::Arc<cudarc::driver::CudaDevice>,
 ) -> Result<()> {
     let module_name = "fused_prefill_attention_with_lse";
-    let kernel_name = format!("fused_prefill_attention_with_lse_{}", kernel_suffix::<T>());
-    if !device.has_func(module_name, &kernel_name) {
+    if !device.has_func(module_name, "fused_prefill_attention_with_lse_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(FUSED_PREFILL_WITH_LSE_PTX),
             module_name,
@@ -535,15 +527,16 @@ fn ensure_fused_prefill_with_lse_kernel<T: cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
-pub fn fused_attention_prefill_with_lse<T: TensorDType + cudarc::driver::DeviceRepr>(
-    q: &CudaTensor<T>,
-    k: &CudaTensor<T>,
-    v: &CudaTensor<T>,
+pub fn fused_attention_prefill_with_lse(
+    q: &CudaTensor,
+    k: &CudaTensor,
+    v: &CudaTensor,
     offset: usize,
     scale: Option<f32>,
     softcap: Option<f32>,
     sliding_window: Option<usize>,
-) -> Result<(CudaTensor<T>, CudaTensor<f32>)> {
+) -> Result<(CudaTensor, CudaTensor)> {
+    let dtype = q.dtype();
     let q_shape = q.shape();
     let k_shape = k.shape();
     let v_shape = v.shape();
@@ -580,13 +573,13 @@ pub fn fused_attention_prefill_with_lse<T: TensorDType + cudarc::driver::DeviceR
     let mut scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     let mut softcap_val = softcap.unwrap_or(0.0);
     let mut output =
-        unsafe { CudaTensor::<T>::uninit(q.context(), &[seq_q, num_heads, head_dim])? };
-    let mut lse = unsafe { CudaTensor::<f32>::uninit(q.context(), &[seq_q, num_heads])? };
+        unsafe { CudaTensor::uninit(q.context(), &[seq_q, num_heads, head_dim], dtype)? };
+    let mut lse = unsafe { CudaTensor::uninit(q.context(), &[seq_q, num_heads], DType::F32)? };
 
     let device = q.context().device();
-    ensure_fused_prefill_with_lse_kernel::<T>(device)?;
+    ensure_fused_prefill_with_lse_kernel(device)?;
 
-    let kernel_name = format!("fused_prefill_attention_with_lse_{}", kernel_suffix::<T>());
+    let kernel_name = format!("fused_prefill_attention_with_lse_{}", kernel_suffix(dtype));
     let func = device
         .get_func("fused_prefill_attention_with_lse", &kernel_name)
         .unwrap();
@@ -657,12 +650,9 @@ const COMBINE_LSE_KERNEL_NAMES: &[&str] = &[
     "combine_attention_lse_bf16",
 ];
 
-fn ensure_combine_lse_kernel<T: cudarc::driver::DeviceRepr>(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
-) -> Result<()> {
+fn ensure_combine_lse_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module_name = "combine_attention_lse";
-    let kernel_name = format!("combine_attention_lse_{}", kernel_suffix::<T>());
-    if !device.has_func(module_name, &kernel_name) {
+    if !device.has_func(module_name, "combine_attention_lse_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(COMBINE_LSE_PTX),
             module_name,
@@ -689,12 +679,13 @@ fn ensure_combine_lse_kernel<T: cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
-pub fn combine_attention_with_lse<T: TensorDType + cudarc::driver::DeviceRepr>(
-    out1: &CudaTensor<T>,
-    lse1: &CudaTensor<f32>,
-    out2: &CudaTensor<T>,
-    lse2: &CudaTensor<f32>,
-) -> Result<CudaTensor<T>> {
+pub fn combine_attention_with_lse(
+    out1: &CudaTensor,
+    lse1: &CudaTensor,
+    out2: &CudaTensor,
+    lse2: &CudaTensor,
+) -> Result<CudaTensor> {
+    let dtype = out1.dtype();
     let shape1 = out1.shape();
     let shape2 = out2.shape();
     assert_eq!(shape1.len(), 3, "out1 must be 3D: (N, num_heads, head_dim)");
@@ -715,12 +706,12 @@ pub fn combine_attention_with_lse<T: TensorDType + cudarc::driver::DeviceRepr>(
         "LSE shape must be (N, num_heads)"
     );
 
-    let mut combined = unsafe { CudaTensor::<T>::uninit(out1.context(), shape1)? };
+    let mut combined = unsafe { CudaTensor::uninit(out1.context(), shape1, dtype)? };
 
     let device = out1.context().device();
-    ensure_combine_lse_kernel::<T>(device)?;
+    ensure_combine_lse_kernel(device)?;
 
-    let kernel_name = format!("combine_attention_lse_{}", kernel_suffix::<T>());
+    let kernel_name = format!("combine_attention_lse_{}", kernel_suffix(dtype));
     let func = device
         .get_func("combine_attention_lse", &kernel_name)
         .unwrap();
@@ -761,11 +752,11 @@ mod tests {
     ///
     /// Independent of the fused kernel so we can compare against it.
     fn reference_attention_kv(
-        q: &CudaTensor<f32>,
-        k_full: &CudaTensor<f32>,
-        v_full: &CudaTensor<f32>,
+        q: &CudaTensor,
+        k_full: &CudaTensor,
+        v_full: &CudaTensor,
         num_heads: usize,
-    ) -> CudaTensor<f32> {
+    ) -> CudaTensor {
         use super::super::{matmul, repeat_kv, softmax, transpose_012_to_102, transpose_last_two};
 
         let num_kv_heads = k_full.shape()[1];
@@ -793,7 +784,7 @@ mod tests {
 
         // scores: (heads, 1, total_len) — scale via CPU roundtrip
         let scores = matmul(&q_t, &k_tt).unwrap();
-        let mut scores_cpu = scores.to_vec().unwrap();
+        let mut scores_cpu = scores.to_vec::<f32>().unwrap();
         for val in &mut scores_cpu {
             *val *= scale;
         }
@@ -835,8 +826,8 @@ mod tests {
 
         assert_eq!(fused.shape(), &[1, num_heads, head_dim]);
 
-        let fused_data = fused.to_vec().unwrap();
-        let ref_data = reference.to_vec().unwrap();
+        let fused_data = fused.to_vec::<f32>().unwrap();
+        let ref_data = reference.to_vec::<f32>().unwrap();
 
         for (i, (&f, &r)) in fused_data.iter().zip(ref_data.iter()).enumerate() {
             assert!(
@@ -874,8 +865,8 @@ mod tests {
         let fused = fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
         let reference = reference_attention_kv(&q, &k, &v, num_heads);
 
-        let fused_data = fused.to_vec().unwrap();
-        let ref_data = reference.to_vec().unwrap();
+        let fused_data = fused.to_vec::<f32>().unwrap();
+        let ref_data = reference.to_vec::<f32>().unwrap();
 
         for (i, (&f, &r)) in fused_data.iter().zip(ref_data.iter()).enumerate() {
             assert!(
@@ -894,7 +885,7 @@ mod tests {
         let v = CudaTensor::from_slice(&ctx, &[1, 1, 4], &[0.5, 0.5, 0.5, 0.5]).unwrap();
 
         let output = fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Only one key position, so output == V
         for (i, &val) in result.iter().enumerate() {
@@ -927,8 +918,8 @@ mod tests {
 
         assert_eq!(fused.shape(), &[seq_q, num_heads, head_dim]);
 
-        let fused_data = fused.to_vec().unwrap();
-        let ref_data = reference.to_vec().unwrap();
+        let fused_data = fused.to_vec::<f32>().unwrap();
+        let ref_data = reference.to_vec::<f32>().unwrap();
 
         for (i, (&f, &r)) in fused_data.iter().zip(ref_data.iter()).enumerate() {
             assert!(
@@ -968,8 +959,8 @@ mod tests {
 
         let fused = fused_attention_prefill(&q, &k, &v, 0, None, None, None).unwrap();
 
-        let fused_data = fused.to_vec().unwrap();
-        let ref_data = reference.to_vec().unwrap();
+        let fused_data = fused.to_vec::<f32>().unwrap();
+        let ref_data = reference.to_vec::<f32>().unwrap();
 
         for (i, (&f, &r)) in fused_data.iter().zip(ref_data.iter()).enumerate() {
             assert!(
@@ -1054,7 +1045,7 @@ mod tests {
         let cache_len = 3;
         let new_seq = 2;
 
-        let mut kv_cache = KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim).unwrap();
+        let mut kv_cache = KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Populate cache with initial tokens
         let k_init: Vec<f32> = (0..cache_len * num_kv_heads * head_dim)
@@ -1095,8 +1086,8 @@ mod tests {
             fused_attention_prefill(&q, &k_full, &v_full, cache_len, None, None, None).unwrap();
 
         // CPU reference with offset-aware causal mask
-        let k_full_cpu = k_full.to_vec().unwrap();
-        let v_full_cpu = v_full.to_vec().unwrap();
+        let k_full_cpu = k_full.to_vec::<f32>().unwrap();
+        let v_full_cpu = v_full.to_vec::<f32>().unwrap();
         let ref_data = cpu_causal_attention(
             &q_data,
             &k_full_cpu,
@@ -1109,7 +1100,7 @@ mod tests {
             cache_len,
         );
 
-        let fused_data = fused.to_vec().unwrap();
+        let fused_data = fused.to_vec::<f32>().unwrap();
 
         for (i, (&f, &r)) in fused_data.iter().zip(ref_data.iter()).enumerate() {
             assert!(
@@ -1128,7 +1119,7 @@ mod tests {
         let head_dim = 8;
         let prefill_len = 4;
 
-        let mut kv_cache = KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim).unwrap();
+        let mut kv_cache = KvCache::new(&ctx, 1, 32, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Prefill KV cache
         let kv_data: Vec<f32> = (0..prefill_len * num_kv_heads * head_dim)
@@ -1163,8 +1154,8 @@ mod tests {
         // Independent reference (transpose + matmul + softmax)
         let ref_output = reference_attention_kv(&q1, &k_full, &v_full, num_heads);
 
-        let fused_data = fused_output.to_vec().unwrap();
-        let ref_data = ref_output.to_vec().unwrap();
+        let fused_data = fused_output.to_vec::<f32>().unwrap();
+        let ref_data = ref_output.to_vec::<f32>().unwrap();
 
         for (i, (&f, &r)) in fused_data.iter().zip(ref_data.iter()).enumerate() {
             assert!(
@@ -1202,8 +1193,8 @@ mod tests {
         let fused = fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
         let reference = reference_attention_kv(&q, &k, &v, num_heads);
 
-        let fused_data = fused.to_vec().unwrap();
-        let ref_data = reference.to_vec().unwrap();
+        let fused_data = fused.to_vec::<f32>().unwrap();
+        let ref_data = reference.to_vec::<f32>().unwrap();
 
         for (i, (&f, &r)) in fused_data.iter().zip(ref_data.iter()).enumerate() {
             assert!(
@@ -1222,7 +1213,7 @@ mod tests {
         num_kv_heads: usize,
         head_dim: usize,
         seed: f32,
-    ) -> (CudaTensor<f32>, Vec<f32>) {
+    ) -> (CudaTensor, Vec<f32>) {
         let mut data = vec![0.0_f32; max_seq_len * num_kv_heads * head_dim];
         for i in 0..(total_len * num_kv_heads * head_dim) {
             data[i] = ((i as f32) * seed).sin();
@@ -1288,8 +1279,8 @@ mod tests {
 
         assert_eq!(indirect.shape(), &[1, num_heads, head_dim]);
 
-        let direct_data = direct.to_vec().unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let direct_data = direct.to_vec::<f32>().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -1356,8 +1347,8 @@ mod tests {
 
         assert_eq!(indirect.shape(), &[1, num_heads, head_dim]);
 
-        let direct_data = direct.to_vec().unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let direct_data = direct.to_vec::<f32>().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -1414,8 +1405,8 @@ mod tests {
         )
         .unwrap();
 
-        let data3 = out3.to_vec().unwrap();
-        let data10 = out10.to_vec().unwrap();
+        let data3 = out3.to_vec::<f32>().unwrap();
+        let data10 = out10.to_vec::<f32>().unwrap();
 
         // Attending to more tokens must produce different results
         assert_ne!(
@@ -1427,18 +1418,18 @@ mod tests {
         let k3 = CudaTensor::from_slice(
             &ctx,
             &[3, num_heads, head_dim],
-            &k_full.to_vec().unwrap()[..3 * num_heads * head_dim],
+            &k_full.to_vec::<f32>().unwrap()[..3 * num_heads * head_dim],
         )
         .unwrap();
         let v3 = CudaTensor::from_slice(
             &ctx,
             &[3, num_heads, head_dim],
-            &v_full.to_vec().unwrap()[..3 * num_heads * head_dim],
+            &v_full.to_vec::<f32>().unwrap()[..3 * num_heads * head_dim],
         )
         .unwrap();
         let direct3 = fused_attention_decode(&q, &k3, &v3, None, None, None).unwrap();
 
-        let direct3_data = direct3.to_vec().unwrap();
+        let direct3_data = direct3.to_vec::<f32>().unwrap();
         for (i, (&a, &b)) in data3.iter().zip(direct3_data.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 1e-3,
@@ -1521,8 +1512,8 @@ mod tests {
         let windowed = fused_attention_decode(&q, &k, &v, None, None, Some(window)).unwrap();
         let full = fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
 
-        let windowed_data = windowed.to_vec().unwrap();
-        let full_data = full.to_vec().unwrap();
+        let windowed_data = windowed.to_vec::<f32>().unwrap();
+        let full_data = full.to_vec::<f32>().unwrap();
 
         // Windowed and full should differ (total_len > window)
         assert_ne!(
@@ -1570,8 +1561,8 @@ mod tests {
         let windowed = fused_attention_decode(&q, &k, &v, None, None, Some(window)).unwrap();
         let full = fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
 
-        let windowed_data = windowed.to_vec().unwrap();
-        let full_data = full.to_vec().unwrap();
+        let windowed_data = windowed.to_vec::<f32>().unwrap();
+        let full_data = full.to_vec::<f32>().unwrap();
 
         for (i, (&w, &f)) in windowed_data.iter().zip(full_data.iter()).enumerate() {
             assert!(
@@ -1605,8 +1596,8 @@ mod tests {
         let windowed = fused_attention_prefill(&q, &k, &v, 0, None, None, Some(window)).unwrap();
         let full = fused_attention_prefill(&q, &k, &v, 0, None, None, None).unwrap();
 
-        let windowed_data = windowed.to_vec().unwrap();
-        let full_data = full.to_vec().unwrap();
+        let windowed_data = windowed.to_vec::<f32>().unwrap();
+        let full_data = full.to_vec::<f32>().unwrap();
 
         // First `window` positions should be identical (window covers all valid keys)
         let first_window_elems = window * num_heads * head_dim;
@@ -1686,8 +1677,8 @@ mod tests {
         )
         .unwrap();
 
-        let direct_data = direct.to_vec().unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let direct_data = direct.to_vec::<f32>().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -1754,8 +1745,8 @@ mod tests {
         )
         .unwrap();
 
-        let direct_data = direct.to_vec().unwrap();
-        let indirect_data = indirect.to_vec().unwrap();
+        let direct_data = direct.to_vec::<f32>().unwrap();
+        let indirect_data = indirect.to_vec::<f32>().unwrap();
 
         for (i, (&d, &ind)) in direct_data.iter().zip(indirect_data.iter()).enumerate() {
             assert!(
@@ -1843,8 +1834,8 @@ mod tests {
         // Without softcap
         let uncapped = fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
 
-        let capped_data = capped.to_vec().unwrap();
-        let uncapped_data = uncapped.to_vec().unwrap();
+        let capped_data = capped.to_vec::<f32>().unwrap();
+        let uncapped_data = uncapped.to_vec::<f32>().unwrap();
 
         // Softcap should change the output
         assert_ne!(
@@ -1889,8 +1880,8 @@ mod tests {
         let capped = fused_attention_prefill(&q, &k, &v, 0, None, Some(cap), None).unwrap();
         let uncapped = fused_attention_prefill(&q, &k, &v, 0, None, None, None).unwrap();
 
-        let capped_data = capped.to_vec().unwrap();
-        let uncapped_data = uncapped.to_vec().unwrap();
+        let capped_data = capped.to_vec::<f32>().unwrap();
+        let uncapped_data = uncapped.to_vec::<f32>().unwrap();
 
         // Softcap should change output (at least for later positions with larger scores)
         assert_ne!(
@@ -1942,8 +1933,8 @@ mod tests {
         let custom = fused_attention_decode(&q, &k, &v, Some(custom_scale), None, None).unwrap();
         let default = fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
 
-        let custom_data = custom.to_vec().unwrap();
-        let default_data = default.to_vec().unwrap();
+        let custom_data = custom.to_vec::<f32>().unwrap();
+        let default_data = default.to_vec::<f32>().unwrap();
 
         // Different scales should produce different outputs
         assert_ne!(
@@ -2018,9 +2009,9 @@ mod tests {
         let (with_out, lse) =
             fused_attention_prefill_with_lse(&q, &k, &v, 0, None, None, None).unwrap();
 
-        let without_data = without.to_vec().unwrap();
-        let with_data = with_out.to_vec().unwrap();
-        let lse_data = lse.to_vec().unwrap();
+        let without_data = without.to_vec::<f32>().unwrap();
+        let with_data = with_out.to_vec::<f32>().unwrap();
+        let lse_data = lse.to_vec::<f32>().unwrap();
 
         for (i, (&a, &b)) in without_data.iter().zip(with_data.iter()).enumerate() {
             assert!(
@@ -2056,7 +2047,7 @@ mod tests {
         let lse2 = CudaTensor::from_slice(&ctx, &[n, num_heads], &lse_data).unwrap();
 
         let combined = combine_attention_with_lse(&out1, &lse1, &out2, &lse2).unwrap();
-        let result = combined.to_vec().unwrap();
+        let result = combined.to_vec::<f32>().unwrap();
 
         for (i, (&r, (&a, &b))) in result
             .iter()
@@ -2089,7 +2080,7 @@ mod tests {
         let lse2 = CudaTensor::from_slice(&ctx, &[n, num_heads], &lse2_data).unwrap();
 
         let combined = combine_attention_with_lse(&out1, &lse1, &out2, &lse2).unwrap();
-        let result = combined.to_vec().unwrap();
+        let result = combined.to_vec::<f32>().unwrap();
 
         for (i, &r) in result.iter().enumerate() {
             assert!(

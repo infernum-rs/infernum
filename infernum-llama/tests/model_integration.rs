@@ -93,7 +93,7 @@ fn greedy_options(max_tokens: usize) -> GenerateOptions {
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model = LlamaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -105,7 +105,7 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
 /// Load a model and generate text with greedy decoding + CUDA graph capture/replay.
 fn generate_greedy_with_graphs(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = LlamaModel::<f32>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model = LlamaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let mut opts = greedy_options(max_tokens);
@@ -140,8 +140,7 @@ mod smollm2_360m {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -149,7 +148,7 @@ mod smollm2_360m {
 
         // Run a raw forward pass and check logits for NaN/Inf
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -171,7 +170,7 @@ mod smollm2_360m {
         let prompt_ids = tokenizer.encode("The capital of France is", true).unwrap();
         let num_decode_steps = 20;
 
-        let model = LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("load model");
         let model_cfg = Model::config(&model);
 
         // forward() reference: greedy decode step-by-step (no KV cache)
@@ -205,6 +204,7 @@ mod smollm2_360m {
             &block_config,
             model_cfg.num_kv_heads,
             model_cfg.head_dim,
+            model.dtype(),
         )
         .expect("paged kv")];
         let mut allocator = BlockAllocator::new(&block_config);
@@ -335,15 +335,14 @@ mod llama_fp8 {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -383,15 +382,14 @@ mod llama_gptq {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -423,15 +421,14 @@ mod mixtral_moe_tiny {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -484,15 +481,14 @@ mod mixtral_2x7b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            LlamaModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
@@ -527,7 +523,7 @@ mod mixtral_moe_tp {
     #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
     fn loads_and_generates_2gpu() {
         let model_dir = model_dir();
-        let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&model_dir, 2)
+        let model = ShardedModel::<LlamaModel>::from_pretrained(&model_dir, 2)
             .expect("Failed to load sharded MoE model");
 
         let tokenizer =
@@ -543,7 +539,7 @@ mod mixtral_moe_tp {
     #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
     fn no_nan_in_output_2gpu() {
         let model_dir = model_dir();
-        let model = ShardedModel::<LlamaModel<f32>>::from_pretrained(&model_dir, 2)
+        let model = ShardedModel::<LlamaModel>::from_pretrained(&model_dir, 2)
             .expect("Failed to load sharded MoE model");
 
         let tokenizer =
@@ -596,8 +592,7 @@ mod mistral_7b {
     fn capital_of_france() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            MistralModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = MistralModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -616,15 +611,14 @@ mod mistral_7b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            MistralModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = MistralModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
         let input_ids = tokenizer.encode("Hello world", true).unwrap();
 
         let logits = model.forward(&input_ids).expect("Forward pass failed");
-        let logits_vec = logits.to_vec().expect("Failed to read logits");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
 
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();

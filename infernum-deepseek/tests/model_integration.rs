@@ -88,8 +88,7 @@ fn greedy_options(max_tokens: usize) -> GenerateOptions {
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model =
-        DeepSeekModel::<f32>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model = DeepSeekModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -129,8 +128,7 @@ mod deepseek_v3_tiny {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            DeepSeekModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = DeepSeekModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -161,8 +159,7 @@ mod deepseek_v3_tiny {
 
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model =
-            DeepSeekModel::<f32>::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = DeepSeekModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -179,6 +176,7 @@ mod deepseek_v3_tiny {
             &block_config,
             model_config.num_kv_heads,
             model_config.head_dim,
+            model.dtype(),
         )
         .expect("Failed to create paged KV cache")];
         let mut allocator = BlockAllocator::new(&block_config);

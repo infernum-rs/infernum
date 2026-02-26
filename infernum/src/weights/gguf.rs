@@ -1,7 +1,7 @@
 //! GGUF file format loader
 //!
 //! Parses the GGUF binary format used by llama.cpp and loads tensors
-//! as either `CudaTensor<f32>` (for unquantized weights) or
+//! as either `CudaTensor` (for unquantized weights) or
 //! `QuantizedTensor` (for Q8_0, Q4_0, etc.).
 //!
 //! Reference: <https://github.com/ggerganov/ggml/blob/master/docs/gguf.md>
@@ -412,7 +412,7 @@ impl GgufLoader {
 }
 
 impl WeightLoader for GgufLoader {
-    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<f32>> {
+    fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let info = self
             .tensors
             .get(name)
@@ -573,7 +573,7 @@ impl WeightLoader for GgufLoader {
         CudaTensor::from_slice(ctx, &info.shape, &f32_data)
     }
 
-    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::f16>> {
+    fn load_f16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let info = self
             .tensors
             .get(name)
@@ -617,7 +617,7 @@ impl WeightLoader for GgufLoader {
         CudaTensor::from_slice(ctx, &info.shape, &f16_data)
     }
 
-    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor<half::bf16>> {
+    fn load_bf16(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let info = self
             .tensors
             .get(name)
@@ -1062,7 +1062,7 @@ mod tests {
         let tensor = loader.load_f32(&ctx, "test_weight").unwrap();
 
         assert_eq!(tensor.shape(), &[2, 3]);
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         assert_eq!(result, data);
 
         std::fs::remove_file(&path).ok();
@@ -1150,7 +1150,7 @@ mod tests {
         let tensor = loader.load_f32(&ctx, "embed").unwrap();
 
         assert_eq!(tensor.shape(), &[1, 32]);
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         for (got, want) in result.iter().zip(expected.iter()) {
             assert!((got - want).abs() < 0.01, "got {got}, want {want}");
         }
@@ -1187,7 +1187,7 @@ mod tests {
         let tensor = loader.load_f32(&ctx, "embed").unwrap();
 
         assert_eq!(tensor.shape(), &[1, 32]);
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         for (got, want) in result.iter().zip(expected.iter()) {
             assert!((got - want).abs() < 0.01, "got {got}, want {want}");
         }
@@ -1247,7 +1247,7 @@ mod tests {
         let tensor = loader.load_f32(&ctx, "q6k_weight").unwrap();
         assert_eq!(tensor.shape(), &[1, Q6_K_BLOCK_ELEMENTS]);
 
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         assert_eq!(result.len(), Q6_K_BLOCK_ELEMENTS);
 
         let expected = -11.0_f32; // d=0.5, scale=2, q=(21-32)=-11 → 0.5*2*(-11) = -11
@@ -1305,8 +1305,8 @@ mod tests {
         let result_f32 = matmul(&input, &weight_f32_t).unwrap();
         let result_q4 = quantized_matmul(&input, &weight_q4).unwrap();
 
-        let out_f32 = result_f32.to_vec().unwrap();
-        let out_q4 = result_q4.to_vec().unwrap();
+        let out_f32 = result_f32.to_vec::<f32>().unwrap();
+        let out_q4 = result_q4.to_vec::<f32>().unwrap();
 
         // Check they match within quantization error
         for (i, (&f32_val, &q4_val)) in out_f32.iter().zip(out_q4.iter()).enumerate() {

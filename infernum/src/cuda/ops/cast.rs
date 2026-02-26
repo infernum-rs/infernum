@@ -10,7 +10,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::{DType, TensorDType};
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -41,32 +41,82 @@ fn ensure_cast_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> R
 ///
 /// # Panics
 /// Panics if `T` is not `f32`, `f16`, or `bf16`.
-pub fn cast_to_f32<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-) -> Result<CudaTensor<f32>> {
+pub fn cast_to_f32(input: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let n = input.numel();
     let shape = input.shape();
 
-    match T::DTYPE {
-        DType::F32 => {
-            // T is f32 — clone (GPU dtod copy) + reinterpret (zero-cost type cast).
-            let cloned = input.clone();
-            // SAFETY: T::DTYPE is F32, so T and f32 have identical layout.
-            Ok(unsafe { cloned.reinterpret() })
-        }
+    match dtype {
+        DType::F32 => Ok(input.clone()),
         DType::F16 => launch_cast_kernel(input, "cast_f16_to_f32", n, shape),
         DType::BF16 => launch_cast_kernel(input, "cast_bf16_to_f32", n, shape),
         other => panic!("Unsupported dtype for cast_to_f32: {other}"),
     }
 }
 
+/// Cast an f32 tensor to the specified target dtype on the GPU.
+///
+/// If `target` is `F32`, returns a clone. For `F16` and `BF16`, launches
+/// the appropriate CUDA cast kernel.
+///
+/// # Errors
+/// Returns an error if the kernel launch or allocation fails.
+///
+/// # Panics
+/// Panics if `target` is not `F32`, `F16`, or `BF16`.
+pub fn cast_from_f32(input: &CudaTensor, target: DType) -> Result<CudaTensor> {
+    assert_eq!(
+        input.dtype(),
+        DType::F32,
+        "cast_from_f32: input must be f32"
+    );
+    match target {
+        DType::F32 => Ok(input.clone()),
+        DType::F16 => cast_f32_to_f16(input),
+        DType::BF16 => cast_f32_to_bf16(input),
+        other => panic!("Unsupported target dtype for cast_from_f32: {other}"),
+    }
+}
+
+/// Cast an f32 tensor to f16 on the GPU
+///
+/// # Errors
+/// Returns an error if the kernel launch or allocation fails
+pub fn cast_f32_to_f16(input: &CudaTensor) -> Result<CudaTensor> {
+    let n = input.numel();
+    let mut output = unsafe { CudaTensor::uninit(input.context(), input.shape(), DType::F16)? };
+
+    let device = input.context().device();
+    ensure_cast_kernels(device)?;
+
+    let func = device.get_func("cast", "cast_f32_to_f16").unwrap();
+
+    let block_size = 256;
+    let grid_size = n.div_ceil(block_size);
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (output.cuda_slice_mut(), &input.cuda_slice(), n as i32),
+        )?;
+    }
+
+    Ok(output)
+}
+
 /// Cast an f32 tensor to bf16 on the GPU
 ///
 /// # Errors
 /// Returns an error if the kernel launch or allocation fails
-pub fn cast_f32_to_bf16(input: &CudaTensor<f32>) -> Result<CudaTensor<half::bf16>> {
+pub fn cast_f32_to_bf16(input: &CudaTensor) -> Result<CudaTensor> {
     let n = input.numel();
-    let mut output = unsafe { CudaTensor::<half::bf16>::uninit(input.context(), input.shape())? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), input.shape(), DType::BF16)? };
 
     let device = input.context().device();
     ensure_cast_kernels(device)?;
@@ -96,9 +146,9 @@ pub fn cast_f32_to_bf16(input: &CudaTensor<f32>) -> Result<CudaTensor<half::bf16
 ///
 /// # Errors
 /// Returns an error if the kernel launch or allocation fails
-pub fn cast_bf16_to_f32(input: &CudaTensor<half::bf16>) -> Result<CudaTensor<f32>> {
+pub fn cast_bf16_to_f32(input: &CudaTensor) -> Result<CudaTensor> {
     let n = input.numel();
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), input.shape())? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), input.shape(), DType::F32)? };
 
     let device = input.context().device();
     ensure_cast_kernels(device)?;
@@ -124,13 +174,13 @@ pub fn cast_bf16_to_f32(input: &CudaTensor<half::bf16>) -> Result<CudaTensor<f32
     Ok(output)
 }
 
-fn launch_cast_kernel<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
+fn launch_cast_kernel(
+    input: &CudaTensor,
     kernel_name: &str,
     n: usize,
     shape: &[usize],
-) -> Result<CudaTensor<f32>> {
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+) -> Result<CudaTensor> {
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, DType::F32)? };
     let device = input.context().device();
 
     ensure_cast_kernels(device)?;
@@ -168,7 +218,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4], &data).unwrap();
 
         let output = cast_to_f32(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, data);
     }
 
@@ -181,7 +231,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4], &bf16_data).unwrap();
 
         let output = cast_to_f32(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for (i, (&got, &expected)) in result.iter().zip(f32_data.iter()).enumerate() {
             assert!(
@@ -199,7 +249,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4], &f16_data).unwrap();
 
         let output = cast_to_f32(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for (i, (&got, &expected)) in result.iter().zip(f32_data.iter()).enumerate() {
             assert!(
@@ -222,7 +272,7 @@ mod tests {
         let back = cast_bf16_to_f32(&bf16).unwrap();
         assert_eq!(back.shape(), &[2, 3]);
 
-        let result = back.to_vec().unwrap();
+        let result = back.to_vec::<f32>().unwrap();
         for (i, (&orig, &got)) in data.iter().zip(result.iter()).enumerate() {
             let tol = orig.abs() * 0.01 + 1e-3;
             assert!((orig - got).abs() < tol, "Mismatch at {i}: {orig} vs {got}");

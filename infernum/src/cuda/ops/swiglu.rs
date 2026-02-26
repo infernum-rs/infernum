@@ -12,7 +12,6 @@
 )]
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
 use crate::Result;
 
 infernum_macros::define_block! {
@@ -23,17 +22,17 @@ infernum_macros::define_block! {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn swiglu<T: TensorDType + cudarc::driver::DeviceRepr>(
-        gate: &CudaTensor<T>,
-        up: &CudaTensor<T>,
-    ) -> Result<CudaTensor<T>> {
+    pub fn swiglu(
+        gate: &CudaTensor,
+        up: &CudaTensor,
+    ) -> Result<CudaTensor> {
         super::silu_mul(gate, up)
     }
 }
 
 infernum_macros::define_fusion! {
     name: "swiglu",
-    fn swiglu_fused_f32(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+    fn swiglu_fused_f32(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
         super::silu_mul(gate, up)
     }
 }
@@ -54,7 +53,7 @@ mod tests {
         let up = CudaTensor::from_slice(&ctx, &[4], &up_data).unwrap();
 
         let output = swiglu_decomposed(&gate, &up).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for i in 0..4 {
             let silu_gate = gate_data[i] / (1.0 + (-gate_data[i]).exp());
@@ -77,8 +76,14 @@ mod tests {
         let gate = CudaTensor::from_slice(&ctx, &[8], &gate_data).unwrap();
         let up = CudaTensor::from_slice(&ctx, &[8], &up_data).unwrap();
 
-        let decomposed = swiglu_decomposed(&gate, &up).unwrap().to_vec().unwrap();
-        let fused = swiglu_fused_f32(&gate, &up).unwrap().to_vec().unwrap();
+        let decomposed = swiglu_decomposed(&gate, &up)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        let fused = swiglu_fused_f32(&gate, &up)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
 
         for i in 0..8 {
             assert!(

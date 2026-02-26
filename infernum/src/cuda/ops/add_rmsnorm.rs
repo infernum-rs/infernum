@@ -15,7 +15,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -23,11 +23,11 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/add_rmsnorm.pt
 
 const KERNEL_NAMES: &[&str] = &["add_rmsnorm_f32", "add_rmsnorm_f16", "add_rmsnorm_bf16"];
 
-fn kernel_suffix<T: TensorDType>() -> &'static str {
-    match T::DTYPE {
-        crate::dtype::DType::F32 => "f32",
-        crate::dtype::DType::F16 => "f16",
-        crate::dtype::DType::BF16 => "bf16",
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
         other => panic!("add_rmsnorm not supported for dtype: {other}"),
     }
 }
@@ -42,12 +42,13 @@ fn kernel_suffix<T: TensorDType>() -> &'static str {
 ///
 /// # Errors
 /// Returns an error if the operation fails.
-pub fn add_rmsnorm<T: TensorDType + cudarc::driver::DeviceRepr>(
-    residual: &CudaTensor<T>,
-    x: &CudaTensor<T>,
-    weight: &CudaTensor<T>,
+pub fn add_rmsnorm(
+    residual: &CudaTensor,
+    x: &CudaTensor,
+    weight: &CudaTensor,
     eps: f32,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+) -> Result<(CudaTensor, CudaTensor)> {
+    let dtype = residual.dtype();
     let shape = residual.shape();
     assert_eq!(shape, x.shape(), "residual and x must have the same shape");
 
@@ -62,11 +63,11 @@ pub fn add_rmsnorm<T: TensorDType + cudarc::driver::DeviceRepr>(
         "Weight shape must match hidden dimension"
     );
 
-    let mut sum_out = unsafe { CudaTensor::<T>::uninit(residual.context(), shape)? };
-    let mut norm_out = unsafe { CudaTensor::<T>::uninit(residual.context(), shape)? };
+    let mut sum_out = unsafe { CudaTensor::uninit(residual.context(), shape, dtype)? };
+    let mut norm_out = unsafe { CudaTensor::uninit(residual.context(), shape, dtype)? };
 
     let device = residual.context().device();
-    let kernel_name = format!("add_rmsnorm_{}", kernel_suffix::<T>());
+    let kernel_name = format!("add_rmsnorm_{}", kernel_suffix(dtype));
 
     let module_name = "add_rmsnorm";
     if !device.has_func(module_name, &kernel_name) {
@@ -123,8 +124,8 @@ mod tests {
 
         let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
 
-        let sum_result = sum.to_vec().unwrap();
-        let normed_result = normed.to_vec().unwrap();
+        let sum_result = sum.to_vec::<f32>().unwrap();
+        let normed_result = normed.to_vec::<f32>().unwrap();
 
         for i in 0..8 {
             let expected = residual_data[i] + x_data[i];
@@ -175,9 +176,14 @@ mod tests {
 
         let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
 
-        let sum_result: Vec<f32> = sum.to_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let sum_result: Vec<f32> = sum
+            .to_vec::<half::bf16>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         let normed_result: Vec<f32> = normed
-            .to_vec()
+            .to_vec::<half::bf16>()
             .unwrap()
             .iter()
             .map(|v| v.to_f32())
@@ -227,8 +233,8 @@ mod tests {
 
         let (sum, normed) = add_rmsnorm(&residual, &x, &weight, 1e-6).unwrap();
 
-        let sum_result = sum.to_vec().unwrap();
-        let normed_result = normed.to_vec().unwrap();
+        let sum_result = sum.to_vec::<f32>().unwrap();
+        let normed_result = normed.to_vec::<f32>().unwrap();
 
         let expected_sum: Vec<f32> = residual_data
             .iter()

@@ -11,6 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::{CudaContext, CudaTensor};
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -23,7 +24,7 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/argmax.ptx"));
 ///
 /// # Errors
 /// Returns an error if the kernel launch or data transfer fails
-pub fn argmax_last(input: &CudaTensor<f32>) -> Result<Vec<u32>> {
+pub fn argmax_last(input: &CudaTensor) -> Result<Vec<u32>> {
     let shape = input.shape();
     assert!(
         shape.len() == 2,
@@ -35,7 +36,7 @@ pub fn argmax_last(input: &CudaTensor<f32>) -> Result<Vec<u32>> {
     let ctx = input.context();
 
     let output = argmax_last_gpu(ctx, input, num_rows, row_size)?;
-    output.to_vec()
+    output.to_vec::<u32>()
 }
 
 /// Compute argmax of the **last row** of a 2D logits tensor, returning a
@@ -47,7 +48,7 @@ pub fn argmax_last(input: &CudaTensor<f32>) -> Result<Vec<u32>> {
 ///
 /// # Errors
 /// Returns an error if the kernel launch or data transfer fails.
-pub fn argmax_last_scalar(input: &CudaTensor<f32>) -> Result<u32> {
+pub fn argmax_last_scalar(input: &CudaTensor) -> Result<u32> {
     let shape = input.shape();
     assert!(
         shape.len() == 2,
@@ -69,11 +70,12 @@ pub fn argmax_last_scalar(input: &CudaTensor<f32>) -> Result<u32> {
     // Single-element output on GPU
     let mut out_device = device.alloc_zeros::<u32>(1)?;
 
-    // Point the kernel at the last row
-    let last_row_offset = (num_rows - 1) * row_size;
+    // Point the kernel at the last row (byte offsets — cuda_slice() is raw u8)
+    let elem = input.dtype().size_in_bytes();
+    let last_row_byte_offset = (num_rows - 1) * row_size * elem;
     let last_row = input
         .cuda_slice()
-        .slice(last_row_offset..num_rows * row_size);
+        .slice(last_row_byte_offset..num_rows * row_size * elem);
 
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
@@ -107,11 +109,11 @@ const MODULE_NAME: &str = "argmax";
 /// Compute argmax over the last dimension, returning a GPU tensor of u32 indices.
 fn argmax_last_gpu(
     ctx: &CudaContext,
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     num_rows: usize,
     row_size: usize,
-) -> Result<CudaTensor<u32>> {
-    let mut output = unsafe { CudaTensor::<u32>::uninit(ctx, &[num_rows])? };
+) -> Result<CudaTensor> {
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[num_rows], DType::U32)? };
 
     ensure_kernel_loaded(ctx)?;
     let func = ctx

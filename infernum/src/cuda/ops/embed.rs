@@ -11,7 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::{CudaContext, CudaTensor};
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -23,36 +23,33 @@ const KERNEL_NAMES: &[&str] = &[
 ];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for embed: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
 /// Gather embeddings (generic version)
-fn embedding_gather_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
+fn embedding_gather_generic(
     ctx: &CudaContext,
-    embed_table: &CudaTensor<T>,
+    embed_table: &CudaTensor,
     input_ids: &[u32],
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = embed_table.dtype();
     let hidden_size = embed_table.shape()[1];
     let seq_len = input_ids.len();
 
     let output_shape = [seq_len, hidden_size];
-    let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &output_shape, dtype)? };
 
     // Copy input_ids to GPU
     let ids_gpu = ctx.device().htod_sync_copy(input_ids)?;
 
     let device = ctx.device();
-    let kernel_name = format!("embedding_gather_{}", kernel_suffix::<T>());
+    let kernel_name = format!("embedding_gather_{}", kernel_suffix(dtype));
 
     let module_name = "embed";
     if !device.has_func(module_name, &kernel_name) {
@@ -100,11 +97,11 @@ fn embedding_gather_generic<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn embedding_gather<T: TensorDType + cudarc::driver::DeviceRepr>(
+pub fn embedding_gather(
     ctx: &CudaContext,
-    embed_table: &CudaTensor<T>,
+    embed_table: &CudaTensor,
     input_ids: &[u32],
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
     embedding_gather_generic(ctx, embed_table, input_ids)
 }
 
@@ -116,19 +113,20 @@ pub fn embedding_gather<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn embedding_gather_from_device<T: TensorDType + cudarc::driver::DeviceRepr>(
+pub fn embedding_gather_from_device(
     ctx: &CudaContext,
-    embed_table: &CudaTensor<T>,
+    embed_table: &CudaTensor,
     input_ids: &cudarc::driver::CudaSlice<u32>,
     seq_len: usize,
-) -> Result<CudaTensor<T>> {
+) -> Result<CudaTensor> {
+    let dtype = embed_table.dtype();
     let hidden_size = embed_table.shape()[1];
 
     let output_shape = [seq_len, hidden_size];
-    let mut output = unsafe { CudaTensor::<T>::uninit(ctx, &output_shape)? };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &output_shape, dtype)? };
 
     let device = ctx.device();
-    let kernel_name = format!("embedding_gather_{}", kernel_suffix::<T>());
+    let kernel_name = format!("embedding_gather_{}", kernel_suffix(dtype));
 
     let module_name = "embed";
     if !device.has_func(module_name, &kernel_name) {
@@ -185,7 +183,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[3, 3]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         // token 2, token 0, token 3
         let expected: Vec<f32> = vec![2.1, 2.2, 2.3, 0.1, 0.2, 0.3, 3.1, 3.2, 3.3];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
@@ -211,7 +209,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[3, 3]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         let expected: Vec<f32> = vec![2.1, 2.2, 2.3, 0.1, 0.2, 0.3, 3.1, 3.2, 3.3];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((got - exp).abs() < 1e-5, "Mismatch at {i}: {got} vs {exp}");
@@ -233,7 +231,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[1, 3]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         let expected: Vec<f32> = vec![1.1, 1.2, 1.3];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((got - exp).abs() < 1e-5, "Mismatch at {i}: {got} vs {exp}");

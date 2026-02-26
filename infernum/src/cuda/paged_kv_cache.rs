@@ -14,12 +14,12 @@
     clippy::missing_panics_doc
 )]
 
-use cudarc::driver::{LaunchAsync, LaunchConfig, ValidAsZeroBits};
+use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use super::block_allocator::{BlockConfig, BlockTable};
 use super::CudaContext;
 use super::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -33,25 +33,21 @@ const KERNEL_NAMES: &[&str] = &[
     "append_kv_paged_batched_bf16",
 ];
 
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for append_kv_paged: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype for append_kv_paged: {dtype}"),
     }
 }
 
 /// Per-layer K/V pool buffers.
-struct LayerPool<T: TensorDType> {
+struct LayerPool {
     /// Shape: `(num_blocks, block_size, num_kv_heads, head_dim)`
-    k: CudaTensor<T>,
+    k: CudaTensor,
     /// Shape: `(num_blocks, block_size, num_kv_heads, head_dim)`
-    v: CudaTensor<T>,
+    v: CudaTensor,
 }
 
 /// Paged KV cache for all transformer layers.
@@ -59,15 +55,16 @@ struct LayerPool<T: TensorDType> {
 /// GPU memory is pre-allocated as a pool of blocks. Each request gets a
 /// chain of blocks tracked by a [`BlockTable`]. The paged attention kernel
 /// uses block tables to index into the shared pool.
-pub struct PagedKvCache<T: TensorDType = f32> {
-    layers: Vec<LayerPool<T>>,
+pub struct PagedKvCache {
+    layers: Vec<LayerPool>,
     ctx: CudaContext,
     block_size: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    dtype: DType,
 }
 
-impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache<T> {
+impl PagedKvCache {
     /// Allocate a new paged KV cache.
     ///
     /// # Arguments
@@ -76,6 +73,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
     /// * `block_config` — block size and total number of blocks
     /// * `num_kv_heads` — number of key-value heads (GQA-aware)
     /// * `head_dim` — dimension of each attention head
+    /// * `dtype` — element type for the cache buffers
     ///
     /// # Errors
     /// Returns an error if GPU memory allocation fails.
@@ -85,6 +83,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
         block_config: &BlockConfig,
         num_kv_heads: usize,
         head_dim: usize,
+        dtype: DType,
     ) -> Result<Self> {
         let shape = [
             block_config.num_blocks,
@@ -97,8 +96,8 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
             // SAFETY: Pool memory is written before being read (via append_paged).
             // Block allocator ensures only allocated blocks are accessed.
             layers.push(LayerPool {
-                k: unsafe { CudaTensor::uninit(ctx, &shape)? },
-                v: unsafe { CudaTensor::uninit(ctx, &shape)? },
+                k: unsafe { CudaTensor::uninit(ctx, &shape, dtype)? },
+                v: unsafe { CudaTensor::uninit(ctx, &shape, dtype)? },
             });
         }
 
@@ -108,6 +107,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
             block_size: block_config.block_size,
             num_kv_heads,
             head_dim,
+            dtype,
         })
     }
 
@@ -127,8 +127,8 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
         &mut self,
         layer_idx: usize,
         block_table: &BlockTable,
-        k_new: &CudaTensor<T>,
-        v_new: &CudaTensor<T>,
+        k_new: &CudaTensor,
+        v_new: &CudaTensor,
         start_pos: usize,
     ) -> Result<()> {
         let k_shape = k_new.shape();
@@ -168,6 +168,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
             self.num_kv_heads,
             self.head_dim,
             new_seq_len,
+            self.dtype,
         )?;
         launch_append_paged(
             &self.ctx,
@@ -179,6 +180,65 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
             self.num_kv_heads,
             self.head_dim,
             new_seq_len,
+            self.dtype,
+        )?;
+
+        Ok(())
+    }
+
+    /// Append one K/V token per sequence across a batch, using GPU-resident
+    /// positions and block tables.
+    ///
+    /// `k_new` and `v_new` must have shape `(batch_size, num_kv_heads, head_dim)`.
+    /// `positions_gpu` and `block_tables_gpu` are pre-allocated device buffers
+    /// (e.g., from [`BatchedGraphInputs`](super::BatchedGraphInputs)).
+    ///
+    /// # Errors
+    /// Returns an error if the kernel launch fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_paged_batched(
+        &mut self,
+        layer_idx: usize,
+        k_new: &CudaTensor,
+        v_new: &CudaTensor,
+        block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
+        positions_gpu: &cudarc::driver::CudaSlice<i32>,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        let k_shape = k_new.shape();
+        assert_eq!(k_shape.len(), 3, "k_new must be 3D");
+        assert_eq!(k_shape[0], batch_size);
+        assert_eq!(k_shape[1], self.num_kv_heads);
+        assert_eq!(k_shape[2], self.head_dim);
+
+        let pool = &mut self.layers[layer_idx];
+
+        launch_append_paged_batched(
+            &self.ctx,
+            &mut pool.k,
+            k_new,
+            block_tables_gpu,
+            positions_gpu,
+            batch_size,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            max_blocks_per_seq,
+            self.dtype,
+        )?;
+        launch_append_paged_batched(
+            &self.ctx,
+            &mut pool.v,
+            v_new,
+            block_tables_gpu,
+            positions_gpu,
+            batch_size,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            max_blocks_per_seq,
+            self.dtype,
         )?;
 
         Ok(())
@@ -189,7 +249,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
     /// The attention kernel uses the block table to index into these pools.
     /// Shape: `(num_blocks, block_size, num_kv_heads, head_dim)`.
     #[must_use]
-    pub fn get_pools(&self, layer_idx: usize) -> (&CudaTensor<T>, &CudaTensor<T>) {
+    pub fn get_pools(&self, layer_idx: usize) -> (&CudaTensor, &CudaTensor) {
         let pool = &self.layers[layer_idx];
         (&pool.k, &pool.v)
     }
@@ -212,6 +272,12 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
         self.head_dim
     }
 
+    /// Element type of the cache buffers.
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
     /// Number of transformer layers.
     #[must_use]
     pub fn num_layers(&self) -> usize {
@@ -227,21 +293,22 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache
 
 /// Launch the paged append kernel for one K or V pool.
 #[allow(clippy::too_many_arguments)]
-fn launch_append_paged<T: TensorDType + cudarc::driver::DeviceRepr>(
+fn launch_append_paged(
     ctx: &CudaContext,
-    pool: &mut CudaTensor<T>,
-    new_data: &CudaTensor<T>,
+    pool: &mut CudaTensor,
+    new_data: &CudaTensor,
     block_table_gpu: &cudarc::driver::CudaSlice<i32>,
     start_pos: usize,
     block_size: usize,
     num_kv_heads: usize,
     head_dim: usize,
     new_seq_len: usize,
+    dtype: DType,
 ) -> Result<()> {
     let total = new_seq_len * num_kv_heads * head_dim;
     let device = ctx.device();
 
-    let kernel_name = format!("append_kv_paged_{}", kernel_suffix::<T>());
+    let kernel_name = format!("append_kv_paged_{}", kernel_suffix(dtype));
     let module_name = "append_kv_paged";
     if !device.has_func(module_name, &kernel_name) {
         device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
@@ -283,10 +350,10 @@ fn launch_append_paged<T: TensorDType + cudarc::driver::DeviceRepr>(
 /// kernel launch. Block tables and positions are read from pre-allocated GPU
 /// buffers, making this safe for CUDA graph capture.
 #[allow(clippy::too_many_arguments)]
-fn launch_append_paged_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
+fn launch_append_paged_batched(
     ctx: &CudaContext,
-    pool: &mut CudaTensor<T>,
-    new_data: &CudaTensor<T>,
+    pool: &mut CudaTensor,
+    new_data: &CudaTensor,
     block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
     positions_gpu: &cudarc::driver::CudaSlice<i32>,
     batch_size: usize,
@@ -294,10 +361,11 @@ fn launch_append_paged_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
     num_kv_heads: usize,
     head_dim: usize,
     max_blocks_per_seq: usize,
+    dtype: DType,
 ) -> Result<()> {
     let device = ctx.device();
 
-    let kernel_name = format!("append_kv_paged_batched_{}", kernel_suffix::<T>());
+    let kernel_name = format!("append_kv_paged_batched_{}", kernel_suffix(dtype));
     let module_name = "append_kv_paged";
     if !device.has_func(module_name, &kernel_name) {
         device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
@@ -334,68 +402,11 @@ fn launch_append_paged_batched<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(())
 }
 
-impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> PagedKvCache<T> {
-    /// Append one K/V token per sequence across a batch, using GPU-resident
-    /// positions and block tables.
-    ///
-    /// `k_new` and `v_new` must have shape `(batch_size, num_kv_heads, head_dim)`.
-    /// `positions_gpu` and `block_tables_gpu` are pre-allocated device buffers
-    /// (e.g., from [`BatchedGraphInputs`](super::BatchedGraphInputs)).
-    ///
-    /// # Errors
-    /// Returns an error if the kernel launch fails.
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_paged_batched(
-        &mut self,
-        layer_idx: usize,
-        k_new: &CudaTensor<T>,
-        v_new: &CudaTensor<T>,
-        block_tables_gpu: &cudarc::driver::CudaSlice<i32>,
-        positions_gpu: &cudarc::driver::CudaSlice<i32>,
-        batch_size: usize,
-        max_blocks_per_seq: usize,
-    ) -> Result<()> {
-        let k_shape = k_new.shape();
-        assert_eq!(k_shape.len(), 3, "k_new must be 3D");
-        assert_eq!(k_shape[0], batch_size);
-        assert_eq!(k_shape[1], self.num_kv_heads);
-        assert_eq!(k_shape[2], self.head_dim);
-
-        let pool = &mut self.layers[layer_idx];
-
-        launch_append_paged_batched(
-            &self.ctx,
-            &mut pool.k,
-            k_new,
-            block_tables_gpu,
-            positions_gpu,
-            batch_size,
-            self.block_size,
-            self.num_kv_heads,
-            self.head_dim,
-            max_blocks_per_seq,
-        )?;
-        launch_append_paged_batched(
-            &self.ctx,
-            &mut pool.v,
-            v_new,
-            block_tables_gpu,
-            positions_gpu,
-            batch_size,
-            self.block_size,
-            self.num_kv_heads,
-            self.head_dim,
-            max_blocks_per_seq,
-        )?;
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cuda::block_allocator::BlockAllocator;
+    use crate::cuda::CudaContext;
 
     fn make_ctx() -> CudaContext {
         CudaContext::new(0).expect("Failed to create CUDA context")
@@ -408,8 +419,8 @@ mod tests {
             block_size: 4,
             num_blocks: 10,
         };
-        let cache: PagedKvCache<f32> =
-            PagedKvCache::new(&ctx, 2, &config, 4, 16).expect("Failed to create paged KV cache");
+        let cache = PagedKvCache::new(&ctx, 2, &config, 4, 16, DType::F32)
+            .expect("Failed to create paged KV cache");
 
         assert_eq!(cache.num_layers(), 2);
         assert_eq!(cache.block_size(), 4);
@@ -428,7 +439,8 @@ mod tests {
             block_size,
             num_blocks: 4,
         };
-        let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut cache =
+            PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim, DType::F32).unwrap();
         let mut allocator = BlockAllocator::new(&config);
 
         // Allocate one block and create a block table
@@ -446,8 +458,8 @@ mod tests {
 
         // Read back the block from the pool and verify
         let (k_pool, v_pool) = cache.get_pools(0);
-        let k_all = k_pool.to_vec().unwrap();
-        let v_all = v_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
+        let v_all: Vec<f32> = v_pool.to_vec::<f32>().unwrap();
 
         // The data should be at physical block `block_idx`, offset 0
         let base = block_idx * block_size * num_kv_heads * head_dim;
@@ -468,7 +480,8 @@ mod tests {
             block_size,
             num_blocks: 4,
         };
-        let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut cache =
+            PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim, DType::F32).unwrap();
         let mut allocator = BlockAllocator::new(&config);
 
         let b0 = allocator.allocate().unwrap();
@@ -499,7 +512,7 @@ mod tests {
 
         // Verify data in both blocks
         let (k_pool, _) = cache.get_pools(0);
-        let k_all = k_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
 
         let stride = block_size * num_kv_heads * head_dim; // elements per block
                                                            // Block b0: tokens 0 and 1
@@ -523,7 +536,8 @@ mod tests {
             block_size,
             num_blocks: 4,
         };
-        let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut cache =
+            PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim, DType::F32).unwrap();
         let mut allocator = BlockAllocator::new(&config);
 
         // Prefill 6 tokens → needs ceil(6/4) = 2 blocks
@@ -545,8 +559,8 @@ mod tests {
 
         // Verify: block b0 has tokens 0-3, block b1 has tokens 4-5
         let (k_pool, v_pool) = cache.get_pools(0);
-        let k_all = k_pool.to_vec().unwrap();
-        let v_all = v_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
+        let v_all: Vec<f32> = v_pool.to_vec::<f32>().unwrap();
 
         let stride = block_size * num_kv_heads * head_dim;
         // Block b0: tokens 0-3 → elements 0..8
@@ -572,7 +586,8 @@ mod tests {
             block_size,
             num_blocks: 4,
         };
-        let mut cache = PagedKvCache::new(&ctx, 2, &config, num_kv_heads, head_dim).unwrap();
+        let mut cache =
+            PagedKvCache::new(&ctx, 2, &config, num_kv_heads, head_dim, DType::F32).unwrap();
         let mut allocator = BlockAllocator::new(&config);
 
         let b0 = allocator.allocate().unwrap();
@@ -592,12 +607,12 @@ mod tests {
         let stride = block_size * num_kv_heads * head_dim;
 
         let (k_pool_0, _) = cache.get_pools(0);
-        let k_all_0 = k_pool_0.to_vec().unwrap();
+        let k_all_0: Vec<f32> = k_pool_0.to_vec::<f32>().unwrap();
         assert_eq!(k_all_0[b0 * stride], 1.0);
         assert_eq!(k_all_0[b0 * stride + 1], 2.0);
 
         let (k_pool_1, _) = cache.get_pools(1);
-        let k_all_1 = k_pool_1.to_vec().unwrap();
+        let k_all_1: Vec<f32> = k_pool_1.to_vec::<f32>().unwrap();
         assert_eq!(k_all_1[b0 * stride], 5.0);
         assert_eq!(k_all_1[b0 * stride + 1], 6.0);
     }
@@ -613,7 +628,8 @@ mod tests {
             block_size,
             num_blocks: 2,
         };
-        let mut cache = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut cache =
+            PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim, DType::F32).unwrap();
         let mut allocator = BlockAllocator::new(&config);
 
         // Request 1: use both blocks
@@ -635,8 +651,8 @@ mod tests {
         cache.append_paged(0, &table, &k, &v, 0).unwrap();
 
         let (k_pool, v_pool) = cache.get_pools(0);
-        let k_all = k_pool.to_vec().unwrap();
-        let v_all = v_pool.to_vec().unwrap();
+        let k_all: Vec<f32> = k_pool.to_vec::<f32>().unwrap();
+        let v_all: Vec<f32> = v_pool.to_vec::<f32>().unwrap();
         let stride = block_size * num_kv_heads * head_dim;
         assert_eq!(k_all[b2 * stride], 99.0);
         assert_eq!(v_all[b2 * stride], 77.0);
@@ -669,7 +685,8 @@ mod tests {
         table1.append_block(b2);
 
         // --- Per-sequence reference ---
-        let mut cache_ref = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut cache_ref =
+            PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim, DType::F32).unwrap();
 
         let k0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[1.0_f32, 2.0]).unwrap();
         let v0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[10.0_f32, 20.0]).unwrap();
@@ -680,11 +697,12 @@ mod tests {
         cache_ref.append_paged(0, &table1, &k1, &v1, 5).unwrap();
 
         let (k_ref, v_ref) = cache_ref.get_pools(0);
-        let k_ref_data = k_ref.to_vec().unwrap();
-        let v_ref_data = v_ref.to_vec().unwrap();
+        let k_ref_data: Vec<f32> = k_ref.to_vec::<f32>().unwrap();
+        let v_ref_data: Vec<f32> = v_ref.to_vec::<f32>().unwrap();
 
         // --- Batched ---
-        let mut cache_bat = PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim).unwrap();
+        let mut cache_bat =
+            PagedKvCache::new(&ctx, 1, &config, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Build batched K/V: (2, 1, 2)
         let k_bat = CudaTensor::from_slice(&ctx, &[2, 1, 2], &[1.0_f32, 2.0, 3.0, 4.0]).unwrap();
@@ -716,8 +734,8 @@ mod tests {
             .unwrap();
 
         let (k_bat_pool, v_bat_pool) = cache_bat.get_pools(0);
-        let k_bat_data = k_bat_pool.to_vec().unwrap();
-        let v_bat_data = v_bat_pool.to_vec().unwrap();
+        let k_bat_data: Vec<f32> = k_bat_pool.to_vec::<f32>().unwrap();
+        let v_bat_data: Vec<f32> = v_bat_pool.to_vec::<f32>().unwrap();
 
         // Verify the blocks written match
         let stride = block_size * num_kv_heads * head_dim;

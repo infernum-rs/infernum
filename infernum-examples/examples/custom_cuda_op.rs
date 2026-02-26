@@ -19,7 +19,7 @@ use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use infernum::cuda::CudaContext;
 use infernum::tensor::Tensor;
-use infernum::{CudaTensor, Result};
+use infernum::{CudaTensor, DType, Result};
 
 // ---------- Step 1: Load the pre-compiled PTX ----------
 //
@@ -36,9 +36,9 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/relu.ptx"));
 // - Launch the kernel
 
 /// Apply ReLU activation element-wise: out[i] = max(0, x[i])
-fn relu(x: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+fn relu(x: &CudaTensor) -> Result<CudaTensor> {
     let n = x.numel();
-    let mut output = unsafe { CudaTensor::<f32>::uninit(x.context(), x.shape())? };
+    let mut output = unsafe { CudaTensor::uninit(x.context(), x.shape(), DType::F32)? };
 
     let device = x.context().device();
 
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
     println!("Input:  {:?}", data);
 
     let y = relu(&x)?;
-    let result = y.to_vec()?;
+    let result = y.to_vec::<f32>()?;
 
     println!("ReLU:   {result:?}");
     assert_eq!(result, vec![0.0, 0.0, 0.0, 1.0, 3.0, 0.0, 2.5, 0.0]);

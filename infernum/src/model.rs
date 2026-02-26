@@ -7,9 +7,6 @@
 use std::path::Path;
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
-
-#[cfg(feature = "cuda")]
 use crate::cuda::block_allocator::BlockTable;
 #[cfg(feature = "cuda")]
 use crate::cuda::BatchedGraphInputs;
@@ -18,7 +15,7 @@ use crate::cuda::{nccl::NcclCommunicator, ShardConfig};
 #[cfg(feature = "cuda")]
 use crate::cuda::{CudaContext, CudaTensor, PagedKvCache};
 #[cfg(feature = "cuda")]
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 #[cfg(feature = "cuda")]
 use crate::Result;
 
@@ -35,21 +32,17 @@ pub struct ModelConfig {
     pub head_dim: usize,
     /// End-of-sequence token ID
     pub eos_token_id: u32,
+    /// Data type for KV cache entries
+    #[cfg(feature = "cuda")]
+    pub cache_dtype: DType,
 }
 
 /// Trait for LLM models that can be used with the Engine.
 ///
 /// A model takes token IDs, runs a forward pass, and returns logits (always f32).
 /// It supports both full-recompute and KV-cached inference.
-///
-/// The associated type `CacheDtype` determines the KV cache element type,
-/// allowing models to compute in f16/bf16 while the Engine allocates the
-/// correct cache type.
 #[cfg(feature = "cuda")]
 pub trait Model {
-    /// Element type for KV cache tensors (f32, f16, or bf16).
-    type CacheDtype: TensorDType + DeviceRepr + ValidAsZeroBits;
-
     /// Get the model configuration needed for resource allocation.
     fn config(&self) -> ModelConfig;
 
@@ -70,7 +63,7 @@ pub trait Model {
     ///
     /// # Errors
     /// Returns an error if the forward pass fails.
-    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor<f32>>;
+    fn forward(&self, input_ids: &[u32]) -> Result<CudaTensor>;
 
     /// Single-sequence prefill forward pass with paged KV cache.
     ///
@@ -90,10 +83,10 @@ pub trait Model {
     fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        paged_kvs: &mut [PagedKvCache],
         block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor<f32>>;
+    ) -> Result<CudaTensor>;
 
     /// Batched decode forward pass with paged KV cache.
     ///
@@ -110,10 +103,10 @@ pub trait Model {
     fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        paged_kvs: &mut [PagedKvCache],
         block_tables: &[BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor<f32>>;
+    ) -> Result<CudaTensor>;
 
     /// Batched decode using indirect kernels for CUDA graph capture.
     ///
@@ -130,9 +123,9 @@ pub trait Model {
     fn forward_batch_decode_indirect(
         &self,
         _graph_inputs: &BatchedGraphInputs,
-        _paged_kvs: &mut [PagedKvCache<Self::CacheDtype>],
+        _paged_kvs: &mut [PagedKvCache],
         _max_seq_len: usize,
-    ) -> Result<CudaTensor<f32>> {
+    ) -> Result<CudaTensor> {
         unimplemented!("forward_batch_decode_indirect not implemented for this model")
     }
 }

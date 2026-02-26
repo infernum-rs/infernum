@@ -16,8 +16,8 @@ pub use model::LlamaModel;
 
 /// Mistral model (architecturally identical to Llama).
 #[cfg(feature = "cuda")]
-pub type MistralModel<T> = LlamaModel<T>;
+pub type MistralModel = LlamaModel;
 
 /// Mixtral model (Llama + Mixture-of-Experts).
 #[cfg(feature = "cuda")]
-pub type MixtralModel<T> = LlamaModel<T>;
+pub type MixtralModel = LlamaModel;

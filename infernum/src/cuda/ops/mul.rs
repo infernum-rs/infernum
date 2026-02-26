@@ -11,7 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -19,16 +19,12 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/mul.ptx"));
 const KERNEL_NAMES: &[&str] = &["mul_f32", "mul_f16", "mul_bf16"];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for mul: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
@@ -38,19 +34,17 @@ fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn mul<T: TensorDType + cudarc::driver::DeviceRepr>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn mul(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = a.dtype();
     assert_eq!(a.shape(), b.shape(), "Shapes must match for multiplication");
 
     let shape = a.shape();
     let n = a.numel();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(a.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(a.context(), shape, dtype)? };
 
     let device = a.context().device();
-    let kernel_name = format!("mul_{}", kernel_suffix::<T>());
+    let kernel_name = format!("mul_{}", kernel_suffix(dtype));
 
     let module_name = "mul";
     if !device.has_func(module_name, &kernel_name) {
@@ -89,7 +83,7 @@ const SCALE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/scale.pt
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn scale_f32_inplace(tensor: &mut CudaTensor<f32>, scale: f32) -> Result<()> {
+pub fn scale_f32_inplace(tensor: &mut CudaTensor, scale: f32) -> Result<()> {
     let n = tensor.numel();
     let device = tensor.context().device();
 
@@ -139,7 +133,7 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 3]);
 
-        let result = c.to_vec().unwrap();
+        let result = c.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![10.0, 40.0, 90.0, 160.0, 250.0, 360.0]);
     }
 
@@ -155,7 +149,7 @@ mod tests {
         let b = CudaTensor::from_slice(&ctx, &[n], &b_data).unwrap();
 
         let c = mul(&a, &b).unwrap();
-        let result = c.to_vec().unwrap();
+        let result = c.to_vec::<f32>().unwrap();
 
         for i in 0..n {
             let expected = (i as f32) * (i as f32 * 2.0);

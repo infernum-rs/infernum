@@ -11,7 +11,6 @@
 )]
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
 use crate::Result;
 
 infernum_macros::define_block! {
@@ -22,17 +21,17 @@ infernum_macros::define_block! {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn geglu<T: TensorDType + cudarc::driver::DeviceRepr>(
-        gate: &CudaTensor<T>,
-        up: &CudaTensor<T>,
-    ) -> Result<CudaTensor<T>> {
+    pub fn geglu(
+        gate: &CudaTensor,
+        up: &CudaTensor,
+    ) -> Result<CudaTensor> {
         super::gelu_mul(gate, up)
     }
 }
 
 infernum_macros::define_fusion! {
     name: "geglu",
-    fn geglu_fused_f32(gate: &CudaTensor<f32>, up: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+    fn geglu_fused_f32(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
         super::gelu_mul(gate, up)
     }
 }
@@ -58,7 +57,7 @@ mod tests {
         let up = CudaTensor::from_slice(&ctx, &[4], &up_data).unwrap();
 
         let output = geglu_decomposed(&gate, &up).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for i in 0..4 {
             let expected = gelu_ref(gate_data[i]) * up_data[i];
@@ -80,8 +79,14 @@ mod tests {
         let gate = CudaTensor::from_slice(&ctx, &[8], &gate_data).unwrap();
         let up = CudaTensor::from_slice(&ctx, &[8], &up_data).unwrap();
 
-        let decomposed = geglu_decomposed(&gate, &up).unwrap().to_vec().unwrap();
-        let fused = geglu_fused_f32(&gate, &up).unwrap().to_vec().unwrap();
+        let decomposed = geglu_decomposed(&gate, &up)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        let fused = geglu_fused_f32(&gate, &up)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
 
         for i in 0..8 {
             assert!(

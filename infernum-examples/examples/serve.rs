@@ -121,19 +121,19 @@ async fn main() -> Result<()> {
 
     let entry = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
-            let model = LlamaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let model = LlamaModel::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
-            let model = QwenModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "deepseek_v3" => {
-            let model = DeepSeekModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "gemma2" | "gemma3_text" => {
-            let model = GemmaModel::<f32>::from_pretrained(&ctx, &cli.model)?;
+            let model = GemmaModel::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         other => {

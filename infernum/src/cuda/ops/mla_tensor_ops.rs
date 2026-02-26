@@ -11,10 +11,10 @@
     clippy::manual_div_ceil
 )]
 
-use cudarc::driver::{DeviceRepr, LaunchAsync, LaunchConfig, ValidAsZeroBits};
+use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::{DType, TensorDType};
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -65,25 +65,26 @@ fn launch_cfg(n: usize) -> LaunchConfig {
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn split_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    tensor: &CudaTensor<T>,
+pub fn split_inner_dim(
+    tensor: &CudaTensor,
     dim1: usize,
     dim2: usize,
-) -> Result<(CudaTensor<T>, CudaTensor<T>)> {
+) -> Result<(CudaTensor, CudaTensor)> {
+    let dtype = tensor.dtype();
     let shape = tensor.shape();
     assert_eq!(shape.len(), 2, "split_inner_dim: expected 2D tensor");
     let outer = shape[0];
     let total = shape[1];
     assert_eq!(total, dim1 + dim2, "split_inner_dim: dim mismatch");
 
-    let mut out_a = unsafe { CudaTensor::<T>::uninit(tensor.context(), &[outer, dim1])? };
-    let mut out_b = unsafe { CudaTensor::<T>::uninit(tensor.context(), &[outer, dim2])? };
+    let mut out_a = unsafe { CudaTensor::uninit(tensor.context(), &[outer, dim1], dtype)? };
+    let mut out_b = unsafe { CudaTensor::uninit(tensor.context(), &[outer, dim2], dtype)? };
 
     let device = tensor.context().device();
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("split_inner_dim", T::DTYPE))
+        .get_func(MODULE, &kernel_name("split_inner_dim", dtype))
         .unwrap();
 
     let n = outer * total;
@@ -109,10 +110,8 @@ pub fn split_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn concat_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    a: &CudaTensor<T>,
-    b: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn concat_inner_dim(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = a.dtype();
     let shape_a = a.shape();
     let shape_b = b.shape();
     assert_eq!(shape_a.len(), 2, "concat_inner_dim: expected 2D tensor (a)");
@@ -123,13 +122,13 @@ pub fn concat_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
     let dim2 = shape_b[1];
     let total = dim1 + dim2;
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(a.context(), &[outer, total])? };
+    let mut output = unsafe { CudaTensor::uninit(a.context(), &[outer, total], dtype)? };
 
     let device = a.context().device();
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("concat_inner_dim", T::DTYPE))
+        .get_func(MODULE, &kernel_name("concat_inner_dim", dtype))
         .unwrap();
 
     let n = outer * total;
@@ -158,10 +157,8 @@ pub fn concat_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn broadcast_to_heads<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    tensor: &CudaTensor<T>,
-    num_heads: usize,
-) -> Result<CudaTensor<T>> {
+pub fn broadcast_to_heads(tensor: &CudaTensor, num_heads: usize) -> Result<CudaTensor> {
+    let dtype = tensor.dtype();
     let shape = tensor.shape();
     assert_eq!(shape.len(), 3, "broadcast_to_heads: expected 3D tensor");
     assert_eq!(shape[1], 1, "broadcast_to_heads: expected 1 head in input");
@@ -169,13 +166,13 @@ pub fn broadcast_to_heads<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
     let dim = shape[2];
 
     let mut output =
-        unsafe { CudaTensor::<T>::uninit(tensor.context(), &[seq_len, num_heads, dim])? };
+        unsafe { CudaTensor::uninit(tensor.context(), &[seq_len, num_heads, dim], dtype)? };
 
     let device = tensor.context().device();
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("broadcast_to_heads", T::DTYPE))
+        .get_func(MODULE, &kernel_name("broadcast_to_heads", dtype))
         .unwrap();
 
     // The kernel broadcasts [dim] → [num_heads * dim].
@@ -185,15 +182,18 @@ pub fn broadcast_to_heads<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
     // seq position. Since the kernel works on flat [dim] → [num_heads * dim],
     // we can treat it as outer=seq with each position being independent.
     // Launch seq separate kernels or flatten. For simplicity, loop over seq.
+    let elem = tensor.dtype().size_in_bytes();
     for s in 0..seq_len {
-        let src_offset = s * dim;
-        let dst_offset = s * num_heads * dim;
+        let src_offset = s * dim * elem;
+        let dst_offset = s * num_heads * dim * elem;
         let n = num_heads * dim;
 
-        let src_slice = tensor.cuda_slice().slice(src_offset..src_offset + dim);
+        let src_slice = tensor
+            .cuda_slice()
+            .slice(src_offset..src_offset + dim * elem);
         let dst_slice = &mut output
             .cuda_slice_mut()
-            .slice_mut(dst_offset..dst_offset + n);
+            .slice_mut(dst_offset..dst_offset + n * elem);
 
         unsafe {
             func.clone().launch(
@@ -212,10 +212,8 @@ pub fn broadcast_to_heads<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-pub fn pad_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
-    tensor: &CudaTensor<T>,
-    dst_dim: usize,
-) -> Result<CudaTensor<T>> {
+pub fn pad_inner_dim(tensor: &CudaTensor, dst_dim: usize) -> Result<CudaTensor> {
+    let dtype = tensor.dtype();
     let shape = tensor.shape();
     assert_eq!(shape.len(), 2, "pad_inner_dim: expected 2D tensor");
     let outer = shape[0];
@@ -229,13 +227,13 @@ pub fn pad_inner_dim<T: TensorDType + DeviceRepr + ValidAsZeroBits>(
         return Ok(tensor.slice_view(0, tensor.shape()));
     }
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(tensor.context(), &[outer, dst_dim])? };
+    let mut output = unsafe { CudaTensor::uninit(tensor.context(), &[outer, dst_dim], dtype)? };
 
     let device = tensor.context().device();
     ensure_mla_kernel(device)?;
 
     let func = device
-        .get_func(MODULE, &kernel_name("pad_inner_dim", T::DTYPE))
+        .get_func(MODULE, &kernel_name("pad_inner_dim", dtype))
         .unwrap();
 
     let n = outer * dst_dim;
@@ -273,8 +271,11 @@ mod tests {
 
         assert_eq!(a.shape(), &[2, 3]);
         assert_eq!(b.shape(), &[2, 2]);
-        assert_eq!(a.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 6.0, 7.0, 8.0]);
-        assert_eq!(b.to_vec().unwrap(), vec![4.0, 5.0, 9.0, 10.0]);
+        assert_eq!(
+            a.to_vec::<f32>().unwrap(),
+            vec![1.0, 2.0, 3.0, 6.0, 7.0, 8.0]
+        );
+        assert_eq!(b.to_vec::<f32>().unwrap(), vec![4.0, 5.0, 9.0, 10.0]);
     }
 
     #[test]
@@ -288,7 +289,7 @@ mod tests {
 
         assert_eq!(out.shape(), &[2, 5]);
         assert_eq!(
-            out.to_vec().unwrap(),
+            out.to_vec::<f32>().unwrap(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
         );
     }
@@ -302,7 +303,7 @@ mod tests {
         let out = broadcast_to_heads(&tensor, 4).unwrap();
 
         assert_eq!(out.shape(), &[2, 4, 3]);
-        let result = out.to_vec().unwrap();
+        let result = out.to_vec::<f32>().unwrap();
         // seq=0: [1,2,3] repeated 4 times
         for h in 0..4 {
             assert_eq!(&result[h * 3..(h + 1) * 3], &[1.0, 2.0, 3.0]);
@@ -324,7 +325,7 @@ mod tests {
 
         assert_eq!(out.shape(), &[2, 5]);
         assert_eq!(
-            out.to_vec().unwrap(),
+            out.to_vec::<f32>().unwrap(),
             vec![1.0, 2.0, 3.0, 0.0, 0.0, 4.0, 5.0, 6.0, 0.0, 0.0]
         );
     }
@@ -337,7 +338,7 @@ mod tests {
         let out = pad_inner_dim(&tensor, 3).unwrap();
 
         assert_eq!(out.shape(), &[2, 3]);
-        assert_eq!(out.to_vec().unwrap(), data);
+        assert_eq!(out.to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
@@ -350,6 +351,6 @@ mod tests {
         let restored = concat_inner_dim(&a, &b).unwrap();
 
         assert_eq!(restored.shape(), &[5, 6]);
-        assert_eq!(restored.to_vec().unwrap(), data);
+        assert_eq!(restored.to_vec::<f32>().unwrap(), data);
     }
 }

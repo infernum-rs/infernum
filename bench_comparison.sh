@@ -366,14 +366,14 @@ for bench in "${benchmarks[@]}"; do
         F32)
             log "[${step}/${total}] F32 — llama.cpp"
             results_llama["F32"]=$(run_llama_bench "${GGUF_F32}")
-            log "[${step}/${total}] F32 — infernum"
-            results_infernum["F32"]=$(run_infernum_bench "${BASE_MODEL_DIR}" --dtype f32)
+            log "[${step}/${total}] F32 — infernum (GGUF, no graphs)"
+            results_infernum["F32"]=$(run_infernum_bench_no_graphs "${GGUF_F32}")
             ;;
         BF16)
             log "[${step}/${total}] BF16 — llama.cpp"
             results_llama["BF16"]=$(run_llama_bench "${GGUF_BF16}")
             log "[${step}/${total}] BF16 — infernum"
-            results_infernum["BF16"]=$(run_infernum_bench "${BASE_MODEL_DIR}" --dtype bf16)
+            results_infernum["BF16"]=$(run_infernum_bench "${BASE_MODEL_DIR}")
             ;;
         F16)
             log "[${step}/${total}] F16 — llama.cpp"

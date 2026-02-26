@@ -10,6 +10,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -22,7 +23,7 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/softmax.ptx"))
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn softmax(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
+pub fn softmax(input: &CudaTensor) -> Result<CudaTensor> {
     let shape = input.shape();
     let row_size = *shape
         .last()
@@ -30,7 +31,7 @@ pub fn softmax(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
     let num_rows: usize = shape[..shape.len() - 1].iter().product();
     let num_rows = if num_rows == 0 { 1 } else { num_rows };
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, DType::F32)? };
 
     let device = input.context().device();
 
@@ -80,17 +81,17 @@ pub fn softmax(input: &CudaTensor<f32>) -> Result<CudaTensor<f32>> {
 /// # Errors
 /// Returns an error if the operation fails
 pub fn softmax_causal(
-    input: &CudaTensor<f32>,
+    input: &CudaTensor,
     query_idx: usize,
     position_offset: usize,
-) -> Result<CudaTensor<f32>> {
+) -> Result<CudaTensor> {
     let shape = input.shape();
     assert_eq!(shape.len(), 2, "Expected (num_heads, seq_len)");
 
     let num_heads = shape[0];
     let row_size = shape[1];
 
-    let mut output = unsafe { CudaTensor::<f32>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, DType::F32)? };
 
     let device = input.context().device();
 
@@ -143,7 +144,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
 
         let output = softmax(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Row 0: softmax([1, 2, 3, 4])
         let max0 = 4.0_f32;
@@ -185,7 +186,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[4, 8], &input_data).unwrap();
 
         let output = softmax(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Each row should sum to 1
         for row in 0..4 {
@@ -211,7 +212,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
 
         let output = softmax_causal(&input, 1, 0).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Positions 2 and 3 should be masked (zero)
         for head in 0..2 {
@@ -242,7 +243,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[1, 3], &input_data).unwrap();
 
         let output = softmax_causal(&input, 0, 0).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Only position 0 is valid -> softmax of single element = 1.0
         assert!(

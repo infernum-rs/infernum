@@ -10,7 +10,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -25,11 +25,11 @@ const KERNEL_NAMES: &[&str] = &[
     "rmsnorm_inplace_bf16",
 ];
 
-fn kernel_suffix<T: TensorDType>() -> &'static str {
-    match T::DTYPE {
-        crate::dtype::DType::F32 => "f32",
-        crate::dtype::DType::F16 => "f16",
-        crate::dtype::DType::BF16 => "bf16",
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
         other => panic!("RMS norm not supported for dtype: {other}"),
     }
 }
@@ -55,11 +55,8 @@ fn load_rmsnorm_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> 
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn rms_norm<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    weight: &CudaTensor<T>,
-    eps: f32,
-) -> Result<CudaTensor<T>> {
+pub fn rms_norm(input: &CudaTensor, weight: &CudaTensor, eps: f32) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     let hidden_size = *shape
         .last()
@@ -72,12 +69,12 @@ pub fn rms_norm<T: TensorDType + cudarc::driver::DeviceRepr>(
         "Weight shape must match hidden dimension"
     );
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
     load_rmsnorm_kernels(device)?;
 
-    let kernel_name = format!("rmsnorm_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rmsnorm_{}", kernel_suffix(dtype));
     let func = device.get_func("rmsnorm", &kernel_name).unwrap();
 
     let block_size = 256.min(hidden_size);
@@ -120,11 +117,8 @@ pub fn rms_norm<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn rms_norm_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &mut CudaTensor<T>,
-    weight: &CudaTensor<T>,
-    eps: f32,
-) -> Result<()> {
+pub fn rms_norm_inplace(input: &mut CudaTensor, weight: &CudaTensor, eps: f32) -> Result<()> {
+    let dtype = input.dtype();
     let shape = input.shape();
     let hidden_size = *shape
         .last()
@@ -140,7 +134,7 @@ pub fn rms_norm_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
     let device = input.context().device();
     load_rmsnorm_kernels(device)?;
 
-    let kernel_name = format!("rmsnorm_inplace_{}", kernel_suffix::<T>());
+    let kernel_name = format!("rmsnorm_inplace_{}", kernel_suffix(dtype));
     let func = device.get_func("rmsnorm", &kernel_name).unwrap();
 
     let block_size = 256.min(hidden_size);
@@ -188,7 +182,7 @@ mod tests {
 
         assert_eq!(output.shape(), &[2, 4]);
 
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         // Row 0: rms = sqrt((1+4+9+16)/4) = sqrt(7.5) ≈ 2.739
         // Row 0 normalized: [0.365, 0.730, 1.095, 1.461]
@@ -221,7 +215,7 @@ mod tests {
         let weight = CudaTensor::from_slice(&ctx, &[hidden_size], &weight_data).unwrap();
 
         let output = rms_norm(&input, &weight, 1e-6).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         let sum_sq: f32 = input_data.iter().map(|x| x * x).sum();
         let rms = (sum_sq / hidden_size as f32).sqrt();
@@ -252,14 +246,14 @@ mod tests {
         let weight = CudaTensor::from_slice(&ctx, &[4], &weight_data).unwrap();
         let expected = rms_norm(&input_ref, &weight, 1e-6)
             .unwrap()
-            .to_vec()
+            .to_vec::<f32>()
             .unwrap();
 
         // Compute with in-place version
         let mut input = CudaTensor::from_slice(&ctx, &[2, 4], &input_data).unwrap();
         rms_norm_inplace(&mut input, &weight, 1e-6).unwrap();
 
-        let result = input.to_vec().unwrap();
+        let result = input.to_vec::<f32>().unwrap();
 
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(

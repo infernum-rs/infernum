@@ -11,7 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -26,16 +26,12 @@ const KERNEL_NAMES: &[&str] = &[
 ];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for bias_add: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
@@ -45,10 +41,8 @@ fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
 ///
 /// # Errors
 /// Returns an error if the operation fails.
-pub fn bias_add<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-    bias: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn bias_add(input: &CudaTensor, bias: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     assert_eq!(shape.len(), 2, "bias_add: input must be 2D");
     let rows = shape[0];
@@ -62,10 +56,10 @@ pub fn bias_add<T: TensorDType + cudarc::driver::DeviceRepr>(
     );
 
     let n = rows * cols;
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("bias_add_{}", kernel_suffix::<T>());
+    let kernel_name = format!("bias_add_{}", kernel_suffix(dtype));
 
     let module_name = "bias_add";
     if !device.has_func(module_name, &kernel_name) {
@@ -105,10 +99,8 @@ pub fn bias_add<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails.
-pub fn bias_add_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &mut CudaTensor<T>,
-    bias: &CudaTensor<T>,
-) -> Result<()> {
+pub fn bias_add_inplace(input: &mut CudaTensor, bias: &CudaTensor) -> Result<()> {
+    let dtype = input.dtype();
     let shape = input.shape().to_vec();
     assert_eq!(shape.len(), 2, "bias_add_inplace: input must be 2D");
     let rows = shape[0];
@@ -123,7 +115,7 @@ pub fn bias_add_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
 
     let n = rows * cols;
     let device = input.context().device();
-    let kernel_name = format!("bias_add_inplace_{}", kernel_suffix::<T>());
+    let kernel_name = format!("bias_add_inplace_{}", kernel_suffix(dtype));
 
     let module_name = "bias_add";
     if !device.has_func(module_name, &kernel_name) {
@@ -174,7 +166,7 @@ mod tests {
         let output = bias_add(&input, &bias).unwrap();
 
         assert_eq!(output.shape(), &[2, 3]);
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
     }
 
@@ -189,7 +181,7 @@ mod tests {
         let bias = CudaTensor::from_slice(&ctx, &[3], &bias_data).unwrap();
 
         let output = bias_add(&input, &bias).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, input_data);
     }
 
@@ -204,7 +196,7 @@ mod tests {
         let bias = CudaTensor::from_slice(&ctx, &[4], &bias_data).unwrap();
 
         let output = bias_add(&input, &bias).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![1.5, 1.5, 4.0, 3.0]);
     }
 
@@ -221,7 +213,7 @@ mod tests {
         bias_add_inplace(&mut input, &bias).unwrap();
 
         assert_eq!(input.shape(), &[2, 3]);
-        let result = input.to_vec().unwrap();
+        let result = input.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
     }
 
@@ -238,7 +230,7 @@ mod tests {
         let bias = CudaTensor::from_slice(&ctx, &[cols], &bias_data).unwrap();
 
         let output = bias_add(&input, &bias).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for r in 0..rows {
             for c in 0..cols {

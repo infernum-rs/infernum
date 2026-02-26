@@ -16,7 +16,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -34,16 +34,12 @@ const KERNEL_NAMES: &[&str] = &[
 ];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for gelu: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
@@ -64,16 +60,15 @@ fn ensure_module(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn gelu<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn gelu(input: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = input.dtype();
     let shape = input.shape();
     let n = input.numel();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(input.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
 
     let device = input.context().device();
-    let kernel_name = format!("gelu_{}", kernel_suffix::<T>());
+    let kernel_name = format!("gelu_{}", kernel_suffix(dtype));
     ensure_module(device, &kernel_name)?;
 
     let func = device.get_func("gelu", &kernel_name).unwrap();
@@ -103,12 +98,11 @@ pub fn gelu<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn gelu_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
-    input: &mut CudaTensor<T>,
-) -> Result<()> {
+pub fn gelu_inplace(input: &mut CudaTensor) -> Result<()> {
+    let dtype = input.dtype();
     let n = input.numel();
     let device = input.context().device();
-    let kernel_name = format!("gelu_inplace_{}", kernel_suffix::<T>());
+    let kernel_name = format!("gelu_inplace_{}", kernel_suffix(dtype));
     ensure_module(device, &kernel_name)?;
 
     let func = device.get_func("gelu", &kernel_name).unwrap();
@@ -135,19 +129,17 @@ pub fn gelu_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn gelu_mul<T: TensorDType + cudarc::driver::DeviceRepr>(
-    gate: &CudaTensor<T>,
-    up: &CudaTensor<T>,
-) -> Result<CudaTensor<T>> {
+pub fn gelu_mul(gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
+    let dtype = gate.dtype();
     assert_eq!(gate.shape(), up.shape(), "gate and up must have same shape");
 
     let shape = gate.shape();
     let n = gate.numel();
 
-    let mut output = unsafe { CudaTensor::<T>::uninit(gate.context(), shape)? };
+    let mut output = unsafe { CudaTensor::uninit(gate.context(), shape, dtype)? };
 
     let device = gate.context().device();
-    let kernel_name = format!("gelu_mul_{}", kernel_suffix::<T>());
+    let kernel_name = format!("gelu_mul_{}", kernel_suffix(dtype));
     ensure_module(device, &kernel_name)?;
 
     let func = device.get_func("gelu", &kernel_name).unwrap();
@@ -195,7 +187,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         let output = gelu(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for (i, &x) in input_data.iter().enumerate() {
             let expected = gelu_ref(x);
@@ -217,7 +209,7 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[3], &input_data).unwrap();
 
         let output = gelu(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         assert!(
             result[0].abs() < 1e-6,
@@ -244,7 +236,7 @@ mod tests {
         let mut input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         gelu_inplace(&mut input).unwrap();
-        let result = input.to_vec().unwrap();
+        let result = input.to_vec::<f32>().unwrap();
 
         for (i, &x) in input_data.iter().enumerate() {
             let expected = gelu_ref(x);
@@ -269,7 +261,7 @@ mod tests {
         let up = CudaTensor::from_slice(&ctx, &[4], &up_data).unwrap();
 
         let output = gelu_mul(&gate, &up).unwrap();
-        let result = output.to_vec().unwrap();
+        let result = output.to_vec::<f32>().unwrap();
 
         for i in 0..4 {
             let expected = gelu_ref(gate_data[i]) * up_data[i];
@@ -299,12 +291,17 @@ mod tests {
         let input = CudaTensor::from_slice(&ctx, &[5], &input_data).unwrap();
 
         let output = gelu(&input).unwrap();
-        let result = output.to_vec().unwrap();
+        let result: Vec<f32> = output
+            .to_vec::<bf16>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
 
         let ref_data: Vec<f32> = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         for (i, &x) in ref_data.iter().enumerate() {
             let expected = gelu_ref(x);
-            let actual = result[i].to_f32();
+            let actual = result[i];
             assert!(
                 (actual - expected).abs() < 0.05,
                 "BF16 mismatch at {}: {} vs {}",

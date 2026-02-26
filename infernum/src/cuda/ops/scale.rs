@@ -11,7 +11,7 @@
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use crate::cuda::CudaTensor;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -19,16 +19,12 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/scale.ptx"));
 const KERNEL_NAMES: &[&str] = &["scale_f32", "scale_f16", "scale_bf16", "scale_rows_f32"];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for scale: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype: {dtype:?}"),
     }
 }
 
@@ -38,13 +34,11 @@ fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
 ///
 /// # Errors
 /// Returns an error if the operation fails
-pub fn scale_inplace<T: TensorDType + cudarc::driver::DeviceRepr>(
-    data: &mut CudaTensor<T>,
-    scale: f32,
-) -> Result<()> {
+pub fn scale_inplace(data: &mut CudaTensor, scale: f32) -> Result<()> {
+    let dtype = data.dtype();
     let n = data.numel();
     let device = data.context().device();
-    let kernel_name = format!("scale_{}", kernel_suffix::<T>());
+    let kernel_name = format!("scale_{}", kernel_suffix(dtype));
 
     let module_name = "scale";
     if !device.has_func(module_name, &kernel_name) {
@@ -83,7 +77,7 @@ mod tests {
 
         scale_inplace(&mut tensor, 2.5).unwrap();
 
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![2.5, 5.0, 7.5, 10.0]);
     }
 
@@ -103,9 +97,13 @@ mod tests {
 
         scale_inplace(&mut tensor, 2.0).unwrap();
 
-        let result = tensor.to_vec().unwrap();
-        let result_f32: Vec<f32> = result.iter().map(|x| x.to_f32()).collect();
-        assert_eq!(result_f32, vec![2.0, 4.0, 6.0, 8.0]);
+        let result: Vec<f32> = tensor
+            .to_vec::<bf16>()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
+        assert_eq!(result, vec![2.0, 4.0, 6.0, 8.0]);
     }
 
     #[test]
@@ -117,7 +115,7 @@ mod tests {
 
         scale_inplace(&mut tensor, 1.0).unwrap();
 
-        let result = tensor.to_vec().unwrap();
+        let result = tensor.to_vec::<f32>().unwrap();
         assert_eq!(result, vec![1.0, 2.0, 3.0]);
     }
 }

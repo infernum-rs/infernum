@@ -10,6 +10,7 @@
 use cudarc::driver::LaunchAsync;
 
 use crate::cuda::CudaTensor;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -34,8 +35,8 @@ pub struct GpuRouting {
 /// Reuse across all MoE layers in a decode step to avoid per-layer
 /// `cuMemAllocAsync` / `cuMemFreeAsync` overhead.
 pub struct GpuRoutingBuffers {
-    out_indices: CudaTensor<u32>,
-    out_weights: CudaTensor<f32>,
+    out_indices: CudaTensor,
+    out_weights: CudaTensor,
 }
 
 impl GpuRoutingBuffers {
@@ -45,8 +46,8 @@ impl GpuRoutingBuffers {
     /// Returns an error if GPU memory allocation fails.
     pub fn new(ctx: &crate::cuda::CudaContext, top_k: usize) -> Result<Self> {
         Ok(Self {
-            out_indices: unsafe { CudaTensor::<u32>::uninit(ctx, &[top_k])? },
-            out_weights: unsafe { CudaTensor::<f32>::uninit(ctx, &[top_k])? },
+            out_indices: unsafe { CudaTensor::uninit(ctx, &[top_k], DType::U32)? },
+            out_weights: unsafe { CudaTensor::uninit(ctx, &[top_k], DType::F32)? },
         })
     }
 
@@ -57,8 +58,8 @@ impl GpuRoutingBuffers {
     #[allow(clippy::too_many_arguments)]
     pub fn route(
         &mut self,
-        logits: &CudaTensor<f32>,
-        bias_gpu: &CudaTensor<f32>,
+        logits: &CudaTensor,
+        bias_gpu: &CudaTensor,
         num_experts_per_tok: usize,
         n_group: usize,
         topk_group: usize,
@@ -82,10 +83,10 @@ impl GpuRoutingBuffers {
 /// Launch the routing kernel and copy results to CPU.
 #[allow(clippy::too_many_arguments)]
 fn launch_routing_kernel(
-    logits: &CudaTensor<f32>,
-    bias_gpu: &CudaTensor<f32>,
-    out_indices: &mut CudaTensor<u32>,
-    out_weights: &mut CudaTensor<f32>,
+    logits: &CudaTensor,
+    bias_gpu: &CudaTensor,
+    out_indices: &mut CudaTensor,
+    out_weights: &mut CudaTensor,
     num_experts_per_tok: usize,
     n_group: usize,
     topk_group: usize,
@@ -136,8 +137,8 @@ fn launch_routing_kernel(
     }
 
     // Small DtoH: only top_k values (e.g. 8 × 4 + 8 × 4 = 64 bytes)
-    let indices = out_indices.to_vec()?;
-    let weights = out_weights.to_vec()?;
+    let indices: Vec<u32> = out_indices.to_vec()?;
+    let weights: Vec<f32> = out_weights.to_vec()?;
 
     Ok(GpuRouting {
         expert_indices: indices,
@@ -154,8 +155,8 @@ fn launch_routing_kernel(
 /// Returns an error if kernel launch or DtoH copy fails.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_route_sigmoid_gpu(
-    logits: &CudaTensor<f32>,
-    bias_gpu: &CudaTensor<f32>,
+    logits: &CudaTensor,
+    bias_gpu: &CudaTensor,
     num_experts_per_tok: usize,
     n_group: usize,
     topk_group: usize,
@@ -242,7 +243,7 @@ mod tests {
 
         // CPU path: needs hidden @ gate_weight to produce logits.
         // We bypass that by using the logits directly with the CPU routing.
-        // The CPU function takes gate output as a Vec<T>, so we replicate
+        // The CPU function takes gate output as a Vec, so we replicate
         // the routing logic manually.
         let cpu_routing = {
             let scores: Vec<f32> = logits_data

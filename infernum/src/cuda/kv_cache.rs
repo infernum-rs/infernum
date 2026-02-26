@@ -10,12 +10,12 @@
     clippy::manual_div_ceil
 )]
 
-use cudarc::driver::{LaunchAsync, LaunchConfig, ValidAsZeroBits};
+use cudarc::driver::{LaunchAsync, LaunchConfig};
 
 use super::CudaContext;
 use super::CudaTensor;
 use crate::cuda::SeqPosition;
-use crate::dtype::TensorDType;
+use crate::dtype::DType;
 use crate::tensor::Tensor;
 use crate::Result;
 
@@ -28,16 +28,12 @@ const INDIRECT_KERNEL_NAMES: &[&str] = &[
 ];
 
 /// Kernel name suffix for dtype
-fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
-    let type_name = std::any::type_name::<T>();
-    if type_name.contains("f32") {
-        "f32"
-    } else if type_name.contains("f16") && !type_name.contains("bf16") {
-        "f16"
-    } else if type_name.contains("bf16") {
-        "bf16"
-    } else {
-        panic!("Unsupported dtype for append_kv: {type_name}")
+fn kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => panic!("Unsupported dtype for append_kv: {dtype}"),
     }
 }
 
@@ -45,24 +41,23 @@ fn kernel_suffix<T: cudarc::driver::DeviceRepr>() -> &'static str {
 ///
 /// Layout: `(max_seq_len, num_kv_heads, head_dim)`, row-major.
 /// Only the first `current_len` positions contain valid data.
-struct LayerBuffer<T: TensorDType> {
-    k: CudaTensor<T>,
-    v: CudaTensor<T>,
+struct LayerBuffer {
+    k: CudaTensor,
+    v: CudaTensor,
 }
 
 /// Pre-allocated KV cache for all transformer layers.
 ///
 /// Holds key and value buffers on GPU, tracks current sequence length,
 /// and provides `append` / `get` / `reset` operations.
-///
-/// Generic over `T` (f32, f16, bf16) to support different compute precisions.
-pub struct KvCache<T: TensorDType = f32> {
-    layers: Vec<LayerBuffer<T>>,
+pub struct KvCache {
+    layers: Vec<LayerBuffer>,
     ctx: CudaContext,
     current_len: usize,
     max_seq_len: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    dtype: DType,
     /// GPU-resident write offset for `append_indirect` (equals `current_len`).
     position: SeqPosition,
     /// GPU-resident total length for `fused_attention_decode_indirect`.
@@ -82,20 +77,21 @@ pub struct KvCache<T: TensorDType = f32> {
 
 /// Launch the GPU kernel that copies `new_data` into `cache` at `current_len`.
 #[allow(clippy::too_many_arguments)]
-fn launch_append<T: TensorDType + cudarc::driver::DeviceRepr>(
+fn launch_append(
     ctx: &CudaContext,
-    cache: &mut CudaTensor<T>,
-    new_data: &CudaTensor<T>,
+    cache: &mut CudaTensor,
+    new_data: &CudaTensor,
     current_len: usize,
     max_seq_len: usize,
     num_kv_heads: usize,
     head_dim: usize,
     new_seq_len: usize,
+    dtype: DType,
 ) -> Result<()> {
     let total = new_seq_len * num_kv_heads * head_dim;
     let device = ctx.device();
 
-    let kernel_name = format!("append_kv_{}", kernel_suffix::<T>());
+    let kernel_name = format!("append_kv_{}", kernel_suffix(dtype));
     let module_name = "append_kv";
     if !device.has_func(module_name, &kernel_name) {
         let all_names: Vec<&str> = KERNEL_NAMES
@@ -138,20 +134,21 @@ fn launch_append<T: TensorDType + cudarc::driver::DeviceRepr>(
 /// Launch the GPU kernel that copies `new_data` into `cache`, reading the
 /// write offset from a device pointer (`position`).
 #[allow(clippy::too_many_arguments)]
-fn launch_append_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
+fn launch_append_indirect(
     ctx: &CudaContext,
-    cache: &mut CudaTensor<T>,
-    new_data: &CudaTensor<T>,
+    cache: &mut CudaTensor,
+    new_data: &CudaTensor,
     position: &SeqPosition,
     max_seq_len: usize,
     num_kv_heads: usize,
     head_dim: usize,
     new_seq_len: usize,
+    dtype: DType,
 ) -> Result<()> {
     let total = new_seq_len * num_kv_heads * head_dim;
     let device = ctx.device();
 
-    let kernel_name = format!("append_kv_indirect_{}", kernel_suffix::<T>());
+    let kernel_name = format!("append_kv_indirect_{}", kernel_suffix(dtype));
     let module_name = "append_kv";
     if !device.has_func(module_name, &kernel_name) {
         let all_names: Vec<&str> = KERNEL_NAMES
@@ -191,7 +188,7 @@ fn launch_append_indirect<T: TensorDType + cudarc::driver::DeviceRepr>(
     Ok(())
 }
 
-impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
+impl KvCache {
     /// Allocate a new KV cache.
     ///
     /// # Arguments
@@ -200,6 +197,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     /// * `max_seq_len` — maximum sequence length the cache can hold
     /// * `num_kv_heads` — number of key-value heads (GQA-aware)
     /// * `head_dim` — dimension of each attention head
+    /// * `dtype` — element type for the cache buffers
     ///
     /// # Errors
     /// Returns an error if GPU memory allocation fails.
@@ -209,6 +207,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
         max_seq_len: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        dtype: DType,
     ) -> Result<Self> {
         let shape = [max_seq_len, num_kv_heads, head_dim];
         let mut layers = Vec::with_capacity(num_layers);
@@ -216,8 +215,8 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
             // SAFETY: KV cache tracks current_len and only accesses valid (written) positions.
             // Uninitialized memory beyond current_len is never read.
             layers.push(LayerBuffer {
-                k: unsafe { CudaTensor::uninit(ctx, &shape)? },
-                v: unsafe { CudaTensor::uninit(ctx, &shape)? },
+                k: unsafe { CudaTensor::uninit(ctx, &shape, dtype)? },
+                v: unsafe { CudaTensor::uninit(ctx, &shape, dtype)? },
             });
         }
 
@@ -231,6 +230,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
             max_seq_len,
             num_kv_heads,
             head_dim,
+            dtype,
             position,
             total_len,
             graph_max_seq_len: max_seq_len,
@@ -250,8 +250,8 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     pub fn append(
         &mut self,
         layer_idx: usize,
-        k_new: &CudaTensor<T>,
-        v_new: &CudaTensor<T>,
+        k_new: &CudaTensor,
+        v_new: &CudaTensor,
     ) -> Result<()> {
         let k_shape = k_new.shape();
         let v_shape = v_new.shape();
@@ -281,6 +281,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
             self.num_kv_heads,
             self.head_dim,
             new_seq_len,
+            self.dtype,
         )?;
         launch_append(
             &self.ctx,
@@ -291,6 +292,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
             self.num_kv_heads,
             self.head_dim,
             new_seq_len,
+            self.dtype,
         )?;
 
         // Only advance current_len after the last layer appends
@@ -312,8 +314,8 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     pub fn append_indirect(
         &mut self,
         layer_idx: usize,
-        k_new: &CudaTensor<T>,
-        v_new: &CudaTensor<T>,
+        k_new: &CudaTensor,
+        v_new: &CudaTensor,
     ) -> Result<()> {
         let k_shape = k_new.shape();
         let v_shape = v_new.shape();
@@ -343,6 +345,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
             self.num_kv_heads,
             self.head_dim,
             new_seq_len,
+            self.dtype,
         )?;
         launch_append_indirect(
             &self.ctx,
@@ -353,6 +356,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
             self.num_kv_heads,
             self.head_dim,
             new_seq_len,
+            self.dtype,
         )?;
 
         Ok(())
@@ -385,7 +389,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     /// # Panics
     /// Panics if `current_len` is 0 (no data appended yet).
     #[must_use]
-    pub fn get(&self, layer_idx: usize) -> (CudaTensor<T>, CudaTensor<T>) {
+    pub fn get(&self, layer_idx: usize) -> (CudaTensor, CudaTensor) {
         assert!(self.current_len > 0, "KV cache is empty");
         self.get_up_to(layer_idx, self.current_len)
     }
@@ -399,7 +403,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     /// # Panics
     /// Panics if `len` is 0 or exceeds `max_seq_len`.
     #[must_use]
-    pub fn get_up_to(&self, layer_idx: usize, len: usize) -> (CudaTensor<T>, CudaTensor<T>) {
+    pub fn get_up_to(&self, layer_idx: usize, len: usize) -> (CudaTensor, CudaTensor) {
         assert!(len > 0, "requested length must be > 0");
         assert!(
             len <= self.max_seq_len,
@@ -416,7 +420,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     ///
     /// Returns a `CudaTensor` that shares the same GPU allocation as the cache
     /// buffer — no allocation or copy occurs.
-    fn slice_to_len(&self, tensor: &CudaTensor<T>, len: usize) -> CudaTensor<T> {
+    fn slice_to_len(&self, tensor: &CudaTensor, len: usize) -> CudaTensor {
         let shape = [len, self.num_kv_heads, self.head_dim];
         tensor.slice_view(0, &shape)
     }
@@ -428,7 +432,7 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     /// position stored in [`current_position`], but the fixed buffer
     /// addresses allow the graph to be replayed without re-capture.
     #[must_use]
-    pub fn full_buffers(&self, layer_idx: usize) -> (&CudaTensor<T>, &CudaTensor<T>) {
+    pub fn full_buffers(&self, layer_idx: usize) -> (&CudaTensor, &CudaTensor) {
         let buf = &self.layers[layer_idx];
         (&buf.k, &buf.v)
     }
@@ -473,6 +477,12 @@ impl<T: TensorDType + cudarc::driver::DeviceRepr + ValidAsZeroBits> KvCache<T> {
     #[must_use]
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    /// Element type of the cache buffers.
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// Effective max sequence length for graph-captured kernels.
@@ -522,8 +532,8 @@ mod tests {
     #[test]
     fn test_kv_cache_new() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let cache: KvCache<f32> =
-            KvCache::new(&ctx, 2, 128, 4, 16).expect("Failed to create KV cache");
+        let cache =
+            KvCache::new(&ctx, 2, 128, 4, 16, DType::F32).expect("Failed to create KV cache");
 
         assert_eq!(cache.current_len(), 0);
         assert_eq!(cache.max_seq_len(), 128);
@@ -535,7 +545,7 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let num_kv_heads = 2;
         let head_dim = 4;
-        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Append a single token's K and V
         let k_data: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| i as f32).collect();
@@ -555,8 +565,8 @@ mod tests {
         assert_eq!(k_out.shape(), &[1, num_kv_heads, head_dim]);
         assert_eq!(v_out.shape(), &[1, num_kv_heads, head_dim]);
 
-        let k_result = k_out.to_vec().unwrap();
-        let v_result = v_out.to_vec().unwrap();
+        let k_result: Vec<f32> = k_out.to_vec::<f32>().unwrap();
+        let v_result: Vec<f32> = v_out.to_vec::<f32>().unwrap();
         assert_eq!(k_result, k_data);
         assert_eq!(v_result, v_data);
     }
@@ -566,7 +576,7 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let num_kv_heads = 2;
         let head_dim = 4;
-        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Prefill: append 3 tokens at once
         let seq_len = 3;
@@ -588,8 +598,8 @@ mod tests {
         let (k_out, v_out) = cache.get(0);
         assert_eq!(k_out.shape(), &[3, num_kv_heads, head_dim]);
 
-        let k_result = k_out.to_vec().unwrap();
-        let v_result = v_out.to_vec().unwrap();
+        let k_result: Vec<f32> = k_out.to_vec::<f32>().unwrap();
+        let v_result: Vec<f32> = v_out.to_vec::<f32>().unwrap();
         assert_eq!(k_result, k_data);
         assert_eq!(v_result, v_data);
     }
@@ -599,17 +609,17 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let num_kv_heads = 1;
         let head_dim = 2;
-        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Token 0
-        let k0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[1.0, 2.0]).unwrap();
-        let v0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[10.0, 20.0]).unwrap();
+        let k0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[1.0_f32, 2.0]).unwrap();
+        let v0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[10.0_f32, 20.0]).unwrap();
         cache.append(0, &k0, &v0).unwrap();
         cache.advance(1).unwrap();
 
         // Token 1
-        let k1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[3.0, 4.0]).unwrap();
-        let v1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[30.0, 40.0]).unwrap();
+        let k1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[3.0_f32, 4.0]).unwrap();
+        let v1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[30.0_f32, 40.0]).unwrap();
         cache.append(0, &k1, &v1).unwrap();
         cache.advance(1).unwrap();
 
@@ -618,20 +628,20 @@ mod tests {
         let (k_out, v_out) = cache.get(0);
         assert_eq!(k_out.shape(), &[2, 1, 2]);
 
-        let k_result = k_out.to_vec().unwrap();
+        let k_result: Vec<f32> = k_out.to_vec::<f32>().unwrap();
         assert_eq!(k_result, vec![1.0, 2.0, 3.0, 4.0]);
 
-        let v_result = v_out.to_vec().unwrap();
+        let v_result: Vec<f32> = v_out.to_vec::<f32>().unwrap();
         assert_eq!(v_result, vec![10.0, 20.0, 30.0, 40.0]);
     }
 
     #[test]
     fn test_kv_cache_reset() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let mut cache = KvCache::new(&ctx, 1, 16, 2, 4).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 16, 2, 4, DType::F32).unwrap();
 
-        let k = CudaTensor::from_slice(&ctx, &[1, 2, 4], &[0.0; 8]).unwrap();
-        let v = CudaTensor::from_slice(&ctx, &[1, 2, 4], &[0.0; 8]).unwrap();
+        let k = CudaTensor::from_slice(&ctx, &[1, 2, 4], &[0.0_f32; 8]).unwrap();
+        let v = CudaTensor::from_slice(&ctx, &[1, 2, 4], &[0.0_f32; 8]).unwrap();
         cache.append(0, &k, &v).unwrap();
         cache.advance(1).unwrap();
         assert_eq!(cache.current_len(), 1);
@@ -645,12 +655,12 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let num_kv_heads = 1;
         let head_dim = 2;
-        let mut cache = KvCache::new(&ctx, 2, 16, num_kv_heads, head_dim).unwrap();
+        let mut cache = KvCache::new(&ctx, 2, 16, num_kv_heads, head_dim, DType::F32).unwrap();
 
-        let k0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[1.0, 2.0]).unwrap();
-        let v0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[10.0, 20.0]).unwrap();
-        let k1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[5.0, 6.0]).unwrap();
-        let v1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[50.0, 60.0]).unwrap();
+        let k0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[1.0_f32, 2.0]).unwrap();
+        let v0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[10.0_f32, 20.0]).unwrap();
+        let k1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[5.0_f32, 6.0]).unwrap();
+        let v1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[50.0_f32, 60.0]).unwrap();
 
         cache.append(0, &k0, &v0).unwrap();
         cache.append(1, &k1, &v1).unwrap();
@@ -659,14 +669,14 @@ mod tests {
         let (k_out_0, _) = cache.get(0);
         let (k_out_1, _) = cache.get(1);
 
-        assert_eq!(k_out_0.to_vec().unwrap(), vec![1.0, 2.0]);
-        assert_eq!(k_out_1.to_vec().unwrap(), vec![5.0, 6.0]);
+        assert_eq!(k_out_0.to_vec::<f32>().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(k_out_1.to_vec::<f32>().unwrap(), vec![5.0, 6.0]);
     }
 
     #[test]
     fn test_graph_max_seq_len_defaults_to_max() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let cache: KvCache<f32> = KvCache::new(&ctx, 1, 256, 2, 4).unwrap();
+        let cache = KvCache::new(&ctx, 1, 256, 2, 4, DType::F32).unwrap();
 
         assert_eq!(cache.graph_max_seq_len(), 256);
         assert_eq!(cache.graph_max_seq_len(), cache.max_seq_len());
@@ -675,7 +685,7 @@ mod tests {
     #[test]
     fn test_graph_max_seq_len_setter() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let mut cache: KvCache<f32> = KvCache::new(&ctx, 1, 256, 2, 4).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 256, 2, 4, DType::F32).unwrap();
 
         cache.set_graph_max_seq_len(64);
         assert_eq!(cache.graph_max_seq_len(), 64);
@@ -685,7 +695,7 @@ mod tests {
     #[test]
     fn test_graph_max_seq_len_at_boundary() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let mut cache: KvCache<f32> = KvCache::new(&ctx, 1, 256, 2, 4).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 256, 2, 4, DType::F32).unwrap();
 
         // Setting to exactly max_seq_len should be fine
         cache.set_graph_max_seq_len(256);
@@ -696,7 +706,7 @@ mod tests {
     #[should_panic(expected = "graph_max_seq_len (257) exceeds max_seq_len (256)")]
     fn test_graph_max_seq_len_panics_on_overflow() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let mut cache: KvCache<f32> = KvCache::new(&ctx, 1, 256, 2, 4).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 256, 2, 4, DType::F32).unwrap();
 
         cache.set_graph_max_seq_len(257);
     }
@@ -706,7 +716,7 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let num_kv_heads = 2;
         let head_dim = 4;
-        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim, DType::F32).unwrap();
 
         let k_data: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| i as f32).collect();
         let v_data: Vec<f32> = (0..num_kv_heads * head_dim)
@@ -723,8 +733,8 @@ mod tests {
         assert_eq!(cache.current_len(), 1);
 
         let (k_out, v_out) = cache.get(0);
-        assert_eq!(k_out.to_vec().unwrap(), k_data);
-        assert_eq!(v_out.to_vec().unwrap(), v_data);
+        assert_eq!(k_out.to_vec::<f32>().unwrap(), k_data);
+        assert_eq!(v_out.to_vec::<f32>().unwrap(), v_data);
     }
 
     #[test]
@@ -732,25 +742,25 @@ mod tests {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let num_kv_heads = 1;
         let head_dim = 2;
-        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim).unwrap();
+        let mut cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim, DType::F32).unwrap();
 
         // Token 0
-        let k0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[1.0, 2.0]).unwrap();
-        let v0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[10.0, 20.0]).unwrap();
+        let k0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[1.0_f32, 2.0]).unwrap();
+        let v0 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[10.0_f32, 20.0]).unwrap();
         cache.append_indirect(0, &k0, &v0).unwrap();
         cache.advance(1).unwrap();
 
         // Token 1
-        let k1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[3.0, 4.0]).unwrap();
-        let v1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[30.0, 40.0]).unwrap();
+        let k1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[3.0_f32, 4.0]).unwrap();
+        let v1 = CudaTensor::from_slice(&ctx, &[1, 1, 2], &[30.0_f32, 40.0]).unwrap();
         cache.append_indirect(0, &k1, &v1).unwrap();
         cache.advance(1).unwrap();
 
         assert_eq!(cache.current_len(), 2);
 
         let (k_out, v_out) = cache.get(0);
-        assert_eq!(k_out.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(v_out.to_vec().unwrap(), vec![10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(k_out.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(v_out.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 30.0, 40.0]);
     }
 
     #[test]
@@ -767,7 +777,8 @@ mod tests {
             .collect();
 
         // Direct append (prefill 3 tokens, then 1 decode)
-        let mut direct_cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim).unwrap();
+        let mut direct_cache =
+            KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim, DType::F32).unwrap();
         let k_all = CudaTensor::from_slice(&ctx, &[3, num_kv_heads, head_dim], &k_data).unwrap();
         let v_all = CudaTensor::from_slice(&ctx, &[3, num_kv_heads, head_dim], &v_data).unwrap();
         direct_cache.append(0, &k_all, &v_all).unwrap();
@@ -783,7 +794,8 @@ mod tests {
         direct_cache.advance(1).unwrap();
 
         // Indirect append (same data, prefill with direct, decode with indirect)
-        let mut indirect_cache = KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim).unwrap();
+        let mut indirect_cache =
+            KvCache::new(&ctx, 1, 16, num_kv_heads, head_dim, DType::F32).unwrap();
         let k_all2 = CudaTensor::from_slice(&ctx, &[3, num_kv_heads, head_dim], &k_data).unwrap();
         let v_all2 = CudaTensor::from_slice(&ctx, &[3, num_kv_heads, head_dim], &v_data).unwrap();
         indirect_cache.append(0, &k_all2, &v_all2).unwrap();
@@ -799,7 +811,13 @@ mod tests {
         let (dk_out, dv_out) = direct_cache.get(0);
         let (ik_out, iv_out) = indirect_cache.get(0);
 
-        assert_eq!(dk_out.to_vec().unwrap(), ik_out.to_vec().unwrap());
-        assert_eq!(dv_out.to_vec().unwrap(), iv_out.to_vec().unwrap());
+        assert_eq!(
+            dk_out.to_vec::<f32>().unwrap(),
+            ik_out.to_vec::<f32>().unwrap()
+        );
+        assert_eq!(
+            dv_out.to_vec::<f32>().unwrap(),
+            iv_out.to_vec::<f32>().unwrap()
+        );
     }
 }
