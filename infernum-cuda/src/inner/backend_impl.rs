@@ -1,8 +1,9 @@
 //! `CudaBackend` — implements the infernum `Backend` + op traits for CUDA.
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
-    NormOps, PagedAttentionOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, KvCacheOps,
+    MatmulExtOps, MatmulOps, MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
+    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::block_allocator::BlockTable;
 use infernum::{DType, Result};
@@ -157,6 +158,29 @@ impl TensorOps for CudaBackend {
     fn repeat_kv(tensor: &CudaTensor, num_repeats: usize) -> Result<CudaTensor> {
         ops::repeat_kv(tensor, num_repeats)
     }
+
+    fn concat_rows(parts: &[CudaTensor]) -> Result<CudaTensor> {
+        use infernum::tensor::Tensor;
+
+        assert!(!parts.is_empty(), "concat_rows: empty input");
+        let cols = parts[0].shape().last().copied().unwrap_or(0);
+        let dtype = parts[0].dtype();
+        let elem = dtype.size_in_bytes();
+        let total_rows: usize = parts.iter().map(|p| p.shape()[0]).sum();
+        let ctx = parts[0].context();
+
+        let mut output = unsafe { CudaTensor::uninit(ctx, &[total_rows, cols], dtype)? };
+        let out_slice = output.cuda_slice_mut();
+        let mut offset = 0;
+        for part in parts {
+            let row_bytes = part.shape()[0] * cols * elem;
+            let src = part.cuda_slice().slice(..row_bytes);
+            let mut dst = out_slice.slice_mut(offset..offset + row_bytes);
+            ctx.device().dtod_copy(&src, &mut dst)?;
+            offset += row_bytes;
+        }
+        Ok(output)
+    }
 }
 
 // ---- RoPE ----
@@ -272,5 +296,79 @@ impl PagedAttentionOps for CudaBackend {
         block_table: &BlockTable,
     ) -> Result<(CudaTensor, CudaTensor)> {
         ops::gather_paged_kv(paged_kv, layer_idx, block_table)
+    }
+}
+
+// ---- KV cache management ----
+
+impl PagedKvCacheOps for CudaBackend {
+    fn append_paged(
+        cache: &mut crate::cuda::PagedKvCache,
+        layer_idx: usize,
+        block_table: &BlockTable,
+        k: &CudaTensor,
+        v: &CudaTensor,
+        start_pos: usize,
+    ) -> Result<()> {
+        cache.append_paged(layer_idx, block_table, k, v, start_pos)
+    }
+
+    fn get_pools(
+        cache: &crate::cuda::PagedKvCache,
+        layer_idx: usize,
+    ) -> (&CudaTensor, &CudaTensor) {
+        cache.get_pools(layer_idx)
+    }
+
+    fn block_size(cache: &crate::cuda::PagedKvCache) -> usize {
+        cache.block_size()
+    }
+}
+
+impl KvCacheOps for CudaBackend {
+    fn append_kv(
+        cache: &mut crate::cuda::KvCache,
+        layer_idx: usize,
+        k: &CudaTensor,
+        v: &CudaTensor,
+    ) -> Result<()> {
+        cache.append(layer_idx, k, v)
+    }
+
+    fn get_kv(cache: &crate::cuda::KvCache, layer_idx: usize) -> (CudaTensor, CudaTensor) {
+        cache.get(layer_idx)
+    }
+
+    fn get_kv_up_to(
+        cache: &crate::cuda::KvCache,
+        layer_idx: usize,
+        len: usize,
+    ) -> (CudaTensor, CudaTensor) {
+        cache.get_up_to(layer_idx, len)
+    }
+}
+
+// ---- MoE ----
+
+impl MoeOps for CudaBackend {
+    fn moe_forward_softmax<F>(
+        hidden: &CudaTensor,
+        gate_weight: &CudaTensor,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        norm_topk_prob: bool,
+        expert_fn: F,
+    ) -> Result<CudaTensor>
+    where
+        F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
+    {
+        crate::cuda::moe::moe_forward(
+            hidden,
+            gate_weight,
+            num_experts,
+            num_experts_per_tok,
+            norm_topk_prob,
+            expert_fn,
+        )
     }
 }

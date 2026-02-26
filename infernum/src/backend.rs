@@ -168,6 +168,9 @@ pub trait TensorOps: Backend {
     ///
     /// `(seq, num_kv_heads, head_dim)` → `(seq, num_kv_heads * repeats, head_dim)`
     fn repeat_kv(tensor: &Self::Tensor, num_repeats: usize) -> Result<Self::Tensor>;
+
+    /// Vertically stack a slice of 2D tensors (each `(1, cols)`) into `(n, cols)`.
+    fn concat_rows(parts: &[Self::Tensor]) -> Result<Self::Tensor>;
 }
 
 // ---- RoPE ----
@@ -269,6 +272,70 @@ pub trait PagedAttentionOps: Backend {
         layer_idx: usize,
         block_table: &BlockTable,
     ) -> Result<(Self::Tensor, Self::Tensor)>;
+}
+
+// ---- KV cache management ----
+
+/// Paged KV cache operations (append, query pools).
+pub trait PagedKvCacheOps: Backend {
+    /// Append K/V tensors to the paged cache at the given position.
+    fn append_paged(
+        cache: &mut Self::PagedKvCache,
+        layer_idx: usize,
+        block_table: &BlockTable,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        start_pos: usize,
+    ) -> Result<()>;
+
+    /// Get the raw K/V pool tensors for a given layer.
+    fn get_pools(cache: &Self::PagedKvCache, layer_idx: usize) -> (&Self::Tensor, &Self::Tensor);
+
+    /// Get the block size of the paged cache.
+    fn block_size(cache: &Self::PagedKvCache) -> usize;
+}
+
+/// Contiguous (non-paged) KV cache operations (DeepSeek MLA).
+pub trait KvCacheOps: Backend {
+    /// Append K/V to a contiguous cache.
+    fn append_kv(
+        cache: &mut Self::KvCache,
+        layer_idx: usize,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+    ) -> Result<()>;
+
+    /// Get cached K/V for a layer (up to current length).
+    fn get_kv(cache: &Self::KvCache, layer_idx: usize) -> (Self::Tensor, Self::Tensor);
+
+    /// Get cached K/V up to a specific length (for decode where append
+    /// has already been called but advance has not).
+    fn get_kv_up_to(
+        cache: &Self::KvCache,
+        layer_idx: usize,
+        len: usize,
+    ) -> (Self::Tensor, Self::Tensor);
+}
+
+// ---- Mixture-of-Experts ----
+
+/// MoE routing and dispatch.
+pub trait MoeOps: Backend {
+    /// Softmax-gated MoE forward pass (Mixtral, Qwen-MoE).
+    ///
+    /// Routes tokens through `num_experts_per_tok` experts selected by
+    /// softmax over `gate_weight`. Calls `expert_fn(expert_idx, input)`
+    /// for each expert and combines outputs with routing weights.
+    fn moe_forward_softmax<F>(
+        hidden: &Self::Tensor,
+        gate_weight: &Self::Tensor,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        norm_topk_prob: bool,
+        expert_fn: F,
+    ) -> Result<Self::Tensor>
+    where
+        F: Fn(usize, &Self::Tensor) -> Result<Self::Tensor>;
 }
 
 // ---- Extended matmul ----
