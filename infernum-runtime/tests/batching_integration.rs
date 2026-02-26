@@ -13,9 +13,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
+use infernum_cuda::cuda::CudaContext;
 use infernum_llama::LlamaModel;
 use infernum_runtime::{BatchConfig, Engine, FinishReason, GenerationEvent};
 

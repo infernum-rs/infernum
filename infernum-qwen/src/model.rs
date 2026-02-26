@@ -7,10 +7,14 @@
     unused_mut
 )]
 
+use std::marker::PhantomData;
 use std::path::Path;
 
-use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::ops::{
+use infernum::backend::{Backend, MatmulOps};
+use infernum::dtype::DType;
+use infernum::tensor::Tensor;
+use infernum::Result;
+use infernum_cuda::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
     bias_add_inplace, cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
     fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32, mul,
@@ -18,15 +22,14 @@ use infernum::cuda::ops::{
     precompute_rope_cache_scaled, rms_norm, rms_norm_inplace, split_inner_dim, swiglu,
     transpose_2d, LinearWeight, RopeScaling,
 };
-use infernum::cuda::{
+use infernum_cuda::cuda::{
     BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
 };
 #[cfg(feature = "nccl")]
-use infernum::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
-use infernum::dtype::DType;
-use infernum::tensor::Tensor;
-use infernum::weights::{SafeTensorsLoader, WeightLoader};
-use infernum::Result;
+use infernum_cuda::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
+use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
+use infernum_cuda::BlockTable;
+use infernum_cuda::CudaBackend;
 
 use crate::QwenConfig;
 
@@ -106,72 +109,72 @@ fn load_typed_sharded(
 
 // --- Weight structures ---
 
-enum KvProjWeight {
+enum KvProjWeight<B: Backend + MatmulOps> {
     Fused {
-        weight: CudaTensor,
+        weight: B::Tensor,
         kv_dim: usize,
     },
     Separate {
-        k_proj: Box<LinearWeight>,
-        v_proj: Box<LinearWeight>,
+        k_proj: Box<<B as MatmulOps>::LinearWeight>,
+        v_proj: Box<<B as MatmulOps>::LinearWeight>,
     },
 }
 
-struct QwenAttentionWeights {
-    q_proj: LinearWeight,
-    kv_proj: KvProjWeight,
-    o_proj: LinearWeight,
+struct QwenAttentionWeights<B: Backend + MatmulOps> {
+    q_proj: <B as MatmulOps>::LinearWeight,
+    kv_proj: KvProjWeight<B>,
+    o_proj: <B as MatmulOps>::LinearWeight,
     /// Q/K/V biases (Qwen2, some Qwen3-MoE)
-    q_bias: Option<CudaTensor>,
-    k_bias: Option<CudaTensor>,
-    v_bias: Option<CudaTensor>,
+    q_bias: Option<B::Tensor>,
+    k_bias: Option<B::Tensor>,
+    v_bias: Option<B::Tensor>,
     /// QK-norm weights (Qwen3): RMSNorm per-head before RoPE
-    q_norm: Option<CudaTensor>,
-    k_norm: Option<CudaTensor>,
+    q_norm: Option<B::Tensor>,
+    k_norm: Option<B::Tensor>,
 }
 
-enum GateUpWeight {
+enum GateUpWeight<B: Backend + MatmulOps> {
     Fused {
-        weight: CudaTensor,
+        weight: B::Tensor,
         intermediate_size: usize,
     },
     Separate {
-        gate_proj: Box<LinearWeight>,
-        up_proj: Box<LinearWeight>,
+        gate_proj: Box<<B as MatmulOps>::LinearWeight>,
+        up_proj: Box<<B as MatmulOps>::LinearWeight>,
     },
 }
 
-struct QwenMlpWeights {
-    gate_up: GateUpWeight,
-    down_proj: LinearWeight,
+struct QwenMlpWeights<B: Backend + MatmulOps> {
+    gate_up: GateUpWeight<B>,
+    down_proj: <B as MatmulOps>::LinearWeight,
 }
 
-struct MoeExpertWeights {
-    mlp: QwenMlpWeights,
+struct MoeExpertWeights<B: Backend + MatmulOps> {
+    mlp: QwenMlpWeights<B>,
 }
 
 #[allow(clippy::large_enum_variant)]
-enum QwenFfnWeights {
-    Dense(Box<QwenMlpWeights>),
+enum QwenFfnWeights<B: Backend + MatmulOps> {
+    Dense(Box<QwenMlpWeights<B>>),
     Moe {
-        gate: CudaTensor,
-        experts: Vec<MoeExpertWeights>,
+        gate: B::Tensor,
+        experts: Vec<MoeExpertWeights<B>>,
         num_experts_per_tok: usize,
         norm_topk_prob: bool,
-        shared_expert: Option<Box<QwenMlpWeights>>,
-        shared_expert_gate: Option<CudaTensor>,
+        shared_expert: Option<Box<QwenMlpWeights<B>>>,
+        shared_expert_gate: Option<B::Tensor>,
     },
 }
 
-struct QwenLayerWeights {
-    input_layernorm: CudaTensor,
-    attention: QwenAttentionWeights,
-    post_attention_layernorm: CudaTensor,
-    ffn: QwenFfnWeights,
+struct QwenLayerWeights<B: Backend + MatmulOps> {
+    input_layernorm: B::Tensor,
+    attention: QwenAttentionWeights<B>,
+    post_attention_layernorm: B::Tensor,
+    ffn: QwenFfnWeights<B>,
 }
 
-/// Complete Qwen model with runtime dtype.
-pub struct QwenModel {
+/// Complete Qwen model, generic over the compute backend `B`.
+pub struct QwenModel<B: Backend + MatmulOps> {
     config: QwenConfig,
     ctx: CudaContext,
     #[allow(dead_code)]
@@ -184,16 +187,18 @@ pub struct QwenModel {
     tp_num_kv_heads: usize,
 
     dtype: DType,
-    embed_tokens: CudaTensor,
-    layers: Vec<QwenLayerWeights>,
-    norm: CudaTensor,
-    lm_head: LinearWeight,
+    embed_tokens: B::Tensor,
+    layers: Vec<QwenLayerWeights<B>>,
+    norm: B::Tensor,
+    lm_head: <B as MatmulOps>::LinearWeight,
 
-    cos_cache: CudaTensor,
-    sin_cache: CudaTensor,
+    cos_cache: B::Tensor,
+    sin_cache: B::Tensor,
+
+    _backend: PhantomData<B>,
 }
 
-impl QwenModel {
+impl QwenModel<CudaBackend> {
     /// Load a Qwen model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
@@ -302,7 +307,7 @@ impl QwenModel {
             prefix: &str,
             intermediate_size: usize,
             qc: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<QwenMlpWeights> {
+        ) -> Result<QwenMlpWeights<CudaBackend>> {
             let gate = load_linear(
                 dtype,
                 ctx,
@@ -312,11 +317,13 @@ impl QwenModel {
             )?;
             let up = load_linear(dtype, ctx, loader, &format!("{prefix}.up_proj.weight"), qc)?;
             let gate_up = match (gate, up) {
-                (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
-                    weight: concat_weights(&g, &u)?,
-                    intermediate_size,
-                },
-                (g, u) => GateUpWeight::Separate {
+                (LinearWeight::Dense(g), LinearWeight::Dense(u)) => {
+                    GateUpWeight::<CudaBackend>::Fused {
+                        weight: concat_weights(&g, &u)?,
+                        intermediate_size,
+                    }
+                }
+                (g, u) => GateUpWeight::<CudaBackend>::Separate {
                     gate_proj: Box::new(g),
                     up_proj: Box::new(u),
                 },
@@ -340,7 +347,7 @@ impl QwenModel {
             layer_prefix: &str,
             config: &QwenConfig,
             qc: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<QwenFfnWeights> {
+        ) -> Result<QwenFfnWeights<CudaBackend>> {
             let num_experts = config.num_experts.expect("MoE requires num_experts");
             let num_experts_per_tok = config
                 .num_experts_per_tok
@@ -385,7 +392,7 @@ impl QwenModel {
                 None
             };
 
-            Ok(QwenFfnWeights::Moe {
+            Ok(QwenFfnWeights::<CudaBackend>::Moe {
                 gate,
                 experts,
                 num_experts_per_tok,
@@ -457,11 +464,13 @@ impl QwenModel {
                 qc,
             )?;
             let kv_proj = match (k, v) {
-                (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => KvProjWeight::Fused {
-                    kv_dim: config.num_kv_heads() * config.head_dim(),
-                    weight: concat_weights(&k_w, &v_w)?,
-                },
-                (k, v) => KvProjWeight::Separate {
+                (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
+                    KvProjWeight::<CudaBackend>::Fused {
+                        kv_dim: config.num_kv_heads() * config.head_dim(),
+                        weight: concat_weights(&k_w, &v_w)?,
+                    }
+                }
+                (k, v) => KvProjWeight::<CudaBackend>::Separate {
                     k_proj: Box::new(k),
                     v_proj: Box::new(v),
                 },
@@ -505,7 +514,7 @@ impl QwenModel {
                 ffn: if config.is_moe_layer(i) {
                     load_moe_weights(dtype, ctx, loader, &prefix, &config, qc)?
                 } else {
-                    QwenFfnWeights::Dense(Box::new(load_dense_mlp(
+                    QwenFfnWeights::<CudaBackend>::Dense(Box::new(load_dense_mlp(
                         dtype,
                         ctx,
                         loader,
@@ -602,6 +611,7 @@ impl QwenModel {
             lm_head,
             cos_cache,
             sin_cache,
+            _backend: PhantomData,
         })
     }
 
@@ -816,7 +826,7 @@ impl QwenModel {
                 ShardStrategy::Column,
                 qc,
             )?;
-            let kv_proj = KvProjWeight::Separate {
+            let kv_proj = KvProjWeight::<CudaBackend>::Separate {
                 k_proj: Box::new(k_proj),
                 v_proj: Box::new(v_proj),
             };
@@ -865,7 +875,7 @@ impl QwenModel {
                         ShardStrategy::Column,
                         qc,
                     )?;
-                    let gate_up = GateUpWeight::Separate {
+                    let gate_up = GateUpWeight::<CudaBackend>::Separate {
                         gate_proj: Box::new(gate_proj),
                         up_proj: Box::new(up_proj),
                     };
@@ -907,7 +917,7 @@ impl QwenModel {
                         ShardStrategy::Column,
                         qc,
                     )?;
-                    let gate_up = GateUpWeight::Separate {
+                    let gate_up = GateUpWeight::<CudaBackend>::Separate {
                         gate_proj: Box::new(gate_proj),
                         up_proj: Box::new(up_proj),
                     };
@@ -937,7 +947,7 @@ impl QwenModel {
                     None
                 };
 
-                QwenFfnWeights::Moe {
+                QwenFfnWeights::<CudaBackend>::Moe {
                     gate,
                     experts,
                     num_experts_per_tok,
@@ -968,12 +978,12 @@ impl QwenModel {
                     ShardStrategy::Column,
                     qc,
                 )?;
-                let gate_up = GateUpWeight::Separate {
+                let gate_up = GateUpWeight::<CudaBackend>::Separate {
                     gate_proj: Box::new(gate),
                     up_proj: Box::new(up),
                 };
 
-                QwenFfnWeights::Dense(Box::new(QwenMlpWeights {
+                QwenFfnWeights::<CudaBackend>::Dense(Box::new(QwenMlpWeights {
                     gate_up,
                     down_proj: load_linear_sharded(
                         dtype,
@@ -1069,6 +1079,7 @@ impl QwenModel {
             lm_head,
             cos_cache,
             sin_cache,
+            _backend: PhantomData,
         })
     }
 
@@ -1210,7 +1221,7 @@ impl QwenModel {
     fn forward_layer_paged_decode(
         &self,
         hidden: &CudaTensor,
-        layer: &QwenLayerWeights,
+        layer: &QwenLayerWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
@@ -1242,7 +1253,7 @@ impl QwenModel {
     fn forward_attention_paged_decode(
         &self,
         hidden: &CudaTensor,
-        weights: &QwenAttentionWeights,
+        weights: &QwenAttentionWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
@@ -1255,7 +1266,7 @@ impl QwenModel {
 
         let mut q = linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
+            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
                 if batch_size == 1 {
                     let k = kv.slice_view(0, &[1, *kv_dim]);
@@ -1265,7 +1276,7 @@ impl QwenModel {
                     split_kv(&kv, *kv_dim)?
                 }
             }
-            KvProjWeight::Separate { k_proj, v_proj } => {
+            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
                 let v = linear(hidden, v_proj)?;
                 (k, v)
@@ -1357,7 +1368,7 @@ impl QwenModel {
     fn forward_layer_paged_decode_indirect(
         &self,
         hidden: &CudaTensor,
-        layer: &QwenLayerWeights,
+        layer: &QwenLayerWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
@@ -1390,7 +1401,7 @@ impl QwenModel {
     fn forward_attention_paged_decode_indirect(
         &self,
         hidden: &CudaTensor,
-        weights: &QwenAttentionWeights,
+        weights: &QwenAttentionWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
@@ -1403,7 +1414,7 @@ impl QwenModel {
 
         let mut q = linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
+            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
                 if batch_size == 1 {
                     let k = kv.slice_view(0, &[1, *kv_dim]);
@@ -1413,7 +1424,7 @@ impl QwenModel {
                     split_kv(&kv, *kv_dim)?
                 }
             }
-            KvProjWeight::Separate { k_proj, v_proj } => {
+            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
                 let v = linear(hidden, v_proj)?;
                 (k, v)
@@ -1498,7 +1509,7 @@ impl QwenModel {
     fn forward_layer_paged_prefill(
         &self,
         hidden: &CudaTensor,
-        layer: &QwenLayerWeights,
+        layer: &QwenLayerWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
@@ -1533,7 +1544,7 @@ impl QwenModel {
     fn forward_attention_paged_prefill(
         &self,
         hidden: &CudaTensor,
-        weights: &QwenAttentionWeights,
+        weights: &QwenAttentionWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
@@ -1546,11 +1557,11 @@ impl QwenModel {
 
         let mut q = linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
+            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
                 split_kv(&kv, *kv_dim)?
             }
-            KvProjWeight::Separate { k_proj, v_proj } => {
+            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
                 let v = linear(hidden, v_proj)?;
                 (k, v)
@@ -1611,10 +1622,14 @@ impl QwenModel {
 
     // --- FFN ---
 
-    fn forward_ffn(&self, hidden: &CudaTensor, ffn: &QwenFfnWeights) -> Result<CudaTensor> {
+    fn forward_ffn(
+        &self,
+        hidden: &CudaTensor,
+        ffn: &QwenFfnWeights<CudaBackend>,
+    ) -> Result<CudaTensor> {
         match ffn {
-            QwenFfnWeights::Dense(mlp) => self.forward_mlp(hidden, mlp),
-            QwenFfnWeights::Moe {
+            QwenFfnWeights::<CudaBackend>::Dense(mlp) => self.forward_mlp(hidden, mlp),
+            QwenFfnWeights::<CudaBackend>::Moe {
                 gate,
                 experts,
                 num_experts_per_tok,
@@ -1634,9 +1649,13 @@ impl QwenModel {
     }
 
     #[allow(clippy::unused_self)]
-    fn forward_mlp(&self, hidden: &CudaTensor, weights: &QwenMlpWeights) -> Result<CudaTensor> {
+    fn forward_mlp(
+        &self,
+        hidden: &CudaTensor,
+        weights: &QwenMlpWeights<CudaBackend>,
+    ) -> Result<CudaTensor> {
         let (gate, up) = match &weights.gate_up {
-            GateUpWeight::Fused {
+            GateUpWeight::<CudaBackend>::Fused {
                 weight,
                 intermediate_size,
             } => {
@@ -1650,7 +1669,7 @@ impl QwenModel {
                     split_gate_up(&gate_up, *intermediate_size)?
                 }
             }
-            GateUpWeight::Separate { gate_proj, up_proj } => {
+            GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
                 let gate = linear(hidden, gate_proj)?;
                 let up = linear(hidden, up_proj)?;
                 (gate, up)
@@ -1667,10 +1686,10 @@ impl QwenModel {
     fn forward_mlp_no_reduce(
         &self,
         hidden: &CudaTensor,
-        weights: &QwenMlpWeights,
+        weights: &QwenMlpWeights<CudaBackend>,
     ) -> Result<CudaTensor> {
         let (gate, up) = match &weights.gate_up {
-            GateUpWeight::Fused {
+            GateUpWeight::<CudaBackend>::Fused {
                 weight,
                 intermediate_size,
             } => {
@@ -1684,7 +1703,7 @@ impl QwenModel {
                     split_gate_up(&gate_up, *intermediate_size)?
                 }
             }
-            GateUpWeight::Separate { gate_proj, up_proj } => {
+            GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
                 let gate = linear(hidden, gate_proj)?;
                 let up = linear(hidden, up_proj)?;
                 (gate, up)
@@ -1699,13 +1718,13 @@ impl QwenModel {
         &self,
         hidden: &CudaTensor,
         gate: &CudaTensor,
-        experts: &[MoeExpertWeights],
+        experts: &[MoeExpertWeights<CudaBackend>],
         num_experts_per_tok: usize,
         norm_topk_prob: bool,
-        shared_expert: Option<&QwenMlpWeights>,
+        shared_expert: Option<&QwenMlpWeights<CudaBackend>>,
         shared_expert_gate: Option<&CudaTensor>,
     ) -> Result<CudaTensor> {
-        let mut out = infernum::cuda::moe::moe_forward(
+        let mut out = infernum_cuda::cuda::moe::moe_forward(
             hidden,
             gate,
             experts.len(),
@@ -1750,7 +1769,7 @@ impl QwenModel {
     }
 }
 
-impl infernum::Model for QwenModel {
+impl infernum_cuda::Model for QwenModel<CudaBackend> {
     fn config(&self) -> infernum::ModelConfig {
         let config = self.config();
         infernum::ModelConfig {
@@ -1780,11 +1799,11 @@ impl infernum::Model for QwenModel {
 
             let mut q = linear(&normed, &layer.attention.q_proj)?;
             let (mut k, mut v) = match &layer.attention.kv_proj {
-                KvProjWeight::Fused { weight, kv_dim } => {
+                KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                     let kv = matmul(&normed, weight)?;
                     split_kv(&kv, *kv_dim)?
                 }
-                KvProjWeight::Separate { k_proj, v_proj } => {
+                KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                     let k = linear(&normed, k_proj)?;
                     let v = linear(&normed, v_proj)?;
                     (k, v)
@@ -1873,7 +1892,7 @@ impl infernum::Model for QwenModel {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum::ShardedLoadable for QwenModel {
+impl infernum_cuda::ShardedLoadable for QwenModel<CudaBackend> {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,

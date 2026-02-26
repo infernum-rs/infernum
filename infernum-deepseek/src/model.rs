@@ -9,10 +9,14 @@
     unused_mut
 )]
 
+use std::marker::PhantomData;
 use std::path::Path;
 
-use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::ops::{
+use infernum::backend::Backend;
+use infernum::dtype::DType;
+use infernum::tensor::Tensor;
+use infernum::Result;
+use infernum_cuda::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope_interleaved, apply_rope_interleaved_batched_indirect,
     apply_rope_interleaved_indirect, broadcast_to_heads, cast_from_f32, cast_to_f32,
     combine_attention_with_lse, concat_inner_dim, embedding_gather, embedding_gather_from_device,
@@ -22,16 +26,15 @@ use infernum::cuda::ops::{
     precompute_rope_cache_scaled, quantized_matmul, rms_norm, rms_norm_inplace, split_inner_dim,
     swiglu, transpose_2d, LinearWeight, RopeScaling,
 };
-use infernum::cuda::{
+use infernum_cuda::cuda::{
     BatchedGraphInputs, CudaContext, CudaSlice, CudaTensor, GpuConfig, KvCache, PagedKvCache,
     QuantizedTensor,
 };
 #[cfg(feature = "nccl")]
-use infernum::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
-use infernum::dtype::DType;
-use infernum::tensor::Tensor;
-use infernum::weights::{SafeTensorsLoader, WeightLoader};
-use infernum::Result;
+use infernum_cuda::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
+use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
+use infernum_cuda::BlockTable;
+use infernum_cuda::CudaBackend;
 
 use crate::DeepSeekConfig;
 
@@ -241,7 +244,7 @@ struct MoeWeights {
     /// GPU-resident copy of the bias for the sigmoid routing kernel.
     e_score_correction_bias_gpu: CudaTensor,
     /// Pre-allocated GPU buffers for routing output, reused across decode steps.
-    routing_bufs: std::sync::Mutex<infernum::cuda::ops::GpuRoutingBuffers>,
+    routing_bufs: std::sync::Mutex<infernum_cuda::cuda::ops::GpuRoutingBuffers>,
     experts: Vec<DenseMlpWeights>,
     shared_expert: DenseMlpWeights,
 }
@@ -262,7 +265,7 @@ struct DeepSeekLayerWeights {
 }
 
 /// Complete DeepSeek V3/R1 model.
-pub struct DeepSeekModel {
+pub struct DeepSeekModel<B: Backend> {
     config: DeepSeekConfig,
     ctx: CudaContext,
     #[allow(dead_code)]
@@ -274,19 +277,21 @@ pub struct DeepSeekModel {
     tp_num_heads: usize,
     dtype: DType,
 
-    embed_tokens: CudaTensor,
+    embed_tokens: B::Tensor,
     layers: Vec<DeepSeekLayerWeights>,
-    norm: CudaTensor,
+    norm: B::Tensor,
     lm_head: LinearWeight,
 
-    cos_cache: CudaTensor,
-    sin_cache: CudaTensor,
+    cos_cache: B::Tensor,
+    sin_cache: B::Tensor,
 
     /// Pre-computed attention scale (includes YaRN mscale adjustment)
     attn_scale: f32,
+
+    _backend: PhantomData<B>,
 }
 
-impl DeepSeekModel {
+impl DeepSeekModel<CudaBackend> {
     /// Load a DeepSeek model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
@@ -558,9 +563,11 @@ impl DeepSeekModel {
                     &e_score_correction_bias,
                 )?;
 
-                let routing_bufs = std::sync::Mutex::new(
-                    infernum::cuda::ops::GpuRoutingBuffers::new(ctx, config.num_experts_per_tok)?,
-                );
+                let routing_bufs =
+                    std::sync::Mutex::new(infernum_cuda::cuda::ops::GpuRoutingBuffers::new(
+                        ctx,
+                        config.num_experts_per_tok,
+                    )?);
 
                 FfnWeights::Moe(Box::new(MoeWeights {
                     gate_weight,
@@ -662,6 +669,7 @@ impl DeepSeekModel {
             cos_cache,
             sin_cache,
             attn_scale,
+            _backend: PhantomData,
         })
     }
 
@@ -996,9 +1004,11 @@ impl DeepSeekModel {
                     &e_score_correction_bias,
                 )?;
 
-                let routing_bufs = std::sync::Mutex::new(
-                    infernum::cuda::ops::GpuRoutingBuffers::new(ctx, config.num_experts_per_tok)?,
-                );
+                let routing_bufs =
+                    std::sync::Mutex::new(infernum_cuda::cuda::ops::GpuRoutingBuffers::new(
+                        ctx,
+                        config.num_experts_per_tok,
+                    )?);
 
                 FfnWeights::Moe(Box::new(MoeWeights {
                     gate_weight,
@@ -1118,6 +1128,7 @@ impl DeepSeekModel {
             cos_cache,
             sin_cache,
             attn_scale,
+            _backend: PhantomData,
         })
     }
 
@@ -1564,7 +1575,7 @@ impl DeepSeekModel {
         let num_experts = moe_weights.experts.len();
 
         let mut routing_bufs = moe_weights.routing_bufs.lock().unwrap();
-        let mut routed_output = infernum::cuda::moe::moe_forward_sigmoid_gpu(
+        let mut routed_output = infernum_cuda::cuda::moe::moe_forward_sigmoid_gpu(
             hidden,
             &moe_weights.gate_weight,
             &moe_weights.e_score_correction_bias,
@@ -2206,7 +2217,7 @@ impl DeepSeekModel {
 
 // --- Model trait implementation ---
 
-impl infernum::Model for DeepSeekModel {
+impl infernum_cuda::Model for DeepSeekModel<CudaBackend> {
     fn config(&self) -> infernum::ModelConfig {
         let config = &self.config;
         infernum::ModelConfig {
@@ -2350,7 +2361,7 @@ impl infernum::Model for DeepSeekModel {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum::ShardedLoadable for DeepSeekModel {
+impl infernum_cuda::ShardedLoadable for DeepSeekModel<CudaBackend> {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,

@@ -20,9 +20,9 @@ use tower_http::cors::CorsLayer;
 
 use infernum::chat_template::ChatTemplate;
 use infernum::{
-    ChatMessage, GenerateOptions, Model, ModelConfig, Result as InfernumResult, SamplingParams,
-    Tokenizer,
+    ChatMessage, GenerateOptions, ModelConfig, Result as InfernumResult, SamplingParams, Tokenizer,
 };
+use infernum_cuda::Model;
 use infernum_runtime::{BatchConfig, Engine, FinishReason, GenerationEvent, TokenSender};
 
 use crate::types::{

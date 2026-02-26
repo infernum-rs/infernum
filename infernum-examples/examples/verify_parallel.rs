@@ -15,9 +15,10 @@ use clap::Parser;
 use cudarc::driver::CudaDevice;
 use serde::Deserialize;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::{GenerateOptions, Model as _, Result, ShardedModel};
+use infernum::{GenerateOptions, Result};
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::{CudaBackend, Model as _, ShardedModel};
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -72,7 +73,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
     Ok(probe.model_type)
 }
 
-fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
+fn run_single_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
@@ -92,7 +93,7 @@ fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> R
     Ok(output)
 }
 
-fn run_multi_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
+fn run_multi_gpu<M: infernum_cuda::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String> {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
     let t0 = Instant::now();
@@ -151,7 +152,7 @@ fn main() -> Result<()> {
 
         match family {
             "qwen" => {
-                let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
+                let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
                 println!(
                     "Loaded in {:.2}s ({} layers, hidden={})",
                     t0.elapsed().as_secs_f64(),
@@ -161,7 +162,7 @@ fn main() -> Result<()> {
                 run_single_gpu(model, &cli)?
             }
             "deepseek" => {
-                let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
+                let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
                 println!(
                     "Loaded in {:.2}s ({} layers, hidden={})",
                     t0.elapsed().as_secs_f64(),
@@ -171,7 +172,7 @@ fn main() -> Result<()> {
                 run_single_gpu(model, &cli)?
             }
             "gemma" => {
-                let model = GemmaModel::from_pretrained(&ctx, &cli.model)?;
+                let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
                 println!(
                     "Loaded in {:.2}s ({} layers, hidden={})",
                     t0.elapsed().as_secs_f64(),
@@ -181,7 +182,7 @@ fn main() -> Result<()> {
                 run_single_gpu(model, &cli)?
             }
             _ => {
-                let model = LlamaModel::from_pretrained(&ctx, &cli.model)?;
+                let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
                 println!(
                     "Loaded in {:.2}s ({} layers, hidden={})",
                     t0.elapsed().as_secs_f64(),
@@ -201,7 +202,9 @@ fn main() -> Result<()> {
 
         match family {
             "qwen" => {
-                let model = ShardedModel::<QwenModel>::from_pretrained(&cli.model, world_size)?;
+                let model = ShardedModel::<QwenModel<CudaBackend>>::from_pretrained(
+                    &cli.model, world_size,
+                )?;
                 let cfg = model.config();
                 println!(
                     "Loaded in {:.2}s ({} layers, head_dim={})",
@@ -212,7 +215,9 @@ fn main() -> Result<()> {
                 run_multi_gpu(model, &cli)?
             }
             "deepseek" => {
-                let model = ShardedModel::<DeepSeekModel>::from_pretrained(&cli.model, world_size)?;
+                let model = ShardedModel::<DeepSeekModel<CudaBackend>>::from_pretrained(
+                    &cli.model, world_size,
+                )?;
                 let cfg = model.config();
                 println!(
                     "Loaded in {:.2}s ({} layers, head_dim={})",
@@ -223,7 +228,9 @@ fn main() -> Result<()> {
                 run_multi_gpu(model, &cli)?
             }
             "gemma" => {
-                let model = ShardedModel::<GemmaModel>::from_pretrained(&cli.model, world_size)?;
+                let model = ShardedModel::<GemmaModel<CudaBackend>>::from_pretrained(
+                    &cli.model, world_size,
+                )?;
                 let cfg = model.config();
                 println!(
                     "Loaded in {:.2}s ({} layers, head_dim={})",
@@ -234,7 +241,9 @@ fn main() -> Result<()> {
                 run_multi_gpu(model, &cli)?
             }
             _ => {
-                let model = ShardedModel::<LlamaModel>::from_pretrained(&cli.model, world_size)?;
+                let model = ShardedModel::<LlamaModel<CudaBackend>>::from_pretrained(
+                    &cli.model, world_size,
+                )?;
                 let cfg = model.config();
                 println!(
                     "Loaded in {:.2}s ({} layers, head_dim={})",

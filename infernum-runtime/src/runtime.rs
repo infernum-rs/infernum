@@ -5,7 +5,8 @@
 
 use std::io::{self, Write};
 
-use infernum::{GenerateOptions, Model, ModelConfig, Result, Tokenizer};
+use infernum::{GenerateOptions, ModelConfig, Result, Tokenizer};
+use infernum_cuda::Model;
 
 use crate::engine::GenerationEvent;
 use crate::Engine;

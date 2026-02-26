@@ -12,9 +12,9 @@ use std::time::Instant;
 use clap::Parser;
 use serde::Deserialize;
 
-use infernum::cuda::CudaContext;
-use infernum::model::Model;
 use infernum::GenerateOptions;
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::Model;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;

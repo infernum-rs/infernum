@@ -11,10 +11,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
-use infernum::Model;
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::Model;
 use infernum_deepseek::DeepSeekModel;
 use infernum_runtime::Runtime;
 
@@ -154,8 +154,8 @@ mod deepseek_v3_tiny {
     /// actually capturing a CUDA graph.
     #[test]
     fn batched_decode_indirect_no_nan() {
-        use infernum::cuda::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
-        use infernum::cuda::{BatchedGraphInputs, PagedKvCache};
+        use infernum_cuda::cuda::{BatchedGraphInputs, PagedKvCache};
+        use infernum_cuda::{BlockAllocator, BlockConfig, BlockTable};
 
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();

@@ -1,0 +1,47 @@
+[package]
+name = "infernum-cuda"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+cuda = ["cudarc"]
+nccl = ["cuda", "cudarc/nccl", "infernum/nccl-errors"]
+# Force fused kernels even in debug builds
+force-fuse = []
+# Disable fused kernels even in release builds
+no-fuse = []
+
+[dependencies]
+# CUDA bindings
+cudarc = { version = "0.12", features = ["cublas", "cublaslt", "f16", "cuda-12060"], optional = true }
+
+# Core crate (for Tensor trait, DType, error types, etc.)
+infernum = { path = "../infernum", features = ["cuda-errors"] }
+
+# Proc macros (define_fusion!, etc.)
+infernum-macros = { path = "../infernum-macros" }
+
+# Fusion registry (distributed plugin collection across crates)
+inventory = "0.3"
+
+# Weight loading (also in infernum core, but the CUDA loaders need these)
+safetensors = "0.4"
+memmap2 = "0.9"
+
+# Half-precision types
+half = { version = "2.4", features = ["num-traits", "bytemuck"] }
+num-traits = "0.2"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Config parsing (for weight loaders)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
+
+[[example]]
+name = "test_tokenizer"
+required-features = ["cuda"]

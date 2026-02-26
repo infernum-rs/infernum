@@ -8,25 +8,20 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Main error type for Infernum operations
 #[derive(Error, Debug)]
 pub enum Error {
-    #[cfg(feature = "cuda")]
     #[error("CUDA error: {0}")]
-    Cuda(#[from] cudarc::driver::DriverError),
+    Cuda(String),
 
-    #[cfg(feature = "cuda")]
     #[error("cuBLAS error: {0}")]
-    CuBlas(#[from] cudarc::cublas::result::CublasError),
+    CuBlas(String),
 
-    #[cfg(feature = "cuda")]
     #[error("cuBLASLt error: {0}")]
-    CuBlasLt(#[from] cudarc::cublaslt::result::CublasError),
+    CuBlasLt(String),
 
-    #[cfg(feature = "cuda")]
     #[error("NVRTC error: {0}")]
-    Nvrtc(#[from] cudarc::nvrtc::result::NvrtcError),
+    Nvrtc(String),
 
-    #[cfg(feature = "cuda")]
     #[error("NVRTC compile error: {0}")]
-    NvrtcCompile(#[from] cudarc::nvrtc::CompileError),
+    NvrtcCompile(String),
 
     #[error("Shape mismatch: expected {expected:?}, got {got:?}")]
     ShapeMismatch {
@@ -41,7 +36,7 @@ pub enum Error {
     DtypeMismatch { expected: String, got: String },
 
     #[error("SafeTensors error: {0}")]
-    SafeTensors(#[from] safetensors::SafeTensorError),
+    SafeTensors(String),
 
     #[error("Weight not found: {0}")]
     WeightNotFound(String),
@@ -61,26 +56,64 @@ pub enum Error {
     #[error("Unsupported model: {0}")]
     UnsupportedModel(String),
 
-    #[cfg(feature = "cuda")]
     #[error("CUDA graph error: {0}")]
     CudaGraph(String),
 
-    #[cfg(feature = "nccl")]
     #[error("NCCL error: {0}")]
-    Nccl(#[from] NcclErrorWrapper),
+    Nccl(String),
 }
 
-/// Wrapper around `cudarc::nccl::result::NcclError` that provides useful
-/// `Debug` and `Display` output. The upstream type's `Debug` impl discards
-/// the `ncclResult_t` error code, printing only the opaque string "`NcclError`".
-#[cfg(feature = "nccl")]
-pub struct NcclErrorWrapper(pub cudarc::nccl::result::NcclError);
+// ---------------------------------------------------------------------------
+// Optional From impls for cudarc error types (enabled by `cuda-errors` feature)
+// ---------------------------------------------------------------------------
 
-#[cfg(feature = "nccl")]
-impl NcclErrorWrapper {
-    fn error_name(&self) -> &'static str {
+#[cfg(feature = "cuda-errors")]
+impl From<cudarc::driver::DriverError> for Error {
+    fn from(e: cudarc::driver::DriverError) -> Self {
+        Self::Cuda(e.to_string())
+    }
+}
+
+#[cfg(feature = "cuda-errors")]
+impl From<cudarc::cublas::result::CublasError> for Error {
+    fn from(e: cudarc::cublas::result::CublasError) -> Self {
+        Self::CuBlas(format!("{e:?}"))
+    }
+}
+
+#[cfg(feature = "cuda-errors")]
+impl From<cudarc::cublaslt::result::CublasError> for Error {
+    fn from(e: cudarc::cublaslt::result::CublasError) -> Self {
+        Self::CuBlasLt(format!("{e:?}"))
+    }
+}
+
+#[cfg(feature = "cuda-errors")]
+impl From<cudarc::nvrtc::result::NvrtcError> for Error {
+    fn from(e: cudarc::nvrtc::result::NvrtcError) -> Self {
+        Self::Nvrtc(format!("{e:?}"))
+    }
+}
+
+#[cfg(feature = "cuda-errors")]
+impl From<cudarc::nvrtc::CompileError> for Error {
+    fn from(e: cudarc::nvrtc::CompileError) -> Self {
+        Self::NvrtcCompile(e.to_string())
+    }
+}
+
+#[cfg(feature = "cuda-errors")]
+impl From<safetensors::SafeTensorError> for Error {
+    fn from(e: safetensors::SafeTensorError) -> Self {
+        Self::SafeTensors(e.to_string())
+    }
+}
+
+#[cfg(feature = "nccl-errors")]
+impl From<cudarc::nccl::result::NcclError> for Error {
+    fn from(e: cudarc::nccl::result::NcclError) -> Self {
         use cudarc::nccl::sys::ncclResult_t;
-        match self.0 .0 {
+        let name = match e.0 {
             ncclResult_t::ncclUnhandledCudaError => {
                 "ncclUnhandledCudaError (an unhandled CUDA error)"
             }
@@ -91,30 +124,7 @@ impl NcclErrorWrapper {
             }
             ncclResult_t::ncclInvalidUsage => "ncclInvalidUsage (invalid API usage)",
             _ => "unknown NCCL error code",
-        }
-    }
-}
-
-#[cfg(feature = "nccl")]
-impl std::fmt::Debug for NcclErrorWrapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.error_name())
-    }
-}
-
-#[cfg(feature = "nccl")]
-impl std::fmt::Display for NcclErrorWrapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.error_name())
-    }
-}
-
-#[cfg(feature = "nccl")]
-impl std::error::Error for NcclErrorWrapper {}
-
-#[cfg(feature = "nccl")]
-impl From<cudarc::nccl::result::NcclError> for Error {
-    fn from(e: cudarc::nccl::result::NcclError) -> Self {
-        Self::Nccl(NcclErrorWrapper(e))
+        };
+        Self::Nccl(name.to_string())
     }
 }

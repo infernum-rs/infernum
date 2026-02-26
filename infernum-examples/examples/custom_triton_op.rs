@@ -23,9 +23,10 @@
 
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 
-use infernum::cuda::CudaContext;
 use infernum::tensor::Tensor;
-use infernum::{CudaTensor, DType, Result};
+use infernum::{DType, Result};
+use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaTensor;
 
 // ---------- Step 1: Load the pre-compiled PTX ----------
 //

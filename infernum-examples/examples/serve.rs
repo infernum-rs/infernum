@@ -26,9 +26,9 @@ use std::path::Path;
 use clap::Parser;
 use serde::Deserialize;
 
-use infernum::cuda::CudaContext;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{ChatTemplate, Result};
+use infernum_cuda::cuda::CudaContext;
 use infernum_deepseek::{DeepSeekModel, DeepSeekTemplate};
 use infernum_gemma::{GemmaModel, GemmaTemplate};
 use infernum_llama::{Llama3Template, LlamaModel, MistralTemplate};

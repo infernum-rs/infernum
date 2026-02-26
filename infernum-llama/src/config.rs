@@ -240,9 +240,9 @@ impl LlamaConfig {
     /// Returns an error if required metadata keys are missing.
     #[cfg(feature = "cuda")]
     pub fn from_gguf_metadata(
-        metadata: &std::collections::HashMap<String, infernum::weights::GgufValue>,
+        metadata: &std::collections::HashMap<String, infernum_cuda::weights::GgufValue>,
     ) -> Result<Self> {
-        use infernum::weights::GgufValue;
+        use infernum_cuda::weights::GgufValue;
 
         let get_usize = |key: &str| -> Result<usize> {
             metadata

@@ -15,10 +15,14 @@
     unused_mut
 )]
 
+use std::marker::PhantomData;
 use std::path::Path;
 
-use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::ops::{
+use infernum::backend::Backend;
+use infernum::dtype::DType;
+use infernum::tensor::Tensor;
+use infernum::Result;
+use infernum_cuda::cuda::ops::{
     add_inplace, apply_rope, apply_rope_batched, apply_rope_batched_indirect, cast_from_f32,
     cast_to_f32, embedding_gather, embedding_gather_from_device, fused_attention_prefill,
     gather_paged_kv, geglu, matmul, matmul_bf16_f32, paged_attention_decode,
@@ -26,14 +30,15 @@ use infernum::cuda::ops::{
     rms_norm_inplace, scale_inplace, split_inner_dim, transpose_2d,
 };
 #[cfg(feature = "nccl")]
-use infernum::cuda::{shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy};
-use infernum::cuda::{
+use infernum_cuda::cuda::{
+    shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy,
+};
+use infernum_cuda::cuda::{
     BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
 };
-use infernum::dtype::DType;
-use infernum::tensor::Tensor;
-use infernum::weights::{SafeTensorsLoader, WeightLoader};
-use infernum::Result;
+use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
+use infernum_cuda::BlockTable;
+use infernum_cuda::CudaBackend;
 
 use crate::GemmaConfig;
 
@@ -185,7 +190,7 @@ struct GemmaLayerWeights {
 }
 
 /// Gemma model supporting both Gemma 2 and Gemma 3 text architectures.
-pub struct GemmaModel {
+pub struct GemmaModel<B: Backend> {
     config: GemmaConfig,
     ctx: CudaContext,
     #[allow(dead_code)]
@@ -198,9 +203,9 @@ pub struct GemmaModel {
     tp_num_kv_heads: usize,
     dtype: DType,
 
-    embed_tokens: CudaTensor,
+    embed_tokens: B::Tensor,
     layers: Vec<GemmaLayerWeights>,
-    norm: CudaTensor,
+    norm: B::Tensor,
     lm_head: LinearWeight,
 
     /// Embedding scale factor: sqrt(hidden_size)
@@ -210,14 +215,16 @@ pub struct GemmaModel {
     attn_scale: f32,
 
     // RoPE caches — Gemma 2: single set, Gemma 3: two sets (local + global)
-    cos_cache: CudaTensor,
-    sin_cache: CudaTensor,
+    cos_cache: B::Tensor,
+    sin_cache: B::Tensor,
     // Gemma 3 dual-theta RoPE: separate cache for full-attention layers
-    cos_cache_global: Option<CudaTensor>,
-    sin_cache_global: Option<CudaTensor>,
+    cos_cache_global: Option<B::Tensor>,
+    sin_cache_global: Option<B::Tensor>,
+
+    _backend: PhantomData<B>,
 }
 
-impl GemmaModel {
+impl GemmaModel<CudaBackend> {
     /// Load a Gemma model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
@@ -528,6 +535,7 @@ impl GemmaModel {
             sin_cache,
             cos_cache_global,
             sin_cache_global,
+            _backend: PhantomData,
         })
     }
 
@@ -873,6 +881,7 @@ impl GemmaModel {
             sin_cache,
             cos_cache_global,
             sin_cache_global,
+            _backend: PhantomData,
         })
     }
 
@@ -1525,7 +1534,7 @@ fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
 // --- Model trait implementation ---
 
 #[allow(private_bounds)]
-impl infernum::Model for GemmaModel {
+impl infernum_cuda::Model for GemmaModel<CudaBackend> {
     fn config(&self) -> infernum::ModelConfig {
         infernum::ModelConfig {
             num_layers: self.config.num_hidden_layers,
@@ -1661,7 +1670,7 @@ impl infernum::Model for GemmaModel {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum::ShardedLoadable for GemmaModel {
+impl infernum_cuda::ShardedLoadable for GemmaModel<CudaBackend> {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,

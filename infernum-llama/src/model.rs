@@ -7,10 +7,13 @@
     unused_mut // variables are conditionally mutated via cfg(feature = "nccl")
 )]
 
+use std::marker::PhantomData;
 use std::path::Path;
 
-use infernum::cuda::block_allocator::BlockTable;
-use infernum::cuda::ops::{
+use infernum::backend::{Backend, MatmulOps};
+use infernum::dtype::DType;
+use infernum::tensor::Tensor;
+use infernum_cuda::cuda::ops::{
     add_inplace, add_rmsnorm, apply_rope, apply_rope_batched, apply_rope_batched_indirect,
     cast_from_f32, cast_to_f32, embedding_gather, embedding_gather_from_device,
     fused_attention_prefill, gather_paged_kv, linear, matmul, matmul_bf16_f32,
@@ -18,12 +21,14 @@ use infernum::cuda::ops::{
     rms_norm_inplace, split_inner_dim, swiglu, transpose_2d, LinearWeight,
 };
 #[cfg(feature = "nccl")]
-use infernum::cuda::{shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy};
-use infernum::cuda::{
+use infernum_cuda::cuda::{
+    shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy,
+};
+use infernum_cuda::cuda::{
     BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
 };
-use infernum::dtype::DType;
-use infernum::tensor::Tensor;
+use infernum_cuda::BlockTable;
+use infernum_cuda::CudaBackend;
 
 #[cfg(feature = "nccl")]
 fn nccl_all_reduce(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor) -> Result<()> {
@@ -33,8 +38,8 @@ fn nccl_all_reduce(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor) -> 
     Ok(())
 }
 
-use infernum::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 use infernum::Result;
+use infernum_cuda::weights::{GgufLoader, SafeTensorsLoader, WeightLoader};
 
 use crate::LlamaConfig;
 
@@ -150,84 +155,80 @@ fn load_typed_sharded(
 }
 
 /// K+V projection storage: fused for dense weights, separate for quantized.
-enum KvProjWeight {
+enum KvProjWeight<B: Backend + MatmulOps> {
     /// K and V weights concatenated into a single (hidden, 2*kv_dim) dense
     /// tensor. After matmul the output columns split as `[k(kv_dim), v(kv_dim)]`.
-    Fused { weight: CudaTensor, kv_dim: usize },
+    Fused { weight: B::Tensor, kv_dim: usize },
     /// Separate K and V projections (used for quantized weights).
     Separate {
-        k_proj: Box<LinearWeight>,
-        v_proj: Box<LinearWeight>,
+        k_proj: Box<<B as MatmulOps>::LinearWeight>,
+        v_proj: Box<<B as MatmulOps>::LinearWeight>,
     },
 }
 
 /// Weights for a single Llama attention layer
-struct LlamaAttentionWeights {
-    q_proj: LinearWeight,
-    kv_proj: KvProjWeight,
-    o_proj: LinearWeight,
+struct LlamaAttentionWeights<B: Backend + MatmulOps> {
+    q_proj: <B as MatmulOps>::LinearWeight,
+    kv_proj: KvProjWeight<B>,
+    o_proj: <B as MatmulOps>::LinearWeight,
 }
 
 /// Gate+Up projection storage: fused for dense weights, separate for quantized.
-enum GateUpWeight {
+enum GateUpWeight<B: Backend + MatmulOps> {
     /// Gate and up weights concatenated into a single (hidden, 2*intermediate)
     /// dense tensor. After matmul the output columns split as
     /// `[gate(intermediate), up(intermediate)]`.
     Fused {
-        weight: CudaTensor,
+        weight: B::Tensor,
         intermediate_size: usize,
     },
     /// Separate gate and up projections (used for quantized weights).
     Separate {
-        gate_proj: Box<LinearWeight>,
-        up_proj: Box<LinearWeight>,
+        gate_proj: Box<<B as MatmulOps>::LinearWeight>,
+        up_proj: Box<<B as MatmulOps>::LinearWeight>,
     },
 }
 
 /// Weights for a single Llama MLP layer
-struct LlamaMlpWeights {
-    gate_up: GateUpWeight,
-    down_proj: LinearWeight,
+struct LlamaMlpWeights<B: Backend + MatmulOps> {
+    gate_up: GateUpWeight<B>,
+    down_proj: <B as MatmulOps>::LinearWeight,
 }
 
 /// Weights for a single `MoE` expert (same structure as a dense MLP).
-struct MoeExpertWeights {
-    mlp: LlamaMlpWeights,
+struct MoeExpertWeights<B: Backend + MatmulOps> {
+    mlp: LlamaMlpWeights<B>,
 }
 
 /// Feed-forward network weights: either a single dense MLP or a Mixture-of-Experts layer.
-enum FfnWeights {
+enum FfnWeights<B: Backend + MatmulOps> {
     /// Standard dense MLP (Llama, etc.)
-    Dense(Box<LlamaMlpWeights>),
+    Dense(Box<LlamaMlpWeights<B>>),
     /// Mixture-of-Experts (Mixtral, etc.)
     Moe {
         /// Router gate weight, pre-transposed: shape `[hidden_size, num_experts]`
-        gate: CudaTensor,
+        gate: B::Tensor,
         /// Per-expert MLP weights
-        experts: Vec<MoeExpertWeights>,
+        experts: Vec<MoeExpertWeights<B>>,
         /// How many experts to activate per token
         num_experts_per_tok: usize,
     },
 }
 
 /// Weights for a single Llama decoder layer
-struct LlamaLayerWeights {
-    input_layernorm: CudaTensor,
-    attention: LlamaAttentionWeights,
-    post_attention_layernorm: CudaTensor,
-    ffn: FfnWeights,
+struct LlamaLayerWeights<B: Backend + MatmulOps> {
+    input_layernorm: B::Tensor,
+    attention: LlamaAttentionWeights<B>,
+    post_attention_layernorm: B::Tensor,
+    ffn: FfnWeights<B>,
 }
 
-/// Complete Llama model, generic over the compute dtype `T`.
+/// Complete Llama model, generic over the compute backend `B`.
 ///
-/// `T` is the dtype for activations, weights, and KV cache. Supported: `f32`, `f16`, `bf16`.
-///
-/// - `LlamaModel`: standard f32 model (also supports GGUF quantized weights)
-/// - `LlamaModel`: bf16 model (SafeTensors only)
-/// - `LlamaModel`: f16 model (SafeTensors only)
-///
-/// Logits are always returned as `CudaTensor` (cast at the lm_head output).
-pub struct LlamaModel {
+/// The backend determines the tensor type and linear weight representation.
+/// All CUDA-specific methods (loading, attention, paged KV) are implemented
+/// on `LlamaModel<CudaBackend>`.
+pub struct LlamaModel<B: Backend + MatmulOps> {
     config: LlamaConfig,
     dtype: DType,
     ctx: CudaContext,
@@ -242,23 +243,25 @@ pub struct LlamaModel {
     tp_num_kv_heads: usize,
 
     // Embeddings
-    embed_tokens: CudaTensor,
+    embed_tokens: B::Tensor,
 
     // Transformer layers
-    layers: Vec<LlamaLayerWeights>,
+    layers: Vec<LlamaLayerWeights<B>>,
 
     // Final layer norm
-    norm: CudaTensor,
+    norm: B::Tensor,
 
     // Output projection (may be tied to embed_tokens)
-    lm_head: LinearWeight,
+    lm_head: <B as MatmulOps>::LinearWeight,
 
     // RoPE caches (stored in model dtype)
-    cos_cache: CudaTensor,
-    sin_cache: CudaTensor,
+    cos_cache: B::Tensor,
+    sin_cache: B::Tensor,
+
+    _backend: PhantomData<B>,
 }
 
-impl LlamaModel {
+impl LlamaModel<CudaBackend> {
     /// Load a Llama model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
@@ -398,7 +401,7 @@ impl LlamaModel {
             layer_prefix: &str,
             config: &LlamaConfig,
             qc: Option<&crate::QuantizationConfig>,
-        ) -> Result<LlamaMlpWeights> {
+        ) -> Result<LlamaMlpWeights<CudaBackend>> {
             let gate = load_linear(
                 dtype,
                 ctx,
@@ -414,11 +417,13 @@ impl LlamaModel {
                 qc,
             )?;
             let gate_up = match (gate, up) {
-                (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
-                    weight: concat_weights(&g, &u)?,
-                    intermediate_size: config.intermediate_size,
-                },
-                (g, u) => GateUpWeight::Separate {
+                (LinearWeight::Dense(g), LinearWeight::Dense(u)) => {
+                    GateUpWeight::<CudaBackend>::Fused {
+                        weight: concat_weights(&g, &u)?,
+                        intermediate_size: config.intermediate_size,
+                    }
+                }
+                (g, u) => GateUpWeight::<CudaBackend>::Separate {
                     gate_proj: Box::new(g),
                     up_proj: Box::new(u),
                 },
@@ -449,7 +454,7 @@ impl LlamaModel {
             layer_prefix: &str,
             config: &LlamaConfig,
             qc: Option<&crate::QuantizationConfig>,
-        ) -> Result<FfnWeights> {
+        ) -> Result<FfnWeights<CudaBackend>> {
             let num_experts = config
                 .num_local_experts
                 .expect("MoE requires num_local_experts");
@@ -471,11 +476,13 @@ impl LlamaModel {
                 let gate_proj = load_linear(dtype, ctx, loader, &format!("{ep}.w1.weight"), qc)?;
                 let up_proj = load_linear(dtype, ctx, loader, &format!("{ep}.w3.weight"), qc)?;
                 let gate_up = match (gate_proj, up_proj) {
-                    (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
-                        weight: concat_weights(&g, &u)?,
-                        intermediate_size: config.intermediate_size,
-                    },
-                    (g, u) => GateUpWeight::Separate {
+                    (LinearWeight::Dense(g), LinearWeight::Dense(u)) => {
+                        GateUpWeight::<CudaBackend>::Fused {
+                            weight: concat_weights(&g, &u)?,
+                            intermediate_size: config.intermediate_size,
+                        }
+                    }
+                    (g, u) => GateUpWeight::<CudaBackend>::Separate {
                         gate_proj: Box::new(g),
                         up_proj: Box::new(u),
                     },
@@ -486,7 +493,7 @@ impl LlamaModel {
                 });
             }
 
-            Ok(FfnWeights::Moe {
+            Ok(FfnWeights::<CudaBackend>::Moe {
                 gate,
                 experts,
                 num_experts_per_tok,
@@ -535,12 +542,12 @@ impl LlamaModel {
                     )?;
                     let kv_proj = match (k, v) {
                         (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
-                            KvProjWeight::Fused {
+                            KvProjWeight::<CudaBackend>::Fused {
                                 kv_dim: config.num_kv_heads() * config.head_dim(),
                                 weight: concat_weights(&k_w, &v_w)?,
                             }
                         }
-                        (k, v) => KvProjWeight::Separate {
+                        (k, v) => KvProjWeight::<CudaBackend>::Separate {
                             k_proj: Box::new(k),
                             v_proj: Box::new(v),
                         },
@@ -572,7 +579,7 @@ impl LlamaModel {
                 ffn: if config.is_moe() {
                     load_moe_weights(dtype, ctx, loader, &prefix, &config, qc)?
                 } else {
-                    FfnWeights::Dense(Box::new(load_dense_mlp(
+                    FfnWeights::<CudaBackend>::Dense(Box::new(load_dense_mlp(
                         dtype, ctx, loader, &prefix, &config, qc,
                     )?))
                 },
@@ -657,6 +664,7 @@ impl LlamaModel {
             lm_head,
             cos_cache,
             sin_cache,
+            _backend: PhantomData,
         })
     }
 
@@ -769,7 +777,7 @@ impl LlamaModel {
             config: &LlamaConfig,
             shard: &ShardConfig,
             qc: Option<&crate::QuantizationConfig>,
-        ) -> Result<FfnWeights> {
+        ) -> Result<FfnWeights<CudaBackend>> {
             let num_experts = config
                 .num_local_experts
                 .expect("MoE requires num_local_experts");
@@ -809,7 +817,7 @@ impl LlamaModel {
                 )?;
 
                 // Keep gate/up separate (same as dense sharded MLP)
-                let gate_up = GateUpWeight::Separate {
+                let gate_up = GateUpWeight::<CudaBackend>::Separate {
                     gate_proj: Box::new(gate_proj),
                     up_proj: Box::new(up_proj),
                 };
@@ -830,7 +838,7 @@ impl LlamaModel {
                 });
             }
 
-            Ok(FfnWeights::Moe {
+            Ok(FfnWeights::<CudaBackend>::Moe {
                 gate,
                 experts,
                 num_experts_per_tok,
@@ -927,7 +935,7 @@ impl LlamaModel {
 
                     // With TP we keep K/V separate — fusing sharded weights
                     // would require matching the shard boundary to the K/V split.
-                    let kv_proj = KvProjWeight::Separate {
+                    let kv_proj = KvProjWeight::<CudaBackend>::Separate {
                         k_proj: Box::new(k_proj),
                         v_proj: Box::new(v_proj),
                     };
@@ -979,12 +987,12 @@ impl LlamaModel {
                     )?;
 
                     // Keep gate/up separate for the same reason as K/V
-                    let gate_up = GateUpWeight::Separate {
+                    let gate_up = GateUpWeight::<CudaBackend>::Separate {
                         gate_proj: Box::new(gate),
                         up_proj: Box::new(up),
                     };
 
-                    FfnWeights::Dense(Box::new(LlamaMlpWeights {
+                    FfnWeights::<CudaBackend>::Dense(Box::new(LlamaMlpWeights {
                         gate_up,
                         down_proj: load_linear_sharded(
                             dtype,
@@ -1043,6 +1051,7 @@ impl LlamaModel {
             lm_head,
             cos_cache,
             sin_cache,
+            _backend: PhantomData,
         })
     }
 
@@ -1208,7 +1217,7 @@ impl LlamaModel {
     fn forward_layer_paged_decode(
         &self,
         hidden: &CudaTensor,
-        layer: &LlamaLayerWeights,
+        layer: &LlamaLayerWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
@@ -1246,7 +1255,7 @@ impl LlamaModel {
     fn forward_attention_paged_decode(
         &self,
         hidden: &CudaTensor,
-        weights: &LlamaAttentionWeights,
+        weights: &LlamaAttentionWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
@@ -1260,7 +1269,7 @@ impl LlamaModel {
         // Batch Q/K/V projections: (batch_size, hidden) -> (batch_size, proj_dim)
         let q = linear(hidden, &weights.q_proj)?;
         let (k, v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
+            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
                 if batch_size == 1 {
                     let k = kv.slice_view(0, &[1, *kv_dim]);
@@ -1270,7 +1279,7 @@ impl LlamaModel {
                     split_kv(&kv, *kv_dim)?
                 }
             }
-            KvProjWeight::Separate { k_proj, v_proj } => {
+            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
                 let v = linear(hidden, v_proj)?;
                 (k, v)
@@ -1348,7 +1357,7 @@ impl LlamaModel {
     fn forward_layer_paged_decode_indirect(
         &self,
         hidden: &CudaTensor,
-        layer: &LlamaLayerWeights,
+        layer: &LlamaLayerWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
@@ -1383,7 +1392,7 @@ impl LlamaModel {
     fn forward_attention_paged_decode_indirect(
         &self,
         hidden: &CudaTensor,
-        weights: &LlamaAttentionWeights,
+        weights: &LlamaAttentionWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         graph_inputs: &BatchedGraphInputs,
@@ -1397,7 +1406,7 @@ impl LlamaModel {
         // Batched Q/K/V projections
         let q = linear(hidden, &weights.q_proj)?;
         let (k, v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
+            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
                 if batch_size == 1 {
                     let k = kv.slice_view(0, &[1, *kv_dim]);
@@ -1407,7 +1416,7 @@ impl LlamaModel {
                     split_kv(&kv, *kv_dim)?
                 }
             }
-            KvProjWeight::Separate { k_proj, v_proj } => {
+            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
                 let v = linear(hidden, v_proj)?;
                 (k, v)
@@ -1478,7 +1487,7 @@ impl LlamaModel {
     fn forward_layer_paged_prefill(
         &self,
         hidden: &CudaTensor,
-        layer: &LlamaLayerWeights,
+        layer: &LlamaLayerWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
@@ -1517,7 +1526,7 @@ impl LlamaModel {
     fn forward_attention_paged_prefill(
         &self,
         hidden: &CudaTensor,
-        weights: &LlamaAttentionWeights,
+        weights: &LlamaAttentionWeights<CudaBackend>,
         layer_idx: usize,
         paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
@@ -1531,11 +1540,11 @@ impl LlamaModel {
         // Project Q, K, V
         let q = linear(hidden, &weights.q_proj)?;
         let (k, v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
+            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
                 split_kv(&kv, *kv_dim)?
             }
-            KvProjWeight::Separate { k_proj, v_proj } => {
+            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
                 let v = linear(hidden, v_proj)?;
                 (k, v)
@@ -1581,9 +1590,13 @@ impl LlamaModel {
     /// Transformer layer forward pass using indirect kernels.
     /// Forward pass through MLP (SwiGLU)
     #[allow(clippy::unused_self)]
-    fn forward_mlp(&self, hidden: &CudaTensor, weights: &LlamaMlpWeights) -> Result<CudaTensor> {
+    fn forward_mlp(
+        &self,
+        hidden: &CudaTensor,
+        weights: &LlamaMlpWeights<CudaBackend>,
+    ) -> Result<CudaTensor> {
         let (gate, up) = match &weights.gate_up {
-            GateUpWeight::Fused {
+            GateUpWeight::<CudaBackend>::Fused {
                 weight,
                 intermediate_size,
             } => {
@@ -1600,7 +1613,7 @@ impl LlamaModel {
                     split_gate_up(&gate_up, *intermediate_size)?
                 }
             }
-            GateUpWeight::Separate { gate_proj, up_proj } => {
+            GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
                 let gate = linear(hidden, gate_proj)?;
                 let up = linear(hidden, up_proj)?;
                 (gate, up)
@@ -1626,10 +1639,10 @@ impl LlamaModel {
     fn forward_mlp_no_reduce(
         &self,
         hidden: &CudaTensor,
-        weights: &LlamaMlpWeights,
+        weights: &LlamaMlpWeights<CudaBackend>,
     ) -> Result<CudaTensor> {
         let (gate, up) = match &weights.gate_up {
-            GateUpWeight::Fused {
+            GateUpWeight::<CudaBackend>::Fused {
                 weight,
                 intermediate_size,
             } => {
@@ -1643,7 +1656,7 @@ impl LlamaModel {
                     split_gate_up(&gate_up, *intermediate_size)?
                 }
             }
-            GateUpWeight::Separate { gate_proj, up_proj } => {
+            GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
                 let gate = linear(hidden, gate_proj)?;
                 let up = linear(hidden, up_proj)?;
                 (gate, up)
@@ -1655,10 +1668,14 @@ impl LlamaModel {
     }
 
     /// Dispatch to dense MLP or MoE forward pass.
-    fn forward_ffn(&self, hidden: &CudaTensor, ffn: &FfnWeights) -> Result<CudaTensor> {
+    fn forward_ffn(
+        &self,
+        hidden: &CudaTensor,
+        ffn: &FfnWeights<CudaBackend>,
+    ) -> Result<CudaTensor> {
         match ffn {
-            FfnWeights::Dense(mlp) => self.forward_mlp(hidden, mlp),
-            FfnWeights::Moe {
+            FfnWeights::<CudaBackend>::Dense(mlp) => self.forward_mlp(hidden, mlp),
+            FfnWeights::<CudaBackend>::Moe {
                 gate,
                 experts,
                 num_experts_per_tok,
@@ -1675,10 +1692,10 @@ impl LlamaModel {
         &self,
         hidden: &CudaTensor,
         gate: &CudaTensor,
-        experts: &[MoeExpertWeights],
+        experts: &[MoeExpertWeights<CudaBackend>],
         num_experts_per_tok: usize,
     ) -> Result<CudaTensor> {
-        let mut out = infernum::cuda::moe::moe_forward(
+        let mut out = infernum_cuda::cuda::moe::moe_forward(
             hidden,
             gate,
             experts.len(),
@@ -1710,7 +1727,7 @@ impl LlamaModel {
 }
 
 /// Methods only available for `LlamaModel` (GGUF loading, non-cached forward)
-impl LlamaModel {
+impl LlamaModel<CudaBackend> {
     /// Load a Llama model from a GGUF file containing quantized weights
     ///
     /// # Errors
@@ -1784,12 +1801,12 @@ impl LlamaModel {
                     let v = load_linear(ctx, loader, &format!("{prefix}.attn_v.weight"))?;
                     let kv_proj = match (k, v) {
                         (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
-                            KvProjWeight::Fused {
+                            KvProjWeight::<CudaBackend>::Fused {
                                 kv_dim: config.num_kv_heads() * config.head_dim(),
                                 weight: concat_weights(&k_w, &v_w)?,
                             }
                         }
-                        (k, v) => KvProjWeight::Separate {
+                        (k, v) => KvProjWeight::<CudaBackend>::Separate {
                             k_proj: Box::new(k),
                             v_proj: Box::new(v),
                         },
@@ -1812,16 +1829,18 @@ impl LlamaModel {
                     let gate = load_linear(ctx, loader, &format!("{prefix}.ffn_gate.weight"))?;
                     let up = load_linear(ctx, loader, &format!("{prefix}.ffn_up.weight"))?;
                     let gate_up = match (gate, up) {
-                        (LinearWeight::Dense(g), LinearWeight::Dense(u)) => GateUpWeight::Fused {
-                            weight: concat_weights(&g, &u)?,
-                            intermediate_size: config.intermediate_size,
-                        },
-                        (g, u) => GateUpWeight::Separate {
+                        (LinearWeight::Dense(g), LinearWeight::Dense(u)) => {
+                            GateUpWeight::<CudaBackend>::Fused {
+                                weight: concat_weights(&g, &u)?,
+                                intermediate_size: config.intermediate_size,
+                            }
+                        }
+                        (g, u) => GateUpWeight::<CudaBackend>::Separate {
                             gate_proj: Box::new(g),
                             up_proj: Box::new(u),
                         },
                     };
-                    FfnWeights::Dense(Box::new(LlamaMlpWeights {
+                    FfnWeights::<CudaBackend>::Dense(Box::new(LlamaMlpWeights {
                         gate_up,
                         down_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_down.weight"))?,
                     }))
@@ -1884,6 +1903,7 @@ impl LlamaModel {
             lm_head,
             cos_cache,
             sin_cache,
+            _backend: PhantomData,
         })
     }
 
@@ -1916,7 +1936,11 @@ impl LlamaModel {
     }
 
     /// Forward pass through a single transformer layer (no KV cache)
-    fn forward_layer(&self, hidden: &CudaTensor, layer: &LlamaLayerWeights) -> Result<CudaTensor> {
+    fn forward_layer(
+        &self,
+        hidden: &CudaTensor,
+        layer: &LlamaLayerWeights<CudaBackend>,
+    ) -> Result<CudaTensor> {
         let _seq_len = hidden.shape()[0];
         let _hidden_size = self.config.hidden_size;
 
@@ -1946,7 +1970,7 @@ impl LlamaModel {
     fn forward_attention(
         &self,
         hidden: &CudaTensor,
-        weights: &LlamaAttentionWeights,
+        weights: &LlamaAttentionWeights<CudaBackend>,
     ) -> Result<CudaTensor> {
         let seq_len = hidden.shape()[0];
         let num_heads = self.tp_num_heads;
@@ -1956,11 +1980,11 @@ impl LlamaModel {
         // Project Q, K, V
         let q = linear(hidden, &weights.q_proj)?;
         let (k, v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
+            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                 let kv = matmul(hidden, weight)?;
                 split_kv(&kv, *kv_dim)?
             }
-            KvProjWeight::Separate { k_proj, v_proj } => {
+            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                 let k = linear(hidden, k_proj)?;
                 let v = linear(hidden, v_proj)?;
                 (k, v)
@@ -1990,7 +2014,7 @@ impl LlamaModel {
     }
 }
 
-impl infernum::Model for LlamaModel {
+impl infernum_cuda::Model for LlamaModel<CudaBackend> {
     fn config(&self) -> infernum::ModelConfig {
         let config = self.config();
         infernum::ModelConfig {
@@ -2022,11 +2046,11 @@ impl infernum::Model for LlamaModel {
 
             let q = linear(&normed, &layer.attention.q_proj)?;
             let (k, v) = match &layer.attention.kv_proj {
-                KvProjWeight::Fused { weight, kv_dim } => {
+                KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
                     let kv = matmul(&normed, weight)?;
                     split_kv(&kv, *kv_dim)?
                 }
-                KvProjWeight::Separate { k_proj, v_proj } => {
+                KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
                     let k = linear(&normed, k_proj)?;
                     let v = linear(&normed, v_proj)?;
                     (k, v)
@@ -2095,7 +2119,7 @@ impl infernum::Model for LlamaModel {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum::ShardedLoadable for LlamaModel {
+impl infernum_cuda::ShardedLoadable for LlamaModel<CudaBackend> {
     fn load_shard(
         ctx: &CudaContext,
         model_path: &Path,
@@ -2427,7 +2451,7 @@ mod tests {
         loader
     }
 
-    fn build_tiny_model(ctx: &CudaContext) -> LlamaModel {
+    fn build_tiny_model(ctx: &CudaContext) -> LlamaModel<CudaBackend> {
         let config = tiny_config();
         let loader = tiny_weight_loader(&config);
         LlamaModel::load_weights(ctx, config, &loader).expect("Failed to build tiny model")
@@ -2629,7 +2653,7 @@ mod tests {
         loader
     }
 
-    fn build_tiny_gptq_model(ctx: &CudaContext) -> LlamaModel {
+    fn build_tiny_gptq_model(ctx: &CudaContext) -> LlamaModel<CudaBackend> {
         let config = tiny_gptq_config();
         let loader = tiny_gptq_weight_loader(&config);
         LlamaModel::load_weights(ctx, config, &loader).expect("Failed to build tiny GPTQ model")
