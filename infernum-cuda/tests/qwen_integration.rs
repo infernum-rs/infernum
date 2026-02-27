@@ -1,90 +1,21 @@
-//! Integration tests that download real models and verify generation output.
+//! Integration tests for Qwen model family (Qwen2/2.5, Qwen3, Qwen3-MoE).
 //!
-//! Gated behind the `integration` feature so they don't run during normal
-//! `cargo test`. Run with:
-//!
-//!   cargo test -p infernum-qwen --features integration -- --test-threads=1
-//!
-//! Models are cached in `~/.cache/infernum/models/`, so subsequent runs are fast.
+//! Run with:
+//!   cargo test -p infernum-cuda --features integration -- --test-threads=1 qwen
 #![cfg(feature = "integration")]
 
-use std::fs;
+mod test_helpers;
+
 use std::path::PathBuf;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
 use infernum_cuda::CudaBackend;
 use infernum_qwen::QwenModel;
 use infernum_runtime::Runtime;
 
-/// Files needed from a HuggingFace repo to load a SafeTensors model.
-const REQUIRED_FILES: &[&str] = &[
-    "config.json",
-    "model.safetensors",
-    "tokenizer.json",
-    "tokenizer_config.json",
-];
-
-/// Download a single file from HuggingFace Hub to `dest`.
-///
-/// Streams directly to disk to avoid buffering large files in memory.
-/// Skips the download if `dest` already exists.
-fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
-    if dest.exists() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).expect("Failed to create cache directory");
-    }
-
-    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
-    let response = ureq::get(&url).call().unwrap_or_else(|e| {
-        panic!("Failed to download {repo_id}/{filename}: {e}");
-    });
-
-    let tmp_dest = dest.with_extension("tmp");
-    let mut file = fs::File::create(&tmp_dest)
-        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp_dest.display()));
-    std::io::copy(&mut response.into_body().as_reader(), &mut file)
-        .unwrap_or_else(|e| panic!("Failed to download {filename}: {e}"));
-    fs::rename(&tmp_dest, dest)
-        .unwrap_or_else(|e| panic!("Failed to rename {}: {e}", tmp_dest.display()));
-}
-
-/// Download a model from HuggingFace Hub and return the local directory path.
-///
-/// Files are cached in `~/.cache/infernum/models/<org>/<model>/`.
-fn download_model(repo_id: &str) -> PathBuf {
-    download_model_files(repo_id, REQUIRED_FILES)
-}
-
-/// Download specific files from a HuggingFace model repo.
-fn download_model_files(repo_id: &str, files: &[&str]) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let cache_dir = PathBuf::from(home)
-        .join(".cache")
-        .join("infernum")
-        .join("models")
-        .join(repo_id);
-
-    for filename in files {
-        download_file(repo_id, filename, &cache_dir.join(filename));
-    }
-
-    cache_dir
-}
-
-/// Greedy generation options (deterministic, no sampling).
-fn greedy_options(max_tokens: usize) -> GenerateOptions {
-    GenerateOptions {
-        max_new_tokens: max_tokens,
-        sampling: None,
-        use_kv_cache: true,
-        ..GenerateOptions::default()
-    }
-}
+use test_helpers::{download_model, greedy_options};
 
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
@@ -101,7 +32,6 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
 
 // ─── Qwen2.5-0.5B (bf16, Q/K/V bias, tied embeddings) ──────────────────────
 
-/// Qwen/Qwen2.5-0.5B (ungated, ~987MB bf16, 24 layers, GQA 14/2, Q/K/V bias)
 mod qwen2_5_0_5b {
     use super::*;
 
@@ -237,14 +167,15 @@ mod qwen2_5_0_5b {
         let dec_text = tokenizer.decode(&decode_tokens).unwrap_or_default();
         assert_eq!(
             fwd_tokens, decode_tokens,
-            "Paged decode diverged from forward():\n  forward: {fwd_text:?}\n  decode:  {dec_text:?}"
+            "Paged decode diverged from forward():
+  forward: {fwd_text:?}
+  decode:  {dec_text:?}"
         );
     }
 }
 
 // ─── Qwen3-0.6B (bf16, QK-norm, no bias, tied embeddings) ──────────────────
 
-/// Qwen/Qwen3-0.6B (ungated, ~1.2GB bf16, 28 layers, GQA 16/8, QK-norm)
 mod qwen3_0_6b {
     use super::*;
 
@@ -287,11 +218,6 @@ mod qwen3_0_6b {
 
 // ─── Qwen3-MoE tiny (random weights, MoE plumbing test) ─────────────────────
 
-/// yujiepan/qwen3-moe-tiny-random (ungated, ~5MB, 2 layers, 8 experts top-2,
-/// decoder_sparse_step=2, head_dim=32, random weights)
-///
-/// Tests MoE loading and routing plumbing. Random weights produce garbage
-/// output so we only check no NaN/Inf.
 mod qwen3_moe_tiny {
     use super::*;
 

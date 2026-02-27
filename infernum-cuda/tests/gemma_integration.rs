@@ -1,90 +1,21 @@
-//! Integration tests that download real models and verify generation output.
+//! Integration tests for Gemma model family (Gemma 2, Gemma 3 text).
 //!
-//! Gated behind the `integration` feature so they don't run during normal
-//! `cargo test`. Run with:
-//!
-//!   cargo test -p infernum-gemma --features integration -- --test-threads=1
-//!
-//! Models are cached in `~/.cache/infernum/models/`, so subsequent runs are fast.
+//! Run with:
+//!   cargo test -p infernum-cuda --features integration -- --test-threads=1 gemma
 #![cfg(feature = "integration")]
 
-use std::fs;
+mod test_helpers;
+
 use std::path::PathBuf;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
 use infernum_cuda::CudaBackend;
 use infernum_gemma::GemmaModel;
 use infernum_runtime::Runtime;
 
-/// Files needed from a HuggingFace repo to load a SafeTensors model.
-const REQUIRED_FILES: &[&str] = &[
-    "config.json",
-    "model.safetensors",
-    "tokenizer.json",
-    "tokenizer_config.json",
-];
-
-/// Download a single file from HuggingFace Hub to `dest`.
-///
-/// Streams directly to disk to avoid buffering large files in memory.
-/// Skips the download if `dest` already exists.
-fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
-    if dest.exists() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).expect("Failed to create cache directory");
-    }
-
-    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
-    let response = ureq::get(&url).call().unwrap_or_else(|e| {
-        panic!("Failed to download {repo_id}/{filename}: {e}");
-    });
-
-    let tmp_dest = dest.with_extension("tmp");
-    let mut file = fs::File::create(&tmp_dest)
-        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp_dest.display()));
-    std::io::copy(&mut response.into_body().as_reader(), &mut file)
-        .unwrap_or_else(|e| panic!("Failed to download {filename}: {e}"));
-    fs::rename(&tmp_dest, dest)
-        .unwrap_or_else(|e| panic!("Failed to rename {}: {e}", tmp_dest.display()));
-}
-
-/// Download a model from HuggingFace Hub and return the local directory path.
-///
-/// Files are cached in `~/.cache/infernum/models/<org>/<model>/`.
-fn download_model(repo_id: &str) -> PathBuf {
-    download_model_files(repo_id, REQUIRED_FILES)
-}
-
-/// Download specific files from a HuggingFace model repo.
-fn download_model_files(repo_id: &str, files: &[&str]) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let cache_dir = PathBuf::from(home)
-        .join(".cache")
-        .join("infernum")
-        .join("models")
-        .join(repo_id);
-
-    for filename in files {
-        download_file(repo_id, filename, &cache_dir.join(filename));
-    }
-
-    cache_dir
-}
-
-/// Greedy generation options (deterministic, no sampling).
-fn greedy_options(max_tokens: usize) -> GenerateOptions {
-    GenerateOptions {
-        max_new_tokens: max_tokens,
-        sampling: None,
-        use_kv_cache: true,
-        ..GenerateOptions::default()
-    }
-}
+use test_helpers::{download_model, greedy_options};
 
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
@@ -101,12 +32,6 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
 
 // ─── Gemma 2 tiny random (random weights, architecture test) ────────────────
 
-/// yujiepan/gemma-2-tiny-random (ungated, ~2MB, 2 layers, hidden_size=8,
-/// head_dim=32, sliding_window=4096, softcapping, random weights)
-///
-/// Tests Gemma 2 architecture: 4 norms/layer, GeGLU, embedding scaling,
-/// query_pre_attn_scalar, attention logit softcapping, final logit softcapping,
-/// alternating sliding/full attention. Random weights — no quality check.
 mod gemma2_tiny_random {
     use super::*;
 
@@ -147,12 +72,6 @@ mod gemma2_tiny_random {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 
-    /// Verify paged decode produces logits consistent with non-paged forward().
-    ///
-    /// Runs forward() on a prompt to get reference logits, then runs the paged
-    /// prefill + decode path on the same tokens and compares the argmax at each
-    /// step. Catches bugs where paged_attention_decode receives wrong params
-    /// (e.g. attn_scale instead of softcap).
     #[test]
     fn paged_decode_matches_forward() {
         use infernum_cuda::cuda::PagedKvCache;
@@ -251,10 +170,6 @@ mod gemma2_tiny_random {
             prev_token = paged_next;
         }
 
-        // For random-weight models, decode token-level matching is too strict
-        // (flat logit distributions mean tiny numerical differences flip the
-        // argmax). The key correctness check is that prefill matches forward(),
-        // which we already verified above.
         println!(
             "Paged decode generated {} tokens (NaN-free)",
             generated.len()
@@ -264,13 +179,6 @@ mod gemma2_tiny_random {
 
 // ─── Gemma 3 text tiny random (random weights, architecture test) ───────────
 
-/// katuni4ka/tiny-random-gemma3-text (ungated, ~2MB, 2 layers, hidden_size=8,
-/// head_dim=16, sliding_window=512, sliding_window_pattern=6, QK-norm,
-/// dual-theta RoPE, random weights)
-///
-/// Tests Gemma 3 text architecture: QK-norm, dual RoPE theta (local + global),
-/// no softcapping, sliding_window_pattern auto-generation. Random weights —
-/// no quality check.
 mod gemma3_text_tiny_random {
     use super::*;
 
@@ -323,7 +231,6 @@ mod gemma3_text_tiny_random {
         let prompt_ids = tokenizer.encode("Hello world", true).unwrap();
         let num_decode_steps = 4;
 
-        // --- Reference: greedy decode via forward() ---
         let model_ref =
             GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let ref_logits = model_ref.forward_full(&prompt_ids).expect("forward");
@@ -338,7 +245,6 @@ mod gemma3_text_tiny_random {
             .unwrap()
             .0 as u32;
 
-        // --- Paged path ---
         let model_cfg = model_ref.model_config();
         let block_config = BlockConfig {
             block_size: 16,
@@ -362,7 +268,6 @@ mod gemma3_text_tiny_random {
             block_table.append_block(allocator.allocate().expect("alloc"));
         }
 
-        // Prefill
         let prefill_logits = model_ref
             .forward_prefill_paged(&prompt_ids, &mut paged_kv, &block_table, 0)
             .expect("prefill");
@@ -380,7 +285,6 @@ mod gemma3_text_tiny_random {
             "Prefill argmax diverged from forward()"
         );
 
-        // Decode steps
         let mut generated = vec![paged_first_token];
         let mut prev_token = paged_first_token;
         for step in 0..num_decode_steps {
@@ -417,8 +321,6 @@ mod gemma3_text_tiny_random {
 
 // ─── Gemma 2 2B (ungated, ignored, quality check) ──────────────────────────
 
-/// unsloth/gemma-2-2b (ungated mirror, ~5GB bf16) — validates Gemma 2
-/// generation quality with real weights. Requires ~10GB VRAM (loaded as f32).
 mod gemma2_2b {
     use super::*;
 
@@ -436,8 +338,6 @@ mod gemma2_2b {
             output.contains("city"),
             "Expected continuation containing 'city', got: {output}"
         );
-        // Reject degenerate repetition loops (e.g., "a city of contrasts, a
-        // city of contrasts...") by requiring enough unique words.
         let unique_words: std::collections::HashSet<&str> = output.split_whitespace().collect();
         assert!(
             unique_words.len() >= 15,
@@ -486,7 +386,6 @@ mod gemma2_2b {
             GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let model_cfg = model.model_config();
 
-        // forward() reference: greedy decode step-by-step (no KV cache)
         let mut fwd_ids = prompt_ids.clone();
         let mut fwd_tokens = Vec::new();
         for _step in 0..num_decode_steps {
@@ -506,7 +405,6 @@ mod gemma2_2b {
             fwd_ids.push(next_id);
         }
 
-        // Paged prefill + decode
         let block_config = BlockConfig {
             block_size: 16,
             num_blocks: 128,
@@ -561,20 +459,19 @@ mod gemma2_2b {
             prev_token = next_id;
         }
 
-        // Token-by-token match
         let fwd_text = tokenizer.decode(&fwd_tokens).unwrap_or_default();
         let dec_text = tokenizer.decode(&decode_tokens).unwrap_or_default();
         assert_eq!(
             fwd_tokens, decode_tokens,
-            "Paged decode diverged from forward():\n  forward: {fwd_text:?}\n  decode:  {dec_text:?}"
+            "Paged decode diverged from forward():
+  forward: {fwd_text:?}
+  decode:  {dec_text:?}"
         );
     }
 }
 
 // ─── Gemma 3 1B (ungated, ignored, quality check) ──────────────────────────
 
-/// unsloth/gemma-3-1b-it (ungated mirror, ~2GB bf16) — validates Gemma 3
-/// generation quality with real weights. Requires ~4GB VRAM (loaded as f32).
 mod gemma3_1b {
     use super::*;
 

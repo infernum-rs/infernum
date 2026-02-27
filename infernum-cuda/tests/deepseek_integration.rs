@@ -1,89 +1,20 @@
-//! Integration tests that download real models and verify generation output.
+//! Integration tests for DeepSeek model family (V3, R1).
 //!
-//! Gated behind the `integration` feature so they don't run during normal
-//! `cargo test`. Run with:
-//!
-//!   cargo test -p infernum-deepseek --features integration -- --test-threads=1
-//!
-//! Models are cached in `~/.cache/infernum/models/`, so subsequent runs are fast.
+//! Run with:
+//!   cargo test -p infernum-cuda --features integration -- --test-threads=1 deepseek
 #![cfg(feature = "integration")]
 
-use std::fs;
+mod test_helpers;
+
 use std::path::PathBuf;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::GenerateOptions;
 use infernum_cuda::cuda::CudaContext;
 use infernum_cuda::CudaBackend;
 use infernum_deepseek::DeepSeekModel;
 use infernum_runtime::Runtime;
 
-/// Files needed from a HuggingFace repo to load a SafeTensors model.
-const REQUIRED_FILES: &[&str] = &[
-    "config.json",
-    "model.safetensors",
-    "tokenizer.json",
-    "tokenizer_config.json",
-];
-
-/// Download a single file from HuggingFace Hub to `dest`.
-///
-/// Streams directly to disk to avoid buffering large files in memory.
-/// Skips the download if `dest` already exists.
-fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
-    if dest.exists() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).expect("Failed to create cache directory");
-    }
-
-    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
-    let response = ureq::get(&url).call().unwrap_or_else(|e| {
-        panic!("Failed to download {repo_id}/{filename}: {e}");
-    });
-
-    let tmp_dest = dest.with_extension("tmp");
-    let mut file = fs::File::create(&tmp_dest)
-        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp_dest.display()));
-    std::io::copy(&mut response.into_body().as_reader(), &mut file)
-        .unwrap_or_else(|e| panic!("Failed to download {filename}: {e}"));
-    fs::rename(&tmp_dest, dest)
-        .unwrap_or_else(|e| panic!("Failed to rename {}: {e}", tmp_dest.display()));
-}
-
-/// Download a model from HuggingFace Hub and return the local directory path.
-///
-/// Files are cached in `~/.cache/infernum/models/<org>/<model>/`.
-fn download_model(repo_id: &str) -> PathBuf {
-    download_model_files(repo_id, REQUIRED_FILES)
-}
-
-/// Download specific files from a HuggingFace model repo.
-fn download_model_files(repo_id: &str, files: &[&str]) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let cache_dir = PathBuf::from(home)
-        .join(".cache")
-        .join("infernum")
-        .join("models")
-        .join(repo_id);
-
-    for filename in files {
-        download_file(repo_id, filename, &cache_dir.join(filename));
-    }
-
-    cache_dir
-}
-
-/// Greedy generation options (deterministic, no sampling).
-fn greedy_options(max_tokens: usize) -> GenerateOptions {
-    GenerateOptions {
-        max_new_tokens: max_tokens,
-        sampling: None,
-        use_kv_cache: true,
-        ..GenerateOptions::default()
-    }
-}
+use test_helpers::{download_model, greedy_options};
 
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
@@ -100,12 +31,6 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
 
 // ─── DeepSeek-V3 tiny (random weights, MLA + MoE plumbing test) ─────────────
 
-/// yujiepan/deepseek-v3-tiny-random (ungated, ~8.8MB, 2 layers, 256 experts
-/// top-8, MLA with q_lora_rank=16, kv_lora_rank=16, random weights)
-///
-/// Tests MLA projection pipeline, sigmoid routing, shared expert,
-/// dense→MoE transition (first_k_dense_replace=1). Random weights
-/// produce garbage output so we only check no NaN/Inf.
 mod deepseek_v3_tiny {
     use super::*;
 
@@ -147,8 +72,7 @@ mod deepseek_v3_tiny {
     }
 
     /// Tests batched decode via the `Model::forward_batch_decode` trait
-    /// method with device tensors. This validates the batched forward
-    /// path used by the inflight batching engine.
+    /// method with device tensors.
     #[test]
     #[allow(clippy::cast_possible_wrap)]
     fn batched_decode_no_nan() {

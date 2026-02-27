@@ -908,13 +908,19 @@ dependencies = [
  "cudarc",
  "half",
  "infernum",
+ "infernum-deepseek",
+ "infernum-gemma",
+ "infernum-llama",
  "infernum-macros",
+ "infernum-qwen",
+ "infernum-runtime",
  "inventory",
  "memmap2",
  "num-traits",
  "safetensors",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
@@ -923,11 +929,8 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
- "infernum-cuda",
- "infernum-runtime",
  "serde",
  "serde_json",
- "ureq",
 ]
 
 [[package]]
@@ -955,11 +958,8 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
- "infernum-cuda",
- "infernum-runtime",
  "serde",
  "serde_json",
- "ureq",
 ]
 
 [[package]]
@@ -968,11 +968,8 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
- "infernum-cuda",
- "infernum-runtime",
  "serde",
  "serde_json",
- "ureq",
 ]
 
 [[package]]
@@ -990,11 +987,8 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
- "infernum-cuda",
- "infernum-runtime",
  "serde",
  "serde_json",
- "ureq",
 ]
 
 [[package]]
@@ -1002,9 +996,6 @@ name = "infernum-runtime"
 version = "0.1.0"
 dependencies = [
  "infernum",
- "infernum-cuda",
- "infernum-llama",
- "ureq",
 ]
 
 [[package]]
