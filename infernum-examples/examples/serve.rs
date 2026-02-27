@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "gemma2" | "gemma3_text" => {
-            let model = GemmaModel::from_pretrained(&ctx, &cli.model)?;
+            let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         other => {

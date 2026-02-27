@@ -9,19 +9,15 @@
 
 mod chat_templates;
 mod config;
-#[cfg(feature = "cuda")]
 mod model;
 
 pub use chat_templates::GemmaTemplate;
 
 pub use config::GemmaConfig;
-#[cfg(feature = "cuda")]
 pub use model::GemmaModel;
 
 /// Type alias for Gemma 2 models (`model_type: "gemma2"`)
-#[cfg(feature = "cuda")]
 pub type Gemma2Model<B> = GemmaModel<B>;
 
 /// Type alias for Gemma 3 text models (`model_type: "gemma3_text"`)
-#[cfg(feature = "cuda")]
 pub type Gemma3Model<B> = GemmaModel<B>;

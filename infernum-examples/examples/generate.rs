@@ -291,7 +291,7 @@ fn main() -> Result<()> {
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
             "gemma2" | "gemma3_text" => {
-                let model = GemmaModel::from_pretrained(&ctx, &cli.model)?;
+                let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)

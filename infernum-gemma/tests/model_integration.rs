@@ -15,6 +15,7 @@ use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_gemma::GemmaModel;
 use infernum_runtime::Runtime;
 
@@ -88,7 +89,8 @@ fn greedy_options(max_tokens: usize) -> GenerateOptions {
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = GemmaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model =
+        GemmaModel::<CudaBackend>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -128,7 +130,8 @@ mod gemma2_tiny_random {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -163,7 +166,8 @@ mod gemma2_tiny_random {
         let num_decode_steps = 4;
 
         // --- Reference: greedy decode via forward() ---
-        let model_ref = GemmaModel::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model_ref =
+            GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let ref_logits = model_ref.forward_full(&prompt_ids).expect("forward");
         let ref_vec: Vec<f32> = ref_logits.to_vec().expect("read logits");
         let vocab_size = ref_logits.shape()[1];
@@ -290,7 +294,8 @@ mod gemma3_text_tiny_random {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -319,7 +324,8 @@ mod gemma3_text_tiny_random {
         let num_decode_steps = 4;
 
         // --- Reference: greedy decode via forward() ---
-        let model_ref = GemmaModel::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model_ref =
+            GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let ref_logits = model_ref.forward_full(&prompt_ids).expect("forward");
         let ref_vec: Vec<f32> = ref_logits.to_vec().expect("read logits");
         let vocab_size = ref_logits.shape()[1];
@@ -445,7 +451,8 @@ mod gemma2_2b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -475,7 +482,8 @@ mod gemma2_2b {
         let prompt_ids = tokenizer.encode(prompt, true).unwrap();
         let num_decode_steps = 20;
 
-        let model = GemmaModel::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model =
+            GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let model_cfg = model.model_config();
 
         // forward() reference: greedy decode step-by-step (no KV cache)
@@ -591,7 +599,8 @@ mod gemma3_1b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
