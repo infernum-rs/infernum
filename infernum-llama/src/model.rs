@@ -681,6 +681,279 @@ impl<B: LlamaOps> LlamaModel<B> {
         })
     }
 
+    // ---- Sharded weight loading (tensor parallelism) ----
+
+    /// Load model weights with tensor-parallel sharding, generic over backend.
+    ///
+    /// Splits attention and MLP projections across GPUs according to shard
+    /// strategy. The `all_reduce` closure is called after each parallel
+    /// region in the forward pass to synchronise partial results.
+    ///
+    /// If `gpu_config` is `Single`, falls back to the non-sharded
+    /// [`load_weights`](Self::load_weights) and attaches the all-reduce fn.
+    ///
+    /// # Errors
+    /// Returns an error if weight loading fails.
+    ///
+    /// # Panics
+    /// Panics if head counts or intermediate size are not divisible by
+    /// `world_size`.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    pub fn load_weights_sharded(
+        device: B::DeviceHandle,
+        config: LlamaConfig,
+        loader: &impl infernum::WeightLoader<B>,
+        gpu_config: GpuConfig,
+        all_reduce: AllReduceFn<B>,
+    ) -> Result<Self> {
+        use infernum::shard::{shard_strategy_for_weight, ShardStrategy};
+
+        let shard = match &gpu_config {
+            GpuConfig::Sharded(s) => *s,
+            GpuConfig::Single => {
+                return Self::load_weights(device, config, loader).map(|mut m| {
+                    m.all_reduce = Some(all_reduce);
+                    m
+                })
+            }
+        };
+        let world_size = shard.world_size;
+
+        assert!(
+            config.num_attention_heads.is_multiple_of(world_size),
+            "num_attention_heads ({}) must be divisible by world_size ({world_size})",
+            config.num_attention_heads
+        );
+        assert!(
+            config.num_kv_heads().is_multiple_of(world_size),
+            "num_kv_heads ({}) must be divisible by world_size ({world_size})",
+            config.num_kv_heads()
+        );
+        assert!(
+            config.intermediate_size.is_multiple_of(world_size),
+            "intermediate_size ({}) must be divisible by world_size ({world_size})",
+            config.intermediate_size
+        );
+
+        let qc = config.quantization_config.as_ref();
+
+        let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+        let dtype = if embed_dtype.is_quantized() {
+            DType::F32
+        } else {
+            embed_dtype
+        };
+
+        let embed_tokens = loader.load_tensor("model.embed_tokens.weight", dtype)?;
+
+        let tp_num_heads = config.num_attention_heads / world_size;
+        let tp_num_kv_heads = config.num_kv_heads() / world_size;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            let layer = LlamaLayerWeights {
+                input_layernorm: loader
+                    .load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype)?,
+                attention: {
+                    let q_name = format!("{prefix}.self_attn.q_proj.weight");
+                    let k_name = format!("{prefix}.self_attn.k_proj.weight");
+                    let v_name = format!("{prefix}.self_attn.v_proj.weight");
+                    let o_name = format!("{prefix}.self_attn.o_proj.weight");
+
+                    let q_proj = loader.load_linear_sharded(
+                        &q_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&q_name),
+                    )?;
+                    let k_proj = loader.load_linear_sharded(
+                        &k_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&k_name),
+                    )?;
+                    let v_proj = loader.load_linear_sharded(
+                        &v_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&v_name),
+                    )?;
+
+                    let kv_proj = KvProjWeight::<B>::Separate {
+                        k_proj: Box::new(k_proj),
+                        v_proj: Box::new(v_proj),
+                    };
+
+                    LlamaAttentionWeights {
+                        q_proj,
+                        kv_proj,
+                        o_proj: loader.load_linear_sharded(
+                            &o_name,
+                            dtype,
+                            qc,
+                            &shard,
+                            shard_strategy_for_weight(&o_name),
+                        )?,
+                    }
+                },
+                post_attention_layernorm: loader
+                    .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
+                ffn: if config.is_moe() {
+                    Self::load_moe_weights_sharded(dtype, loader, &prefix, &config, &shard, qc)?
+                } else {
+                    let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+                    let up_name = format!("{prefix}.mlp.up_proj.weight");
+                    let down_name = format!("{prefix}.mlp.down_proj.weight");
+
+                    let gate = loader.load_linear_sharded(
+                        &gate_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&gate_name),
+                    )?;
+                    let up = loader.load_linear_sharded(
+                        &up_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&up_name),
+                    )?;
+
+                    let gate_up = GateUpWeight::<B>::Separate {
+                        gate_proj: Box::new(gate),
+                        up_proj: Box::new(up),
+                    };
+
+                    FfnWeights::<B>::Dense(Box::new(LlamaMlpWeights {
+                        gate_up,
+                        down_proj: loader.load_linear_sharded(
+                            &down_name,
+                            dtype,
+                            qc,
+                            &shard,
+                            shard_strategy_for_weight(&down_name),
+                        )?,
+                    }))
+                },
+            };
+
+            layers.push(layer);
+        }
+
+        let norm = loader.load_tensor("model.norm.weight", dtype)?;
+        let lm_head = if config.tie_word_embeddings {
+            let embed_f32 = B::cast_to_f32(&embed_tokens)?;
+            let transposed = B::transpose_2d(&embed_f32)?;
+            B::dense_weight(B::cast_from_f32(&transposed, dtype)?)
+        } else {
+            loader.load_linear_sharded(
+                "lm_head.weight",
+                dtype,
+                None,
+                &shard,
+                ShardStrategy::Replicate,
+            )?
+        };
+
+        let half_dim = config.head_dim() / 2;
+        let max_pos = config.max_position_embeddings;
+        let (cos_data, sin_data) =
+            infernum::rope::precompute_rope_data(max_pos, config.head_dim(), config.rope_theta);
+        let cos_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &cos_data)?;
+        let sin_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &sin_data)?;
+        let cos_cache = B::cast_from_f32(&cos_f32, dtype)?;
+        let sin_cache = B::cast_from_f32(&sin_f32, dtype)?;
+
+        Ok(Self {
+            tp_num_heads,
+            tp_num_kv_heads,
+            dtype,
+            config,
+            device,
+            gpu_config,
+            all_reduce: Some(all_reduce),
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+            _backend: PhantomData,
+        })
+    }
+
+    /// Load MoE weights with tensor-parallel sharding for a single layer.
+    fn load_moe_weights_sharded(
+        dtype: DType,
+        loader: &impl infernum::WeightLoader<B>,
+        layer_prefix: &str,
+        config: &LlamaConfig,
+        shard: &infernum::ShardConfig,
+        qc: Option<&infernum::QuantizationConfig>,
+    ) -> Result<FfnWeights<B>> {
+        use infernum::shard::ShardStrategy;
+
+        let num_experts = config
+            .num_local_experts
+            .expect("MoE requires num_local_experts");
+        let num_experts_per_tok = config
+            .num_experts_per_tok
+            .expect("MoE requires num_experts_per_tok");
+
+        let gate_name = format!("{layer_prefix}.block_sparse_moe.gate.weight");
+        let gate_f32 = loader.load_tensor(&gate_name, DType::F32)?;
+        let gate_transposed = B::transpose_2d(&gate_f32)?;
+        let gate = B::cast_from_f32(&gate_transposed, dtype)?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let ep = format!("{layer_prefix}.block_sparse_moe.experts.{e}");
+            let gate_proj = loader.load_linear_sharded(
+                &format!("{ep}.w1.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+            let up_proj = loader.load_linear_sharded(
+                &format!("{ep}.w3.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+
+            let gate_up = GateUpWeight::<B>::Separate {
+                gate_proj: Box::new(gate_proj),
+                up_proj: Box::new(up_proj),
+            };
+
+            let down_proj = loader.load_linear_sharded(
+                &format!("{ep}.w2.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Row,
+            )?;
+
+            experts.push(MoeExpertWeights {
+                mlp: LlamaMlpWeights { gate_up, down_proj },
+            });
+        }
+
+        Ok(FfnWeights::<B>::Moe {
+            gate,
+            experts,
+            num_experts_per_tok,
+        })
+    }
+
     // ---- Helpers ----
 
     /// Extract the last row from a (seq_len, hidden_size) tensor
