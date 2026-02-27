@@ -246,6 +246,19 @@ pub trait MatmulOps: Backend {
         shape: &[usize],
         data: &[f32],
     ) -> Result<Self::LinearWeight>;
+
+    /// Upload a host-side linear weight (dense or quantized) to the device.
+    ///
+    /// For dense weights, the host data is already transposed to matmul-ready
+    /// layout. For quantized weights, the backend constructs its quantized
+    /// tensor type from the raw data/scales/qzeros buffers.
+    ///
+    /// # Errors
+    /// Returns an error if device allocation or upload fails.
+    fn upload_host_linear(
+        device: &Self::DeviceHandle,
+        weight: &crate::weights::host::HostLinearWeight,
+    ) -> Result<Self::LinearWeight>;
 }
 
 /// Normalization operations.

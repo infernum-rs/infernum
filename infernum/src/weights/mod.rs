@@ -6,8 +6,16 @@
 //!
 //! Backend-specific implementations (e.g., `SafeTensorsLoader` for CUDA)
 //! live in the backend crates.
+//!
+//! The [`format`] module provides [`FormatLoader`](format::FormatLoader),
+//! the backend-agnostic parser interface that returns host-side buffers.
+//! Format-specific parsers (GGUF, SafeTensors) implement this trait.
 
 #![allow(clippy::doc_markdown)]
+
+pub mod format;
+pub mod gguf;
+pub mod host;
 
 use crate::backend::MatmulOps;
 use crate::dtype::DType;

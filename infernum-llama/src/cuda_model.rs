@@ -25,7 +25,7 @@ use infernum_cuda::cuda::ops::{
 use infernum_cuda::cuda::{CudaContext, CudaTensor, PagedKvCache, QuantizedTensor};
 #[cfg(feature = "nccl")]
 use infernum_cuda::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
-use infernum_cuda::weights::{CudaWeightLoader, GgufLoader, SafeTensorsLoader, WeightLoader};
+use infernum_cuda::weights::{CudaWeightLoader, SafeTensorsLoader, WeightLoader};
 use infernum_cuda::CudaBackend;
 
 #[cfg(feature = "nccl")]
@@ -36,9 +36,10 @@ use crate::model::{
 };
 use crate::LlamaConfig;
 
-// ---- Helper free functions ----
+// ---- Helper free functions (used by sharded loading, nccl only) ----
 
 /// Transpose a weight matrix: (out_features, in_features) -> (in_features, out_features)
+#[cfg(feature = "nccl")]
 fn pretranspose_weight(weight: &CudaTensor) -> Result<CudaTensor> {
     transpose_2d(weight)
 }
@@ -47,6 +48,7 @@ fn pretranspose_weight(weight: &CudaTensor) -> Result<CudaTensor> {
 /// (output features) dimension: `(K, N1)` + `(K, N2)` → `(K, N1+N2)`.
 ///
 /// Both matrices must share the same first dimension (in_features).
+#[cfg(feature = "nccl")]
 fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
     let k = a.shape()[0];
     assert_eq!(k, b.shape()[0], "concat_weights: K dimension mismatch");
@@ -72,6 +74,7 @@ fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
 ///
 /// GGUF files interleave each head's rows: `[h0, h_half, h1, h_{half+1}, ...]`.
 /// This restores the HuggingFace sequential-half layout: `[h0..h_{half-1}, h_half..h_{dim-1}]`.
+#[cfg(feature = "nccl")]
 fn unpermute_f32(weight: &CudaTensor, n_head: usize) -> Result<CudaTensor> {
     let shape = weight.shape();
     let n_rows = shape[0];
@@ -401,168 +404,17 @@ fn make_all_reduce_fn(comm: NcclCommunicator) -> AllReduceFn<CudaBackend> {
 // ---- GGUF loading ----
 
 impl LlamaModel<CudaBackend> {
-    /// Load a Llama model from a GGUF file containing quantized weights
+    /// Load a Llama model from a GGUF file containing quantized weights.
+    ///
+    /// Parses the GGUF file using the core parser (CPU-only), then uploads
+    /// weights to the GPU via the generic `load_weights_gguf` method.
     ///
     /// # Errors
-    /// Returns an error if the file cannot be parsed or weights fail to load
+    /// Returns an error if the file cannot be parsed or weights fail to load.
     pub fn from_gguf(ctx: &CudaContext, gguf_path: impl AsRef<Path>) -> Result<Self> {
-        let loader = GgufLoader::from_file(gguf_path)?;
+        let loader = infernum::weights::gguf::GgufLoader::from_file(gguf_path)?;
         let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
-        Self::load_weights_gguf(ctx, config, &loader)
-    }
-
-    /// Load model weights from a GGUF loader, using quantized weights where available
-    fn load_weights_gguf(
-        ctx: &CudaContext,
-        config: LlamaConfig,
-        loader: &GgufLoader,
-    ) -> Result<Self> {
-        fn load_linear(ctx: &CudaContext, loader: &GgufLoader, name: &str) -> Result<LinearWeight> {
-            let dtype = loader.get_dtype(name)?;
-            if dtype.is_quantized() {
-                Ok(LinearWeight::Quantized(loader.load_quantized(ctx, name)?))
-            } else {
-                Ok(LinearWeight::Dense(pretranspose_weight(
-                    &loader.load_f32(ctx, name)?,
-                )?))
-            }
-        }
-
-        fn load_linear_unpermute(
-            ctx: &CudaContext,
-            loader: &GgufLoader,
-            name: &str,
-            n_head: usize,
-        ) -> Result<LinearWeight> {
-            let dtype = loader.get_dtype(name)?;
-            if dtype.is_quantized() {
-                Ok(LinearWeight::Quantized(
-                    loader.load_quantized_unpermute(ctx, name, n_head)?,
-                ))
-            } else {
-                let tensor = loader.load_f32(ctx, name)?;
-                let unpermuted = unpermute_f32(&tensor, n_head)?;
-                Ok(LinearWeight::Dense(pretranspose_weight(&unpermuted)?))
-            }
-        }
-
-        let embed_tokens = loader.load_f32(ctx, "token_embd.weight")?;
-
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            let prefix = format!("blk.{i}");
-
-            let layer = LlamaLayerWeights {
-                input_layernorm: loader.load_f32(ctx, &format!("{prefix}.attn_norm.weight"))?,
-                attention: {
-                    let k = load_linear_unpermute(
-                        ctx,
-                        loader,
-                        &format!("{prefix}.attn_k.weight"),
-                        config.num_kv_heads(),
-                    )?;
-                    let v = load_linear(ctx, loader, &format!("{prefix}.attn_v.weight"))?;
-                    let kv_proj = match (k, v) {
-                        (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
-                            KvProjWeight::<CudaBackend>::Fused {
-                                kv_dim: config.num_kv_heads() * config.head_dim(),
-                                weight: concat_weights(&k_w, &v_w)?,
-                            }
-                        }
-                        (k, v) => KvProjWeight::<CudaBackend>::Separate {
-                            k_proj: Box::new(k),
-                            v_proj: Box::new(v),
-                        },
-                    };
-                    LlamaAttentionWeights {
-                        q_proj: load_linear_unpermute(
-                            ctx,
-                            loader,
-                            &format!("{prefix}.attn_q.weight"),
-                            config.num_attention_heads,
-                        )?,
-                        kv_proj,
-                        o_proj: load_linear(ctx, loader, &format!("{prefix}.attn_output.weight"))?,
-                    }
-                },
-                post_attention_layernorm: loader
-                    .load_f32(ctx, &format!("{prefix}.ffn_norm.weight"))?,
-                ffn: {
-                    assert!(!config.is_moe(), "MoE GGUF loading is not yet supported");
-                    let gate = load_linear(ctx, loader, &format!("{prefix}.ffn_gate.weight"))?;
-                    let up = load_linear(ctx, loader, &format!("{prefix}.ffn_up.weight"))?;
-                    let gate_up = match (gate, up) {
-                        (LinearWeight::Dense(g), LinearWeight::Dense(u)) => {
-                            GateUpWeight::<CudaBackend>::Fused {
-                                weight: concat_weights(&g, &u)?,
-                                intermediate_size: config.intermediate_size,
-                            }
-                        }
-                        (g, u) => GateUpWeight::<CudaBackend>::Separate {
-                            gate_proj: Box::new(g),
-                            up_proj: Box::new(u),
-                        },
-                    };
-                    FfnWeights::<CudaBackend>::Dense(Box::new(LlamaMlpWeights {
-                        gate_up,
-                        down_proj: load_linear(ctx, loader, &format!("{prefix}.ffn_down.weight"))?,
-                    }))
-                },
-            };
-
-            layers.push(layer);
-        }
-
-        let norm = loader.load_f32(ctx, "output_norm.weight")?;
-
-        let lm_head = if config.tie_word_embeddings {
-            let embd_dtype = loader.get_dtype("token_embd.weight")?;
-            if embd_dtype.is_quantized() {
-                LinearWeight::Quantized(loader.load_quantized(ctx, "token_embd.weight")?)
-            } else {
-                LinearWeight::Dense(pretranspose_weight(&embed_tokens)?)
-            }
-        } else if loader.contains("output.weight") {
-            let dtype = loader.get_dtype("output.weight")?;
-            if dtype.is_quantized() {
-                LinearWeight::Quantized(loader.load_quantized(ctx, "output.weight")?)
-            } else {
-                LinearWeight::Dense(pretranspose_weight(
-                    &loader.load_f32(ctx, "output.weight")?,
-                )?)
-            }
-        } else {
-            let embd_dtype = loader.get_dtype("token_embd.weight")?;
-            if embd_dtype.is_quantized() {
-                LinearWeight::Quantized(loader.load_quantized(ctx, "token_embd.weight")?)
-            } else {
-                LinearWeight::Dense(pretranspose_weight(&embed_tokens)?)
-            }
-        };
-
-        let (cos_cache, sin_cache) = precompute_rope_cache(
-            ctx,
-            config.max_position_embeddings,
-            config.head_dim(),
-            config.rope_theta,
-        )?;
-
-        Ok(Self {
-            tp_num_heads: config.num_attention_heads,
-            tp_num_kv_heads: config.num_kv_heads(),
-            dtype: DType::F32,
-            config,
-            device: ctx.clone(),
-            gpu_config: GpuConfig::Single,
-            all_reduce: None,
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-            cos_cache,
-            sin_cache,
-            _backend: PhantomData,
-        })
+        Self::load_weights_gguf(ctx.clone(), config, &loader)
     }
 }
 

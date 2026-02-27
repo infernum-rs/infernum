@@ -890,6 +890,7 @@ dependencies = [
  "half",
  "infernum-macros",
  "inventory",
+ "memmap2",
  "num-traits",
  "safetensors",
  "serde",

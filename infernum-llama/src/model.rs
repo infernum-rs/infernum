@@ -454,6 +454,233 @@ impl<B: LlamaOps> LlamaModel<B> {
         })
     }
 
+    // ---- GGUF weight loading (generic over backend) ----
+
+    /// Load model weights from a GGUF file, generic over any backend.
+    ///
+    /// Uses GGUF tensor names (`token_embd.weight`, `blk.N.*`, etc.)
+    /// and the core [`GgufLoader`](infernum::weights::gguf::GgufLoader)
+    /// which returns host-side buffers. Uploads to the backend via
+    /// `B::upload_host_linear` and `B::from_f32_slice`.
+    ///
+    /// # Errors
+    /// Returns an error if any weight fails to load or upload.
+    ///
+    /// # Panics
+    /// Panics if the model config is MoE (MoE GGUF loading is not yet supported).
+    #[allow(clippy::too_many_lines)]
+    pub fn load_weights_gguf(
+        device: B::DeviceHandle,
+        config: LlamaConfig,
+        loader: &infernum::weights::gguf::GgufLoader,
+    ) -> Result<Self> {
+        use infernum::weights::format::FormatLoader;
+        use infernum::weights::format::{host_transpose_2d, host_unpermute_f32};
+        use infernum::weights::host::{host_concat_inner_dim, HostLinearWeight};
+
+        /// Load a GGUF tensor as a linear weight (dense or quantized).
+        /// Dense weights are transposed to matmul-ready layout on the host.
+        fn host_load_linear(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                    loader, name,
+                )?))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&tensor)?))
+            }
+        }
+
+        /// Load a GGUF Q/K weight with head-dimension unpermuting.
+        fn host_load_linear_unpermute(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+            n_head: usize,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(
+                    FormatLoader::load_quantized_unpermute(loader, name, n_head)?,
+                ))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                let unpermuted = host_unpermute_f32(&tensor, n_head)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&unpermuted)?))
+            }
+        }
+
+        let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
+        let embed_tokens =
+            B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("blk.{i}");
+
+            let attn_norm_host =
+                FormatLoader::load_f32(loader, &format!("{prefix}.attn_norm.weight"))?;
+            let input_layernorm = B::from_f32_slice(
+                &device,
+                &attn_norm_host.shape,
+                attn_norm_host.as_f32_slice(),
+            )?;
+
+            let attention = {
+                let k_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_k.weight"),
+                    config.num_kv_heads(),
+                )?;
+                let v_host = host_load_linear(loader, &format!("{prefix}.attn_v.weight"))?;
+
+                // Try to fuse K+V if both are dense
+                let kv_proj = if let (HostLinearWeight::Dense(k_t), HostLinearWeight::Dense(v_t)) =
+                    (&k_host, &v_host)
+                {
+                    let fused = host_concat_inner_dim(k_t, v_t);
+                    let fused_tensor =
+                        B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                    KvProjWeight::<B>::Fused {
+                        kv_dim: config.num_kv_heads() * config.head_dim(),
+                        weight: fused_tensor,
+                    }
+                } else {
+                    let k_dev = B::upload_host_linear(&device, &k_host)?;
+                    let v_dev = B::upload_host_linear(&device, &v_host)?;
+                    KvProjWeight::<B>::Separate {
+                        k_proj: Box::new(k_dev),
+                        v_proj: Box::new(v_dev),
+                    }
+                };
+
+                let q_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_q.weight"),
+                    config.num_attention_heads,
+                )?;
+                let o_host = host_load_linear(loader, &format!("{prefix}.attn_output.weight"))?;
+
+                LlamaAttentionWeights {
+                    q_proj: B::upload_host_linear(&device, &q_host)?,
+                    kv_proj,
+                    o_proj: B::upload_host_linear(&device, &o_host)?,
+                }
+            };
+
+            let ffn_norm_host =
+                FormatLoader::load_f32(loader, &format!("{prefix}.ffn_norm.weight"))?;
+            let post_attention_layernorm =
+                B::from_f32_slice(&device, &ffn_norm_host.shape, ffn_norm_host.as_f32_slice())?;
+
+            let ffn = {
+                assert!(!config.is_moe(), "MoE GGUF loading is not yet supported");
+                let gate_host = host_load_linear(loader, &format!("{prefix}.ffn_gate.weight"))?;
+                let up_host = host_load_linear(loader, &format!("{prefix}.ffn_up.weight"))?;
+
+                let gate_up = if let (HostLinearWeight::Dense(g), HostLinearWeight::Dense(u)) =
+                    (&gate_host, &up_host)
+                {
+                    let fused = host_concat_inner_dim(g, u);
+                    let fused_tensor =
+                        B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                    GateUpWeight::<B>::Fused {
+                        weight: fused_tensor,
+                        intermediate_size: config.intermediate_size,
+                    }
+                } else {
+                    let g_dev = B::upload_host_linear(&device, &gate_host)?;
+                    let u_dev = B::upload_host_linear(&device, &up_host)?;
+                    GateUpWeight::<B>::Separate {
+                        gate_proj: Box::new(g_dev),
+                        up_proj: Box::new(u_dev),
+                    }
+                };
+
+                FfnWeights::<B>::Dense(Box::new(LlamaMlpWeights {
+                    gate_up,
+                    down_proj: B::upload_host_linear(
+                        &device,
+                        &host_load_linear(loader, &format!("{prefix}.ffn_down.weight"))?,
+                    )?,
+                }))
+            };
+
+            layers.push(LlamaLayerWeights {
+                input_layernorm,
+                attention,
+                post_attention_layernorm,
+                ffn,
+            });
+        }
+
+        let norm_host = FormatLoader::load_f32(loader, "output_norm.weight")?;
+        let norm = B::from_f32_slice(&device, &norm_host.shape, norm_host.as_f32_slice())?;
+
+        // lm_head: check tied embeddings, quantized fallback
+        let lm_head = if config.tie_word_embeddings {
+            let embd_dtype = FormatLoader::get_dtype(loader, "token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                B::upload_host_linear(
+                    &device,
+                    &HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                        loader,
+                        "token_embd.weight",
+                    )?),
+                )?
+            } else {
+                let transposed = host_transpose_2d(&embed_host)?;
+                B::upload_host_linear(&device, &HostLinearWeight::Dense(transposed))?
+            }
+        } else if loader.contains("output.weight") {
+            B::upload_host_linear(&device, &host_load_linear(loader, "output.weight")?)?
+        } else {
+            let embd_dtype = FormatLoader::get_dtype(loader, "token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                B::upload_host_linear(
+                    &device,
+                    &HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                        loader,
+                        "token_embd.weight",
+                    )?),
+                )?
+            } else {
+                let transposed = host_transpose_2d(&embed_host)?;
+                B::upload_host_linear(&device, &HostLinearWeight::Dense(transposed))?
+            }
+        };
+
+        // Precompute RoPE caches
+        let half_dim = config.head_dim() / 2;
+        let max_pos = config.max_position_embeddings;
+        let (cos_data, sin_data) =
+            infernum::rope::precompute_rope_data(max_pos, config.head_dim(), config.rope_theta);
+        let cos_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &cos_data)?;
+        let sin_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &sin_data)?;
+        let cos_cache = B::cast_from_f32(&cos_f32, DType::F32)?;
+        let sin_cache = B::cast_from_f32(&sin_f32, DType::F32)?;
+
+        Ok(Self {
+            tp_num_heads: config.num_attention_heads,
+            tp_num_kv_heads: config.num_kv_heads(),
+            dtype: DType::F32,
+            config,
+            device,
+            gpu_config: GpuConfig::Single,
+            all_reduce: None,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+            _backend: PhantomData,
+        })
+    }
+
     // ---- Helpers ----
 
     /// Extract the last row from a (seq_len, hidden_size) tensor

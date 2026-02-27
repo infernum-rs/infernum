@@ -132,6 +132,50 @@ impl MatmulOps for CudaBackend {
             crate::cuda::QuantizedTensor::from_f32_as_q8(device, shape, data)?,
         ))
     }
+
+    fn upload_host_linear(
+        device: &crate::cuda::CudaContext,
+        weight: &infernum::weights::host::HostLinearWeight,
+    ) -> Result<LinearWeight> {
+        use infernum::weights::host::HostLinearWeight;
+
+        match weight {
+            HostLinearWeight::Dense(host_tensor) => {
+                let tensor = CudaTensor::from_raw_bytes(
+                    device,
+                    &host_tensor.shape,
+                    host_tensor.dtype,
+                    &host_tensor.data,
+                )?;
+                Ok(LinearWeight::Dense(tensor))
+            }
+            HostLinearWeight::Quantized(hq) => {
+                if hq.dtype.is_group_quantized() {
+                    let qzeros = hq
+                        .qzeros
+                        .as_deref()
+                        .expect("GPTQ/AWQ quantized weight must have qzeros");
+                    let group_size = hq
+                        .group_size
+                        .expect("GPTQ/AWQ quantized weight must have group_size");
+                    let qt = crate::cuda::QuantizedTensor::from_gptq_raw(
+                        device, &hq.shape, hq.dtype, &hq.data, &hq.scales, qzeros, group_size,
+                    )?;
+                    Ok(LinearWeight::Quantized(qt))
+                } else {
+                    let mut qt = crate::cuda::QuantizedTensor::from_raw(
+                        device, &hq.shape, hq.dtype, &hq.data, &hq.scales,
+                    )?;
+                    if let Some(ref channel_scales) = hq.channel_scales {
+                        qt.set_channel_scales(device, channel_scales)?;
+                    } else if (hq.weight_scale - 1.0).abs() > f32::EPSILON {
+                        qt.set_weight_scale(device, hq.weight_scale)?;
+                    }
+                    Ok(LinearWeight::Quantized(qt))
+                }
+            }
+        }
+    }
 }
 
 impl MatmulExtOps for CudaBackend {
