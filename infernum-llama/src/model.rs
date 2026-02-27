@@ -13,10 +13,11 @@
 )]
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, MatmulExtOps, MatmulOps, MoeOps, NormOps,
-    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps, TensorFactory,
+    ArithOps, AttentionOps, Backend, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps, MoeOps,
+    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps, TensorFactory,
     TensorOps,
 };
 use infernum::block_allocator::BlockTable;
@@ -101,10 +102,6 @@ pub(crate) struct LlamaLayerWeights<B: Backend + MatmulOps> {
 /// All-reduce callback for tensor-parallel models.
 ///
 /// Wraps the backend-specific communicator in a type-erased closure so
-/// the generic model struct doesn't need `B: AllReduceOps` bounds.
-pub(crate) type AllReduceFn<B> =
-    Box<dyn Fn(&mut <B as Backend>::Tensor) -> Result<()> + Send + Sync>;
-
 /// Complete Llama model, generic over the compute backend `B`.
 ///
 /// The backend determines the tensor type and linear weight representation.
@@ -117,8 +114,9 @@ pub struct LlamaModel<B: Backend + MatmulOps> {
     #[allow(dead_code)]
     pub(crate) gpu_config: GpuConfig,
 
-    /// Optional all-reduce for tensor-parallel models.
-    pub(crate) all_reduce: Option<AllReduceFn<B>>,
+    /// Optional communicator for tensor-parallel all-reduce.
+    /// `None` for single-GPU, `Some(comm)` for sharded models.
+    pub(crate) comm: Option<B::Comm>,
 
     // Per-GPU head counts (== full counts for single-GPU, divided for TP)
     pub(crate) tp_num_heads: usize,
@@ -357,7 +355,7 @@ impl<B: LlamaOps> LlamaModel<B> {
             config,
             device,
             gpu_config: GpuConfig::Single,
-            all_reduce: None,
+            comm: None,
             embed_tokens,
             layers,
             norm,
@@ -670,7 +668,7 @@ impl<B: LlamaOps> LlamaModel<B> {
             config,
             device,
             gpu_config: GpuConfig::Single,
-            all_reduce: None,
+            comm: None,
             embed_tokens,
             layers,
             norm,
@@ -681,16 +679,47 @@ impl<B: LlamaOps> LlamaModel<B> {
         })
     }
 
+    /// Load a Llama model from a GGUF file.
+    ///
+    /// Parses the GGUF file (CPU-only), then uploads weights to the device
+    /// via the generic [`load_weights_gguf`](Self::load_weights_gguf) method.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be parsed or weights fail to load.
+    pub fn from_gguf(device: &B::DeviceHandle, gguf_path: impl AsRef<Path>) -> Result<Self> {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(gguf_path)?;
+        let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+        Self::load_weights_gguf(device.clone(), config, &loader)
+    }
+
+    /// Load a Llama model from a SafeTensors directory.
+    ///
+    /// Reads `config.json` for model configuration and loads weights from
+    /// `*.safetensors` files. The backend provides the weight loader via
+    /// [`SafeTensorsLoaderOps`](infernum::SafeTensorsLoaderOps).
+    ///
+    /// # Errors
+    /// Returns an error if the config is missing or weights fail to load.
+    pub fn from_pretrained(device: &B::DeviceHandle, model_path: impl AsRef<Path>) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
+        let model_path = model_path.as_ref();
+        let config = LlamaConfig::from_file(model_path.join("config.json"))?;
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights(device.clone(), config, &loader)
+    }
+
     // ---- Sharded weight loading (tensor parallelism) ----
 
     /// Load model weights with tensor-parallel sharding, generic over backend.
     ///
     /// Splits attention and MLP projections across GPUs according to shard
-    /// strategy. The `all_reduce` closure is called after each parallel
+    /// strategy. The communicator is used for all-reduce after each parallel
     /// region in the forward pass to synchronise partial results.
     ///
     /// If `gpu_config` is `Single`, falls back to the non-sharded
-    /// [`load_weights`](Self::load_weights) and attaches the all-reduce fn.
+    /// [`load_weights`](Self::load_weights) and attaches the communicator.
     ///
     /// # Errors
     /// Returns an error if weight loading fails.
@@ -704,7 +733,7 @@ impl<B: LlamaOps> LlamaModel<B> {
         config: LlamaConfig,
         loader: &impl infernum::WeightLoader<B>,
         gpu_config: GpuConfig,
-        all_reduce: AllReduceFn<B>,
+        comm: Option<B::Comm>,
     ) -> Result<Self> {
         use infernum::shard::{shard_strategy_for_weight, ShardStrategy};
 
@@ -712,7 +741,7 @@ impl<B: LlamaOps> LlamaModel<B> {
             GpuConfig::Sharded(s) => *s,
             GpuConfig::Single => {
                 return Self::load_weights(device, config, loader).map(|mut m| {
-                    m.all_reduce = Some(all_reduce);
+                    m.comm = comm;
                     m
                 })
             }
@@ -877,7 +906,7 @@ impl<B: LlamaOps> LlamaModel<B> {
             config,
             device,
             gpu_config,
-            all_reduce: Some(all_reduce),
+            comm,
             embed_tokens,
             layers,
             norm,
@@ -973,8 +1002,8 @@ impl<B: LlamaOps> LlamaModel<B> {
 
     /// Optional all-reduce for tensor-parallel models. No-op for single GPU.
     pub(crate) fn maybe_all_reduce(&self, tensor: &mut B::Tensor) -> Result<()> {
-        if let Some(f) = &self.all_reduce {
-            f(tensor)?;
+        if let Some(comm) = &self.comm {
+            comm.all_reduce_sum(tensor)?;
         }
         Ok(())
     }
@@ -1041,7 +1070,61 @@ impl<B: LlamaOps> LlamaModel<B> {
         self.lm_head_forward(&hidden)
     }
 
-    // ---- Batched decode with paged KV cache ----
+    // ---- Batched decode (host-side convenience) ----
+
+    /// Batched decode with host-side inputs.
+    ///
+    /// Converts host arrays to device tensors and calls
+    /// [`forward_batch_decode_tensors`](Self::forward_batch_decode_tensors).
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        paged_kvs: &mut [B::PagedKvCache],
+        block_tables: &[BlockTable],
+        positions: &[usize],
+    ) -> Result<B::Tensor> {
+        let batch_size = token_ids.len();
+        let max_blocks_per_seq = block_tables
+            .iter()
+            .map(|bt| bt.blocks().len())
+            .max()
+            .unwrap_or(0);
+        let mut bt_flat = vec![0i32; batch_size * max_blocks_per_seq];
+        for (i, bt) in block_tables.iter().enumerate() {
+            for (j, &block_id) in bt.blocks().iter().enumerate() {
+                bt_flat[i * max_blocks_per_seq + j] = block_id as i32;
+            }
+        }
+        let seq_lens: Vec<i32> = positions.iter().map(|&p| (p + 1) as i32).collect();
+        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let max_seq_len = seq_lens.iter().copied().max().unwrap_or(0) as usize;
+
+        let token_ids_t = B::from_u32_slice(&self.device, &[batch_size], token_ids)?;
+        let bt_t = B::from_i32_slice(&self.device, &[batch_size * max_blocks_per_seq], &bt_flat)?;
+        let sl_t = B::from_i32_slice(&self.device, &[batch_size], &seq_lens)?;
+        let pos_t = B::from_i32_slice(&self.device, &[batch_size], &positions_i32)?;
+
+        self.forward_batch_decode_tensors(
+            &token_ids_t,
+            paged_kvs,
+            &bt_t,
+            &sl_t,
+            &pos_t,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
+        )
+    }
+
+    // ---- Batched decode with paged KV cache (device tensors) ----
 
     /// Batched decode forward pass with paged KV cache.
     ///

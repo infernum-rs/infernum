@@ -29,6 +29,7 @@ use serde::Deserialize;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{ChatTemplate, Result};
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_deepseek::{DeepSeekModel, DeepSeekTemplate};
 use infernum_gemma::{GemmaModel, GemmaTemplate};
 use infernum_llama::{Llama3Template, LlamaModel, MistralTemplate};
@@ -121,7 +122,7 @@ async fn main() -> Result<()> {
 
     let entry = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
-            let model = LlamaModel::from_pretrained(&ctx, &cli.model)?;
+            let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {

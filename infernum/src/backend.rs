@@ -24,6 +24,31 @@ use crate::tensor::Tensor;
 use crate::DType;
 use crate::Result;
 
+// ---- Communicator trait ----
+
+/// Communicator for multi-device all-reduce operations.
+///
+/// Implemented by backend-specific communicators (e.g., NCCL for CUDA).
+/// Single-GPU backends use the blanket `impl Comm<T> for ()` which is
+/// a no-op.
+///
+/// Models store `Option<B::Comm>` and call [`all_reduce_sum`](Comm::all_reduce_sum)
+/// at tensor-parallel sync points (after `o_proj` and `down_proj` matmuls).
+pub trait Comm<T>: Send + Sync {
+    /// In-place sum all-reduce across all ranks.
+    ///
+    /// # Errors
+    /// Returns an error if the collective operation fails.
+    fn all_reduce_sum(&self, tensor: &mut T) -> Result<()>;
+}
+
+/// No-op communicator for single-GPU backends.
+impl<T> Comm<T> for () {
+    fn all_reduce_sum(&self, _tensor: &mut T) -> Result<()> {
+        Ok(())
+    }
+}
+
 // ---- Core backend trait ----
 
 /// A compute backend (CUDA, CPU, Metal, etc.).
@@ -60,6 +85,13 @@ pub trait Backend: 'static {
     /// Backend-specific logits type returned by forward passes.
     /// Must implement the `Logits` trait so the engine can sample from it.
     type Logits: Logits;
+
+    /// Communicator for multi-device all-reduce.
+    ///
+    /// For CUDA this is `NcclCommunicator`. Single-GPU backends use `()`
+    /// (blanket no-op impl). Models store `Option<Self::Comm>` — `None`
+    /// for single-GPU, `Some(comm)` for tensor-parallel sharded models.
+    type Comm: Comm<Self::Tensor>;
 
     /// Wrap a raw logits tensor into the backend's `Logits` type.
     ///
@@ -308,6 +340,29 @@ pub trait TensorDataOps: Backend {
     ///
     /// The backend casts to f32 if necessary.
     fn to_f32_vec(tensor: &Self::Tensor) -> Result<Vec<f32>>;
+}
+
+/// Construct a [`WeightLoader`](crate::WeightLoader) from a SafeTensors directory.
+///
+/// Each backend provides its own loader type (e.g., for CUDA: `SafeTensorsLoader`
+/// wrapped in `CudaWeightLoader`). Models use this trait to implement generic
+/// `from_pretrained` methods without knowing the concrete loader type.
+pub trait SafeTensorsLoaderOps: MatmulOps + Sized {
+    /// The concrete `WeightLoader<Self>` type returned by this backend.
+    type SafeTensorsLoader: crate::WeightLoader<Self>;
+
+    /// Create a weight loader for a SafeTensors model directory.
+    ///
+    /// `model_dir` contains `*.safetensors` files and usually `config.json`.
+    /// The backend handles device context (e.g., GPU upload handles)
+    /// internally.
+    ///
+    /// # Errors
+    /// Returns an error if the directory is missing or files are malformed.
+    fn safetensors_loader(
+        device: &Self::DeviceHandle,
+        model_dir: &std::path::Path,
+    ) -> Result<Self::SafeTensorsLoader>;
 }
 
 /// Embedding lookup.
@@ -594,8 +649,10 @@ pub trait MatmulExtOps: Backend {
 /// and call `all_reduce_sum_inplace` after each TP-split matmul.
 pub trait AllReduceOps: Backend {
     /// Opaque communicator handle (e.g., `NcclCommunicator`).
-    type Comm: Send + Sync;
+    ///
+    /// Deprecated: being replaced by `Backend::Comm` + `Comm` trait.
+    type OldComm: Send + Sync;
 
     /// In-place sum all-reduce across all ranks.
-    fn all_reduce_sum_inplace(comm: &Self::Comm, tensor: &mut Self::Tensor) -> Result<()>;
+    fn all_reduce_sum_inplace(comm: &Self::OldComm, tensor: &mut Self::Tensor) -> Result<()>;
 }

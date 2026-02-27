@@ -25,6 +25,11 @@ impl Backend for CudaBackend {
     type RuntimeState = CudaRuntimeState;
     type Logits = CudaLogits;
 
+    #[cfg(feature = "nccl")]
+    type Comm = crate::cuda::NcclCommunicator;
+    #[cfg(not(feature = "nccl"))]
+    type Comm = ();
+
     fn logits_from_tensor(tensor: CudaTensor) -> CudaLogits {
         CudaLogits::new(tensor)
     }
@@ -566,9 +571,24 @@ impl MoeOps for CudaBackend {
 
 #[cfg(feature = "nccl")]
 impl infernum::backend::AllReduceOps for CudaBackend {
-    type Comm = crate::cuda::NcclCommunicator;
+    type OldComm = crate::cuda::NcclCommunicator;
 
-    fn all_reduce_sum_inplace(comm: &Self::Comm, tensor: &mut CudaTensor) -> Result<()> {
+    fn all_reduce_sum_inplace(comm: &Self::OldComm, tensor: &mut CudaTensor) -> Result<()> {
         comm.all_reduce_sum_inplace(tensor)
+    }
+}
+
+impl infernum::backend::SafeTensorsLoaderOps for CudaBackend {
+    type SafeTensorsLoader = crate::weights::CudaWeightLoader<crate::weights::SafeTensorsLoader>;
+
+    fn safetensors_loader(
+        device: &Self::DeviceHandle,
+        model_dir: &std::path::Path,
+    ) -> Result<Self::SafeTensorsLoader> {
+        let format_loader = crate::weights::SafeTensorsLoader::from_directory(model_dir)?;
+        Ok(crate::weights::CudaWeightLoader::new(
+            device.clone(),
+            format_loader,
+        ))
     }
 }

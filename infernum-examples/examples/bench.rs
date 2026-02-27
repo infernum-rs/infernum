@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use infernum::GenerateOptions;
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -126,9 +127,9 @@ fn main() -> infernum::Result<()> {
     let result = match family {
         "llama" => {
             let model = if is_gguf {
-                LlamaModel::from_gguf(&ctx, &cli.model)?
+                LlamaModel::<CudaBackend>::from_gguf(&ctx, &cli.model)?
             } else {
-                LlamaModel::from_pretrained(&ctx, &cli.model)?
+                LlamaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?
             };
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
