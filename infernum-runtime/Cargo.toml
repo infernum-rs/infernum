@@ -3,16 +3,5 @@ name = "infernum-runtime"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = []
-cuda = []
-nccl = ["cuda"]
-integration = ["cuda", "infernum-llama/cuda", "infernum-cuda/cuda"]
-
 [dependencies]
 infernum = { path = "../infernum" }
-
-[dev-dependencies]
-infernum-cuda = { path = "../infernum-cuda" }
-infernum-llama = { path = "../infernum-llama" }
-ureq = { version = "3", features = ["json"] }

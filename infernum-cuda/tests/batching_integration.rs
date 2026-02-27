@@ -4,78 +4,28 @@
 //! [`Engine`] produces correct output under various concurrency patterns.
 //!
 //! Run with:
-//!   cargo test -p infernum-runtime --features integration -- --test-threads=1
+//!   cargo test -p infernum-cuda --features integration -- --test-threads=1 batching
 #![cfg(feature = "integration")]
 
-use std::fs;
+mod test_helpers;
+
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::GenerateOptions;
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_llama::LlamaModel;
 use infernum_runtime::{BatchConfig, Engine, FinishReason, GenerationEvent};
 
-// ---------------------------------------------------------------------------
-// Test infrastructure (copied from llama integration tests)
-// ---------------------------------------------------------------------------
-
-const REQUIRED_FILES: &[&str] = &[
-    "config.json",
-    "model.safetensors",
-    "tokenizer.json",
-    "tokenizer_config.json",
-];
-
-fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
-    if dest.exists() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).expect("Failed to create cache directory");
-    }
-    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
-    let response = ureq::get(&url)
-        .call()
-        .unwrap_or_else(|e| panic!("Failed to download {repo_id}/{filename}: {e}"));
-    let tmp_dest = dest.with_extension("tmp");
-    let mut file = fs::File::create(&tmp_dest)
-        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp_dest.display()));
-    std::io::copy(&mut response.into_body().as_reader(), &mut file)
-        .unwrap_or_else(|e| panic!("Failed to download {filename}: {e}"));
-    fs::rename(&tmp_dest, dest)
-        .unwrap_or_else(|e| panic!("Failed to rename {}: {e}", tmp_dest.display()));
-}
-
-fn download_model(repo_id: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let cache_dir = PathBuf::from(home)
-        .join(".cache")
-        .join("infernum")
-        .join("models")
-        .join(repo_id);
-    for filename in REQUIRED_FILES {
-        download_file(repo_id, filename, &cache_dir.join(filename));
-    }
-    cache_dir
-}
+use test_helpers::{download_model, greedy_options};
 
 const REPO: &str = "HuggingFaceTB/SmolLM2-360M";
 
 fn model_dir() -> PathBuf {
     download_model(REPO)
-}
-
-fn greedy_options(max_tokens: usize) -> GenerateOptions {
-    GenerateOptions {
-        max_new_tokens: max_tokens,
-        sampling: None,
-        use_kv_cache: true,
-        ..GenerateOptions::default()
-    }
 }
 
 fn batch_config() -> BatchConfig {
@@ -112,7 +62,8 @@ fn collect_tokens(rx: mpsc::Receiver<GenerationEvent>) -> (Vec<u32>, FinishReaso
 fn single_request() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model: LlamaModel<CudaBackend> =
+        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     let engine = Engine::with_config(model, batch_config()).expect("engine");
@@ -135,7 +86,8 @@ fn single_request() {
 fn concurrent_identical_requests() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model: LlamaModel<CudaBackend> =
+        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -179,7 +131,8 @@ fn concurrent_identical_requests() {
 fn concurrent_different_prompts() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model: LlamaModel<CudaBackend> =
+        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -226,7 +179,8 @@ fn concurrent_different_prompts() {
 fn staggered_arrival() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model: LlamaModel<CudaBackend> =
+        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -267,7 +221,8 @@ fn staggered_arrival() {
 fn early_cancellation() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model: LlamaModel<CudaBackend> =
+        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -316,7 +271,8 @@ fn early_cancellation() {
 fn memory_pressure() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model: LlamaModel<CudaBackend> =
+        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     // Very small block pool — enough for about 2 short sequences
@@ -355,7 +311,8 @@ fn memory_pressure() {
 fn sequential_engine_regression() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model: LlamaModel<CudaBackend> =
+        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     let engine = Engine::new(model).expect("engine");

@@ -135,6 +135,19 @@ impl BlockTable {
         }
     }
 
+    /// Create a block table from pre-existing data.
+    ///
+    /// Used to reconstruct block tables from flat GPU tensors when
+    /// bridging between tensor-based and host-based APIs.
+    #[must_use]
+    pub fn from_raw(blocks: Vec<usize>, seq_len: usize, block_size: usize) -> Self {
+        Self {
+            blocks,
+            seq_len,
+            block_size,
+        }
+    }
+
     /// Physical block indices in order.
     pub fn blocks(&self) -> &[usize] {
         &self.blocks

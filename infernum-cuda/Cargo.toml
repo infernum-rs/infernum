@@ -8,6 +8,8 @@ build = "build.rs"
 default = []
 cuda = ["cudarc"]
 nccl = ["cuda", "cudarc/nccl", "infernum/nccl-errors"]
+# Integration tests — downloads real models (implies cuda)
+integration = ["cuda"]
 # Force fused kernels even in debug builds
 force-fuse = []
 # Disable fused kernels even in release builds
@@ -41,6 +43,12 @@ serde_json = "1.0"
 
 [dev-dependencies]
 approx = "0.5"
+infernum-llama = { path = "../infernum-llama" }
+infernum-qwen = { path = "../infernum-qwen" }
+infernum-deepseek = { path = "../infernum-deepseek" }
+infernum-gemma = { path = "../infernum-gemma" }
+infernum-runtime = { path = "../infernum-runtime" }
+ureq = { version = "3", features = ["json"] }
 
 [[example]]
 name = "test_tokenizer"

@@ -61,6 +61,12 @@ pub trait Model: Send + 'static {
     /// sizing. The model knows its own architecture parameters.
     fn config(&self) -> ModelConfig;
 
+    /// Reference to the backend device handle (e.g. `CudaContext`).
+    ///
+    /// Used by the engine to upload host data to device tensors before
+    /// calling `forward_batch_decode`.
+    fn device(&self) -> &<Self::B as Backend>::DeviceHandle;
+
     /// Allocate the KV cache for this model.
     ///
     /// Called once by the Engine at startup. `block_config` provides
@@ -99,18 +105,29 @@ pub trait Model: Send + 'static {
     /// Batched decode with KV cache.
     ///
     /// Processes one new token per sequence for `batch_size` sequences.
-    /// Returns logits with `batch_size` rows. The backend may
-    /// internally use graph capture/replay or other optimisations
-    /// via `runtime_state` — the engine is unaware.
+    /// Returns logits with `batch_size` rows. All inputs are device-side
+    /// tensors — the engine uploads them (or uses pre-allocated graph
+    /// buffers for CUDA graph capture).
+    ///
+    /// - `token_ids`: 1D u32 tensor of shape `(batch_size,)`.
+    /// - `block_tables`: flattened i32 tensor of shape
+    ///   `(batch_size * max_blocks_per_seq,)`.
+    /// - `seq_lens`: 1D i32 tensor of shape `(batch_size,)`.
+    /// - `positions`: 1D i32 tensor of shape `(batch_size,)`.
     ///
     /// # Errors
     /// Returns an error if the forward pass fails.
+    #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
-        token_ids: &[u32],
+        token_ids: &<Self::B as Backend>::Tensor,
         kv_cache: &mut Self::KvCache,
         runtime_state: &mut <Self::B as Backend>::RuntimeState,
-        block_tables: &[BlockTable],
-        positions: &[usize],
+        block_tables: &<Self::B as Backend>::Tensor,
+        seq_lens: &<Self::B as Backend>::Tensor,
+        positions: &<Self::B as Backend>::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
     ) -> Result<<Self::B as Backend>::Logits>;
 }

@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use infernum::GenerateOptions;
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -59,10 +60,10 @@ fn detect_model_type(model_path: &str) -> infernum::Result<String> {
     Ok(probe.model_type)
 }
 
-fn bench_model<M: infernum::Model + Send + 'static>(
-    model: M,
-    n_gen: usize,
-) -> infernum::Result<()> {
+fn bench_model<M: infernum::Model + Send + 'static>(model: M, n_gen: usize) -> infernum::Result<()>
+where
+    M::B: infernum::DecodeBufferOps,
+{
     let prompt = vec![1u32, 15043, 29892, 920, 526, 366, 2599, 13];
 
     let engine = Engine::new(model)?;
@@ -94,7 +95,10 @@ fn bench_with_info<M: infernum::Model + Send + 'static>(
     hidden_size: usize,
     dtype: &str,
     n_gen: usize,
-) -> infernum::Result<()> {
+) -> infernum::Result<()>
+where
+    M::B: infernum::DecodeBufferOps,
+{
     eprintln!(
         "Model loaded: {} layers, {} hidden, dtype={}",
         num_layers, hidden_size, dtype,
@@ -123,28 +127,28 @@ fn main() -> infernum::Result<()> {
     let result = match family {
         "llama" => {
             let model = if is_gguf {
-                LlamaModel::from_gguf(&ctx, &cli.model)?
+                LlamaModel::<CudaBackend>::from_gguf(&ctx, &cli.model)?
             } else {
-                LlamaModel::from_pretrained(&ctx, &cli.model)?
+                LlamaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?
             };
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "qwen" => {
-            let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
+            let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "deepseek" => {
-            let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
+            let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "gemma" => {
-            let model = GemmaModel::from_pretrained(&ctx, &cli.model)?;
+            let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)

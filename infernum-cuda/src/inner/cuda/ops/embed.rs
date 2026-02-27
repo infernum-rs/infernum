@@ -160,6 +160,66 @@ pub fn embedding_gather_from_device(
     Ok(output)
 }
 
+/// Gather embedding rows using a device-side tensor of token IDs.
+///
+/// `input_ids` is a `CudaTensor` with dtype I32 (holding u32 token IDs).
+///
+/// # Errors
+/// Returns an error if kernel launch or allocation fails.
+pub fn embedding_gather_from_tensor(
+    ctx: &CudaContext,
+    embed_table: &CudaTensor,
+    input_ids: &CudaTensor,
+    seq_len: usize,
+) -> Result<CudaTensor> {
+    assert!(
+        input_ids.dtype() == DType::U32,
+        "embedding_gather_from_tensor: input_ids must be U32 (holding u32 token IDs), got {:?}",
+        input_ids.dtype()
+    );
+    let dtype = embed_table.dtype();
+    let hidden_size = embed_table.shape()[1];
+
+    let output_shape = [seq_len, hidden_size];
+    let mut output = unsafe { CudaTensor::uninit(ctx, &output_shape, dtype)? };
+
+    let device = ctx.device();
+    let kernel_name = format!("embedding_gather_{}", kernel_suffix(dtype));
+
+    let module_name = "embed";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let block_size = 256;
+    let grid_y = (hidden_size + block_size - 1) / block_size;
+
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, grid_y as u32, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // I32 and u32 are bit-identical; the kernel treats the pointer as
+    // unsigned indices into the embedding table.
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &embed_table.cuda_slice(),
+                &input_ids.cuda_slice(),
+                seq_len as i32,
+                hidden_size as i32,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

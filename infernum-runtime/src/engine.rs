@@ -8,7 +8,7 @@
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-use infernum::backend::Backend;
+use infernum::backend::{Backend, DecodeBufferOps};
 use infernum::logits::Logits;
 use infernum::runtime_state::RuntimeStateInit;
 use infernum::{
@@ -43,7 +43,10 @@ pub struct Engine<M: Model> {
     _phantom: std::marker::PhantomData<fn() -> M>,
 }
 
-impl<M: Model> Engine<M> {
+impl<M: Model> Engine<M>
+where
+    M::B: DecodeBufferOps,
+{
     /// Create a new engine wrapping the given model with default batch config.
     ///
     /// # Errors
@@ -171,14 +174,17 @@ impl<M: Model> Drop for Engine<M> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-fn worker_loop<M: Model>(
+fn worker_loop<M>(
     model: M,
     mut kv_cache: M::KvCache,
     mut runtime_state: <M::B as Backend>::RuntimeState,
     mut allocator: BlockAllocator,
     batch_config: BatchConfig,
     request_rx: mpsc::Receiver<GenerationRequest>,
-) {
+) where
+    M: Model,
+    M::B: DecodeBufferOps,
+{
     let model_config = model.config();
     let mut scheduler = Scheduler::new(&batch_config);
 
@@ -300,17 +306,27 @@ fn process_prefill<M: Model>(
 // Decode (backend-agnostic, no graph logic)
 // ---------------------------------------------------------------------------
 
-fn process_decode_batch<M: Model>(
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn process_decode_batch<M>(
     tasks: &[DecodeTask],
     model: &M,
     kv_cache: &mut M::KvCache,
     runtime_state: &mut <M::B as Backend>::RuntimeState,
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
-) {
-    let mut token_ids = Vec::with_capacity(tasks.len());
-    let mut block_tables = Vec::with_capacity(tasks.len());
-    let mut positions = Vec::with_capacity(tasks.len());
+) where
+    M: Model,
+    M::B: DecodeBufferOps,
+{
+    let batch_size = tasks.len();
+    let mut token_ids_host = Vec::with_capacity(batch_size);
+    let mut seq_lens_host = Vec::with_capacity(batch_size);
+    let mut positions_host = Vec::with_capacity(batch_size);
+    let mut block_tables_raw: Vec<Vec<usize>> = Vec::with_capacity(batch_size);
     let running_indices: Vec<usize> = tasks.iter().map(|t| t.running_idx).collect();
 
     for &idx in &running_indices {
@@ -320,17 +336,51 @@ fn process_decode_batch<M: Model>(
             .last()
             .copied()
             .unwrap_or_else(|| *seq.prompt_ids.last().unwrap_or(&0));
-        token_ids.push(tok);
-        block_tables.push(seq.block_table.clone());
-        positions.push(seq.block_table.seq_len());
+        token_ids_host.push(tok);
+        let pos = seq.block_table.seq_len();
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            positions_host.push(pos as i32);
+            seq_lens_host.push((pos + 1) as i32);
+        }
+        block_tables_raw.push(seq.block_table.blocks().to_vec());
     }
 
+    // Flatten block tables into (batch_size * max_blocks_per_seq) with padding
+    let max_blocks_per_seq = block_tables_raw.iter().map(Vec::len).max().unwrap_or(0);
+    #[allow(clippy::cast_possible_wrap)]
+    let block_tables_flat: Vec<i32> = {
+        let mut flat = vec![0i32; batch_size * max_blocks_per_seq];
+        for (i, bt) in block_tables_raw.iter().enumerate() {
+            for (j, &block_id) in bt.iter().enumerate() {
+                flat[i * max_blocks_per_seq + j] = block_id as i32;
+            }
+        }
+        flat
+    };
+
+    let device = model.device();
+    let decode = <M::B as DecodeBufferOps>::prepare_decode_tensors(
+        runtime_state,
+        device,
+        &token_ids_host,
+        &positions_host,
+        &block_tables_flat,
+        &seq_lens_host,
+        max_blocks_per_seq,
+    )
+    .expect("failed to prepare decode tensors");
+
     let result = model.forward_batch_decode(
-        &token_ids,
+        &decode.token_ids,
         kv_cache,
         runtime_state,
-        &block_tables,
-        &positions,
+        &decode.block_tables,
+        &decode.seq_lens,
+        &decode.positions,
+        decode.batch_size,
+        decode.max_blocks_per_seq,
+        decode.max_seq_len,
     );
 
     match result {

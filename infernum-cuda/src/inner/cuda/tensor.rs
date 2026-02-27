@@ -445,6 +445,14 @@ impl Tensor for CudaTensor {
     fn dtype(&self) -> DType {
         self.dtype
     }
+
+    fn reshape(&self, shape: &[usize]) -> Self {
+        self.reshape(shape)
+    }
+
+    fn slice_view(&self, offset: usize, shape: &[usize]) -> Self {
+        self.slice_view(offset, shape)
+    }
 }
 
 #[cfg(test)]

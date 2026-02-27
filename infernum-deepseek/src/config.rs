@@ -8,46 +8,9 @@ use serde::Deserialize;
 
 use infernum::Result;
 
-/// Quantization configuration parsed from `config.json`
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    /// Quantization method: `"gptq"` or `"awq"`
-    pub quant_method: String,
-
-    /// Number of bits per weight (typically 4)
-    #[serde(default = "default_quant_bits")]
-    pub bits: u32,
-
-    /// Number of elements per quantization group (typically 128).
-    #[serde(
-        default = "default_group_size",
-        deserialize_with = "deserialize_group_size"
-    )]
-    pub group_size: usize,
-}
-
-fn default_quant_bits() -> u32 {
-    4
-}
-
-fn default_group_size() -> usize {
-    128
-}
-
-/// Deserialize `group_size`: -1 (per-channel) → 0 sentinel, positive values pass through.
-#[allow(clippy::cast_possible_truncation)]
-fn deserialize_group_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i64::deserialize(deserializer)?;
-    if value <= 0 {
-        Ok(0)
-    } else {
-        #[allow(clippy::cast_sign_loss)]
-        Ok(value as usize)
-    }
-}
+/// Re-exported from `infernum` core — the same struct is used by
+/// `WeightLoader<B>` for generic weight loading.
+pub use infernum::QuantizationConfig;
 
 /// RoPE scaling configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +28,16 @@ pub struct RopeScalingConfig {
     /// YaRN mscale all-dim factor (DeepSeek V3 uses 1.0)
     #[serde(default)]
     pub mscale_all_dim: Option<f32>,
+}
+
+impl From<&RopeScalingConfig> for infernum::RopeScaling {
+    fn from(rs: &RopeScalingConfig) -> Self {
+        Self {
+            rope_type: rs.rope_type.clone(),
+            factor: rs.factor,
+            original_max_position_embeddings: rs.original_max_position_embeddings,
+        }
+    }
 }
 
 /// Configuration for DeepSeek V3 / R1 models

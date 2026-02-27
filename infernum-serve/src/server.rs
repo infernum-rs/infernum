@@ -82,7 +82,10 @@ trait ErasedEngine: Send + Sync {
     fn model_config(&self) -> &ModelConfig;
 }
 
-impl<M: Model> ErasedEngine for Engine<M> {
+impl<M: Model> ErasedEngine for Engine<M>
+where
+    M::B: infernum::DecodeBufferOps,
+{
     fn submit(
         &self,
         input_ids: Vec<u32>,
@@ -128,6 +131,7 @@ impl ModelEntry {
     pub fn new<M, T, C>(name: &str, model: M, tokenizer: T, template: C) -> Self
     where
         M: Model,
+        M::B: infernum::DecodeBufferOps,
         T: Tokenizer + Send + Sync + 'static,
         C: ChatTemplate + 'static,
     {
@@ -157,6 +161,7 @@ impl ModelEntry {
     ) -> Self
     where
         M: Model,
+        M::B: infernum::DecodeBufferOps,
         T: Tokenizer + Send + Sync + 'static,
         C: ChatTemplate + 'static,
     {

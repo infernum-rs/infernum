@@ -19,7 +19,10 @@ pub struct Runtime<M: Model, T: Tokenizer> {
     tokenizer: T,
 }
 
-impl<M: Model, T: Tokenizer> Runtime<M, T> {
+impl<M: Model, T: Tokenizer> Runtime<M, T>
+where
+    M::B: infernum::DecodeBufferOps,
+{
     /// Create a new runtime from a model and tokenizer.
     ///
     /// # Errors

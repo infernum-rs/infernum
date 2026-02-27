@@ -8,50 +8,9 @@ use serde::Deserialize;
 
 use infernum::Result;
 
-/// Quantization configuration parsed from `config.json`
-///
-/// Present in GPTQ and AWQ quantized models under the `quantization_config` key.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    /// Quantization method: `"gptq"` or `"awq"`
-    pub quant_method: String,
-
-    /// Number of bits per weight (typically 4)
-    #[serde(default = "default_quant_bits")]
-    pub bits: u32,
-
-    /// Number of elements per quantization group (typically 128).
-    /// A value of 0 means per-channel quantization (one group = full input dim),
-    /// resolved to `in_features` at load time. JSON value `-1` is deserialized as 0.
-    #[serde(
-        default = "default_group_size",
-        deserialize_with = "deserialize_group_size"
-    )]
-    pub group_size: usize,
-}
-
-fn default_quant_bits() -> u32 {
-    4
-}
-
-fn default_group_size() -> usize {
-    128
-}
-
-/// Deserialize `group_size`: -1 (per-channel) → 0 sentinel, positive values pass through.
-#[allow(clippy::cast_possible_truncation)]
-fn deserialize_group_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i64::deserialize(deserializer)?;
-    if value <= 0 {
-        Ok(0)
-    } else {
-        #[allow(clippy::cast_sign_loss)]
-        Ok(value as usize)
-    }
-}
+/// Re-exported from `infernum` core — the same struct is used by
+/// `WeightLoader<B>` for generic weight loading.
+pub use infernum::QuantizationConfig;
 
 /// RoPE scaling configuration (YaRN for extended context)
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +23,16 @@ pub struct RopeScalingConfig {
 
     /// Original context length before scaling
     pub original_max_position_embeddings: usize,
+}
+
+impl From<&RopeScalingConfig> for infernum::RopeScaling {
+    fn from(rs: &RopeScalingConfig) -> Self {
+        Self {
+            rope_type: rs.rope_type.clone(),
+            factor: rs.factor,
+            original_max_position_embeddings: rs.original_max_position_embeddings,
+        }
+    }
 }
 
 /// Configuration for Qwen models

@@ -118,15 +118,23 @@ impl infernum::Model for MockModel {
         Ok(CudaLogits::new(self.make_logits_tensor(1, 42)?))
     }
 
+    fn device(&self) -> &CudaContext {
+        &self.ctx
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
-        token_ids: &[u32],
+        _token_ids: &CudaTensor,
         _kv_cache: &mut Self::KvCache,
         _runtime_state: &mut CudaRuntimeState,
-        _block_tables: &[BlockTable],
-        _positions: &[usize],
+        _block_tables: &CudaTensor,
+        _seq_lens: &CudaTensor,
+        _positions: &CudaTensor,
+        batch_size: usize,
+        _max_blocks_per_seq: usize,
+        _max_seq_len: usize,
     ) -> InfernumResult<CudaLogits> {
-        let batch_size = token_ids.len();
         Ok(CudaLogits::new(self.make_logits_tensor(batch_size, 42)?))
     }
 }

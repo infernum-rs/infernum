@@ -102,6 +102,12 @@ impl NcclCommunicator {
     }
 }
 
+impl infernum::Comm<CudaTensor> for NcclCommunicator {
+    fn all_reduce_sum(&self, tensor: &mut CudaTensor) -> Result<()> {
+        self.all_reduce_sum_inplace(tensor)
+    }
+}
+
 /// Opaque NCCL unique ID for coordinating communicator creation.
 ///
 /// Rank 0 creates this and broadcasts the raw bytes to other ranks.

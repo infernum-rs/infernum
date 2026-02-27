@@ -1,98 +1,32 @@
-//! Integration tests that download real models and verify generation output.
+//! Integration tests for Llama/Mistral/Mixtral model families.
 //!
+//! Downloads real models from HuggingFace and verifies generation output.
 //! Gated behind the `integration` feature so they don't run during normal
 //! `cargo test`. Run with:
 //!
-//!   cargo test -p infernum-llama --features integration -- --test-threads=1
+//!   cargo test -p infernum-cuda --features integration -- --test-threads=1 llama
 //!
 //! Models are cached in `~/.cache/infernum/models/`, so subsequent runs are fast.
 #![cfg(feature = "integration")]
 
-use std::fs;
+mod test_helpers;
+
 use std::path::PathBuf;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_llama::LlamaModel;
 use infernum_runtime::Runtime;
 
-/// Files needed from a HuggingFace repo to load a SafeTensors model.
-const REQUIRED_FILES: &[&str] = &[
-    "config.json",
-    "model.safetensors",
-    "tokenizer.json",
-    "tokenizer_config.json",
-];
-
-/// Download a single file from HuggingFace Hub to `dest`.
-///
-/// Streams directly to disk to avoid buffering large files in memory.
-/// Skips the download if `dest` already exists.
-fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
-    if dest.exists() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).expect("Failed to create cache directory");
-    }
-
-    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
-    let response = ureq::get(&url).call().unwrap_or_else(|e| {
-        panic!("Failed to download {repo_id}/{filename}: {e}");
-    });
-
-    // Stream to a temp file first, then rename — avoids partial files on failure.
-    let tmp_dest = dest.with_extension("tmp");
-    let mut file = fs::File::create(&tmp_dest)
-        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp_dest.display()));
-    std::io::copy(&mut response.into_body().as_reader(), &mut file)
-        .unwrap_or_else(|e| panic!("Failed to download {filename}: {e}"));
-    fs::rename(&tmp_dest, dest)
-        .unwrap_or_else(|e| panic!("Failed to rename {}: {e}", tmp_dest.display()));
-}
-
-/// Download a model from HuggingFace Hub and return the local directory path.
-///
-/// Files are cached in `~/.cache/infernum/models/<org>/<model>/`.
-fn download_model(repo_id: &str) -> PathBuf {
-    download_model_files(repo_id, REQUIRED_FILES)
-}
-
-/// Download specific files from a HuggingFace model repo.
-///
-/// Use this instead of [`download_model`] for sharded models or repos
-/// with non-standard file layouts.
-fn download_model_files(repo_id: &str, files: &[&str]) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let cache_dir = PathBuf::from(home)
-        .join(".cache")
-        .join("infernum")
-        .join("models")
-        .join(repo_id);
-
-    for filename in files {
-        download_file(repo_id, filename, &cache_dir.join(filename));
-    }
-
-    cache_dir
-}
-
-/// Greedy generation options (deterministic, no sampling).
-fn greedy_options(max_tokens: usize) -> GenerateOptions {
-    GenerateOptions {
-        max_new_tokens: max_tokens,
-        sampling: None,
-        use_kv_cache: true,
-        ..GenerateOptions::default()
-    }
-}
+use test_helpers::{download_model, download_model_files, greedy_options};
 
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model =
+        LlamaModel::<CudaBackend>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -104,7 +38,8 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
 /// Load a model and generate text with greedy decoding + CUDA graph capture/replay.
 fn generate_greedy_with_graphs(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model =
+        LlamaModel::<CudaBackend>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -138,7 +73,8 @@ mod smollm2_360m {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -168,7 +104,8 @@ mod smollm2_360m {
         let prompt_ids = tokenizer.encode("The capital of France is", true).unwrap();
         let num_decode_steps = 20;
 
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model =
+            LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let model_cfg = model.model_config();
 
         // forward() reference: greedy decode step-by-step (no KV cache)
@@ -196,7 +133,7 @@ mod smollm2_360m {
             block_size: 16,
             num_blocks: 128,
         };
-        let mut paged_kvs = vec![PagedKvCache::new(
+        let mut paged_kv = PagedKvCache::new(
             &ctx,
             model_cfg.num_layers,
             &block_config,
@@ -204,7 +141,7 @@ mod smollm2_360m {
             model_cfg.head_dim,
             model.dtype(),
         )
-        .expect("paged kv")];
+        .expect("paged kv");
         let mut allocator = BlockAllocator::new(&block_config);
         let mut block_table = BlockTable::new(block_config.block_size);
 
@@ -214,7 +151,7 @@ mod smollm2_360m {
         }
 
         let prefill_logits = model
-            .forward_prefill_paged(&prompt_ids, &mut paged_kvs, &block_table, 0)
+            .forward_prefill_paged(&prompt_ids, &mut paged_kv, &block_table, 0)
             .expect("prefill");
         block_table.advance(prompt_ids.len());
 
@@ -231,12 +168,7 @@ mod smollm2_360m {
         for _step in 0..num_decode_steps - 1 {
             let pos = block_table.seq_len();
             let decode_logits = model
-                .forward_batch_decode(
-                    &[prev_token],
-                    &mut paged_kvs,
-                    &[block_table.clone()],
-                    &[pos],
-                )
+                .forward_batch_decode(&[prev_token], &mut paged_kv, &[block_table.clone()], &[pos])
                 .expect("decode");
             block_table.advance(1);
 
@@ -255,7 +187,9 @@ mod smollm2_360m {
         let dec_text = tokenizer.decode(&decode_tokens).unwrap_or_default();
         assert_eq!(
             fwd_tokens, decode_tokens,
-            "Paged decode diverged from forward():\n  forward: {fwd_text:?}\n  decode:  {dec_text:?}"
+            "Paged decode diverged from forward():
+  forward: {fwd_text:?}
+  decode:  {dec_text:?}"
         );
     }
 }
@@ -333,7 +267,8 @@ mod llama_fp8 {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -349,11 +284,6 @@ mod llama_fp8 {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 }
-
-// ─── GGUF ────────────────────────────────────────────────────────────────────
-
-// TODO: Add GGUF integration test once we pick an ungated GGUF model.
-// Will test LlamaModel::from_gguf() and GgufTokenizer.
 
 // ─── GPTQ INT4 ───────────────────────────────────────────────────────────────
 
@@ -380,7 +310,8 @@ mod llama_gptq {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -419,7 +350,8 @@ mod mixtral_moe_tiny {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -439,11 +371,6 @@ mod mixtral_moe_tiny {
 // ─── Mixtral MoE (real weights) ─────────────────────────────────────────────
 
 /// laser-dolphin-mixtral-2x7b-dpo (ungated, ~24GB bf16, 3 sharded SafeTensors)
-///
-/// Real Mixtral-architecture MoE model with 2 experts (top-2), 32 layers.
-/// Requires ~48GB VRAM (loaded as f32) — fits on a single A100 80GB or 2+ GPUs.
-/// Run manually with:
-///   cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mixtral_2x7b
 mod mixtral_2x7b {
     use super::*;
 
@@ -479,7 +406,8 @@ mod mixtral_2x7b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -498,18 +426,10 @@ mod mixtral_2x7b {
 
 // ─── MoE tensor-parallel (multi-GPU) ────────────────────────────────────────
 
-/// tiny-mixtral on 2 GPUs — validates MoE sharded loading and forward pass.
-///
-/// Uses the same tiny random-weight Mixtral as `mixtral_moe_tiny`, but
-/// loads across 2 GPUs with tensor parallelism to verify that the sharded
-/// MoE weight loading and the single all-reduce forward path work correctly.
-///
-/// Requires 2+ CUDA GPUs and the `nccl` feature. Run manually with:
-///   cargo test -p infernum-llama --features integration,nccl -- --ignored --test-threads=1 mixtral_moe_tp
 #[cfg(feature = "nccl")]
 mod mixtral_moe_tp {
     use super::*;
-    use infernum::{Model as _, ShardedModel};
+    use infernum::{GpuConfig, Model as _, ShardedModel};
 
     const REPO: &str = "jamesdborin/tiny-mixtral";
 
@@ -521,8 +441,19 @@ mod mixtral_moe_tp {
     #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
     fn loads_and_generates_2gpu() {
         let model_dir = model_dir();
-        let model = ShardedModel::<LlamaModel>::from_pretrained(&model_dir, 2)
-            .expect("Failed to load sharded MoE model");
+        let model = ShardedModel::<CudaBackend, LlamaModel<CudaBackend>>::from_pretrained(
+            &model_dir,
+            2,
+            |device, path, shard, comm| {
+                LlamaModel::<CudaBackend>::from_pretrained_sharded(
+                    device,
+                    path,
+                    GpuConfig::Sharded(shard),
+                    Some(comm),
+                )
+            },
+        )
+        .expect("Failed to load sharded MoE model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -537,8 +468,19 @@ mod mixtral_moe_tp {
     #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
     fn no_nan_in_output_2gpu() {
         let model_dir = model_dir();
-        let model = ShardedModel::<LlamaModel>::from_pretrained(&model_dir, 2)
-            .expect("Failed to load sharded MoE model");
+        let model = ShardedModel::<CudaBackend, LlamaModel<CudaBackend>>::from_pretrained(
+            &model_dir,
+            2,
+            |device, path, shard, comm| {
+                LlamaModel::<CudaBackend>::from_pretrained_sharded(
+                    device,
+                    path,
+                    GpuConfig::Sharded(shard),
+                    Some(comm),
+                )
+            },
+        )
+        .expect("Failed to load sharded MoE model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -557,14 +499,6 @@ mod mixtral_moe_tp {
 
 // ─── Mistral (dense) ────────────────────────────────────────────────────────
 
-/// Mistral-7B-Instruct-v0.3 (ungated, ~14.5GB, 3 sharded SafeTensors)
-///
-/// Dense Mistral model with `model_type: "mistral"`. Architecturally identical
-/// to Llama — tests that `model_type` validation accepts `"mistral"` and that
-/// loading + generation works correctly via the `MistralModel` alias.
-///
-/// Run manually with:
-///   cargo test -p infernum-llama --features integration -- --ignored --test-threads=1 mistral_7b
 mod mistral_7b {
     use super::*;
     use infernum_llama::MistralModel;
@@ -590,7 +524,8 @@ mod mistral_7b {
     fn capital_of_france() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = MistralModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = MistralModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -609,7 +544,8 @@ mod mistral_7b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = MistralModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = MistralModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");

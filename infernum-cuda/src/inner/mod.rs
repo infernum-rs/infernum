@@ -11,7 +11,6 @@ pub use cuda_logits::CudaLogits;
 pub use cuda_runtime_state::CudaRuntimeState;
 
 pub use cuda::ops::LinearWeight;
-pub use cuda::BatchedGraphInputs;
 pub use cuda::BlockAllocator;
 pub use cuda::BlockConfig;
 pub use cuda::BlockTable;
@@ -23,12 +22,10 @@ pub use cuda::KvCache;
 pub use cuda::PagedKvCache;
 pub use cuda::QuantizedTensor;
 pub use cuda::SeqPosition;
-#[cfg(feature = "nccl")]
-pub use cuda::{nccl::NcclId, NcclCommunicator, ShardedModel};
 pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
 #[cfg(feature = "nccl")]
-pub use model::ShardedLoadable;
-pub use weights::{GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
+pub use cuda::{NcclCommunicator, NcclId};
+pub use weights::{CudaWeightLoader, GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
 
 // Re-export cudarc types/traits needed by downstream generic model code
 pub use cudarc::cublas::{CudaBlas, Gemm};
