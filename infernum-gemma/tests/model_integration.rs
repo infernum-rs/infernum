@@ -183,7 +183,7 @@ mod gemma2_tiny_random {
             block_size: 16,
             num_blocks: 64,
         };
-        let mut paged_kvs = vec![PagedKvCache::new(
+        let mut paged_kv = PagedKvCache::new(
             &ctx,
             model_cfg.num_layers,
             &block_config,
@@ -191,7 +191,7 @@ mod gemma2_tiny_random {
             model_cfg.head_dim,
             model_ref.dtype(),
         )
-        .expect("paged kv")];
+        .expect("paged kv");
         let mut allocator = BlockAllocator::new(&block_config);
 
         let mut block_table = BlockTable::new(block_config.block_size);
@@ -203,7 +203,7 @@ mod gemma2_tiny_random {
 
         // Prefill
         let prefill_logits = model_ref
-            .forward_prefill_paged(&prompt_ids, &mut paged_kvs, &block_table, 0)
+            .forward_prefill_paged(&prompt_ids, &mut paged_kv, &block_table, 0)
             .expect("prefill");
         block_table.advance(prompt_ids.len());
         let prefill_vec: Vec<f32> = prefill_logits.to_vec().expect("read");
@@ -226,12 +226,7 @@ mod gemma2_tiny_random {
             let pos = block_table.seq_len();
 
             let decode_logits = model_ref
-                .forward_batch_decode(
-                    &[prev_token],
-                    &mut paged_kvs,
-                    &[block_table.clone()],
-                    &[pos],
-                )
+                .forward_batch_decode(&[prev_token], &mut paged_kv, &[block_table.clone()], &[pos])
                 .expect("decode");
             block_table.advance(1);
 
@@ -343,7 +338,7 @@ mod gemma3_text_tiny_random {
             block_size: 16,
             num_blocks: 64,
         };
-        let mut paged_kvs = vec![PagedKvCache::new(
+        let mut paged_kv = PagedKvCache::new(
             &ctx,
             model_cfg.num_layers,
             &block_config,
@@ -351,7 +346,7 @@ mod gemma3_text_tiny_random {
             model_cfg.head_dim,
             model_ref.dtype(),
         )
-        .expect("paged kv")];
+        .expect("paged kv");
         let mut allocator = BlockAllocator::new(&block_config);
 
         let mut block_table = BlockTable::new(block_config.block_size);
@@ -363,7 +358,7 @@ mod gemma3_text_tiny_random {
 
         // Prefill
         let prefill_logits = model_ref
-            .forward_prefill_paged(&prompt_ids, &mut paged_kvs, &block_table, 0)
+            .forward_prefill_paged(&prompt_ids, &mut paged_kv, &block_table, 0)
             .expect("prefill");
         block_table.advance(prompt_ids.len());
         let prefill_vec: Vec<f32> = prefill_logits.to_vec().expect("read");
@@ -386,12 +381,7 @@ mod gemma3_text_tiny_random {
             let pos = block_table.seq_len();
 
             let decode_logits = model_ref
-                .forward_batch_decode(
-                    &[prev_token],
-                    &mut paged_kvs,
-                    &[block_table.clone()],
-                    &[pos],
-                )
+                .forward_batch_decode(&[prev_token], &mut paged_kv, &[block_table.clone()], &[pos])
                 .expect("decode");
             block_table.advance(1);
 
@@ -513,7 +503,7 @@ mod gemma2_2b {
             block_size: 16,
             num_blocks: 128,
         };
-        let mut paged_kvs = vec![PagedKvCache::new(
+        let mut paged_kv = PagedKvCache::new(
             &ctx,
             model_cfg.num_layers,
             &block_config,
@@ -521,7 +511,7 @@ mod gemma2_2b {
             model_cfg.head_dim,
             model.dtype(),
         )
-        .expect("paged kv")];
+        .expect("paged kv");
         let mut allocator = BlockAllocator::new(&block_config);
         let mut block_table = BlockTable::new(block_config.block_size);
 
@@ -531,7 +521,7 @@ mod gemma2_2b {
         }
 
         let prefill_logits = model
-            .forward_prefill_paged(&prompt_ids, &mut paged_kvs, &block_table, 0)
+            .forward_prefill_paged(&prompt_ids, &mut paged_kv, &block_table, 0)
             .expect("prefill");
         block_table.advance(prompt_ids.len());
 
@@ -548,12 +538,7 @@ mod gemma2_2b {
         for _step in 0..num_decode_steps - 1 {
             let pos = block_table.seq_len();
             let decode_logits = model
-                .forward_batch_decode(
-                    &[prev_token],
-                    &mut paged_kvs,
-                    &[block_table.clone()],
-                    &[pos],
-                )
+                .forward_batch_decode(&[prev_token], &mut paged_kv, &[block_table.clone()], &[pos])
                 .expect("decode");
             block_table.advance(1);
 

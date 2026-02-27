@@ -570,15 +570,6 @@ impl MoeOps for CudaBackend {
 }
 
 #[cfg(feature = "nccl")]
-impl infernum::backend::AllReduceOps for CudaBackend {
-    type OldComm = crate::cuda::NcclCommunicator;
-
-    fn all_reduce_sum_inplace(comm: &Self::OldComm, tensor: &mut CudaTensor) -> Result<()> {
-        comm.all_reduce_sum_inplace(tensor)
-    }
-}
-
-#[cfg(feature = "nccl")]
 impl infernum::backend::MultiDeviceOps for CudaBackend {
     type CommId = crate::cuda::NcclId;
 

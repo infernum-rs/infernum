@@ -2140,12 +2140,11 @@ impl DeepSeekModel<CudaBackend> {
     pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
+        paged_kv: &mut PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
     ) -> Result<CudaTensor> {
         let seq_len = input_ids.len();
-        let paged_kv = &mut paged_kvs[0];
 
         let mut hidden = self.embed(input_ids)?;
 
@@ -2177,12 +2176,11 @@ impl DeepSeekModel<CudaBackend> {
     pub fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
+        paged_kv: &mut PagedKvCache,
         block_tables: &[BlockTable],
         positions: &[usize],
     ) -> Result<CudaTensor> {
         let batch_size = token_ids.len();
-        let paged_kv = &mut paged_kvs[0];
         let hidden_size = self.config.hidden_size;
 
         // Process each sequence independently through the full MLA pipeline.
@@ -2255,12 +2253,7 @@ impl infernum::Model for DeepSeekModel<CudaBackend> {
         block_table: &infernum::BlockTable,
         start_pos: usize,
     ) -> Result<infernum_cuda::CudaLogits> {
-        let tensor = self.forward_prefill_paged(
-            input_ids,
-            std::slice::from_mut(kv_cache),
-            block_table,
-            start_pos,
-        )?;
+        let tensor = self.forward_prefill_paged(input_ids, kv_cache, block_table, start_pos)?;
         Ok(infernum_cuda::CudaLogits::new(tensor))
     }
 
@@ -2294,7 +2287,7 @@ impl infernum::Model for DeepSeekModel<CudaBackend> {
         let tensor = DeepSeekModel::forward_batch_decode(
             self,
             &token_ids_host,
-            std::slice::from_mut(kv_cache),
+            kv_cache,
             &block_tables_host,
             &positions_host,
         )?;

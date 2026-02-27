@@ -641,22 +641,6 @@ pub trait MatmulExtOps: Backend {
     fn matmul_bf16_f32(a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
 }
 
-// ---- Multi-GPU ----
-
-/// Communicator handle for all-reduce operations (e.g., NCCL).
-///
-/// Models that support tensor parallelism store `Option<Self::Comm>`
-/// and call `all_reduce_sum_inplace` after each TP-split matmul.
-pub trait AllReduceOps: Backend {
-    /// Opaque communicator handle (e.g., `NcclCommunicator`).
-    ///
-    /// Deprecated: being replaced by `Backend::Comm` + `Comm` trait.
-    type OldComm: Send + Sync;
-
-    /// In-place sum all-reduce across all ranks.
-    fn all_reduce_sum_inplace(comm: &Self::OldComm, tensor: &mut Self::Tensor) -> Result<()>;
-}
-
 // ---- Multi-device ops ----
 
 /// Factory methods for creating devices and communicators across multiple

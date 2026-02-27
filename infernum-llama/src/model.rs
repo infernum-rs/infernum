@@ -1109,7 +1109,7 @@ impl<B: LlamaOps> LlamaModel<B> {
     pub fn forward_batch_decode(
         &self,
         token_ids: &[u32],
-        paged_kvs: &mut [B::PagedKvCache],
+        paged_kv: &mut B::PagedKvCache,
         block_tables: &[BlockTable],
         positions: &[usize],
     ) -> Result<B::Tensor> {
@@ -1136,7 +1136,7 @@ impl<B: LlamaOps> LlamaModel<B> {
 
         self.forward_batch_decode_tensors(
             &token_ids_t,
-            paged_kvs,
+            paged_kv,
             &bt_t,
             &sl_t,
             &pos_t,
@@ -1162,7 +1162,7 @@ impl<B: LlamaOps> LlamaModel<B> {
     pub fn forward_batch_decode_tensors(
         &self,
         token_ids: &B::Tensor,
-        paged_kvs: &mut [B::PagedKvCache],
+        paged_kv: &mut B::PagedKvCache,
         block_tables: &B::Tensor,
         seq_lens: &B::Tensor,
         positions: &B::Tensor,
@@ -1170,8 +1170,6 @@ impl<B: LlamaOps> LlamaModel<B> {
         max_blocks_per_seq: usize,
         max_seq_len: usize,
     ) -> Result<B::Tensor> {
-        let paged_kv = &mut paged_kvs[0];
-
         let mut hidden = B::embedding_gather_tensor(&self.embed_tokens, token_ids, batch_size)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -1206,12 +1204,11 @@ impl<B: LlamaOps> LlamaModel<B> {
     pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [B::PagedKvCache],
+        paged_kv: &mut B::PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
     ) -> Result<B::Tensor> {
         let seq_len = input_ids.len();
-        let paged_kv = &mut paged_kvs[0];
 
         let mut hidden = self.embed(input_ids)?;
 
@@ -1605,12 +1602,7 @@ where
         block_table: &BlockTable,
         start_pos: usize,
     ) -> Result<B::Logits> {
-        let tensor = self.forward_prefill_paged(
-            input_ids,
-            std::slice::from_mut(kv_cache),
-            block_table,
-            start_pos,
-        )?;
+        let tensor = self.forward_prefill_paged(input_ids, kv_cache, block_table, start_pos)?;
         Ok(B::logits_from_tensor(tensor))
     }
 
@@ -1629,7 +1621,7 @@ where
     ) -> Result<B::Logits> {
         let tensor = self.forward_batch_decode_tensors(
             token_ids,
-            std::slice::from_mut(kv_cache),
+            kv_cache,
             block_tables,
             seq_lens,
             positions,

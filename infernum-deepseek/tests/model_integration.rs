@@ -168,7 +168,7 @@ mod deepseek_v3_tiny {
             block_size,
             num_blocks,
         };
-        let mut paged_kvs = vec![PagedKvCache::new(
+        let mut paged_kv = PagedKvCache::new(
             &ctx,
             model_config.num_layers,
             &block_config,
@@ -176,7 +176,7 @@ mod deepseek_v3_tiny {
             model_config.head_dim,
             model.dtype(),
         )
-        .expect("Failed to create paged KV cache")];
+        .expect("Failed to create paged KV cache");
         let mut allocator = BlockAllocator::new(&block_config);
 
         // Prefill a prompt first
@@ -188,7 +188,7 @@ mod deepseek_v3_tiny {
             bt.append_block(block_idx);
         }
         let _prefill_logits = model
-            .forward_prefill_paged(&input_ids, &mut paged_kvs, &bt, 0)
+            .forward_prefill_paged(&input_ids, &mut paged_kv, &bt, 0)
             .expect("Prefill failed");
         bt.advance(input_ids.len());
 
@@ -231,7 +231,7 @@ mod deepseek_v3_tiny {
         let logits = Model::forward_batch_decode(
             &model,
             &token_ids_t,
-            &mut paged_kvs[0],
+            &mut paged_kv,
             &mut runtime_state,
             &block_tables_t,
             &seq_lens_t,

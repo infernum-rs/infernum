@@ -196,7 +196,7 @@ mod smollm2_360m {
             block_size: 16,
             num_blocks: 128,
         };
-        let mut paged_kvs = vec![PagedKvCache::new(
+        let mut paged_kv = PagedKvCache::new(
             &ctx,
             model_cfg.num_layers,
             &block_config,
@@ -204,7 +204,7 @@ mod smollm2_360m {
             model_cfg.head_dim,
             model.dtype(),
         )
-        .expect("paged kv")];
+        .expect("paged kv");
         let mut allocator = BlockAllocator::new(&block_config);
         let mut block_table = BlockTable::new(block_config.block_size);
 
@@ -214,7 +214,7 @@ mod smollm2_360m {
         }
 
         let prefill_logits = model
-            .forward_prefill_paged(&prompt_ids, &mut paged_kvs, &block_table, 0)
+            .forward_prefill_paged(&prompt_ids, &mut paged_kv, &block_table, 0)
             .expect("prefill");
         block_table.advance(prompt_ids.len());
 
@@ -231,12 +231,7 @@ mod smollm2_360m {
         for _step in 0..num_decode_steps - 1 {
             let pos = block_table.seq_len();
             let decode_logits = model
-                .forward_batch_decode(
-                    &[prev_token],
-                    &mut paged_kvs,
-                    &[block_table.clone()],
-                    &[pos],
-                )
+                .forward_batch_decode(&[prev_token], &mut paged_kv, &[block_table.clone()], &[pos])
                 .expect("decode");
             block_table.advance(1);
 
