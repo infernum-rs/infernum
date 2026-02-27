@@ -39,6 +39,14 @@ use crate::DeepSeekConfig;
 /// - `kv_b_proj_k`: `(kv_lora_rank, num_heads * qk_nope_dim)` — K-nope decompression
 /// - `kv_b_proj_v`: `(num_heads, kv_lora_rank, v_head_dim)` — V decompression (batched matmul)
 /// - `kv_b_proj_k_t`: `(num_heads, qk_nope_dim, kv_lora_rank)` — Q absorption (batched matmul)
+///
+/// # Panics
+///
+/// Panics if the weight's column count does not equal `num_heads * (qk_nope_dim + v_head_dim)`.
+///
+/// # Errors
+///
+/// Returns an error if tensor data extraction or construction fails.
 pub fn split_kv_b_proj_dense<B: TensorFactory + TensorDataOps>(
     device: &B::DeviceHandle,
     weight: &B::Tensor,
