@@ -29,8 +29,6 @@ use infernum::Result;
 use infernum_cuda::cuda::ops::{
     cast_from_f32, matmul, precompute_rope_cache, quantized_matmul, transpose_2d,
 };
-#[cfg(feature = "nccl")]
-use infernum_cuda::cuda::NcclCommunicator;
 use infernum_cuda::cuda::{CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor};
 use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
 use infernum_cuda::BlockTable;
@@ -1377,18 +1375,6 @@ fn gemma_linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor>
 }
 
 // --- Model trait implementation ---
-
-#[cfg(feature = "nccl")]
-impl infernum_cuda::ShardedLoadable for GemmaModel<CudaBackend> {
-    fn load_shard(
-        ctx: &CudaContext,
-        model_path: &Path,
-        shard: ShardConfig,
-        comm: NcclCommunicator,
-    ) -> Result<Self> {
-        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), Some(comm))
-    }
-}
 
 // --- Public helpers & infernum::Model implementation ---
 

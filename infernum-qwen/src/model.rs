@@ -22,8 +22,6 @@ use infernum_cuda::cuda::ops::{
     cast_from_f32, cast_to_f32, precompute_rope_cache, precompute_rope_cache_scaled, transpose_2d,
     LinearWeight, RopeScaling,
 };
-#[cfg(feature = "nccl")]
-use infernum_cuda::cuda::NcclCommunicator;
 use infernum_cuda::cuda::{CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor};
 use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
 use infernum_cuda::BlockTable;
@@ -1620,18 +1618,6 @@ impl QwenModel<CudaBackend> {
             return Ok(logits_t);
         }
         CudaBackend::cast_to_f32(&logits_t)
-    }
-}
-
-#[cfg(feature = "nccl")]
-impl infernum_cuda::ShardedLoadable for QwenModel<CudaBackend> {
-    fn load_shard(
-        ctx: &CudaContext,
-        model_path: &Path,
-        shard: ShardConfig,
-        comm: NcclCommunicator,
-    ) -> Result<Self> {
-        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), Some(comm))
     }
 }
 

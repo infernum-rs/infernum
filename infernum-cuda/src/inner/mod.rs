@@ -23,10 +23,8 @@ pub use cuda::PagedKvCache;
 pub use cuda::QuantizedTensor;
 pub use cuda::SeqPosition;
 #[cfg(feature = "nccl")]
-pub use cuda::{nccl::NcclId, NcclCommunicator, ShardedModel};
+pub use cuda::{nccl::NcclId, NcclCommunicator};
 pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
-#[cfg(feature = "nccl")]
-pub use model::ShardedLoadable;
 pub use weights::{CudaWeightLoader, GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
 
 // Re-export cudarc types/traits needed by downstream generic model code

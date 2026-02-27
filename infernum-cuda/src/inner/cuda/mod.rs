@@ -13,8 +13,6 @@ pub mod ops;
 pub mod paged_kv_cache;
 mod quantized;
 pub mod seq_position;
-#[cfg(feature = "nccl")]
-mod sharded;
 mod tensor;
 
 pub use buffer_pool::{BufferPool, PooledSlice};
@@ -26,8 +24,6 @@ pub use nccl::NcclCommunicator;
 pub use paged_kv_cache::PagedKvCache;
 pub use quantized::QuantizedTensor;
 pub use seq_position::SeqPosition;
-#[cfg(feature = "nccl")]
-pub use sharded::{ShardedKvCache, ShardedModel};
 pub use tensor::CudaTensor;
 
 // Re-export from infernum core (pure data types, no CUDA dependency)

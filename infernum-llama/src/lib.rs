@@ -6,8 +6,6 @@
 
 mod chat_templates;
 mod config;
-#[cfg(feature = "nccl")]
-mod cuda_model;
 mod model;
 
 pub use chat_templates::{Llama3Template, MistralTemplate};

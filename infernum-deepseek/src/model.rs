@@ -25,8 +25,6 @@ use infernum_cuda::cuda::ops::{
     fused_attention_decode_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
     quantized_matmul, transpose_2d, LinearWeight, RopeScaling,
 };
-#[cfg(feature = "nccl")]
-use infernum_cuda::cuda::NcclCommunicator;
 use infernum_cuda::cuda::{
     CudaContext, CudaSlice, CudaTensor, GpuConfig, KvCache, PagedKvCache, QuantizedTensor,
 };
@@ -2078,18 +2076,6 @@ impl DeepSeekModel<CudaBackend> {
 }
 
 // --- Model trait implementation ---
-
-#[cfg(feature = "nccl")]
-impl infernum_cuda::ShardedLoadable for DeepSeekModel<CudaBackend> {
-    fn load_shard(
-        ctx: &CudaContext,
-        model_path: &Path,
-        shard: ShardConfig,
-        comm: NcclCommunicator,
-    ) -> Result<Self> {
-        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), Some(comm))
-    }
-}
 
 // --- Public helpers & infernum::Model implementation ---
 

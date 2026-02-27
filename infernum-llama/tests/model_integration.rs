@@ -509,7 +509,8 @@ mod mixtral_2x7b {
 #[cfg(feature = "nccl")]
 mod mixtral_moe_tp {
     use super::*;
-    use infernum::{Model as _, ShardedModel};
+    use infernum::{GpuConfig, Model as _, ShardedModel};
+    use infernum_cuda::CudaBackend;
 
     const REPO: &str = "jamesdborin/tiny-mixtral";
 
@@ -521,8 +522,19 @@ mod mixtral_moe_tp {
     #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
     fn loads_and_generates_2gpu() {
         let model_dir = model_dir();
-        let model = ShardedModel::<LlamaModel>::from_pretrained(&model_dir, 2)
-            .expect("Failed to load sharded MoE model");
+        let model = ShardedModel::<CudaBackend, LlamaModel<CudaBackend>>::from_pretrained(
+            &model_dir,
+            2,
+            |device, path, shard, comm| {
+                LlamaModel::from_pretrained_sharded(
+                    device,
+                    path,
+                    GpuConfig::Sharded(shard),
+                    Some(comm),
+                )
+            },
+        )
+        .expect("Failed to load sharded MoE model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -537,8 +549,19 @@ mod mixtral_moe_tp {
     #[ignore = "Requires 2+ GPUs with NCCL — run manually with --ignored"]
     fn no_nan_in_output_2gpu() {
         let model_dir = model_dir();
-        let model = ShardedModel::<LlamaModel>::from_pretrained(&model_dir, 2)
-            .expect("Failed to load sharded MoE model");
+        let model = ShardedModel::<CudaBackend, LlamaModel<CudaBackend>>::from_pretrained(
+            &model_dir,
+            2,
+            |device, path, shard, comm| {
+                LlamaModel::from_pretrained_sharded(
+                    device,
+                    path,
+                    GpuConfig::Sharded(shard),
+                    Some(comm),
+                )
+            },
+        )
+        .expect("Failed to load sharded MoE model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
