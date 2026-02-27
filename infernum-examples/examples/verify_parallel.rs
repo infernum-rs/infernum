@@ -17,9 +17,9 @@ use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::Model as _;
-use infernum::{GenerateOptions, Result};
+use infernum::{GenerateOptions, GpuConfig, Result, ShardedModel};
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::{CudaBackend, ShardedModel};
+use infernum_cuda::CudaBackend;
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
@@ -207,8 +207,17 @@ fn main() -> Result<()> {
 
         match family {
             "qwen" => {
-                let model = ShardedModel::<QwenModel<CudaBackend>>::from_pretrained(
-                    &cli.model, world_size,
+                let model = ShardedModel::<CudaBackend, QwenModel<CudaBackend>>::from_pretrained(
+                    &cli.model,
+                    world_size,
+                    |device, path, shard, comm| {
+                        QwenModel::from_pretrained_sharded(
+                            device,
+                            path,
+                            GpuConfig::Sharded(shard),
+                            Some(comm),
+                        )
+                    },
                 )?;
                 let cfg = model.config();
                 println!(
@@ -220,9 +229,19 @@ fn main() -> Result<()> {
                 run_multi_gpu(model, &cli)?
             }
             "deepseek" => {
-                let model = ShardedModel::<DeepSeekModel<CudaBackend>>::from_pretrained(
-                    &cli.model, world_size,
-                )?;
+                let model =
+                    ShardedModel::<CudaBackend, DeepSeekModel<CudaBackend>>::from_pretrained(
+                        &cli.model,
+                        world_size,
+                        |device, path, shard, comm| {
+                            DeepSeekModel::from_pretrained_sharded(
+                                device,
+                                path,
+                                GpuConfig::Sharded(shard),
+                                Some(comm),
+                            )
+                        },
+                    )?;
                 let cfg = model.config();
                 println!(
                     "Loaded in {:.2}s ({} layers, head_dim={})",
@@ -233,8 +252,17 @@ fn main() -> Result<()> {
                 run_multi_gpu(model, &cli)?
             }
             "gemma" => {
-                let model = ShardedModel::<GemmaModel<CudaBackend>>::from_pretrained(
-                    &cli.model, world_size,
+                let model = ShardedModel::<CudaBackend, GemmaModel<CudaBackend>>::from_pretrained(
+                    &cli.model,
+                    world_size,
+                    |device, path, shard, comm| {
+                        GemmaModel::from_pretrained_sharded(
+                            device,
+                            path,
+                            GpuConfig::Sharded(shard),
+                            Some(comm),
+                        )
+                    },
                 )?;
                 let cfg = model.config();
                 println!(
@@ -246,8 +274,17 @@ fn main() -> Result<()> {
                 run_multi_gpu(model, &cli)?
             }
             _ => {
-                let model = ShardedModel::<LlamaModel<CudaBackend>>::from_pretrained(
-                    &cli.model, world_size,
+                let model = ShardedModel::<CudaBackend, LlamaModel<CudaBackend>>::from_pretrained(
+                    &cli.model,
+                    world_size,
+                    |device, path, shard, comm| {
+                        LlamaModel::from_pretrained_sharded(
+                            device,
+                            path,
+                            GpuConfig::Sharded(shard),
+                            Some(comm),
+                        )
+                    },
                 )?;
                 let cfg = model.config();
                 println!(
