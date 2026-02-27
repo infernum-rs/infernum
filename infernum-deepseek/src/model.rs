@@ -1659,12 +1659,11 @@ where
 
 use infernum::transformer;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn split_kv_b_proj_shapes() {
         use infernum_cuda::cuda::{CudaContext, CudaTensor};
         use infernum_cuda::CudaBackend;
@@ -1690,7 +1689,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn split_kv_b_proj_roundtrip() {
         use infernum_cuda::cuda::{CudaContext, CudaTensor};
         use infernum_cuda::CudaBackend;
@@ -1739,7 +1737,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn split_kv_b_proj_k_transpose() {
         use infernum_cuda::cuda::{CudaContext, CudaTensor};
         use infernum_cuda::CudaBackend;
