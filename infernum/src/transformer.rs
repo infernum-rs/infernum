@@ -23,7 +23,8 @@
 )]
 
 use crate::backend::{
-    Backend, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps, SwigluOps, TensorFactory, TensorOps,
+    Backend, BiasOps, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps, NormOps, SwigluOps,
+    TensorFactory, TensorOps,
 };
 use crate::block_allocator::BlockTable;
 use crate::dtype::DType;
@@ -395,4 +396,78 @@ pub fn build_rope_cache<B: TensorFactory + CastOps>(
     let cos_cache = B::cast_from_f32(&cos_f32, dtype)?;
     let sin_cache = B::cast_from_f32(&sin_f32, dtype)?;
     Ok((cos_cache, sin_cache))
+}
+
+/// Apply optional per-head QK-norm (RMSNorm) to Q and K tensors in-place.
+///
+/// When present, the Q/K tensors are reshaped to `(seq_len * num_heads, head_dim)`,
+/// normalized, and reshaped back to `(seq_len, num_heads, head_dim)`.
+///
+/// # Errors
+/// Returns an error if `rms_norm` fails.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_qk_norm<B: NormOps>(
+    q: &mut B::Tensor,
+    k: &mut B::Tensor,
+    q_norm: Option<&B::Tensor>,
+    k_norm: Option<&B::Tensor>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<()> {
+    let seq_len = q.shape()[0];
+    if let Some(q_norm_w) = q_norm {
+        let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
+        let normed_q = B::rms_norm(&flat_q, q_norm_w, eps)?;
+        *q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
+    }
+    if let Some(k_norm_w) = k_norm {
+        let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
+        let normed_k = B::rms_norm(&flat_k, k_norm_w, eps)?;
+        *k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
+    }
+    Ok(())
+}
+
+/// Apply optional Q/K/V biases in-place.
+///
+/// Each bias is optional — `None` means no bias for that projection.
+///
+/// # Errors
+/// Returns an error if `bias_add_inplace` fails.
+pub fn apply_qkv_bias<B: BiasOps>(
+    q: &mut B::Tensor,
+    k: &mut B::Tensor,
+    v: &mut B::Tensor,
+    q_bias: Option<&B::Tensor>,
+    k_bias: Option<&B::Tensor>,
+    v_bias: Option<&B::Tensor>,
+) -> Result<()> {
+    if let Some(bias) = q_bias {
+        B::bias_add_inplace(q, bias)?;
+    }
+    if let Some(bias) = k_bias {
+        B::bias_add_inplace(k, bias)?;
+    }
+    if let Some(bias) = v_bias {
+        B::bias_add_inplace(v, bias)?;
+    }
+    Ok(())
+}
+
+/// Load an optional tensor (returns `None` if the weight does not exist in the loader).
+///
+/// # Errors
+/// Returns an error if the tensor exists but fails to load.
+pub fn load_optional_tensor<B: Backend + MatmulOps>(
+    loader: &impl crate::WeightLoader<B>,
+    name: &str,
+    dtype: DType,
+) -> Result<Option<B::Tensor>> {
+    if loader.contains(name) {
+        Ok(Some(loader.load_tensor(name, dtype)?))
+    } else {
+        Ok(None)
+    }
 }

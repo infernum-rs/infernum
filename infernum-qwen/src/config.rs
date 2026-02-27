@@ -25,6 +25,16 @@ pub struct RopeScalingConfig {
     pub original_max_position_embeddings: usize,
 }
 
+impl From<&RopeScalingConfig> for infernum::RopeScaling {
+    fn from(rs: &RopeScalingConfig) -> Self {
+        Self {
+            rope_type: rs.rope_type.clone(),
+            factor: rs.factor,
+            original_max_position_embeddings: rs.original_max_position_embeddings,
+        }
+    }
+}
+
 /// Configuration for Qwen models
 ///
 /// Parsed from the model's `config.json` file. Covers Qwen2/2.5, Qwen3/3.5,

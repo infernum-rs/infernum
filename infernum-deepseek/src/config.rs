@@ -30,6 +30,16 @@ pub struct RopeScalingConfig {
     pub mscale_all_dim: Option<f32>,
 }
 
+impl From<&RopeScalingConfig> for infernum::RopeScaling {
+    fn from(rs: &RopeScalingConfig) -> Self {
+        Self {
+            rope_type: rs.rope_type.clone(),
+            factor: rs.factor,
+            original_max_position_embeddings: rs.original_max_position_embeddings,
+        }
+    }
+}
+
 /// Configuration for DeepSeek V3 / R1 models
 ///
 /// Parsed from the model's `config.json` file.

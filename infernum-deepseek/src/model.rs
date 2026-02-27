@@ -423,18 +423,12 @@ impl<B: DeepSeekOps> DeepSeekModel<B> {
         )?;
 
         // RoPE cache — use qk_rope_head_dim (only rope portion gets RoPE)
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(|rs| infernum::RopeScaling {
-                rope_type: rs.rope_type.clone(),
-                factor: rs.factor,
-                original_max_position_embeddings: rs.original_max_position_embeddings,
-            });
+        let rope_scaling: Option<infernum::RopeScaling> =
+            config.rope_scaling.as_ref().map(Into::into);
         let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
             &device,
-            config.max_position_embeddings,
             config.qk_rope_head_dim,
+            config.max_position_embeddings,
             config.rope_theta,
             rope_scaling.as_ref(),
             dtype,
@@ -728,18 +722,12 @@ impl<B: DeepSeekOps> DeepSeekModel<B> {
             )?
         };
 
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(|rs| infernum::RopeScaling {
-                rope_type: rs.rope_type.clone(),
-                factor: rs.factor,
-                original_max_position_embeddings: rs.original_max_position_embeddings,
-            });
+        let rope_scaling: Option<infernum::RopeScaling> =
+            config.rope_scaling.as_ref().map(Into::into);
         let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
             &device,
-            config.max_position_embeddings,
             config.qk_rope_head_dim,
+            config.max_position_embeddings,
             config.rope_theta,
             rope_scaling.as_ref(),
             dtype,

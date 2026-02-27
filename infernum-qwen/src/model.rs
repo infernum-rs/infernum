@@ -287,14 +287,8 @@ impl<B: QwenOps> QwenModel<B> {
         )?;
 
         // Precompute RoPE cache (with optional YaRN scaling)
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(|rs| infernum::RopeScaling {
-                rope_type: rs.rope_type.clone(),
-                factor: rs.factor,
-                original_max_position_embeddings: rs.original_max_position_embeddings,
-            });
+        let rope_scaling: Option<infernum::RopeScaling> =
+            config.rope_scaling.as_ref().map(Into::into);
         let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
             &device,
             config.head_dim(),
@@ -639,14 +633,8 @@ impl<B: QwenOps> QwenModel<B> {
             )?
         };
 
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(|rs| infernum::RopeScaling {
-                rope_type: rs.rope_type.clone(),
-                factor: rs.factor,
-                original_max_position_embeddings: rs.original_max_position_embeddings,
-            });
+        let rope_scaling: Option<infernum::RopeScaling> =
+            config.rope_scaling.as_ref().map(Into::into);
         let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
             &device,
             config.head_dim(),
@@ -786,11 +774,7 @@ impl<B: QwenOps> QwenModel<B> {
         name: &str,
         dtype: DType,
     ) -> Result<Option<B::Tensor>> {
-        if loader.contains(name) {
-            Ok(Some(loader.load_tensor(name, dtype)?))
-        } else {
-            Ok(None)
-        }
+        transformer::load_optional_tensor::<B>(loader, name, dtype)
     }
 
     fn embed(&self, input_ids: &[u32]) -> Result<B::Tensor> {
@@ -824,30 +808,29 @@ impl<B: QwenOps> QwenModel<B> {
             let (mut k, mut v) =
                 transformer::compute_kv_proj::<B>(&normed, &layer.attention.kv_proj)?;
 
-            if let Some(ref bias) = layer.attention.q_bias {
-                B::bias_add_inplace(&mut q, bias)?;
-            }
-            if let Some(ref bias) = layer.attention.k_bias {
-                B::bias_add_inplace(&mut k, bias)?;
-            }
-            if let Some(ref bias) = layer.attention.v_bias {
-                B::bias_add_inplace(&mut v, bias)?;
-            }
+            transformer::apply_qkv_bias::<B>(
+                &mut q,
+                &mut k,
+                &mut v,
+                layer.attention.q_bias.as_ref(),
+                layer.attention.k_bias.as_ref(),
+                layer.attention.v_bias.as_ref(),
+            )?;
 
             let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
             let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
             let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
 
-            if let Some(ref q_norm_w) = layer.attention.q_norm {
-                let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-                let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-                q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
-            }
-            if let Some(ref k_norm_w) = layer.attention.k_norm {
-                let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-                let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-                k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
-            }
+            transformer::apply_qk_norm::<B>(
+                &mut q,
+                &mut k,
+                layer.attention.q_norm.as_ref(),
+                layer.attention.k_norm.as_ref(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                self.config.rms_norm_eps,
+            )?;
 
             let q = B::apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
             let k = B::apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
@@ -1038,30 +1021,29 @@ impl<B: QwenOps> QwenModel<B> {
         let (mut k, mut v) =
             transformer::compute_kv_proj_decode::<B>(hidden, &weights.kv_proj, batch_size)?;
 
-        if let Some(ref bias) = weights.q_bias {
-            B::bias_add_inplace(&mut q, bias)?;
-        }
-        if let Some(ref bias) = weights.k_bias {
-            B::bias_add_inplace(&mut k, bias)?;
-        }
-        if let Some(ref bias) = weights.v_bias {
-            B::bias_add_inplace(&mut v, bias)?;
-        }
+        transformer::apply_qkv_bias::<B>(
+            &mut q,
+            &mut k,
+            &mut v,
+            weights.q_bias.as_ref(),
+            weights.k_bias.as_ref(),
+            weights.v_bias.as_ref(),
+        )?;
 
         let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
         let mut k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
         let v = v.reshape(&[batch_size, num_kv_heads, head_dim]);
 
-        if let Some(ref q_norm_w) = weights.q_norm {
-            let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-            q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
-        }
-        if let Some(ref k_norm_w) = weights.k_norm {
-            let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-            k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
-        }
+        transformer::apply_qk_norm::<B>(
+            &mut q,
+            &mut k,
+            weights.q_norm.as_ref(),
+            weights.k_norm.as_ref(),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.config.rms_norm_eps,
+        )?;
 
         let sliding_window = self.config.effective_sliding_window(layer_idx);
 
@@ -1156,30 +1138,29 @@ impl<B: QwenOps> QwenModel<B> {
         let mut q = B::linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = transformer::compute_kv_proj::<B>(hidden, &weights.kv_proj)?;
 
-        if let Some(ref bias) = weights.q_bias {
-            B::bias_add_inplace(&mut q, bias)?;
-        }
-        if let Some(ref bias) = weights.k_bias {
-            B::bias_add_inplace(&mut k, bias)?;
-        }
-        if let Some(ref bias) = weights.v_bias {
-            B::bias_add_inplace(&mut v, bias)?;
-        }
+        transformer::apply_qkv_bias::<B>(
+            &mut q,
+            &mut k,
+            &mut v,
+            weights.q_bias.as_ref(),
+            weights.k_bias.as_ref(),
+            weights.v_bias.as_ref(),
+        )?;
 
         let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
         let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
         let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
 
-        if let Some(ref q_norm_w) = weights.q_norm {
-            let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-            let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-            q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
-        }
-        if let Some(ref k_norm_w) = weights.k_norm {
-            let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-            let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-            k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
-        }
+        transformer::apply_qk_norm::<B>(
+            &mut q,
+            &mut k,
+            weights.q_norm.as_ref(),
+            weights.k_norm.as_ref(),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.config.rms_norm_eps,
+        )?;
 
         let q = B::apply_rope(&q, &self.cos_cache, &self.sin_cache, start_pos)?;
         let k = B::apply_rope(&k, &self.cos_cache, &self.sin_cache, start_pos)?;

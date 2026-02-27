@@ -47,10 +47,7 @@ struct GemmaAttentionWeights<B: Backend + MatmulOps> {
     k_norm: Option<B::Tensor>,
 }
 
-struct GemmaMlpWeights<B: Backend + MatmulOps> {
-    gate_up: GateUpWeight<B>,
-    down_proj: <B as MatmulOps>::LinearWeight,
-}
+type GemmaMlpWeights<B> = transformer::MlpWeights<B>;
 
 struct GemmaLayerWeights<B: Backend + MatmulOps> {
     input_layernorm: B::Tensor,
@@ -262,16 +259,16 @@ impl<B: GemmaOps> GemmaModel<B> {
             let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
             let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
 
-            if let Some(ref q_norm_w) = layer.attention.q_norm {
-                let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-                let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-                q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
-            }
-            if let Some(ref k_norm_w) = layer.attention.k_norm {
-                let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-                let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-                k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
-            }
+            transformer::apply_qk_norm::<B>(
+                &mut q,
+                &mut k,
+                layer.attention.q_norm.as_ref(),
+                layer.attention.k_norm.as_ref(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                self.config.rms_norm_eps,
+            )?;
 
             let (cos, sin) = self.rope_caches_for_layer(layer_idx);
             let q = B::apply_rope(&q, cos, sin, 0)?;
@@ -498,16 +495,16 @@ impl<B: GemmaOps> GemmaModel<B> {
         let mut k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
         let v = v.reshape(&[batch_size, num_kv_heads, head_dim]);
 
-        if let Some(ref q_norm_w) = weights.q_norm {
-            let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-            q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
-        }
-        if let Some(ref k_norm_w) = weights.k_norm {
-            let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-            k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
-        }
+        transformer::apply_qk_norm::<B>(
+            &mut q,
+            &mut k,
+            weights.q_norm.as_ref(),
+            weights.k_norm.as_ref(),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.config.rms_norm_eps,
+        )?;
 
         let (cos, sin) = self.rope_caches_for_layer(layer_idx);
         let q = B::apply_rope_batched(&q, cos, sin, positions, batch_size)?;
@@ -617,16 +614,16 @@ impl<B: GemmaOps> GemmaModel<B> {
         let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
         let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
 
-        if let Some(ref q_norm_w) = weights.q_norm {
-            let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-            let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-            q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
-        }
-        if let Some(ref k_norm_w) = weights.k_norm {
-            let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-            let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-            k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
-        }
+        transformer::apply_qk_norm::<B>(
+            &mut q,
+            &mut k,
+            weights.q_norm.as_ref(),
+            weights.k_norm.as_ref(),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.config.rms_norm_eps,
+        )?;
 
         let (cos, sin) = self.rope_caches_for_layer(layer_idx);
         let q = B::apply_rope(&q, cos, sin, start_pos)?;
