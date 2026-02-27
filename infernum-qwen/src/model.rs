@@ -11,32 +11,25 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, MatmulExtOps, MatmulOps, MoeOps,
-    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps,
+    MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
+use infernum::shard::{ShardConfig, ShardStrategy};
 use infernum::tensor::Tensor;
 use infernum::Result;
 use infernum_cuda::cuda::ops::{
     cast_from_f32, cast_to_f32, precompute_rope_cache, precompute_rope_cache_scaled, transpose_2d,
     LinearWeight, RopeScaling,
 };
-use infernum_cuda::cuda::{CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor};
 #[cfg(feature = "nccl")]
-use infernum_cuda::cuda::{NcclCommunicator, ShardConfig, ShardStrategy};
+use infernum_cuda::cuda::NcclCommunicator;
+use infernum_cuda::cuda::{CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor};
 use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
 use infernum_cuda::BlockTable;
 use infernum_cuda::CudaBackend;
 
 use crate::QwenConfig;
-
-#[cfg(feature = "nccl")]
-fn nccl_all_reduce(comm: Option<&NcclCommunicator>, tensor: &mut CudaTensor) -> Result<()> {
-    if let Some(comm) = comm {
-        comm.all_reduce_sum_inplace(tensor)?;
-    }
-    Ok(())
-}
 
 // --- Weight helpers ---
 
@@ -79,7 +72,6 @@ fn load_typed(
     }
 }
 
-#[cfg(feature = "nccl")]
 fn load_typed_sharded(
     dtype: DType,
     loader: &impl WeightLoader,
@@ -169,8 +161,8 @@ pub struct QwenModel<B: Backend + MatmulOps> {
     #[allow(dead_code)]
     gpu_config: GpuConfig,
 
-    #[cfg(feature = "nccl")]
-    nccl_comm: Option<NcclCommunicator>,
+    /// Optional communicator for tensor-parallel all-reduce.
+    comm: Option<B::Comm>,
 
     tp_num_heads: usize,
     tp_num_kv_heads: usize,
@@ -204,18 +196,25 @@ impl QwenModel<CudaBackend> {
     ///
     /// # Errors
     /// Returns an error if loading fails or head counts are not divisible.
-    #[cfg(feature = "nccl")]
     pub fn from_pretrained_sharded(
         ctx: &CudaContext,
         model_path: impl AsRef<Path>,
         gpu_config: GpuConfig,
-        nccl_comm: NcclCommunicator,
+        comm: Option<<CudaBackend as Backend>::Comm>,
     ) -> Result<Self> {
         let model_path = model_path.as_ref();
         let config_path = model_path.join("config.json");
         let config = QwenConfig::from_file(&config_path)?;
         let loader = SafeTensorsLoader::from_directory(model_path)?;
-        Self::load_weights_sharded(ctx, config, &loader, gpu_config, nccl_comm)
+        Self::load_weights_sharded(ctx, config, &loader, gpu_config, comm)
+    }
+
+    /// Optional all-reduce for tensor-parallel models. No-op for single GPU.
+    fn maybe_all_reduce(&self, tensor: &mut CudaTensor) -> Result<()> {
+        if let Some(comm) = &self.comm {
+            comm.all_reduce_sum(tensor)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -592,8 +591,7 @@ impl QwenModel<CudaBackend> {
             config,
             ctx: ctx.clone(),
             gpu_config: GpuConfig::Single,
-            #[cfg(feature = "nccl")]
-            nccl_comm: None,
+            comm: None,
             embed_tokens,
             layers,
             norm,
@@ -606,14 +604,13 @@ impl QwenModel<CudaBackend> {
 
     // --- Sharded loading ---
 
-    #[cfg(feature = "nccl")]
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn load_weights_sharded(
         ctx: &CudaContext,
         config: QwenConfig,
         loader: &impl WeightLoader,
         gpu_config: GpuConfig,
-        nccl_comm: NcclCommunicator,
+        comm: Option<<CudaBackend as Backend>::Comm>,
     ) -> Result<Self> {
         fn load_linear_sharded(
             model_dtype: DType,
@@ -699,7 +696,7 @@ impl QwenModel<CudaBackend> {
             GpuConfig::Sharded(s) => *s,
             GpuConfig::Single => {
                 return Self::load_weights(ctx, config, loader).map(|mut m| {
-                    m.nccl_comm = Some(nccl_comm);
+                    m.comm = comm;
                     m
                 })
             }
@@ -1061,7 +1058,7 @@ impl QwenModel<CudaBackend> {
             config,
             ctx: ctx.clone(),
             gpu_config,
-            nccl_comm: Some(nccl_comm),
+            comm,
             embed_tokens,
             layers,
             norm,
@@ -1359,8 +1356,7 @@ impl QwenModel<CudaBackend> {
         let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
 
         let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
 
@@ -1476,8 +1472,7 @@ impl QwenModel<CudaBackend> {
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
         let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
 
@@ -1538,8 +1533,7 @@ impl QwenModel<CudaBackend> {
         };
         let intermediate = CudaBackend::swiglu(&gate, &up)?;
         let mut out = CudaBackend::linear(&intermediate, &weights.down_proj)?;
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
 
@@ -1611,8 +1605,7 @@ impl QwenModel<CudaBackend> {
             }
         }
 
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
+        self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
 
@@ -1638,7 +1631,7 @@ impl infernum_cuda::ShardedLoadable for QwenModel<CudaBackend> {
         shard: ShardConfig,
         comm: NcclCommunicator,
     ) -> Result<Self> {
-        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), comm)
+        Self::from_pretrained_sharded(ctx, model_path, GpuConfig::Sharded(shard), Some(comm))
     }
 }
 
@@ -1723,8 +1716,7 @@ impl QwenModel<CudaBackend> {
                 CudaBackend::fused_attention_prefill(&q, &k, &v, 0, None, None, sliding_window)?;
             let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
             let mut attn_output = CudaBackend::linear(&attn_output, &layer.attention.o_proj)?;
-            #[cfg(feature = "nccl")]
-            nccl_all_reduce(self.nccl_comm.as_ref(), &mut attn_output)?;
+            self.maybe_all_reduce(&mut attn_output)?;
 
             let (mut h, normed) = CudaBackend::add_rmsnorm(
                 &hidden,
