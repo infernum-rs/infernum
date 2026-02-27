@@ -15,6 +15,7 @@ use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_qwen::QwenModel;
 use infernum_runtime::Runtime;
 
@@ -88,7 +89,8 @@ fn greedy_options(max_tokens: usize) -> GenerateOptions {
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = QwenModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model =
+        QwenModel::<CudaBackend>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -122,7 +124,8 @@ mod qwen2_5_0_5b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = QwenModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -151,7 +154,8 @@ mod qwen2_5_0_5b {
         let prompt_ids = tokenizer.encode("The capital of France is", true).unwrap();
         let num_decode_steps = 20;
 
-        let model = QwenModel::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model =
+            QwenModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let model_cfg = model.model_config();
 
         // forward() reference: greedy decode step-by-step (no KV cache)
@@ -263,7 +267,8 @@ mod qwen3_0_6b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = QwenModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -310,7 +315,8 @@ mod qwen3_moe_tiny {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = QwenModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 

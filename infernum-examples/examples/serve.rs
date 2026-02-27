@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
-            let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
+            let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "deepseek_v3" => {

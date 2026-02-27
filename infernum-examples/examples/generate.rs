@@ -279,7 +279,7 @@ fn main() -> Result<()> {
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
             "qwen2" | "qwen3" | "qwen3_moe" => {
-                let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
+                let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)

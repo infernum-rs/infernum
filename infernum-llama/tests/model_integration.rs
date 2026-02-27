@@ -15,6 +15,7 @@ use infernum::tokenizer::LlamaTokenizer;
 use infernum::GenerateOptions;
 use infernum::Tensor;
 use infernum_cuda::cuda::CudaContext;
+use infernum_cuda::CudaBackend;
 use infernum_llama::LlamaModel;
 use infernum_runtime::Runtime;
 
@@ -92,7 +93,8 @@ fn greedy_options(max_tokens: usize) -> GenerateOptions {
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model =
+        LlamaModel::<CudaBackend>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -104,7 +106,8 @@ fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> Stri
 /// Load a model and generate text with greedy decoding + CUDA graph capture/replay.
 fn generate_greedy_with_graphs(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = LlamaModel::from_pretrained(&ctx, model_dir).expect("Failed to load model");
+    let model =
+        LlamaModel::<CudaBackend>::from_pretrained(&ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
@@ -138,7 +141,8 @@ mod smollm2_360m {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -168,7 +172,8 @@ mod smollm2_360m {
         let prompt_ids = tokenizer.encode("The capital of France is", true).unwrap();
         let num_decode_steps = 20;
 
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("load model");
+        let model =
+            LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir).expect("load model");
         let model_cfg = model.model_config();
 
         // forward() reference: greedy decode step-by-step (no KV cache)
@@ -328,7 +333,8 @@ mod llama_fp8 {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -375,7 +381,8 @@ mod llama_gptq {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -414,7 +421,8 @@ mod mixtral_moe_tiny {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -474,7 +482,8 @@ mod mixtral_2x7b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = LlamaModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
@@ -521,7 +530,7 @@ mod mixtral_moe_tp {
             &model_dir,
             2,
             |device, path, shard, comm| {
-                LlamaModel::from_pretrained_sharded(
+                LlamaModel::<CudaBackend>::from_pretrained_sharded(
                     device,
                     path,
                     GpuConfig::Sharded(shard),
@@ -548,7 +557,7 @@ mod mixtral_moe_tp {
             &model_dir,
             2,
             |device, path, shard, comm| {
-                LlamaModel::from_pretrained_sharded(
+                LlamaModel::<CudaBackend>::from_pretrained_sharded(
                     device,
                     path,
                     GpuConfig::Sharded(shard),
@@ -608,7 +617,8 @@ mod mistral_7b {
     fn capital_of_france() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = MistralModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = MistralModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -627,7 +637,8 @@ mod mistral_7b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = MistralModel::from_pretrained(&ctx, &model_dir).expect("Failed to load model");
+        let model = MistralModel::<CudaBackend>::from_pretrained(&ctx, &model_dir)
+            .expect("Failed to load model");
 
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");

@@ -136,7 +136,7 @@ fn main() -> infernum::Result<()> {
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "qwen" => {
-            let model = QwenModel::from_pretrained(&ctx, &cli.model)?;
+            let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)
