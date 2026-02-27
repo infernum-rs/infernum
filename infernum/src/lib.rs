@@ -23,6 +23,7 @@ pub mod shard;
 pub mod sharded;
 pub mod tensor;
 pub mod tokenizer;
+pub mod transformer;
 pub mod weights;
 
 pub use backend::{

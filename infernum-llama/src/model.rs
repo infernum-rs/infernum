@@ -16,31 +16,20 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps, MoeOps,
-    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps, TensorFactory,
+    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, MatmulExtOps, MatmulOps, MoeOps, NormOps,
+    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps, TensorFactory,
     TensorOps,
 };
 use infernum::block_allocator::BlockTable;
 use infernum::dtype::DType;
 use infernum::shard::GpuConfig;
 use infernum::tensor::Tensor;
+use infernum::transformer::{self, GateUpWeight, KvProjWeight, MlpWeights};
 use infernum::Result;
 
 use crate::LlamaConfig;
 
 // ---- Weight types ----
-
-/// K+V projection storage: fused for dense weights, separate for quantized.
-pub(crate) enum KvProjWeight<B: Backend + MatmulOps> {
-    /// K and V weights concatenated into a single (hidden, 2*kv_dim) dense
-    /// tensor. After matmul the output columns split as `[k(kv_dim), v(kv_dim)]`.
-    Fused { weight: B::Tensor, kv_dim: usize },
-    /// Separate K and V projections (used for quantized weights).
-    Separate {
-        k_proj: Box<<B as MatmulOps>::LinearWeight>,
-        v_proj: Box<<B as MatmulOps>::LinearWeight>,
-    },
-}
 
 /// Weights for a single Llama attention layer
 pub(crate) struct LlamaAttentionWeights<B: Backend + MatmulOps> {
@@ -49,43 +38,16 @@ pub(crate) struct LlamaAttentionWeights<B: Backend + MatmulOps> {
     pub o_proj: <B as MatmulOps>::LinearWeight,
 }
 
-/// Gate+Up projection storage: fused for dense weights, separate for quantized.
-pub(crate) enum GateUpWeight<B: Backend + MatmulOps> {
-    /// Gate and up weights concatenated into a single (hidden, 2*intermediate)
-    /// dense tensor. After matmul the output columns split as
-    /// `[gate(intermediate), up(intermediate)]`.
-    Fused {
-        weight: B::Tensor,
-        intermediate_size: usize,
-    },
-    /// Separate gate and up projections (used for quantized weights).
-    Separate {
-        gate_proj: Box<<B as MatmulOps>::LinearWeight>,
-        up_proj: Box<<B as MatmulOps>::LinearWeight>,
-    },
-}
-
-/// Weights for a single Llama MLP layer
-pub(crate) struct LlamaMlpWeights<B: Backend + MatmulOps> {
-    pub gate_up: GateUpWeight<B>,
-    pub down_proj: <B as MatmulOps>::LinearWeight,
-}
-
-/// Weights for a single `MoE` expert (same structure as a dense MLP).
-pub(crate) struct MoeExpertWeights<B: Backend + MatmulOps> {
-    pub mlp: LlamaMlpWeights<B>,
-}
-
 /// Feed-forward network weights: either a single dense MLP or a Mixture-of-Experts layer.
 pub(crate) enum FfnWeights<B: Backend + MatmulOps> {
     /// Standard dense MLP (Llama, etc.)
-    Dense(Box<LlamaMlpWeights<B>>),
+    Dense(Box<MlpWeights<B>>),
     /// Mixture-of-Experts (Mixtral, etc.)
     Moe {
         /// Router gate weight, pre-transposed: shape `[hidden_size, num_experts]`
         gate: B::Tensor,
         /// Per-expert MLP weights
-        experts: Vec<MoeExpertWeights<B>>,
+        experts: Vec<MlpWeights<B>>,
         /// How many experts to activate per token
         num_experts_per_tok: usize,
     },
@@ -99,9 +61,6 @@ pub(crate) struct LlamaLayerWeights<B: Backend + MatmulOps> {
     pub ffn: FfnWeights<B>,
 }
 
-/// All-reduce callback for tensor-parallel models.
-///
-/// Wraps the backend-specific communicator in a type-erased closure so
 /// Complete Llama model, generic over the compute backend `B`.
 ///
 /// The backend determines the tensor type and linear weight representation.
@@ -306,47 +265,23 @@ impl<B: LlamaOps> LlamaModel<B> {
 
         let norm = loader.load_tensor("model.norm.weight", dtype)?;
 
-        let lm_head = if config.tie_word_embeddings {
-            if qc.is_some() {
-                // Quantized tied embeddings: cast to f32, quantize to Q8
-                let embed_f32 = B::cast_to_f32(&embed_tokens)?;
-                let data = B::to_f32_vec(&embed_f32)?;
-                B::quantize_to_q8(&device, embed_f32.shape(), &data)?
-            } else {
-                // Dense tied embeddings: transpose to matmul-ready layout
-                let embed_f32 = B::cast_to_f32(&embed_tokens)?;
-                let transposed = B::transpose_2d(&embed_f32)?;
-                B::dense_weight(B::cast_from_f32(&transposed, dtype)?)
-            }
-        } else {
-            let lw = loader.load_linear("lm_head.weight", dtype, None)?;
-            if qc.is_some() {
-                // Quantized model with separate lm_head: re-quantize as Q8
-                if let Some(w) = B::as_dense_weight(&lw) {
-                    let f32_w = B::cast_to_f32(w)?;
-                    // f32_w is in (in_features, out_features) col-major.
-                    // Transpose back to (out_features, in_features) row-major
-                    // for Q8 quantization.
-                    let row_major = B::transpose_2d(&f32_w)?;
-                    let data = B::to_f32_vec(&row_major)?;
-                    B::quantize_to_q8(&device, row_major.shape(), &data)?
-                } else {
-                    lw
-                }
-            } else {
-                lw
-            }
-        };
+        let lm_head = transformer::load_lm_head::<B>(
+            &device,
+            loader,
+            &embed_tokens,
+            config.tie_word_embeddings,
+            dtype,
+            qc,
+        )?;
 
-        // Precompute RoPE caches
-        let half_dim = config.head_dim() / 2;
-        let max_pos = config.max_position_embeddings;
-        let (cos_data, sin_data) =
-            infernum::rope::precompute_rope_data(max_pos, config.head_dim(), config.rope_theta);
-        let cos_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &cos_data)?;
-        let sin_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &sin_data)?;
-        let cos_cache = B::cast_from_f32(&cos_f32, dtype)?;
-        let sin_cache = B::cast_from_f32(&sin_f32, dtype)?;
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            None,
+            dtype,
+        )?;
 
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
@@ -373,31 +308,14 @@ impl<B: LlamaOps> LlamaModel<B> {
         layer_prefix: &str,
         config: &LlamaConfig,
         qc: Option<&infernum::QuantizationConfig>,
-    ) -> Result<LlamaMlpWeights<B>> {
-        let gate =
-            loader.load_linear(&format!("{layer_prefix}.mlp.gate_proj.weight"), dtype, qc)?;
-        let up = loader.load_linear(&format!("{layer_prefix}.mlp.up_proj.weight"), dtype, qc)?;
-        let gate_up = if B::is_dense_weight(&gate) && B::is_dense_weight(&up) {
-            let g = B::as_dense_weight(&gate).expect("checked dense");
-            let u = B::as_dense_weight(&up).expect("checked dense");
-            GateUpWeight::<B>::Fused {
-                weight: B::concat_inner_dim(g, u)?,
-                intermediate_size: config.intermediate_size,
-            }
-        } else {
-            GateUpWeight::<B>::Separate {
-                gate_proj: Box::new(gate),
-                up_proj: Box::new(up),
-            }
-        };
-        Ok(LlamaMlpWeights {
-            gate_up,
-            down_proj: loader.load_linear(
-                &format!("{layer_prefix}.mlp.down_proj.weight"),
-                dtype,
-                qc,
-            )?,
-        })
+    ) -> Result<MlpWeights<B>> {
+        transformer::load_mlp_weights(
+            loader,
+            &format!("{layer_prefix}.mlp"),
+            config.intermediate_size,
+            dtype,
+            qc,
+        )
     }
 
     /// Load MoE weights (router gate + per-expert MLPs) for a single layer.
@@ -440,9 +358,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                 }
             };
             let down_proj = loader.load_linear(&format!("{ep}.w2.weight"), dtype, qc)?;
-            experts.push(MoeExpertWeights {
-                mlp: LlamaMlpWeights { gate_up, down_proj },
-            });
+            experts.push(MlpWeights { gate_up, down_proj });
         }
 
         Ok(FfnWeights::<B>::Moe {
@@ -598,7 +514,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                     }
                 };
 
-                FfnWeights::<B>::Dense(Box::new(LlamaMlpWeights {
+                FfnWeights::<B>::Dense(Box::new(MlpWeights {
                     gate_up,
                     down_proj: B::upload_host_linear(
                         &device,
@@ -651,15 +567,14 @@ impl<B: LlamaOps> LlamaModel<B> {
             }
         };
 
-        // Precompute RoPE caches
-        let half_dim = config.head_dim() / 2;
-        let max_pos = config.max_position_embeddings;
-        let (cos_data, sin_data) =
-            infernum::rope::precompute_rope_data(max_pos, config.head_dim(), config.rope_theta);
-        let cos_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &cos_data)?;
-        let sin_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &sin_data)?;
-        let cos_cache = B::cast_from_f32(&cos_f32, DType::F32)?;
-        let sin_cache = B::cast_from_f32(&sin_f32, DType::F32)?;
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            None,
+            DType::F32,
+        )?;
 
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
@@ -881,7 +796,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                         up_proj: Box::new(up),
                     };
 
-                    FfnWeights::<B>::Dense(Box::new(LlamaMlpWeights {
+                    FfnWeights::<B>::Dense(Box::new(MlpWeights {
                         gate_up,
                         down_proj: loader.load_linear_sharded(
                             &down_name,
@@ -912,14 +827,14 @@ impl<B: LlamaOps> LlamaModel<B> {
             )?
         };
 
-        let half_dim = config.head_dim() / 2;
-        let max_pos = config.max_position_embeddings;
-        let (cos_data, sin_data) =
-            infernum::rope::precompute_rope_data(max_pos, config.head_dim(), config.rope_theta);
-        let cos_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &cos_data)?;
-        let sin_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &sin_data)?;
-        let cos_cache = B::cast_from_f32(&cos_f32, dtype)?;
-        let sin_cache = B::cast_from_f32(&sin_f32, dtype)?;
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            None,
+            dtype,
+        )?;
 
         Ok(Self {
             tp_num_heads,
@@ -993,9 +908,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                 ShardStrategy::Row,
             )?;
 
-            experts.push(MoeExpertWeights {
-                mlp: LlamaMlpWeights { gate_up, down_proj },
-            });
+            experts.push(MlpWeights { gate_up, down_proj });
         }
 
         Ok(FfnWeights::<B>::Moe {
@@ -1007,27 +920,12 @@ impl<B: LlamaOps> LlamaModel<B> {
 
     // ---- Helpers ----
 
-    /// Extract the last row from a (seq_len, hidden_size) tensor
-    #[allow(clippy::unused_self)]
-    fn extract_last_row(&self, hidden: &B::Tensor, seq_len: usize) -> B::Tensor {
-        let hidden_size = hidden.shape()[1];
-        if seq_len == 1 {
-            return hidden.reshape(&[1, hidden_size]);
-        }
-        hidden.slice_view((seq_len - 1) * hidden_size, &[1, hidden_size])
-    }
-
-    /// Embed token IDs
     fn embed(&self, input_ids: &[u32]) -> Result<B::Tensor> {
-        B::embedding_gather(&self.embed_tokens, input_ids)
+        transformer::embed::<B>(&self.embed_tokens, input_ids)
     }
 
-    /// Optional all-reduce for tensor-parallel models. No-op for single GPU.
     pub(crate) fn maybe_all_reduce(&self, tensor: &mut B::Tensor) -> Result<()> {
-        if let Some(comm) = &self.comm {
-            comm.all_reduce_sum(tensor)?;
-        }
-        Ok(())
+        transformer::maybe_all_reduce::<B>(self.comm.as_ref(), tensor)
     }
 
     // ---- Full forward pass (no KV cache) ----
@@ -1049,17 +947,7 @@ impl<B: LlamaOps> LlamaModel<B> {
             let head_dim = self.config.head_dim();
 
             let q = B::linear(&normed, &layer.attention.q_proj)?;
-            let (k, v) = match &layer.attention.kv_proj {
-                KvProjWeight::<B>::Fused { weight, kv_dim } => {
-                    let kv = B::matmul(&normed, weight)?;
-                    B::split_inner_dim(&kv, *kv_dim, *kv_dim)?
-                }
-                KvProjWeight::<B>::Separate { k_proj, v_proj } => {
-                    let k = B::linear(&normed, k_proj)?;
-                    let v = B::linear(&normed, v_proj)?;
-                    (k, v)
-                }
-            };
+            let (k, v) = transformer::compute_kv_proj::<B>(&normed, &layer.attention.kv_proj)?;
 
             let q = q.reshape(&[seq_len, num_heads, head_dim]);
             let k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
@@ -1101,11 +989,6 @@ impl<B: LlamaOps> LlamaModel<B> {
     ///
     /// # Errors
     /// Returns an error if the forward pass fails.
-    #[allow(
-        clippy::cast_possible_wrap,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
     pub fn forward_batch_decode(
         &self,
         token_ids: &[u32],
@@ -1113,36 +996,14 @@ impl<B: LlamaOps> LlamaModel<B> {
         block_tables: &[BlockTable],
         positions: &[usize],
     ) -> Result<B::Tensor> {
-        let batch_size = token_ids.len();
-        let max_blocks_per_seq = block_tables
-            .iter()
-            .map(|bt| bt.blocks().len())
-            .max()
-            .unwrap_or(0);
-        let mut bt_flat = vec![0i32; batch_size * max_blocks_per_seq];
-        for (i, bt) in block_tables.iter().enumerate() {
-            for (j, &block_id) in bt.blocks().iter().enumerate() {
-                bt_flat[i * max_blocks_per_seq + j] = block_id as i32;
-            }
-        }
-        let seq_lens: Vec<i32> = positions.iter().map(|&p| (p + 1) as i32).collect();
-        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
-        let max_seq_len = seq_lens.iter().copied().max().unwrap_or(0) as usize;
-
-        let token_ids_t = B::from_u32_slice(&self.device, &[batch_size], token_ids)?;
-        let bt_t = B::from_i32_slice(&self.device, &[batch_size * max_blocks_per_seq], &bt_flat)?;
-        let sl_t = B::from_i32_slice(&self.device, &[batch_size], &seq_lens)?;
-        let pos_t = B::from_i32_slice(&self.device, &[batch_size], &positions_i32)?;
-
-        self.forward_batch_decode_tensors(
-            &token_ids_t,
-            paged_kv,
-            &bt_t,
-            &sl_t,
-            &pos_t,
-            batch_size,
-            max_blocks_per_seq,
-            max_seq_len,
+        transformer::forward_batch_decode_host::<B, _>(
+            &self.device,
+            token_ids,
+            block_tables,
+            positions,
+            |tid, bt, sl, pos, bs, mbps, msl| {
+                self.forward_batch_decode_tensors(tid, paged_kv, bt, sl, pos, bs, mbps, msl)
+            },
         )
     }
 
@@ -1224,7 +1085,7 @@ impl<B: LlamaOps> LlamaModel<B> {
             )?;
         }
 
-        let last = self.extract_last_row(&hidden, seq_len);
+        let last = transformer::extract_last_row::<B>(&hidden, seq_len);
         let normed = B::rms_norm(&last, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&normed.reshape(&[1, self.config.hidden_size]))
     }
@@ -1293,23 +1154,8 @@ impl<B: LlamaOps> LlamaModel<B> {
         let head_dim = self.config.head_dim();
 
         let q = B::linear(hidden, &weights.q_proj)?;
-        let (k, v) = match &weights.kv_proj {
-            KvProjWeight::<B>::Fused { weight, kv_dim } => {
-                let kv = B::matmul(hidden, weight)?;
-                if batch_size == 1 {
-                    let k = kv.slice_view(0, &[1, *kv_dim]);
-                    let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
-                    (k, v)
-                } else {
-                    B::split_inner_dim(&kv, *kv_dim, *kv_dim)?
-                }
-            }
-            KvProjWeight::<B>::Separate { k_proj, v_proj } => {
-                let k = B::linear(hidden, k_proj)?;
-                let v = B::linear(hidden, v_proj)?;
-                (k, v)
-            }
-        };
+        let (k, v) =
+            transformer::compute_kv_proj_decode::<B>(hidden, &weights.kv_proj, batch_size)?;
 
         let q = q.reshape(&[batch_size, num_heads, head_dim]);
         let k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
@@ -1408,17 +1254,7 @@ impl<B: LlamaOps> LlamaModel<B> {
         let head_dim = self.config.head_dim();
 
         let q = B::linear(hidden, &weights.q_proj)?;
-        let (k, v) = match &weights.kv_proj {
-            KvProjWeight::<B>::Fused { weight, kv_dim } => {
-                let kv = B::matmul(hidden, weight)?;
-                B::split_inner_dim(&kv, *kv_dim, *kv_dim)?
-            }
-            KvProjWeight::<B>::Separate { k_proj, v_proj } => {
-                let k = B::linear(hidden, k_proj)?;
-                let v = B::linear(hidden, v_proj)?;
-                (k, v)
-            }
-        };
+        let (k, v) = transformer::compute_kv_proj::<B>(hidden, &weights.kv_proj)?;
 
         let q = q.reshape(&[seq_len, num_heads, head_dim]);
         let k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
@@ -1453,55 +1289,8 @@ impl<B: LlamaOps> LlamaModel<B> {
 
     // ---- MLP / FFN ----
 
-    /// Forward pass through MLP (SwiGLU)
-    #[allow(clippy::unused_self)]
-    fn forward_mlp(&self, hidden: &B::Tensor, weights: &LlamaMlpWeights<B>) -> Result<B::Tensor> {
-        let (gate, up) = self.compute_gate_up(hidden, &weights.gate_up)?;
-        let intermediate = B::swiglu(&gate, &up)?;
-        let mut out = B::linear(&intermediate, &weights.down_proj)?;
-        self.maybe_all_reduce(&mut out)?;
-        Ok(out)
-    }
-
-    /// Compute gate and up projections from a gate+up weight.
-    #[allow(clippy::unused_self)]
-    fn compute_gate_up(
-        &self,
-        hidden: &B::Tensor,
-        gate_up: &GateUpWeight<B>,
-    ) -> Result<(B::Tensor, B::Tensor)> {
-        match gate_up {
-            GateUpWeight::<B>::Fused {
-                weight,
-                intermediate_size,
-            } => {
-                let seq_len = hidden.shape()[0];
-                let gate_up = B::matmul(hidden, weight)?;
-                if seq_len == 1 {
-                    let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
-                    let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
-                    Ok((gate, up))
-                } else {
-                    B::split_inner_dim(&gate_up, *intermediate_size, *intermediate_size)
-                }
-            }
-            GateUpWeight::<B>::Separate { gate_proj, up_proj } => {
-                let gate = B::linear(hidden, gate_proj)?;
-                let up = B::linear(hidden, up_proj)?;
-                Ok((gate, up))
-            }
-        }
-    }
-
-    /// Forward pass through MLP without all-reduce (used by MoE experts).
-    fn forward_mlp_no_reduce(
-        &self,
-        hidden: &B::Tensor,
-        weights: &LlamaMlpWeights<B>,
-    ) -> Result<B::Tensor> {
-        let (gate, up) = self.compute_gate_up(hidden, &weights.gate_up)?;
-        let intermediate = B::swiglu(&gate, &up)?;
-        B::linear(&intermediate, &weights.down_proj)
+    fn forward_mlp(&self, hidden: &B::Tensor, weights: &MlpWeights<B>) -> Result<B::Tensor> {
+        transformer::forward_mlp::<B>(hidden, weights, self.comm.as_ref())
     }
 
     /// Dispatch to dense MLP or MoE forward pass.
@@ -1521,7 +1310,7 @@ impl<B: LlamaOps> LlamaModel<B> {
         &self,
         hidden: &B::Tensor,
         gate: &B::Tensor,
-        experts: &[MoeExpertWeights<B>],
+        experts: &[MlpWeights<B>],
         num_experts_per_tok: usize,
     ) -> Result<B::Tensor> {
         let mut out = B::moe_forward_softmax(
@@ -1531,32 +1320,15 @@ impl<B: LlamaOps> LlamaModel<B> {
             num_experts_per_tok,
             true,
             |expert_idx, expert_input| {
-                self.forward_mlp_no_reduce(expert_input, &experts[expert_idx].mlp)
+                transformer::forward_mlp_no_reduce::<B>(expert_input, &experts[expert_idx])
             },
         )?;
         self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
 
-    /// Project hidden states to vocabulary logits (always f32)
     pub(crate) fn lm_head_forward(&self, hidden: &B::Tensor) -> Result<B::Tensor> {
-        if self.dtype == DType::BF16 {
-            if let Some(w) = self.lm_head_dense_weight() {
-                return B::matmul_bf16_f32(hidden, w);
-            }
-        }
-        let logits_t = B::linear(hidden, &self.lm_head)?;
-        if self.dtype == DType::F32 {
-            return Ok(logits_t);
-        }
-        B::cast_to_f32(&logits_t)
-    }
-
-    /// Try to extract the dense weight from lm_head for mixed-precision matmul.
-    ///
-    /// Returns `None` if lm_head is quantized.
-    fn lm_head_dense_weight(&self) -> Option<&B::Tensor> {
-        B::as_dense_weight(&self.lm_head)
+        transformer::lm_head_forward::<B>(hidden, &self.lm_head, self.dtype)
     }
 }
 
