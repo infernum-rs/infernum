@@ -24,6 +24,10 @@ impl Backend for CudaBackend {
     type KvCache = crate::cuda::KvCache;
     type RuntimeState = CudaRuntimeState;
     type Logits = CudaLogits;
+
+    fn logits_from_tensor(tensor: CudaTensor) -> CudaLogits {
+        CudaLogits::new(tensor)
+    }
 }
 
 // ---- Tensor factory ----
@@ -44,6 +48,26 @@ impl TensorFactory for CudaBackend {
         data: &[u8],
     ) -> Result<CudaTensor> {
         CudaTensor::from_raw_bytes(device, shape, dtype, data)
+    }
+
+    fn from_u32_slice(
+        device: &crate::cuda::CudaContext,
+        shape: &[usize],
+        data: &[u32],
+    ) -> Result<CudaTensor> {
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+        CudaTensor::from_raw_bytes(device, shape, DType::U32, bytes)
+    }
+
+    fn from_i32_slice(
+        device: &crate::cuda::CudaContext,
+        shape: &[usize],
+        data: &[i32],
+    ) -> Result<CudaTensor> {
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+        CudaTensor::from_raw_bytes(device, shape, DType::U32, bytes)
     }
 }
 
@@ -78,6 +102,31 @@ impl MatmulOps for CudaBackend {
 
     fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
         ops::linear(input, weight)
+    }
+
+    fn as_dense_weight(weight: &LinearWeight) -> Option<&CudaTensor> {
+        match weight {
+            LinearWeight::Dense(t) => Some(t),
+            LinearWeight::Quantized(_) => None,
+        }
+    }
+
+    fn dense_weight(tensor: CudaTensor) -> LinearWeight {
+        LinearWeight::Dense(tensor)
+    }
+
+    fn is_dense_weight(weight: &LinearWeight) -> bool {
+        matches!(weight, LinearWeight::Dense(_))
+    }
+
+    fn quantize_to_q8(
+        device: &crate::cuda::CudaContext,
+        shape: &[usize],
+        data: &[f32],
+    ) -> Result<LinearWeight> {
+        Ok(LinearWeight::Quantized(
+            crate::cuda::QuantizedTensor::from_f32_as_q8(device, shape, data)?,
+        ))
     }
 }
 
@@ -134,11 +183,33 @@ impl CastOps for CudaBackend {
     }
 }
 
+// ---- Tensor data (host download) ----
+
+impl infernum::backend::TensorDataOps for CudaBackend {
+    fn to_f32_vec(tensor: &CudaTensor) -> Result<Vec<f32>> {
+        use infernum::tensor::Tensor;
+        if tensor.dtype() == DType::F32 {
+            tensor.to_vec::<f32>()
+        } else {
+            let f32_tensor = ops::cast_to_f32(tensor)?;
+            f32_tensor.to_vec::<f32>()
+        }
+    }
+}
+
 // ---- Embedding ----
 
 impl EmbedOps for CudaBackend {
     fn embedding_gather(table: &CudaTensor, indices: &[u32]) -> Result<CudaTensor> {
         ops::embedding_gather(table.context(), table, indices)
+    }
+
+    fn embedding_gather_tensor(
+        table: &CudaTensor,
+        indices: &CudaTensor,
+        seq_len: usize,
+    ) -> Result<CudaTensor> {
+        ops::embedding_gather_from_tensor(table.context(), table, indices, seq_len)
     }
 }
 
@@ -221,9 +292,14 @@ impl RopeOps for CudaBackend {
         input: &CudaTensor,
         cos_cache: &CudaTensor,
         sin_cache: &CudaTensor,
-        positions: &[usize],
+        positions: &CudaTensor,
+        batch_size: usize,
     ) -> Result<CudaTensor> {
-        ops::apply_rope_batched(input, cos_cache, sin_cache, positions)
+        // The tensor holds i32 positions; apply_rope_batched_indirect
+        // reads them from the GPU via CudaSlice<i32>. Since I32 and i32
+        // are bit-identical and cudarc passes raw device pointers, we
+        // can pass the CudaView<u8> directly to the kernel.
+        ops::apply_rope_batched_from_tensor(input, cos_cache, sin_cache, positions, batch_size)
     }
 }
 
@@ -293,19 +369,25 @@ impl PagedAttentionOps for CudaBackend {
         q: &CudaTensor,
         k_pool: &CudaTensor,
         v_pool: &CudaTensor,
-        block_tables: &[BlockTable],
+        block_tables: &CudaTensor,
+        seq_lens: &CudaTensor,
         block_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
         scale: Option<f32>,
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<CudaTensor> {
-        ops::paged_attention_decode(
+        ops::paged_attention_decode_from_tensor(
             q.context(),
             q,
             k_pool,
             v_pool,
             block_tables,
+            seq_lens,
             block_size,
+            max_blocks_per_seq,
+            max_seq_len,
             scale,
             softcap,
             sliding_window,
@@ -363,6 +445,27 @@ impl PagedKvCacheOps for CudaBackend {
     fn block_size(cache: &crate::cuda::PagedKvCache) -> usize {
         cache.block_size()
     }
+
+    fn append_paged_batched(
+        cache: &mut crate::cuda::PagedKvCache,
+        layer_idx: usize,
+        k: &CudaTensor,
+        v: &CudaTensor,
+        block_tables: &CudaTensor,
+        positions: &CudaTensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        cache.append_paged_batched_tensor(
+            layer_idx,
+            k,
+            v,
+            block_tables,
+            positions,
+            batch_size,
+            max_blocks_per_seq,
+        )
+    }
 }
 
 impl KvCacheOps for CudaBackend {
@@ -410,5 +513,14 @@ impl MoeOps for CudaBackend {
             norm_topk_prob,
             expert_fn,
         )
+    }
+}
+
+#[cfg(feature = "nccl")]
+impl infernum::backend::AllReduceOps for CudaBackend {
+    type Comm = crate::cuda::NcclCommunicator;
+
+    fn all_reduce_sum_inplace(comm: &Self::Comm, tensor: &mut CudaTensor) -> Result<()> {
+        comm.all_reduce_sum_inplace(tensor)
     }
 }

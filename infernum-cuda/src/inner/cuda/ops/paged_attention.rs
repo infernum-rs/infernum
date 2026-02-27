@@ -378,6 +378,136 @@ pub fn paged_attention_decode_indirect(
     Ok(output)
 }
 
+/// Paged attention decode with block tables and seq lens as `CudaTensor`s.
+///
+/// Same as [`paged_attention_decode_indirect`] but accepts `CudaTensor`
+/// (I32 dtype) instead of `CudaSlice<i32>`, for use in the generic
+/// backend trait.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_decode_from_tensor(
+    ctx: &CudaContext,
+    q: &CudaTensor,
+    k_pool: &CudaTensor,
+    v_pool: &CudaTensor,
+    block_tables: &CudaTensor,
+    seq_lens: &CudaTensor,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    scale: Option<f32>,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
+) -> Result<CudaTensor> {
+    assert!(
+        block_tables.dtype() == DType::U32,
+        "block_tables must be U32, got {:?}",
+        block_tables.dtype()
+    );
+    assert!(
+        seq_lens.dtype() == DType::U32,
+        "seq_lens must be U32, got {:?}",
+        seq_lens.dtype()
+    );
+
+    let dtype = q.dtype();
+    let q_shape = q.shape();
+    assert_eq!(
+        q_shape.len(),
+        3,
+        "Q must be 3D: (batch_size, num_heads, head_dim)"
+    );
+
+    let batch_size = q_shape[0];
+    let num_heads = q_shape[1];
+    let head_dim = q_shape[2];
+
+    let k_pool_shape = k_pool.shape();
+    assert_eq!(k_pool_shape.len(), 4, "K pool must be 4D");
+    let num_kv_heads = k_pool_shape[2];
+
+    assert!(
+        num_heads.is_multiple_of(num_kv_heads),
+        "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+    );
+
+    let mut scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+    let mut softcap_val = softcap.unwrap_or(0.0);
+    let window_size = sliding_window.map_or(0, |w| w as i32);
+
+    #[allow(clippy::cast_sign_loss)]
+    let max_active_len = if window_size > 0 {
+        max_seq_len.min(window_size as usize)
+    } else {
+        max_seq_len
+    };
+
+    let output_shape = [batch_size, num_heads, head_dim];
+    let mut output = unsafe { CudaTensor::uninit(ctx, &output_shape, dtype)? };
+
+    let device = ctx.device();
+    ensure_paged_decode_kernel(device)?;
+
+    let kernel_name = format!("paged_decode_attention_{}", kernel_suffix(dtype));
+    let func = device
+        .get_func("paged_decode_attention", &kernel_name)
+        .unwrap();
+
+    let threads = 256_usize.min(max_active_len.next_power_of_two()).max(1);
+    let shared_mem = (head_dim + max_active_len + threads) * std::mem::size_of::<f32>();
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, batch_size as u32, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    let out_slice = output.cuda_slice_mut();
+    let q_slice = q.cuda_slice();
+    let k_slice = k_pool.cuda_slice();
+    let v_slice = v_pool.cuda_slice();
+    let bt_slice = block_tables.cuda_slice();
+    let sl_slice = seq_lens.cuda_slice();
+    let mut bs = block_size as i32;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut mbps = max_blocks_per_seq as i32;
+    let mut ws = window_size;
+
+    let mut args: Vec<*mut c_void> = vec![
+        std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_ref(q_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(k_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(v_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(bt_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(sl_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        (&raw mut scale).cast::<c_void>(),
+        (&raw mut softcap_val).cast::<c_void>(),
+        (&raw mut bs).cast::<c_void>(),
+        (&raw mut nh).cast::<c_void>(),
+        (&raw mut nkv).cast::<c_void>(),
+        (&raw mut hd).cast::<c_void>(),
+        (&raw mut mbps).cast::<c_void>(),
+        (&raw mut ws).cast::<c_void>(),
+    ];
+
+    unsafe {
+        func.launch(cfg, &mut args)?;
+    }
+
+    Ok(output)
+}
+
 /// Gather paged K/V into contiguous buffers for a single request.
 ///
 /// Copies K/V data from the paged pool into contiguous tensors of shape

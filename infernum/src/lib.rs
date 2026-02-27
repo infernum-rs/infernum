@@ -25,9 +25,9 @@ pub mod tokenizer;
 pub mod weights;
 
 pub use backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, KvCacheOps,
-    MatmulExtOps, MatmulOps, MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
+    AllReduceOps, ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps,
+    KvCacheOps, MatmulExtOps, MatmulOps, MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
+    RopeInterleavedOps, RopeOps, SwigluOps, TensorDataOps, TensorFactory, TensorOps,
 };
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};

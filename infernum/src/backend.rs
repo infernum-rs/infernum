@@ -29,7 +29,7 @@ use crate::Result;
 /// A compute backend (CUDA, CPU, Metal, etc.).
 pub trait Backend: 'static {
     /// The tensor type for this backend (e.g., `CudaTensor`).
-    type Tensor: Tensor + Clone;
+    type Tensor: Tensor + Clone + Send + Sync;
 
     /// Opaque device handle for this backend.
     ///
@@ -60,6 +60,12 @@ pub trait Backend: 'static {
     /// Backend-specific logits type returned by forward passes.
     /// Must implement the `Logits` trait so the engine can sample from it.
     type Logits: Logits;
+
+    /// Wrap a raw logits tensor into the backend's `Logits` type.
+    ///
+    /// Used by generic `Model` impls to return backend-specific logits
+    /// from forward passes without knowing the concrete type.
+    fn logits_from_tensor(tensor: Self::Tensor) -> Self::Logits;
 }
 
 // ---- Op traits ----
@@ -86,6 +92,26 @@ pub trait TensorFactory: Backend {
         shape: &[usize],
         dtype: DType,
         data: &[u8],
+    ) -> Result<Self::Tensor>;
+
+    /// Create a tensor from a `u32` slice on the host.
+    ///
+    /// Used by the engine to upload token IDs to the device before
+    /// calling model forward methods.
+    fn from_u32_slice(
+        device: &Self::DeviceHandle,
+        shape: &[usize],
+        data: &[u32],
+    ) -> Result<Self::Tensor>;
+
+    /// Create a tensor from an `i32` slice on the host.
+    ///
+    /// Used by the engine to upload positions, block tables, and
+    /// sequence lengths to the device before calling model forward methods.
+    fn from_i32_slice(
+        device: &Self::DeviceHandle,
+        shape: &[usize],
+        data: &[i32],
     ) -> Result<Self::Tensor>;
 }
 
@@ -114,6 +140,35 @@ pub trait MatmulOps: Backend {
 
     /// Linear layer: `input @ weight` (handles dense and quantized).
     fn linear(input: &Self::Tensor, weight: &Self::LinearWeight) -> Result<Self::Tensor>;
+
+    /// Try to extract a reference to the underlying dense tensor from a
+    /// `LinearWeight`. Returns `None` if the weight is quantized.
+    ///
+    /// Used by models for mixed-precision matmul paths (e.g., bf16 → f32).
+    fn as_dense_weight(_weight: &Self::LinearWeight) -> Option<&Self::Tensor> {
+        None
+    }
+
+    /// Wrap a pre-transposed dense tensor into a `LinearWeight`.
+    ///
+    /// The tensor must already be in matmul-ready layout
+    /// `(in_features, out_features)`.
+    fn dense_weight(tensor: Self::Tensor) -> Self::LinearWeight;
+
+    /// Check whether a `LinearWeight` is a dense (non-quantized) tensor.
+    fn is_dense_weight(weight: &Self::LinearWeight) -> bool;
+
+    /// Quantize f32 data to Q8 and wrap as a `LinearWeight`.
+    ///
+    /// Used to quantize the lm_head weight when the model uses quantized
+    /// layers (GPTQ/AWQ) for consistent decode throughput.
+    ///
+    /// `shape` is row-major `(out_features, in_features)`.
+    fn quantize_to_q8(
+        device: &Self::DeviceHandle,
+        shape: &[usize],
+        data: &[f32],
+    ) -> Result<Self::LinearWeight>;
 }
 
 /// Normalization operations.
@@ -154,13 +209,35 @@ pub trait CastOps: Backend {
     fn cast_from_f32(input: &Self::Tensor, target: DType) -> Result<Self::Tensor>;
 }
 
+/// Downloading tensor data to the host.
+///
+/// Used by generic loading code that needs to manipulate weight data
+/// on the host (e.g., GGUF unpermute, Q8 quantization of lm_head).
+pub trait TensorDataOps: Backend {
+    /// Download tensor contents to the host as `Vec<f32>`.
+    ///
+    /// The backend casts to f32 if necessary.
+    fn to_f32_vec(tensor: &Self::Tensor) -> Result<Vec<f32>>;
+}
+
 /// Embedding lookup.
 pub trait EmbedOps: Backend {
-    /// Gather rows from an embedding table by token IDs.
+    /// Gather rows from an embedding table by token IDs (host slice).
     ///
     /// `table` has shape `(vocab_size, hidden_size)`.
     /// Returns a tensor of shape `(indices.len(), hidden_size)`.
     fn embedding_gather(table: &Self::Tensor, indices: &[u32]) -> Result<Self::Tensor>;
+
+    /// Gather rows from an embedding table by device-side token IDs.
+    ///
+    /// `indices` is a 1D tensor of u32 token IDs already on the device.
+    /// `seq_len` is the number of valid tokens to gather.
+    /// Returns a tensor of shape `(seq_len, hidden_size)`.
+    fn embedding_gather_tensor(
+        table: &Self::Tensor,
+        indices: &Self::Tensor,
+        seq_len: usize,
+    ) -> Result<Self::Tensor>;
 }
 
 /// Bias addition.
@@ -218,11 +295,14 @@ pub trait RopeOps: Backend {
     ) -> Result<Self::Tensor>;
 
     /// Apply RoPE with per-token positions (for batched decode).
+    ///
+    /// `positions` is a 1D i32 tensor on the device with `batch_size` entries.
     fn apply_rope_batched(
         input: &Self::Tensor,
         cos_cache: &Self::Tensor,
         sin_cache: &Self::Tensor,
-        positions: &[usize],
+        positions: &Self::Tensor,
+        batch_size: usize,
     ) -> Result<Self::Tensor>;
 }
 
@@ -288,12 +368,19 @@ pub trait AttentionOps: Backend {
 #[allow(clippy::too_many_arguments)]
 pub trait PagedAttentionOps: Backend {
     /// Paged attention decode: batched decode against block-structured KV cache.
+    ///
+    /// `block_tables` is a flattened i32 tensor of shape
+    /// `(batch_size * max_blocks_per_seq,)` containing physical block indices.
+    /// `seq_lens` is a 1D i32 tensor of shape `(batch_size,)`.
     fn paged_attention_decode(
         q: &Self::Tensor,
         k_pool: &Self::Tensor,
         v_pool: &Self::Tensor,
-        block_tables: &[BlockTable],
+        block_tables: &Self::Tensor,
+        seq_lens: &Self::Tensor,
         block_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
         scale: Option<f32>,
         softcap: Option<f32>,
         sliding_window: Option<usize>,
@@ -339,6 +426,23 @@ pub trait PagedKvCacheOps: Backend {
 
     /// Get the block size of the paged cache.
     fn block_size(cache: &Self::PagedKvCache) -> usize;
+
+    /// Batched KV cache append using device-side block tables and positions.
+    ///
+    /// `block_tables` is a flattened i32 tensor of shape
+    /// `(batch_size * max_blocks_per_seq,)`.
+    /// `positions` is a 1D i32 tensor of shape `(batch_size,)`.
+    #[allow(clippy::too_many_arguments)]
+    fn append_paged_batched(
+        cache: &mut Self::PagedKvCache,
+        layer_idx: usize,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        block_tables: &Self::Tensor,
+        positions: &Self::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()>;
 }
 
 /// Contiguous (non-paged) KV cache operations (DeepSeek MLA).
@@ -390,4 +494,18 @@ pub trait MoeOps: Backend {
 pub trait MatmulExtOps: Backend {
     /// Matmul with bf16 inputs producing f32 output (for MLA).
     fn matmul_bf16_f32(a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
+}
+
+// ---- Multi-GPU ----
+
+/// Communicator handle for all-reduce operations (e.g., NCCL).
+///
+/// Models that support tensor parallelism store `Option<Self::Comm>`
+/// and call `all_reduce_sum_inplace` after each TP-split matmul.
+pub trait AllReduceOps: Backend {
+    /// Opaque communicator handle (e.g., `NcclCommunicator`).
+    type Comm: Send + Sync;
+
+    /// In-place sum all-reduce across all ranks.
+    fn all_reduce_sum_inplace(comm: &Self::Comm, tensor: &mut Self::Tensor) -> Result<()>;
 }

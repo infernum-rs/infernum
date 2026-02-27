@@ -1892,13 +1892,37 @@ impl DeepSeekModel<CudaBackend> {
 
         let mut table_with_current = block_table.clone();
         table_with_current.advance(1);
+
+        // Build device tensors for single-sequence paged attention
+        let max_blocks_per_seq = table_with_current.blocks().len();
+        #[allow(clippy::cast_possible_wrap)]
+        let bt_i32: Vec<i32> = table_with_current
+            .blocks()
+            .iter()
+            .map(|&b| b as i32)
+            .collect();
+        let block_tables_tensor = CudaTensor::from_raw_bytes(
+            &self.ctx,
+            &[max_blocks_per_seq],
+            infernum::DType::U32,
+            unsafe { std::slice::from_raw_parts(bt_i32.as_ptr().cast::<u8>(), bt_i32.len() * 4) },
+        )?;
+        let seq_len_val = table_with_current.seq_len() as i32;
+        let seq_lens_tensor =
+            CudaTensor::from_raw_bytes(&self.ctx, &[1], infernum::DType::U32, unsafe {
+                std::slice::from_raw_parts((&raw const seq_len_val).cast::<u8>(), 4)
+            })?;
+
         let (k_pool, _v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
         let attn_output = CudaBackend::paged_attention_decode(
             &q_absorbed,
             k_pool,
             k_pool,
-            &[table_with_current],
+            &block_tables_tensor,
+            &seq_lens_tensor,
             CudaBackend::block_size(paged_kv),
+            max_blocks_per_seq,
+            table_with_current.seq_len(),
             Some(self.attn_scale),
             None,
             None,
@@ -2415,6 +2439,10 @@ impl infernum::Model for DeepSeekModel<CudaBackend> {
         self.model_config()
     }
 
+    fn device(&self) -> &CudaContext {
+        &self.ctx
+    }
+
     fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
         let mc = self.model_config();
         PagedKvCache::new(
@@ -2450,19 +2478,39 @@ impl infernum::Model for DeepSeekModel<CudaBackend> {
         Ok(infernum_cuda::CudaLogits::new(tensor))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
-        token_ids: &[u32],
+        token_ids: &CudaTensor,
         kv_cache: &mut Self::KvCache,
         _runtime_state: &mut infernum_cuda::CudaRuntimeState,
-        block_tables: &[infernum::BlockTable],
-        positions: &[usize],
+        block_tables: &CudaTensor,
+        _seq_lens: &CudaTensor,
+        positions: &CudaTensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        _max_seq_len: usize,
     ) -> Result<infernum_cuda::CudaLogits> {
-        let tensor = self.forward_batch_decode(
-            token_ids,
+        // Bridge: download tensors to host and call old-style method.
+        let token_ids_host = token_ids.to_vec::<u32>()?;
+        let positions_u32 = positions.to_vec::<u32>()?;
+        let positions_host: Vec<usize> = positions_u32.iter().map(|&p| p as usize).collect();
+        let bt_flat = block_tables.to_vec::<u32>()?;
+        let block_size = CudaBackend::block_size(kv_cache);
+        let block_tables_host: Vec<infernum::BlockTable> = (0..batch_size)
+            .map(|i| {
+                let start = i * max_blocks_per_seq;
+                let end = start + max_blocks_per_seq;
+                let blocks: Vec<usize> = bt_flat[start..end].iter().map(|&b| b as usize).collect();
+                infernum::BlockTable::from_raw(blocks, positions_host[i], block_size)
+            })
+            .collect();
+        let tensor = DeepSeekModel::forward_batch_decode(
+            self,
+            &token_ids_host,
             std::slice::from_mut(kv_cache),
-            block_tables,
-            positions,
+            &block_tables_host,
+            &positions_host,
         )?;
         Ok(infernum_cuda::CudaLogits::new(tensor))
     }

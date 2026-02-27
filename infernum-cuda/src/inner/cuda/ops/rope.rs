@@ -719,6 +719,77 @@ pub fn apply_rope_batched_indirect(
     Ok(output)
 }
 
+/// Apply batched RoPE with positions stored in a `CudaTensor` (I32 dtype).
+pub fn apply_rope_batched_from_tensor(
+    input: &CudaTensor,
+    cos_cache: &CudaTensor,
+    sin_cache: &CudaTensor,
+    positions: &CudaTensor,
+    batch_size: usize,
+) -> Result<CudaTensor> {
+    let dtype = input.dtype();
+    let shape = input.shape();
+    assert_eq!(
+        shape.len(),
+        3,
+        "Input must be 3D: (batch_size, num_heads, head_dim)"
+    );
+    assert_eq!(shape[0], batch_size);
+    assert!(
+        positions.dtype() == DType::U32,
+        "positions must be U32, got {:?}",
+        positions.dtype()
+    );
+
+    let num_heads = shape[1];
+    let head_dim = shape[2];
+
+    assert_eq!(head_dim % 2, 0, "head_dim must be even");
+
+    let mut output = unsafe { CudaTensor::uninit(input.context(), shape, dtype)? };
+
+    let device = input.context().device();
+    let kernel_name = format!("rope_batched_{}", kernel_suffix(dtype));
+
+    let module_name = "rope";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(PTX),
+            module_name,
+            &all_kernel_names(),
+        )?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (batch_size as u32, num_heads as u32, 1),
+        block_dim: ((head_dim / 2) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // The kernel reads positions as `const int*`. CudaTensor stores I32
+    // data as raw bytes; passing the CudaView<u8> gives the same device
+    // pointer the kernel needs.
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &input.cuda_slice(),
+                &cos_cache.cuda_slice(),
+                &sin_cache.cuda_slice(),
+                batch_size as i32,
+                num_heads as i32,
+                head_dim as i32,
+                &positions.cuda_slice(),
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

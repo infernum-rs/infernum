@@ -244,6 +244,64 @@ impl PagedKvCache {
         Ok(())
     }
 
+    /// Batched KV cache append using `CudaTensor` block tables and positions.
+    ///
+    /// Same as [`append_paged_batched`](Self::append_paged_batched) but
+    /// accepts `CudaTensor` (I32 dtype) instead of `CudaSlice<i32>`.
+    pub fn append_paged_batched_tensor(
+        &mut self,
+        layer_idx: usize,
+        k_new: &CudaTensor,
+        v_new: &CudaTensor,
+        block_tables: &CudaTensor,
+        positions: &CudaTensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        use infernum::tensor::Tensor;
+        let k_shape = k_new.shape();
+        assert_eq!(k_shape.len(), 3, "k_new must be 3D");
+        assert_eq!(k_shape[0], batch_size);
+        assert_eq!(k_shape[1], self.num_kv_heads);
+        assert_eq!(k_shape[2], self.head_dim);
+        assert!(
+            block_tables.dtype() == DType::U32,
+            "block_tables must be U32"
+        );
+        assert!(positions.dtype() == DType::U32, "positions must be U32");
+
+        let pool = &mut self.layers[layer_idx];
+
+        launch_append_paged_batched_tensor(
+            &self.ctx,
+            &mut pool.k,
+            k_new,
+            block_tables,
+            positions,
+            batch_size,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            max_blocks_per_seq,
+            self.dtype,
+        )?;
+        launch_append_paged_batched_tensor(
+            &self.ctx,
+            &mut pool.v,
+            v_new,
+            block_tables,
+            positions,
+            batch_size,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            max_blocks_per_seq,
+            self.dtype,
+        )?;
+
+        Ok(())
+    }
+
     /// Get the raw K/V pool tensors for a given layer.
     ///
     /// The attention kernel uses the block table to index into these pools.
@@ -391,6 +449,61 @@ fn launch_append_paged_batched(
                 &new_data.cuda_slice(),
                 block_tables_gpu,
                 positions_gpu,
+                block_size as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                max_blocks_per_seq as i32,
+            ),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Same as [`launch_append_paged_batched`] but accepts `CudaTensor` (I32)
+/// for block tables and positions.
+#[allow(clippy::too_many_arguments)]
+fn launch_append_paged_batched_tensor(
+    ctx: &CudaContext,
+    pool: &mut CudaTensor,
+    new_data: &CudaTensor,
+    block_tables: &CudaTensor,
+    positions: &CudaTensor,
+    batch_size: usize,
+    block_size: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_blocks_per_seq: usize,
+    dtype: DType,
+) -> Result<()> {
+    let device = ctx.device();
+
+    let kernel_name = format!("append_kv_paged_batched_{}", kernel_suffix(dtype));
+    let module_name = "append_kv_paged";
+    if !device.has_func(module_name, &kernel_name) {
+        device.load_ptx(cudarc::nvrtc::Ptx::from_src(PTX), module_name, KERNEL_NAMES)?;
+    }
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+
+    let total_per_token = num_kv_heads * head_dim;
+    let threads = 256;
+    let blocks_x = total_per_token.div_ceil(threads);
+
+    let cfg = LaunchConfig {
+        grid_dim: (blocks_x as u32, batch_size as u32, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                pool.cuda_slice_mut(),
+                &new_data.cuda_slice(),
+                &block_tables.cuda_slice(),
+                &positions.cuda_slice(),
                 block_size as i32,
                 num_kv_heads as i32,
                 head_dim as i32,

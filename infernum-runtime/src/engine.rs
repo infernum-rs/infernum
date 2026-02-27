@@ -8,7 +8,7 @@
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-use infernum::backend::Backend;
+use infernum::backend::{Backend, TensorFactory};
 use infernum::logits::Logits;
 use infernum::runtime_state::RuntimeStateInit;
 use infernum::{
@@ -43,7 +43,10 @@ pub struct Engine<M: Model> {
     _phantom: std::marker::PhantomData<fn() -> M>,
 }
 
-impl<M: Model> Engine<M> {
+impl<M: Model> Engine<M>
+where
+    M::B: TensorFactory,
+{
     /// Create a new engine wrapping the given model with default batch config.
     ///
     /// # Errors
@@ -171,14 +174,17 @@ impl<M: Model> Drop for Engine<M> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-fn worker_loop<M: Model>(
+fn worker_loop<M>(
     model: M,
     mut kv_cache: M::KvCache,
     mut runtime_state: <M::B as Backend>::RuntimeState,
     mut allocator: BlockAllocator,
     batch_config: BatchConfig,
     request_rx: mpsc::Receiver<GenerationRequest>,
-) {
+) where
+    M: Model,
+    M::B: TensorFactory,
+{
     let model_config = model.config();
     let mut scheduler = Scheduler::new(&batch_config);
 
@@ -300,17 +306,22 @@ fn process_prefill<M: Model>(
 // Decode (backend-agnostic, no graph logic)
 // ---------------------------------------------------------------------------
 
-fn process_decode_batch<M: Model>(
+fn process_decode_batch<M>(
     tasks: &[DecodeTask],
     model: &M,
     kv_cache: &mut M::KvCache,
     runtime_state: &mut <M::B as Backend>::RuntimeState,
     allocator: &mut BlockAllocator,
     scheduler: &mut Scheduler,
-) {
-    let mut token_ids = Vec::with_capacity(tasks.len());
-    let mut block_tables = Vec::with_capacity(tasks.len());
-    let mut positions = Vec::with_capacity(tasks.len());
+) where
+    M: Model,
+    M::B: TensorFactory,
+{
+    let batch_size = tasks.len();
+    let mut token_ids_host = Vec::with_capacity(batch_size);
+    let mut seq_lens_host = Vec::with_capacity(batch_size);
+    let mut positions_host = Vec::with_capacity(batch_size);
+    let mut block_tables_raw: Vec<Vec<usize>> = Vec::with_capacity(batch_size);
     let running_indices: Vec<usize> = tasks.iter().map(|t| t.running_idx).collect();
 
     for &idx in &running_indices {
@@ -320,17 +331,59 @@ fn process_decode_batch<M: Model>(
             .last()
             .copied()
             .unwrap_or_else(|| *seq.prompt_ids.last().unwrap_or(&0));
-        token_ids.push(tok);
-        block_tables.push(seq.block_table.clone());
-        positions.push(seq.block_table.seq_len());
+        token_ids_host.push(tok);
+        let pos = seq.block_table.seq_len();
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            positions_host.push(pos as i32);
+            seq_lens_host.push((pos + 1) as i32);
+        }
+        block_tables_raw.push(seq.block_table.blocks().to_vec());
     }
 
+    // Flatten block tables into (batch_size * max_blocks_per_seq) with padding
+    let max_blocks_per_seq = block_tables_raw.iter().map(Vec::len).max().unwrap_or(0);
+    #[allow(clippy::cast_possible_wrap)]
+    let block_tables_flat: Vec<i32> = {
+        let mut flat = vec![0i32; batch_size * max_blocks_per_seq];
+        for (i, bt) in block_tables_raw.iter().enumerate() {
+            for (j, &block_id) in bt.iter().enumerate() {
+                flat[i * max_blocks_per_seq + j] = block_id as i32;
+            }
+        }
+        flat
+    };
+
+    #[allow(clippy::cast_sign_loss)]
+    let max_seq_len = seq_lens_host.iter().copied().max().unwrap_or(0) as usize;
+    let device = model.device();
+
+    let token_ids_tensor =
+        <M::B as TensorFactory>::from_u32_slice(device, &[batch_size], &token_ids_host)
+            .expect("failed to upload token_ids");
+    let block_tables_tensor = <M::B as TensorFactory>::from_i32_slice(
+        device,
+        &[batch_size * max_blocks_per_seq],
+        &block_tables_flat,
+    )
+    .expect("failed to upload block_tables");
+    let seq_lens_tensor =
+        <M::B as TensorFactory>::from_i32_slice(device, &[batch_size], &seq_lens_host)
+            .expect("failed to upload seq_lens");
+    let positions_tensor =
+        <M::B as TensorFactory>::from_i32_slice(device, &[batch_size], &positions_host)
+            .expect("failed to upload positions");
+
     let result = model.forward_batch_decode(
-        &token_ids,
+        &token_ids_tensor,
         kv_cache,
         runtime_state,
-        &block_tables,
-        &positions,
+        &block_tables_tensor,
+        &seq_lens_tensor,
+        &positions_tensor,
+        batch_size,
+        max_blocks_per_seq,
+        max_seq_len,
     );
 
     match result {

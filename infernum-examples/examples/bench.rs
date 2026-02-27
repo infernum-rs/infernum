@@ -59,10 +59,10 @@ fn detect_model_type(model_path: &str) -> infernum::Result<String> {
     Ok(probe.model_type)
 }
 
-fn bench_model<M: infernum::Model + Send + 'static>(
-    model: M,
-    n_gen: usize,
-) -> infernum::Result<()> {
+fn bench_model<M: infernum::Model + Send + 'static>(model: M, n_gen: usize) -> infernum::Result<()>
+where
+    M::B: infernum::TensorFactory,
+{
     let prompt = vec![1u32, 15043, 29892, 920, 526, 366, 2599, 13];
 
     let engine = Engine::new(model)?;
@@ -94,7 +94,10 @@ fn bench_with_info<M: infernum::Model + Send + 'static>(
     hidden_size: usize,
     dtype: &str,
     n_gen: usize,
-) -> infernum::Result<()> {
+) -> infernum::Result<()>
+where
+    M::B: infernum::TensorFactory,
+{
     eprintln!(
         "Model loaded: {} layers, {} hidden, dtype={}",
         num_layers, hidden_size, dtype,

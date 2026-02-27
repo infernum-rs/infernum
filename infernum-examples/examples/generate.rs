@@ -156,7 +156,10 @@ fn run_generate<M: infernum::Model + Send + 'static>(
     num_layers: usize,
     hidden_size: usize,
     cli: &Cli,
-) -> Result<()> {
+) -> Result<()>
+where
+    M::B: infernum::TensorFactory,
+{
     println!(
         "Model loaded ({} layers, {} hidden, vocab {})",
         num_layers,

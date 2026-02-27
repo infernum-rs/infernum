@@ -1078,41 +1078,92 @@ impl GemmaModel<CudaBackend> {
             k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
         }
 
+        // Upload positions to device for batched RoPE
+        #[allow(clippy::cast_possible_wrap)]
+        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let positions_tensor =
+            CudaTensor::from_raw_bytes(&self.ctx, &[batch_size], infernum::DType::U32, unsafe {
+                std::slice::from_raw_parts(
+                    positions_i32.as_ptr().cast::<u8>(),
+                    positions_i32.len() * 4,
+                )
+            })?;
+
         let (cos, sin) = self.rope_caches_for_layer(layer_idx);
-        let q = CudaBackend::apply_rope_batched(&q, cos, sin, positions)?;
-        let k = CudaBackend::apply_rope_batched(&k, cos, sin, positions)?;
+        let q = CudaBackend::apply_rope_batched(&q, cos, sin, &positions_tensor, batch_size)?;
+        let k = CudaBackend::apply_rope_batched(&k, cos, sin, &positions_tensor, batch_size)?;
 
-        let q_stride = num_heads * head_dim;
-        let kv_stride = num_kv_heads * head_dim;
+        // Build flattened block tables and seq_lens for batched paged attention
+        let max_blocks_per_seq = block_tables
+            .iter()
+            .map(|bt| bt.blocks().len())
+            .max()
+            .unwrap_or(0);
+        #[allow(clippy::cast_possible_wrap)]
+        let block_tables_flat: Vec<i32> = {
+            let mut flat = vec![0i32; batch_size * max_blocks_per_seq];
+            for (i, bt) in block_tables.iter().enumerate() {
+                for (j, &block_id) in bt.blocks().iter().enumerate() {
+                    flat[i * max_blocks_per_seq + j] = block_id as i32;
+                }
+            }
+            flat
+        };
+        let block_tables_tensor = CudaTensor::from_raw_bytes(
+            &self.ctx,
+            &[batch_size * max_blocks_per_seq],
+            infernum::DType::U32,
+            unsafe {
+                std::slice::from_raw_parts(
+                    block_tables_flat.as_ptr().cast::<u8>(),
+                    block_tables_flat.len() * 4,
+                )
+            },
+        )?;
+
+        #[allow(clippy::cast_possible_wrap)]
+        let seq_lens_i32: Vec<i32> = positions.iter().map(|&p| (p + 1) as i32).collect();
+        let seq_lens_tensor =
+            CudaTensor::from_raw_bytes(&self.ctx, &[batch_size], infernum::DType::U32, unsafe {
+                std::slice::from_raw_parts(
+                    seq_lens_i32.as_ptr().cast::<u8>(),
+                    seq_lens_i32.len() * 4,
+                )
+            })?;
+
+        // Batched KV cache append
+        CudaBackend::append_paged_batched(
+            paged_kv,
+            layer_idx,
+            &k,
+            &v,
+            &block_tables_tensor,
+            &positions_tensor,
+            batch_size,
+            max_blocks_per_seq,
+        )?;
+
         let sliding_window = self.config.effective_sliding_window(layer_idx);
+        #[allow(clippy::cast_sign_loss)]
+        let max_seq_len = seq_lens_i32.iter().copied().max().unwrap_or(0) as usize;
 
-        let mut attn_parts = Vec::with_capacity(batch_size);
-        for (i, &pos) in positions.iter().enumerate() {
-            let q_i = q.slice_view(i * q_stride, &[1, num_heads, head_dim]);
-            let k_i = k.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
-            let v_i = v.slice_view(i * kv_stride, &[1, num_kv_heads, head_dim]);
+        // Batched paged attention decode
+        let (k_pool, v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
+        let attn_output = CudaBackend::paged_attention_decode(
+            &q,
+            k_pool,
+            v_pool,
+            &block_tables_tensor,
+            &seq_lens_tensor,
+            CudaBackend::block_size(paged_kv),
+            max_blocks_per_seq,
+            max_seq_len,
+            None,
+            self.config.attn_logit_softcapping,
+            sliding_window,
+        )?;
 
-            CudaBackend::append_paged(paged_kv, layer_idx, &block_tables[i], &k_i, &v_i, pos)?;
-
-            let mut table_with_current = block_tables[i].clone();
-            table_with_current.advance(1);
-
-            let (k_pool, v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
-            let attn_i = CudaBackend::paged_attention_decode(
-                &q_i,
-                k_pool,
-                v_pool,
-                &[table_with_current],
-                CudaBackend::block_size(paged_kv),
-                None,
-                self.config.attn_logit_softcapping,
-                sliding_window,
-            )?;
-
-            attn_parts.push(attn_i.reshape(&[1, num_heads * head_dim]));
-        }
-
-        let attn_output = CudaBackend::concat_rows(&attn_parts)?;
+        let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
 
         let mut out = gemma_linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
@@ -1645,6 +1696,10 @@ impl infernum::Model for GemmaModel<CudaBackend> {
         self.model_config()
     }
 
+    fn device(&self) -> &CudaContext {
+        &self.ctx
+    }
+
     fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
         let mc = self.model_config();
         PagedKvCache::new(
@@ -1680,19 +1735,39 @@ impl infernum::Model for GemmaModel<CudaBackend> {
         Ok(infernum_cuda::CudaLogits::new(tensor))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
-        token_ids: &[u32],
+        token_ids: &CudaTensor,
         kv_cache: &mut Self::KvCache,
         _runtime_state: &mut infernum_cuda::CudaRuntimeState,
-        block_tables: &[infernum::BlockTable],
-        positions: &[usize],
+        block_tables: &CudaTensor,
+        _seq_lens: &CudaTensor,
+        positions: &CudaTensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        _max_seq_len: usize,
     ) -> Result<infernum_cuda::CudaLogits> {
-        let tensor = self.forward_batch_decode(
-            token_ids,
+        // Bridge: download tensors to host and call old-style method.
+        let token_ids_host = token_ids.to_vec::<u32>()?;
+        let positions_u32 = positions.to_vec::<u32>()?;
+        let positions_host: Vec<usize> = positions_u32.iter().map(|&p| p as usize).collect();
+        let bt_flat = block_tables.to_vec::<u32>()?;
+        let block_size = CudaBackend::block_size(kv_cache);
+        let block_tables_host: Vec<infernum::BlockTable> = (0..batch_size)
+            .map(|i| {
+                let start = i * max_blocks_per_seq;
+                let end = start + max_blocks_per_seq;
+                let blocks: Vec<usize> = bt_flat[start..end].iter().map(|&b| b as usize).collect();
+                infernum::BlockTable::from_raw(blocks, positions_host[i], block_size)
+            })
+            .collect();
+        let tensor = GemmaModel::forward_batch_decode(
+            self,
+            &token_ids_host,
             std::slice::from_mut(kv_cache),
-            block_tables,
-            positions,
+            &block_tables_host,
+            &positions_host,
         )?;
         Ok(infernum_cuda::CudaLogits::new(tensor))
     }
