@@ -45,10 +45,18 @@ pub trait RuntimeStateInit: Send + Sized {
     /// # Errors
     /// Returns an error if backend-specific initialisation fails.
     fn new(batch_config: &BatchConfig, block_config: &BlockConfig) -> Result<Self>;
+
+    /// Create a lightweight placeholder runtime state.
+    ///
+    /// Used by `ShardedModel`'s per-replica threads which each need
+    /// their own state but don't have graph capture or buffer pools.
+    fn new_placeholder() -> Self;
 }
 
 impl RuntimeStateInit for () {
     fn new(_batch_config: &BatchConfig, _block_config: &BlockConfig) -> Result<Self> {
         Ok(())
     }
+
+    fn new_placeholder() -> Self {}
 }

@@ -16,6 +16,7 @@ use crate::inner::backend_impl::CudaBackend;
 use crate::inner::cuda_logits::CudaLogits;
 use crate::inner::cuda_runtime_state::CudaRuntimeState;
 use crate::model::ShardedLoadable;
+use infernum::runtime_state::RuntimeStateInit;
 use infernum::Result;
 
 /// A model sharded across multiple GPUs for tensor-parallel inference.

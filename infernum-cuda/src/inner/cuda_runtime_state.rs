@@ -17,12 +17,6 @@ pub struct CudaRuntimeState {
 }
 
 impl CudaRuntimeState {
-    /// Create a placeholder runtime state (no graph capture).
-    #[cfg(feature = "nccl")]
-    pub(crate) fn new_placeholder() -> Self {
-        Self { _private: () }
-    }
-
     /// Create a placeholder for tests that call model methods directly.
     #[must_use]
     pub fn test_placeholder() -> Self {
@@ -33,5 +27,9 @@ impl CudaRuntimeState {
 impl RuntimeStateInit for CudaRuntimeState {
     fn new(_batch_config: &BatchConfig, _block_config: &BlockConfig) -> Result<Self> {
         Ok(Self { _private: () })
+    }
+
+    fn new_placeholder() -> Self {
+        Self { _private: () }
     }
 }
