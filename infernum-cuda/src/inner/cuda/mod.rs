@@ -20,7 +20,7 @@ pub use context::CudaContext;
 pub use graph::CudaGraph;
 pub use kv_cache::KvCache;
 #[cfg(feature = "nccl")]
-pub use nccl::NcclCommunicator;
+pub use nccl::{NcclCommunicator, NcclId};
 pub use paged_kv_cache::PagedKvCache;
 pub use quantized::QuantizedTensor;
 pub use seq_position::SeqPosition;
