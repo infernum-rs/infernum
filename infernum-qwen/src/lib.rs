@@ -5,10 +5,8 @@
 
 mod chat_templates;
 mod config;
-#[cfg(feature = "cuda")]
 mod model;
 
 pub use chat_templates::ChatMLTemplate;
 pub use config::QwenConfig;
-#[cfg(feature = "cuda")]
-pub use model::QwenModel;
+pub use model::{QwenModel, QwenOps};

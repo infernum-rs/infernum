@@ -1,9 +1,13 @@
-//! Qwen model implementation
+//! Qwen model implementation — fully generic over the compute backend `B`.
+//!
+//! All forward pass methods, weight loading, and the model struct are
+//! generic over `B: Backend`. No CUDA-specific code remains in this file.
 
 #![allow(
     clippy::struct_field_names,
     clippy::no_effect_underscore_binding,
     clippy::doc_markdown,
+    dead_code,
     unused_mut
 )]
 
@@ -12,79 +16,16 @@ use std::path::Path;
 
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps,
-    MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
+    MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps,
+    TensorFactory, TensorOps,
 };
+use infernum::block_allocator::BlockTable;
 use infernum::dtype::DType;
-use infernum::shard::{ShardConfig, ShardStrategy};
+use infernum::shard::GpuConfig;
 use infernum::tensor::Tensor;
 use infernum::Result;
-use infernum_cuda::cuda::ops::{
-    cast_from_f32, cast_to_f32, precompute_rope_cache, precompute_rope_cache_scaled, transpose_2d,
-    LinearWeight, RopeScaling,
-};
-use infernum_cuda::cuda::{CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor};
-use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
-use infernum_cuda::BlockTable;
-use infernum_cuda::CudaBackend;
 
 use crate::QwenConfig;
-
-// --- Weight helpers ---
-
-fn pretranspose_weight(weight: &CudaTensor) -> Result<CudaTensor> {
-    transpose_2d(weight)
-}
-
-fn concat_weights(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
-    let k = a.shape()[0];
-    assert_eq!(k, b.shape()[0], "concat_weights: K dimension mismatch");
-    let n1 = a.shape()[1];
-    let n2 = b.shape()[1];
-    let dtype = a.dtype();
-    let elem = dtype.size_in_bytes();
-
-    let a_data = a.to_raw_bytes()?;
-    let b_data = b.to_raw_bytes()?;
-    let mut out = vec![0u8; k * (n1 + n2) * elem];
-    for row in 0..k {
-        let out_off = row * (n1 + n2) * elem;
-        out[out_off..out_off + n1 * elem]
-            .copy_from_slice(&a_data[row * n1 * elem..(row + 1) * n1 * elem]);
-        out[out_off + n1 * elem..out_off + (n1 + n2) * elem]
-            .copy_from_slice(&b_data[row * n2 * elem..(row + 1) * n2 * elem]);
-    }
-    CudaTensor::from_raw_bytes(a.context(), &[k, n1 + n2], dtype, &out)
-}
-
-fn load_typed(
-    dtype: DType,
-    loader: &impl WeightLoader,
-    ctx: &CudaContext,
-    name: &str,
-) -> Result<CudaTensor> {
-    match dtype {
-        DType::F32 => loader.load_f32(ctx, name),
-        DType::F16 => loader.load_f16(ctx, name),
-        DType::BF16 => loader.load_bf16(ctx, name),
-        other => panic!("Unsupported dtype for load_typed: {other}"),
-    }
-}
-
-fn load_typed_sharded(
-    dtype: DType,
-    loader: &impl WeightLoader,
-    ctx: &CudaContext,
-    name: &str,
-    shard: &ShardConfig,
-    strategy: ShardStrategy,
-) -> Result<CudaTensor> {
-    match dtype {
-        DType::F32 => loader.load_f32_sharded(ctx, name, shard, strategy),
-        DType::F16 => loader.load_f16_sharded(ctx, name, shard, strategy),
-        DType::BF16 => loader.load_bf16_sharded(ctx, name, shard, strategy),
-        other => panic!("Unsupported dtype for load_typed_sharded: {other}"),
-    }
-}
 
 // --- Weight structures ---
 
@@ -155,7 +96,7 @@ struct QwenLayerWeights<B: Backend + MatmulOps> {
 /// Complete Qwen model, generic over the compute backend `B`.
 pub struct QwenModel<B: Backend + MatmulOps> {
     config: QwenConfig,
-    ctx: CudaContext,
+    device: B::DeviceHandle,
     #[allow(dead_code)]
     gpu_config: GpuConfig,
 
@@ -177,217 +118,96 @@ pub struct QwenModel<B: Backend + MatmulOps> {
     _backend: PhantomData<B>,
 }
 
-impl QwenModel<CudaBackend> {
-    /// Load a Qwen model from a directory containing SafeTensors and config.json
-    ///
-    /// # Errors
-    /// Returns an error if loading fails
-    pub fn from_pretrained(ctx: &CudaContext, model_path: impl AsRef<Path>) -> Result<Self> {
-        let model_path = model_path.as_ref();
-        let config_path = model_path.join("config.json");
-        let config = QwenConfig::from_file(&config_path)?;
-        let loader = SafeTensorsLoader::from_directory(model_path)?;
-        Self::load_weights(ctx, config, &loader)
+// ---- Trait alias ----
+
+/// Convenience alias: all op traits required by `QwenModel` forward methods.
+pub trait QwenOps:
+    Backend
+    + MatmulOps
+    + MatmulExtOps
+    + NormOps
+    + ArithOps
+    + SwigluOps
+    + CastOps
+    + EmbedOps
+    + TensorOps
+    + TensorFactory
+    + TensorDataOps
+    + RopeOps
+    + AttentionOps
+    + PagedAttentionOps
+    + PagedKvCacheOps
+    + MoeOps
+    + BiasOps
+{
+}
+
+impl<B> QwenOps for B where
+    B: Backend
+        + MatmulOps
+        + MatmulExtOps
+        + NormOps
+        + ArithOps
+        + SwigluOps
+        + CastOps
+        + EmbedOps
+        + TensorOps
+        + TensorFactory
+        + TensorDataOps
+        + RopeOps
+        + AttentionOps
+        + PagedAttentionOps
+        + PagedKvCacheOps
+        + MoeOps
+        + BiasOps
+{
+}
+
+// ---- Generic impl ----
+
+impl<B: QwenOps> QwenModel<B> {
+    /// Get the model configuration
+    #[must_use]
+    pub fn config(&self) -> &QwenConfig {
+        &self.config
     }
 
-    /// Load a Qwen model with tensor-parallel sharding across multiple GPUs.
-    ///
-    /// # Errors
-    /// Returns an error if loading fails or head counts are not divisible.
-    pub fn from_pretrained_sharded(
-        ctx: &CudaContext,
-        model_path: impl AsRef<Path>,
-        gpu_config: GpuConfig,
-        comm: Option<<CudaBackend as Backend>::Comm>,
-    ) -> Result<Self> {
-        let model_path = model_path.as_ref();
-        let config_path = model_path.join("config.json");
-        let config = QwenConfig::from_file(&config_path)?;
-        let loader = SafeTensorsLoader::from_directory(model_path)?;
-        Self::load_weights_sharded(ctx, config, &loader, gpu_config, comm)
+    /// Get the model's compute dtype
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
-    /// Optional all-reduce for tensor-parallel models. No-op for single GPU.
-    fn maybe_all_reduce(&self, tensor: &mut CudaTensor) -> Result<()> {
-        if let Some(comm) = &self.comm {
-            comm.all_reduce_sum(tensor)?;
+    /// Build the runtime-facing [`ModelConfig`](infernum::ModelConfig).
+    #[must_use]
+    pub fn model_config(&self) -> infernum::ModelConfig {
+        let c = self.config();
+        infernum::ModelConfig {
+            num_layers: c.num_hidden_layers,
+            max_seq_len: c.max_position_embeddings,
+            num_kv_heads: self.tp_num_kv_heads,
+            head_dim: c.head_dim(),
+            eos_token_id: c.eos_token_id,
+            cache_dtype: self.dtype,
         }
-        Ok(())
     }
 
+    // ---- Generic weight loading ----
+
+    /// Load model weights from a backend-agnostic weight loader.
+    ///
+    /// # Errors
+    /// Returns an error if any weight fails to load.
+    ///
+    /// # Panics
+    /// Panics if `as_dense_weight` returns `None` after `is_dense_weight`
+    /// returned `true`.
     #[allow(clippy::too_many_lines)]
-    fn load_weights(
-        ctx: &CudaContext,
+    pub fn load_weights(
+        device: B::DeviceHandle,
         config: QwenConfig,
-        loader: &impl WeightLoader,
+        loader: &impl infernum::WeightLoader<B>,
     ) -> Result<Self> {
-        fn load_linear(
-            model_dtype: DType,
-            ctx: &CudaContext,
-            loader: &impl WeightLoader,
-            name: &str,
-            quant_config: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<LinearWeight> {
-            if let Some(qc) = quant_config {
-                let prefix = name
-                    .strip_suffix(".weight")
-                    .expect("GPTQ/AWQ weight name must end with .weight");
-                match qc.quant_method.as_str() {
-                    "gptq" => {
-                        let qt = loader.load_gptq_linear(ctx, prefix, qc.group_size)?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    "awq" => {
-                        let qt = loader.load_awq_linear(ctx, prefix, qc.group_size)?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    _ => {}
-                }
-            }
-
-            let file_dtype = loader.get_dtype(name)?;
-            if file_dtype.is_quantized() {
-                let mut qt = loader.load_quantized(ctx, name)?;
-                let scale_name = format!("{name}_scale");
-                if loader.contains(&scale_name) {
-                    let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec::<f32>()?;
-                    if scale_val.len() == 1 {
-                        qt.set_weight_scale(ctx, scale_val[0])?;
-                    } else {
-                        qt.set_channel_scales(ctx, &scale_val)?;
-                    }
-                }
-                Ok(LinearWeight::Quantized(qt))
-            } else if model_dtype == DType::F32 {
-                let f32_weight = loader.load_f32(ctx, name)?;
-                Ok(LinearWeight::Dense(pretranspose_weight(&f32_weight)?))
-            } else {
-                let native = load_typed(model_dtype, loader, ctx, name)?;
-                let shape = native.shape().to_vec();
-                let rows = shape[0];
-                let cols = shape[1];
-                let elem = model_dtype.size_in_bytes();
-                let data = native.to_raw_bytes()?;
-                let mut transposed_data = vec![0u8; data.len()];
-                for r in 0..rows {
-                    for c in 0..cols {
-                        let src = (r * cols + c) * elem;
-                        let dst = (c * rows + r) * elem;
-                        transposed_data[dst..dst + elem].copy_from_slice(&data[src..src + elem]);
-                    }
-                }
-                Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
-                    ctx,
-                    &[cols, rows],
-                    model_dtype,
-                    &transposed_data,
-                )?))
-            }
-        }
-
-        fn load_dense_mlp(
-            dtype: DType,
-            ctx: &CudaContext,
-            loader: &impl WeightLoader,
-            prefix: &str,
-            intermediate_size: usize,
-            qc: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<QwenMlpWeights<CudaBackend>> {
-            let gate = load_linear(
-                dtype,
-                ctx,
-                loader,
-                &format!("{prefix}.gate_proj.weight"),
-                qc,
-            )?;
-            let up = load_linear(dtype, ctx, loader, &format!("{prefix}.up_proj.weight"), qc)?;
-            let gate_up = match (gate, up) {
-                (LinearWeight::Dense(g), LinearWeight::Dense(u)) => {
-                    GateUpWeight::<CudaBackend>::Fused {
-                        weight: concat_weights(&g, &u)?,
-                        intermediate_size,
-                    }
-                }
-                (g, u) => GateUpWeight::<CudaBackend>::Separate {
-                    gate_proj: Box::new(g),
-                    up_proj: Box::new(u),
-                },
-            };
-            Ok(QwenMlpWeights {
-                gate_up,
-                down_proj: load_linear(
-                    dtype,
-                    ctx,
-                    loader,
-                    &format!("{prefix}.down_proj.weight"),
-                    qc,
-                )?,
-            })
-        }
-
-        fn load_moe_weights(
-            dtype: DType,
-            ctx: &CudaContext,
-            loader: &impl WeightLoader,
-            layer_prefix: &str,
-            config: &QwenConfig,
-            qc: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<QwenFfnWeights<CudaBackend>> {
-            let num_experts = config.num_experts.expect("MoE requires num_experts");
-            let num_experts_per_tok = config
-                .num_experts_per_tok
-                .expect("MoE requires num_experts_per_tok");
-            let expert_inter = config.moe_expert_intermediate_size();
-
-            // Qwen MoE router: mlp.gate.weight [num_experts, hidden_size]
-            let gate_name = format!("{layer_prefix}.mlp.gate.weight");
-            let gate_f32 = loader.load_f32(ctx, &gate_name)?;
-            let gate_transposed = pretranspose_weight(&gate_f32)?;
-            let gate = cast_from_f32(&gate_transposed, dtype)?;
-
-            // Per-expert MLPs: mlp.experts.{E}.{gate,up,down}_proj.weight
-            let mut experts = Vec::with_capacity(num_experts);
-            for e in 0..num_experts {
-                let ep = format!("{layer_prefix}.mlp.experts.{e}");
-                let mlp = load_dense_mlp(dtype, ctx, loader, &ep, expert_inter, qc)?;
-                experts.push(MoeExpertWeights { mlp });
-            }
-
-            // Shared expert: mlp.shared_expert.{gate,up,down}_proj.weight
-            let shared_expert = if config.has_shared_expert() {
-                let shared_inter = config
-                    .shared_expert_intermediate_size
-                    .expect("shared_expert_intermediate_size required");
-                let sp = format!("{layer_prefix}.mlp.shared_expert");
-                let mlp = load_dense_mlp(dtype, ctx, loader, &sp, shared_inter, qc)?;
-                Some(Box::new(mlp))
-            } else {
-                None
-            };
-
-            // Shared expert gate: mlp.shared_expert_gate.weight [1]
-            let shared_expert_gate = if config.has_shared_expert() {
-                let gate_name = format!("{layer_prefix}.mlp.shared_expert_gate.weight");
-                if loader.contains(&gate_name) {
-                    Some(load_typed(dtype, loader, ctx, &gate_name)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            Ok(QwenFfnWeights::<CudaBackend>::Moe {
-                gate,
-                experts,
-                num_experts_per_tok,
-                norm_topk_prob: config.norm_topk_prob,
-                shared_expert,
-                shared_expert_gate,
-            })
-        }
-
         let qc = config.quantization_config.as_ref();
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
@@ -397,92 +217,68 @@ impl QwenModel<CudaBackend> {
             embed_dtype
         };
 
-        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
+        let embed_tokens = loader.load_tensor("model.embed_tokens.weight", dtype)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
 
-            let q_bias_name = format!("{prefix}.self_attn.q_proj.bias");
-            let k_bias_name = format!("{prefix}.self_attn.k_proj.bias");
-            let v_bias_name = format!("{prefix}.self_attn.v_proj.bias");
-            let q_bias = if loader.contains(&q_bias_name) {
-                Some(load_typed(dtype, loader, ctx, &q_bias_name)?)
-            } else {
-                None
-            };
-            let k_bias = if loader.contains(&k_bias_name) {
-                Some(load_typed(dtype, loader, ctx, &k_bias_name)?)
-            } else {
-                None
-            };
-            let v_bias = if loader.contains(&v_bias_name) {
-                Some(load_typed(dtype, loader, ctx, &v_bias_name)?)
-            } else {
-                None
-            };
-
-            let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
-            let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
-            let q_norm = if loader.contains(&q_norm_name) {
-                Some(load_typed(dtype, loader, ctx, &q_norm_name)?)
-            } else {
-                None
-            };
-            let k_norm = if loader.contains(&k_norm_name) {
-                Some(load_typed(dtype, loader, ctx, &k_norm_name)?)
-            } else {
-                None
-            };
-
-            let k = load_linear(
-                dtype,
-                ctx,
+            let q_bias = Self::load_optional_tensor(
                 loader,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-                qc,
-            )?;
-            let v = load_linear(
+                &format!("{prefix}.self_attn.q_proj.bias"),
                 dtype,
-                ctx,
-                loader,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-                qc,
             )?;
-            let kv_proj = match (k, v) {
-                (LinearWeight::Dense(k_w), LinearWeight::Dense(v_w)) => {
-                    KvProjWeight::<CudaBackend>::Fused {
-                        kv_dim: config.num_kv_heads() * config.head_dim(),
-                        weight: concat_weights(&k_w, &v_w)?,
-                    }
+            let k_bias = Self::load_optional_tensor(
+                loader,
+                &format!("{prefix}.self_attn.k_proj.bias"),
+                dtype,
+            )?;
+            let v_bias = Self::load_optional_tensor(
+                loader,
+                &format!("{prefix}.self_attn.v_proj.bias"),
+                dtype,
+            )?;
+
+            let q_norm = Self::load_optional_tensor(
+                loader,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                dtype,
+            )?;
+            let k_norm = Self::load_optional_tensor(
+                loader,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                dtype,
+            )?;
+
+            let k = loader.load_linear(&format!("{prefix}.self_attn.k_proj.weight"), dtype, qc)?;
+            let v = loader.load_linear(&format!("{prefix}.self_attn.v_proj.weight"), dtype, qc)?;
+            let kv_proj = if B::is_dense_weight(&k) && B::is_dense_weight(&v) {
+                let k_t = B::as_dense_weight(&k).expect("checked dense");
+                let v_t = B::as_dense_weight(&v).expect("checked dense");
+                KvProjWeight::<B>::Fused {
+                    kv_dim: config.num_kv_heads() * config.head_dim(),
+                    weight: B::concat_inner_dim(k_t, v_t)?,
                 }
-                (k, v) => KvProjWeight::<CudaBackend>::Separate {
+            } else {
+                KvProjWeight::<B>::Separate {
                     k_proj: Box::new(k),
                     v_proj: Box::new(v),
-                },
+                }
             };
 
             let layer = QwenLayerWeights {
-                input_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.input_layernorm.weight"),
-                )?,
+                input_layernorm: loader
+                    .load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype)?,
                 attention: QwenAttentionWeights {
-                    q_proj: load_linear(
-                        dtype,
-                        ctx,
-                        loader,
+                    q_proj: loader.load_linear(
                         &format!("{prefix}.self_attn.q_proj.weight"),
+                        dtype,
                         qc,
                     )?,
                     kv_proj,
-                    o_proj: load_linear(
-                        dtype,
-                        ctx,
-                        loader,
+                    o_proj: loader.load_linear(
                         &format!("{prefix}.self_attn.o_proj.weight"),
+                        dtype,
                         qc,
                     )?,
                     q_bias,
@@ -491,18 +287,13 @@ impl QwenModel<CudaBackend> {
                     q_norm,
                     k_norm,
                 },
-                post_attention_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                )?,
+                post_attention_layernorm: loader
+                    .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
                 ffn: if config.is_moe_layer(i) {
-                    load_moe_weights(dtype, ctx, loader, &prefix, &config, qc)?
+                    Self::load_moe_weights(dtype, loader, &prefix, &config, qc)?
                 } else {
-                    QwenFfnWeights::<CudaBackend>::Dense(Box::new(load_dense_mlp(
+                    QwenFfnWeights::<B>::Dense(Box::new(Self::load_dense_mlp(
                         dtype,
-                        ctx,
                         loader,
                         &format!("{prefix}.mlp"),
                         config.intermediate_size,
@@ -514,41 +305,26 @@ impl QwenModel<CudaBackend> {
             layers.push(layer);
         }
 
-        let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
+        let norm = loader.load_tensor("model.norm.weight", dtype)?;
 
         let lm_head = if config.tie_word_embeddings {
             if qc.is_some() {
-                let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
-                let data = embed_f32.to_vec::<f32>()?;
-                LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
-                    ctx,
-                    embed_f32.shape(),
-                    &data,
-                )?)
+                let embed_f32 = B::cast_to_f32(&embed_tokens)?;
+                let data = B::to_f32_vec(&embed_f32)?;
+                B::quantize_to_q8(&device, embed_f32.shape(), &data)?
             } else {
-                let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
-                let transposed = pretranspose_weight(&embed_f32)?;
-                LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
+                let embed_f32 = B::cast_to_f32(&embed_tokens)?;
+                let transposed = B::transpose_2d(&embed_f32)?;
+                B::dense_weight(B::cast_from_f32(&transposed, dtype)?)
             }
         } else {
-            let lw = load_linear(dtype, ctx, loader, "lm_head.weight", None)?;
+            let lw = loader.load_linear("lm_head.weight", dtype, None)?;
             if qc.is_some() {
-                if let LinearWeight::Dense(ref w) = lw {
-                    let f32_w = cast_to_f32(w)?;
-                    let data = f32_w.to_vec::<f32>()?;
-                    let k = f32_w.shape()[0];
-                    let n = f32_w.shape()[1];
-                    let mut row_major = vec![0.0_f32; data.len()];
-                    for r in 0..k {
-                        for c in 0..n {
-                            row_major[c * k + r] = data[r * n + c];
-                        }
-                    }
-                    LinearWeight::Quantized(QuantizedTensor::from_f32_as_q8(
-                        ctx,
-                        &[n, k],
-                        &row_major,
-                    )?)
+                if let Some(w) = B::as_dense_weight(&lw) {
+                    let f32_w = B::cast_to_f32(w)?;
+                    let row_major = B::transpose_2d(&f32_w)?;
+                    let data = B::to_f32_vec(&row_major)?;
+                    B::quantize_to_q8(&device, row_major.shape(), &data)?
                 } else {
                     lw
                 }
@@ -558,36 +334,34 @@ impl QwenModel<CudaBackend> {
         };
 
         // Precompute RoPE cache (with optional YaRN scaling)
-        let (cos_f32, sin_f32) = if let Some(ref rs) = config.rope_scaling {
-            let scaling = RopeScaling {
+        let half_dim = config.head_dim() / 2;
+        let max_pos = config.max_position_embeddings;
+        let (cos_data, sin_data) = if let Some(ref rs) = config.rope_scaling {
+            let scaling = infernum::rope::RopeScaling {
                 rope_type: rs.rope_type.clone(),
                 factor: rs.factor,
                 original_max_position_embeddings: rs.original_max_position_embeddings,
             };
-            precompute_rope_cache_scaled(
-                ctx,
-                config.max_position_embeddings,
+            infernum::rope::precompute_rope_data_scaled(
+                max_pos,
                 config.head_dim(),
                 config.rope_theta,
                 &scaling,
-            )?
+            )
         } else {
-            precompute_rope_cache(
-                ctx,
-                config.max_position_embeddings,
-                config.head_dim(),
-                config.rope_theta,
-            )?
+            infernum::rope::precompute_rope_data(max_pos, config.head_dim(), config.rope_theta)
         };
-        let cos_cache = cast_from_f32(&cos_f32, dtype)?;
-        let sin_cache = cast_from_f32(&sin_f32, dtype)?;
+        let cos_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &cos_data)?;
+        let sin_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &sin_data)?;
+        let cos_cache = B::cast_from_f32(&cos_f32, dtype)?;
+        let sin_cache = B::cast_from_f32(&sin_f32, dtype)?;
 
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
             tp_num_kv_heads: config.num_kv_heads(),
             dtype,
             config,
-            ctx: ctx.clone(),
+            device,
             gpu_config: GpuConfig::Single,
             comm: None,
             embed_tokens,
@@ -600,100 +374,148 @@ impl QwenModel<CudaBackend> {
         })
     }
 
-    // --- Sharded loading ---
-
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
-    fn load_weights_sharded(
-        ctx: &CudaContext,
-        config: QwenConfig,
-        loader: &impl WeightLoader,
-        gpu_config: GpuConfig,
-        comm: Option<<CudaBackend as Backend>::Comm>,
-    ) -> Result<Self> {
-        fn load_linear_sharded(
-            model_dtype: DType,
-            ctx: &CudaContext,
-            loader: &impl WeightLoader,
-            name: &str,
-            shard: &ShardConfig,
-            strategy: ShardStrategy,
-            quant_config: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<LinearWeight> {
-            if let Some(qc) = quant_config {
-                let prefix = name
-                    .strip_suffix(".weight")
-                    .expect("GPTQ/AWQ weight name must end with .weight");
-                match qc.quant_method.as_str() {
-                    "gptq" => {
-                        let qt = loader.load_gptq_linear_sharded(
-                            ctx,
-                            prefix,
-                            qc.group_size,
-                            shard,
-                            strategy,
-                        )?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    "awq" => {
-                        let qt = loader.load_awq_linear_sharded(
-                            ctx,
-                            prefix,
-                            qc.group_size,
-                            shard,
-                            strategy,
-                        )?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    _ => {}
-                }
+    /// Load a dense MLP (gate_proj, up_proj, down_proj).
+    fn load_dense_mlp(
+        dtype: DType,
+        loader: &impl infernum::WeightLoader<B>,
+        prefix: &str,
+        intermediate_size: usize,
+        qc: Option<&crate::config::QuantizationConfig>,
+    ) -> Result<QwenMlpWeights<B>> {
+        let gate = loader.load_linear(&format!("{prefix}.gate_proj.weight"), dtype, qc)?;
+        let up = loader.load_linear(&format!("{prefix}.up_proj.weight"), dtype, qc)?;
+        let gate_up = if B::is_dense_weight(&gate) && B::is_dense_weight(&up) {
+            let g = B::as_dense_weight(&gate).expect("checked dense");
+            let u = B::as_dense_weight(&up).expect("checked dense");
+            GateUpWeight::<B>::Fused {
+                weight: B::concat_inner_dim(g, u)?,
+                intermediate_size,
             }
-
-            let dtype = loader.get_dtype(name)?;
-            if dtype.is_quantized() {
-                let mut qt =
-                    loader.load_quantized_sharded(ctx, name, shard, ShardStrategy::Replicate)?;
-                let scale_name = format!("{name}_scale");
-                if loader.contains(&scale_name) {
-                    let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec::<f32>()?;
-                    qt.set_weight_scale(ctx, scale_val[0])?;
-                }
-                Ok(LinearWeight::Quantized(qt))
-            } else {
-                let f32_weight = loader.load_f32_sharded(ctx, name, shard, strategy)?;
-                let transposed = pretranspose_weight(&f32_weight)?;
-                if model_dtype == DType::F32 {
-                    Ok(LinearWeight::Dense(transposed))
-                } else {
-                    let shape = transposed.shape();
-                    let rows = shape[0];
-                    let cols = shape[1];
-                    let native =
-                        load_typed_sharded(model_dtype, loader, ctx, name, shard, strategy)?;
-                    let native_bytes = native.to_raw_bytes()?;
-                    let elem = model_dtype.size_in_bytes();
-                    let mut buf = vec![0u8; native_bytes.len()];
-                    for r in 0..rows {
-                        for c in 0..cols {
-                            let src = (r * cols + c) * elem;
-                            let dst = (c * rows + r) * elem;
-                            buf[dst..dst + elem].copy_from_slice(&native_bytes[src..src + elem]);
-                        }
-                    }
-                    Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
-                        ctx,
-                        &[cols, rows],
-                        model_dtype,
-                        &buf,
-                    )?))
-                }
+        } else {
+            GateUpWeight::<B>::Separate {
+                gate_proj: Box::new(gate),
+                up_proj: Box::new(up),
             }
+        };
+        Ok(QwenMlpWeights {
+            gate_up,
+            down_proj: loader.load_linear(&format!("{prefix}.down_proj.weight"), dtype, qc)?,
+        })
+    }
+
+    /// Load MoE weights for a single layer.
+    fn load_moe_weights(
+        dtype: DType,
+        loader: &impl infernum::WeightLoader<B>,
+        layer_prefix: &str,
+        config: &QwenConfig,
+        qc: Option<&crate::config::QuantizationConfig>,
+    ) -> Result<QwenFfnWeights<B>> {
+        let num_experts = config.num_experts.expect("MoE requires num_experts");
+        let num_experts_per_tok = config
+            .num_experts_per_tok
+            .expect("MoE requires num_experts_per_tok");
+        let expert_inter = config.moe_expert_intermediate_size();
+
+        let gate_f32 =
+            loader.load_tensor(&format!("{layer_prefix}.mlp.gate.weight"), DType::F32)?;
+        let gate_transposed = B::transpose_2d(&gate_f32)?;
+        let gate = B::cast_from_f32(&gate_transposed, dtype)?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let ep = format!("{layer_prefix}.mlp.experts.{e}");
+            let mlp = Self::load_dense_mlp(dtype, loader, &ep, expert_inter, qc)?;
+            experts.push(MoeExpertWeights { mlp });
         }
+
+        let shared_expert = if config.has_shared_expert() {
+            let shared_inter = config
+                .shared_expert_intermediate_size
+                .expect("shared_expert_intermediate_size required");
+            let sp = format!("{layer_prefix}.mlp.shared_expert");
+            let mlp = Self::load_dense_mlp(dtype, loader, &sp, shared_inter, qc)?;
+            Some(Box::new(mlp))
+        } else {
+            None
+        };
+
+        let shared_expert_gate = if config.has_shared_expert() {
+            let gate_name = format!("{layer_prefix}.mlp.shared_expert_gate.weight");
+            if loader.contains(&gate_name) {
+                Some(loader.load_tensor(&gate_name, dtype)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(QwenFfnWeights::<B>::Moe {
+            gate,
+            experts,
+            num_experts_per_tok,
+            norm_topk_prob: config.norm_topk_prob,
+            shared_expert,
+            shared_expert_gate,
+        })
+    }
+
+    /// Load a SafeTensors model from a directory.
+    ///
+    /// # Errors
+    /// Returns an error if the config is missing or weights fail to load.
+    pub fn from_pretrained(device: &B::DeviceHandle, model_path: impl AsRef<Path>) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
+        let model_path = model_path.as_ref();
+        let config = QwenConfig::from_file(model_path.join("config.json"))?;
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights(device.clone(), config, &loader)
+    }
+
+    /// Load a Qwen model with tensor-parallel sharding.
+    ///
+    /// # Errors
+    /// Returns an error if loading fails or head counts are not divisible.
+    pub fn from_pretrained_sharded(
+        device: &B::DeviceHandle,
+        model_path: impl AsRef<Path>,
+        gpu_config: GpuConfig,
+        comm: Option<B::Comm>,
+    ) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
+        let model_path = model_path.as_ref();
+        let config = QwenConfig::from_file(model_path.join("config.json"))?;
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights_sharded(device.clone(), config, &loader, gpu_config, comm)
+    }
+    // ---- Sharded weight loading ----
+
+    /// Load model weights with tensor-parallel sharding, generic over backend.
+    ///
+    /// # Errors
+    /// Returns an error if weight loading fails.
+    ///
+    /// # Panics
+    /// Panics if head counts are not divisible by `world_size`.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    pub fn load_weights_sharded(
+        device: B::DeviceHandle,
+        config: QwenConfig,
+        loader: &impl infernum::WeightLoader<B>,
+        gpu_config: GpuConfig,
+        comm: Option<B::Comm>,
+    ) -> Result<Self> {
+        use infernum::shard::{shard_strategy_for_weight, ShardStrategy};
 
         let shard = match &gpu_config {
             GpuConfig::Sharded(s) => *s,
             GpuConfig::Single => {
-                return Self::load_weights(ctx, config, loader).map(|mut m| {
+                return Self::load_weights(device, config, loader).map(|mut m| {
                     m.comm = comm;
                     m
                 })
@@ -721,7 +543,7 @@ impl QwenModel<CudaBackend> {
             embed_dtype
         };
 
-        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
+        let embed_tokens = loader.load_tensor("model.embed_tokens.weight", dtype)?;
 
         let tp_num_heads = config.num_attention_heads / world_size;
         let tp_num_kv_heads = config.num_kv_heads() / world_size;
@@ -734,11 +556,9 @@ impl QwenModel<CudaBackend> {
             let k_bias_name = format!("{prefix}.self_attn.k_proj.bias");
             let v_bias_name = format!("{prefix}.self_attn.v_proj.bias");
             let q_bias = if loader.contains(&q_bias_name) {
-                Some(load_typed_sharded(
-                    dtype,
-                    loader,
-                    ctx,
+                Some(loader.load_tensor_sharded(
                     &q_bias_name,
+                    dtype,
                     &shard,
                     ShardStrategy::Column,
                 )?)
@@ -746,11 +566,9 @@ impl QwenModel<CudaBackend> {
                 None
             };
             let k_bias = if loader.contains(&k_bias_name) {
-                Some(load_typed_sharded(
-                    dtype,
-                    loader,
-                    ctx,
+                Some(loader.load_tensor_sharded(
                     &k_bias_name,
+                    dtype,
                     &shard,
                     ShardStrategy::Column,
                 )?)
@@ -758,11 +576,9 @@ impl QwenModel<CudaBackend> {
                 None
             };
             let v_bias = if loader.contains(&v_bias_name) {
-                Some(load_typed_sharded(
-                    dtype,
-                    loader,
-                    ctx,
+                Some(loader.load_tensor_sharded(
                     &v_bias_name,
+                    dtype,
                     &shard,
                     ShardStrategy::Column,
                 )?)
@@ -770,291 +586,157 @@ impl QwenModel<CudaBackend> {
                 None
             };
 
-            let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
-            let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
-            let q_norm = if loader.contains(&q_norm_name) {
-                Some(load_typed(dtype, loader, ctx, &q_norm_name)?)
-            } else {
-                None
-            };
-            let k_norm = if loader.contains(&k_norm_name) {
-                Some(load_typed(dtype, loader, ctx, &k_norm_name)?)
-            } else {
-                None
-            };
+            // QK-norm weights: replicated
+            let q_norm = Self::load_optional_tensor(
+                loader,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                dtype,
+            )?;
+            let k_norm = Self::load_optional_tensor(
+                loader,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                dtype,
+            )?;
 
-            let q_proj = load_linear_sharded(
+            let q_name = format!("{prefix}.self_attn.q_proj.weight");
+            let k_name = format!("{prefix}.self_attn.k_proj.weight");
+            let v_name = format!("{prefix}.self_attn.v_proj.weight");
+            let o_name = format!("{prefix}.self_attn.o_proj.weight");
+
+            let q_proj = loader.load_linear_sharded(
+                &q_name,
                 dtype,
-                ctx,
-                loader,
-                &format!("{prefix}.self_attn.q_proj.weight"),
-                &shard,
-                ShardStrategy::Column,
                 qc,
+                &shard,
+                shard_strategy_for_weight(&q_name),
             )?;
-            let k_proj = load_linear_sharded(
+            let k_proj = loader.load_linear_sharded(
+                &k_name,
                 dtype,
-                ctx,
-                loader,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-                &shard,
-                ShardStrategy::Column,
                 qc,
+                &shard,
+                shard_strategy_for_weight(&k_name),
             )?;
-            let v_proj = load_linear_sharded(
+            let v_proj = loader.load_linear_sharded(
+                &v_name,
                 dtype,
-                ctx,
-                loader,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-                &shard,
-                ShardStrategy::Column,
                 qc,
+                &shard,
+                shard_strategy_for_weight(&v_name),
             )?;
-            let kv_proj = KvProjWeight::<CudaBackend>::Separate {
+
+            let kv_proj = KvProjWeight::<B>::Separate {
                 k_proj: Box::new(k_proj),
                 v_proj: Box::new(v_proj),
             };
 
-            let o_proj = load_linear_sharded(
-                dtype,
-                ctx,
-                loader,
-                &format!("{prefix}.self_attn.o_proj.weight"),
-                &shard,
-                ShardStrategy::Row,
-                qc,
-            )?;
-
             let ffn = if config.is_moe_layer(i) {
-                let num_experts = config.num_experts.expect("MoE requires num_experts");
-                let num_experts_per_tok = config
-                    .num_experts_per_tok
-                    .expect("MoE requires num_experts_per_tok");
-                let _expert_inter = config.moe_expert_intermediate_size();
-
-                // Router: replicated
-                let gate_name = format!("{prefix}.mlp.gate.weight");
-                let gate_f32 = loader.load_f32(ctx, &gate_name)?;
-                let gate_transposed = pretranspose_weight(&gate_f32)?;
-                let gate = cast_from_f32(&gate_transposed, dtype)?;
-
-                let mut experts = Vec::with_capacity(num_experts);
-                for e in 0..num_experts {
-                    let ep = format!("{prefix}.mlp.experts.{e}");
-                    let gate_proj = load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{ep}.gate_proj.weight"),
-                        &shard,
-                        ShardStrategy::Column,
-                        qc,
-                    )?;
-                    let up_proj = load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{ep}.up_proj.weight"),
-                        &shard,
-                        ShardStrategy::Column,
-                        qc,
-                    )?;
-                    let gate_up = GateUpWeight::<CudaBackend>::Separate {
-                        gate_proj: Box::new(gate_proj),
-                        up_proj: Box::new(up_proj),
-                    };
-                    let down_proj = load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{ep}.down_proj.weight"),
-                        &shard,
-                        ShardStrategy::Row,
-                        qc,
-                    )?;
-                    experts.push(MoeExpertWeights {
-                        mlp: QwenMlpWeights { gate_up, down_proj },
-                    });
-                }
-
-                // Shared expert: sharded like dense MLP
-                let shared_expert = if config.has_shared_expert() {
-                    let _shared_inter = config
-                        .shared_expert_intermediate_size
-                        .expect("shared_expert_intermediate_size required");
-                    let sp = format!("{prefix}.mlp.shared_expert");
-                    let gate_proj = load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.gate_proj.weight"),
-                        &shard,
-                        ShardStrategy::Column,
-                        qc,
-                    )?;
-                    let up_proj = load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.up_proj.weight"),
-                        &shard,
-                        ShardStrategy::Column,
-                        qc,
-                    )?;
-                    let gate_up = GateUpWeight::<CudaBackend>::Separate {
-                        gate_proj: Box::new(gate_proj),
-                        up_proj: Box::new(up_proj),
-                    };
-                    let down_proj = load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.down_proj.weight"),
-                        &shard,
-                        ShardStrategy::Row,
-                        qc,
-                    )?;
-                    Some(Box::new(QwenMlpWeights { gate_up, down_proj }))
-                } else {
-                    None
-                };
-
-                // Shared expert gate: replicated
-                let shared_expert_gate = if config.has_shared_expert() {
-                    let gate_name = format!("{prefix}.mlp.shared_expert_gate.weight");
-                    if loader.contains(&gate_name) {
-                        Some(load_typed(dtype, loader, ctx, &gate_name)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                QwenFfnWeights::<CudaBackend>::Moe {
-                    gate,
-                    experts,
-                    num_experts_per_tok,
-                    norm_topk_prob: config.norm_topk_prob,
-                    shared_expert,
-                    shared_expert_gate,
-                }
+                Self::load_moe_weights_sharded(dtype, loader, &prefix, &config, &shard, qc)?
             } else {
                 let gate_name = format!("{prefix}.mlp.gate_proj.weight");
                 let up_name = format!("{prefix}.mlp.up_proj.weight");
                 let down_name = format!("{prefix}.mlp.down_proj.weight");
 
-                let gate = load_linear_sharded(
-                    dtype,
-                    ctx,
-                    loader,
+                let gate = loader.load_linear_sharded(
                     &gate_name,
-                    &shard,
-                    ShardStrategy::Column,
-                    qc,
-                )?;
-                let up = load_linear_sharded(
                     dtype,
-                    ctx,
-                    loader,
-                    &up_name,
-                    &shard,
-                    ShardStrategy::Column,
                     qc,
+                    &shard,
+                    shard_strategy_for_weight(&gate_name),
                 )?;
-                let gate_up = GateUpWeight::<CudaBackend>::Separate {
+                let up = loader.load_linear_sharded(
+                    &up_name,
+                    dtype,
+                    qc,
+                    &shard,
+                    shard_strategy_for_weight(&up_name),
+                )?;
+
+                let gate_up = GateUpWeight::<B>::Separate {
                     gate_proj: Box::new(gate),
                     up_proj: Box::new(up),
                 };
 
-                QwenFfnWeights::<CudaBackend>::Dense(Box::new(QwenMlpWeights {
+                QwenFfnWeights::<B>::Dense(Box::new(QwenMlpWeights {
                     gate_up,
-                    down_proj: load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
+                    down_proj: loader.load_linear_sharded(
                         &down_name,
-                        &shard,
-                        ShardStrategy::Row,
+                        dtype,
                         qc,
+                        &shard,
+                        shard_strategy_for_weight(&down_name),
                     )?,
                 }))
             };
 
             layers.push(QwenLayerWeights {
-                input_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.input_layernorm.weight"),
-                )?,
+                input_layernorm: loader
+                    .load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype)?,
                 attention: QwenAttentionWeights {
                     q_proj,
                     kv_proj,
-                    o_proj,
+                    o_proj: loader.load_linear_sharded(
+                        &o_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&o_name),
+                    )?,
                     q_bias,
                     k_bias,
                     v_bias,
                     q_norm,
                     k_norm,
                 },
-                post_attention_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                )?,
+                post_attention_layernorm: loader
+                    .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
                 ffn,
             });
         }
 
-        let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
+        let norm = loader.load_tensor("model.norm.weight", dtype)?;
         let lm_head = if config.tie_word_embeddings {
-            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
-            let transposed = pretranspose_weight(&embed_f32)?;
-            LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
+            let embed_f32 = B::cast_to_f32(&embed_tokens)?;
+            let transposed = B::transpose_2d(&embed_f32)?;
+            B::dense_weight(B::cast_from_f32(&transposed, dtype)?)
         } else {
-            load_linear_sharded(
-                dtype,
-                ctx,
-                loader,
+            loader.load_linear_sharded(
                 "lm_head.weight",
+                dtype,
+                None,
                 &shard,
                 ShardStrategy::Replicate,
-                None,
             )?
         };
 
-        let (cos_f32, sin_f32) = if let Some(ref rs) = config.rope_scaling {
-            let scaling = RopeScaling {
+        let half_dim = config.head_dim() / 2;
+        let max_pos = config.max_position_embeddings;
+        let (cos_data, sin_data) = if let Some(ref rs) = config.rope_scaling {
+            let scaling = infernum::rope::RopeScaling {
                 rope_type: rs.rope_type.clone(),
                 factor: rs.factor,
                 original_max_position_embeddings: rs.original_max_position_embeddings,
             };
-            precompute_rope_cache_scaled(
-                ctx,
-                config.max_position_embeddings,
+            infernum::rope::precompute_rope_data_scaled(
+                max_pos,
                 config.head_dim(),
                 config.rope_theta,
                 &scaling,
-            )?
+            )
         } else {
-            precompute_rope_cache(
-                ctx,
-                config.max_position_embeddings,
-                config.head_dim(),
-                config.rope_theta,
-            )?
+            infernum::rope::precompute_rope_data(max_pos, config.head_dim(), config.rope_theta)
         };
-        let cos_cache = cast_from_f32(&cos_f32, dtype)?;
-        let sin_cache = cast_from_f32(&sin_f32, dtype)?;
+        let cos_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &cos_data)?;
+        let sin_f32 = B::from_f32_slice(&device, &[max_pos, half_dim], &sin_data)?;
+        let cos_cache = B::cast_from_f32(&cos_f32, dtype)?;
+        let sin_cache = B::cast_from_f32(&sin_f32, dtype)?;
 
         Ok(Self {
             tp_num_heads,
             tp_num_kv_heads,
             dtype,
             config,
-            ctx: ctx.clone(),
+            device,
             gpu_config,
             comm,
             embed_tokens,
@@ -1067,22 +749,130 @@ impl QwenModel<CudaBackend> {
         })
     }
 
-    // --- Forward pass ---
+    /// Load MoE weights with tensor-parallel sharding for a single layer.
+    fn load_moe_weights_sharded(
+        dtype: DType,
+        loader: &impl infernum::WeightLoader<B>,
+        layer_prefix: &str,
+        config: &QwenConfig,
+        shard: &infernum::ShardConfig,
+        qc: Option<&crate::config::QuantizationConfig>,
+    ) -> Result<QwenFfnWeights<B>> {
+        use infernum::shard::ShardStrategy;
 
-    /// Get the model configuration
-    #[must_use]
-    pub fn config(&self) -> &QwenConfig {
-        &self.config
+        let num_experts = config.num_experts.expect("MoE requires num_experts");
+        let num_experts_per_tok = config
+            .num_experts_per_tok
+            .expect("MoE requires num_experts_per_tok");
+
+        let gate_f32 =
+            loader.load_tensor(&format!("{layer_prefix}.mlp.gate.weight"), DType::F32)?;
+        let gate_transposed = B::transpose_2d(&gate_f32)?;
+        let gate = B::cast_from_f32(&gate_transposed, dtype)?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let ep = format!("{layer_prefix}.mlp.experts.{e}");
+            let gate_proj = loader.load_linear_sharded(
+                &format!("{ep}.gate_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+            let up_proj = loader.load_linear_sharded(
+                &format!("{ep}.up_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+            let gate_up = GateUpWeight::<B>::Separate {
+                gate_proj: Box::new(gate_proj),
+                up_proj: Box::new(up_proj),
+            };
+            let down_proj = loader.load_linear_sharded(
+                &format!("{ep}.down_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Row,
+            )?;
+            experts.push(MoeExpertWeights {
+                mlp: QwenMlpWeights { gate_up, down_proj },
+            });
+        }
+
+        let shared_expert = if config.has_shared_expert() {
+            let sp = format!("{layer_prefix}.mlp.shared_expert");
+            let gate_proj = loader.load_linear_sharded(
+                &format!("{sp}.gate_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+            let up_proj = loader.load_linear_sharded(
+                &format!("{sp}.up_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+            let gate_up = GateUpWeight::<B>::Separate {
+                gate_proj: Box::new(gate_proj),
+                up_proj: Box::new(up_proj),
+            };
+            let down_proj = loader.load_linear_sharded(
+                &format!("{sp}.down_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Row,
+            )?;
+            Some(Box::new(QwenMlpWeights { gate_up, down_proj }))
+        } else {
+            None
+        };
+
+        let shared_expert_gate = if config.has_shared_expert() {
+            let gate_name = format!("{layer_prefix}.mlp.shared_expert_gate.weight");
+            if loader.contains(&gate_name) {
+                Some(loader.load_tensor(&gate_name, dtype)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(QwenFfnWeights::<B>::Moe {
+            gate,
+            experts,
+            num_experts_per_tok,
+            norm_topk_prob: config.norm_topk_prob,
+            shared_expert,
+            shared_expert_gate,
+        })
+    }
+    // ---- Helpers ----
+
+    /// Load an optional tensor (returns `None` if the tensor does not exist).
+    fn load_optional_tensor(
+        loader: &impl infernum::WeightLoader<B>,
+        name: &str,
+        dtype: DType,
+    ) -> Result<Option<B::Tensor>> {
+        if loader.contains(name) {
+            Ok(Some(loader.load_tensor(name, dtype)?))
+        } else {
+            Ok(None)
+        }
     }
 
-    /// Get the model's compute dtype
-    #[must_use]
-    pub fn dtype(&self) -> DType {
-        self.dtype
-    }
-
+    /// Extract the last row from a (seq_len, hidden_size) tensor
     #[allow(clippy::unused_self)]
-    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> CudaTensor {
+    fn extract_last_row(&self, hidden: &B::Tensor, seq_len: usize) -> B::Tensor {
         let hidden_size = hidden.shape()[1];
         if seq_len == 1 {
             return hidden.reshape(&[1, hidden_size]);
@@ -1090,42 +880,195 @@ impl QwenModel<CudaBackend> {
         hidden.slice_view((seq_len - 1) * hidden_size, &[1, hidden_size])
     }
 
-    fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor> {
-        CudaBackend::embedding_gather(&self.embed_tokens, input_ids)
+    /// Embed token IDs
+    fn embed(&self, input_ids: &[u32]) -> Result<B::Tensor> {
+        B::embedding_gather(&self.embed_tokens, input_ids)
     }
 
-    // --- Paged KV cache methods ---
+    /// Optional all-reduce for tensor-parallel models. No-op for single GPU.
+    fn maybe_all_reduce(&self, tensor: &mut B::Tensor) -> Result<()> {
+        if let Some(comm) = &self.comm {
+            comm.all_reduce_sum(tensor)?;
+        }
+        Ok(())
+    }
+
+    // ---- Full forward pass (no KV cache) ----
+
+    /// Full forward pass without KV cache (recomputes everything).
+    ///
+    /// Returns raw logits tensor of shape `(seq_len, vocab_size)`.
+    ///
+    /// # Errors
+    /// Returns an error if any operation fails.
+    pub fn forward_full(&self, input_ids: &[u32]) -> Result<B::Tensor> {
+        let seq_len = input_ids.len();
+        let mut hidden = self.embed(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let normed = B::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+            let num_heads = self.tp_num_heads;
+            let num_kv_heads = self.tp_num_kv_heads;
+            let head_dim = self.config.head_dim();
+
+            let mut q = B::linear(&normed, &layer.attention.q_proj)?;
+            let (mut k, mut v) = match &layer.attention.kv_proj {
+                KvProjWeight::<B>::Fused { weight, kv_dim } => {
+                    let kv = B::matmul(&normed, weight)?;
+                    B::split_inner_dim(&kv, *kv_dim, *kv_dim)?
+                }
+                KvProjWeight::<B>::Separate { k_proj, v_proj } => {
+                    let k = B::linear(&normed, k_proj)?;
+                    let v = B::linear(&normed, v_proj)?;
+                    (k, v)
+                }
+            };
+
+            if let Some(ref bias) = layer.attention.q_bias {
+                B::bias_add_inplace(&mut q, bias)?;
+            }
+            if let Some(ref bias) = layer.attention.k_bias {
+                B::bias_add_inplace(&mut k, bias)?;
+            }
+            if let Some(ref bias) = layer.attention.v_bias {
+                B::bias_add_inplace(&mut v, bias)?;
+            }
+
+            let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
+            let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
+            let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
+
+            if let Some(ref q_norm_w) = layer.attention.q_norm {
+                let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
+                let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+                q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
+            }
+            if let Some(ref k_norm_w) = layer.attention.k_norm {
+                let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
+                let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+                k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
+            }
+
+            let q = B::apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
+            let k = B::apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
+
+            let sliding_window = self.config.effective_sliding_window(layer_idx);
+            let attn_output =
+                B::fused_attention_prefill(&q, &k, &v, 0, None, None, sliding_window)?;
+            let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
+            let mut attn_output = B::linear(&attn_output, &layer.attention.o_proj)?;
+            self.maybe_all_reduce(&mut attn_output)?;
+
+            let (mut h, normed) = B::add_rmsnorm(
+                &hidden,
+                &attn_output,
+                &layer.post_attention_layernorm,
+                self.config.rms_norm_eps,
+            )?;
+
+            let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+            B::add_inplace(&mut h, &mlp_output)?;
+            hidden = h;
+        }
+
+        B::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        self.lm_head_forward(&hidden)
+    }
+
+    // ---- Batched decode (host-side convenience) ----
+
+    /// Batched decode with host-side inputs.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        paged_kvs: &mut [B::PagedKvCache],
+        block_tables: &[BlockTable],
+        positions: &[usize],
+    ) -> Result<B::Tensor> {
+        let batch_size = token_ids.len();
+        let max_blocks_per_seq = block_tables
+            .iter()
+            .map(|bt| bt.blocks().len())
+            .max()
+            .unwrap_or(0);
+        let mut bt_flat = vec![0i32; batch_size * max_blocks_per_seq];
+        for (i, bt) in block_tables.iter().enumerate() {
+            for (j, &block_id) in bt.blocks().iter().enumerate() {
+                bt_flat[i * max_blocks_per_seq + j] = block_id as i32;
+            }
+        }
+        let seq_lens: Vec<i32> = positions.iter().map(|&p| (p + 1) as i32).collect();
+        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let max_seq_len = seq_lens.iter().copied().max().unwrap_or(0) as usize;
+
+        let token_ids_t = B::from_u32_slice(&self.device, &[batch_size], token_ids)?;
+        let bt_t = B::from_i32_slice(&self.device, &[batch_size * max_blocks_per_seq], &bt_flat)?;
+        let sl_t = B::from_i32_slice(&self.device, &[batch_size], &seq_lens)?;
+        let pos_t = B::from_i32_slice(&self.device, &[batch_size], &positions_i32)?;
+
+        self.forward_batch_decode_tensors(
+            &token_ids_t,
+            paged_kvs,
+            &bt_t,
+            &sl_t,
+            &pos_t,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
+        )
+    }
+
+    // ---- Batched decode with paged KV cache (device tensors) ----
 
     /// Batched decode forward pass with paged KV cache.
     ///
     /// # Errors
     /// Returns an error if the forward pass fails.
-    pub fn forward_batch_decode(
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_decode_tensors(
         &self,
-        token_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
-        block_tables: &[BlockTable],
-        positions: &[usize],
-    ) -> Result<CudaTensor> {
-        let batch_size = token_ids.len();
+        token_ids: &B::Tensor,
+        paged_kvs: &mut [B::PagedKvCache],
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<B::Tensor> {
         let paged_kv = &mut paged_kvs[0];
 
-        let mut hidden = self.embed(token_ids)?;
+        let mut hidden = B::embedding_gather_tensor(&self.embed_tokens, token_ids, batch_size)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_paged_decode(
+            hidden = self.forward_layer_paged_decode_batched(
                 &hidden,
                 layer,
                 layer_idx,
                 paged_kv,
                 block_tables,
+                seq_lens,
                 positions,
+                batch_size,
+                max_blocks_per_seq,
+                max_seq_len,
             )?;
         }
 
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        B::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
         self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
+
+    // ---- Single-sequence prefill with paged KV cache ----
 
     /// Single-sequence prefill with paged KV cache.
     ///
@@ -1134,10 +1077,10 @@ impl QwenModel<CudaBackend> {
     pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kvs: &mut [PagedKvCache],
+        paged_kvs: &mut [B::PagedKvCache],
         block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let seq_len = input_ids.len();
         let paged_kv = &mut paged_kvs[0];
 
@@ -1155,33 +1098,43 @@ impl QwenModel<CudaBackend> {
             )?;
         }
 
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-        let last_hidden = self.extract_last_row(&hidden, seq_len);
-        self.lm_head_forward(&last_hidden)
+        let last = self.extract_last_row(&hidden, seq_len);
+        let normed = B::rms_norm(&last, &self.norm, self.config.rms_norm_eps)?;
+        self.lm_head_forward(&normed.reshape(&[1, self.config.hidden_size]))
     }
+    // ---- Layer-level forward methods ----
 
-    fn forward_layer_paged_decode(
+    /// Transformer layer forward for batched decode with paged KV cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_paged_decode_batched(
         &self,
-        hidden: &CudaTensor,
-        layer: &QwenLayerWeights<CudaBackend>,
+        hidden: &B::Tensor,
+        layer: &QwenLayerWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        block_tables: &[BlockTable],
-        positions: &[usize],
-    ) -> Result<CudaTensor> {
-        let normed =
-            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+        paged_kv: &mut B::PagedKvCache,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<B::Tensor> {
+        let normed = B::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
-        let attn_output = self.forward_attention_paged_decode(
+        let attn_output = self.forward_attention_paged_decode_batched(
             &normed,
             &layer.attention,
             layer_idx,
             paged_kv,
             block_tables,
+            seq_lens,
             positions,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
         )?;
 
-        let (mut hidden, normed) = CudaBackend::add_rmsnorm(
+        let (mut hidden, normed) = B::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1189,56 +1142,56 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        CudaBackend::add_inplace(&mut hidden, &mlp_output)?;
+        B::add_inplace(&mut hidden, &mlp_output)?;
         Ok(hidden)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    fn forward_attention_paged_decode(
+    /// Batched attention decode with paged KV cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_paged_decode_batched(
         &self,
-        hidden: &CudaTensor,
-        weights: &QwenAttentionWeights<CudaBackend>,
+        hidden: &B::Tensor,
+        weights: &QwenAttentionWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        block_tables: &[BlockTable],
-        positions: &[usize],
-    ) -> Result<CudaTensor> {
-        let batch_size = hidden.shape()[0];
+        paged_kv: &mut B::PagedKvCache,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<B::Tensor> {
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let mut q = CudaBackend::linear(hidden, &weights.q_proj)?;
+        let mut q = B::linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
-            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
-                let kv = CudaBackend::matmul(hidden, weight)?;
+            KvProjWeight::<B>::Fused { weight, kv_dim } => {
+                let kv = B::matmul(hidden, weight)?;
                 if batch_size == 1 {
                     let k = kv.slice_view(0, &[1, *kv_dim]);
                     let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
                     (k, v)
                 } else {
-                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
+                    B::split_inner_dim(&kv, *kv_dim, *kv_dim)?
                 }
             }
-            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
-                let k = CudaBackend::linear(hidden, k_proj)?;
-                let v = CudaBackend::linear(hidden, v_proj)?;
+            KvProjWeight::<B>::Separate { k_proj, v_proj } => {
+                let k = B::linear(hidden, k_proj)?;
+                let v = B::linear(hidden, v_proj)?;
                 (k, v)
             }
         };
 
         if let Some(ref bias) = weights.q_bias {
-            CudaBackend::bias_add_inplace(&mut q, bias)?;
+            B::bias_add_inplace(&mut q, bias)?;
         }
         if let Some(ref bias) = weights.k_bias {
-            CudaBackend::bias_add_inplace(&mut k, bias)?;
+            B::bias_add_inplace(&mut k, bias)?;
         }
         if let Some(ref bias) = weights.v_bias {
-            CudaBackend::bias_add_inplace(&mut v, bias)?;
+            B::bias_add_inplace(&mut v, bias)?;
         }
 
         let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
@@ -1247,103 +1200,39 @@ impl QwenModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
         }
 
-        // Upload positions to device for batched RoPE
-        #[allow(clippy::cast_possible_wrap)]
-        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
-        let positions_tensor =
-            CudaTensor::from_raw_bytes(&self.ctx, &[batch_size], infernum::DType::U32, unsafe {
-                std::slice::from_raw_parts(
-                    positions_i32.as_ptr().cast::<u8>(),
-                    positions_i32.len() * 4,
-                )
-            })?;
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
 
-        let q = CudaBackend::apply_rope_batched(
-            &q,
-            &self.cos_cache,
-            &self.sin_cache,
-            &positions_tensor,
-            batch_size,
-        )?;
-        let k = CudaBackend::apply_rope_batched(
-            &k,
-            &self.cos_cache,
-            &self.sin_cache,
-            &positions_tensor,
-            batch_size,
-        )?;
+        let q = B::apply_rope_batched(&q, &self.cos_cache, &self.sin_cache, positions, batch_size)?;
+        let k = B::apply_rope_batched(&k, &self.cos_cache, &self.sin_cache, positions, batch_size)?;
 
-        // Build flattened block tables and seq_lens for batched paged attention
-        let max_blocks_per_seq = block_tables
-            .iter()
-            .map(|bt| bt.blocks().len())
-            .max()
-            .unwrap_or(0);
-        #[allow(clippy::cast_possible_wrap)]
-        let block_tables_flat: Vec<i32> = {
-            let mut flat = vec![0i32; batch_size * max_blocks_per_seq];
-            for (i, bt) in block_tables.iter().enumerate() {
-                for (j, &block_id) in bt.blocks().iter().enumerate() {
-                    flat[i * max_blocks_per_seq + j] = block_id as i32;
-                }
-            }
-            flat
-        };
-        let block_tables_tensor = CudaTensor::from_raw_bytes(
-            &self.ctx,
-            &[batch_size * max_blocks_per_seq],
-            infernum::DType::U32,
-            unsafe {
-                std::slice::from_raw_parts(
-                    block_tables_flat.as_ptr().cast::<u8>(),
-                    block_tables_flat.len() * 4,
-                )
-            },
-        )?;
-
-        #[allow(clippy::cast_possible_wrap)]
-        let seq_lens_i32: Vec<i32> = positions.iter().map(|&p| (p + 1) as i32).collect();
-        let seq_lens_tensor =
-            CudaTensor::from_raw_bytes(&self.ctx, &[batch_size], infernum::DType::U32, unsafe {
-                std::slice::from_raw_parts(
-                    seq_lens_i32.as_ptr().cast::<u8>(),
-                    seq_lens_i32.len() * 4,
-                )
-            })?;
-
-        // Batched KV cache append
-        CudaBackend::append_paged_batched(
+        B::append_paged_batched(
             paged_kv,
             layer_idx,
             &k,
             &v,
-            &block_tables_tensor,
-            &positions_tensor,
+            block_tables,
+            positions,
             batch_size,
             max_blocks_per_seq,
         )?;
 
-        let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let max_seq_len = seq_lens_i32.iter().copied().max().unwrap_or(0) as usize;
-
-        // Batched paged attention decode
-        let (k_pool, v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
-        let attn_output = CudaBackend::paged_attention_decode(
+        let (k_pool, v_pool) = B::get_pools(paged_kv, layer_idx);
+        let attn_output = B::paged_attention_decode(
             &q,
             k_pool,
             v_pool,
-            &block_tables_tensor,
-            &seq_lens_tensor,
-            CudaBackend::block_size(paged_kv),
+            block_tables,
+            seq_lens,
+            B::block_size(paged_kv),
             max_blocks_per_seq,
             max_seq_len,
             None,
@@ -1353,24 +1242,24 @@ impl QwenModel<CudaBackend> {
 
         let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
 
-        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
+        let mut out = B::linear(&attn_output, &weights.o_proj)?;
         self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
 
+    /// Transformer layer forward for single-sequence prefill with paged KV cache.
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_paged_prefill(
         &self,
-        hidden: &CudaTensor,
-        layer: &QwenLayerWeights<CudaBackend>,
+        hidden: &B::Tensor,
+        layer: &QwenLayerWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
+        paged_kv: &mut B::PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor> {
-        let normed =
-            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+    ) -> Result<B::Tensor> {
+        let normed = B::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
         let attn_output = self.forward_attention_paged_prefill(
             &normed,
@@ -1382,7 +1271,7 @@ impl QwenModel<CudaBackend> {
             seq_len,
         )?;
 
-        let (mut hidden, normed) = CudaBackend::add_rmsnorm(
+        let (mut hidden, normed) = B::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1390,46 +1279,47 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        CudaBackend::add_inplace(&mut hidden, &mlp_output)?;
+        B::add_inplace(&mut hidden, &mlp_output)?;
         Ok(hidden)
     }
 
+    /// Attention for single-sequence prefill with paged KV cache.
     #[allow(clippy::too_many_arguments)]
     fn forward_attention_paged_prefill(
         &self,
-        hidden: &CudaTensor,
-        weights: &QwenAttentionWeights<CudaBackend>,
+        hidden: &B::Tensor,
+        weights: &QwenAttentionWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
+        paged_kv: &mut B::PagedKvCache,
         block_table: &BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let num_heads = self.tp_num_heads;
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let mut q = CudaBackend::linear(hidden, &weights.q_proj)?;
+        let mut q = B::linear(hidden, &weights.q_proj)?;
         let (mut k, mut v) = match &weights.kv_proj {
-            KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
-                let kv = CudaBackend::matmul(hidden, weight)?;
-                CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
+            KvProjWeight::<B>::Fused { weight, kv_dim } => {
+                let kv = B::matmul(hidden, weight)?;
+                B::split_inner_dim(&kv, *kv_dim, *kv_dim)?
             }
-            KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
-                let k = CudaBackend::linear(hidden, k_proj)?;
-                let v = CudaBackend::linear(hidden, v_proj)?;
+            KvProjWeight::<B>::Separate { k_proj, v_proj } => {
+                let k = B::linear(hidden, k_proj)?;
+                let v = B::linear(hidden, v_proj)?;
                 (k, v)
             }
         };
 
         if let Some(ref bias) = weights.q_bias {
-            CudaBackend::bias_add_inplace(&mut q, bias)?;
+            B::bias_add_inplace(&mut q, bias)?;
         }
         if let Some(ref bias) = weights.k_bias {
-            CudaBackend::bias_add_inplace(&mut k, bias)?;
+            B::bias_add_inplace(&mut k, bias)?;
         }
         if let Some(ref bias) = weights.v_bias {
-            CudaBackend::bias_add_inplace(&mut v, bias)?;
+            B::bias_add_inplace(&mut v, bias)?;
         }
 
         let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
@@ -1438,27 +1328,26 @@ impl QwenModel<CudaBackend> {
 
         if let Some(ref q_norm_w) = weights.q_norm {
             let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
+            let normed_q = B::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
             q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
         }
         if let Some(ref k_norm_w) = weights.k_norm {
             let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
+            let normed_k = B::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
             k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
         }
 
-        let q = CudaBackend::apply_rope(&q, &self.cos_cache, &self.sin_cache, start_pos)?;
-        let k = CudaBackend::apply_rope(&k, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let q = B::apply_rope(&q, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let k = B::apply_rope(&k, &self.cos_cache, &self.sin_cache, start_pos)?;
 
-        CudaBackend::append_paged(paged_kv, layer_idx, block_table, &k, &v, start_pos)?;
+        B::append_paged(paged_kv, layer_idx, block_table, &k, &v, start_pos)?;
 
         let mut gather_table = block_table.clone();
         gather_table.advance(seq_len);
-        let (k_contig, v_contig) =
-            CudaBackend::gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
+        let (k_contig, v_contig) = B::gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
 
         let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output = CudaBackend::fused_attention_prefill(
+        let attn_output = B::fused_attention_prefill(
             &q,
             &k_contig,
             &v_contig,
@@ -1469,21 +1358,69 @@ impl QwenModel<CudaBackend> {
         )?;
 
         let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
+        let mut out = B::linear(&attn_output, &weights.o_proj)?;
         self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
 
-    // --- FFN ---
+    // ---- MLP / FFN ----
 
-    fn forward_ffn(
+    /// Compute gate and up projections from a gate+up weight.
+    #[allow(clippy::unused_self)]
+    fn compute_gate_up(
         &self,
-        hidden: &CudaTensor,
-        ffn: &QwenFfnWeights<CudaBackend>,
-    ) -> Result<CudaTensor> {
+        hidden: &B::Tensor,
+        gate_up: &GateUpWeight<B>,
+    ) -> Result<(B::Tensor, B::Tensor)> {
+        match gate_up {
+            GateUpWeight::<B>::Fused {
+                weight,
+                intermediate_size,
+            } => {
+                let seq_len = hidden.shape()[0];
+                let gate_up = B::matmul(hidden, weight)?;
+                if seq_len == 1 {
+                    let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
+                    let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
+                    Ok((gate, up))
+                } else {
+                    B::split_inner_dim(&gate_up, *intermediate_size, *intermediate_size)
+                }
+            }
+            GateUpWeight::<B>::Separate { gate_proj, up_proj } => {
+                let gate = B::linear(hidden, gate_proj)?;
+                let up = B::linear(hidden, up_proj)?;
+                Ok((gate, up))
+            }
+        }
+    }
+
+    /// Forward pass through MLP (SwiGLU) with all-reduce.
+    #[allow(clippy::unused_self)]
+    fn forward_mlp(&self, hidden: &B::Tensor, weights: &QwenMlpWeights<B>) -> Result<B::Tensor> {
+        let (gate, up) = self.compute_gate_up(hidden, &weights.gate_up)?;
+        let intermediate = B::swiglu(&gate, &up)?;
+        let mut out = B::linear(&intermediate, &weights.down_proj)?;
+        self.maybe_all_reduce(&mut out)?;
+        Ok(out)
+    }
+
+    /// Forward pass through MLP without all-reduce (used by MoE experts).
+    fn forward_mlp_no_reduce(
+        &self,
+        hidden: &B::Tensor,
+        weights: &QwenMlpWeights<B>,
+    ) -> Result<B::Tensor> {
+        let (gate, up) = self.compute_gate_up(hidden, &weights.gate_up)?;
+        let intermediate = B::swiglu(&gate, &up)?;
+        B::linear(&intermediate, &weights.down_proj)
+    }
+
+    /// Dispatch to dense MLP or MoE forward pass.
+    fn forward_ffn(&self, hidden: &B::Tensor, ffn: &QwenFfnWeights<B>) -> Result<B::Tensor> {
         match ffn {
-            QwenFfnWeights::<CudaBackend>::Dense(mlp) => self.forward_mlp(hidden, mlp),
-            QwenFfnWeights::<CudaBackend>::Moe {
+            QwenFfnWeights::<B>::Dense(mlp) => self.forward_mlp(hidden, mlp),
+            QwenFfnWeights::<B>::Moe {
                 gate,
                 experts,
                 num_experts_per_tok,
@@ -1502,82 +1439,19 @@ impl QwenModel<CudaBackend> {
         }
     }
 
-    #[allow(clippy::unused_self)]
-    fn forward_mlp(
-        &self,
-        hidden: &CudaTensor,
-        weights: &QwenMlpWeights<CudaBackend>,
-    ) -> Result<CudaTensor> {
-        let (gate, up) = match &weights.gate_up {
-            GateUpWeight::<CudaBackend>::Fused {
-                weight,
-                intermediate_size,
-            } => {
-                let seq_len = hidden.shape()[0];
-                let gate_up = CudaBackend::matmul(hidden, weight)?;
-                if seq_len == 1 {
-                    let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
-                    let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
-                    (gate, up)
-                } else {
-                    CudaBackend::split_inner_dim(&gate_up, *intermediate_size, *intermediate_size)?
-                }
-            }
-            GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
-                let gate = CudaBackend::linear(hidden, gate_proj)?;
-                let up = CudaBackend::linear(hidden, up_proj)?;
-                (gate, up)
-            }
-        };
-        let intermediate = CudaBackend::swiglu(&gate, &up)?;
-        let mut out = CudaBackend::linear(&intermediate, &weights.down_proj)?;
-        self.maybe_all_reduce(&mut out)?;
-        Ok(out)
-    }
-
-    #[allow(clippy::unused_self)]
-    fn forward_mlp_no_reduce(
-        &self,
-        hidden: &CudaTensor,
-        weights: &QwenMlpWeights<CudaBackend>,
-    ) -> Result<CudaTensor> {
-        let (gate, up) = match &weights.gate_up {
-            GateUpWeight::<CudaBackend>::Fused {
-                weight,
-                intermediate_size,
-            } => {
-                let seq_len = hidden.shape()[0];
-                let gate_up = CudaBackend::matmul(hidden, weight)?;
-                if seq_len == 1 {
-                    let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
-                    let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
-                    (gate, up)
-                } else {
-                    CudaBackend::split_inner_dim(&gate_up, *intermediate_size, *intermediate_size)?
-                }
-            }
-            GateUpWeight::<CudaBackend>::Separate { gate_proj, up_proj } => {
-                let gate = CudaBackend::linear(hidden, gate_proj)?;
-                let up = CudaBackend::linear(hidden, up_proj)?;
-                (gate, up)
-            }
-        };
-        let intermediate = CudaBackend::swiglu(&gate, &up)?;
-        CudaBackend::linear(&intermediate, &weights.down_proj)
-    }
-
+    /// Forward pass through a Mixture-of-Experts layer with shared expert.
     #[allow(clippy::too_many_arguments)]
     fn forward_moe(
         &self,
-        hidden: &CudaTensor,
-        gate: &CudaTensor,
-        experts: &[MoeExpertWeights<CudaBackend>],
+        hidden: &B::Tensor,
+        gate: &B::Tensor,
+        experts: &[MoeExpertWeights<B>],
         num_experts_per_tok: usize,
         norm_topk_prob: bool,
-        shared_expert: Option<&QwenMlpWeights<CudaBackend>>,
-        shared_expert_gate: Option<&CudaTensor>,
-    ) -> Result<CudaTensor> {
-        let mut out = CudaBackend::moe_forward_softmax(
+        shared_expert: Option<&QwenMlpWeights<B>>,
+        shared_expert_gate: Option<&B::Tensor>,
+    ) -> Result<B::Tensor> {
+        let mut out = B::moe_forward_softmax(
             hidden,
             gate,
             experts.len(),
@@ -1592,14 +1466,14 @@ impl QwenModel<CudaBackend> {
             let shared_out = self.forward_mlp_no_reduce(hidden, shared_mlp)?;
 
             if let Some(gate_weight) = shared_expert_gate {
-                let gate_data: Vec<f32> = cast_to_f32(gate_weight)?.to_vec::<f32>()?;
+                let gate_data = B::to_f32_vec(gate_weight)?;
                 let gate_val = 1.0 / (1.0 + (-gate_data[0]).exp());
-                let gate_f32 = CudaTensor::from_slice(&self.ctx, &[1], &[gate_val])?;
-                let gate_t = cast_from_f32(&gate_f32, self.dtype)?;
-                let gated = CudaBackend::mul(&shared_out, &gate_t)?;
-                CudaBackend::add_inplace(&mut out, &gated)?;
+                let gate_f32 = B::from_f32_slice(&self.device, &[1], &[gate_val])?;
+                let gate_t = B::cast_from_f32(&gate_f32, self.dtype)?;
+                let gated = B::mul(&shared_out, &gate_t)?;
+                B::add_inplace(&mut out, &gated)?;
             } else {
-                CudaBackend::add_inplace(&mut out, &shared_out)?;
+                B::add_inplace(&mut out, &shared_out)?;
             }
         }
 
@@ -1607,203 +1481,95 @@ impl QwenModel<CudaBackend> {
         Ok(out)
     }
 
-    fn lm_head_forward(&self, hidden: &CudaTensor) -> Result<CudaTensor> {
+    /// Project hidden states to vocabulary logits (always f32)
+    fn lm_head_forward(&self, hidden: &B::Tensor) -> Result<B::Tensor> {
         if self.dtype == DType::BF16 {
-            if let LinearWeight::Dense(w) = &self.lm_head {
-                return CudaBackend::matmul_bf16_f32(hidden, w);
+            if let Some(w) = B::as_dense_weight(&self.lm_head) {
+                return B::matmul_bf16_f32(hidden, w);
             }
         }
-        let logits_t = CudaBackend::linear(hidden, &self.lm_head)?;
+        let logits_t = B::linear(hidden, &self.lm_head)?;
         if self.dtype == DType::F32 {
             return Ok(logits_t);
         }
-        CudaBackend::cast_to_f32(&logits_t)
+        B::cast_to_f32(&logits_t)
     }
 }
 
-// --- Public helpers & infernum::Model implementation ---
+// ---- Model trait impl (generic over any backend) ----
 
-impl QwenModel<CudaBackend> {
-    /// Build the runtime-facing [`ModelConfig`](infernum::ModelConfig).
-    #[must_use]
-    pub fn model_config(&self) -> infernum::ModelConfig {
-        let c = self.config();
-        infernum::ModelConfig {
-            num_layers: c.num_hidden_layers,
-            max_seq_len: c.max_position_embeddings,
-            num_kv_heads: self.tp_num_kv_heads,
-            head_dim: c.head_dim(),
-            eos_token_id: c.eos_token_id,
-            cache_dtype: self.dtype,
-        }
-    }
-
-    /// Full forward pass without KV cache (recomputes everything).
-    ///
-    /// Returns raw logits as a [`CudaTensor`] of shape `(seq_len, vocab_size)`.
-    ///
-    /// # Errors
-    /// Returns an error if any GPU operation fails.
-    pub fn forward_full(&self, input_ids: &[u32]) -> Result<CudaTensor> {
-        let seq_len = input_ids.len();
-        let mut hidden = self.embed(input_ids)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let normed =
-                CudaBackend::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-
-            let num_heads = self.tp_num_heads;
-            let num_kv_heads = self.tp_num_kv_heads;
-            let head_dim = self.config.head_dim();
-
-            let mut q = CudaBackend::linear(&normed, &layer.attention.q_proj)?;
-            let (mut k, mut v) = match &layer.attention.kv_proj {
-                KvProjWeight::<CudaBackend>::Fused { weight, kv_dim } => {
-                    let kv = CudaBackend::matmul(&normed, weight)?;
-                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
-                }
-                KvProjWeight::<CudaBackend>::Separate { k_proj, v_proj } => {
-                    let k = CudaBackend::linear(&normed, k_proj)?;
-                    let v = CudaBackend::linear(&normed, v_proj)?;
-                    (k, v)
-                }
-            };
-
-            if let Some(ref bias) = layer.attention.q_bias {
-                CudaBackend::bias_add_inplace(&mut q, bias)?;
-            }
-            if let Some(ref bias) = layer.attention.k_bias {
-                CudaBackend::bias_add_inplace(&mut k, bias)?;
-            }
-            if let Some(ref bias) = layer.attention.v_bias {
-                CudaBackend::bias_add_inplace(&mut v, bias)?;
-            }
-
-            let mut q = q.reshape(&[seq_len, num_heads, head_dim]);
-            let mut k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
-            let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
-
-            if let Some(ref q_norm_w) = layer.attention.q_norm {
-                let flat_q = q.reshape(&[seq_len * num_heads, head_dim]);
-                let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-                q = normed_q.reshape(&[seq_len, num_heads, head_dim]);
-            }
-            if let Some(ref k_norm_w) = layer.attention.k_norm {
-                let flat_k = k.reshape(&[seq_len * num_kv_heads, head_dim]);
-                let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-                k = normed_k.reshape(&[seq_len, num_kv_heads, head_dim]);
-            }
-
-            let q = CudaBackend::apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
-            let k = CudaBackend::apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
-
-            let sliding_window = self.config.effective_sliding_window(layer_idx);
-            let attn_output =
-                CudaBackend::fused_attention_prefill(&q, &k, &v, 0, None, None, sliding_window)?;
-            let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
-            let mut attn_output = CudaBackend::linear(&attn_output, &layer.attention.o_proj)?;
-            self.maybe_all_reduce(&mut attn_output)?;
-
-            let (mut h, normed) = CudaBackend::add_rmsnorm(
-                &hidden,
-                &attn_output,
-                &layer.post_attention_layernorm,
-                self.config.rms_norm_eps,
-            )?;
-
-            let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-            CudaBackend::add_inplace(&mut h, &mlp_output)?;
-            hidden = h;
-        }
-
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-        self.lm_head_forward(&hidden)
-    }
-}
-
-impl infernum::Model for QwenModel<CudaBackend> {
-    type B = CudaBackend;
-    type KvCache = PagedKvCache;
+impl<B: QwenOps + Send + 'static> infernum::Model for QwenModel<B>
+where
+    <B as MatmulOps>::LinearWeight: Send + Sync,
+{
+    type B = B;
+    type KvCache = B::PagedKvCache;
 
     fn config(&self) -> infernum::ModelConfig {
         self.model_config()
     }
 
-    fn device(&self) -> &CudaContext {
-        &self.ctx
+    fn device(&self) -> &B::DeviceHandle {
+        &self.device
     }
 
     fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
-        let mc = self.model_config();
-        PagedKvCache::new(
-            &self.ctx,
-            mc.num_layers,
+        let c = &self.config;
+        B::allocate_paged_kv_cache(
+            &self.device,
+            c.num_hidden_layers,
             block_config,
-            mc.num_kv_heads,
-            mc.head_dim,
-            mc.cache_dtype,
+            self.tp_num_kv_heads,
+            c.head_dim(),
+            self.dtype,
         )
     }
 
-    fn forward(&self, input_ids: &[u32]) -> Result<infernum_cuda::CudaLogits> {
-        Ok(infernum_cuda::CudaLogits::new(
-            self.forward_full(input_ids)?,
-        ))
+    fn forward(&self, input_ids: &[u32]) -> Result<B::Logits> {
+        let tensor = self.forward_full(input_ids)?;
+        Ok(B::logits_from_tensor(tensor))
     }
 
     fn forward_prefill(
         &self,
         input_ids: &[u32],
         kv_cache: &mut Self::KvCache,
-        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
-        block_table: &infernum::BlockTable,
+        _runtime_state: &mut B::RuntimeState,
+        block_table: &BlockTable,
         start_pos: usize,
-    ) -> Result<infernum_cuda::CudaLogits> {
+    ) -> Result<B::Logits> {
         let tensor = self.forward_prefill_paged(
             input_ids,
             std::slice::from_mut(kv_cache),
             block_table,
             start_pos,
         )?;
-        Ok(infernum_cuda::CudaLogits::new(tensor))
+        Ok(B::logits_from_tensor(tensor))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
-        token_ids: &CudaTensor,
+        token_ids: &B::Tensor,
         kv_cache: &mut Self::KvCache,
-        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
-        block_tables: &CudaTensor,
-        _seq_lens: &CudaTensor,
-        positions: &CudaTensor,
+        _runtime_state: &mut B::RuntimeState,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
         batch_size: usize,
         max_blocks_per_seq: usize,
-        _max_seq_len: usize,
-    ) -> Result<infernum_cuda::CudaLogits> {
-        // Download tensors to host and call old-style internal method.
-        // TODO: refactor QwenModel to use tensor-based ops directly.
-        let token_ids_host = token_ids.to_vec::<u32>()?;
-        let positions_u32 = positions.to_vec::<u32>()?;
-        let positions_host: Vec<usize> = positions_u32.iter().map(|&p| p as usize).collect();
-        let bt_flat = block_tables.to_vec::<u32>()?;
-        let block_size = CudaBackend::block_size(kv_cache);
-        let block_tables_host: Vec<infernum::BlockTable> = (0..batch_size)
-            .map(|i| {
-                let start = i * max_blocks_per_seq;
-                let end = start + max_blocks_per_seq;
-                let blocks: Vec<usize> = bt_flat[start..end].iter().map(|&b| b as usize).collect();
-                let seq_len = positions_host[i];
-                infernum::BlockTable::from_raw(blocks, seq_len, block_size)
-            })
-            .collect();
-        let tensor = QwenModel::forward_batch_decode(
-            self,
-            &token_ids_host,
+        max_seq_len: usize,
+    ) -> Result<B::Logits> {
+        let tensor = self.forward_batch_decode_tensors(
+            token_ids,
             std::slice::from_mut(kv_cache),
-            &block_tables_host,
-            &positions_host,
+            block_tables,
+            seq_lens,
+            positions,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
         )?;
-        Ok(infernum_cuda::CudaLogits::new(tensor))
+        Ok(B::logits_from_tensor(tensor))
     }
 }
