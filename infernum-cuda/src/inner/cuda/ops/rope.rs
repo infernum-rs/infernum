@@ -491,7 +491,8 @@ pub fn apply_rope_interleaved_indirect(
 ///
 /// # Errors
 /// Returns an error if the kernel launch or GPU allocation fails.
-pub fn apply_rope_interleaved_batched_indirect(
+#[allow(dead_code)]
+pub(crate) fn apply_rope_interleaved_batched_indirect(
     input: &CudaTensor,
     cos_cache: &CudaTensor,
     sin_cache: &CudaTensor,
@@ -657,7 +658,8 @@ pub fn apply_rope_batched(
 ///
 /// # Errors
 /// Returns an error if the kernel launch or GPU allocation fails.
-pub fn apply_rope_batched_indirect(
+#[allow(dead_code)]
+pub(crate) fn apply_rope_batched_indirect(
     input: &CudaTensor,
     cos_cache: &CudaTensor,
     sin_cache: &CudaTensor,

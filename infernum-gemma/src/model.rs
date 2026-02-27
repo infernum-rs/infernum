@@ -26,16 +26,13 @@ use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::Result;
 use infernum_cuda::cuda::ops::{
-    apply_rope_batched_indirect, cast_from_f32, embedding_gather_from_device, matmul,
-    paged_attention_decode_indirect, precompute_rope_cache, quantized_matmul, transpose_2d,
+    cast_from_f32, matmul, precompute_rope_cache, quantized_matmul, transpose_2d,
 };
 #[cfg(feature = "nccl")]
 use infernum_cuda::cuda::{
     shard_strategy_for_weight, NcclCommunicator, ShardConfig, ShardStrategy,
 };
-use infernum_cuda::cuda::{
-    BatchedGraphInputs, CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor,
-};
+use infernum_cuda::cuda::{CudaContext, CudaTensor, GpuConfig, PagedKvCache, QuantizedTensor};
 use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
 use infernum_cuda::BlockTable;
 use infernum_cuda::CudaBackend;
@@ -913,42 +910,6 @@ impl GemmaModel<CudaBackend> {
         self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
     }
 
-    /// Batched decode using indirect kernels for CUDA graph capture.
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_batch_decode_indirect(
-        &self,
-        graph_inputs: &BatchedGraphInputs,
-        paged_kvs: &mut [PagedKvCache],
-        max_seq_len: usize,
-    ) -> Result<CudaTensor> {
-        let batch_size = graph_inputs.max_batch_size();
-        let paged_kv = &mut paged_kvs[0];
-
-        let mut hidden = embedding_gather_from_device(
-            &self.ctx,
-            &self.embed_tokens,
-            graph_inputs.token_ids(),
-            batch_size,
-        )?;
-        CudaBackend::scale_inplace(&mut hidden, self.embed_scale)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_paged_decode_indirect(
-                &hidden,
-                layer,
-                layer_idx,
-                paged_kv,
-                graph_inputs,
-                max_seq_len,
-            )?;
-        }
-
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-        self.lm_head_forward(&hidden.reshape(&[batch_size, self.config.hidden_size]))
-    }
-
     /// Single-sequence prefill with paged KV cache.
     ///
     /// # Errors
@@ -1165,141 +1126,6 @@ impl GemmaModel<CudaBackend> {
 
         let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
 
-        let mut out = gemma_linear(&attn_output, &weights.o_proj)?;
-        #[cfg(feature = "nccl")]
-        nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;
-        Ok(out)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn forward_layer_paged_decode_indirect(
-        &self,
-        hidden: &CudaTensor,
-        layer: &GemmaLayerWeights,
-        layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        graph_inputs: &BatchedGraphInputs,
-        max_seq_len: usize,
-    ) -> Result<CudaTensor> {
-        let normed =
-            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-
-        let attn_output = self.forward_attention_paged_decode_indirect(
-            &normed,
-            &layer.attention,
-            layer_idx,
-            paged_kv,
-            graph_inputs,
-            max_seq_len,
-        )?;
-
-        let post_attn = CudaBackend::rms_norm(
-            &attn_output,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-        let mut hidden = hidden.clone();
-        CudaBackend::add_inplace(&mut hidden, &post_attn)?;
-
-        let normed_ffn = CudaBackend::rms_norm(
-            &hidden,
-            &layer.pre_feedforward_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        let mlp_output = self.forward_mlp(&normed_ffn, &layer.mlp)?;
-
-        let post_ffn = CudaBackend::rms_norm(
-            &mlp_output,
-            &layer.post_feedforward_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-        CudaBackend::add_inplace(&mut hidden, &post_ffn)?;
-
-        Ok(hidden)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn forward_attention_paged_decode_indirect(
-        &self,
-        hidden: &CudaTensor,
-        weights: &GemmaAttentionWeights,
-        layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        graph_inputs: &BatchedGraphInputs,
-        max_seq_len: usize,
-    ) -> Result<CudaTensor> {
-        let batch_size = hidden.shape()[0];
-        let num_heads = self.tp_num_heads;
-        let num_kv_heads = self.tp_num_kv_heads;
-        let head_dim = self.config.head_dim;
-
-        let q = gemma_linear(hidden, &weights.q_proj)?;
-        let (k, v) = match &weights.kv_proj {
-            KvProjWeight::Fused { weight, kv_dim } => {
-                let kv = matmul(hidden, weight)?;
-                if batch_size == 1 {
-                    let k = kv.slice_view(0, &[1, *kv_dim]);
-                    let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
-                    (k, v)
-                } else {
-                    CudaBackend::split_inner_dim(&kv, *kv_dim, *kv_dim)?
-                }
-            }
-            KvProjWeight::Separate { k_proj, v_proj } => {
-                let k = gemma_linear(hidden, k_proj)?;
-                let v = gemma_linear(hidden, v_proj)?;
-                (k, v)
-            }
-        };
-
-        let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
-        let mut k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
-        let v = v.reshape(&[batch_size, num_kv_heads, head_dim]);
-
-        if let Some(ref q_norm_w) = weights.q_norm {
-            let flat_q = q.reshape(&[batch_size * num_heads, head_dim]);
-            let normed_q = CudaBackend::rms_norm(&flat_q, q_norm_w, self.config.rms_norm_eps)?;
-            q = normed_q.reshape(&[batch_size, num_heads, head_dim]);
-        }
-        if let Some(ref k_norm_w) = weights.k_norm {
-            let flat_k = k.reshape(&[batch_size * num_kv_heads, head_dim]);
-            let normed_k = CudaBackend::rms_norm(&flat_k, k_norm_w, self.config.rms_norm_eps)?;
-            k = normed_k.reshape(&[batch_size, num_kv_heads, head_dim]);
-        }
-
-        let (cos, sin) = self.rope_caches_for_layer(layer_idx);
-        let q = apply_rope_batched_indirect(&q, cos, sin, graph_inputs.positions(), batch_size)?;
-        let k = apply_rope_batched_indirect(&k, cos, sin, graph_inputs.positions(), batch_size)?;
-
-        paged_kv.append_paged_batched(
-            layer_idx,
-            &k,
-            &v,
-            graph_inputs.block_tables(),
-            graph_inputs.positions(),
-            batch_size,
-            graph_inputs.max_blocks_per_seq(),
-        )?;
-
-        let (k_pool, v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
-        let sliding_window = self.config.effective_sliding_window(layer_idx);
-        let attn_output = paged_attention_decode_indirect(
-            &self.ctx,
-            &q,
-            k_pool,
-            v_pool,
-            graph_inputs.block_tables(),
-            graph_inputs.seq_lens(),
-            CudaBackend::block_size(paged_kv),
-            graph_inputs.max_blocks_per_seq(),
-            max_seq_len,
-            None,
-            self.config.attn_logit_softcapping,
-            sliding_window,
-        )?;
-
-        let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
         let mut out = gemma_linear(&attn_output, &weights.o_proj)?;
         #[cfg(feature = "nccl")]
         nccl_all_reduce(self.nccl_comm.as_ref(), &mut out)?;

@@ -115,6 +115,83 @@ pub trait TensorFactory: Backend {
     ) -> Result<Self::Tensor>;
 }
 
+/// Device tensors for a batched decode step, produced by
+/// [`DecodeBufferOps::prepare_decode_tensors`].
+pub struct DecodeTensors<T> {
+    /// Token IDs: shape `(batch_size,)`.
+    pub token_ids: T,
+    /// Flattened block tables: shape `(batch_size * max_blocks_per_seq,)`.
+    pub block_tables: T,
+    /// Sequence lengths (pos + 1): shape `(batch_size,)`.
+    pub seq_lens: T,
+    /// Positions: shape `(batch_size,)`.
+    pub positions: T,
+    /// Number of active sequences.
+    pub batch_size: usize,
+    /// Maximum blocks per sequence in the flattened block table.
+    pub max_blocks_per_seq: usize,
+    /// Maximum sequence length across the batch.
+    pub max_seq_len: usize,
+}
+
+/// Prepare device tensors for a batched decode step.
+///
+/// The default implementation allocates fresh tensors each call via
+/// [`TensorFactory`]. Backends that use CUDA graphs override this to
+/// write into pre-allocated fixed-address buffers so that graph replay
+/// sees the updated values without re-recording.
+pub trait DecodeBufferOps: TensorFactory {
+    /// Convert host-side decode batch data into device tensors.
+    ///
+    /// # Arguments
+    /// * `state` — mutable backend runtime state (graph-enabled backends
+    ///   store pre-allocated buffers here)
+    /// * `device` — device handle for tensor creation
+    /// * `token_ids` — one token per sequence (`batch_size` elements)
+    /// * `positions` — current position per sequence (i32)
+    /// * `block_tables_flat` — flattened block table
+    ///   (`batch_size * max_blocks_per_seq` elements, i32)
+    /// * `seq_lens` — sequence length per sequence (i32)
+    /// * `max_blocks_per_seq` — max blocks per sequence in `block_tables_flat`
+    ///
+    /// # Errors
+    /// Returns an error if device upload fails.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_decode_tensors(
+        state: &mut Self::RuntimeState,
+        device: &Self::DeviceHandle,
+        token_ids: &[u32],
+        positions: &[i32],
+        block_tables_flat: &[i32],
+        seq_lens: &[i32],
+        max_blocks_per_seq: usize,
+    ) -> Result<DecodeTensors<Self::Tensor>> {
+        let _ = state;
+        let batch_size = token_ids.len();
+        #[allow(clippy::cast_sign_loss)]
+        let max_seq_len = seq_lens.iter().copied().max().unwrap_or(0) as usize;
+
+        let token_ids_t = Self::from_u32_slice(device, &[batch_size], token_ids)?;
+        let block_tables_t = Self::from_i32_slice(
+            device,
+            &[batch_size * max_blocks_per_seq],
+            block_tables_flat,
+        )?;
+        let seq_lens_t = Self::from_i32_slice(device, &[batch_size], seq_lens)?;
+        let positions_t = Self::from_i32_slice(device, &[batch_size], positions)?;
+
+        Ok(DecodeTensors {
+            token_ids: token_ids_t,
+            block_tables: block_tables_t,
+            seq_lens: seq_lens_t,
+            positions: positions_t,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
+        })
+    }
+}
+
 /// Core tensor arithmetic.
 pub trait ArithOps: Backend {
     /// Element-wise addition, returning a new tensor.

@@ -109,7 +109,7 @@ fn run_parallel<M: Model + Send + 'static>(
     world_size: usize,
 ) -> Result<()>
 where
-    M::B: infernum::TensorFactory,
+    M::B: infernum::DecodeBufferOps,
 {
     let cfg = model.config();
     println!(

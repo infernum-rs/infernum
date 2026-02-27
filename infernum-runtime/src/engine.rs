@@ -8,7 +8,7 @@
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-use infernum::backend::{Backend, TensorFactory};
+use infernum::backend::{Backend, DecodeBufferOps};
 use infernum::logits::Logits;
 use infernum::runtime_state::RuntimeStateInit;
 use infernum::{
@@ -45,7 +45,7 @@ pub struct Engine<M: Model> {
 
 impl<M: Model> Engine<M>
 where
-    M::B: TensorFactory,
+    M::B: DecodeBufferOps,
 {
     /// Create a new engine wrapping the given model with default batch config.
     ///
@@ -183,7 +183,7 @@ fn worker_loop<M>(
     request_rx: mpsc::Receiver<GenerationRequest>,
 ) where
     M: Model,
-    M::B: TensorFactory,
+    M::B: DecodeBufferOps,
 {
     let model_config = model.config();
     let mut scheduler = Scheduler::new(&batch_config);
@@ -320,7 +320,7 @@ fn process_decode_batch<M>(
     scheduler: &mut Scheduler,
 ) where
     M: Model,
-    M::B: TensorFactory,
+    M::B: DecodeBufferOps,
 {
     let batch_size = tasks.len();
     let mut token_ids_host = Vec::with_capacity(batch_size);
@@ -359,36 +359,28 @@ fn process_decode_batch<M>(
         flat
     };
 
-    #[allow(clippy::cast_sign_loss)]
-    let max_seq_len = seq_lens_host.iter().copied().max().unwrap_or(0) as usize;
     let device = model.device();
-
-    let token_ids_tensor =
-        <M::B as TensorFactory>::from_u32_slice(device, &[batch_size], &token_ids_host)
-            .expect("failed to upload token_ids");
-    let block_tables_tensor = <M::B as TensorFactory>::from_i32_slice(
+    let decode = <M::B as DecodeBufferOps>::prepare_decode_tensors(
+        runtime_state,
         device,
-        &[batch_size * max_blocks_per_seq],
+        &token_ids_host,
+        &positions_host,
         &block_tables_flat,
+        &seq_lens_host,
+        max_blocks_per_seq,
     )
-    .expect("failed to upload block_tables");
-    let seq_lens_tensor =
-        <M::B as TensorFactory>::from_i32_slice(device, &[batch_size], &seq_lens_host)
-            .expect("failed to upload seq_lens");
-    let positions_tensor =
-        <M::B as TensorFactory>::from_i32_slice(device, &[batch_size], &positions_host)
-            .expect("failed to upload positions");
+    .expect("failed to prepare decode tensors");
 
     let result = model.forward_batch_decode(
-        &token_ids_tensor,
+        &decode.token_ids,
         kv_cache,
         runtime_state,
-        &block_tables_tensor,
-        &seq_lens_tensor,
-        &positions_tensor,
-        batch_size,
-        max_blocks_per_seq,
-        max_seq_len,
+        &decode.block_tables,
+        &decode.seq_lens,
+        &decode.positions,
+        decode.batch_size,
+        decode.max_blocks_per_seq,
+        decode.max_seq_len,
     );
 
     match result {

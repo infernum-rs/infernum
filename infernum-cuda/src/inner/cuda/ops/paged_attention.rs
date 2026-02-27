@@ -304,8 +304,8 @@ fn launch_paged_decode(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails.
-#[allow(clippy::too_many_arguments)]
-pub fn paged_attention_decode_indirect(
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn paged_attention_decode_indirect(
     ctx: &CudaContext,
     q: &CudaTensor,
     k_pool: &CudaTensor,

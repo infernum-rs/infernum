@@ -2,6 +2,9 @@
 //!
 //! All buffers are allocated at engine start with `max_batch_size` capacity.
 //! Contents are updated via `htod_copy_into` between graph replays.
+//!
+//! Currently unused: will be wired into `DecodeBufferOps` when CUDA graph
+//! capture is implemented.
 
 #![allow(
     clippy::cast_possible_truncation,

@@ -158,7 +158,7 @@ fn run_generate<M: infernum::Model + Send + 'static>(
     cli: &Cli,
 ) -> Result<()>
 where
-    M::B: infernum::TensorFactory,
+    M::B: infernum::DecodeBufferOps,
 {
     println!(
         "Model loaded ({} layers, {} hidden, vocab {})",

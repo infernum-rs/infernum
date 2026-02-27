@@ -143,17 +143,16 @@ mod deepseek_v3_tiny {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 
-    /// Tests `forward_batch_decode_indirect` by calling it directly
-    /// with a `BatchedGraphInputs` buffer. This validates the batched
-    /// indirect forward path used by the inflight batching engine.
-    ///
-    /// Note: DeepSeek's MoE routing uses GPU→CPU copies (`to_vec()`),
-    /// which prevents CUDA graph capture. This test exercises the
-    /// indirect kernels (batched RoPE, paged append/attention) without
-    /// actually capturing a CUDA graph.
+    /// Tests batched decode via the `Model::forward_batch_decode` trait
+    /// method with device tensors. This validates the batched forward
+    /// path used by the inflight batching engine.
     #[test]
-    fn batched_decode_indirect_no_nan() {
-        use infernum_cuda::cuda::{BatchedGraphInputs, PagedKvCache};
+    #[allow(clippy::cast_possible_wrap)]
+    fn batched_decode_no_nan() {
+        use infernum::backend::TensorFactory;
+        use infernum::Model;
+        use infernum_cuda::cuda::PagedKvCache;
+        use infernum_cuda::CudaBackend;
         use infernum_cuda::{BlockAllocator, BlockConfig, BlockTable};
 
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
@@ -201,38 +200,49 @@ mod deepseek_v3_tiny {
             bt.append_block(block_idx);
         }
 
-        // Prepare batched indirect decode step
-        let max_blocks_per_seq = model_config
-            .max_seq_len
-            .div_ceil(block_size)
-            .min(num_blocks);
-        let dummy_block = allocator.allocate().expect("need dummy block");
+        // Prepare tensor-based batched decode step
         let batch_size = 1;
-        let mut graph_inputs =
-            BatchedGraphInputs::new(ctx.device(), batch_size, max_blocks_per_seq, dummy_block)
-                .expect("Failed to allocate BatchedGraphInputs");
+        let max_blocks_per_seq = bt.blocks().len();
+        let position = input_ids.len() as i32;
+        let seq_len = position + 1;
+        let max_seq_len = seq_len as usize;
 
-        // Build flattened block table: (1 × max_blocks_per_seq)
         let mut block_tables_flat: Vec<i32> = bt.blocks().iter().map(|&b| b as i32).collect();
         block_tables_flat.resize(max_blocks_per_seq, 0);
 
-        let position = input_ids.len() as i32;
-        let seq_len = position + 1; // includes the new token
-        graph_inputs
-            .update(
-                &[2_u32],    // dummy next token id
-                &[position], // position for this decode step
-                &block_tables_flat,
-                &[seq_len], // sequence length after this token
-            )
-            .expect("Failed to update graph inputs");
+        let token_ids_t =
+            <CudaBackend as TensorFactory>::from_u32_slice(&ctx, &[batch_size], &[2_u32])
+                .expect("upload token_ids");
+        let block_tables_t = <CudaBackend as TensorFactory>::from_i32_slice(
+            &ctx,
+            &[batch_size * max_blocks_per_seq],
+            &block_tables_flat,
+        )
+        .expect("upload block_tables");
+        let seq_lens_t =
+            <CudaBackend as TensorFactory>::from_i32_slice(&ctx, &[batch_size], &[seq_len])
+                .expect("upload seq_lens");
+        let positions_t =
+            <CudaBackend as TensorFactory>::from_i32_slice(&ctx, &[batch_size], &[position])
+                .expect("upload positions");
 
-        let max_seq_len = max_blocks_per_seq * block_size;
-        let logits = model
-            .forward_batch_decode_indirect(&graph_inputs, &mut paged_kvs, max_seq_len)
-            .expect("Batched indirect decode failed");
+        let mut runtime_state = infernum_cuda::CudaRuntimeState::test_placeholder();
 
-        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
+        let logits = Model::forward_batch_decode(
+            &model,
+            &token_ids_t,
+            &mut paged_kvs[0],
+            &mut runtime_state,
+            &block_tables_t,
+            &seq_lens_t,
+            &positions_t,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
+        )
+        .expect("Batched decode failed");
+
+        let logits_vec: Vec<f32> = logits.tensor().to_vec().expect("Failed to read logits");
         let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
 

@@ -21,7 +21,7 @@ pub struct Runtime<M: Model, T: Tokenizer> {
 
 impl<M: Model, T: Tokenizer> Runtime<M, T>
 where
-    M::B: infernum::TensorFactory,
+    M::B: infernum::DecodeBufferOps,
 {
     /// Create a new runtime from a model and tokenizer.
     ///

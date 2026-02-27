@@ -11,7 +11,6 @@ pub use cuda_logits::CudaLogits;
 pub use cuda_runtime_state::CudaRuntimeState;
 
 pub use cuda::ops::LinearWeight;
-pub use cuda::BatchedGraphInputs;
 pub use cuda::BlockAllocator;
 pub use cuda::BlockConfig;
 pub use cuda::BlockTable;

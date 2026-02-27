@@ -22,6 +22,12 @@ impl CudaRuntimeState {
     pub(crate) fn new_placeholder() -> Self {
         Self { _private: () }
     }
+
+    /// Create a placeholder for tests that call model methods directly.
+    #[must_use]
+    pub fn test_placeholder() -> Self {
+        Self { _private: () }
+    }
 }
 
 impl RuntimeStateInit for CudaRuntimeState {

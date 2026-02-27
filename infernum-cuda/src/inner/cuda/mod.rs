@@ -1,5 +1,6 @@
 //! CUDA backend implementation
 
+#[allow(dead_code)]
 mod batched_graph;
 pub mod buffer_pool;
 mod context;
@@ -16,7 +17,6 @@ pub mod seq_position;
 mod sharded;
 mod tensor;
 
-pub use batched_graph::BatchedGraphInputs;
 pub use buffer_pool::{BufferPool, PooledSlice};
 pub use context::CudaContext;
 pub use graph::CudaGraph;

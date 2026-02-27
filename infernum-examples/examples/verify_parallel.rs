@@ -76,7 +76,7 @@ fn detect_model_type(model_path: &str) -> Result<String> {
 
 fn run_single_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String>
 where
-    M::B: infernum::TensorFactory,
+    M::B: infernum::DecodeBufferOps,
 {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;
@@ -98,7 +98,7 @@ where
 
 fn run_multi_gpu<M: infernum::Model + Send + 'static>(model: M, cli: &Cli) -> Result<String>
 where
-    M::B: infernum::TensorFactory,
+    M::B: infernum::DecodeBufferOps,
 {
     let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
     let runtime = Runtime::with_max_seq_len(model, tokenizer, cli.max_seq_len)?;

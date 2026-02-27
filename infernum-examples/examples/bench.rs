@@ -61,7 +61,7 @@ fn detect_model_type(model_path: &str) -> infernum::Result<String> {
 
 fn bench_model<M: infernum::Model + Send + 'static>(model: M, n_gen: usize) -> infernum::Result<()>
 where
-    M::B: infernum::TensorFactory,
+    M::B: infernum::DecodeBufferOps,
 {
     let prompt = vec![1u32, 15043, 29892, 920, 526, 366, 2599, 13];
 
@@ -96,7 +96,7 @@ fn bench_with_info<M: infernum::Model + Send + 'static>(
     n_gen: usize,
 ) -> infernum::Result<()>
 where
-    M::B: infernum::TensorFactory,
+    M::B: infernum::DecodeBufferOps,
 {
     eprintln!(
         "Model loaded: {} layers, {} hidden, dtype={}",

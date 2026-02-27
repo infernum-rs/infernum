@@ -71,6 +71,10 @@ impl TensorFactory for CudaBackend {
     }
 }
 
+// ---- Decode buffers ----
+
+impl infernum::backend::DecodeBufferOps for CudaBackend {}
+
 // ---- Arithmetic ----
 
 impl ArithOps for CudaBackend {
