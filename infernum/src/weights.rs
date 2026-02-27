@@ -1,11 +1,13 @@
 //! Generic weight loading traits and types.
 //!
-//! `WeightLoader<B>` is the backend-agnostic interface for loading model
+//! [`WeightLoader<B>`] is the backend-agnostic interface for loading model
 //! weights from disk (SafeTensors, GGUF, etc.). Model code calls the trait
 //! methods without knowing the backend or file format.
 //!
 //! Backend-specific implementations (e.g., `SafeTensorsLoader` for CUDA)
 //! live in the backend crates.
+
+#![allow(clippy::doc_markdown)]
 
 use crate::backend::MatmulOps;
 use crate::dtype::DType;
@@ -45,7 +47,7 @@ fn default_group_size() -> usize {
 }
 
 /// Deserialize `group_size`: -1 (per-channel) → 0 sentinel, positive values pass through.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn deserialize_group_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -72,6 +74,9 @@ pub trait WeightLoader<B: MatmulOps> {
     ///
     /// The loader handles dtype conversion (e.g., loading bf16 from disk
     /// when the model requests bf16).
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found or dtype conversion fails.
     fn load_tensor(&self, name: &str, dtype: DType) -> Result<B::Tensor>;
 
     /// Load a linear weight (dense or quantized) by name.
@@ -81,6 +86,9 @@ pub trait WeightLoader<B: MatmulOps> {
     /// - FP8 weight scale loading (companion `{name}_scale` tensor)
     /// - Dense weight transposition (matmul-ready layout)
     /// - Host-side transpose for non-f32 dtypes
+    ///
+    /// # Errors
+    /// Returns an error if loading or quantized packing fails.
     fn load_linear(
         &self,
         name: &str,
@@ -94,6 +102,9 @@ pub trait WeightLoader<B: MatmulOps> {
     /// - `Column`: split output features (rows)
     /// - `Row`: split input features (columns)
     /// - `Replicate`: load full tensor
+    ///
+    /// # Errors
+    /// Returns an error if loading or sharding fails.
     fn load_linear_sharded(
         &self,
         name: &str,
@@ -104,6 +115,9 @@ pub trait WeightLoader<B: MatmulOps> {
     ) -> Result<B::LinearWeight>;
 
     /// Load a tensor with tensor-parallel sharding.
+    ///
+    /// # Errors
+    /// Returns an error if loading or sharding fails.
     fn load_tensor_sharded(
         &self,
         name: &str,
@@ -113,9 +127,15 @@ pub trait WeightLoader<B: MatmulOps> {
     ) -> Result<B::Tensor>;
 
     /// Get the shape of a tensor without loading it.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found.
     fn get_shape(&self, name: &str) -> Result<Vec<usize>>;
 
     /// Get the dtype of a tensor.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found.
     fn get_dtype(&self, name: &str) -> Result<DType>;
 
     /// Check if a tensor exists.

@@ -4,7 +4,7 @@
 //! `Vec<f32>` arrays that can be uploaded to any backend via
 //! `TensorFactory::from_f32_slice`.
 
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 
 /// Precompute RoPE cos/sin cache for standard (unscaled) RoPE.
 ///

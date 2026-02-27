@@ -1236,6 +1236,11 @@ impl QwenModel<CudaBackend> {
         Ok(hidden)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn forward_attention_paged_decode(
         &self,
         hidden: &CudaTensor,

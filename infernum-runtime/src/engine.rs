@@ -306,6 +306,11 @@ fn process_prefill<M: Model>(
 // Decode (backend-agnostic, no graph logic)
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn process_decode_batch<M>(
     tasks: &[DecodeTask],
     model: &M,

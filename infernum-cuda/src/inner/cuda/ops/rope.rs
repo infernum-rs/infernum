@@ -720,6 +720,9 @@ pub fn apply_rope_batched_indirect(
 }
 
 /// Apply batched RoPE with positions stored in a `CudaTensor` (I32 dtype).
+///
+/// # Errors
+/// Returns an error if kernel launch or allocation fails.
 pub fn apply_rope_batched_from_tensor(
     input: &CudaTensor,
     cos_cache: &CudaTensor,

@@ -248,6 +248,10 @@ impl PagedKvCache {
     ///
     /// Same as [`append_paged_batched`](Self::append_paged_batched) but
     /// accepts `CudaTensor` (I32 dtype) instead of `CudaSlice<i32>`.
+    ///
+    /// # Errors
+    /// Returns an error if kernel launch fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_paged_batched_tensor(
         &mut self,
         layer_idx: usize,

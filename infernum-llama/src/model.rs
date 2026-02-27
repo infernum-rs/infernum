@@ -226,6 +226,10 @@ impl<B: LlamaOps> LlamaModel<B> {
     ///
     /// # Errors
     /// Returns an error if any weight fails to load.
+    ///
+    /// # Panics
+    /// Panics if `as_dense_weight` returns `None` after `is_dense_weight`
+    /// returned `true` (indicates a backend bug).
     #[allow(clippy::too_many_lines)]
     pub fn load_weights(
         device: B::DeviceHandle,

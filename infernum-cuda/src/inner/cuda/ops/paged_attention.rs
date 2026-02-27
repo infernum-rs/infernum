@@ -383,6 +383,9 @@ pub fn paged_attention_decode_indirect(
 /// Same as [`paged_attention_decode_indirect`] but accepts `CudaTensor`
 /// (I32 dtype) instead of `CudaSlice<i32>`, for use in the generic
 /// backend trait.
+///
+/// # Errors
+/// Returns an error if kernel launch or allocation fails.
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_decode_from_tensor(
     ctx: &CudaContext,

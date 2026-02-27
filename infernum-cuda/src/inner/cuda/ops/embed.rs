@@ -163,6 +163,9 @@ pub fn embedding_gather_from_device(
 /// Gather embedding rows using a device-side tensor of token IDs.
 ///
 /// `input_ids` is a `CudaTensor` with dtype I32 (holding u32 token IDs).
+///
+/// # Errors
+/// Returns an error if kernel launch or allocation fails.
 pub fn embedding_gather_from_tensor(
     ctx: &CudaContext,
     embed_table: &CudaTensor,

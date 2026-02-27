@@ -1822,6 +1822,7 @@ impl DeepSeekModel<CudaBackend> {
     }
 
     /// MLA attention for single-token decode with paged KV cache.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn forward_mla_attention_paged_decode(
         &self,
         hidden: &CudaTensor,
