@@ -578,6 +578,33 @@ impl infernum::backend::AllReduceOps for CudaBackend {
     }
 }
 
+#[cfg(feature = "nccl")]
+impl infernum::backend::MultiDeviceOps for CudaBackend {
+    type CommId = crate::cuda::NcclId;
+
+    fn create_comm_id() -> Result<Self::CommId> {
+        crate::cuda::NcclId::new()
+    }
+
+    fn create_device(rank: usize) -> Result<Self::DeviceHandle> {
+        crate::cuda::CudaContext::new(rank)
+    }
+
+    fn create_comm(
+        device: &Self::DeviceHandle,
+        rank: usize,
+        world_size: usize,
+        comm_id: Self::CommId,
+    ) -> Result<Self::Comm> {
+        crate::cuda::NcclCommunicator::from_rank(
+            std::sync::Arc::clone(device.device()),
+            rank,
+            world_size,
+            comm_id,
+        )
+    }
+}
+
 impl infernum::backend::SafeTensorsLoaderOps for CudaBackend {
     type SafeTensorsLoader = crate::weights::CudaWeightLoader<crate::weights::SafeTensorsLoader>;
 

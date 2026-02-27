@@ -656,3 +656,44 @@ pub trait AllReduceOps: Backend {
     /// In-place sum all-reduce across all ranks.
     fn all_reduce_sum_inplace(comm: &Self::OldComm, tensor: &mut Self::Tensor) -> Result<()>;
 }
+
+// ---- Multi-device ops ----
+
+/// Factory methods for creating devices and communicators across multiple
+/// GPUs/devices. Used by [`ShardedModel`](crate::ShardedModel) to set up
+/// tensor-parallel inference without knowing the backend.
+///
+/// Single-GPU backends don't implement this — it's only required when
+/// constructing a `ShardedModel`.
+pub trait MultiDeviceOps: Backend {
+    /// Opaque ID used to coordinate communicator creation across ranks.
+    ///
+    /// For NCCL this is `NcclId`. Rank 0 generates it and broadcasts
+    /// the raw bytes to other ranks.
+    type CommId: Send + Sync + Copy;
+
+    /// Generate a unique communicator ID (called once, shared across ranks).
+    ///
+    /// # Errors
+    /// Returns an error if ID generation fails.
+    fn create_comm_id() -> Result<Self::CommId>;
+
+    /// Create a device handle for the given rank.
+    ///
+    /// # Errors
+    /// Returns an error if device creation fails.
+    fn create_device(rank: usize) -> Result<Self::DeviceHandle>;
+
+    /// Create a communicator for the given rank.
+    ///
+    /// All ranks must call this concurrently with the same `comm_id`.
+    ///
+    /// # Errors
+    /// Returns an error if communicator creation fails.
+    fn create_comm(
+        device: &Self::DeviceHandle,
+        rank: usize,
+        world_size: usize,
+        comm_id: Self::CommId,
+    ) -> Result<Self::Comm>;
+}
