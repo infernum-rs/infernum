@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use super::nccl::NcclCommunicator;
-use super::{CudaContext, PagedKvCache, ShardConfig};
+use super::{CudaContext, CudaTensor, PagedKvCache, ShardConfig};
 use crate::inner::backend_impl::CudaBackend;
 use crate::inner::cuda_logits::CudaLogits;
 use crate::inner::cuda_runtime_state::CudaRuntimeState;
@@ -96,6 +96,10 @@ where
     type B = CudaBackend;
     type KvCache = ShardedKvCache<PagedKvCache>;
 
+    fn device(&self) -> &CudaContext {
+        &self.replicas[0].0
+    }
+
     fn config(&self) -> infernum::ModelConfig {
         infernum::Model::config(&self.replicas[0].1)
     }
@@ -152,13 +156,18 @@ where
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
-        token_ids: &[u32],
+        token_ids: &CudaTensor,
         kv_cache: &mut Self::KvCache,
         _runtime_state: &mut CudaRuntimeState,
-        block_tables: &[infernum::BlockTable],
-        positions: &[usize],
+        block_tables: &CudaTensor,
+        seq_lens: &CudaTensor,
+        positions: &CudaTensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
     ) -> Result<CudaLogits> {
         thread::scope(|s| {
             let handles: Vec<_> = self
@@ -174,7 +183,11 @@ where
                             kv,
                             &mut state,
                             block_tables,
+                            seq_lens,
                             positions,
+                            batch_size,
+                            max_blocks_per_seq,
+                            max_seq_len,
                         )
                     })
                 })

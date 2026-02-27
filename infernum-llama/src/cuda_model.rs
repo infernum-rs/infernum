@@ -115,6 +115,9 @@ impl LlamaModel<CudaBackend> {
     }
 
     /// Load a Llama model with tensor-parallel sharding for multi-GPU.
+    ///
+    /// # Errors
+    /// Returns an error if loading fails or head counts are not divisible.
     #[cfg(feature = "nccl")]
     pub fn from_pretrained_sharded(
         ctx: &CudaContext,

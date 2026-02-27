@@ -107,7 +107,10 @@ fn run_parallel<M: Model + Send + 'static>(
     tokenizer: LlamaTokenizer,
     cli: &Cli,
     world_size: usize,
-) -> Result<()> {
+) -> Result<()>
+where
+    M::B: infernum::TensorFactory,
+{
     let cfg = model.config();
     println!(
         "Model loaded ({} layers, head_dim={})",
