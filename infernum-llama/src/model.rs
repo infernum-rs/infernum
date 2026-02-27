@@ -1,8 +1,8 @@
 //! Llama model implementation — fully generic over the compute backend.
 //!
-//! All forward pass methods, weight types, and the model struct are generic
-//! over `B: Backend`. CUDA-specific code (loading, indirect graph kernels,
-//! `Model` impl) lives in `cuda_model.rs` behind `#[cfg(feature = "cuda")]`.
+//! All forward pass methods, weight loading, and the model struct are
+//! generic over `B: Backend`. The only CUDA-specific code is the
+//! `ShardedLoadable` bridge in `cuda_model.rs` (behind `nccl` feature).
 
 #![allow(
     clippy::struct_field_names, // _proj suffix is conventional for Llama weights
@@ -708,6 +708,28 @@ impl<B: LlamaOps> LlamaModel<B> {
         let config = LlamaConfig::from_file(model_path.join("config.json"))?;
         let loader = B::safetensors_loader(device, model_path)?;
         Self::load_weights(device.clone(), config, &loader)
+    }
+
+    /// Load a Llama model with tensor-parallel sharding.
+    ///
+    /// Generic over any backend implementing [`SafeTensorsLoaderOps`].
+    /// The communicator is stored in the model for all-reduce calls.
+    ///
+    /// # Errors
+    /// Returns an error if loading fails or head counts are not divisible.
+    pub fn from_pretrained_sharded(
+        device: &B::DeviceHandle,
+        model_path: impl AsRef<Path>,
+        gpu_config: GpuConfig,
+        comm: Option<B::Comm>,
+    ) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
+        let model_path = model_path.as_ref();
+        let config = LlamaConfig::from_file(model_path.join("config.json"))?;
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights_sharded(device.clone(), config, &loader, gpu_config, comm)
     }
 
     // ---- Sharded weight loading (tensor parallelism) ----

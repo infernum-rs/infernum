@@ -6,7 +6,7 @@
 
 mod chat_templates;
 mod config;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "nccl")]
 mod cuda_model;
 mod model;
 
