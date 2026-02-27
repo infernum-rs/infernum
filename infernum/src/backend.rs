@@ -340,6 +340,12 @@ pub trait TensorDataOps: Backend {
     ///
     /// The backend casts to f32 if necessary.
     fn to_f32_vec(tensor: &Self::Tensor) -> Result<Vec<f32>>;
+
+    /// Download tensor contents to the host as raw bytes.
+    ///
+    /// Each element occupies `tensor.dtype().size_in_bytes()` bytes.
+    /// Used for dtype-agnostic host-side operations (concat, split, transpose).
+    fn to_raw_bytes(tensor: &Self::Tensor) -> Result<Vec<u8>>;
 }
 
 /// Construct a [`WeightLoader`](crate::WeightLoader) from a SafeTensors directory.
@@ -627,6 +633,37 @@ pub trait MoeOps: Backend {
         num_experts: usize,
         num_experts_per_tok: usize,
         norm_topk_prob: bool,
+        expert_fn: F,
+    ) -> Result<Self::Tensor>
+    where
+        F: Fn(usize, &Self::Tensor) -> Result<Self::Tensor>;
+}
+
+/// Sigmoid-gated MoE routing (DeepSeek V3/R1).
+///
+/// Uses sigmoid scoring with bias correction and grouped top-k selection.
+/// This is separate from `MoeOps` because the routing algorithm is
+/// fundamentally different (sigmoid + groups + bias vs. plain softmax).
+#[allow(clippy::too_many_arguments)]
+pub trait MoeSigmoidOps: Backend {
+    /// Sigmoid MoE forward pass with bias-corrected grouped top-k routing.
+    ///
+    /// Routes tokens through `num_experts_per_tok` experts selected by
+    /// sigmoid scoring over `gate_weight`, with `e_score_correction_bias`
+    /// applied to the scores. Groups experts into `n_group` groups and
+    /// selects `topk_group` groups before picking top-k within them.
+    ///
+    /// Calls `expert_fn(expert_idx, input)` for each selected expert.
+    fn moe_forward_sigmoid<F>(
+        hidden: &Self::Tensor,
+        gate_weight: &Self::Tensor,
+        e_score_correction_bias: &[f32],
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        n_group: usize,
+        topk_group: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
         expert_fn: F,
     ) -> Result<Self::Tensor>
     where

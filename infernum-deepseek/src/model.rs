@@ -1,4 +1,7 @@
-//! DeepSeek V3 / R1 model implementation
+//! DeepSeek V3 / R1 model implementation — fully generic over the compute backend `B`.
+//!
+//! All forward pass methods, weight loading, and the model struct are
+//! generic over `B: Backend`. No CUDA-specific code remains in this file.
 
 #![allow(
     clippy::similar_names,
@@ -13,62 +16,16 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps, NormOps,
-    PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, CastOps, Comm, EmbedOps, MatmulExtOps, MatmulOps,
+    MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, SwigluOps,
+    TensorDataOps, TensorFactory, TensorOps,
 };
 use infernum::dtype::DType;
-use infernum::shard::{ShardConfig, ShardStrategy};
+use infernum::shard::GpuConfig;
 use infernum::tensor::Tensor;
 use infernum::Result;
-use infernum_cuda::cuda::ops::{
-    apply_rope_interleaved_indirect, cast_from_f32, embedding_gather_from_device,
-    fused_attention_decode_indirect, precompute_rope_cache, precompute_rope_cache_scaled,
-    quantized_matmul, transpose_2d, LinearWeight, RopeScaling,
-};
-use infernum_cuda::cuda::{
-    CudaContext, CudaSlice, CudaTensor, GpuConfig, KvCache, PagedKvCache, QuantizedTensor,
-};
-use infernum_cuda::weights::{SafeTensorsLoader, WeightLoader};
-use infernum_cuda::BlockTable;
-use infernum_cuda::CudaBackend;
 
 use crate::DeepSeekConfig;
-
-// --- Weight helpers ---
-
-fn pretranspose_weight(weight: &CudaTensor) -> Result<CudaTensor> {
-    transpose_2d(weight)
-}
-
-fn load_typed(
-    dtype: DType,
-    loader: &impl WeightLoader,
-    ctx: &CudaContext,
-    name: &str,
-) -> Result<CudaTensor> {
-    match dtype {
-        DType::F32 => loader.load_f32(ctx, name),
-        DType::F16 => loader.load_f16(ctx, name),
-        DType::BF16 => loader.load_bf16(ctx, name),
-        other => panic!("Unsupported dtype for load_typed: {other}"),
-    }
-}
-
-fn load_typed_sharded(
-    dtype: DType,
-    loader: &impl WeightLoader,
-    ctx: &CudaContext,
-    name: &str,
-    shard: &ShardConfig,
-    strategy: ShardStrategy,
-) -> Result<CudaTensor> {
-    match dtype {
-        DType::F32 => loader.load_f32_sharded(ctx, name, shard, strategy),
-        DType::F16 => loader.load_f16_sharded(ctx, name, shard, strategy),
-        DType::BF16 => loader.load_bf16_sharded(ctx, name, shard, strategy),
-        other => panic!("Unsupported dtype for load_typed_sharded: {other}"),
-    }
-}
 
 // --- kv_b_proj splitting ---
 
@@ -82,13 +39,13 @@ fn load_typed_sharded(
 /// - `kv_b_proj_k`: `(kv_lora_rank, num_heads * qk_nope_dim)` — K-nope decompression
 /// - `kv_b_proj_v`: `(num_heads, kv_lora_rank, v_head_dim)` — V decompression (batched matmul)
 /// - `kv_b_proj_k_t`: `(num_heads, qk_nope_dim, kv_lora_rank)` — Q absorption (batched matmul)
-fn split_kv_b_proj_dense(
-    ctx: &CudaContext,
-    weight: &CudaTensor,
+fn split_kv_b_proj_dense<B: TensorFactory + TensorDataOps>(
+    device: &B::DeviceHandle,
+    weight: &B::Tensor,
     num_heads: usize,
     qk_nope_dim: usize,
     v_head_dim: usize,
-) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
     let shape = weight.shape();
     let dtype = weight.dtype();
     let elem = dtype.size_in_bytes();
@@ -102,7 +59,7 @@ fn split_kv_b_proj_dense(
         num_heads * stride
     );
 
-    let data = weight.to_raw_bytes()?;
+    let data = B::to_raw_bytes(weight)?;
 
     // Extract K-nope columns: shape (kv_lora_rank, num_heads * qk_nope_dim)
     let k_cols = num_heads * qk_nope_dim;
@@ -142,11 +99,15 @@ fn split_kv_b_proj_dense(
         }
     }
 
-    let k_tensor = CudaTensor::from_raw_bytes(ctx, &[kv_lora_rank, k_cols], dtype, &k_data)?;
-    let v_tensor =
-        CudaTensor::from_raw_bytes(ctx, &[num_heads, kv_lora_rank, v_head_dim], dtype, &v_data)?;
-    let k_t_tensor = CudaTensor::from_raw_bytes(
-        ctx,
+    let k_tensor = B::from_raw_bytes(device, &[kv_lora_rank, k_cols], dtype, &k_data)?;
+    let v_tensor = B::from_raw_bytes(
+        device,
+        &[num_heads, kv_lora_rank, v_head_dim],
+        dtype,
+        &v_data,
+    )?;
+    let k_t_tensor = B::from_raw_bytes(
+        device,
         &[num_heads, qk_nope_dim, kv_lora_rank],
         dtype,
         &k_t_data,
@@ -157,23 +118,18 @@ fn split_kv_b_proj_dense(
 
 /// Split a quantized `kv_b_proj` by dequantizing to dense first, then splitting.
 ///
-/// The quantized weight has shape `(out_features, in_features)` where
-/// `out_features = num_heads * (qk_nope_dim + v_head_dim)` and `in_features = kv_lora_rank`.
-/// We dequantize via identity matmul: `I @ W^T = W^T`, yielding the pre-transposed dense
-/// weight `(kv_lora_rank, out_features)` that `split_kv_b_proj_dense` expects.
-///
-/// This is a one-time cost at model load time.
-fn split_kv_b_proj_quantized(
+/// Uses identity matmul: `I @ W^T = W^T` to dequantize via `B::linear`.
+fn split_kv_b_proj_quantized<B: MatmulOps + CastOps + TensorFactory + TensorDataOps>(
     dtype: DType,
-    ctx: &CudaContext,
-    w: &QuantizedTensor,
+    device: &B::DeviceHandle,
+    w: &<B as MatmulOps>::LinearWeight,
+    w_shape: &[usize],
     num_heads: usize,
     qk_nope_dim: usize,
     v_head_dim: usize,
-) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
-    let shape = w.shape();
-    let out_features = shape[0];
-    let kv_lora_rank = shape[1];
+) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
+    let out_features = w_shape[0];
+    let kv_lora_rank = w_shape[1];
     assert_eq!(
         out_features,
         num_heads * (qk_nope_dim + v_head_dim),
@@ -185,87 +141,129 @@ fn split_kv_b_proj_quantized(
     for i in 0..kv_lora_rank {
         identity_data[i * kv_lora_rank + i] = 1.0;
     }
-    let identity = CudaTensor::from_slice(ctx, &[kv_lora_rank, kv_lora_rank], &identity_data)?;
+    let identity = B::from_f32_slice(device, &[kv_lora_rank, kv_lora_rank], &identity_data)?;
 
     // Dequantize: I @ W^T → (kv_lora_rank, out_features) as f32
-    let dense_f32 = quantized_matmul(&identity, w)?;
+    let dense_f32 = B::linear(&identity, w)?;
 
     // Convert to target dtype and split
-    let dense_t = cast_from_f32(&dense_f32, dtype)?;
+    let dense_t = B::cast_from_f32(&dense_f32, dtype)?;
 
-    split_kv_b_proj_dense(ctx, &dense_t, num_heads, qk_nope_dim, v_head_dim)
+    split_kv_b_proj_dense::<B>(device, &dense_t, num_heads, qk_nope_dim, v_head_dim)
 }
 
 // --- Weight structures ---
 
 /// MLA attention weights (shared by dense and MoE layers)
-struct DeepSeekAttentionWeights {
-    q_a_proj: LinearWeight,
-    q_a_layernorm: CudaTensor,
-    q_b_proj: LinearWeight,
-    kv_a_proj_with_mqa: LinearWeight,
-    kv_a_layernorm: CudaTensor,
-    kv_b_proj: LinearWeight,
+struct DeepSeekAttentionWeights<B: Backend + MatmulOps> {
+    q_a_proj: <B as MatmulOps>::LinearWeight,
+    q_a_layernorm: B::Tensor,
+    q_b_proj: <B as MatmulOps>::LinearWeight,
+    kv_a_proj_with_mqa: <B as MatmulOps>::LinearWeight,
+    kv_a_layernorm: B::Tensor,
+    kv_b_proj: <B as MatmulOps>::LinearWeight,
     /// K-nope decompression columns, pre-transposed: `(kv_lora_rank, num_heads * qk_nope_dim)`
-    kv_b_proj_k: LinearWeight,
+    kv_b_proj_k: <B as MatmulOps>::LinearWeight,
     /// V decompression per-head: `(num_heads, kv_lora_rank, v_head_dim)` for batched V absorption
-    kv_b_proj_v: CudaTensor,
+    kv_b_proj_v: B::Tensor,
     /// Transposed K per-head: `(num_heads, qk_nope_dim, kv_lora_rank)` for batched Q absorption
-    kv_b_proj_k_t: CudaTensor,
-    o_proj: LinearWeight,
+    kv_b_proj_k_t: B::Tensor,
+    o_proj: <B as MatmulOps>::LinearWeight,
 }
 
 /// Dense MLP weights
-struct DenseMlpWeights {
-    gate_proj: LinearWeight,
-    up_proj: LinearWeight,
-    down_proj: LinearWeight,
+struct DenseMlpWeights<B: Backend + MatmulOps> {
+    gate_proj: <B as MatmulOps>::LinearWeight,
+    up_proj: <B as MatmulOps>::LinearWeight,
+    down_proj: <B as MatmulOps>::LinearWeight,
 }
 
 /// MoE layer weights
-struct MoeWeights {
-    gate_weight: CudaTensor,
+struct MoeWeights<B: Backend + MatmulOps> {
+    gate_weight: B::Tensor,
     e_score_correction_bias: Vec<f32>,
-    /// GPU-resident copy of the bias for the sigmoid routing kernel.
-    e_score_correction_bias_gpu: CudaTensor,
-    /// Pre-allocated GPU buffers for routing output, reused across decode steps.
-    routing_bufs: std::sync::Mutex<infernum_cuda::cuda::ops::GpuRoutingBuffers>,
-    experts: Vec<DenseMlpWeights>,
-    shared_expert: DenseMlpWeights,
+    experts: Vec<DenseMlpWeights<B>>,
+    shared_expert: DenseMlpWeights<B>,
 }
 
 /// Dense vs MoE FFN layer
 #[allow(clippy::large_enum_variant)]
-enum FfnWeights {
-    Dense(Box<DenseMlpWeights>),
-    Moe(Box<MoeWeights>),
+enum FfnWeights<B: Backend + MatmulOps> {
+    Dense(Box<DenseMlpWeights<B>>),
+    Moe(Box<MoeWeights<B>>),
 }
 
 /// Single transformer layer
-struct DeepSeekLayerWeights {
-    input_layernorm: CudaTensor,
-    attention: DeepSeekAttentionWeights,
-    post_attention_layernorm: CudaTensor,
-    ffn: FfnWeights,
+struct DeepSeekLayerWeights<B: Backend + MatmulOps> {
+    input_layernorm: B::Tensor,
+    attention: DeepSeekAttentionWeights<B>,
+    post_attention_layernorm: B::Tensor,
+    ffn: FfnWeights<B>,
+}
+
+// --- DeepSeekOps trait alias ---
+
+/// Combined ops trait for DeepSeek models.
+///
+/// Bundles all backend bounds required by `DeepSeekModel`, including
+/// MLA attention, MoE sigmoid routing, and interleaved RoPE.
+pub trait DeepSeekOps:
+    Backend
+    + MatmulOps
+    + MatmulExtOps
+    + NormOps
+    + ArithOps
+    + SwigluOps
+    + CastOps
+    + EmbedOps
+    + TensorOps
+    + TensorFactory
+    + TensorDataOps
+    + RopeInterleavedOps
+    + AttentionOps
+    + PagedAttentionOps
+    + PagedKvCacheOps
+    + MoeSigmoidOps
+{
+}
+
+impl<B> DeepSeekOps for B where
+    B: Backend
+        + MatmulOps
+        + MatmulExtOps
+        + NormOps
+        + ArithOps
+        + SwigluOps
+        + CastOps
+        + EmbedOps
+        + TensorOps
+        + TensorFactory
+        + TensorDataOps
+        + RopeInterleavedOps
+        + AttentionOps
+        + PagedAttentionOps
+        + PagedKvCacheOps
+        + MoeSigmoidOps
+{
 }
 
 /// Complete DeepSeek V3/R1 model.
-pub struct DeepSeekModel<B: Backend> {
+pub struct DeepSeekModel<B: Backend + MatmulOps> {
     config: DeepSeekConfig,
-    ctx: CudaContext,
+    device: B::DeviceHandle,
     #[allow(dead_code)]
     gpu_config: GpuConfig,
 
     /// Optional communicator for tensor-parallel all-reduce.
-    comm: Option<<CudaBackend as Backend>::Comm>,
+    comm: Option<B::Comm>,
 
     tp_num_heads: usize,
     dtype: DType,
 
     embed_tokens: B::Tensor,
-    layers: Vec<DeepSeekLayerWeights>,
+    layers: Vec<DeepSeekLayerWeights<B>>,
     norm: B::Tensor,
-    lm_head: LinearWeight,
+    lm_head: <B as MatmulOps>::LinearWeight,
 
     cos_cache: B::Tensor,
     sin_cache: B::Tensor,
@@ -276,17 +274,20 @@ pub struct DeepSeekModel<B: Backend> {
     _backend: PhantomData<B>,
 }
 
-impl DeepSeekModel<CudaBackend> {
+impl<B: DeepSeekOps> DeepSeekModel<B> {
     /// Load a DeepSeek model from a directory containing SafeTensors and config.json
     ///
     /// # Errors
     /// Returns an error if loading fails
-    pub fn from_pretrained(ctx: &CudaContext, model_path: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_pretrained(device: &B::DeviceHandle, model_path: impl AsRef<Path>) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
         let model_path = model_path.as_ref();
         let config_path = model_path.join("config.json");
         let config = DeepSeekConfig::from_file(&config_path)?;
-        let loader = SafeTensorsLoader::from_directory(model_path)?;
-        Self::load_weights(ctx, config, &loader)
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights(device.clone(), config, &loader)
     }
 
     /// Get the model configuration
@@ -305,78 +306,10 @@ impl DeepSeekModel<CudaBackend> {
 
     #[allow(clippy::too_many_lines)]
     fn load_weights(
-        ctx: &CudaContext,
+        device: B::DeviceHandle,
         config: DeepSeekConfig,
-        loader: &impl WeightLoader,
+        loader: &impl infernum::WeightLoader<B>,
     ) -> Result<Self> {
-        fn load_linear(
-            model_dtype: DType,
-            ctx: &CudaContext,
-            loader: &impl WeightLoader,
-            name: &str,
-            quant_config: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<LinearWeight> {
-            if let Some(qc) = quant_config {
-                let prefix = name
-                    .strip_suffix(".weight")
-                    .expect("GPTQ/AWQ weight name must end with .weight");
-                match qc.quant_method.as_str() {
-                    "gptq" => {
-                        let qt = loader.load_gptq_linear(ctx, prefix, qc.group_size)?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    "awq" => {
-                        let qt = loader.load_awq_linear(ctx, prefix, qc.group_size)?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    _ => {}
-                }
-            }
-
-            let dtype = loader.get_dtype(name)?;
-            if dtype.is_quantized() {
-                let mut qt = loader.load_quantized(ctx, name)?;
-                let scale_name = format!("{name}_scale");
-                if loader.contains(&scale_name) {
-                    let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec::<f32>()?;
-                    if scale_val.len() == 1 {
-                        qt.set_weight_scale(ctx, scale_val[0])?;
-                    } else {
-                        qt.set_channel_scales(ctx, &scale_val)?;
-                    }
-                }
-                Ok(LinearWeight::Quantized(qt))
-            } else {
-                let f32_weight = loader.load_f32(ctx, name)?;
-                let transposed = pretranspose_weight(&f32_weight)?;
-                if model_dtype == DType::F32 {
-                    Ok(LinearWeight::Dense(transposed))
-                } else {
-                    let native = load_typed(model_dtype, loader, ctx, name)?;
-                    let raw = native.to_raw_bytes()?;
-                    let shape = native.shape();
-                    let rows = shape[0];
-                    let cols = shape[1];
-                    let elem = model_dtype.size_in_bytes();
-                    let mut buf = vec![0u8; raw.len()];
-                    for r in 0..rows {
-                        for c in 0..cols {
-                            let src = (r * cols + c) * elem;
-                            let dst = (c * rows + r) * elem;
-                            buf[dst..dst + elem].copy_from_slice(&raw[src..src + elem]);
-                        }
-                    }
-                    Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
-                        ctx,
-                        &[cols, rows],
-                        model_dtype,
-                        &buf,
-                    )?))
-                }
-            }
-        }
-
         let qc = config.quantization_config.as_ref();
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
@@ -386,256 +319,126 @@ impl DeepSeekModel<CudaBackend> {
             embed_dtype
         };
 
-        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
+        let embed_tokens = loader.load_tensor("model.embed_tokens.weight", dtype)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
 
             // MLA attention weights
-            let kv_b_proj = load_linear(
-                dtype,
-                ctx,
-                loader,
-                &format!("{prefix}.self_attn.kv_b_proj.weight"),
-                qc,
-            )?;
+            let kv_b_proj =
+                loader.load_linear(&format!("{prefix}.self_attn.kv_b_proj.weight"), dtype, qc)?;
 
             // Split kv_b_proj into K-nope and V portions for absorbed attention
-            let (kv_b_proj_k, kv_b_proj_v, kv_b_proj_k_t) = match &kv_b_proj {
-                LinearWeight::Dense(w) => {
-                    let (k, v, k_t) = split_kv_b_proj_dense(
-                        ctx,
-                        w,
-                        config.num_attention_heads,
-                        config.qk_nope_head_dim,
-                        config.v_head_dim,
-                    )?;
-                    (LinearWeight::Dense(k), v, k_t)
-                }
-                LinearWeight::Quantized(w) => {
-                    let (k, v, k_t) = split_kv_b_proj_quantized(
-                        dtype,
-                        ctx,
-                        w,
-                        config.num_attention_heads,
-                        config.qk_nope_head_dim,
-                        config.v_head_dim,
-                    )?;
-                    (LinearWeight::Dense(k), v, k_t)
-                }
+            let kv_b_proj_shape =
+                loader.get_shape(&format!("{prefix}.self_attn.kv_b_proj.weight"))?;
+            let (kv_b_proj_k_dense, kv_b_proj_v, kv_b_proj_k_t) = if B::is_dense_weight(&kv_b_proj)
+            {
+                let w = B::as_dense_weight(&kv_b_proj)
+                    .expect("is_dense_weight returned true but as_dense_weight is None");
+                let (k, v, k_t) = split_kv_b_proj_dense::<B>(
+                    &device,
+                    w,
+                    config.num_attention_heads,
+                    config.qk_nope_head_dim,
+                    config.v_head_dim,
+                )?;
+                (k, v, k_t)
+            } else {
+                let (k, v, k_t) = split_kv_b_proj_quantized::<B>(
+                    dtype,
+                    &device,
+                    &kv_b_proj,
+                    &kv_b_proj_shape,
+                    config.num_attention_heads,
+                    config.qk_nope_head_dim,
+                    config.v_head_dim,
+                )?;
+                (k, v, k_t)
             };
+            let kv_b_proj_k = B::dense_weight(kv_b_proj_k_dense);
 
             let attention = DeepSeekAttentionWeights {
-                q_a_proj: load_linear(
-                    dtype,
-                    ctx,
-                    loader,
+                q_a_proj: loader.load_linear(
                     &format!("{prefix}.self_attn.q_a_proj.weight"),
+                    dtype,
                     qc,
                 )?,
-                q_a_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.self_attn.q_a_layernorm.weight"),
-                )?,
-                q_b_proj: load_linear(
-                    dtype,
-                    ctx,
-                    loader,
+                q_a_layernorm: loader
+                    .load_tensor(&format!("{prefix}.self_attn.q_a_layernorm.weight"), dtype)?,
+                q_b_proj: loader.load_linear(
                     &format!("{prefix}.self_attn.q_b_proj.weight"),
+                    dtype,
                     qc,
                 )?,
-                kv_a_proj_with_mqa: load_linear(
-                    dtype,
-                    ctx,
-                    loader,
+                kv_a_proj_with_mqa: loader.load_linear(
                     &format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
+                    dtype,
                     qc,
                 )?,
-                kv_a_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.self_attn.kv_a_layernorm.weight"),
-                )?,
+                kv_a_layernorm: loader
+                    .load_tensor(&format!("{prefix}.self_attn.kv_a_layernorm.weight"), dtype)?,
                 kv_b_proj,
                 kv_b_proj_k,
                 kv_b_proj_v,
                 kv_b_proj_k_t,
-                o_proj: load_linear(
-                    dtype,
-                    ctx,
-                    loader,
+                o_proj: loader.load_linear(
                     &format!("{prefix}.self_attn.o_proj.weight"),
+                    dtype,
                     qc,
                 )?,
             };
 
             // FFN: dense or MoE
             let ffn = if config.is_moe_layer(i) {
-                let num_experts = config
-                    .n_routed_experts
-                    .expect("MoE layer requires n_routed_experts");
-
-                // Router gate
-                let gate_name = format!("{prefix}.mlp.gate.weight");
-                let gate_f32 = loader.load_f32(ctx, &gate_name)?;
-                let gate_transposed = pretranspose_weight(&gate_f32)?;
-                let gate_weight = cast_from_f32(&gate_transposed, dtype)?;
-
-                // Bias correction
-                let bias_name = format!("{prefix}.mlp.gate.e_score_correction_bias");
-                let e_score_correction_bias = if loader.contains(&bias_name) {
-                    loader.load_f32(ctx, &bias_name)?.to_vec::<f32>()?
-                } else {
-                    vec![0.0_f32; num_experts]
-                };
-
-                // Per-expert MLPs
-                let mut experts = Vec::with_capacity(num_experts);
-                for e in 0..num_experts {
-                    let ep = format!("{prefix}.mlp.experts.{e}");
-                    experts.push(DenseMlpWeights {
-                        gate_proj: load_linear(
-                            dtype,
-                            ctx,
-                            loader,
-                            &format!("{ep}.gate_proj.weight"),
-                            qc,
-                        )?,
-                        up_proj: load_linear(
-                            dtype,
-                            ctx,
-                            loader,
-                            &format!("{ep}.up_proj.weight"),
-                            qc,
-                        )?,
-                        down_proj: load_linear(
-                            dtype,
-                            ctx,
-                            loader,
-                            &format!("{ep}.down_proj.weight"),
-                            qc,
-                        )?,
-                    });
-                }
-
-                // Shared expert
-                let sp = format!("{prefix}.mlp.shared_experts");
-                let shared_expert = DenseMlpWeights {
-                    gate_proj: load_linear(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.gate_proj.weight"),
-                        qc,
-                    )?,
-                    up_proj: load_linear(dtype, ctx, loader, &format!("{sp}.up_proj.weight"), qc)?,
-                    down_proj: load_linear(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.down_proj.weight"),
-                        qc,
-                    )?,
-                };
-
-                let e_score_correction_bias_gpu = CudaTensor::from_slice(
-                    ctx,
-                    &[e_score_correction_bias.len()],
-                    &e_score_correction_bias,
-                )?;
-
-                let routing_bufs =
-                    std::sync::Mutex::new(infernum_cuda::cuda::ops::GpuRoutingBuffers::new(
-                        ctx,
-                        config.num_experts_per_tok,
-                    )?);
-
-                FfnWeights::Moe(Box::new(MoeWeights {
-                    gate_weight,
-                    e_score_correction_bias,
-                    e_score_correction_bias_gpu,
-                    routing_bufs,
-                    experts,
-                    shared_expert,
-                }))
+                Self::load_moe_weights(&config, &prefix, dtype, qc, loader, &device)?
             } else {
                 let mp = format!("{prefix}.mlp");
                 FfnWeights::Dense(Box::new(DenseMlpWeights {
-                    gate_proj: load_linear(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{mp}.gate_proj.weight"),
-                        qc,
-                    )?,
-                    up_proj: load_linear(dtype, ctx, loader, &format!("{mp}.up_proj.weight"), qc)?,
-                    down_proj: load_linear(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{mp}.down_proj.weight"),
-                        qc,
-                    )?,
+                    gate_proj: loader.load_linear(&format!("{mp}.gate_proj.weight"), dtype, qc)?,
+                    up_proj: loader.load_linear(&format!("{mp}.up_proj.weight"), dtype, qc)?,
+                    down_proj: loader.load_linear(&format!("{mp}.down_proj.weight"), dtype, qc)?,
                 }))
             };
 
             layers.push(DeepSeekLayerWeights {
-                input_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.input_layernorm.weight"),
-                )?,
+                input_layernorm: loader
+                    .load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype)?,
                 attention,
-                post_attention_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                )?,
+                post_attention_layernorm: loader
+                    .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
                 ffn,
             });
         }
 
-        let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
+        let norm = loader.load_tensor("model.norm.weight", dtype)?;
 
-        let lm_head = if config.tie_word_embeddings {
-            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
-            let transposed = pretranspose_weight(&embed_f32)?;
-            LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
-        } else {
-            load_linear(dtype, ctx, loader, "lm_head.weight", None)?
-        };
+        let lm_head = transformer::load_lm_head::<B>(
+            &device,
+            loader,
+            &embed_tokens,
+            config.tie_word_embeddings,
+            dtype,
+            config.quantization_config.as_ref(),
+        )?;
 
         // RoPE cache — use qk_rope_head_dim (only rope portion gets RoPE)
-        let rope_head_dim = config.qk_rope_head_dim;
-        let (cos_f32, sin_f32) = if let Some(ref rs) = config.rope_scaling {
-            let scaling = RopeScaling {
+        let rope_scaling = config
+            .rope_scaling
+            .as_ref()
+            .map(|rs| infernum::RopeScaling {
                 rope_type: rs.rope_type.clone(),
                 factor: rs.factor,
                 original_max_position_embeddings: rs.original_max_position_embeddings,
-            };
-            precompute_rope_cache_scaled(
-                ctx,
-                config.max_position_embeddings,
-                rope_head_dim,
-                config.rope_theta,
-                &scaling,
-            )?
-        } else {
-            precompute_rope_cache(
-                ctx,
-                config.max_position_embeddings,
-                rope_head_dim,
-                config.rope_theta,
-            )?
-        };
-        let cos_cache = cast_from_f32(&cos_f32, dtype)?;
-        let sin_cache = cast_from_f32(&sin_f32, dtype)?;
+            });
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.max_position_embeddings,
+            config.qk_rope_head_dim,
+            config.rope_theta,
+            rope_scaling.as_ref(),
+            dtype,
+        )?;
 
         let attn_scale = config.mla_attn_scale();
 
@@ -643,7 +446,7 @@ impl DeepSeekModel<CudaBackend> {
             tp_num_heads: config.num_attention_heads,
             dtype,
             config,
-            ctx: ctx.clone(),
+            device,
             gpu_config: GpuConfig::Single,
             comm: None,
             embed_tokens,
@@ -657,25 +460,81 @@ impl DeepSeekModel<CudaBackend> {
         })
     }
 
+    /// Load MoE weights for a single layer.
+    fn load_moe_weights(
+        config: &DeepSeekConfig,
+        prefix: &str,
+        dtype: DType,
+        qc: Option<&crate::config::QuantizationConfig>,
+        loader: &impl infernum::WeightLoader<B>,
+        _device: &B::DeviceHandle,
+    ) -> Result<FfnWeights<B>> {
+        let num_experts = config
+            .n_routed_experts
+            .expect("MoE layer requires n_routed_experts");
+
+        // Router gate — load as dense tensor, transpose for matmul-ready layout
+        let gate_f32 = loader.load_tensor(&format!("{prefix}.mlp.gate.weight"), DType::F32)?;
+        let gate_transposed = B::transpose_2d(&gate_f32)?;
+        let gate_weight = B::cast_from_f32(&gate_transposed, dtype)?;
+
+        // Bias correction
+        let bias_name = format!("{prefix}.mlp.gate.e_score_correction_bias");
+        let e_score_correction_bias = if loader.contains(&bias_name) {
+            B::to_f32_vec(&loader.load_tensor(&bias_name, DType::F32)?)?
+        } else {
+            vec![0.0_f32; num_experts]
+        };
+
+        // Per-expert MLPs
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let ep = format!("{prefix}.mlp.experts.{e}");
+            experts.push(DenseMlpWeights {
+                gate_proj: loader.load_linear(&format!("{ep}.gate_proj.weight"), dtype, qc)?,
+                up_proj: loader.load_linear(&format!("{ep}.up_proj.weight"), dtype, qc)?,
+                down_proj: loader.load_linear(&format!("{ep}.down_proj.weight"), dtype, qc)?,
+            });
+        }
+
+        // Shared expert
+        let sp = format!("{prefix}.mlp.shared_experts");
+        let shared_expert = DenseMlpWeights {
+            gate_proj: loader.load_linear(&format!("{sp}.gate_proj.weight"), dtype, qc)?,
+            up_proj: loader.load_linear(&format!("{sp}.up_proj.weight"), dtype, qc)?,
+            down_proj: loader.load_linear(&format!("{sp}.down_proj.weight"), dtype, qc)?,
+        };
+
+        Ok(FfnWeights::Moe(Box::new(MoeWeights {
+            gate_weight,
+            e_score_correction_bias,
+            experts,
+            shared_expert,
+        })))
+    }
+
     /// Load a DeepSeek model with tensor-parallel sharding across multiple GPUs.
     ///
     /// # Errors
     /// Returns an error if loading fails or head counts are not divisible.
     pub fn from_pretrained_sharded(
-        ctx: &CudaContext,
+        device: &B::DeviceHandle,
         model_path: impl AsRef<Path>,
         gpu_config: GpuConfig,
-        comm: Option<<CudaBackend as Backend>::Comm>,
-    ) -> Result<Self> {
+        comm: Option<B::Comm>,
+    ) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
         let model_path = model_path.as_ref();
         let config_path = model_path.join("config.json");
         let config = DeepSeekConfig::from_file(&config_path)?;
-        let loader = SafeTensorsLoader::from_directory(model_path)?;
-        Self::load_weights_sharded(ctx, config, &loader, gpu_config, comm)
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights_sharded(device.clone(), config, &loader, gpu_config, comm)
     }
 
     /// Optional all-reduce for tensor-parallel models. No-op for single GPU.
-    fn maybe_all_reduce(&self, tensor: &mut CudaTensor) -> Result<()> {
+    fn maybe_all_reduce(&self, tensor: &mut B::Tensor) -> Result<()> {
         if let Some(comm) = &self.comm {
             comm.all_reduce_sum(tensor)?;
         }
@@ -684,100 +543,18 @@ impl DeepSeekModel<CudaBackend> {
 
     #[allow(clippy::too_many_lines)]
     fn load_weights_sharded(
-        ctx: &CudaContext,
+        device: B::DeviceHandle,
         config: DeepSeekConfig,
-        loader: &impl WeightLoader,
+        loader: &impl infernum::WeightLoader<B>,
         gpu_config: GpuConfig,
-        comm: Option<<CudaBackend as Backend>::Comm>,
+        comm: Option<B::Comm>,
     ) -> Result<Self> {
-        fn load_linear_sharded(
-            model_dtype: DType,
-            ctx: &CudaContext,
-            loader: &impl WeightLoader,
-            name: &str,
-            shard: &ShardConfig,
-            strategy: ShardStrategy,
-            quant_config: Option<&crate::config::QuantizationConfig>,
-        ) -> Result<LinearWeight> {
-            if let Some(qc) = quant_config {
-                let prefix = name
-                    .strip_suffix(".weight")
-                    .expect("GPTQ/AWQ weight name must end with .weight");
-                match qc.quant_method.as_str() {
-                    "gptq" => {
-                        let qt = loader.load_gptq_linear_sharded(
-                            ctx,
-                            prefix,
-                            qc.group_size,
-                            shard,
-                            strategy,
-                        )?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    "awq" => {
-                        let qt = loader.load_awq_linear_sharded(
-                            ctx,
-                            prefix,
-                            qc.group_size,
-                            shard,
-                            strategy,
-                        )?;
-                        return Ok(LinearWeight::Quantized(qt));
-                    }
-                    _ => {}
-                }
-            }
-
-            let dtype = loader.get_dtype(name)?;
-            if dtype.is_quantized() {
-                let mut qt =
-                    loader.load_quantized_sharded(ctx, name, shard, ShardStrategy::Replicate)?;
-                let scale_name = format!("{name}_scale");
-                if loader.contains(&scale_name) {
-                    let scale_tensor = loader.load_f32(ctx, &scale_name)?;
-                    let scale_val = scale_tensor.to_vec::<f32>()?;
-                    if scale_val.len() == 1 {
-                        qt.set_weight_scale(ctx, scale_val[0])?;
-                    } else {
-                        qt.set_channel_scales(ctx, &scale_val)?;
-                    }
-                }
-                Ok(LinearWeight::Quantized(qt))
-            } else {
-                let f32_weight = loader.load_f32_sharded(ctx, name, shard, strategy)?;
-                let transposed = pretranspose_weight(&f32_weight)?;
-                if model_dtype == DType::F32 {
-                    Ok(LinearWeight::Dense(transposed))
-                } else {
-                    let native =
-                        load_typed_sharded(model_dtype, loader, ctx, name, shard, strategy)?;
-                    let raw = native.to_raw_bytes()?;
-                    let shape = native.shape();
-                    let rows = shape[0];
-                    let cols = shape[1];
-                    let elem = model_dtype.size_in_bytes();
-                    let mut buf = vec![0u8; raw.len()];
-                    for r in 0..rows {
-                        for c in 0..cols {
-                            let src = (r * cols + c) * elem;
-                            let dst = (c * rows + r) * elem;
-                            buf[dst..dst + elem].copy_from_slice(&raw[src..src + elem]);
-                        }
-                    }
-                    Ok(LinearWeight::Dense(CudaTensor::from_raw_bytes(
-                        ctx,
-                        &[cols, rows],
-                        model_dtype,
-                        &buf,
-                    )?))
-                }
-            }
-        }
+        use infernum::shard::ShardStrategy;
 
         let shard = match &gpu_config {
             GpuConfig::Sharded(s) => *s,
             GpuConfig::Single => {
-                return Self::load_weights(ctx, config, loader).map(|mut m| {
+                return Self::load_weights(device, config, loader).map(|mut m| {
                     m.comm = comm;
                     m
                 })
@@ -801,7 +578,7 @@ impl DeepSeekModel<CudaBackend> {
             embed_dtype
         };
 
-        let embed_tokens = load_typed(dtype, loader, ctx, "model.embed_tokens.weight")?;
+        let embed_tokens = loader.load_tensor("model.embed_tokens.weight", dtype)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -811,296 +588,162 @@ impl DeepSeekModel<CudaBackend> {
             // q_a_proj, kv_a_proj_with_mqa: replicated (shared bottleneck)
             // q_b_proj, kv_b_proj: column-sharded (output is per-head)
             // o_proj: row-sharded (all-reduce after)
-            let kv_b_proj = load_linear_sharded(
-                dtype,
-                ctx,
-                loader,
+            let kv_b_proj = loader.load_linear_sharded(
                 &format!("{prefix}.self_attn.kv_b_proj.weight"),
+                dtype,
+                qc,
                 &shard,
                 ShardStrategy::Column,
-                qc,
             )?;
 
             // Split kv_b_proj into K-nope and V portions (using tp_num_heads after sharding)
-            let (kv_b_proj_k, kv_b_proj_v, kv_b_proj_k_t) = match &kv_b_proj {
-                LinearWeight::Dense(w) => {
-                    let (k, v, k_t) = split_kv_b_proj_dense(
-                        ctx,
-                        w,
-                        tp_num_heads,
-                        config.qk_nope_head_dim,
-                        config.v_head_dim,
-                    )?;
-                    (LinearWeight::Dense(k), v, k_t)
-                }
-                LinearWeight::Quantized(w) => {
-                    let (k, v, k_t) = split_kv_b_proj_quantized(
-                        dtype,
-                        ctx,
-                        w,
-                        tp_num_heads,
-                        config.qk_nope_head_dim,
-                        config.v_head_dim,
-                    )?;
-                    (LinearWeight::Dense(k), v, k_t)
-                }
+            let kv_b_proj_shape =
+                loader.get_shape(&format!("{prefix}.self_attn.kv_b_proj.weight"))?;
+            let (kv_b_proj_k_dense, kv_b_proj_v, kv_b_proj_k_t) = if B::is_dense_weight(&kv_b_proj)
+            {
+                let w = B::as_dense_weight(&kv_b_proj)
+                    .expect("is_dense_weight returned true but as_dense_weight is None");
+                split_kv_b_proj_dense::<B>(
+                    &device,
+                    w,
+                    tp_num_heads,
+                    config.qk_nope_head_dim,
+                    config.v_head_dim,
+                )?
+            } else {
+                // For sharded quantized, adjust shape for the shard
+                let mut shard_shape = kv_b_proj_shape.clone();
+                shard_shape[0] /= world_size; // Column-sharded: out_features divided
+                split_kv_b_proj_quantized::<B>(
+                    dtype,
+                    &device,
+                    &kv_b_proj,
+                    &shard_shape,
+                    tp_num_heads,
+                    config.qk_nope_head_dim,
+                    config.v_head_dim,
+                )?
             };
+            let kv_b_proj_k = B::dense_weight(kv_b_proj_k_dense);
 
             let attention = DeepSeekAttentionWeights {
-                q_a_proj: load_linear_sharded(
-                    dtype,
-                    ctx,
-                    loader,
+                q_a_proj: loader.load_linear_sharded(
                     &format!("{prefix}.self_attn.q_a_proj.weight"),
+                    dtype,
+                    qc,
                     &shard,
                     ShardStrategy::Replicate,
-                    qc,
                 )?,
-                q_a_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.self_attn.q_a_layernorm.weight"),
-                )?,
-                q_b_proj: load_linear_sharded(
-                    dtype,
-                    ctx,
-                    loader,
+                q_a_layernorm: loader
+                    .load_tensor(&format!("{prefix}.self_attn.q_a_layernorm.weight"), dtype)?,
+                q_b_proj: loader.load_linear_sharded(
                     &format!("{prefix}.self_attn.q_b_proj.weight"),
+                    dtype,
+                    qc,
                     &shard,
                     ShardStrategy::Column,
-                    qc,
                 )?,
-                kv_a_proj_with_mqa: load_linear_sharded(
-                    dtype,
-                    ctx,
-                    loader,
+                kv_a_proj_with_mqa: loader.load_linear_sharded(
                     &format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
+                    dtype,
+                    qc,
                     &shard,
                     ShardStrategy::Replicate,
-                    qc,
                 )?,
-                kv_a_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.self_attn.kv_a_layernorm.weight"),
-                )?,
+                kv_a_layernorm: loader
+                    .load_tensor(&format!("{prefix}.self_attn.kv_a_layernorm.weight"), dtype)?,
                 kv_b_proj,
                 kv_b_proj_k,
                 kv_b_proj_v,
                 kv_b_proj_k_t,
-                o_proj: load_linear_sharded(
-                    dtype,
-                    ctx,
-                    loader,
+                o_proj: loader.load_linear_sharded(
                     &format!("{prefix}.self_attn.o_proj.weight"),
+                    dtype,
+                    qc,
                     &shard,
                     ShardStrategy::Row,
-                    qc,
                 )?,
             };
 
-            // FFN: dense or MoE
+            // FFN: dense or MoE (shared experts replicated, per-expert sharded)
             let ffn = if config.is_moe_layer(i) {
-                let num_experts = config
-                    .n_routed_experts
-                    .expect("MoE layer requires n_routed_experts");
-
-                // Router gate: replicated
-                let gate_name = format!("{prefix}.mlp.gate.weight");
-                let gate_f32 = loader.load_f32(ctx, &gate_name)?;
-                let gate_transposed = pretranspose_weight(&gate_f32)?;
-                let gate_weight = cast_from_f32(&gate_transposed, dtype)?;
-
-                // Bias correction: replicated
-                let bias_name = format!("{prefix}.mlp.gate.e_score_correction_bias");
-                let e_score_correction_bias = if loader.contains(&bias_name) {
-                    loader.load_f32(ctx, &bias_name)?.to_vec::<f32>()?
-                } else {
-                    vec![0.0_f32; num_experts]
-                };
-
-                // Per-expert MLPs: gate/up column-sharded, down row-sharded
-                let mut experts = Vec::with_capacity(num_experts);
-                for e in 0..num_experts {
-                    let ep = format!("{prefix}.mlp.experts.{e}");
-                    experts.push(DenseMlpWeights {
-                        gate_proj: load_linear_sharded(
-                            dtype,
-                            ctx,
-                            loader,
-                            &format!("{ep}.gate_proj.weight"),
-                            &shard,
-                            ShardStrategy::Column,
-                            qc,
-                        )?,
-                        up_proj: load_linear_sharded(
-                            dtype,
-                            ctx,
-                            loader,
-                            &format!("{ep}.up_proj.weight"),
-                            &shard,
-                            ShardStrategy::Column,
-                            qc,
-                        )?,
-                        down_proj: load_linear_sharded(
-                            dtype,
-                            ctx,
-                            loader,
-                            &format!("{ep}.down_proj.weight"),
-                            &shard,
-                            ShardStrategy::Row,
-                            qc,
-                        )?,
-                    });
-                }
-
-                // Shared expert: gate/up column-sharded, down row-sharded
-                let sp = format!("{prefix}.mlp.shared_experts");
-                let shared_expert = DenseMlpWeights {
-                    gate_proj: load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.gate_proj.weight"),
-                        &shard,
-                        ShardStrategy::Column,
-                        qc,
-                    )?,
-                    up_proj: load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.up_proj.weight"),
-                        &shard,
-                        ShardStrategy::Column,
-                        qc,
-                    )?,
-                    down_proj: load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
-                        &format!("{sp}.down_proj.weight"),
-                        &shard,
-                        ShardStrategy::Row,
-                        qc,
-                    )?,
-                };
-
-                let e_score_correction_bias_gpu = CudaTensor::from_slice(
-                    ctx,
-                    &[e_score_correction_bias.len()],
-                    &e_score_correction_bias,
-                )?;
-
-                let routing_bufs =
-                    std::sync::Mutex::new(infernum_cuda::cuda::ops::GpuRoutingBuffers::new(
-                        ctx,
-                        config.num_experts_per_tok,
-                    )?);
-
-                FfnWeights::Moe(Box::new(MoeWeights {
-                    gate_weight,
-                    e_score_correction_bias,
-                    e_score_correction_bias_gpu,
-                    routing_bufs,
-                    experts,
-                    shared_expert,
-                }))
+                Self::load_moe_weights_sharded(
+                    &config, &prefix, dtype, qc, loader, &device, &shard,
+                )?
             } else {
                 let mp = format!("{prefix}.mlp");
                 FfnWeights::Dense(Box::new(DenseMlpWeights {
-                    gate_proj: load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
+                    gate_proj: loader.load_linear_sharded(
                         &format!("{mp}.gate_proj.weight"),
+                        dtype,
+                        qc,
                         &shard,
                         ShardStrategy::Column,
-                        qc,
                     )?,
-                    up_proj: load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
+                    up_proj: loader.load_linear_sharded(
                         &format!("{mp}.up_proj.weight"),
+                        dtype,
+                        qc,
                         &shard,
                         ShardStrategy::Column,
-                        qc,
                     )?,
-                    down_proj: load_linear_sharded(
-                        dtype,
-                        ctx,
-                        loader,
+                    down_proj: loader.load_linear_sharded(
                         &format!("{mp}.down_proj.weight"),
+                        dtype,
+                        qc,
                         &shard,
                         ShardStrategy::Row,
-                        qc,
                     )?,
                 }))
             };
 
             layers.push(DeepSeekLayerWeights {
-                input_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.input_layernorm.weight"),
-                )?,
+                input_layernorm: loader
+                    .load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype)?,
                 attention,
-                post_attention_layernorm: load_typed(
-                    dtype,
-                    loader,
-                    ctx,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                )?,
+                post_attention_layernorm: loader
+                    .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
                 ffn,
             });
         }
 
-        let norm = load_typed(dtype, loader, ctx, "model.norm.weight")?;
+        let norm = loader.load_tensor("model.norm.weight", dtype)?;
 
         let lm_head = if config.tie_word_embeddings {
-            let embed_f32 = CudaBackend::cast_to_f32(&embed_tokens)?;
-            let transposed = pretranspose_weight(&embed_f32)?;
-            LinearWeight::Dense(cast_from_f32(&transposed, dtype)?)
-        } else {
-            load_linear_sharded(
-                dtype,
-                ctx,
+            transformer::load_lm_head::<B>(
+                &device,
                 loader,
+                &embed_tokens,
+                true,
+                dtype,
+                config.quantization_config.as_ref(),
+            )?
+        } else {
+            loader.load_linear_sharded(
                 "lm_head.weight",
+                dtype,
+                None,
                 &shard,
                 ShardStrategy::Replicate,
-                None,
             )?
         };
 
-        let rope_head_dim = config.qk_rope_head_dim;
-        let (cos_f32, sin_f32) = if let Some(ref rs) = config.rope_scaling {
-            let scaling = RopeScaling {
+        let rope_scaling = config
+            .rope_scaling
+            .as_ref()
+            .map(|rs| infernum::RopeScaling {
                 rope_type: rs.rope_type.clone(),
                 factor: rs.factor,
                 original_max_position_embeddings: rs.original_max_position_embeddings,
-            };
-            precompute_rope_cache_scaled(
-                ctx,
-                config.max_position_embeddings,
-                rope_head_dim,
-                config.rope_theta,
-                &scaling,
-            )?
-        } else {
-            precompute_rope_cache(
-                ctx,
-                config.max_position_embeddings,
-                rope_head_dim,
-                config.rope_theta,
-            )?
-        };
-        let cos_cache = cast_from_f32(&cos_f32, dtype)?;
-        let sin_cache = cast_from_f32(&sin_f32, dtype)?;
+            });
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.max_position_embeddings,
+            config.qk_rope_head_dim,
+            config.rope_theta,
+            rope_scaling.as_ref(),
+            dtype,
+        )?;
 
         let attn_scale = config.mla_attn_scale();
 
@@ -1108,7 +751,7 @@ impl DeepSeekModel<CudaBackend> {
             tp_num_heads,
             dtype,
             config,
-            ctx: ctx.clone(),
+            device,
             gpu_config,
             comm,
             embed_tokens,
@@ -1122,46 +765,122 @@ impl DeepSeekModel<CudaBackend> {
         })
     }
 
-    // --- Forward pass ---
+    /// Load sharded MoE weights for a single layer.
+    #[allow(clippy::too_many_arguments)]
+    fn load_moe_weights_sharded(
+        config: &DeepSeekConfig,
+        prefix: &str,
+        dtype: DType,
+        qc: Option<&crate::config::QuantizationConfig>,
+        loader: &impl infernum::WeightLoader<B>,
+        _device: &B::DeviceHandle,
+        shard: &infernum::shard::ShardConfig,
+    ) -> Result<FfnWeights<B>> {
+        use infernum::shard::ShardStrategy;
 
-    fn embed(&self, input_ids: &[u32]) -> Result<CudaTensor> {
-        CudaBackend::embedding_gather(&self.embed_tokens, input_ids)
+        let num_experts = config
+            .n_routed_experts
+            .expect("MoE layer requires n_routed_experts");
+
+        // Router gate: replicated
+        let gate_f32 = loader.load_tensor(&format!("{prefix}.mlp.gate.weight"), DType::F32)?;
+        let gate_transposed = B::transpose_2d(&gate_f32)?;
+        let gate_weight = B::cast_from_f32(&gate_transposed, dtype)?;
+
+        // Bias correction: replicated
+        let bias_name = format!("{prefix}.mlp.gate.e_score_correction_bias");
+        let e_score_correction_bias = if loader.contains(&bias_name) {
+            B::to_f32_vec(&loader.load_tensor(&bias_name, DType::F32)?)?
+        } else {
+            vec![0.0_f32; num_experts]
+        };
+
+        // Per-expert MLPs: gate/up column-sharded, down row-sharded
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let ep = format!("{prefix}.mlp.experts.{e}");
+            experts.push(DenseMlpWeights {
+                gate_proj: loader.load_linear_sharded(
+                    &format!("{ep}.gate_proj.weight"),
+                    dtype,
+                    qc,
+                    shard,
+                    ShardStrategy::Column,
+                )?,
+                up_proj: loader.load_linear_sharded(
+                    &format!("{ep}.up_proj.weight"),
+                    dtype,
+                    qc,
+                    shard,
+                    ShardStrategy::Column,
+                )?,
+                down_proj: loader.load_linear_sharded(
+                    &format!("{ep}.down_proj.weight"),
+                    dtype,
+                    qc,
+                    shard,
+                    ShardStrategy::Row,
+                )?,
+            });
+        }
+
+        // Shared expert: gate/up column-sharded, down row-sharded
+        let sp = format!("{prefix}.mlp.shared_experts");
+        let shared_expert = DenseMlpWeights {
+            gate_proj: loader.load_linear_sharded(
+                &format!("{sp}.gate_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?,
+            up_proj: loader.load_linear_sharded(
+                &format!("{sp}.up_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?,
+            down_proj: loader.load_linear_sharded(
+                &format!("{sp}.down_proj.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Row,
+            )?,
+        };
+
+        Ok(FfnWeights::Moe(Box::new(MoeWeights {
+            gate_weight,
+            e_score_correction_bias,
+            experts,
+            shared_expert,
+        })))
     }
 
-    fn embed_from_device(&self, token_id_gpu: &CudaSlice<u32>) -> Result<CudaTensor> {
-        embedding_gather_from_device(&self.ctx, &self.embed_tokens, token_id_gpu, 1)
+    // --- Forward pass ---
+
+    fn embed(&self, input_ids: &[u32]) -> Result<B::Tensor> {
+        transformer::embed::<B>(&self.embed_tokens, input_ids)
     }
 
     #[allow(clippy::unused_self)]
-    fn extract_last_row(&self, hidden: &CudaTensor, seq_len: usize) -> CudaTensor {
-        let hidden_size = hidden.shape()[1];
-        if seq_len == 1 {
-            return hidden.reshape(&[1, hidden_size]);
-        }
-        hidden.slice_view((seq_len - 1) * hidden_size, &[1, hidden_size])
+    fn extract_last_row(&self, hidden: &B::Tensor, seq_len: usize) -> B::Tensor {
+        transformer::extract_last_row::<B>(hidden, seq_len)
     }
 
-    fn lm_head_forward(&self, hidden: &CudaTensor) -> Result<CudaTensor> {
-        if self.dtype == DType::BF16 {
-            if let LinearWeight::Dense(w) = &self.lm_head {
-                return CudaBackend::matmul_bf16_f32(hidden, w);
-            }
-        }
-        let logits_t = CudaBackend::linear(hidden, &self.lm_head)?;
-        if self.dtype == DType::F32 {
-            return Ok(logits_t);
-        }
-        CudaBackend::cast_to_f32(&logits_t)
+    fn lm_head_forward(&self, hidden: &B::Tensor) -> Result<B::Tensor> {
+        transformer::lm_head_forward::<B>(hidden, &self.lm_head, self.dtype)
     }
 
-    // --- MLA attention ---
+    // --- MLA attention helpers ---
 
     /// Split a 2D tensor `[seq, total_dim]` into two parts along the last dimension.
     fn split_last_dim(
-        tensor: &CudaTensor,
+        tensor: &B::Tensor,
         dim1: usize,
         dim2: usize,
-    ) -> Result<(CudaTensor, CudaTensor)> {
+    ) -> Result<(B::Tensor, B::Tensor)> {
         let seq_len = tensor.shape()[0];
         let total = tensor.shape()[1];
         assert_eq!(total, dim1 + dim2, "split_last_dim: dim mismatch");
@@ -1171,16 +890,16 @@ impl DeepSeekModel<CudaBackend> {
             let b = tensor.slice_view(dim1, &[1, dim2]);
             Ok((a, b))
         } else {
-            CudaBackend::split_inner_dim(tensor, dim1, dim2)
+            B::split_inner_dim(tensor, dim1, dim2)
         }
     }
 
     /// Split a 3D tensor `[seq, num_heads, total_dim]` into two parts along last dim.
     fn split_head_dim(
-        tensor: &CudaTensor,
+        tensor: &B::Tensor,
         dim1: usize,
         dim2: usize,
-    ) -> Result<(CudaTensor, CudaTensor)> {
+    ) -> Result<(B::Tensor, B::Tensor)> {
         let seq_len = tensor.shape()[0];
         let num_heads = tensor.shape()[1];
         let total = tensor.shape()[2];
@@ -1188,14 +907,14 @@ impl DeepSeekModel<CudaBackend> {
 
         let outer = seq_len * num_heads;
         let flat = tensor.reshape(&[outer, total]);
-        let (a_flat, b_flat) = CudaBackend::split_inner_dim(&flat, dim1, dim2)?;
+        let (a_flat, b_flat) = B::split_inner_dim(&flat, dim1, dim2)?;
         let a = a_flat.reshape(&[seq_len, num_heads, dim1]);
         let b = b_flat.reshape(&[seq_len, num_heads, dim2]);
         Ok((a, b))
     }
 
     /// Concatenate two 3D tensors along the last dimension.
-    fn concat_head_dim(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+    fn concat_head_dim(a: &B::Tensor, b: &B::Tensor) -> Result<B::Tensor> {
         let seq_len = a.shape()[0];
         let num_heads = a.shape()[1];
         let dim1 = a.shape()[2];
@@ -1206,17 +925,17 @@ impl DeepSeekModel<CudaBackend> {
         let outer = seq_len * num_heads;
         let a_flat = a.reshape(&[outer, dim1]);
         let b_flat = b.reshape(&[outer, dim2]);
-        let out_flat = CudaBackend::concat_inner_dim(&a_flat, &b_flat)?;
+        let out_flat = B::concat_inner_dim(&a_flat, &b_flat)?;
         Ok(out_flat.reshape(&[seq_len, num_heads, dim1 + dim2]))
     }
 
     /// Broadcast `[seq, 1, rope_dim]` to `[seq, num_heads, rope_dim]`.
-    fn broadcast_kv_rope(k_rope: &CudaTensor, num_heads: usize) -> Result<CudaTensor> {
-        CudaBackend::broadcast_to_heads(k_rope, num_heads)
+    fn broadcast_kv_rope(k_rope: &B::Tensor, num_heads: usize) -> Result<B::Tensor> {
+        B::broadcast_to_heads(k_rope, num_heads)
     }
 
     /// Pad V from `[seq, num_heads, v_head_dim]` to `[seq, num_heads, qk_head_dim]`.
-    fn pad_v_to_qk_dim(v: &CudaTensor, qk_head_dim: usize) -> Result<CudaTensor> {
+    fn pad_v_to_qk_dim(v: &B::Tensor, qk_head_dim: usize) -> Result<B::Tensor> {
         let seq_len = v.shape()[0];
         let num_heads = v.shape()[1];
         let v_dim = v.shape()[2];
@@ -1226,13 +945,13 @@ impl DeepSeekModel<CudaBackend> {
 
         let outer = seq_len * num_heads;
         let flat = v.reshape(&[outer, v_dim]);
-        let padded = CudaBackend::pad_inner_dim(&flat, qk_head_dim)?;
+        let padded = B::pad_inner_dim(&flat, qk_head_dim)?;
         Ok(padded.reshape(&[seq_len, num_heads, qk_head_dim]))
     }
 
     /// Truncate attention output from `[seq, num_heads, qk_head_dim]` to
     /// `[seq, num_heads, v_head_dim]`.
-    fn truncate_attn_output(attn_out: &CudaTensor, v_head_dim: usize) -> Result<CudaTensor> {
+    fn truncate_attn_output(attn_out: &B::Tensor, v_head_dim: usize) -> Result<B::Tensor> {
         let seq_len = attn_out.shape()[0];
         let num_heads = attn_out.shape()[1];
         let qk_dim = attn_out.shape()[2];
@@ -1243,7 +962,7 @@ impl DeepSeekModel<CudaBackend> {
         let outer = seq_len * num_heads;
         let flat = attn_out.reshape(&[outer, qk_dim]);
         let discard_dim = qk_dim - v_head_dim;
-        let (kept, _) = CudaBackend::split_inner_dim(&flat, v_head_dim, discard_dim)?;
+        let (kept, _) = B::split_inner_dim(&flat, v_head_dim, discard_dim)?;
         Ok(kept.reshape(&[seq_len, num_heads, v_head_dim]))
     }
 
@@ -1252,13 +971,13 @@ impl DeepSeekModel<CudaBackend> {
     /// `q_nope`: `(1, num_heads, qk_nope_dim)`
     /// `kv_b_proj_k_t`: `(num_heads, qk_nope_dim, kv_lora_rank)`
     /// Returns: `(1, num_heads, kv_lora_rank)`
-    fn absorb_k_into_q(q_nope: &CudaTensor, kv_b_proj_k_t: &CudaTensor) -> Result<CudaTensor> {
+    fn absorb_k_into_q(q_nope: &B::Tensor, kv_b_proj_k_t: &B::Tensor) -> Result<B::Tensor> {
         let num_heads = q_nope.shape()[1];
         let d = q_nope.shape()[2];
         let kv_lora_rank = kv_b_proj_k_t.shape()[2];
         // (num_heads, 1, D) @ (num_heads, D, R) → (num_heads, 1, R) → (1, H, R)
         let q = q_nope.reshape(&[num_heads, 1, d]);
-        let out = CudaBackend::matmul(&q, kv_b_proj_k_t)?;
+        let out = B::matmul(&q, kv_b_proj_k_t)?;
         Ok(out.reshape(&[1, num_heads, kv_lora_rank]))
     }
 
@@ -1267,59 +986,61 @@ impl DeepSeekModel<CudaBackend> {
     /// `attn_nope`: `(1, num_heads, kv_lora_rank)`
     /// `kv_b_proj_v`: `(num_heads, kv_lora_rank, v_head_dim)`
     /// Returns: `(1, num_heads, v_head_dim)`
-    fn absorb_v(attn_nope: &CudaTensor, kv_b_proj_v: &CudaTensor) -> Result<CudaTensor> {
+    fn absorb_v(attn_nope: &B::Tensor, kv_b_proj_v: &B::Tensor) -> Result<B::Tensor> {
         let num_heads = attn_nope.shape()[1];
         let r = attn_nope.shape()[2];
         let v_head_dim = kv_b_proj_v.shape()[2];
         // (num_heads, 1, R) @ (num_heads, R, V) → (num_heads, 1, V) → (1, H, V)
         let a = attn_nope.reshape(&[num_heads, 1, r]);
-        let out = CudaBackend::matmul(&a, kv_b_proj_v)?;
+        let out = B::matmul(&a, kv_b_proj_v)?;
         Ok(out.reshape(&[1, num_heads, v_head_dim]))
     }
 
-    /// Batched K absorption for batch > 1 (CUDA graph indirect decode).
+    /// Batched K absorption for batch > 1 (multi-chunk prefill).
     ///
     /// `q_nope`: `(batch, num_heads, qk_nope_dim)` — contiguous
     /// `kv_b_proj_k_t`: `(num_heads, qk_nope_dim, kv_lora_rank)`
     /// Returns: `(batch, num_heads, kv_lora_rank)`
     fn absorb_k_batched(
-        q_nope: &CudaTensor,
-        kv_b_proj_k_t: &CudaTensor,
+        device: &B::DeviceHandle,
+        q_nope: &B::Tensor,
+        kv_b_proj_k_t: &B::Tensor,
         batch_size: usize,
         num_heads: usize,
         kv_lora_rank: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let d = q_nope.shape()[2];
         let item_elems = num_heads * d;
-        let out_elems = num_heads * kv_lora_rank;
 
         let elem = q_nope.dtype().size_in_bytes();
+        let out_elems = num_heads * kv_lora_rank;
         let mut all_bytes: Vec<u8> = Vec::with_capacity(batch_size * out_elems * elem);
         for b in 0..batch_size {
             let q_b = q_nope.slice_view(b * item_elems, &[num_heads, 1, d]);
-            let out_b = CudaBackend::matmul(&q_b, kv_b_proj_k_t)?; // (H, 1, R)
-            all_bytes.extend_from_slice(&out_b.to_raw_bytes()?);
+            let out_b = B::matmul(&q_b, kv_b_proj_k_t)?; // (H, 1, R)
+            all_bytes.extend_from_slice(&B::to_raw_bytes(&out_b)?);
         }
-        CudaTensor::from_raw_bytes(
-            q_nope.context(),
+        B::from_raw_bytes(
+            device,
             &[batch_size, num_heads, kv_lora_rank],
             q_nope.dtype(),
             &all_bytes,
         )
     }
 
-    /// Batched V absorption for batch > 1 (CUDA graph indirect decode).
+    /// Batched V absorption for batch > 1 (multi-chunk prefill).
     ///
     /// `attn_nope`: `(batch, num_heads, kv_lora_rank)`
     /// `kv_b_proj_v`: `(num_heads, kv_lora_rank, v_head_dim)`
     /// Returns: `(batch, num_heads, v_head_dim)`
     fn absorb_v_batched(
-        attn_nope: &CudaTensor,
-        kv_b_proj_v: &CudaTensor,
+        device: &B::DeviceHandle,
+        attn_nope: &B::Tensor,
+        kv_b_proj_v: &B::Tensor,
         batch_size: usize,
         num_heads: usize,
         v_head_dim: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let r = attn_nope.shape()[2];
         let item_elems = num_heads * r;
         let out_elems = num_heads * v_head_dim;
@@ -1328,343 +1049,31 @@ impl DeepSeekModel<CudaBackend> {
         let mut all_bytes: Vec<u8> = Vec::with_capacity(batch_size * out_elems * elem);
         for b in 0..batch_size {
             let a_b = attn_nope.slice_view(b * item_elems, &[num_heads, 1, r]);
-            let out_b = CudaBackend::matmul(&a_b, kv_b_proj_v)?; // (H, 1, V)
-            all_bytes.extend_from_slice(&out_b.to_raw_bytes()?);
+            let out_b = B::matmul(&a_b, kv_b_proj_v)?; // (H, 1, V)
+            all_bytes.extend_from_slice(&B::to_raw_bytes(&out_b)?);
         }
-        CudaTensor::from_raw_bytes(
-            attn_nope.context(),
+        B::from_raw_bytes(
+            device,
             &[batch_size, num_heads, v_head_dim],
             attn_nope.dtype(),
             &all_bytes,
         )
     }
 
-    /// MLA attention forward pass.
-    #[allow(clippy::too_many_lines)]
-    fn forward_mla_attention(
-        &self,
-        hidden: &CudaTensor,
-        weights: &DeepSeekAttentionWeights,
-        layer_idx: usize,
-        kv_cache: &mut KvCache,
-        position_offset: usize,
-    ) -> Result<CudaTensor> {
-        let seq_len = hidden.shape()[0];
-        let num_heads = self.tp_num_heads;
-        let qk_nope_dim = self.config.qk_nope_head_dim;
-        let qk_rope_dim = self.config.qk_rope_head_dim;
-        let qk_head_dim = self.config.qk_head_dim();
-        let v_head_dim = self.config.v_head_dim;
-        let kv_lora_rank = self.config.kv_lora_rank;
-
-        // --- Q projection: two-stage LoRA ---
-        // q_compressed = hidden @ q_a_proj → [seq, q_lora_rank]
-        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
-        // RMSNorm
-        let q_compressed = CudaBackend::rms_norm(
-            &q_compressed,
-            &weights.q_a_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-        // q = q_compressed @ q_b_proj → [seq, num_heads * qk_head_dim]
-        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
-
-        // Reshape to [seq, num_heads, qk_head_dim]
-        let q = q.reshape(&[seq_len, num_heads, qk_head_dim]);
-        // Split into nope and rope portions
-        let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
-
-        // --- KV joint projection ---
-        // kv = hidden @ kv_a_proj → [seq, kv_lora_rank + qk_rope_head_dim]
-        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
-        // Split into compressed KV and k_rope
-        let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-
-        // RMSNorm the compressed KV
-        let k_compressed = CudaBackend::rms_norm(
-            &k_compressed,
-            &weights.kv_a_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        // Decompress: kv_decompressed = k_compressed @ kv_b_proj → [seq, num_heads * (qk_nope_dim + v_head_dim)]
-        let kv_decompressed = CudaBackend::linear(&k_compressed, &weights.kv_b_proj)?;
-
-        // Reshape to [seq, num_heads, qk_nope_dim + v_head_dim] and split
-        let kv_decompressed =
-            kv_decompressed.reshape(&[seq_len, num_heads, qk_nope_dim + v_head_dim]);
-        let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
-
-        // --- RoPE ---
-        let k_rope = k_rope.reshape(&[seq_len, 1, qk_rope_dim]);
-        let q_rope = CudaBackend::apply_rope_interleaved(
-            &q_rope,
-            &self.cos_cache,
-            &self.sin_cache,
-            position_offset,
-        )?;
-        let k_rope = CudaBackend::apply_rope_interleaved(
-            &k_rope,
-            &self.cos_cache,
-            &self.sin_cache,
-            position_offset,
-        )?;
-
-        // --- Write compressed entry to KV cache ---
-        let k_rope_2d = k_rope.reshape(&[seq_len, qk_rope_dim]);
-        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
-        let cache_entry = cache_entry_2d.reshape(&[seq_len, 1, kv_lora_rank + qk_rope_dim]);
-        kv_cache.append(layer_idx, &cache_entry, &cache_entry)?;
-        let total_len = kv_cache.current_len() + seq_len;
-
-        // --- Attention ---
-        let attn_output = if seq_len == 1 {
-            // Decode: absorbed attention in compressed space
-            let q_absorbed_nope = Self::absorb_k_into_q(&q_nope, &weights.kv_b_proj_k_t)?;
-            let q_absorbed = Self::concat_head_dim(&q_absorbed_nope, &q_rope)?;
-
-            let (k_full, _v_full) = kv_cache.get_up_to(layer_idx, total_len);
-            let attn_compressed = CudaBackend::fused_attention_decode(
-                &q_absorbed,
-                &k_full,
-                &k_full,
-                Some(self.attn_scale),
-                None,
-                None,
-            )?;
-
-            // Absorb V: discard rope, decompress
-            let (attn_nope, _) = Self::split_head_dim(&attn_compressed, kv_lora_rank, qk_rope_dim)?;
-            Self::absorb_v(&attn_nope, &weights.kv_b_proj_v)?
-        } else {
-            // Prefill: use locally-decompressed K/V
-            let k_rope_broadcast = Self::broadcast_kv_rope(&k_rope, num_heads)?;
-            let q = Self::concat_head_dim(&q_nope, &q_rope)?;
-            let k = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
-            let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
-            let attn = CudaBackend::fused_attention_prefill(
-                &q,
-                &k,
-                &v_padded,
-                position_offset,
-                Some(self.attn_scale),
-                None,
-                None,
-            )?;
-            Self::truncate_attn_output(&attn, v_head_dim)?
-        };
-
-        // --- Output projection ---
-        let attn_output = attn_output.reshape(&[seq_len, num_heads * v_head_dim]);
-        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
-        self.maybe_all_reduce(&mut out)?;
-        Ok(out)
-    }
-
-    /// MLA attention forward using indirect kernels for CUDA graph capture.
-    #[allow(clippy::too_many_lines)]
-    fn forward_mla_attention_indirect(
-        &self,
-        hidden: &CudaTensor,
-        weights: &DeepSeekAttentionWeights,
-        layer_idx: usize,
-        kv_cache: &mut KvCache,
-    ) -> Result<CudaTensor> {
-        let num_heads = self.tp_num_heads;
-        let qk_nope_dim = self.config.qk_nope_head_dim;
-        let qk_rope_dim = self.config.qk_rope_head_dim;
-        let qk_head_dim = self.config.qk_head_dim();
-        let v_head_dim = self.config.v_head_dim;
-        let kv_lora_rank = self.config.kv_lora_rank;
-
-        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
-        let q_compressed = CudaBackend::rms_norm(
-            &q_compressed,
-            &weights.q_a_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
-        let q = q.reshape(&[1, num_heads, qk_head_dim]);
-        let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
-
-        // KV joint projection (compressed only)
-        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
-        let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-        let k_compressed = CudaBackend::rms_norm(
-            &k_compressed,
-            &weights.kv_a_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        let k_rope = k_rope.reshape(&[1, 1, qk_rope_dim]);
-        let position = kv_cache.current_position();
-        let q_rope =
-            apply_rope_interleaved_indirect(&q_rope, &self.cos_cache, &self.sin_cache, position)?;
-        let k_rope =
-            apply_rope_interleaved_indirect(&k_rope, &self.cos_cache, &self.sin_cache, position)?;
-
-        // Write compressed entry to KV cache
-        let k_rope_2d = k_rope.reshape(&[1, qk_rope_dim]);
-        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
-        let cache_entry = cache_entry_2d.reshape(&[1, 1, kv_lora_rank + qk_rope_dim]);
-        kv_cache.append_indirect(layer_idx, &cache_entry, &cache_entry)?;
-
-        // Absorb K into Q
-        let q_absorbed_nope = Self::absorb_k_into_q(&q_nope, &weights.kv_b_proj_k_t)?;
-        let q_absorbed = Self::concat_head_dim(&q_absorbed_nope, &q_rope)?;
-
-        let (k_full, _v_full) = kv_cache.full_buffers(layer_idx);
-        let total_len = kv_cache.current_total_len();
-        let attn_compressed = fused_attention_decode_indirect(
-            &q_absorbed,
-            k_full,
-            k_full,
-            total_len,
-            kv_cache.graph_max_seq_len(),
-            Some(self.attn_scale),
-            None,
-            None,
-        )?;
-
-        // Absorb V: discard rope, decompress
-        let (attn_nope, _) = Self::split_head_dim(&attn_compressed, kv_lora_rank, qk_rope_dim)?;
-        let attn_output = Self::absorb_v(&attn_nope, &weights.kv_b_proj_v)?;
-        let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
-        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
-        self.maybe_all_reduce(&mut out)?;
-        Ok(out)
-    }
-
-    // --- FFN ---
-
-    #[allow(clippy::unused_self)]
-    fn forward_mlp(&self, hidden: &CudaTensor, weights: &DenseMlpWeights) -> Result<CudaTensor> {
-        let gate = CudaBackend::linear(hidden, &weights.gate_proj)?;
-        let up = CudaBackend::linear(hidden, &weights.up_proj)?;
-        let intermediate = CudaBackend::swiglu(&gate, &up)?;
-        let mut out = CudaBackend::linear(&intermediate, &weights.down_proj)?;
-        self.maybe_all_reduce(&mut out)?;
-        Ok(out)
-    }
-
-    #[allow(clippy::unused_self)]
-    fn forward_mlp_no_reduce(
-        &self,
-        hidden: &CudaTensor,
-        weights: &DenseMlpWeights,
-    ) -> Result<CudaTensor> {
-        let gate = CudaBackend::linear(hidden, &weights.gate_proj)?;
-        let up = CudaBackend::linear(hidden, &weights.up_proj)?;
-        let intermediate = CudaBackend::swiglu(&gate, &up)?;
-        CudaBackend::linear(&intermediate, &weights.down_proj)
-    }
-
-    fn forward_moe(&self, hidden: &CudaTensor, moe_weights: &MoeWeights) -> Result<CudaTensor> {
-        let num_experts = moe_weights.experts.len();
-
-        let mut routing_bufs = moe_weights.routing_bufs.lock().unwrap();
-        let mut routed_output = infernum_cuda::cuda::moe::moe_forward_sigmoid_gpu(
-            hidden,
-            &moe_weights.gate_weight,
-            &moe_weights.e_score_correction_bias,
-            &moe_weights.e_score_correction_bias_gpu,
-            num_experts,
-            self.config.num_experts_per_tok,
-            self.config.n_group,
-            self.config.topk_group,
-            self.config.norm_topk_prob,
-            self.config.routed_scaling_factor,
-            &mut routing_bufs,
-            |expert_idx, expert_input| {
-                self.forward_mlp_no_reduce(expert_input, &moe_weights.experts[expert_idx])
-            },
-        )?;
-
-        // Add shared expert output
-        let shared_output = self.forward_mlp_no_reduce(hidden, &moe_weights.shared_expert)?;
-        CudaBackend::add_inplace(&mut routed_output, &shared_output)?;
-
-        self.maybe_all_reduce(&mut routed_output)?;
-        Ok(routed_output)
-    }
-
-    fn forward_ffn(&self, hidden: &CudaTensor, ffn: &FfnWeights) -> Result<CudaTensor> {
-        match ffn {
-            FfnWeights::Dense(mlp) => self.forward_mlp(hidden, mlp),
-            FfnWeights::Moe(moe) => self.forward_moe(hidden, moe),
-        }
-    }
-
-    // --- Layer forward ---
-
-    fn forward_layer_kv(
-        &self,
-        hidden: &CudaTensor,
-        layer: &DeepSeekLayerWeights,
-        layer_idx: usize,
-        kv_cache: &mut KvCache,
-        position_offset: usize,
-    ) -> Result<CudaTensor> {
-        let normed =
-            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-        let attn_output = self.forward_mla_attention(
-            &normed,
-            &layer.attention,
-            layer_idx,
-            kv_cache,
-            position_offset,
-        )?;
-
-        let (mut h, normed) = CudaBackend::add_rmsnorm(
-            hidden,
-            &attn_output,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        CudaBackend::add_inplace(&mut h, &mlp_output)?;
-        Ok(h)
-    }
-
-    fn forward_layer_kv_indirect(
-        &self,
-        hidden: &CudaTensor,
-        layer: &DeepSeekLayerWeights,
-        layer_idx: usize,
-        kv_cache: &mut KvCache,
-    ) -> Result<CudaTensor> {
-        let normed =
-            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
-        let attn_output =
-            self.forward_mla_attention_indirect(&normed, &layer.attention, layer_idx, kv_cache)?;
-
-        let (mut h, normed) = CudaBackend::add_rmsnorm(
-            hidden,
-            &attn_output,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-        )?;
-
-        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        CudaBackend::add_inplace(&mut h, &mlp_output)?;
-        Ok(h)
-    }
-
-    // --- Paged KV cache support ---
+    // --- MLA attention for paged KV ---
 
     /// MLA attention for single-sequence prefill with paged KV cache.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn forward_mla_attention_paged_prefill(
         &self,
-        hidden: &CudaTensor,
-        weights: &DeepSeekAttentionWeights,
+        hidden: &B::Tensor,
+        weights: &DeepSeekAttentionWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        block_table: &BlockTable,
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &infernum::BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let num_heads = self.tp_num_heads;
         let qk_nope_dim = self.config.qk_nope_head_dim;
         let qk_rope_dim = self.config.qk_rope_head_dim;
@@ -1673,49 +1082,41 @@ impl DeepSeekModel<CudaBackend> {
         let kv_lora_rank = self.config.kv_lora_rank;
 
         // Q projection (two-stage LoRA)
-        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
-        let q_compressed = CudaBackend::rms_norm(
+        let q_compressed = B::linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = B::rms_norm(
             &q_compressed,
             &weights.q_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
+        let q = B::linear(&q_compressed, &weights.q_b_proj)?;
         let q = q.reshape(&[seq_len, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
         // KV joint projection
-        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let kv = B::linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-        let k_compressed = CudaBackend::rms_norm(
+        let k_compressed = B::rms_norm(
             &k_compressed,
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let kv_decompressed = CudaBackend::linear(&k_compressed, &weights.kv_b_proj)?;
+        let kv_decompressed = B::linear(&k_compressed, &weights.kv_b_proj)?;
         let kv_decompressed =
             kv_decompressed.reshape(&[seq_len, num_heads, qk_nope_dim + v_head_dim]);
         let (k_nope, v) = Self::split_head_dim(&kv_decompressed, qk_nope_dim, v_head_dim)?;
 
         // RoPE (interleaved)
         let k_rope = k_rope.reshape(&[seq_len, 1, qk_rope_dim]);
-        let q_rope = CudaBackend::apply_rope_interleaved(
-            &q_rope,
-            &self.cos_cache,
-            &self.sin_cache,
-            start_pos,
-        )?;
-        let k_rope = CudaBackend::apply_rope_interleaved(
-            &k_rope,
-            &self.cos_cache,
-            &self.sin_cache,
-            start_pos,
-        )?;
+        let q_rope =
+            B::apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let k_rope =
+            B::apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, start_pos)?;
 
         // Write compressed entry to paged cache: (seq_len, 1, kv_lora_rank + qk_rope_dim)
         let k_rope_2d = k_rope.reshape(&[seq_len, qk_rope_dim]);
-        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
+        let cache_entry_2d = B::concat_inner_dim(&k_compressed, &k_rope_2d)?;
         let cache_entry = cache_entry_2d.reshape(&[seq_len, 1, kv_lora_rank + qk_rope_dim]);
-        CudaBackend::append_paged(
+        B::append_paged(
             paged_kv,
             layer_idx,
             block_table,
@@ -1732,7 +1133,7 @@ impl DeepSeekModel<CudaBackend> {
             let k_full = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
             let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
 
-            let out = CudaBackend::fused_attention_prefill(
+            let out = B::fused_attention_prefill(
                 &q_full,
                 &k_full,
                 &v_padded,
@@ -1747,6 +1148,7 @@ impl DeepSeekModel<CudaBackend> {
             //
             // Pass 1: attend over cached compressed tokens (absorbed path)
             let q_absorbed_nope = Self::absorb_k_batched(
+                &self.device,
                 &q_nope,
                 &weights.kv_b_proj_k_t,
                 seq_len,
@@ -1754,10 +1156,9 @@ impl DeepSeekModel<CudaBackend> {
                 kv_lora_rank,
             )?;
             let q_absorbed = Self::concat_head_dim(&q_absorbed_nope, &q_rope)?;
-            let (cached_k, _cached_v) =
-                CudaBackend::gather_paged_kv(paged_kv, layer_idx, block_table)?;
+            let (cached_k, _cached_v) = B::gather_paged_kv(paged_kv, layer_idx, block_table)?;
             // cached_k: (start_pos, 1, kv_lora_rank + qk_rope_dim) — no causal mask needed
-            let (out_cached, lse_cached) = CudaBackend::fused_attention_prefill_with_lse(
+            let (out_cached, lse_cached) = B::fused_attention_prefill_with_lse(
                 &q_absorbed,
                 &cached_k,
                 &cached_k,
@@ -1770,6 +1171,7 @@ impl DeepSeekModel<CudaBackend> {
             let (attn_nope_cached, _) =
                 Self::split_head_dim(&out_cached, kv_lora_rank, qk_rope_dim)?;
             let out_cached_v = Self::absorb_v_batched(
+                &self.device,
                 &attn_nope_cached,
                 &weights.kv_b_proj_v,
                 seq_len,
@@ -1782,7 +1184,7 @@ impl DeepSeekModel<CudaBackend> {
             let q_full = Self::concat_head_dim(&q_nope, &q_rope)?;
             let k_full = Self::concat_head_dim(&k_nope, &k_rope_broadcast)?;
             let v_padded = Self::pad_v_to_qk_dim(&v, qk_head_dim)?;
-            let (out_local, lse_local) = CudaBackend::fused_attention_prefill_with_lse(
+            let (out_local, lse_local) = B::fused_attention_prefill_with_lse(
                 &q_full,
                 &k_full,
                 &v_padded,
@@ -1794,15 +1196,10 @@ impl DeepSeekModel<CudaBackend> {
             let out_local_v = Self::truncate_attn_output(&out_local, v_head_dim)?;
 
             // Combine with numerically-stable LSE correction
-            CudaBackend::combine_attention_with_lse(
-                &out_cached_v,
-                &lse_cached,
-                &out_local_v,
-                &lse_local,
-            )?
+            B::combine_attention_with_lse(&out_cached_v, &lse_cached, &out_local_v, &lse_local)?
         };
         let attn_output = attn_output.reshape(&[seq_len, num_heads * v_head_dim]);
-        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
+        let mut out = B::linear(&attn_output, &weights.o_proj)?;
         self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
@@ -1811,13 +1208,13 @@ impl DeepSeekModel<CudaBackend> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn forward_mla_attention_paged_decode(
         &self,
-        hidden: &CudaTensor,
-        weights: &DeepSeekAttentionWeights,
+        hidden: &B::Tensor,
+        weights: &DeepSeekAttentionWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        block_table: &BlockTable,
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &infernum::BlockTable,
         position: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let num_heads = self.tp_num_heads;
         let qk_nope_dim = self.config.qk_nope_head_dim;
         let qk_rope_dim = self.config.qk_rope_head_dim;
@@ -1826,20 +1223,20 @@ impl DeepSeekModel<CudaBackend> {
         let kv_lora_rank = self.config.kv_lora_rank;
 
         // Q projection (two-stage LoRA)
-        let q_compressed = CudaBackend::linear(hidden, &weights.q_a_proj)?;
-        let q_compressed = CudaBackend::rms_norm(
+        let q_compressed = B::linear(hidden, &weights.q_a_proj)?;
+        let q_compressed = B::rms_norm(
             &q_compressed,
             &weights.q_a_layernorm,
             self.config.rms_norm_eps,
         )?;
-        let q = CudaBackend::linear(&q_compressed, &weights.q_b_proj)?;
+        let q = B::linear(&q_compressed, &weights.q_b_proj)?;
         let q = q.reshape(&[1, num_heads, qk_head_dim]);
         let (q_nope, q_rope) = Self::split_head_dim(&q, qk_nope_dim, qk_rope_dim)?;
 
         // KV joint projection (compressed only — no decompression for absorbed decode)
-        let kv = CudaBackend::linear(hidden, &weights.kv_a_proj_with_mqa)?;
+        let kv = B::linear(hidden, &weights.kv_a_proj_with_mqa)?;
         let (k_compressed, k_rope) = Self::split_last_dim(&kv, kv_lora_rank, qk_rope_dim)?;
-        let k_compressed = CudaBackend::rms_norm(
+        let k_compressed = B::rms_norm(
             &k_compressed,
             &weights.kv_a_layernorm,
             self.config.rms_norm_eps,
@@ -1847,24 +1244,16 @@ impl DeepSeekModel<CudaBackend> {
 
         // RoPE (interleaved)
         let k_rope = k_rope.reshape(&[1, 1, qk_rope_dim]);
-        let q_rope = CudaBackend::apply_rope_interleaved(
-            &q_rope,
-            &self.cos_cache,
-            &self.sin_cache,
-            position,
-        )?;
-        let k_rope = CudaBackend::apply_rope_interleaved(
-            &k_rope,
-            &self.cos_cache,
-            &self.sin_cache,
-            position,
-        )?;
+        let q_rope =
+            B::apply_rope_interleaved(&q_rope, &self.cos_cache, &self.sin_cache, position)?;
+        let k_rope =
+            B::apply_rope_interleaved(&k_rope, &self.cos_cache, &self.sin_cache, position)?;
 
         // Write compressed entry to paged cache: (1, 1, kv_lora_rank + qk_rope_dim)
         let k_rope_2d = k_rope.reshape(&[1, qk_rope_dim]);
-        let cache_entry_2d = CudaBackend::concat_inner_dim(&k_compressed, &k_rope_2d)?;
+        let cache_entry_2d = B::concat_inner_dim(&k_compressed, &k_rope_2d)?;
         let cache_entry = cache_entry_2d.reshape(&[1, 1, kv_lora_rank + qk_rope_dim]);
-        CudaBackend::append_paged(
+        B::append_paged(
             paged_kv,
             layer_idx,
             block_table,
@@ -1888,26 +1277,18 @@ impl DeepSeekModel<CudaBackend> {
             .iter()
             .map(|&b| b as i32)
             .collect();
-        let block_tables_tensor = CudaTensor::from_raw_bytes(
-            &self.ctx,
-            &[max_blocks_per_seq],
-            infernum::DType::U32,
-            unsafe { std::slice::from_raw_parts(bt_i32.as_ptr().cast::<u8>(), bt_i32.len() * 4) },
-        )?;
+        let block_tables_tensor = B::from_i32_slice(&self.device, &[max_blocks_per_seq], &bt_i32)?;
         let seq_len_val = table_with_current.seq_len() as i32;
-        let seq_lens_tensor =
-            CudaTensor::from_raw_bytes(&self.ctx, &[1], infernum::DType::U32, unsafe {
-                std::slice::from_raw_parts((&raw const seq_len_val).cast::<u8>(), 4)
-            })?;
+        let seq_lens_tensor = B::from_i32_slice(&self.device, &[1], &[seq_len_val])?;
 
-        let (k_pool, _v_pool) = CudaBackend::get_pools(paged_kv, layer_idx);
-        let attn_output = CudaBackend::paged_attention_decode(
+        let (k_pool, _v_pool) = B::get_pools(paged_kv, layer_idx);
+        let attn_output = B::paged_attention_decode(
             &q_absorbed,
             k_pool,
             k_pool,
             &block_tables_tensor,
             &seq_lens_tensor,
-            CudaBackend::block_size(paged_kv),
+            B::block_size(paged_kv),
             max_blocks_per_seq,
             table_with_current.seq_len(),
             Some(self.attn_scale),
@@ -1920,25 +1301,81 @@ impl DeepSeekModel<CudaBackend> {
         let attn_output = Self::absorb_v(&attn_nope, &weights.kv_b_proj_v)?;
 
         let attn_output = attn_output.reshape(&[1, num_heads * v_head_dim]);
-        let mut out = CudaBackend::linear(&attn_output, &weights.o_proj)?;
+        let mut out = B::linear(&attn_output, &weights.o_proj)?;
         self.maybe_all_reduce(&mut out)?;
         Ok(out)
     }
+
+    // --- FFN ---
+
+    fn forward_mlp(&self, hidden: &B::Tensor, weights: &DenseMlpWeights<B>) -> Result<B::Tensor> {
+        let gate = B::linear(hidden, &weights.gate_proj)?;
+        let up = B::linear(hidden, &weights.up_proj)?;
+        let intermediate = B::swiglu(&gate, &up)?;
+        let mut out = B::linear(&intermediate, &weights.down_proj)?;
+        self.maybe_all_reduce(&mut out)?;
+        Ok(out)
+    }
+
+    #[allow(clippy::unused_self)]
+    fn forward_mlp_no_reduce(
+        hidden: &B::Tensor,
+        weights: &DenseMlpWeights<B>,
+    ) -> Result<B::Tensor> {
+        let gate = B::linear(hidden, &weights.gate_proj)?;
+        let up = B::linear(hidden, &weights.up_proj)?;
+        let intermediate = B::swiglu(&gate, &up)?;
+        B::linear(&intermediate, &weights.down_proj)
+    }
+
+    fn forward_moe(&self, hidden: &B::Tensor, moe_weights: &MoeWeights<B>) -> Result<B::Tensor> {
+        let num_experts = moe_weights.experts.len();
+
+        let mut routed_output = B::moe_forward_sigmoid(
+            hidden,
+            &moe_weights.gate_weight,
+            &moe_weights.e_score_correction_bias,
+            num_experts,
+            self.config.num_experts_per_tok,
+            self.config.n_group,
+            self.config.topk_group,
+            self.config.norm_topk_prob,
+            self.config.routed_scaling_factor,
+            |expert_idx, expert_input| {
+                Self::forward_mlp_no_reduce(expert_input, &moe_weights.experts[expert_idx])
+            },
+        )?;
+
+        // Add shared expert output
+        let shared_output = Self::forward_mlp_no_reduce(hidden, &moe_weights.shared_expert)?;
+        B::add_inplace(&mut routed_output, &shared_output)?;
+
+        self.maybe_all_reduce(&mut routed_output)?;
+        Ok(routed_output)
+    }
+
+    fn forward_ffn(&self, hidden: &B::Tensor, ffn: &FfnWeights<B>) -> Result<B::Tensor> {
+        match ffn {
+            FfnWeights::Dense(mlp) => self.forward_mlp(hidden, mlp),
+            FfnWeights::Moe(moe) => self.forward_moe(hidden, moe),
+        }
+    }
+
+    // --- Layer forward ---
 
     /// Layer forward for paged prefill.
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_paged_prefill(
         &self,
-        hidden: &CudaTensor,
-        layer: &DeepSeekLayerWeights,
+        hidden: &B::Tensor,
+        layer: &DeepSeekLayerWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        block_table: &BlockTable,
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &infernum::BlockTable,
         start_pos: usize,
         seq_len: usize,
-    ) -> Result<CudaTensor> {
-        let normed =
-            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+    ) -> Result<B::Tensor> {
+        let normed = B::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
         let attn_output = self.forward_mla_attention_paged_prefill(
             &normed,
             &layer.attention,
@@ -1949,7 +1386,7 @@ impl DeepSeekModel<CudaBackend> {
             seq_len,
         )?;
 
-        let (mut h, normed) = CudaBackend::add_rmsnorm(
+        let (mut h, normed) = B::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1957,22 +1394,21 @@ impl DeepSeekModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        CudaBackend::add_inplace(&mut h, &mlp_output)?;
+        B::add_inplace(&mut h, &mlp_output)?;
         Ok(h)
     }
 
     /// Layer forward for paged decode (single token).
     fn forward_layer_paged_decode(
         &self,
-        hidden: &CudaTensor,
-        layer: &DeepSeekLayerWeights,
+        hidden: &B::Tensor,
+        layer: &DeepSeekLayerWeights<B>,
         layer_idx: usize,
-        paged_kv: &mut PagedKvCache,
-        block_table: &BlockTable,
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &infernum::BlockTable,
         position: usize,
-    ) -> Result<CudaTensor> {
-        let normed =
-            CudaBackend::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+    ) -> Result<B::Tensor> {
+        let normed = B::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
         let attn_output = self.forward_mla_attention_paged_decode(
             &normed,
             &layer.attention,
@@ -1982,7 +1418,7 @@ impl DeepSeekModel<CudaBackend> {
             position,
         )?;
 
-        let (mut h, normed) = CudaBackend::add_rmsnorm(
+        let (mut h, normed) = B::add_rmsnorm(
             hidden,
             &attn_output,
             &layer.post_attention_layernorm,
@@ -1990,96 +1426,12 @@ impl DeepSeekModel<CudaBackend> {
         )?;
 
         let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-        CudaBackend::add_inplace(&mut h, &mlp_output)?;
+        B::add_inplace(&mut h, &mlp_output)?;
         Ok(h)
     }
 
     // --- Public forward methods ---
 
-    /// Forward pass with KV cache (prefill phase)
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_with_kv_cache(
-        &self,
-        input_ids: &[u32],
-        kv_cache: &mut KvCache,
-    ) -> Result<CudaTensor> {
-        let seq_len = input_ids.len();
-        let position_offset = kv_cache.current_len();
-
-        let mut hidden = self.embed(input_ids)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
-        }
-
-        kv_cache.advance(seq_len)?;
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        let last_hidden = self.extract_last_row(&hidden, seq_len);
-        self.lm_head_forward(&last_hidden)
-    }
-
-    /// Forward pass for a single token with KV cache (decode phase)
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_next_token(&self, token_id: u32, kv_cache: &mut KvCache) -> Result<CudaTensor> {
-        self.forward_with_kv_cache(&[token_id], kv_cache)
-    }
-
-    /// Decode-phase forward pass reading the token from a GPU buffer.
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_next_token_device(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache,
-    ) -> Result<CudaTensor> {
-        let position_offset = kv_cache.current_len();
-
-        let mut hidden = self.embed_from_device(token_id_gpu)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv(&hidden, layer, layer_idx, kv_cache, position_offset)?;
-        }
-
-        kv_cache.advance(1)?;
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
-        self.lm_head_forward(&last_hidden)
-    }
-
-    /// Forward pass using indirect kernels for CUDA graph capture.
-    ///
-    /// # Errors
-    /// Returns an error if the forward pass fails.
-    pub fn forward_next_token_indirect(
-        &self,
-        token_id_gpu: &CudaSlice<u32>,
-        kv_cache: &mut KvCache,
-    ) -> Result<CudaTensor> {
-        let mut hidden = self.embed_from_device(token_id_gpu)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_kv_indirect(&hidden, layer, layer_idx, kv_cache)?;
-        }
-
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
-
-        let last_hidden = hidden.reshape(&[1, self.config.hidden_size]);
-        self.lm_head_forward(&last_hidden)
-    }
-}
-
-// --- Model trait implementation ---
-
-// --- Public helpers & infernum::Model implementation ---
-
-impl DeepSeekModel<CudaBackend> {
     /// Build the runtime-facing [`ModelConfig`](infernum::ModelConfig).
     #[must_use]
     pub fn model_config(&self) -> infernum::ModelConfig {
@@ -2102,16 +1454,15 @@ impl DeepSeekModel<CudaBackend> {
     ///
     /// # Errors
     /// Returns an error if any GPU operation fails.
-    pub fn forward_full(&self, input_ids: &[u32]) -> Result<CudaTensor> {
+    pub fn forward_full(&self, input_ids: &[u32]) -> Result<B::Tensor> {
         let seq_len = input_ids.len();
         let mut hidden = self.embed(input_ids)?;
 
         for layer in &self.layers {
-            let normed =
-                CudaBackend::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+            let normed = B::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             // Simplified: skip attention, just do FFN
-            let (mut h, normed) = CudaBackend::add_rmsnorm(
+            let (mut h, normed) = B::add_rmsnorm(
                 &hidden,
                 &normed,
                 &layer.post_attention_layernorm,
@@ -2119,11 +1470,11 @@ impl DeepSeekModel<CudaBackend> {
             )?;
 
             let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
-            CudaBackend::add_inplace(&mut h, &mlp_output)?;
+            B::add_inplace(&mut h, &mlp_output)?;
             hidden = h;
         }
 
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        B::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         if seq_len > 1 {
             let last = self.extract_last_row(&hidden, seq_len);
@@ -2140,10 +1491,10 @@ impl DeepSeekModel<CudaBackend> {
     pub fn forward_prefill_paged(
         &self,
         input_ids: &[u32],
-        paged_kv: &mut PagedKvCache,
-        block_table: &BlockTable,
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &infernum::BlockTable,
         start_pos: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let seq_len = input_ids.len();
 
         let mut hidden = self.embed(input_ids)?;
@@ -2160,7 +1511,7 @@ impl DeepSeekModel<CudaBackend> {
             )?;
         }
 
-        CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        B::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
 
         let last_hidden = self.extract_last_row(&hidden, seq_len);
         self.lm_head_forward(&last_hidden)
@@ -2173,13 +1524,13 @@ impl DeepSeekModel<CudaBackend> {
     ///
     /// # Panics
     /// Panics if `token_ids` is empty (batch size 0).
-    pub fn forward_batch_decode(
+    pub fn forward_batch_decode_paged(
         &self,
         token_ids: &[u32],
-        paged_kv: &mut PagedKvCache,
-        block_tables: &[BlockTable],
+        paged_kv: &mut B::PagedKvCache,
+        block_tables: &[infernum::BlockTable],
         positions: &[usize],
-    ) -> Result<CudaTensor> {
+    ) -> Result<B::Tensor> {
         let batch_size = token_ids.len();
         let hidden_size = self.config.hidden_size;
 
@@ -2201,7 +1552,7 @@ impl DeepSeekModel<CudaBackend> {
                 )?;
             }
 
-            CudaBackend::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+            B::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
             let logits = self.lm_head_forward(&hidden.reshape(&[1, hidden_size]))?;
             logits_parts.push(logits);
         }
@@ -2211,26 +1562,31 @@ impl DeepSeekModel<CudaBackend> {
         }
 
         // Concatenate per-sequence logits into (batch_size, vocab_size)
-        CudaBackend::concat_rows(&logits_parts)
+        B::concat_rows(&logits_parts)
     }
 }
 
-impl infernum::Model for DeepSeekModel<CudaBackend> {
-    type B = CudaBackend;
-    type KvCache = PagedKvCache;
+// --- Model trait implementation ---
+
+impl<B: DeepSeekOps + Send + 'static> infernum::Model for DeepSeekModel<B>
+where
+    <B as MatmulOps>::LinearWeight: Send + Sync,
+{
+    type B = B;
+    type KvCache = B::PagedKvCache;
 
     fn config(&self) -> infernum::ModelConfig {
         self.model_config()
     }
 
-    fn device(&self) -> &CudaContext {
-        &self.ctx
+    fn device(&self) -> &B::DeviceHandle {
+        &self.device
     }
 
     fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
         let mc = self.model_config();
-        PagedKvCache::new(
-            &self.ctx,
+        B::allocate_paged_kv_cache(
+            &self.device,
             mc.num_layers,
             block_config,
             mc.num_kv_heads,
@@ -2239,43 +1595,48 @@ impl infernum::Model for DeepSeekModel<CudaBackend> {
         )
     }
 
-    fn forward(&self, input_ids: &[u32]) -> Result<infernum_cuda::CudaLogits> {
-        Ok(infernum_cuda::CudaLogits::new(
-            self.forward_full(input_ids)?,
-        ))
+    fn forward(&self, input_ids: &[u32]) -> Result<B::Logits> {
+        let tensor = self.forward_full(input_ids)?;
+        Ok(B::logits_from_tensor(tensor))
     }
 
     fn forward_prefill(
         &self,
         input_ids: &[u32],
         kv_cache: &mut Self::KvCache,
-        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
+        _runtime_state: &mut B::RuntimeState,
         block_table: &infernum::BlockTable,
         start_pos: usize,
-    ) -> Result<infernum_cuda::CudaLogits> {
+    ) -> Result<B::Logits> {
         let tensor = self.forward_prefill_paged(input_ids, kv_cache, block_table, start_pos)?;
-        Ok(infernum_cuda::CudaLogits::new(tensor))
+        Ok(B::logits_from_tensor(tensor))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn forward_batch_decode(
         &self,
-        token_ids: &CudaTensor,
+        token_ids: &B::Tensor,
         kv_cache: &mut Self::KvCache,
-        _runtime_state: &mut infernum_cuda::CudaRuntimeState,
-        block_tables: &CudaTensor,
-        _seq_lens: &CudaTensor,
-        positions: &CudaTensor,
+        _runtime_state: &mut B::RuntimeState,
+        block_tables: &B::Tensor,
+        _seq_lens: &B::Tensor,
+        positions: &B::Tensor,
         batch_size: usize,
         max_blocks_per_seq: usize,
         _max_seq_len: usize,
-    ) -> Result<infernum_cuda::CudaLogits> {
-        // Bridge: download tensors to host and call old-style method.
-        let token_ids_host = token_ids.to_vec::<u32>()?;
-        let positions_u32 = positions.to_vec::<u32>()?;
-        let positions_host: Vec<usize> = positions_u32.iter().map(|&p| p as usize).collect();
-        let bt_flat = block_tables.to_vec::<u32>()?;
-        let block_size = CudaBackend::block_size(kv_cache);
+    ) -> Result<B::Logits> {
+        // Bridge: download tensors to host and call per-sequence method.
+        let token_ids_host = B::to_f32_vec(token_ids)?;
+        let token_ids_u32: Vec<u32> = token_ids_host.iter().map(|&v| v as u32).collect();
+        let positions_f32 = B::to_f32_vec(positions)?;
+        let positions_host: Vec<usize> = positions_f32.iter().map(|&p| p as usize).collect();
+        let bt_f32 = B::to_f32_vec(block_tables)?;
+        let bt_flat: Vec<u32> = bt_f32.iter().map(|&b| b as u32).collect();
+        let block_size = B::block_size(kv_cache);
         let block_tables_host: Vec<infernum::BlockTable> = (0..batch_size)
             .map(|i| {
                 let start = i * max_blocks_per_seq;
@@ -2284,23 +1645,30 @@ impl infernum::Model for DeepSeekModel<CudaBackend> {
                 infernum::BlockTable::from_raw(blocks, positions_host[i], block_size)
             })
             .collect();
-        let tensor = DeepSeekModel::forward_batch_decode(
-            self,
-            &token_ids_host,
+        let tensor = self.forward_batch_decode_paged(
+            &token_ids_u32,
             kv_cache,
             &block_tables_host,
             &positions_host,
         )?;
-        Ok(infernum_cuda::CudaLogits::new(tensor))
+        Ok(B::logits_from_tensor(tensor))
     }
 }
+
+// --- Shared module imports ---
+
+use infernum::transformer;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn split_kv_b_proj_shapes() {
+        use infernum_cuda::cuda::{CudaContext, CudaTensor};
+        use infernum_cuda::CudaBackend;
+
         let ctx = CudaContext::new(0).expect("CUDA context");
         let kv_lora_rank = 16;
         let num_heads = 4;
@@ -2313,7 +1681,8 @@ mod tests {
         let weight = CudaTensor::from_slice(&ctx, &[kv_lora_rank, total_cols], &data).unwrap();
 
         let (k, v, k_t) =
-            split_kv_b_proj_dense(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim).unwrap();
+            split_kv_b_proj_dense::<CudaBackend>(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim)
+                .unwrap();
 
         assert_eq!(k.shape(), &[kv_lora_rank, num_heads * qk_nope_dim]);
         assert_eq!(v.shape(), &[num_heads, kv_lora_rank, v_head_dim]);
@@ -2321,7 +1690,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn split_kv_b_proj_roundtrip() {
+        use infernum_cuda::cuda::{CudaContext, CudaTensor};
+        use infernum_cuda::CudaBackend;
+
         let ctx = CudaContext::new(0).expect("CUDA context");
         let kv_lora_rank = 4;
         let num_heads = 2;
@@ -2336,22 +1709,20 @@ mod tests {
         let weight = CudaTensor::from_slice(&ctx, &[kv_lora_rank, total_cols], &data).unwrap();
 
         let (k, v, _) =
-            split_kv_b_proj_dense(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim).unwrap();
+            split_kv_b_proj_dense::<CudaBackend>(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim)
+                .unwrap();
 
         let k_data = k.to_vec::<f32>().unwrap();
         let v_data = v.to_vec::<f32>().unwrap();
 
         // Reconstruct the original by interleaving K and V columns back
-        // K is (kv_lora_rank, num_heads * qk_nope_dim), V is (num_heads, kv_lora_rank, v_head_dim)
         let mut reconstructed = vec![0.0_f32; kv_lora_rank * total_cols];
         for row in 0..kv_lora_rank {
             for h in 0..num_heads {
-                // K columns: k_data layout is (kv_lora_rank, num_heads * qk_nope_dim)
                 for d in 0..qk_nope_dim {
                     reconstructed[row * total_cols + h * stride + d] =
                         k_data[row * (num_heads * qk_nope_dim) + h * qk_nope_dim + d];
                 }
-                // V columns: v_data layout is (num_heads, kv_lora_rank, v_head_dim)
                 for d in 0..v_head_dim {
                     reconstructed[row * total_cols + h * stride + qk_nope_dim + d] =
                         v_data[h * kv_lora_rank * v_head_dim + row * v_head_dim + d];
@@ -2368,7 +1739,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn split_kv_b_proj_k_transpose() {
+        use infernum_cuda::cuda::{CudaContext, CudaTensor};
+        use infernum_cuda::CudaBackend;
+
         let ctx = CudaContext::new(0).expect("CUDA context");
         let kv_lora_rank = 4;
         let num_heads = 2;
@@ -2382,7 +1757,8 @@ mod tests {
         let weight = CudaTensor::from_slice(&ctx, &[kv_lora_rank, total_cols], &data).unwrap();
 
         let (k, _, k_t) =
-            split_kv_b_proj_dense(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim).unwrap();
+            split_kv_b_proj_dense::<CudaBackend>(&ctx, &weight, num_heads, qk_nope_dim, v_head_dim)
+                .unwrap();
 
         let k_cols = num_heads * qk_nope_dim;
         assert_eq!(k_t.shape(), &[num_heads, qk_nope_dim, kv_lora_rank]);

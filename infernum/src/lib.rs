@@ -28,8 +28,8 @@ pub mod weights;
 
 pub use backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, Comm, DecodeBufferOps, DecodeTensors,
-    EmbedOps, GegluOps, KvCacheOps, MatmulExtOps, MatmulOps, MoeOps, MultiDeviceOps, NormOps,
-    PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, RopeOps, SafeTensorsLoaderOps,
+    EmbedOps, GegluOps, KvCacheOps, MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, MultiDeviceOps,
+    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, RopeOps, SafeTensorsLoaderOps,
     SwigluOps, TensorDataOps, TensorFactory, TensorOps,
 };
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};

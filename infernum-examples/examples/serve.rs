@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "deepseek_v3" => {
-            let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
+            let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "gemma2" | "gemma3_text" => {

@@ -234,7 +234,7 @@ fn main() -> Result<()> {
                         &cli.model,
                         world_size,
                         |device, path, shard, comm| {
-                            DeepSeekModel::from_pretrained_sharded(
+                            DeepSeekModel::<CudaBackend>::from_pretrained_sharded(
                                 device,
                                 path,
                                 GpuConfig::Sharded(shard),

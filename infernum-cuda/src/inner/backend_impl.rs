@@ -2,7 +2,7 @@
 
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, KvCacheOps,
-    MatmulExtOps, MatmulOps, MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
+    MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
     RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };
 use infernum::block_allocator::{BlockConfig, BlockTable};
@@ -247,6 +247,10 @@ impl infernum::backend::TensorDataOps for CudaBackend {
             let f32_tensor = ops::cast_to_f32(tensor)?;
             f32_tensor.to_vec::<f32>()
         }
+    }
+
+    fn to_raw_bytes(tensor: &CudaTensor) -> Result<Vec<u8>> {
+        tensor.to_raw_bytes()
     }
 }
 
@@ -564,6 +568,37 @@ impl MoeOps for CudaBackend {
             num_experts,
             num_experts_per_tok,
             norm_topk_prob,
+            expert_fn,
+        )
+    }
+}
+
+impl MoeSigmoidOps for CudaBackend {
+    fn moe_forward_sigmoid<F>(
+        hidden: &CudaTensor,
+        gate_weight: &CudaTensor,
+        e_score_correction_bias: &[f32],
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        n_group: usize,
+        topk_group: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+        expert_fn: F,
+    ) -> Result<CudaTensor>
+    where
+        F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
+    {
+        crate::cuda::moe::moe_forward_sigmoid(
+            hidden,
+            gate_weight,
+            e_score_correction_bias,
+            num_experts,
+            num_experts_per_tok,
+            n_group,
+            topk_group,
+            norm_topk_prob,
+            routed_scaling_factor,
             expert_fn,
         )
     }

@@ -142,7 +142,7 @@ fn main() -> infernum::Result<()> {
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)
         }
         "deepseek" => {
-            let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
+            let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
             let dtype = format!("{}", model.dtype());
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, &dtype, cli.n_gen)

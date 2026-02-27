@@ -285,7 +285,7 @@ fn main() -> Result<()> {
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
             }
             "deepseek_v3" => {
-                let model = DeepSeekModel::from_pretrained(&ctx, &cli.model)?;
+                let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
                 let num_layers = model.config().num_hidden_layers;
                 let hidden_size = model.config().hidden_size;
                 run_generate(model, tokenizer, num_layers, hidden_size, &cli)
