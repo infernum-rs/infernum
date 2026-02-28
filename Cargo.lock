@@ -961,6 +961,7 @@ dependencies = [
  "clap",
  "cudarc",
  "infernum",
+ "infernum-cpu",
  "infernum-cuda",
  "infernum-deepseek",
  "infernum-gemma",
