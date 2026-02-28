@@ -900,6 +900,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "infernum-cpu"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "bytemuck",
+ "half",
+ "infernum",
+ "infernum-llama",
+ "infernum-macros",
+ "infernum-runtime",
+ "inventory",
+ "memmap2",
+ "num-traits",
+ "rand 0.8.5",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "infernum-cuda"
 version = "0.1.0"
 dependencies = [
@@ -940,6 +961,7 @@ dependencies = [
  "clap",
  "cudarc",
  "infernum",
+ "infernum-cpu",
  "infernum-cuda",
  "infernum-deepseek",
  "infernum-gemma",

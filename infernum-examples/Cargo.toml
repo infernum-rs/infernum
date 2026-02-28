@@ -7,6 +7,7 @@ build = "build.rs"
 
 [features]
 default = []
+cpu = ["dep:infernum-cpu"]
 cuda = ["dep:cudarc", "infernum-cuda", "infernum-cuda/cuda", "infernum-serve/cuda"]
 nccl = ["cuda", "infernum-cuda/nccl"]
 
@@ -14,6 +15,7 @@ nccl = ["cuda", "infernum-cuda/nccl"]
 clap = { version = "4", features = ["derive", "env"] }
 cudarc = { version = "0.12", optional = true }
 infernum = { path = "../infernum" }
+infernum-cpu = { path = "../infernum-cpu", optional = true }
 infernum-cuda = { path = "../infernum-cuda", optional = true }
 infernum-deepseek = { path = "../infernum-deepseek" }
 infernum-gemma = { path = "../infernum-gemma" }
@@ -52,3 +54,7 @@ required-features = ["cuda"]
 [[example]]
 name = "serve"
 required-features = ["cuda"]
+
+[[example]]
+name = "generate_cpu"
+required-features = ["cpu"]

@@ -45,6 +45,39 @@ jobs:
       - name: Run tests (no-fuse)
         run: cargo test --all --features no-fuse
 
+  # CPU backend integration tests (x86-64 + AArch64)
+  check-cpu:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest       # x86-64 (AVX2)
+          - runner: ubuntu-24.04-arm    # AArch64 (NEON)
+    runs-on: ${{ matrix.runner }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cpu-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/infernum/models
+          key: infernum-models-cpu-${{ runner.arch }}-v1
+
+      - name: Build CPU example
+        run: cargo build -p infernum-examples --features cpu --example generate_cpu
+
+      - name: Run CPU integration tests (SmolLM2-360M)
+        run: cargo test -p infernum-cpu --features integration -- --test-threads=1
+
   # GPU tests using GitHub's hosted GPU runners
   # Requires GitHub Team or Enterprise Cloud plan
   # See: https://github.blog/changelog/2024-07-08-github-actions-gpu-hosted-runners-are-now-generally-available/
