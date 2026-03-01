@@ -24,7 +24,7 @@ use infernum::backend::Backend;
 
 pub use logits::CpuLogits;
 pub use ops::attention::{CpuKvCache, CpuPagedKvCache};
-pub use tensor::CpuTensor;
+pub use tensor::{CpuLinearWeight, CpuQuantizedWeight, CpuTensor};
 pub use weights::CpuSafeTensorsLoader;
 
 /// Marker type for the CPU backend.

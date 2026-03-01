@@ -12,7 +12,7 @@ use infernum::shard::{ShardConfig, ShardStrategy};
 use infernum::weights::{QuantizationConfig, WeightLoader};
 use infernum::Result;
 
-use crate::tensor::CpuTensor;
+use crate::tensor::{CpuLinearWeight, CpuTensor};
 use crate::CpuBackend;
 
 /// CPU SafeTensors weight loader.
@@ -186,10 +186,10 @@ impl WeightLoader<CpuBackend> for CpuSafeTensorsLoader {
                 transposed[c * out_features + r] = f32_data[r * in_features + c];
             }
         }
-        Ok(CpuTensor::from_f32(
+        Ok(CpuLinearWeight::Dense(CpuTensor::from_f32(
             &[in_features, out_features],
             &transposed,
-        ))
+        )))
     }
 
     fn load_linear_sharded(
