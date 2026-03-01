@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   cargo run --example generate_cpu --features cpu -- -m /path/to/model "Hello"
-//!   cargo run --example generate_cpu --features cpu -- -m model.Q8_0.gguf --tokenizer /path/to/tokenizer "Hello"
+//!   cargo run --example generate_cpu --features cpu -- -m model.Q8_0.gguf "Hello"
 //!   cargo run --example generate_cpu --features cpu -- -m /path/to/model --greedy "Hello"
 //!   cargo run --example generate_cpu --features cpu -- -m /path/to/model -t 0.8 -p 0.95 "Hello"
 
@@ -12,7 +12,8 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use infernum::tokenizer::LlamaTokenizer;
+use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
+use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cpu::CpuBackend;
 use infernum_llama::LlamaModel;
@@ -30,10 +31,6 @@ struct Cli {
     /// Path to model directory (SafeTensors) or .gguf file
     #[arg(short, long, default_value = "models/smollm2-360m")]
     model: String,
-
-    /// Path to tokenizer directory (for GGUF models that need a HuggingFace tokenizer)
-    #[arg(long)]
-    tokenizer: Option<String>,
 
     /// Text prompt
     #[arg(default_value = "Hello")]
@@ -76,6 +73,51 @@ struct Cli {
     max_seq_len: Option<usize>,
 }
 
+/// Abstraction over tokenizer backends so we can use either one.
+enum Tokenizer {
+    HuggingFace(LlamaTokenizer),
+    Gguf(GgufTokenizer),
+}
+
+impl infernum::Tokenizer for Tokenizer {
+    fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
+        match self {
+            Self::HuggingFace(t) => t.encode(text, add_bos),
+            Self::Gguf(t) => t.encode(text, add_bos),
+        }
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String> {
+        match self {
+            Self::HuggingFace(t) => t.decode(ids),
+            Self::Gguf(t) => t.decode(ids),
+        }
+    }
+
+    fn decode_token(&self, id: u32) -> Result<String> {
+        match self {
+            Self::HuggingFace(t) => t.decode_token(id),
+            Self::Gguf(t) => t.decode_token(id),
+        }
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        match self {
+            Self::HuggingFace(t) => t.eos_token_id(),
+            Self::Gguf(t) => t.eos_token_id(),
+        }
+    }
+}
+
+impl Tokenizer {
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::HuggingFace(t) => t.vocab_size(),
+            Self::Gguf(t) => t.vocab_size(),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -87,14 +129,16 @@ fn main() -> Result<()> {
         if is_gguf { "GGUF" } else { "SafeTensors" }
     );
 
-    let model = if is_gguf {
-        LlamaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?
+    let (model, tokenizer) = if is_gguf {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
+        let model = LlamaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
+        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?);
+        (model, tokenizer)
     } else {
-        LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?
+        let model = LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?;
+        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
+        (model, tokenizer)
     };
-
-    let tokenizer_path = cli.tokenizer.as_deref().unwrap_or(&cli.model);
-    let tokenizer = LlamaTokenizer::from_pretrained(tokenizer_path)?;
 
     let num_layers = model.config().num_hidden_layers;
     let hidden_size = model.config().hidden_size;
