@@ -18,7 +18,7 @@ use infernum_cpu::CpuBackend;
 use infernum_llama::LlamaModel;
 use infernum_runtime::Runtime;
 
-use test_helpers::{download_model, greedy_options};
+use test_helpers::{download_model, download_model_files, greedy_options};
 
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
@@ -74,3 +74,66 @@ mod smollm2_360m {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 }
+
+// ─── SmolLM2-360M GGUF Q8_0 ─────────────────────────────────────────────────
+
+/// SmolLM2-360M quantized to Q8_0 (~380MB GGUF).
+/// Tests that GGUF quantized weight loading works on CPU and produces
+/// finite logits. Uses raw token IDs (SmolLM2's GPT2 BPE tokenizer
+/// is not supported by the GGUF tokenizer).
+mod smollm2_360m_q8 {
+    use super::*;
+
+    const REPO: &str = "bartowski/SmolLM2-360M-Instruct-GGUF";
+    const GGUF_FILE: &str = "SmolLM2-360M-Instruct-Q8_0.gguf";
+
+    fn gguf_path() -> PathBuf {
+        let dir = download_model_files(REPO, &[GGUF_FILE]);
+        dir.join(GGUF_FILE)
+    }
+
+    #[test]
+    fn no_nan_in_output() {
+        let path = gguf_path();
+        let model = LlamaModel::<CpuBackend>::from_gguf(&(), &path).expect("Failed to load GGUF");
+
+        // Use raw token IDs: "Hello" in GPT2 BPE (SmolLM2 vocab)
+        // BOS=0, "Hello"=15339 (common GPT2 token)
+        let input_ids = vec![0, 15339];
+
+        let hidden = model.forward_full(&input_ids).expect("Forward pass failed");
+        let logits_vec = hidden.to_f32_vec();
+
+        let nan_count = logits_vec.iter().filter(|x: &&f32| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x: &&f32| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+
+    #[test]
+    fn capital_of_france() {
+        let path = gguf_path();
+        // Only download tokenizer files (not the full SafeTensors model)
+        let tokenizer_dir = download_model_files(
+            "HuggingFaceTB/SmolLM2-360M-Instruct",
+            &["tokenizer.json", "tokenizer_config.json"],
+        );
+        let model = LlamaModel::<CpuBackend>::from_gguf(&(), &path).expect("Failed to load GGUF");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&tokenizer_dir).expect("Failed to load tokenizer");
+
+        let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+        let output = runtime
+            .generate("The capital of France is", &greedy_options(30))
+            .expect("Generation failed");
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in Q8_0 output, got: {output}"
+        );
+    }
+}
+
+// NOTE: Q4_0 GGUF integration test not added yet — available SmolLM2 Q4_0
+// GGUFs contain Q4_1 tensors for norms/embeddings which the GGUF loader
+// doesn't support. Q4_0 dot product correctness is covered by unit tests.
