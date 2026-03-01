@@ -232,6 +232,7 @@ pub fn dot_q4_block(input: &[f32], packed: &[u8], scale: f32) -> f32 {
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm256_sub_ps, _mm_and_si128, _mm_set1_epi8, _mm_srli_epi16};
 
+#[allow(clippy::similar_names)]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_q4_block_inner(input: &[f32], packed: &[u8], scale: f32) -> f32 {
     // Q4_0 layout: byte[i] has low nibble = element[i], high nibble = element[i+16].
