@@ -2,8 +2,9 @@
 //!
 //! GGUF files embed the tokenizer vocabulary under `tokenizer.ggml.*` keys.
 //! This implements BPE encoding using the merge scores stored in the file,
-//! compatible with both SentencePiece-style (score-based) and GPT2-style
-//! (explicit merges) tokenizers.
+//! compatible with both SentencePiece-style (Llama) and GPT2-style (SmolLM,
+//! StarCoder, etc.) tokenizers. The tokenizer model type is read from
+//! `tokenizer.ggml.model` and the encode/decode paths branch accordingly.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -16,12 +17,51 @@ use std::collections::HashMap;
 use crate::gguf_meta::GgufValue;
 use crate::{Error, Result};
 
+/// Which tokenizer convention is used in the GGUF file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenizerModel {
+    /// SentencePiece BPE (Llama, Mistral, etc.)
+    /// Spaces are represented as `▁` (U+2581). Byte fallbacks use `<0xHH>`.
+    SentencePiece,
+    /// GPT2-style byte-level BPE (SmolLM, StarCoder, GPT-2, etc.)
+    /// Each byte 0x00–0xFF is mapped to a printable Unicode character.
+    /// Spaces become `Ġ` (U+0120).
+    Gpt2,
+}
+
+/// Build the GPT2 byte→unicode mapping table.
+///
+/// Printable ASCII (0x21–0x7E) and Latin-1 (0xA1–0xAC, 0xAE–0xFF) map to
+/// themselves. The remaining 68 bytes (control chars, space, DEL, 0x80–0xA0,
+/// 0xAD) are mapped to U+0100–U+0143 in order.
+fn gpt2_byte_to_unicode() -> [char; 256] {
+    let mut table = ['\0'; 256];
+    let mut n: u32 = 0;
+    for b in 0u16..=255 {
+        let is_printable =
+            (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+        if is_printable {
+            table[b as usize] = char::from(b as u8);
+        } else {
+            table[b as usize] = char::from_u32(256 + n).expect("GPT2 byte table Unicode codepoint");
+            n += 1;
+        }
+    }
+    table
+}
+
+/// Build the inverse GPT2 unicode→byte mapping table.
+fn gpt2_unicode_to_byte() -> HashMap<char, u8> {
+    let fwd = gpt2_byte_to_unicode();
+    fwd.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect()
+}
+
 /// A tokenizer built from GGUF metadata (`tokenizer.ggml.*` keys).
 ///
-/// Supports SentencePiece-style BPE where token pairs are merged in order
-/// of decreasing score (higher score = merge first).
+/// Supports both SentencePiece-style (Llama) and GPT2-style byte-level BPE.
+/// The model type is auto-detected from `tokenizer.ggml.model`.
 pub struct GgufTokenizer {
-    /// Token ID → token bytes
+    /// Token ID → token bytes (raw bytes after model-specific decoding)
     vocab: Vec<Vec<u8>>,
     /// Token bytes → token ID (for encoding)
     token_to_id: HashMap<Vec<u8>, u32>,
@@ -29,6 +69,8 @@ pub struct GgufTokenizer {
     merge_scores: HashMap<(u32, u32), f32>,
     bos_token_id: u32,
     eos_token_id: u32,
+    /// Which tokenizer convention is used
+    model: TokenizerModel,
 }
 
 impl GgufTokenizer {
@@ -44,6 +86,15 @@ impl GgufTokenizer {
     /// # Errors
     /// Returns an error if required metadata keys are missing.
     pub fn from_gguf_metadata(metadata: &HashMap<String, GgufValue>) -> Result<Self> {
+        // Detect tokenizer model type
+        let model = match metadata
+            .get("tokenizer.ggml.model")
+            .and_then(GgufValue::as_str)
+        {
+            Some("gpt2") => TokenizerModel::Gpt2,
+            _ => TokenizerModel::SentencePiece,
+        };
+
         // Extract token strings
         let tokens_val = metadata
             .get("tokenizer.ggml.tokens")
@@ -66,12 +117,24 @@ impl GgufTokenizer {
 
         let vocab_size = token_strings.len();
 
-        // Build vocab: decode SentencePiece-style escaped bytes (e.g. <0x0A> for newline)
+        // Build vocab: decode token strings to raw bytes.
+        // SentencePiece uses `<0xHH>` byte-fallback tokens.
+        // GPT2 uses a Unicode remapping table (each byte maps to a printable char).
+        let unicode_to_byte = if model == TokenizerModel::Gpt2 {
+            Some(gpt2_unicode_to_byte())
+        } else {
+            None
+        };
+
         let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(vocab_size);
         let mut token_to_id: HashMap<Vec<u8>, u32> = HashMap::with_capacity(vocab_size);
 
         for (id, token_str) in token_strings.iter().enumerate() {
-            let bytes = decode_token_str(token_str);
+            let bytes = if let Some(ref u2b) = unicode_to_byte {
+                decode_gpt2_token(token_str, u2b)
+            } else {
+                decode_token_str(token_str)
+            };
             // Use insert() to prefer later tokens over earlier ones.
             // This ensures we use the actual character token (e.g., ',')
             // instead of byte-fallback tokens (e.g., '<0x2C>') which appear earlier.
@@ -83,7 +146,11 @@ impl GgufTokenizer {
         // Otherwise fall back to score-based inference (Unigram tokenizers)
         let merge_scores: HashMap<(u32, u32), f32> =
             if let Some(GgufValue::Array(merges_arr)) = metadata.get("tokenizer.ggml.merges") {
-                Self::build_merge_table_from_explicit_merges(merges_arr, &token_to_id)?
+                Self::build_merge_table_from_explicit_merges(
+                    merges_arr,
+                    &token_to_id,
+                    unicode_to_byte.as_ref(),
+                )?
             } else {
                 Self::build_merge_table_from_scores(metadata, &vocab, &token_to_id, vocab_size)
             };
@@ -104,6 +171,7 @@ impl GgufTokenizer {
             merge_scores,
             bos_token_id,
             eos_token_id,
+            model,
         })
     }
 
@@ -112,6 +180,7 @@ impl GgufTokenizer {
     fn build_merge_table_from_explicit_merges(
         merges_arr: &[GgufValue],
         token_to_id: &HashMap<Vec<u8>, u32>,
+        unicode_to_byte: Option<&HashMap<char, u8>>,
     ) -> Result<HashMap<(u32, u32), f32>> {
         let mut merge_scores: HashMap<(u32, u32), f32> = HashMap::new();
         let total_merges = merges_arr.len();
@@ -126,8 +195,16 @@ impl GgufTokenizer {
                 let left_str = &merge_str[..space_idx];
                 let right_str = &merge_str[space_idx + 1..];
 
-                let left_bytes = decode_token_str(left_str);
-                let right_bytes = decode_token_str(right_str);
+                let left_bytes = if let Some(u2b) = unicode_to_byte {
+                    decode_gpt2_token(left_str, u2b)
+                } else {
+                    decode_token_str(left_str)
+                };
+                let right_bytes = if let Some(u2b) = unicode_to_byte {
+                    decode_gpt2_token(right_str, u2b)
+                } else {
+                    decode_token_str(right_str)
+                };
 
                 if let (Some(&left_id), Some(&right_id)) =
                     (token_to_id.get(&left_bytes), token_to_id.get(&right_bytes))
@@ -190,8 +267,8 @@ impl GgufTokenizer {
 
     /// Encode text into token IDs using BPE.
     ///
-    /// SentencePiece prepends a space (▁ = U+2581) to the input, which maps to
-    /// the `▁` byte sequence in the vocabulary.
+    /// For SentencePiece models, prepends `▁` and replaces spaces with `▁`.
+    /// For GPT2 models, each input byte is mapped to its single-byte token.
     ///
     /// # Arguments
     /// * `text` - The text to encode
@@ -210,41 +287,10 @@ impl GgufTokenizer {
             return Ok(ids);
         }
 
-        // SentencePiece convention: prepend ▁ and replace spaces with ▁
-        // "The meaning" → "▁The▁meaning"
-        let sp_text = format!("\u{2581}{}", text.replace(' ', "\u{2581}"));
-
-        // Initialize with character-level tokens (not byte-level)
-        // For each character, check if it exists as a token.
-        // If not, fall back to byte-fallback tokens for each byte of the character.
-        let mut tokens: Vec<u32> = Vec::new();
-        for ch in sp_text.chars() {
-            let char_bytes = ch.to_string();
-            let char_bytes = char_bytes.as_bytes();
-
-            if let Some(&id) = self.token_to_id.get(char_bytes) {
-                // Character exists as a token
-                tokens.push(id);
-            } else {
-                // Fall back to byte-level encoding for this character
-                for &b in char_bytes {
-                    if let Some(&id) = self.token_to_id.get(&[b][..]) {
-                        tokens.push(id);
-                    } else {
-                        // Byte-fallback: <0xHH>
-                        let hex_token = format!("<0x{b:02X}>");
-                        let id = self
-                            .token_to_id
-                            .get(hex_token.as_bytes())
-                            .copied()
-                            .ok_or_else(|| {
-                                Error::Tokenizer(format!("No token for byte 0x{b:02x}"))
-                            })?;
-                        tokens.push(id);
-                    }
-                }
-            }
-        }
+        let mut tokens: Vec<u32> = match self.model {
+            TokenizerModel::SentencePiece => self.encode_sentencepiece(text)?,
+            TokenizerModel::Gpt2 => self.encode_gpt2(text)?,
+        };
 
         // BPE merge loop: repeatedly merge the pair with the highest score
         loop {
@@ -288,9 +334,60 @@ impl GgufTokenizer {
         Ok(ids)
     }
 
+    /// Initialize tokens for SentencePiece BPE.
+    /// Prepends `▁`, replaces spaces with `▁`, then maps characters to token
+    /// IDs with `<0xHH>` byte-fallback.
+    fn encode_sentencepiece(&self, text: &str) -> Result<Vec<u32>> {
+        let sp_text = format!("\u{2581}{}", text.replace(' ', "\u{2581}"));
+
+        let mut tokens = Vec::new();
+        for ch in sp_text.chars() {
+            let char_str = ch.to_string();
+            let char_bytes = char_str.as_bytes();
+
+            if let Some(&id) = self.token_to_id.get(char_bytes) {
+                tokens.push(id);
+            } else {
+                for &b in char_bytes {
+                    if let Some(&id) = self.token_to_id.get(&[b][..]) {
+                        tokens.push(id);
+                    } else {
+                        let hex_token = format!("<0x{b:02X}>");
+                        let id = self
+                            .token_to_id
+                            .get(hex_token.as_bytes())
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::Tokenizer(format!("No token for byte 0x{b:02x}"))
+                            })?;
+                        tokens.push(id);
+                    }
+                }
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// Initialize tokens for GPT2 byte-level BPE.
+    /// Each input byte maps to a single-byte token (the vocab was decoded
+    /// through the GPT2 unicode→byte table at load time).
+    fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>> {
+        let mut tokens = Vec::new();
+        for &b in text.as_bytes() {
+            let id = self
+                .token_to_id
+                .get(&[b][..])
+                .copied()
+                .ok_or_else(|| Error::Tokenizer(format!("No token for byte 0x{b:02x}")))?;
+            tokens.push(id);
+        }
+        Ok(tokens)
+    }
+
     /// Decode token IDs to a string.
     ///
-    /// Replaces SentencePiece `▁` (U+2581) with space.
+    /// For SentencePiece, replaces `▁` (U+2581) with space and trims the
+    /// leading space. For GPT2, the vocab already contains raw bytes.
     ///
     /// # Errors
     /// Returns an error if a token ID is out of range.
@@ -304,11 +401,14 @@ impl GgufTokenizer {
             bytes.extend_from_slice(&self.vocab[id_usize]);
         }
 
-        // Replace ▁ (0xE2 0x96 0x81) with space
-        let text = String::from_utf8_lossy(&bytes).replace('\u{2581}', " ");
-
-        // Trim leading space (from the ▁ we prepend during encoding)
-        Ok(text.strip_prefix(' ').unwrap_or(&text).to_string())
+        match self.model {
+            TokenizerModel::SentencePiece => {
+                let text = String::from_utf8_lossy(&bytes).replace('\u{2581}', " ");
+                // Trim leading space (from the ▁ we prepend during encoding)
+                Ok(text.strip_prefix(' ').unwrap_or(&text).to_string())
+            }
+            TokenizerModel::Gpt2 => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        }
     }
 
     /// Decode a single token ID to a string.
@@ -320,8 +420,14 @@ impl GgufTokenizer {
         if id_usize >= self.vocab.len() {
             return Err(Error::Tokenizer(format!("Token ID {id} out of range")));
         }
-        let text = String::from_utf8_lossy(&self.vocab[id_usize]).replace('\u{2581}', " ");
-        Ok(text)
+
+        let token_bytes = &self.vocab[id_usize];
+        match self.model {
+            TokenizerModel::SentencePiece => {
+                Ok(String::from_utf8_lossy(token_bytes).replace('\u{2581}', " "))
+            }
+            TokenizerModel::Gpt2 => Ok(String::from_utf8_lossy(token_bytes).into_owned()),
+        }
     }
 
     /// Get the BOS token ID
@@ -373,6 +479,17 @@ fn decode_token_str(s: &str) -> Vec<u8> {
         }
     }
     s.as_bytes().to_vec()
+}
+
+/// Decode a GPT2 token string to raw bytes.
+///
+/// GPT2 token strings use a Unicode remapping where each byte 0x00–0xFF is
+/// represented as a printable Unicode character (e.g., space 0x20 → `Ġ`
+/// U+0120). This reverses that mapping to get raw bytes.
+fn decode_gpt2_token(s: &str, unicode_to_byte: &HashMap<char, u8>) -> Vec<u8> {
+    s.chars()
+        .map(|c| unicode_to_byte.get(&c).copied().unwrap_or(c as u8))
+        .collect()
 }
 
 #[cfg(test)]
@@ -551,5 +668,139 @@ mod tests {
         let meta: HashMap<String, GgufValue> = HashMap::new();
         let result = GgufTokenizer::from_gguf_metadata(&meta);
         assert!(result.is_err());
+    }
+
+    // ─── GPT2 BPE tests ─────────────────────────────────────────────────
+
+    /// Build the GPT2 byte→unicode table and create a helper to convert
+    /// raw bytes to a GPT2 token string.
+    fn bytes_to_gpt2_str(raw: &[u8]) -> String {
+        let table = gpt2_byte_to_unicode();
+        raw.iter().map(|&b| table[b as usize]).collect()
+    }
+
+    fn make_gpt2_metadata(
+        tokens: &[&str],
+        merges: &[&str],
+        bos: u32,
+        eos: u32,
+    ) -> HashMap<String, GgufValue> {
+        let mut m = HashMap::new();
+        m.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("gpt2".into()),
+        );
+        m.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(
+                tokens
+                    .iter()
+                    .map(|t| GgufValue::String((*t).into()))
+                    .collect(),
+            ),
+        );
+        m.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::U32(bos));
+        m.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(eos));
+        if !merges.is_empty() {
+            m.insert(
+                "tokenizer.ggml.merges".into(),
+                GgufValue::Array(
+                    merges
+                        .iter()
+                        .map(|s| GgufValue::String((*s).into()))
+                        .collect(),
+                ),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn test_gpt2_byte_to_unicode_roundtrip() {
+        let fwd = gpt2_byte_to_unicode();
+        let inv = gpt2_unicode_to_byte();
+
+        // Every byte should roundtrip
+        for b in 0u8..=255 {
+            let c = fwd[b as usize];
+            assert_eq!(inv[&c], b, "Roundtrip failed for byte 0x{b:02X}");
+        }
+
+        // All 256 entries should map to unique chars
+        let mut chars: Vec<char> = fwd.to_vec();
+        chars.sort_unstable();
+        chars.dedup();
+        assert_eq!(chars.len(), 256);
+    }
+
+    #[test]
+    fn test_gpt2_space_is_remapped() {
+        let table = gpt2_byte_to_unicode();
+        // Space (0x20) should map to Ġ (U+0120)
+        assert_eq!(table[0x20], '\u{0120}');
+    }
+
+    #[test]
+    fn test_gpt2_basic_encoding() {
+        // Build a minimal GPT2 vocab:
+        // Single-byte tokens for all 256 bytes + a few merges
+        let table = gpt2_byte_to_unicode();
+        let mut tokens: Vec<String> = (0u8..=255).map(|b| table[b as usize].to_string()).collect();
+
+        // Token 256: "he" (merged h + e)
+        tokens.push(bytes_to_gpt2_str(b"he"));
+        // Token 257: "Ġt" (merged space + t) — "Ġ" is GPT2's space
+        tokens.push(bytes_to_gpt2_str(b" t"));
+        // Token 258: "Ġthe" — not directly built from merges in this test
+
+        let token_strs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+
+        // Merges: "h e" → "he" (token 256), "Ġ t" → "Ġt" (token 257)
+        let space_char = table[0x20];
+        let merge1 = format!("h e");
+        let merge2 = format!("{space_char} t");
+        let merges = vec![merge1.as_str(), merge2.as_str()];
+
+        let meta = make_gpt2_metadata(&token_strs, &merges, 0, 0);
+        let tok = GgufTokenizer::from_gguf_metadata(&meta).unwrap();
+
+        // "the" → bytes [0x74, 0x68, 0x65] → initial tokens [t, h, e]
+        // Merge h+e → he(256), then no more merges → [t, he]
+        let ids = tok.encode("the", false).unwrap();
+        assert_eq!(ids, vec![b't' as u32, 256]);
+
+        // " t" → bytes [0x20, 0x74] → merge → token 257
+        let ids2 = tok.encode(" t", false).unwrap();
+        assert_eq!(ids2, vec![257]);
+    }
+
+    #[test]
+    fn test_gpt2_decode_roundtrip() {
+        let table = gpt2_byte_to_unicode();
+        let tokens: Vec<String> = (0u8..=255).map(|b| table[b as usize].to_string()).collect();
+        let token_strs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+
+        let meta = make_gpt2_metadata(&token_strs, &[], 0, 0);
+        let tok = GgufTokenizer::from_gguf_metadata(&meta).unwrap();
+
+        let text = "Hello, world!";
+        let ids = tok.encode(text, false).unwrap();
+        let decoded = tok.decode(&ids).unwrap();
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn test_gpt2_no_space_prepend() {
+        // GPT2 should NOT prepend a space like SentencePiece does
+        let table = gpt2_byte_to_unicode();
+        let tokens: Vec<String> = (0u8..=255).map(|b| table[b as usize].to_string()).collect();
+        let token_strs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+
+        let meta = make_gpt2_metadata(&token_strs, &[], 0, 0);
+        let tok = GgufTokenizer::from_gguf_metadata(&meta).unwrap();
+
+        // "Hi" should encode to exactly [H, i] with no leading space token
+        let ids = tok.encode("Hi", false).unwrap();
+        assert_eq!(ids, vec![b'H' as u32, b'i' as u32]);
     }
 }
