@@ -630,6 +630,7 @@ impl WeightLoader for SafeTensorsLoader {
             }
             DType::Q8_0
             | DType::Q4_0
+            | DType::Q4_1
             | DType::Q6_K
             | DType::F8E4M3
             | DType::GPTQ_INT4
