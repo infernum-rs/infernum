@@ -171,12 +171,14 @@ impl CpuTensor {
 pub struct CpuQuantizedWeight {
     /// Logical shape: `[out_features, in_features]`
     pub shape: Vec<usize>,
-    /// Quantization format (`Q8_0` or `Q4_0`)
+    /// Quantization format (`Q8_0`, `Q4_0`, or `Q4_1`)
     pub dtype: DType,
-    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0)
+    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
     pub data: Vec<u8>,
     /// Per-block f16 scales as raw bytes (2 bytes per block)
     pub scales: Vec<u8>,
+    /// Per-block f16 minimums as raw bytes (2 bytes per block, Q4_1 only)
+    pub mins: Option<Vec<u8>>,
 }
 
 /// A linear weight — dense f32 or block-quantized.

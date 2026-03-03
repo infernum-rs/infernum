@@ -257,5 +257,61 @@ unsafe fn dot_q4_block_inner(input: &[f32], packed: &[u8], scale: f32) -> f32 {
     vaddvq_f32(vaddq_f32(acc0, acc1)) * scale
 }
 
+/// Q4_1 block dot product: `sum(input[i] * nibble[i]) * scale + sum(input[i]) * min`
+/// for 32 elements. Unlike Q4_0, nibbles are unsigned [0,15] — no bias subtraction.
+pub fn dot_q4_1_block(input: &[f32], packed: &[u8], scale: f32, min: f32) -> f32 {
+    unsafe { dot_q4_1_block_inner(input, packed, scale, min) }
+}
+
+#[inline]
+unsafe fn dot_q4_1_block_inner(input: &[f32], packed: &[u8], scale: f32, min: f32) -> f32 {
+    let inp = input.as_ptr();
+    let mask = std::arch::aarch64::vdup_n_u8(0x0F);
+
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    // Accumulate sum(input[i]) for the min term
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+
+    // Process low nibbles of all 16 bytes → elements 0..15
+    for group in 0..2 {
+        let raw = vld1_u8(packed.as_ptr().add(group * 8));
+        let lo_u8 = std::arch::aarch64::vand_u8(raw, mask);
+        let lo_signed = vreinterpret_s8_u8(lo_u8);
+        let lo_s16 = vmovl_s8(lo_signed);
+        let lo_s32_0 = vmovl_s16(std::arch::aarch64::vget_low_s16(lo_s16));
+        let lo_s32_1 = vmovl_high_s16(lo_s16);
+        let base = group * 8;
+        let in0 = vld1q_f32(inp.add(base));
+        let in1 = vld1q_f32(inp.add(base + 4));
+        acc0 = vfmaq_f32(acc0, in0, vcvtq_f32_s32(lo_s32_0));
+        acc1 = vfmaq_f32(acc1, in1, vcvtq_f32_s32(lo_s32_1));
+        sum0 = vaddq_f32(sum0, in0);
+        sum1 = vaddq_f32(sum1, in1);
+    }
+
+    // Process high nibbles of all 16 bytes → elements 16..31
+    for group in 0..2 {
+        let raw = vld1_u8(packed.as_ptr().add(group * 8));
+        let hi_u8 = vshr_n_u8(raw, 4);
+        let hi_signed = vreinterpret_s8_u8(hi_u8);
+        let hi_s16 = vmovl_s8(hi_signed);
+        let hi_s32_0 = vmovl_s16(std::arch::aarch64::vget_low_s16(hi_s16));
+        let hi_s32_1 = vmovl_high_s16(hi_s16);
+        let base = 16 + group * 8;
+        let in0 = vld1q_f32(inp.add(base));
+        let in1 = vld1q_f32(inp.add(base + 4));
+        acc0 = vfmaq_f32(acc0, in0, vcvtq_f32_s32(hi_s32_0));
+        acc1 = vfmaq_f32(acc1, in1, vcvtq_f32_s32(hi_s32_1));
+        sum0 = vaddq_f32(sum0, in0);
+        sum1 = vaddq_f32(sum1, in1);
+    }
+
+    let dot = vaddvq_f32(vaddq_f32(acc0, acc1));
+    let input_sum = vaddvq_f32(vaddq_f32(sum0, sum1));
+    dot * scale + input_sum * min
+}
+
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::vdupq_n_s32;

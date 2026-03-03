@@ -43,6 +43,7 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q4_1: u32 = 3;
 const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_BF16: u32 = 30;
 
@@ -63,7 +64,7 @@ struct GgufTensorInfo {
 
 /// Loads model weights from a GGUF file.
 ///
-/// Supports F32, F16, BF16, Q8_0, Q4_0, and Q6_K tensor types. Tensors are
+/// Supports F32, F16, BF16, Q8_0, Q4_0, Q4_1, and Q6_K tensor types. Tensors are
 /// memory-mapped and loaded to host memory on demand. The resulting host
 /// buffers can then be uploaded to any backend.
 pub struct GgufLoader {
@@ -230,6 +231,32 @@ impl GgufLoader {
                 }
                 out
             }
+            DType::Q4_1 => {
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes();
+                let total_bytes = num_blocks * block_bytes;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                let mut out = vec![0.0; numel];
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * block_bytes;
+                    let scale = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
+                    let min = half::f16::from_le_bytes([raw[bs + 2], raw[bs + 3]]).to_f32();
+
+                    let block_out_start = block_idx * QUANTIZATION_BLOCK_SIZE;
+
+                    #[allow(clippy::cast_precision_loss)]
+                    for j in 0..QUANTIZATION_BLOCK_SIZE / 2 {
+                        let byte = raw[bs + 4 + j];
+                        let lo = f32::from(byte & 0x0F);
+                        let hi = f32::from(byte >> 4);
+
+                        out[block_out_start + j] = lo * scale + min;
+                        out[block_out_start + j + 16] = hi * scale + min;
+                    }
+                }
+                out
+            }
             DType::Q6_K => {
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
                 let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
@@ -392,7 +419,7 @@ impl GgufLoader {
         })
     }
 
-    /// Load a tensor as a quantized weight (Q8_0, Q4_0, Q6_K, FP8).
+    /// Load a tensor as a quantized weight (Q8_0, Q4_0, Q4_1, Q6_K, FP8).
     ///
     /// Returns a [`HostQuantizedWeight`] with separated data and scale buffers
     /// ready for upload to a backend's quantized tensor format.
@@ -441,6 +468,36 @@ impl GgufLoader {
                     data: data_buf,
                     scales: scales_buf,
                     qzeros: None,
+                    group_size: None,
+                    weight_scale: 1.0,
+                    channel_scales: None,
+                })
+            }
+            DType::Q4_1 => {
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes(); // 20
+                let total_bytes = num_blocks * block_bytes;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                // Q4_1 block layout: [scale_f16 (2B) | min_f16 (2B) | nibbles (16B)]
+                let nibble_bytes = QUANTIZATION_BLOCK_SIZE / 2;
+                let mut data_buf = Vec::with_capacity(num_blocks * nibble_bytes);
+                let mut scales_buf = Vec::with_capacity(num_blocks * 2);
+                let mut mins_buf = Vec::with_capacity(num_blocks * 2);
+
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * block_bytes;
+                    scales_buf.extend_from_slice(&raw[bs..bs + 2]);
+                    mins_buf.extend_from_slice(&raw[bs + 2..bs + 4]);
+                    data_buf.extend_from_slice(&raw[bs + 4..bs + block_bytes]);
+                }
+
+                Ok(HostQuantizedWeight {
+                    shape: info.shape.clone(),
+                    dtype,
+                    data: data_buf,
+                    scales: scales_buf,
+                    qzeros: Some(mins_buf),
                     group_size: None,
                     weight_scale: 1.0,
                     channel_scales: None,
@@ -560,6 +617,54 @@ impl GgufLoader {
                     data: data_buf,
                     scales: scales_buf,
                     qzeros: None,
+                    group_size: None,
+                    weight_scale: 1.0,
+                    channel_scales: None,
+                })
+            }
+            DType::Q4_1 => {
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes(); // 20
+                let total_bytes = num_blocks * block_bytes;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                let blocks_per_row = n_cols / QUANTIZATION_BLOCK_SIZE;
+                let row_bytes = blocks_per_row * block_bytes;
+
+                // Un-permute rows
+                let mut unpermuted = vec![0u8; total_bytes];
+                for h in 0..n_head {
+                    for i in 0..half_dim {
+                        let src0 = (h * head_dim + 2 * i) * row_bytes;
+                        let src1 = (h * head_dim + 2 * i + 1) * row_bytes;
+                        let dst0 = (h * head_dim + i) * row_bytes;
+                        let dst1 = (h * head_dim + i + half_dim) * row_bytes;
+                        unpermuted[dst0..dst0 + row_bytes]
+                            .copy_from_slice(&raw[src0..src0 + row_bytes]);
+                        unpermuted[dst1..dst1 + row_bytes]
+                            .copy_from_slice(&raw[src1..src1 + row_bytes]);
+                    }
+                }
+
+                // Split into data, scales, mins
+                let nibble_bytes = QUANTIZATION_BLOCK_SIZE / 2;
+                let mut data_buf = Vec::with_capacity(num_blocks * nibble_bytes);
+                let mut scales_buf = Vec::with_capacity(num_blocks * 2);
+                let mut mins_buf = Vec::with_capacity(num_blocks * 2);
+
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * block_bytes;
+                    scales_buf.extend_from_slice(&unpermuted[bs..bs + 2]);
+                    mins_buf.extend_from_slice(&unpermuted[bs + 2..bs + 4]);
+                    data_buf.extend_from_slice(&unpermuted[bs + 4..bs + block_bytes]);
+                }
+
+                Ok(HostQuantizedWeight {
+                    shape: info.shape.clone(),
+                    dtype,
+                    data: data_buf,
+                    scales: scales_buf,
+                    qzeros: Some(mins_buf),
                     group_size: None,
                     weight_scale: 1.0,
                     channel_scales: None,
@@ -813,6 +918,7 @@ fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
         GGML_TYPE_BF16 => Ok(DType::BF16),
         GGML_TYPE_Q8_0 => Ok(DType::Q8_0),
         GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
+        GGML_TYPE_Q4_1 => Ok(DType::Q4_1),
         GGML_TYPE_Q6_K => Ok(DType::Q6_K),
         other => Err(Error::UnsupportedDtype(format!(
             "Unsupported GGML tensor type: {other}"
@@ -904,6 +1010,23 @@ pub(crate) mod test_helpers {
             }
             self.tensors
                 .push((name.to_string(), shape.to_vec(), GGML_TYPE_Q4_0, bytes));
+        }
+
+        pub fn add_tensor_q4_1(
+            &mut self,
+            name: &str,
+            shape: &[usize],
+            blocks: &[(half::f16, half::f16, Vec<u8>)],
+        ) {
+            let mut bytes = Vec::new();
+            for (scale, min, packed) in blocks {
+                assert_eq!(packed.len(), QUANTIZATION_BLOCK_SIZE / 2);
+                bytes.extend_from_slice(&scale.to_le_bytes());
+                bytes.extend_from_slice(&min.to_le_bytes());
+                bytes.extend_from_slice(packed);
+            }
+            self.tensors
+                .push((name.to_string(), shape.to_vec(), GGML_TYPE_Q4_1, bytes));
         }
 
         pub fn add_tensor_q6k_raw(&mut self, name: &str, shape: &[usize], raw_blocks: &[u8]) {
@@ -1196,6 +1319,92 @@ mod tests {
                 "Element {i}: got {val}, expected {expected}"
             );
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_q4_1_dequantize() {
+        let path = test_gguf_path();
+
+        let scale = half::f16::from_f32(0.5);
+        let min = half::f16::from_f32(-2.0);
+        // 16 packed bytes: each byte has lo nibble = element[i], hi nibble = element[i+16]
+        let mut packed = vec![0u8; 16];
+        for i in 0..16 {
+            let lo = (i as u8) & 0x0F;
+            let hi = ((15 - i) as u8) & 0x0F;
+            packed[i] = lo | (hi << 4);
+        }
+
+        let mut builder = GgufBuilder::new();
+        builder.add_tensor_q4_1("t", &[1, 32], &[(scale, min, packed.clone())]);
+        builder.build_to_file(&path);
+
+        let loader = GgufLoader::from_file(&path).unwrap();
+        let tensor = loader.load_f32("t").unwrap();
+        let result = tensor.as_f32_slice();
+        assert_eq!(result.len(), 32);
+
+        let s = scale.to_f32();
+        let m = min.to_f32();
+        // Elements 0..15 come from low nibbles (values 0..15)
+        for i in 0..16 {
+            let expected = (i as f32) * s + m;
+            assert!(
+                (result[i] - expected).abs() < 1e-3,
+                "Element {i}: got {}, expected {expected}",
+                result[i]
+            );
+        }
+        // Elements 16..31 come from high nibbles (values 15..0)
+        for i in 0..16 {
+            let expected = ((15 - i) as f32) * s + m;
+            assert!(
+                (result[16 + i] - expected).abs() < 1e-3,
+                "Element {}: got {}, expected {expected}",
+                16 + i,
+                result[16 + i]
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_q4_1_load_quantized() {
+        let path = test_gguf_path();
+
+        let scale = half::f16::from_f32(0.25);
+        let min = half::f16::from_f32(-1.0);
+        let packed: Vec<u8> = (0..16).map(|i| i | ((15 - i) << 4)).collect();
+
+        let mut builder = GgufBuilder::new();
+        builder.add_tensor_q4_1(
+            "w",
+            &[2, 32],
+            &[(scale, min, packed.clone()), (scale, min, packed.clone())],
+        );
+        builder.build_to_file(&path);
+
+        let loader = GgufLoader::from_file(&path).unwrap();
+        let qw = loader.load_quantized("w").unwrap();
+
+        assert_eq!(qw.dtype, DType::Q4_1);
+        assert_eq!(qw.shape, vec![2, 32]);
+        // 2 blocks × 16 nibble bytes = 32 data bytes
+        assert_eq!(qw.data.len(), 32);
+        // 2 blocks × 2 scale bytes = 4 scale bytes
+        assert_eq!(qw.scales.len(), 4);
+        // 2 blocks × 2 min bytes = 4 min bytes
+        let mins = qw.qzeros.as_ref().unwrap();
+        assert_eq!(mins.len(), 4);
+
+        // Verify scale and min bytes
+        assert_eq!(&qw.scales[0..2], &scale.to_le_bytes());
+        assert_eq!(&mins[0..2], &min.to_le_bytes());
+        // Verify nibble data
+        assert_eq!(&qw.data[0..16], &packed[..]);
 
         std::fs::remove_file(&path).ok();
     }
