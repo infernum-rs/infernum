@@ -178,3 +178,135 @@ pub fn vec_silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
         out[i] = gate[i] * sigmoid * up[i];
     }
 }
+
+/// Q8_0 block dot product: `sum(input[i] * int8[i]) * scale` for 32 elements.
+pub fn dot_q8_block(input: &[f32], quants: &[u8], scale: f32) -> f32 {
+    unsafe { dot_q8_block_inner(input, quants, scale) }
+}
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm256_cvtepi32_ps, _mm256_cvtepi8_epi32, _mm_loadl_epi64};
+
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_q8_block_inner(input: &[f32], quants: &[u8], scale: f32) -> f32 {
+    // Process 32 int8 values in 4 groups of 8:
+    // load 8×i8 → cvtepi8_epi32 → cvtepi32_ps → FMA
+    let inp = input.as_ptr();
+    let q = quants.as_ptr();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    // Group 0: elements 0..7
+    let q8 = _mm_loadl_epi64(q.cast());
+    let q32 = _mm256_cvtepi8_epi32(q8);
+    let qf = _mm256_cvtepi32_ps(q32);
+    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(inp), qf, acc0);
+
+    // Group 1: elements 8..15
+    let q8 = _mm_loadl_epi64(q.add(8).cast());
+    let q32 = _mm256_cvtepi8_epi32(q8);
+    let qf = _mm256_cvtepi32_ps(q32);
+    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(inp.add(8)), qf, acc1);
+
+    // Group 2: elements 16..23
+    let q8 = _mm_loadl_epi64(q.add(16).cast());
+    let q32 = _mm256_cvtepi8_epi32(q8);
+    let qf = _mm256_cvtepi32_ps(q32);
+    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(inp.add(16)), qf, acc0);
+
+    // Group 3: elements 24..31
+    let q8 = _mm_loadl_epi64(q.add(24).cast());
+    let q32 = _mm256_cvtepi8_epi32(q8);
+    let qf = _mm256_cvtepi32_ps(q32);
+    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(inp.add(24)), qf, acc1);
+
+    hsum_256(_mm256_add_ps(acc0, acc1)) * scale
+}
+
+/// Q4_0 block dot product: `sum(input[i] * (nibble[i] - 8)) * scale` for 32 elements.
+pub fn dot_q4_block(input: &[f32], packed: &[u8], scale: f32) -> f32 {
+    unsafe { dot_q4_block_inner(input, packed, scale) }
+}
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm256_sub_ps, _mm_and_si128, _mm_set1_epi8, _mm_srli_epi16};
+
+#[allow(clippy::similar_names)]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_q4_block_inner(input: &[f32], packed: &[u8], scale: f32) -> f32 {
+    // Q4_0 layout: byte[i] has low nibble = element[i], high nibble = element[i+16].
+    // So 16 bytes → low nibbles are elements 0..15, high nibbles are elements 16..31.
+    let inp = input.as_ptr();
+    let bias = _mm256_set1_ps(8.0);
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    let mask_0f = _mm_set1_epi8(0x0F);
+
+    // Process low nibbles of all 16 bytes → elements 0..15
+    for group in 0..2 {
+        let raw = _mm_loadl_epi64(packed.as_ptr().add(group * 8).cast());
+        let lo = _mm_and_si128(raw, mask_0f);
+        let lo_i32 = _mm256_cvtepi8_epi32(lo);
+        let lo_f32 = _mm256_sub_ps(_mm256_cvtepi32_ps(lo_i32), bias);
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(inp.add(group * 8)), lo_f32, acc0);
+    }
+
+    // Process high nibbles of all 16 bytes → elements 16..31
+    for group in 0..2 {
+        let raw = _mm_loadl_epi64(packed.as_ptr().add(group * 8).cast());
+        let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_0f);
+        let hi_i32 = _mm256_cvtepi8_epi32(hi);
+        let hi_f32 = _mm256_sub_ps(_mm256_cvtepi32_ps(hi_i32), bias);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(inp.add(16 + group * 8)), hi_f32, acc1);
+    }
+
+    hsum_256(_mm256_add_ps(acc0, acc1)) * scale
+}
+
+/// Q4_1 block dot product: `sum(input[i] * nibble[i]) * scale + sum(input[i]) * min`
+/// for 32 elements. Unlike Q4_0, nibbles are unsigned [0,15] — no bias subtraction.
+pub fn dot_q4_1_block(input: &[f32], packed: &[u8], scale: f32, min: f32) -> f32 {
+    unsafe { dot_q4_1_block_inner(input, packed, scale, min) }
+}
+
+#[allow(clippy::similar_names)]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_q4_1_block_inner(input: &[f32], packed: &[u8], scale: f32, min: f32) -> f32 {
+    let inp = input.as_ptr();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+
+    let mask_0f = _mm_set1_epi8(0x0F);
+
+    // Process low nibbles of all 16 bytes → elements 0..15
+    for group in 0..2 {
+        let raw = _mm_loadl_epi64(packed.as_ptr().add(group * 8).cast());
+        let lo = _mm_and_si128(raw, mask_0f);
+        let lo_i32 = _mm256_cvtepi8_epi32(lo);
+        let lo_f32 = _mm256_cvtepi32_ps(lo_i32);
+        let in_vec = _mm256_loadu_ps(inp.add(group * 8));
+        acc0 = _mm256_fmadd_ps(in_vec, lo_f32, acc0);
+        sum0 = _mm256_add_ps(sum0, in_vec);
+    }
+
+    // Process high nibbles of all 16 bytes → elements 16..31
+    for group in 0..2 {
+        let raw = _mm_loadl_epi64(packed.as_ptr().add(group * 8).cast());
+        let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_0f);
+        let hi_i32 = _mm256_cvtepi8_epi32(hi);
+        let hi_f32 = _mm256_cvtepi32_ps(hi_i32);
+        let in_vec = _mm256_loadu_ps(inp.add(16 + group * 8));
+        acc1 = _mm256_fmadd_ps(in_vec, hi_f32, acc1);
+        sum1 = _mm256_add_ps(sum1, in_vec);
+    }
+
+    let dot = hsum_256(_mm256_add_ps(acc0, acc1));
+    let input_sum = hsum_256(_mm256_add_ps(sum0, sum1));
+    dot * scale + input_sum * min
+}

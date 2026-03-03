@@ -1,30 +1,34 @@
-//! CPU text generation example (Llama family, SafeTensors only)
+//! CPU text generation example (Llama family, SafeTensors + GGUF)
 //!
 //! Usage:
 //!   cargo run --example generate_cpu --features cpu -- -m /path/to/model "Hello"
+//!   cargo run --example generate_cpu --features cpu -- -m model.Q8_0.gguf "Hello"
 //!   cargo run --example generate_cpu --features cpu -- -m /path/to/model --greedy "Hello"
 //!   cargo run --example generate_cpu --features cpu -- -m /path/to/model -t 0.8 -p 0.95 "Hello"
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use clap::Parser;
 
-use infernum::tokenizer::LlamaTokenizer;
+use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
+use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cpu::CpuBackend;
 use infernum_llama::LlamaModel;
 use infernum_runtime::{Engine, Runtime};
 
-/// CPU text generation with Llama models (SafeTensors only)
+/// CPU text generation with Llama models (SafeTensors + GGUF)
 ///
 /// Supports Llama, Mistral, Mixtral, and other Llama-architecture models.
-/// Weights are loaded as f32 — no quantized formats supported.
+/// SafeTensors models load as f32. GGUF models load quantized weights (Q8_0,
+/// Q4_0) with SIMD-accelerated dequantize-on-the-fly inference.
 /// Uses KV cache and nucleus sampling by default.
 #[derive(Parser)]
 #[command(name = "generate_cpu")]
 struct Cli {
-    /// Path to model directory (SafeTensors)
+    /// Path to model directory (SafeTensors) or .gguf file
     #[arg(short, long, default_value = "models/smollm2-360m")]
     model: String,
 
@@ -69,13 +73,72 @@ struct Cli {
     max_seq_len: Option<usize>,
 }
 
+/// Abstraction over tokenizer backends so we can use either one.
+enum Tokenizer {
+    HuggingFace(LlamaTokenizer),
+    Gguf(GgufTokenizer),
+}
+
+impl infernum::Tokenizer for Tokenizer {
+    fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
+        match self {
+            Self::HuggingFace(t) => t.encode(text, add_bos),
+            Self::Gguf(t) => t.encode(text, add_bos),
+        }
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String> {
+        match self {
+            Self::HuggingFace(t) => t.decode(ids),
+            Self::Gguf(t) => t.decode(ids),
+        }
+    }
+
+    fn decode_token(&self, id: u32) -> Result<String> {
+        match self {
+            Self::HuggingFace(t) => t.decode_token(id),
+            Self::Gguf(t) => t.decode_token(id),
+        }
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        match self {
+            Self::HuggingFace(t) => t.eos_token_id(),
+            Self::Gguf(t) => t.eos_token_id(),
+        }
+    }
+}
+
+impl Tokenizer {
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::HuggingFace(t) => t.vocab_size(),
+            Self::Gguf(t) => t.vocab_size(),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    println!("Loading model from: {} (CPU)", cli.model);
+    let is_gguf = cli.model.ends_with(".gguf");
 
-    let model = LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?;
-    let tokenizer = LlamaTokenizer::from_pretrained(&cli.model)?;
+    println!(
+        "Loading model from: {} (CPU, {})",
+        cli.model,
+        if is_gguf { "GGUF" } else { "SafeTensors" }
+    );
+
+    let (model, tokenizer) = if is_gguf {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
+        let model = LlamaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
+        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?);
+        (model, tokenizer)
+    } else {
+        let model = LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?;
+        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
+        (model, tokenizer)
+    };
 
     let num_layers = model.config().num_hidden_layers;
     let hidden_size = model.config().hidden_size;

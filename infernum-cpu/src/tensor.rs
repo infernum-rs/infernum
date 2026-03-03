@@ -162,6 +162,34 @@ impl CpuTensor {
     }
 }
 
+/// Block-quantized weight for CPU inference.
+///
+/// Stores quantized data and per-block scales separately, matching the
+/// GGUF loader output. Layout is row-major: `out_features` rows of
+/// `in_features` elements, with `in_features / 32` blocks per row.
+#[derive(Clone)]
+pub struct CpuQuantizedWeight {
+    /// Logical shape: `[out_features, in_features]`
+    pub shape: Vec<usize>,
+    /// Quantization format (`Q8_0`, `Q4_0`, or `Q4_1`)
+    pub dtype: DType,
+    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
+    pub data: Vec<u8>,
+    /// Per-block f16 scales as raw bytes (2 bytes per block)
+    pub scales: Vec<u8>,
+    /// Per-block f16 minimums as raw bytes (2 bytes per block, Q4_1 only)
+    pub mins: Option<Vec<u8>>,
+}
+
+/// A linear weight — dense f32 or block-quantized.
+#[derive(Clone)]
+pub enum CpuLinearWeight {
+    /// Dense f32 weight, pre-transposed to `(in_features, out_features)`.
+    Dense(CpuTensor),
+    /// Block-quantized weight in `(out_features, in_features)` layout.
+    Quantized(CpuQuantizedWeight),
+}
+
 impl Tensor for CpuTensor {
     fn shape(&self) -> &[usize] {
         &self.shape

@@ -1,20 +1,24 @@
 //! MatmulOps and MatmulExtOps implementation for CpuBackend.
 //!
-//! All matmul is f32 row-major, using standard `A (M,K) × B (K,N) → C (M,N)`.
-//! Weight matrices are stored as `(in_features, out_features)` after the
-//! host transpose applied by `WeightLoader`.
+//! Dense matmul is f32 row-major: `A (M,K) × B (K,N) → C (M,N)`.
+//! Dense weight matrices are stored as `(in_features, out_features)` after
+//! the host transpose applied by `WeightLoader`.
 //!
 //! Performance: B is transposed to `Bᵀ(N,K)` so that `C[m,n] = dot(A[m,:], Bᵀ[n,:])`
 //! becomes a contiguous SIMD dot product. Output rows are parallelized with Rayon.
+//!
+//! Quantized weights (Q8_0, Q4_0) are stored in their original
+//! `(out_features, in_features)` layout. The quantized linear kernel iterates
+//! per output neuron (row), dequantizing blocks on the fly.
 
 use infernum::backend::{MatmulExtOps, MatmulOps};
-use infernum::dtype::DType;
+use infernum::dtype::{DType, QUANTIZATION_BLOCK_SIZE};
 use infernum::tensor::Tensor;
 use infernum::Result;
 use rayon::prelude::*;
 
 use crate::simd;
-use crate::tensor::CpuTensor;
+use crate::tensor::{CpuLinearWeight, CpuQuantizedWeight, CpuTensor};
 use crate::CpuBackend;
 
 /// Transpose `B (K,N)` → `Bᵀ (N,K)` in row-major order.
@@ -61,8 +65,151 @@ fn gemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     c
 }
 
+/// Quantized linear: `input (M, K) × weight (N, K)_quantized → output (M, N)`.
+///
+/// Weight is stored as `(out_features=N, in_features=K)` in block-quantized
+/// format. For each output element, we iterate over K/32 blocks, dequantizing
+/// on the fly and accumulating the dot product.
+#[allow(clippy::many_single_char_names, clippy::too_many_lines)]
+fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<CpuTensor> {
+    let i_shape = input.shape();
+    let m: usize = i_shape[..i_shape.len() - 1].iter().product();
+    let k = *i_shape.last().unwrap();
+
+    let n = weight.shape[0]; // out_features
+    let wk = weight.shape[1]; // in_features
+    assert_eq!(
+        k, wk,
+        "quantized_linear: input dim {k} != weight in_features {wk}"
+    );
+    assert_eq!(
+        k % QUANTIZATION_BLOCK_SIZE,
+        0,
+        "quantized_linear: in_features {k} not divisible by block size {QUANTIZATION_BLOCK_SIZE}"
+    );
+
+    let num_blocks_per_row = k / QUANTIZATION_BLOCK_SIZE;
+    let input_data = input.as_f32_slice();
+    let mut output = vec![0.0f32; m * n];
+
+    match weight.dtype {
+        DType::Q8_0 => {
+            let quants = &weight.data;
+            let scales_raw = &weight.scales;
+            let quant_bytes_per_row = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
+
+            for row in 0..m {
+                let inp = &input_data[row * k..(row + 1) * k];
+                let out_row = &mut output[row * n..(row + 1) * n];
+
+                for (neuron, out_val) in out_row.iter_mut().enumerate() {
+                    let q_row_start = neuron * quant_bytes_per_row;
+                    let s_row_start = neuron * num_blocks_per_row * 2;
+                    let mut acc = 0.0f32;
+
+                    for blk in 0..num_blocks_per_row {
+                        let scale_bytes = &scales_raw[s_row_start + blk * 2..];
+                        let scale =
+                            half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
+
+                        let q_start = q_row_start + blk * QUANTIZATION_BLOCK_SIZE;
+                        let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
+
+                        acc += simd::dot_q8_block(
+                            &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                            &quants[q_start..q_start + QUANTIZATION_BLOCK_SIZE],
+                            scale,
+                        );
+                    }
+                    *out_val = acc;
+                }
+            }
+        }
+        DType::Q4_0 => {
+            let packed = &weight.data;
+            let scales_raw = &weight.scales;
+            let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+
+            for row in 0..m {
+                let inp = &input_data[row * k..(row + 1) * k];
+                let out_row = &mut output[row * n..(row + 1) * n];
+
+                for (neuron, out_val) in out_row.iter_mut().enumerate() {
+                    let p_row_start = neuron * packed_bytes_per_row;
+                    let s_row_start = neuron * num_blocks_per_row * 2;
+                    let mut acc = 0.0f32;
+
+                    for blk in 0..num_blocks_per_row {
+                        let scale_bytes = &scales_raw[s_row_start + blk * 2..];
+                        let scale =
+                            half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
+
+                        let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
+                        let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
+
+                        acc += simd::dot_q4_block(
+                            &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                            &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
+                            scale,
+                        );
+                    }
+                    *out_val = acc;
+                }
+            }
+        }
+        DType::Q4_1 => {
+            let packed = &weight.data;
+            let scales_raw = &weight.scales;
+            let mins_raw = weight
+                .mins
+                .as_ref()
+                .expect("Q4_1 weight missing mins buffer");
+            let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+
+            for row in 0..m {
+                let inp = &input_data[row * k..(row + 1) * k];
+                let out_row = &mut output[row * n..(row + 1) * n];
+
+                for (neuron, out_val) in out_row.iter_mut().enumerate() {
+                    let p_row_start = neuron * packed_bytes_per_row;
+                    let s_row_start = neuron * num_blocks_per_row * 2;
+                    let mut acc = 0.0f32;
+
+                    for blk in 0..num_blocks_per_row {
+                        let scale_bytes = &scales_raw[s_row_start + blk * 2..];
+                        let scale =
+                            half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
+                        let min_bytes = &mins_raw[s_row_start + blk * 2..];
+                        let min = half::f16::from_le_bytes([min_bytes[0], min_bytes[1]]).to_f32();
+
+                        let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
+                        let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
+
+                        acc += simd::dot_q4_1_block(
+                            &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                            &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
+                            scale,
+                            min,
+                        );
+                    }
+                    *out_val = acc;
+                }
+            }
+        }
+        other => {
+            return Err(infernum::Error::UnsupportedDtype(format!(
+                "quantized_linear: unsupported dtype {other}"
+            )));
+        }
+    }
+
+    let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
+    out_shape.push(n);
+    Ok(CpuTensor::from_f32(&out_shape, &output))
+}
+
 impl MatmulOps for CpuBackend {
-    type LinearWeight = CpuTensor;
+    type LinearWeight = CpuLinearWeight;
 
     fn matmul(input: &CpuTensor, weight: &CpuTensor) -> Result<CpuTensor> {
         // Standard: input (..., K) × weight (K, N) → (..., N)
@@ -94,37 +241,78 @@ impl MatmulOps for CpuBackend {
         Ok(CpuTensor::from_f32(&out_shape, &output))
     }
 
-    fn linear(input: &CpuTensor, weight: &CpuTensor) -> Result<CpuTensor> {
-        Self::matmul(input, weight)
+    fn linear(input: &CpuTensor, weight: &CpuLinearWeight) -> Result<CpuTensor> {
+        match weight {
+            CpuLinearWeight::Dense(w) => Self::matmul(input, w),
+            CpuLinearWeight::Quantized(w) => quantized_linear(input, w),
+        }
     }
 
-    fn as_dense_weight(weight: &CpuTensor) -> Option<&CpuTensor> {
-        Some(weight)
+    fn as_dense_weight(weight: &CpuLinearWeight) -> Option<&CpuTensor> {
+        match weight {
+            CpuLinearWeight::Dense(t) => Some(t),
+            CpuLinearWeight::Quantized(_) => None,
+        }
     }
 
-    fn dense_weight(tensor: CpuTensor) -> CpuTensor {
-        tensor
+    fn dense_weight(tensor: CpuTensor) -> CpuLinearWeight {
+        CpuLinearWeight::Dense(tensor)
     }
 
-    fn is_dense_weight(_weight: &CpuTensor) -> bool {
-        true
+    fn is_dense_weight(weight: &CpuLinearWeight) -> bool {
+        matches!(weight, CpuLinearWeight::Dense(_))
     }
 
-    fn quantize_to_q8(_device: &(), shape: &[usize], data: &[f32]) -> Result<CpuTensor> {
-        // CPU backend: store as f32 (no quantization acceleration)
-        Ok(CpuTensor::from_f32(shape, data))
+    fn quantize_to_q8(_device: &(), shape: &[usize], data: &[f32]) -> Result<CpuLinearWeight> {
+        assert!(shape.len() == 2, "quantize_to_q8: expected 2D shape");
+        let n = shape[0]; // out_features
+        let k = shape[1]; // in_features
+        assert!(
+            k.is_multiple_of(QUANTIZATION_BLOCK_SIZE),
+            "quantize_to_q8: in_features {k} must be a multiple of {QUANTIZATION_BLOCK_SIZE}"
+        );
+        let num_blocks_per_row = k / QUANTIZATION_BLOCK_SIZE;
+
+        let mut qdata = Vec::with_capacity(n * k);
+        let mut scales = Vec::with_capacity(n * num_blocks_per_row * 2);
+
+        for neuron in 0..n {
+            let row = &data[neuron * k..(neuron + 1) * k];
+            for blk in 0..num_blocks_per_row {
+                let block =
+                    &row[blk * QUANTIZATION_BLOCK_SIZE..(blk + 1) * QUANTIZATION_BLOCK_SIZE];
+                let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+                let inv_scale = 1.0 / scale;
+
+                let scale_f16 = half::f16::from_f32(scale);
+                scales.extend_from_slice(&scale_f16.to_le_bytes());
+
+                #[allow(clippy::cast_possible_truncation)]
+                for &v in block {
+                    let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                    qdata.push(q.cast_unsigned());
+                }
+            }
+        }
+
+        Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
+            shape: shape.to_vec(),
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales,
+            mins: None,
+        }))
     }
 
     fn upload_host_linear(
         _device: &(),
         weight: &infernum::weights::host::HostLinearWeight,
-    ) -> Result<CpuTensor> {
+    ) -> Result<CpuLinearWeight> {
         use infernum::weights::host::HostLinearWeight;
 
         match weight {
             HostLinearWeight::Dense(host_tensor) => {
-                // Weight is already in (out_features, in_features) layout,
-                // same as PyTorch nn.Linear.weight and our gemm convention.
                 let f32_data = match host_tensor.dtype {
                     DType::F32 => bytemuck::cast_slice::<u8, f32>(&host_tensor.data).to_vec(),
                     DType::BF16 => {
@@ -141,11 +329,30 @@ impl MatmulOps for CpuBackend {
                         )));
                     }
                 };
-                Ok(CpuTensor::from_f32(&host_tensor.shape, &f32_data))
+                Ok(CpuLinearWeight::Dense(CpuTensor::from_f32(
+                    &host_tensor.shape,
+                    &f32_data,
+                )))
             }
-            HostLinearWeight::Quantized(_) => Err(infernum::Error::UnsupportedDtype(
-                "CPU backend only supports dense weights".into(),
-            )),
+            HostLinearWeight::Quantized(hq) => match hq.dtype {
+                DType::Q8_0 | DType::Q4_0 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
+                    shape: hq.shape.clone(),
+                    dtype: hq.dtype,
+                    data: hq.data.clone(),
+                    scales: hq.scales.clone(),
+                    mins: None,
+                })),
+                DType::Q4_1 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
+                    shape: hq.shape.clone(),
+                    dtype: hq.dtype,
+                    data: hq.data.clone(),
+                    scales: hq.scales.clone(),
+                    mins: hq.qzeros.clone(),
+                })),
+                other => Err(infernum::Error::UnsupportedDtype(format!(
+                    "CPU backend does not support {other} quantized weights"
+                ))),
+            },
         }
     }
 }
@@ -177,11 +384,14 @@ mod tests {
 
     #[test]
     fn test_matmul_2x3_times_3x4() {
+        // input: (2, 3), weight: (3, 4) → output: (2, 4)
+        // Standard matrix multiply: C = A @ B
         #[rustfmt::skip]
         let input = CpuTensor::from_f32(&[2, 3], &[
             1.0, 2.0, 3.0,
             4.0, 5.0, 6.0,
         ]);
+        // Weight is (K=3, N=4) — each column is a "neuron"
         #[rustfmt::skip]
         let weight = CpuTensor::from_f32(&[3, 4], &[
             1.0, 0.0, 0.0, 1.0,
@@ -190,14 +400,15 @@ mod tests {
         ]);
         let out = CpuBackend::matmul(&input, &weight).unwrap();
         assert_eq!(out.shape(), &[2, 4]);
-        assert_eq!(
-            out.as_f32_slice(),
-            &[1.0, 2.0, 3.0, 6.0, 4.0, 5.0, 6.0, 15.0]
-        );
+        let data = out.as_f32_slice();
+        // Row 0: [1*1+2*0+3*0, 1*0+2*1+3*0, 1*0+2*0+3*1, 1*1+2*1+3*1] = [1, 2, 3, 6]
+        // Row 1: [4*1+5*0+6*0, 4*0+5*1+6*0, 4*0+5*0+6*1, 4*1+5*1+6*1] = [4, 5, 6, 15]
+        assert_eq!(data, &[1.0, 2.0, 3.0, 6.0, 4.0, 5.0, 6.0, 15.0]);
     }
 
     #[test]
     fn test_gemv_single_row() {
+        // input: (1, 3), weight: (3, 2) → output: (1, 2)
         let input = CpuTensor::from_f32(&[1, 3], &[1.0, 2.0, 3.0]);
         #[rustfmt::skip]
         let weight = CpuTensor::from_f32(&[3, 2], &[
@@ -207,6 +418,7 @@ mod tests {
         ]);
         let out = CpuBackend::matmul(&input, &weight).unwrap();
         assert_eq!(out.shape(), &[1, 2]);
+        // [1+2+3, 2+4+6] = [6, 12]
         assert_eq!(out.as_f32_slice(), &[6.0, 12.0]);
     }
 
@@ -295,6 +507,362 @@ mod tests {
                 diff < 0.5,
                 "mismatch at [{row},{col}]: got={}, expected={expected}, diff={diff}",
                 result[row * n + col]
+            );
+        }
+    }
+
+    /// Helper: manually quantize f32 values to Q8_0 format.
+    /// Returns (data, scales) where data is int8 bytes and scales is f16 bytes.
+    fn manual_quantize_q8(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
+        assert_eq!(values.len() % 32, 0);
+        let num_blocks = values.len() / 32;
+        let mut data = Vec::with_capacity(num_blocks * 32);
+        let mut scales = Vec::with_capacity(num_blocks * 2);
+
+        for blk in 0..num_blocks {
+            let block = &values[blk * 32..(blk + 1) * 32];
+            let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+            let inv_scale = 1.0 / scale;
+
+            let scale_f16 = half::f16::from_f32(scale);
+            scales.extend_from_slice(&scale_f16.to_le_bytes());
+
+            for &v in block {
+                let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                data.push(q as u8);
+            }
+        }
+        (data, scales)
+    }
+
+    /// Helper: manually quantize f32 values to Q4_0 format.
+    /// Returns (data, scales) where data is packed nibbles and scales is f16 bytes.
+    fn manual_quantize_q4(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
+        assert_eq!(values.len() % 32, 0);
+        let num_blocks = values.len() / 32;
+        let mut data = Vec::with_capacity(num_blocks * 16);
+        let mut scales = Vec::with_capacity(num_blocks * 2);
+
+        for blk in 0..num_blocks {
+            let block = &values[blk * 32..(blk + 1) * 32];
+            let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
+            let inv_scale = 1.0 / scale;
+
+            let scale_f16 = half::f16::from_f32(scale);
+            scales.extend_from_slice(&scale_f16.to_le_bytes());
+
+            // Pack 32 values into 16 bytes (low nibble first, high nibble second)
+            for i in 0..16 {
+                let lo_val = (block[i] * inv_scale).round().clamp(-8.0, 7.0) as i8;
+                let hi_val = (block[i + 16] * inv_scale).round().clamp(-8.0, 7.0) as i8;
+                let lo_nibble = (lo_val + 8) as u8 & 0x0F;
+                let hi_nibble = (hi_val + 8) as u8 & 0x0F;
+                data.push(lo_nibble | (hi_nibble << 4));
+            }
+        }
+        (data, scales)
+    }
+
+    #[test]
+    fn test_quantized_linear_q8_gemv() {
+        // Weight: 2 neurons, 64 inputs (2 blocks of 32 each)
+        let n = 2;
+        let k = 64;
+        let weight_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 - 64.0) * 0.01).collect();
+        let input_f32: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
+
+        // Compute expected output in f32
+        let mut expected = vec![0.0f32; n];
+        for neuron in 0..n {
+            for j in 0..k {
+                expected[neuron] += input_f32[j] * weight_f32[neuron * k + j];
+            }
+        }
+
+        // Quantize weight to Q8_0
+        let (qdata, qscales) = manual_quantize_q8(&weight_f32);
+        let qweight = CpuQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales: qscales,
+            mins: None,
+        };
+
+        let input = CpuTensor::from_f32(&[1, k], &input_f32);
+        let out = quantized_linear(&input, &qweight).unwrap();
+        assert_eq!(out.shape(), &[1, n]);
+
+        let result = out.as_f32_slice();
+        for i in 0..n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.02,
+                "Q8_0 neuron {i}: got {}, expected {}, rel_err {rel_err}",
+                result[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_quantized_linear_q4_gemv() {
+        let n = 2;
+        let k = 64;
+        let weight_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 - 64.0) * 0.01).collect();
+        let input_f32: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
+
+        // Compute expected output in f32
+        let mut expected = vec![0.0f32; n];
+        for neuron in 0..n {
+            for j in 0..k {
+                expected[neuron] += input_f32[j] * weight_f32[neuron * k + j];
+            }
+        }
+
+        // Quantize weight to Q4_0
+        let (qdata, qscales) = manual_quantize_q4(&weight_f32);
+        let qweight = CpuQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q4_0,
+            data: qdata,
+            scales: qscales,
+            mins: None,
+        };
+
+        let input = CpuTensor::from_f32(&[1, k], &input_f32);
+        let out = quantized_linear(&input, &qweight).unwrap();
+        assert_eq!(out.shape(), &[1, n]);
+
+        let result = out.as_f32_slice();
+        for i in 0..n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.15,
+                "Q4_0 neuron {i}: got {}, expected {}, rel_err {rel_err}",
+                result[i],
+                expected[i]
+            );
+        }
+    }
+
+    /// Manually quantize f32 weights to Q4_1 format (asymmetric, unsigned nibbles).
+    fn manual_quantize_q4_1(data: &[f32]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let block_size = 32;
+        let num_blocks = data.len() / block_size;
+        let mut packed = Vec::with_capacity(num_blocks * 16);
+        let mut scales = Vec::with_capacity(num_blocks * 2);
+        let mut mins = Vec::with_capacity(num_blocks * 2);
+
+        for b in 0..num_blocks {
+            let block = &data[b * block_size..(b + 1) * block_size];
+            let min_val = block.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_val = block.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let scale = if (max_val - min_val).abs() < f32::EPSILON {
+                0.0
+            } else {
+                (max_val - min_val) / 15.0
+            };
+            let scale_f16 = half::f16::from_f32(scale);
+            let min_f16 = half::f16::from_f32(min_val);
+            scales.extend_from_slice(&scale_f16.to_le_bytes());
+            mins.extend_from_slice(&min_f16.to_le_bytes());
+
+            // Quantize to 4-bit unsigned [0,15]
+            let s = scale_f16.to_f32();
+            let m = min_f16.to_f32();
+            let mut nibbles = [0u8; 32];
+            for i in 0..32 {
+                nibbles[i] = if s.abs() < f32::EPSILON {
+                    0
+                } else {
+                    ((block[i] - m) / s).round().clamp(0.0, 15.0) as u8
+                };
+            }
+            // Pack: byte[i] = nibbles[i] | (nibbles[i+16] << 4)
+            for i in 0..16 {
+                packed.push(nibbles[i] | (nibbles[i + 16] << 4));
+            }
+        }
+        (packed, scales, mins)
+    }
+
+    #[test]
+    fn test_quantized_linear_q4_1() {
+        let n = 4;
+        let k = 64;
+        let weight_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 - 64.0) * 0.01).collect();
+        let input_f32: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
+
+        let mut expected = vec![0.0f32; n];
+        for neuron in 0..n {
+            for j in 0..k {
+                expected[neuron] += input_f32[j] * weight_f32[neuron * k + j];
+            }
+        }
+
+        let (qdata, qscales, qmins) = manual_quantize_q4_1(&weight_f32);
+        let qweight = CpuQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q4_1,
+            data: qdata,
+            scales: qscales,
+            mins: Some(qmins),
+        };
+
+        let input = CpuTensor::from_f32(&[1, k], &input_f32);
+        let out = quantized_linear(&input, &qweight).unwrap();
+        assert_eq!(out.shape(), &[1, n]);
+
+        let result = out.as_f32_slice();
+        for i in 0..n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.15,
+                "Q4_1 neuron {i}: got {}, expected {}, rel_err {rel_err}",
+                result[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_linear_dispatch_dense() {
+        let input = CpuTensor::from_f32(&[1, 3], &[1.0, 2.0, 3.0]);
+        #[rustfmt::skip]
+        let weight = CpuLinearWeight::Dense(CpuTensor::from_f32(&[3, 2], &[
+            1.0, 2.0,
+            1.0, 2.0,
+            1.0, 2.0,
+        ]));
+        let out = CpuBackend::linear(&input, &weight).unwrap();
+        assert_eq!(out.shape(), &[1, 2]);
+        assert_eq!(out.as_f32_slice(), &[6.0, 12.0]);
+    }
+
+    #[test]
+    fn test_linear_dispatch_quantized_q8() {
+        let k = 32;
+        let n = 1;
+        let weight_f32: Vec<f32> = (0..k).map(|i| i as f32 * 0.1).collect();
+        let input_f32: Vec<f32> = vec![1.0; k];
+
+        let expected: f32 = weight_f32.iter().sum();
+
+        let (qdata, qscales) = manual_quantize_q8(&weight_f32);
+        let weight = CpuLinearWeight::Quantized(CpuQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales: qscales,
+            mins: None,
+        });
+
+        let input = CpuTensor::from_f32(&[1, k], &input_f32);
+        let out = CpuBackend::linear(&input, &weight).unwrap();
+        assert_eq!(out.shape(), &[1, n]);
+        let result = out.as_f32_slice()[0];
+        let rel_err = (result - expected).abs() / expected.abs();
+        assert!(
+            rel_err < 0.02,
+            "Q8 linear dispatch: got {result}, expected {expected}, rel_err {rel_err}"
+        );
+    }
+
+    #[test]
+    fn test_quantized_linear_q8_gemm() {
+        // Test with M=2 (batch of 2 rows)
+        let n = 2;
+        let k = 32;
+        let weight_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 - 32.0) * 0.02).collect();
+        let input_f32: Vec<f32> = (0..2 * k).map(|i| (i as f32) * 0.05).collect();
+
+        let mut expected = vec![0.0f32; 2 * n];
+        for row in 0..2 {
+            for neuron in 0..n {
+                for j in 0..k {
+                    expected[row * n + neuron] +=
+                        input_f32[row * k + j] * weight_f32[neuron * k + j];
+                }
+            }
+        }
+
+        let (qdata, qscales) = manual_quantize_q8(&weight_f32);
+        let qweight = CpuQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales: qscales,
+            mins: None,
+        };
+
+        let input = CpuTensor::from_f32(&[2, k], &input_f32);
+        let out = quantized_linear(&input, &qweight).unwrap();
+        assert_eq!(out.shape(), &[2, n]);
+
+        let result = out.as_f32_slice();
+        for i in 0..2 * n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.02,
+                "Q8 GEMM element {i}: got {}, expected {}, rel_err {rel_err}",
+                result[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_quantize_to_q8_roundtrip() {
+        let n = 2;
+        let k = 64;
+        let weight_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 - 64.0) * 0.01).collect();
+        let input_f32: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
+
+        let mut expected = vec![0.0f32; n];
+        for neuron in 0..n {
+            for j in 0..k {
+                expected[neuron] += input_f32[j] * weight_f32[neuron * k + j];
+            }
+        }
+
+        let q_weight = CpuBackend::quantize_to_q8(&(), &[n, k], &weight_f32).unwrap();
+        assert!(matches!(q_weight, CpuLinearWeight::Quantized(_)));
+
+        let input = CpuTensor::from_f32(&[1, k], &input_f32);
+        let out = CpuBackend::linear(&input, &q_weight).unwrap();
+        assert_eq!(out.shape(), &[1, n]);
+
+        let result = out.as_f32_slice();
+        for i in 0..n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.02,
+                "quantize_to_q8 roundtrip neuron {i}: got {}, expected {}, rel_err {rel_err}",
+                result[i],
+                expected[i]
             );
         }
     }
