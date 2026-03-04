@@ -914,7 +914,7 @@ impl<B: GemmaOps> GemmaModel<B> {
             let post_attention_layernorm = host_load_gemma_norm::<B>(
                 loader,
                 &device,
-                &format!("{prefix}.attn_post_norm.weight"),
+                &format!("{prefix}.post_attention_norm.weight"),
             )?;
             let pre_feedforward_layernorm =
                 host_load_gemma_norm::<B>(loader, &device, &format!("{prefix}.ffn_norm.weight"))?;
