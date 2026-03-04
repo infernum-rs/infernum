@@ -267,7 +267,6 @@ mod qwen25_05b_q8_gguf {
     use super::*;
 
     use infernum::tokenizer::GgufTokenizer;
-    use infernum::Tokenizer as _;
     use test_helpers::download_model_files;
 
     const REPO: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
