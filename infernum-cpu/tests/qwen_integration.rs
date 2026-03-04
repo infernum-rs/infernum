@@ -26,7 +26,6 @@ use test_helpers::{download_model_files, greedy_options};
 mod qwen25_05b_q8 {
     use super::*;
 
-    use infernum::Tokenizer as _;
     use infernum_runtime::Runtime;
 
     const REPO: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";

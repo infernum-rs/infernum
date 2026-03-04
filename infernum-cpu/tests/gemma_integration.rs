@@ -27,7 +27,6 @@ use test_helpers::{download_model_files, greedy_options};
 mod gemma2_2b_q8 {
     use super::*;
 
-    use infernum::Tokenizer as _;
     use infernum_runtime::Runtime;
 
     const REPO: &str = "bartowski/gemma-2-2b-it-GGUF";
