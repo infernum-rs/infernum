@@ -385,6 +385,292 @@ impl<B: QwenOps> QwenModel<B> {
         })
     }
 
+    /// Load Qwen model weights from a GGUF file (CPU-parsed, uploaded to device).
+    ///
+    /// # Errors
+    /// Returns an error if any weight fails to load or upload.
+    ///
+    /// # Panics
+    /// Panics if the model config is MoE (MoE GGUF loading is not yet supported).
+    #[allow(clippy::too_many_lines)]
+    pub fn load_weights_gguf(
+        device: B::DeviceHandle,
+        config: QwenConfig,
+        loader: &infernum::weights::gguf::GgufLoader,
+    ) -> Result<Self> {
+        use infernum::weights::format::FormatLoader;
+        use infernum::weights::format::{host_transpose_2d, host_unpermute_f32};
+        use infernum::weights::host::{host_concat_inner_dim, HostLinearWeight};
+
+        /// Load a GGUF tensor as a linear weight (dense or quantized).
+        fn host_load_linear(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                    loader, name,
+                )?))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&tensor)?))
+            }
+        }
+
+        /// Load a GGUF Q/K weight with head-dimension unpermuting.
+        fn host_load_linear_unpermute(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+            n_head: usize,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(
+                    FormatLoader::load_quantized_unpermute(loader, name, n_head)?,
+                ))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                let unpermuted = host_unpermute_f32(&tensor, n_head)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&unpermuted)?))
+            }
+        }
+
+        /// Load an optional f32 bias vector from GGUF.
+        fn host_load_bias(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+        ) -> Result<Option<infernum::weights::host::HostTensor>> {
+            if loader.contains(name) {
+                Ok(Some(FormatLoader::load_f32(loader, name)?))
+            } else {
+                Ok(None)
+            }
+        }
+
+        assert!(!config.is_moe(), "MoE GGUF loading is not yet supported");
+
+        let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
+        let embed_tokens =
+            B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+
+        let num_kv_heads = config.num_kv_heads();
+        let head_dim = config.head_dim();
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("blk.{i}");
+
+            let attn_norm_host =
+                FormatLoader::load_f32(loader, &format!("{prefix}.attn_norm.weight"))?;
+            let input_layernorm = B::from_f32_slice(
+                &device,
+                &attn_norm_host.shape,
+                attn_norm_host.as_f32_slice(),
+            )?;
+
+            let attention = {
+                let k_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_k.weight"),
+                    num_kv_heads,
+                )?;
+                let v_host = host_load_linear(loader, &format!("{prefix}.attn_v.weight"))?;
+
+                let kv_proj = if let (HostLinearWeight::Dense(k_t), HostLinearWeight::Dense(v_t)) =
+                    (&k_host, &v_host)
+                {
+                    let fused = host_concat_inner_dim(k_t, v_t);
+                    let fused_tensor =
+                        B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                    KvProjWeight::<B>::Fused {
+                        kv_dim: num_kv_heads * head_dim,
+                        weight: fused_tensor,
+                    }
+                } else {
+                    let k_dev = B::upload_host_linear(&device, &k_host)?;
+                    let v_dev = B::upload_host_linear(&device, &v_host)?;
+                    KvProjWeight::<B>::Separate {
+                        k_proj: Box::new(k_dev),
+                        v_proj: Box::new(v_dev),
+                    }
+                };
+
+                let q_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_q.weight"),
+                    config.num_attention_heads,
+                )?;
+                let o_host = host_load_linear(loader, &format!("{prefix}.attn_output.weight"))?;
+
+                // Optional Q/K/V biases (Qwen2/2.5 have these, Qwen3 does not)
+                let q_bias_host = host_load_bias(loader, &format!("{prefix}.attn_q.bias"))?;
+                let k_bias_host = host_load_bias(loader, &format!("{prefix}.attn_k.bias"))?;
+                let v_bias_host = host_load_bias(loader, &format!("{prefix}.attn_v.bias"))?;
+
+                let q_bias = q_bias_host
+                    .as_ref()
+                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .transpose()?;
+                let k_bias = k_bias_host
+                    .as_ref()
+                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .transpose()?;
+                let v_bias = v_bias_host
+                    .as_ref()
+                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .transpose()?;
+
+                // Optional QK-norm (Qwen3 has these, Qwen2/2.5 do not)
+                let q_norm = if loader.contains(&format!("{prefix}.attn_q_norm.weight")) {
+                    let h =
+                        FormatLoader::load_f32(loader, &format!("{prefix}.attn_q_norm.weight"))?;
+                    Some(B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?)
+                } else {
+                    None
+                };
+                let k_norm = if loader.contains(&format!("{prefix}.attn_k_norm.weight")) {
+                    let h =
+                        FormatLoader::load_f32(loader, &format!("{prefix}.attn_k_norm.weight"))?;
+                    Some(B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?)
+                } else {
+                    None
+                };
+
+                QwenAttentionWeights {
+                    q_proj: B::upload_host_linear(&device, &q_host)?,
+                    kv_proj,
+                    o_proj: B::upload_host_linear(&device, &o_host)?,
+                    q_bias,
+                    k_bias,
+                    v_bias,
+                    q_norm,
+                    k_norm,
+                }
+            };
+
+            let ffn_norm_host =
+                FormatLoader::load_f32(loader, &format!("{prefix}.ffn_norm.weight"))?;
+            let post_attention_layernorm =
+                B::from_f32_slice(&device, &ffn_norm_host.shape, ffn_norm_host.as_f32_slice())?;
+
+            let ffn = {
+                let gate_host = host_load_linear(loader, &format!("{prefix}.ffn_gate.weight"))?;
+                let up_host = host_load_linear(loader, &format!("{prefix}.ffn_up.weight"))?;
+
+                let gate_up = if let (HostLinearWeight::Dense(g), HostLinearWeight::Dense(u)) =
+                    (&gate_host, &up_host)
+                {
+                    let fused = host_concat_inner_dim(g, u);
+                    let fused_tensor =
+                        B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                    GateUpWeight::<B>::Fused {
+                        weight: fused_tensor,
+                        intermediate_size: config.intermediate_size,
+                    }
+                } else {
+                    let g_dev = B::upload_host_linear(&device, &gate_host)?;
+                    let u_dev = B::upload_host_linear(&device, &up_host)?;
+                    GateUpWeight::<B>::Separate {
+                        gate_proj: Box::new(g_dev),
+                        up_proj: Box::new(u_dev),
+                    }
+                };
+
+                QwenFfnWeights::Dense(Box::new(MlpWeights {
+                    gate_up,
+                    down_proj: B::upload_host_linear(
+                        &device,
+                        &host_load_linear(loader, &format!("{prefix}.ffn_down.weight"))?,
+                    )?,
+                }))
+            };
+
+            layers.push(QwenLayerWeights {
+                input_layernorm,
+                attention,
+                post_attention_layernorm,
+                ffn,
+            });
+        }
+
+        let norm_host = FormatLoader::load_f32(loader, "output_norm.weight")?;
+        let norm = B::from_f32_slice(&device, &norm_host.shape, norm_host.as_f32_slice())?;
+
+        // lm_head: check tied embeddings or explicit output weight
+        let lm_head = if config.tie_word_embeddings {
+            let embd_dtype = FormatLoader::get_dtype(loader, "token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                B::upload_host_linear(
+                    &device,
+                    &HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                        loader,
+                        "token_embd.weight",
+                    )?),
+                )?
+            } else {
+                let transposed = host_transpose_2d(&embed_host)?;
+                B::upload_host_linear(&device, &HostLinearWeight::Dense(transposed))?
+            }
+        } else if loader.contains("output.weight") {
+            B::upload_host_linear(&device, &host_load_linear(loader, "output.weight")?)?
+        } else {
+            // Fallback to tied embeddings
+            let embd_dtype = FormatLoader::get_dtype(loader, "token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                B::upload_host_linear(
+                    &device,
+                    &HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                        loader,
+                        "token_embd.weight",
+                    )?),
+                )?
+            } else {
+                let transposed = host_transpose_2d(&embed_host)?;
+                B::upload_host_linear(&device, &HostLinearWeight::Dense(transposed))?
+            }
+        };
+
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            head_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
+            None,
+            DType::F32,
+        )?;
+
+        Ok(Self {
+            tp_num_heads: config.num_attention_heads,
+            tp_num_kv_heads: num_kv_heads,
+            dtype: DType::F32,
+            config,
+            device,
+            gpu_config: GpuConfig::Single,
+            comm: None,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+            _backend: PhantomData,
+        })
+    }
+
+    /// Load a Qwen model from a GGUF file.
+    ///
+    /// Parses the GGUF file (CPU-only), then uploads weights to the device
+    /// via the generic [`load_weights_gguf`](Self::load_weights_gguf) method.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be parsed or weights fail to load.
+    pub fn from_gguf(device: &B::DeviceHandle, gguf_path: impl AsRef<Path>) -> Result<Self> {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(gguf_path)?;
+        let config = QwenConfig::from_gguf_metadata(loader.metadata())?;
+        Self::load_weights_gguf(device.clone(), config, &loader)
+    }
+
     /// Load a SafeTensors model from a directory.
     ///
     /// # Errors

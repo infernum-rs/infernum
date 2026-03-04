@@ -237,6 +237,100 @@ impl QwenConfig {
         self.is_moe() && (layer_idx + 1).is_multiple_of(self.decoder_sparse_step)
     }
 
+    /// Build a `QwenConfig` from GGUF metadata key-value pairs.
+    ///
+    /// GGUF metadata uses keys like `qwen2.embedding_length`, `qwen2.block_count`, etc.
+    /// llama.cpp uses `qwen2` as the architecture string for all Qwen models
+    /// (Qwen2, Qwen2.5, Qwen3), but we also accept `qwen3` as a fallback.
+    ///
+    /// # Errors
+    /// Returns an error if required metadata keys are missing.
+    pub fn from_gguf_metadata(
+        metadata: &std::collections::HashMap<String, infernum::GgufValue>,
+    ) -> Result<Self> {
+        use infernum::GgufValue;
+
+        // Detect architecture prefix (qwen2 or qwen3)
+        let arch = metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .unwrap_or("qwen2");
+
+        let get_usize = |key: &str| -> Result<usize> {
+            metadata
+                .get(key)
+                .and_then(GgufValue::as_usize)
+                .ok_or_else(|| {
+                    infernum::Error::InvalidShape(format!("Missing GGUF metadata: {key}"))
+                })
+        };
+
+        let get_f32 = |key: &str, default: f32| -> f32 {
+            metadata
+                .get(key)
+                .and_then(GgufValue::as_f32)
+                .unwrap_or(default)
+        };
+
+        let hidden_size = get_usize(&format!("{arch}.embedding_length"))?;
+        let num_attention_heads = get_usize(&format!("{arch}.attention.head_count"))?;
+
+        let num_key_value_heads = metadata
+            .get(&format!("{arch}.attention.head_count_kv"))
+            .and_then(GgufValue::as_usize);
+
+        // Explicit head_dim from GGUF (Qwen3 uses this)
+        let explicit_head_dim = metadata
+            .get(&format!("{arch}.attention.key_length"))
+            .and_then(GgufValue::as_usize);
+
+        let sliding_window = metadata
+            .get(&format!("{arch}.attention.sliding_window"))
+            .and_then(GgufValue::as_usize)
+            .filter(|&w| w > 0);
+
+        Ok(Self {
+            vocab_size: get_usize(&format!("{arch}.vocab_size"))
+                .or_else(|_| get_usize("tokenizer.ggml.tokens_count"))
+                .unwrap_or(151_936),
+            hidden_size,
+            intermediate_size: get_usize(&format!("{arch}.feed_forward_length"))?,
+            num_hidden_layers: get_usize(&format!("{arch}.block_count"))?,
+            num_attention_heads,
+            num_key_value_heads,
+            explicit_head_dim,
+            max_position_embeddings: get_usize(&format!("{arch}.context_length")).unwrap_or(2048),
+            rms_norm_eps: get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-6),
+            rope_theta: get_f32(&format!("{arch}.rope.freq_base"), 10000.0),
+            tie_word_embeddings: metadata
+                .get(&format!("{arch}.tie_word_embeddings"))
+                .and_then(GgufValue::as_bool)
+                .unwrap_or(false),
+            #[allow(clippy::cast_possible_truncation)]
+            bos_token_id: metadata
+                .get("tokenizer.ggml.bos_token_id")
+                .and_then(GgufValue::as_usize)
+                .unwrap_or(1) as u32,
+            #[allow(clippy::cast_possible_truncation)]
+            eos_token_id: metadata
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(GgufValue::as_usize)
+                .unwrap_or(2) as u32,
+            quantization_config: None,
+            rope_scaling: None,
+            // MoE fields — not supported for GGUF yet
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            norm_topk_prob: true,
+            decoder_sparse_step: 1,
+            sliding_window,
+            use_sliding_window: sliding_window.is_some(),
+            max_window_layers: None,
+        })
+    }
+
     /// Get the number of key-value heads (for grouped-query attention)
     #[must_use]
     pub fn num_kv_heads(&self) -> usize {
@@ -629,5 +723,113 @@ mod tests {
         assert!(!config.use_sliding_window);
         assert_eq!(config.max_window_layers, None);
         assert_eq!(config.effective_sliding_window(0), None);
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_qwen2() {
+        use infernum::GgufValue;
+        use std::collections::HashMap;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("qwen2".into()),
+        );
+        meta.insert("qwen2.embedding_length".into(), GgufValue::U32(896));
+        meta.insert("qwen2.block_count".into(), GgufValue::U32(24));
+        meta.insert("qwen2.attention.head_count".into(), GgufValue::U32(14));
+        meta.insert("qwen2.attention.head_count_kv".into(), GgufValue::U32(2));
+        meta.insert("qwen2.feed_forward_length".into(), GgufValue::U32(4864));
+        meta.insert("qwen2.context_length".into(), GgufValue::U32(32768));
+        meta.insert(
+            "qwen2.attention.layer_norm_rms_epsilon".into(),
+            GgufValue::F32(1e-6),
+        );
+        meta.insert("qwen2.rope.freq_base".into(), GgufValue::F32(1_000_000.0));
+        meta.insert("qwen2.vocab_size".into(), GgufValue::U32(151936));
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::U32(151643));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(151645));
+
+        let config = QwenConfig::from_gguf_metadata(&meta).unwrap();
+
+        assert_eq!(config.hidden_size, 896);
+        assert_eq!(config.num_hidden_layers, 24);
+        assert_eq!(config.num_attention_heads, 14);
+        assert_eq!(config.num_kv_heads(), 2);
+        assert_eq!(config.head_dim(), 64); // 896/14
+        assert_eq!(config.intermediate_size, 4864);
+        assert_eq!(config.max_position_embeddings, 32768);
+        assert!((config.rms_norm_eps - 1e-6).abs() < 1e-10);
+        assert!((config.rope_theta - 1_000_000.0).abs() < 1.0);
+        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.bos_token_id, 151643);
+        assert_eq!(config.eos_token_id, 151645);
+        assert!(!config.is_moe());
+        assert!(config.rope_scaling.is_none());
+        assert!(config.quantization_config.is_none());
+        // No explicit head_dim → None
+        assert!(config.explicit_head_dim.is_none());
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_qwen3_with_head_dim() {
+        use infernum::GgufValue;
+        use std::collections::HashMap;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("qwen2".into()),
+        );
+        meta.insert("qwen2.embedding_length".into(), GgufValue::U32(1024));
+        meta.insert("qwen2.block_count".into(), GgufValue::U32(28));
+        meta.insert("qwen2.attention.head_count".into(), GgufValue::U32(16));
+        meta.insert("qwen2.attention.head_count_kv".into(), GgufValue::U32(8));
+        meta.insert("qwen2.attention.key_length".into(), GgufValue::U32(128));
+        meta.insert("qwen2.feed_forward_length".into(), GgufValue::U32(2816));
+        meta.insert("qwen2.context_length".into(), GgufValue::U32(40960));
+        meta.insert(
+            "qwen2.attention.layer_norm_rms_epsilon".into(),
+            GgufValue::F32(1e-6),
+        );
+        meta.insert("qwen2.rope.freq_base".into(), GgufValue::F32(1_000_000.0));
+
+        let config = QwenConfig::from_gguf_metadata(&meta).unwrap();
+
+        assert_eq!(config.hidden_size, 1024);
+        assert_eq!(config.num_kv_heads(), 8);
+        // Explicit head_dim (128) overrides hidden_size/num_heads (64)
+        assert_eq!(config.explicit_head_dim, Some(128));
+        assert_eq!(config.head_dim(), 128);
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_with_sliding_window() {
+        use infernum::GgufValue;
+        use std::collections::HashMap;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("qwen2".into()),
+        );
+        meta.insert("qwen2.embedding_length".into(), GgufValue::U32(2048));
+        meta.insert("qwen2.block_count".into(), GgufValue::U32(36));
+        meta.insert("qwen2.attention.head_count".into(), GgufValue::U32(16));
+        meta.insert("qwen2.attention.head_count_kv".into(), GgufValue::U32(4));
+        meta.insert("qwen2.feed_forward_length".into(), GgufValue::U32(8192));
+        meta.insert(
+            "qwen2.attention.sliding_window".into(),
+            GgufValue::U32(4096),
+        );
+
+        let config = QwenConfig::from_gguf_metadata(&meta).unwrap();
+
+        assert_eq!(config.sliding_window, Some(4096));
+        assert!(config.use_sliding_window);
+        // max_window_layers not in GGUF → None → all layers use SWA
+        assert_eq!(config.max_window_layers, None);
+        assert_eq!(config.effective_sliding_window(0), Some(4096));
+        assert_eq!(config.effective_sliding_window(35), Some(4096));
     }
 }

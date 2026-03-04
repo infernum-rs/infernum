@@ -839,6 +839,275 @@ impl<B: GemmaOps> GemmaModel<B> {
         })
     }
 
+    /// Load Gemma model weights from a GGUF file (CPU-parsed, uploaded to device).
+    ///
+    /// # Errors
+    /// Returns an error if any weight fails to load or upload.
+    #[allow(clippy::too_many_lines)]
+    pub fn load_weights_gguf(
+        device: B::DeviceHandle,
+        config: GemmaConfig,
+        loader: &infernum::weights::gguf::GgufLoader,
+    ) -> Result<Self> {
+        use infernum::weights::format::FormatLoader;
+        use infernum::weights::format::{host_transpose_2d, host_unpermute_f32};
+        use infernum::weights::host::{host_concat_inner_dim, HostLinearWeight};
+
+        /// Load a GGUF tensor as a linear weight (dense or quantized).
+        fn host_load_linear(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                    loader, name,
+                )?))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&tensor)?))
+            }
+        }
+
+        /// Load a GGUF Q/K weight with head-dimension unpermuting.
+        fn host_load_linear_unpermute(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+            n_head: usize,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(
+                    FormatLoader::load_quantized_unpermute(loader, name, n_head)?,
+                ))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                let unpermuted = host_unpermute_f32(&tensor, n_head)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&unpermuted)?))
+            }
+        }
+
+        /// Load a Gemma RMSNorm weight from GGUF with +1.0 adjustment on host.
+        fn host_load_gemma_norm<B2: Backend + TensorFactory>(
+            loader: &infernum::weights::gguf::GgufLoader,
+            device: &B2::DeviceHandle,
+            name: &str,
+        ) -> Result<B2::Tensor> {
+            let host = FormatLoader::load_f32(loader, name)?;
+            let mut data: Vec<f32> = host.as_f32_slice().to_vec();
+            for v in &mut data {
+                *v += 1.0;
+            }
+            B2::from_f32_slice(device, &host.shape, &data)
+        }
+
+        let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
+        let embed_tokens =
+            B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("blk.{i}");
+
+            let input_layernorm =
+                host_load_gemma_norm::<B>(loader, &device, &format!("{prefix}.attn_norm.weight"))?;
+            let post_attention_layernorm = host_load_gemma_norm::<B>(
+                loader,
+                &device,
+                &format!("{prefix}.attn_post_norm.weight"),
+            )?;
+            let pre_feedforward_layernorm =
+                host_load_gemma_norm::<B>(loader, &device, &format!("{prefix}.ffn_norm.weight"))?;
+            let post_feedforward_layernorm = host_load_gemma_norm::<B>(
+                loader,
+                &device,
+                &format!("{prefix}.post_ffw_norm.weight"),
+            )?;
+
+            let attention = {
+                let k_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_k.weight"),
+                    config.num_key_value_heads,
+                )?;
+                let v_host = host_load_linear(loader, &format!("{prefix}.attn_v.weight"))?;
+
+                let kv_proj = if let (HostLinearWeight::Dense(k_t), HostLinearWeight::Dense(v_t)) =
+                    (&k_host, &v_host)
+                {
+                    let fused = host_concat_inner_dim(k_t, v_t);
+                    let fused_tensor =
+                        B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                    KvProjWeight::<B>::Fused {
+                        kv_dim: config.num_key_value_heads * config.head_dim,
+                        weight: fused_tensor,
+                    }
+                } else {
+                    let k_dev = B::upload_host_linear(&device, &k_host)?;
+                    let v_dev = B::upload_host_linear(&device, &v_host)?;
+                    KvProjWeight::<B>::Separate {
+                        k_proj: Box::new(k_dev),
+                        v_proj: Box::new(v_dev),
+                    }
+                };
+
+                let q_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_q.weight"),
+                    config.num_attention_heads,
+                )?;
+                let o_host = host_load_linear(loader, &format!("{prefix}.attn_output.weight"))?;
+
+                // Optional QK-norm (Gemma 3 only) — also needs +1.0 adjustment
+                let q_norm = if loader.contains(&format!("{prefix}.attn_q_norm.weight")) {
+                    Some(host_load_gemma_norm::<B>(
+                        loader,
+                        &device,
+                        &format!("{prefix}.attn_q_norm.weight"),
+                    )?)
+                } else {
+                    None
+                };
+                let k_norm = if loader.contains(&format!("{prefix}.attn_k_norm.weight")) {
+                    Some(host_load_gemma_norm::<B>(
+                        loader,
+                        &device,
+                        &format!("{prefix}.attn_k_norm.weight"),
+                    )?)
+                } else {
+                    None
+                };
+
+                GemmaAttentionWeights {
+                    q_proj: B::upload_host_linear(&device, &q_host)?,
+                    kv_proj,
+                    o_proj: B::upload_host_linear(&device, &o_host)?,
+                    q_norm,
+                    k_norm,
+                }
+            };
+
+            let mlp = {
+                let gate_host = host_load_linear(loader, &format!("{prefix}.ffn_gate.weight"))?;
+                let up_host = host_load_linear(loader, &format!("{prefix}.ffn_up.weight"))?;
+
+                let gate_up = if let (HostLinearWeight::Dense(g), HostLinearWeight::Dense(u)) =
+                    (&gate_host, &up_host)
+                {
+                    let fused = host_concat_inner_dim(g, u);
+                    let fused_tensor =
+                        B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                    GateUpWeight::<B>::Fused {
+                        weight: fused_tensor,
+                        intermediate_size: config.intermediate_size,
+                    }
+                } else {
+                    let g_dev = B::upload_host_linear(&device, &gate_host)?;
+                    let u_dev = B::upload_host_linear(&device, &up_host)?;
+                    GateUpWeight::<B>::Separate {
+                        gate_proj: Box::new(g_dev),
+                        up_proj: Box::new(u_dev),
+                    }
+                };
+
+                GemmaMlpWeights {
+                    gate_up,
+                    down_proj: B::upload_host_linear(
+                        &device,
+                        &host_load_linear(loader, &format!("{prefix}.ffn_down.weight"))?,
+                    )?,
+                }
+            };
+
+            layers.push(GemmaLayerWeights {
+                input_layernorm,
+                post_attention_layernorm,
+                pre_feedforward_layernorm,
+                post_feedforward_layernorm,
+                attention,
+                mlp,
+            });
+        }
+
+        let norm = host_load_gemma_norm::<B>(loader, &device, "output_norm.weight")?;
+
+        // Gemma always ties word embeddings
+        let embd_dtype = FormatLoader::get_dtype(loader, "token_embd.weight")?;
+        let lm_head = if embd_dtype.is_quantized() {
+            B::upload_host_linear(
+                &device,
+                &HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                    loader,
+                    "token_embd.weight",
+                )?),
+            )?
+        } else {
+            let transposed = host_transpose_2d(&embed_host)?;
+            B::upload_host_linear(&device, &HostLinearWeight::Dense(transposed))?
+        };
+
+        let local_theta = config.rope_local_base_freq.unwrap_or(config.rope_theta);
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.head_dim,
+            config.max_position_embeddings,
+            local_theta,
+            None,
+            DType::F32,
+        )?;
+
+        let (cos_cache_global, sin_cache_global) = if config.rope_local_base_freq.is_some() {
+            let (cos_g, sin_g) = transformer::build_rope_cache::<B>(
+                &device,
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                DType::F32,
+            )?;
+            (Some(cos_g), Some(sin_g))
+        } else {
+            (None, None)
+        };
+
+        let embed_scale = (config.hidden_size as f32).sqrt();
+        let attn_scale = config.attn_scale();
+
+        Ok(Self {
+            tp_num_heads: config.num_attention_heads,
+            tp_num_kv_heads: config.num_key_value_heads,
+            dtype: DType::F32,
+            config,
+            device,
+            gpu_config: GpuConfig::Single,
+            comm: None,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            embed_scale,
+            attn_scale,
+            cos_cache,
+            sin_cache,
+            cos_cache_global,
+            sin_cache_global,
+            _backend: PhantomData,
+        })
+    }
+
+    /// Load a Gemma model from a GGUF file.
+    ///
+    /// Parses the GGUF file (CPU-only), then uploads weights to the device
+    /// via the generic [`load_weights_gguf`](Self::load_weights_gguf) method.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be parsed or weights fail to load.
+    pub fn from_gguf(device: &B::DeviceHandle, gguf_path: impl AsRef<Path>) -> Result<Self> {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(gguf_path)?;
+        let config = GemmaConfig::from_gguf_metadata(loader.metadata())?;
+        Self::load_weights_gguf(device.clone(), config, &loader)
+    }
+
     /// Load a SafeTensors model from a directory.
     ///
     /// # Errors

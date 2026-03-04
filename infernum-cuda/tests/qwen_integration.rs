@@ -258,3 +258,63 @@ mod qwen3_moe_tiny {
         assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
     }
 }
+
+// ─── Qwen2.5-0.5B-Instruct GGUF Q8_0 (CUDA) ───────────────────────────────
+
+/// Qwen2.5-0.5B-Instruct quantized to Q8_0 (~507MB GGUF).
+/// Tests GGUF weight loading on CUDA, Q/K/V biases, and generation quality.
+mod qwen25_05b_q8_gguf {
+    use super::*;
+
+    use infernum::tokenizer::GgufTokenizer;
+    use infernum::Tokenizer as _;
+    use test_helpers::download_model_files;
+
+    const REPO: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+    const GGUF_FILE: &str = "qwen2.5-0.5b-instruct-q8_0.gguf";
+
+    fn gguf_path() -> PathBuf {
+        let dir = download_model_files(REPO, &[GGUF_FILE]);
+        dir.join(GGUF_FILE)
+    }
+
+    #[test]
+    fn no_nan_in_output() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let path = gguf_path();
+        let model = QwenModel::<CudaBackend>::from_gguf(&ctx, &path).expect("Failed to load GGUF");
+
+        // BOS=151643, "Hello"=9707
+        let input_ids = vec![151643, 9707];
+
+        let logits = model.forward_full(&input_ids).expect("Forward pass failed");
+        let logits_vec: Vec<f32> = logits.to_vec().expect("Failed to read logits");
+
+        let nan_count = logits_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|x| x.is_infinite()).count();
+
+        assert_eq!(nan_count, 0, "Found {nan_count} NaN values in logits");
+        assert_eq!(inf_count, 0, "Found {inf_count} Inf values in logits");
+    }
+
+    #[test]
+    fn capital_of_france() {
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+        let path = gguf_path();
+        let model = QwenModel::<CudaBackend>::from_gguf(&ctx, &path).expect("Failed to load GGUF");
+
+        let loader =
+            infernum::weights::gguf::GgufLoader::from_file(&path).expect("Failed to parse GGUF");
+        let tokenizer = GgufTokenizer::from_gguf_metadata(loader.metadata())
+            .expect("Failed to load GGUF tokenizer");
+
+        let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");
+        let output = runtime
+            .generate("The capital of France is", &greedy_options(30))
+            .expect("Generation failed");
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in Q8_0 output, got: {output}"
+        );
+    }
+}
