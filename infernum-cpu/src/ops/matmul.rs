@@ -44,21 +44,42 @@ fn gemm_row(a_row: &[f32], bt: &[f32], c_row: &mut [f32], k: usize, n: usize) {
 
 /// Standard gemm: `A (M,K) × B (K,N) → C (M,N)`.
 ///
-/// Transposes B once, then computes each `C[m,n] = dot(A[m,:], Bᵀ[n,:])`
-/// using SIMD. Output rows are parallelized with Rayon when M > 1.
+/// Transposes B once, then delegates to `gemm_with_bt`.
 #[allow(clippy::many_single_char_names)]
 fn gemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let bt = transpose(b, k, n);
+    gemm_with_bt(a, &bt, m, k, n)
+}
+
+/// GEMM using a pre-transposed weight `Bᵀ (N,K)`.
+///
+/// `C[m,n] = dot(A[m,:], Bᵀ[n,:])` — each dot product is contiguous SIMD.
+/// - M=1 (GEMV / decode): parallel over output columns (N independent dot products).
+/// - M>1 (prefill): parallel over output rows.
+#[allow(clippy::many_single_char_names)]
+fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
 
     if m == 1 {
-        // GEMV (decode phase): single row, skip thread-pool overhead
-        gemm_row(&a[..k], &bt, &mut c[..n], k, n);
+        // GEMV: parallel over chunks of output columns to amortize Rayon overhead.
+        let a_row = &a[..k];
+        // Each chunk processes ≥64 columns — balances parallelism vs. overhead.
+        let chunk_size = (n / rayon::current_num_threads()).max(64).min(n);
+        c.par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, c_chunk)| {
+                let col_start = chunk_idx * chunk_size;
+                for (i, out) in c_chunk.iter_mut().enumerate() {
+                    let col = col_start + i;
+                    let bt_row = &bt[col * k..(col + 1) * k];
+                    *out = simd::dot_f32(a_row, bt_row);
+                }
+            });
     } else {
         // Parallel over output rows
         c.par_chunks_mut(n).enumerate().for_each(|(row, c_row)| {
             let a_row = &a[row * k..(row + 1) * k];
-            gemm_row(a_row, &bt, c_row, k, n);
+            gemm_row(a_row, bt, c_row, k, n);
         });
     }
 
@@ -243,24 +264,45 @@ impl MatmulOps for CpuBackend {
 
     fn linear(input: &CpuTensor, weight: &CpuLinearWeight) -> Result<CpuTensor> {
         match weight {
-            CpuLinearWeight::Dense(w) => Self::matmul(input, w),
+            CpuLinearWeight::Dense { weight_nt, .. } => {
+                // Use pre-transposed weight (N,K) — no per-call transpose needed
+                let nt_shape = weight_nt.shape();
+                let n = nt_shape[0];
+                let k = nt_shape[1];
+
+                let i_shape = input.shape();
+                let m: usize = i_shape[..i_shape.len() - 1].iter().product();
+
+                assert_eq!(
+                    *i_shape.last().unwrap(),
+                    k,
+                    "linear: input last dim {} != weight in_features {k}",
+                    i_shape.last().unwrap(),
+                );
+
+                let output = gemm_with_bt(input.as_f32_slice(), weight_nt.as_f32_slice(), m, k, n);
+
+                let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
+                out_shape.push(n);
+                Ok(CpuTensor::from_f32(&out_shape, &output))
+            }
             CpuLinearWeight::Quantized(w) => quantized_linear(input, w),
         }
     }
 
     fn as_dense_weight(weight: &CpuLinearWeight) -> Option<&CpuTensor> {
         match weight {
-            CpuLinearWeight::Dense(t) => Some(t),
+            CpuLinearWeight::Dense { weight, .. } => Some(weight),
             CpuLinearWeight::Quantized(_) => None,
         }
     }
 
     fn dense_weight(tensor: CpuTensor) -> CpuLinearWeight {
-        CpuLinearWeight::Dense(tensor)
+        CpuLinearWeight::new_dense(tensor)
     }
 
     fn is_dense_weight(weight: &CpuLinearWeight) -> bool {
-        matches!(weight, CpuLinearWeight::Dense(_))
+        matches!(weight, CpuLinearWeight::Dense { .. })
     }
 
     fn quantize_to_q8(_device: &(), shape: &[usize], data: &[f32]) -> Result<CpuLinearWeight> {
@@ -329,7 +371,7 @@ impl MatmulOps for CpuBackend {
                         )));
                     }
                 };
-                Ok(CpuLinearWeight::Dense(CpuTensor::from_f32(
+                Ok(CpuLinearWeight::new_dense(CpuTensor::from_f32(
                     &host_tensor.shape,
                     &f32_data,
                 )))
@@ -744,7 +786,7 @@ mod tests {
     fn test_linear_dispatch_dense() {
         let input = CpuTensor::from_f32(&[1, 3], &[1.0, 2.0, 3.0]);
         #[rustfmt::skip]
-        let weight = CpuLinearWeight::Dense(CpuTensor::from_f32(&[3, 2], &[
+        let weight = CpuLinearWeight::new_dense(CpuTensor::from_f32(&[3, 2], &[
             1.0, 2.0,
             1.0, 2.0,
             1.0, 2.0,

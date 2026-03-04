@@ -184,10 +184,44 @@ pub struct CpuQuantizedWeight {
 /// A linear weight — dense f32 or block-quantized.
 #[derive(Clone)]
 pub enum CpuLinearWeight {
-    /// Dense f32 weight, pre-transposed to `(in_features, out_features)`.
-    Dense(CpuTensor),
+    /// Dense f32 weight.
+    ///
+    /// - `weight`: original layout `(in_features, out_features)` = `(K, N)`,
+    ///   used by `as_dense_weight()` for fusion ops like `concat_inner_dim`.
+    /// - `weight_nt`: pre-transposed to `(out_features, in_features)` = `(N, K)`,
+    ///   used by matmul/GEMV for contiguous dot products (avoids per-call transpose).
+    Dense {
+        weight: CpuTensor,
+        weight_nt: CpuTensor,
+    },
     /// Block-quantized weight in `(out_features, in_features)` layout.
     Quantized(CpuQuantizedWeight),
+}
+
+impl CpuLinearWeight {
+    /// Create a dense weight from a `(K, N)` tensor, pre-computing the transposed layout.
+    ///
+    /// The transposed copy is always stored as f32 (used by matmul kernels).
+    /// The original tensor is kept as-is for fusion ops like `concat_inner_dim`.
+    #[must_use]
+    pub fn new_dense(weight: CpuTensor) -> Self {
+        let shape = weight.shape();
+        assert!(shape.len() == 2, "Dense weight must be 2D, got {shape:?}");
+        let k = shape[0];
+        let n = shape[1];
+        let data = weight.to_f32_vec();
+
+        // Transpose (K, N) → (N, K)
+        let mut nt = vec![0.0f32; n * k];
+        for row in 0..k {
+            for col in 0..n {
+                nt[col * k + row] = data[row * n + col];
+            }
+        }
+        let weight_nt = CpuTensor::from_f32(&[n, k], &nt);
+
+        Self::Dense { weight, weight_nt }
+    }
 }
 
 impl Tensor for CpuTensor {

@@ -186,7 +186,7 @@ impl WeightLoader<CpuBackend> for CpuSafeTensorsLoader {
                 transposed[c * out_features + r] = f32_data[r * in_features + c];
             }
         }
-        Ok(CpuLinearWeight::Dense(CpuTensor::from_f32(
+        Ok(CpuLinearWeight::new_dense(CpuTensor::from_f32(
             &[in_features, out_features],
             &transposed,
         )))
