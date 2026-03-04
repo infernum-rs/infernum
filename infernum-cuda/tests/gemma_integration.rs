@@ -523,7 +523,6 @@ mod gemma2_2b_q8_gguf {
     use super::*;
 
     use infernum::tokenizer::GgufTokenizer;
-    use infernum::Tokenizer as _;
     use test_helpers::download_model_files;
 
     const REPO: &str = "bartowski/gemma-2-2b-it-GGUF";
