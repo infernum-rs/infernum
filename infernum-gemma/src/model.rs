@@ -887,18 +887,18 @@ impl<B: GemmaOps> GemmaModel<B> {
             }
         }
 
-        /// Load a Gemma RMSNorm weight from GGUF with +1.0 adjustment on host.
+        /// Load a Gemma RMSNorm weight from GGUF (no adjustment needed).
+        ///
+        /// llama.cpp's `convert_hf_to_gguf.py` already adds +1.0 to all Gemma
+        /// norm weights during conversion, so GGUF files store them in standard
+        /// `x * w` form.  We load them directly without further adjustment.
         fn host_load_gemma_norm<B2: Backend + TensorFactory>(
             loader: &infernum::weights::gguf::GgufLoader,
             device: &B2::DeviceHandle,
             name: &str,
         ) -> Result<B2::Tensor> {
             let host = FormatLoader::load_f32(loader, name)?;
-            let mut data: Vec<f32> = host.as_f32_slice().to_vec();
-            for v in &mut data {
-                *v += 1.0;
-            }
-            B2::from_f32_slice(device, &host.shape, &data)
+            B2::from_f32_slice(device, &host.shape, host.as_f32_slice())
         }
 
         let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
