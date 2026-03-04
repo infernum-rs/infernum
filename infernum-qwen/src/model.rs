@@ -398,8 +398,8 @@ impl<B: QwenOps> QwenModel<B> {
         config: QwenConfig,
         loader: &infernum::weights::gguf::GgufLoader,
     ) -> Result<Self> {
+        use infernum::weights::format::host_transpose_2d;
         use infernum::weights::format::FormatLoader;
-        use infernum::weights::format::{host_transpose_2d, host_unpermute_f32};
         use infernum::weights::host::{host_concat_inner_dim, HostLinearWeight};
 
         /// Load a GGUF tensor as a linear weight (dense or quantized).
@@ -415,24 +415,6 @@ impl<B: QwenOps> QwenModel<B> {
             } else {
                 let tensor = FormatLoader::load_f32(loader, name)?;
                 Ok(HostLinearWeight::Dense(host_transpose_2d(&tensor)?))
-            }
-        }
-
-        /// Load a GGUF Q/K weight with head-dimension unpermuting.
-        fn host_load_linear_unpermute(
-            loader: &infernum::weights::gguf::GgufLoader,
-            name: &str,
-            n_head: usize,
-        ) -> Result<HostLinearWeight> {
-            let dtype = FormatLoader::get_dtype(loader, name)?;
-            if dtype.is_quantized() {
-                Ok(HostLinearWeight::Quantized(
-                    FormatLoader::load_quantized_unpermute(loader, name, n_head)?,
-                ))
-            } else {
-                let tensor = FormatLoader::load_f32(loader, name)?;
-                let unpermuted = host_unpermute_f32(&tensor, n_head)?;
-                Ok(HostLinearWeight::Dense(host_transpose_2d(&unpermuted)?))
             }
         }
 
@@ -470,11 +452,7 @@ impl<B: QwenOps> QwenModel<B> {
             )?;
 
             let attention = {
-                let k_host = host_load_linear_unpermute(
-                    loader,
-                    &format!("{prefix}.attn_k.weight"),
-                    num_kv_heads,
-                )?;
+                let k_host = host_load_linear(loader, &format!("{prefix}.attn_k.weight"))?;
                 let v_host = host_load_linear(loader, &format!("{prefix}.attn_v.weight"))?;
 
                 let kv_proj = if let (HostLinearWeight::Dense(k_t), HostLinearWeight::Dense(v_t)) =
@@ -496,26 +474,20 @@ impl<B: QwenOps> QwenModel<B> {
                     }
                 };
 
-                let q_host = host_load_linear_unpermute(
-                    loader,
-                    &format!("{prefix}.attn_q.weight"),
-                    config.num_attention_heads,
-                )?;
+                let q_host = host_load_linear(loader, &format!("{prefix}.attn_q.weight"))?;
                 let o_host = host_load_linear(loader, &format!("{prefix}.attn_output.weight"))?;
 
-                // Optional Q/K/V biases (Qwen2/2.5 have these, Qwen3 does not)
-                let q_bias_host = host_load_bias(loader, &format!("{prefix}.attn_q.bias"))?;
-                let k_bias_host = host_load_bias(loader, &format!("{prefix}.attn_k.bias"))?;
+                // Optional Q/K/V biases (Qwen2/2.5 have these, Qwen3 does not).
+                // Note: Qwen2 GGUF files do NOT permute Q/K weights or biases
+                // (unlike Llama). The converter writes them in HF sequential-
+                // half layout, which matches our RoPE directly.
+                let q_bias = host_load_bias(loader, &format!("{prefix}.attn_q.bias"))?
+                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .transpose()?;
+                let k_bias = host_load_bias(loader, &format!("{prefix}.attn_k.bias"))?
+                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .transpose()?;
                 let v_bias_host = host_load_bias(loader, &format!("{prefix}.attn_v.bias"))?;
-
-                let q_bias = q_bias_host
-                    .as_ref()
-                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
-                    .transpose()?;
-                let k_bias = k_bias_host
-                    .as_ref()
-                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
-                    .transpose()?;
                 let v_bias = v_bias_host
                     .as_ref()
                     .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
