@@ -1,5 +1,7 @@
 //! AttentionOps, KvCacheOps, PagedKvCacheOps, PagedAttentionOps implementations.
 
+use std::sync::Arc;
+
 use infernum::backend::{AttentionOps, KvCacheOps, PagedAttentionOps, PagedKvCacheOps};
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::dtype::DType;
@@ -81,14 +83,20 @@ impl KvCacheOps for CpuBackend {
 // ---- Paged KV Cache ----
 
 /// CPU paged KV cache using block-allocated storage.
+///
+/// Pools are stored as `Arc<Vec<u8>>` so that `CpuTensor` views can share the
+/// same backing allocation without copying. On each token append the pool is
+/// mutated in-place via `Arc::get_mut` (safe because we drop the old tensor
+/// first), then a new tensor is created by cloning the `Arc` (pointer bump,
+/// no data copy).
 pub struct CpuPagedKvCache {
-    /// Per-layer K pool: (num_blocks, block_size, num_kv_heads, head_dim)
-    k_pools: Vec<Vec<f32>>,
-    /// Per-layer V pool: same shape
-    v_pools: Vec<Vec<f32>>,
-    /// K pool tensors (recreated on access for trait compliance)
+    /// Per-layer K pool: (num_blocks, block_size, num_kv_heads, head_dim) as bytes
+    k_pools: Vec<Arc<Vec<u8>>>,
+    /// Per-layer V pool: same shape, as bytes
+    v_pools: Vec<Arc<Vec<u8>>>,
+    /// K pool tensors (share backing storage with k_pools)
     k_tensors: Vec<CpuTensor>,
-    /// V pool tensors
+    /// V pool tensors (share backing storage with v_pools)
     v_tensors: Vec<CpuTensor>,
     block_size: usize,
     num_blocks: usize,
@@ -107,7 +115,7 @@ impl PagedKvCacheOps for CpuBackend {
     ) -> Result<CpuPagedKvCache> {
         let block_size = block_config.block_size;
         let num_blocks = block_config.num_blocks;
-        let pool_size = num_blocks * block_size * num_kv_heads * head_dim;
+        let pool_byte_size = num_blocks * block_size * num_kv_heads * head_dim * 4;
 
         let mut k_pools = Vec::with_capacity(num_layers);
         let mut v_pools = Vec::with_capacity(num_layers);
@@ -116,12 +124,12 @@ impl PagedKvCacheOps for CpuBackend {
         let pool_shape = [num_blocks * block_size, num_kv_heads, head_dim];
 
         for _ in 0..num_layers {
-            let k = vec![0.0f32; pool_size];
-            let v = vec![0.0f32; pool_size];
-            k_tensors.push(CpuTensor::from_f32(&pool_shape, &k));
-            v_tensors.push(CpuTensor::from_f32(&pool_shape, &v));
-            k_pools.push(k);
-            v_pools.push(v);
+            let k_arc = Arc::new(vec![0u8; pool_byte_size]);
+            let v_arc = Arc::new(vec![0u8; pool_byte_size]);
+            k_tensors.push(CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&k_arc)));
+            v_tensors.push(CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&v_arc)));
+            k_pools.push(k_arc);
+            v_pools.push(v_arc);
         }
 
         Ok(CpuPagedKvCache {
@@ -148,6 +156,23 @@ impl PagedKvCacheOps for CpuBackend {
         let v_data = v.as_f32_slice();
         let head_stride = cache.num_kv_heads * cache.head_dim;
         let seq_len = k.shape()[0];
+        let pool_shape = [
+            cache.num_blocks * cache.block_size,
+            cache.num_kv_heads,
+            cache.head_dim,
+        ];
+
+        // Drop old tensors so Arc refcount goes to 1, enabling get_mut.
+        cache.k_tensors[layer_idx] = CpuTensor::zeros_f32(&[1]);
+        cache.v_tensors[layer_idx] = CpuTensor::zeros_f32(&[1]);
+
+        // Mutate pool bytes in-place.
+        let k_pool: &mut Vec<u8> = Arc::get_mut(&mut cache.k_pools[layer_idx])
+            .expect("KV pool Arc should have refcount 1");
+        let v_pool: &mut Vec<u8> = Arc::get_mut(&mut cache.v_pools[layer_idx])
+            .expect("KV pool Arc should have refcount 1");
+        let k_pool_f32: &mut [f32] = bytemuck::cast_slice_mut(k_pool);
+        let v_pool_f32: &mut [f32] = bytemuck::cast_slice_mut(v_pool);
 
         for t in 0..seq_len {
             let pos = start_pos + t;
@@ -157,20 +182,17 @@ impl PagedKvCacheOps for CpuBackend {
             let dst_offset = (physical_block * cache.block_size + block_offset) * head_stride;
             let src_offset = t * head_stride;
 
-            cache.k_pools[layer_idx][dst_offset..dst_offset + head_stride]
+            k_pool_f32[dst_offset..dst_offset + head_stride]
                 .copy_from_slice(&k_data[src_offset..src_offset + head_stride]);
-            cache.v_pools[layer_idx][dst_offset..dst_offset + head_stride]
+            v_pool_f32[dst_offset..dst_offset + head_stride]
                 .copy_from_slice(&v_data[src_offset..src_offset + head_stride]);
         }
 
-        // Rebuild tensors
-        let pool_shape = [
-            cache.num_blocks * cache.block_size,
-            cache.num_kv_heads,
-            cache.head_dim,
-        ];
-        cache.k_tensors[layer_idx] = CpuTensor::from_f32(&pool_shape, &cache.k_pools[layer_idx]);
-        cache.v_tensors[layer_idx] = CpuTensor::from_f32(&pool_shape, &cache.v_pools[layer_idx]);
+        // Rebuild tensors sharing the pool Arc (zero-copy).
+        cache.k_tensors[layer_idx] =
+            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.k_pools[layer_idx]));
+        cache.v_tensors[layer_idx] =
+            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.v_pools[layer_idx]));
 
         Ok(())
     }
@@ -198,6 +220,22 @@ impl PagedKvCacheOps for CpuBackend {
         let bt_data = block_tables.as_i32_slice();
         let pos_data = positions.as_i32_slice();
         let head_stride = cache.num_kv_heads * cache.head_dim;
+        let pool_shape = [
+            cache.num_blocks * cache.block_size,
+            cache.num_kv_heads,
+            cache.head_dim,
+        ];
+
+        // Drop old tensors so Arc refcount goes to 1, enabling get_mut.
+        cache.k_tensors[layer_idx] = CpuTensor::zeros_f32(&[1]);
+        cache.v_tensors[layer_idx] = CpuTensor::zeros_f32(&[1]);
+
+        let k_pool: &mut Vec<u8> = Arc::get_mut(&mut cache.k_pools[layer_idx])
+            .expect("KV pool Arc should have refcount 1");
+        let v_pool: &mut Vec<u8> = Arc::get_mut(&mut cache.v_pools[layer_idx])
+            .expect("KV pool Arc should have refcount 1");
+        let k_pool_f32: &mut [f32] = bytemuck::cast_slice_mut(k_pool);
+        let v_pool_f32: &mut [f32] = bytemuck::cast_slice_mut(v_pool);
 
         for b in 0..batch_size {
             #[allow(clippy::cast_sign_loss)]
@@ -209,19 +247,17 @@ impl PagedKvCacheOps for CpuBackend {
             let dst_offset = (physical_block * cache.block_size + block_offset) * head_stride;
             let src_offset = b * head_stride;
 
-            cache.k_pools[layer_idx][dst_offset..dst_offset + head_stride]
+            k_pool_f32[dst_offset..dst_offset + head_stride]
                 .copy_from_slice(&k_data[src_offset..src_offset + head_stride]);
-            cache.v_pools[layer_idx][dst_offset..dst_offset + head_stride]
+            v_pool_f32[dst_offset..dst_offset + head_stride]
                 .copy_from_slice(&v_data[src_offset..src_offset + head_stride]);
         }
 
-        let pool_shape = [
-            cache.num_blocks * cache.block_size,
-            cache.num_kv_heads,
-            cache.head_dim,
-        ];
-        cache.k_tensors[layer_idx] = CpuTensor::from_f32(&pool_shape, &cache.k_pools[layer_idx]);
-        cache.v_tensors[layer_idx] = CpuTensor::from_f32(&pool_shape, &cache.v_pools[layer_idx]);
+        // Rebuild tensors sharing the pool Arc (zero-copy).
+        cache.k_tensors[layer_idx] =
+            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.k_pools[layer_idx]));
+        cache.v_tensors[layer_idx] =
+            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.v_pools[layer_idx]));
 
         Ok(())
     }
@@ -647,6 +683,8 @@ impl PagedAttentionOps for CpuBackend {
         let head_stride = paged_kv.num_kv_heads * paged_kv.head_dim;
         let mut k_out = Vec::with_capacity(seq_len * head_stride);
         let mut v_out = Vec::with_capacity(seq_len * head_stride);
+        let k_pool_f32: &[f32] = bytemuck::cast_slice(&paged_kv.k_pools[layer_idx]);
+        let v_pool_f32: &[f32] = bytemuck::cast_slice(&paged_kv.v_pools[layer_idx]);
 
         for pos in 0..seq_len {
             let block_idx = pos / paged_kv.block_size;
@@ -654,8 +692,8 @@ impl PagedAttentionOps for CpuBackend {
             let phys_block = block_table.blocks()[block_idx];
             let off = (phys_block * paged_kv.block_size + block_offset) * head_stride;
 
-            k_out.extend_from_slice(&paged_kv.k_pools[layer_idx][off..off + head_stride]);
-            v_out.extend_from_slice(&paged_kv.v_pools[layer_idx][off..off + head_stride]);
+            k_out.extend_from_slice(&k_pool_f32[off..off + head_stride]);
+            v_out.extend_from_slice(&v_pool_f32[off..off + head_stride]);
         }
 
         let shape = [seq_len, paged_kv.num_kv_heads, paged_kv.head_dim];

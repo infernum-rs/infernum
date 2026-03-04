@@ -134,6 +134,20 @@ impl CpuTensor {
         }
     }
 
+    /// Create a tensor that shares an existing `Arc<Vec<u8>>` (zero-copy).
+    ///
+    /// Used by the paged KV cache to avoid re-copying pool data on every
+    /// token append.
+    #[must_use]
+    pub fn from_arc(shape: &[usize], dtype: DType, data: Arc<Vec<u8>>) -> Self {
+        Self {
+            data,
+            offset: 0,
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
     /// Create a zero-filled f32 tensor.
     #[must_use]
     pub fn zeros_f32(shape: &[usize]) -> Self {
