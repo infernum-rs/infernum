@@ -86,14 +86,209 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
     c
 }
 
+/// Recursive binary-split GEMV for Q8_0 via `rayon::join`.
+#[allow(clippy::too_many_arguments)]
+fn q8_gemv_parallel(
+    out: &mut [f32],
+    inp: &[f32],
+    quants: &[u8],
+    scales: &[f32],
+    num_blocks_per_row: usize,
+    quant_bytes_per_row: usize,
+    min_chunk: usize,
+    neuron_offset: usize,
+) {
+    let len = out.len();
+    if len <= min_chunk {
+        for (i, out_val) in out.iter_mut().enumerate() {
+            let neuron = neuron_offset + i;
+            let q_row_start = neuron * quant_bytes_per_row;
+            let s_row_start = neuron * num_blocks_per_row;
+            let mut acc = 0.0f32;
+            for blk in 0..num_blocks_per_row {
+                let scale = scales[s_row_start + blk];
+                let q_start = q_row_start + blk * QUANTIZATION_BLOCK_SIZE;
+                let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
+                acc += simd::dot_q8_block(
+                    &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                    &quants[q_start..q_start + QUANTIZATION_BLOCK_SIZE],
+                    scale,
+                );
+            }
+            *out_val = acc;
+        }
+        return;
+    }
+    let mid = len / 2;
+    let (left, right) = out.split_at_mut(mid);
+    rayon::join(
+        || {
+            q8_gemv_parallel(
+                left,
+                inp,
+                quants,
+                scales,
+                num_blocks_per_row,
+                quant_bytes_per_row,
+                min_chunk,
+                neuron_offset,
+            )
+        },
+        || {
+            q8_gemv_parallel(
+                right,
+                inp,
+                quants,
+                scales,
+                num_blocks_per_row,
+                quant_bytes_per_row,
+                min_chunk,
+                neuron_offset + mid,
+            )
+        },
+    );
+}
+
+/// Recursive binary-split GEMV for Q4_0 via `rayon::join`.
+#[allow(clippy::too_many_arguments)]
+fn q4_gemv_parallel(
+    out: &mut [f32],
+    inp: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    num_blocks_per_row: usize,
+    packed_bytes_per_row: usize,
+    min_chunk: usize,
+    neuron_offset: usize,
+) {
+    let len = out.len();
+    if len <= min_chunk {
+        for (i, out_val) in out.iter_mut().enumerate() {
+            let neuron = neuron_offset + i;
+            let p_row_start = neuron * packed_bytes_per_row;
+            let s_row_start = neuron * num_blocks_per_row;
+            let mut acc = 0.0f32;
+            for blk in 0..num_blocks_per_row {
+                let scale = scales[s_row_start + blk];
+                let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
+                let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
+                acc += simd::dot_q4_block(
+                    &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                    &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
+                    scale,
+                );
+            }
+            *out_val = acc;
+        }
+        return;
+    }
+    let mid = len / 2;
+    let (left, right) = out.split_at_mut(mid);
+    rayon::join(
+        || {
+            q4_gemv_parallel(
+                left,
+                inp,
+                packed,
+                scales,
+                num_blocks_per_row,
+                packed_bytes_per_row,
+                min_chunk,
+                neuron_offset,
+            )
+        },
+        || {
+            q4_gemv_parallel(
+                right,
+                inp,
+                packed,
+                scales,
+                num_blocks_per_row,
+                packed_bytes_per_row,
+                min_chunk,
+                neuron_offset + mid,
+            )
+        },
+    );
+}
+
+/// Recursive binary-split GEMV for Q4_1 via `rayon::join`.
+#[allow(clippy::too_many_arguments)]
+fn q4_1_gemv_parallel(
+    out: &mut [f32],
+    inp: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    mins: &[f32],
+    num_blocks_per_row: usize,
+    packed_bytes_per_row: usize,
+    min_chunk: usize,
+    neuron_offset: usize,
+) {
+    let len = out.len();
+    if len <= min_chunk {
+        for (i, out_val) in out.iter_mut().enumerate() {
+            let neuron = neuron_offset + i;
+            let p_row_start = neuron * packed_bytes_per_row;
+            let s_row_start = neuron * num_blocks_per_row;
+            let mut acc = 0.0f32;
+            for blk in 0..num_blocks_per_row {
+                let scale = scales[s_row_start + blk];
+                let min = mins[s_row_start + blk];
+                let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
+                let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
+                acc += simd::dot_q4_1_block(
+                    &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                    &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
+                    scale,
+                    min,
+                );
+            }
+            *out_val = acc;
+        }
+        return;
+    }
+    let mid = len / 2;
+    let (left, right) = out.split_at_mut(mid);
+    rayon::join(
+        || {
+            q4_1_gemv_parallel(
+                left,
+                inp,
+                packed,
+                scales,
+                mins,
+                num_blocks_per_row,
+                packed_bytes_per_row,
+                min_chunk,
+                neuron_offset,
+            )
+        },
+        || {
+            q4_1_gemv_parallel(
+                right,
+                inp,
+                packed,
+                scales,
+                mins,
+                num_blocks_per_row,
+                packed_bytes_per_row,
+                min_chunk,
+                neuron_offset + mid,
+            )
+        },
+    );
+}
+
 /// Quantized linear: `input (M, K) × weight (N, K)_quantized → output (M, N)`.
 ///
 /// Weight is stored as `(out_features=N, in_features=K)` in block-quantized
 /// format. Scales are pre-decoded to f32 in `CpuQuantizedWeight` so no
 /// f16→f32 conversion happens in the hot path.
 ///
-/// Output neurons are computed in parallel with Rayon; each neuron is an
-/// independent dot product over `num_blocks_per_row` blocks.
+/// Parallelism uses `rayon::join` binary-split instead of parallel iterators
+/// to minimize scheduling overhead. Each leaf task processes a contiguous
+/// chunk of output neurons sequentially.
 #[allow(clippy::many_single_char_names, clippy::too_many_lines)]
 fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<CpuTensor> {
     let i_shape = input.shape();
@@ -116,6 +311,9 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
     let input_data = input.as_f32_slice();
     let mut output = vec![0.0f32; m * n];
 
+    // Minimum neurons per leaf task — avoid splitting below this.
+    let min_chunk = (n / rayon::current_num_threads()).max(64);
+
     match weight.dtype {
         DType::Q8_0 => {
             let quants = &weight.data;
@@ -126,27 +324,16 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                 let inp = &input_data[row * k..(row + 1) * k];
                 let out_row = &mut output[row * n..(row + 1) * n];
 
-                out_row
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(neuron, out_val)| {
-                        let q_row_start = neuron * quant_bytes_per_row;
-                        let s_row_start = neuron * num_blocks_per_row;
-                        let mut acc = 0.0f32;
-
-                        for blk in 0..num_blocks_per_row {
-                            let scale = scales[s_row_start + blk];
-                            let q_start = q_row_start + blk * QUANTIZATION_BLOCK_SIZE;
-                            let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
-
-                            acc += simd::dot_q8_block(
-                                &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
-                                &quants[q_start..q_start + QUANTIZATION_BLOCK_SIZE],
-                                scale,
-                            );
-                        }
-                        *out_val = acc;
-                    });
+                q8_gemv_parallel(
+                    out_row,
+                    inp,
+                    quants,
+                    scales,
+                    num_blocks_per_row,
+                    quant_bytes_per_row,
+                    min_chunk,
+                    0,
+                );
             }
         }
         DType::Q4_0 => {
@@ -158,62 +345,42 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                 let inp = &input_data[row * k..(row + 1) * k];
                 let out_row = &mut output[row * n..(row + 1) * n];
 
-                out_row
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(neuron, out_val)| {
-                        let p_row_start = neuron * packed_bytes_per_row;
-                        let s_row_start = neuron * num_blocks_per_row;
-                        let mut acc = 0.0f32;
-
-                        for blk in 0..num_blocks_per_row {
-                            let scale = scales[s_row_start + blk];
-                            let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
-                            let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
-
-                            acc += simd::dot_q4_block(
-                                &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
-                                &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
-                                scale,
-                            );
-                        }
-                        *out_val = acc;
-                    });
+                q4_gemv_parallel(
+                    out_row,
+                    inp,
+                    packed,
+                    scales,
+                    num_blocks_per_row,
+                    packed_bytes_per_row,
+                    min_chunk,
+                    0,
+                );
             }
         }
         DType::Q4_1 => {
             let packed = &weight.data;
             let scales = &weight.scales;
-            let mins = weight.mins.as_ref().expect("Q4_1 weight missing mins buffer");
+            let mins = weight
+                .mins
+                .as_ref()
+                .expect("Q4_1 weight missing mins buffer");
             let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
 
             for row in 0..m {
                 let inp = &input_data[row * k..(row + 1) * k];
                 let out_row = &mut output[row * n..(row + 1) * n];
 
-                out_row
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(neuron, out_val)| {
-                        let p_row_start = neuron * packed_bytes_per_row;
-                        let s_row_start = neuron * num_blocks_per_row;
-                        let mut acc = 0.0f32;
-
-                        for blk in 0..num_blocks_per_row {
-                            let scale = scales[s_row_start + blk];
-                            let min = mins[s_row_start + blk];
-                            let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
-                            let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
-
-                            acc += simd::dot_q4_1_block(
-                                &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
-                                &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
-                                scale,
-                                min,
-                            );
-                        }
-                        *out_val = acc;
-                    });
+                q4_1_gemv_parallel(
+                    out_row,
+                    inp,
+                    packed,
+                    scales,
+                    mins,
+                    num_blocks_per_row,
+                    packed_bytes_per_row,
+                    min_chunk,
+                    0,
+                );
             }
         }
         other => {

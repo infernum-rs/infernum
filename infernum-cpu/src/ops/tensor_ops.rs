@@ -167,7 +167,10 @@ impl TensorOps for CpuBackend {
                 }
             }
         }
-        Ok(CpuTensor::from_f32_vec(&[seq_len, new_heads, head_dim], out))
+        Ok(CpuTensor::from_f32_vec(
+            &[seq_len, new_heads, head_dim],
+            out,
+        ))
     }
 
     fn concat_rows(parts: &[CpuTensor]) -> Result<CpuTensor> {
