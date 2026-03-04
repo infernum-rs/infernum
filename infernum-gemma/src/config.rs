@@ -206,6 +206,129 @@ impl GemmaConfig {
         }
     }
 
+    /// Build a `GemmaConfig` from GGUF metadata key-value pairs.
+    ///
+    /// GGUF metadata uses keys like `gemma2.embedding_length` or
+    /// `gemma3.embedding_length`. The architecture prefix is read from
+    /// `general.architecture`. Gemma-specific fields like soft-capping and
+    /// layer_types are derived from metadata or sensible defaults.
+    ///
+    /// # Errors
+    /// Returns an error if required metadata keys are missing.
+    pub fn from_gguf_metadata(
+        metadata: &std::collections::HashMap<String, infernum::GgufValue>,
+    ) -> infernum::Result<Self> {
+        use infernum::GgufValue;
+
+        let arch = metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .unwrap_or("gemma2");
+
+        let get_usize = |key: &str| -> infernum::Result<usize> {
+            metadata
+                .get(key)
+                .and_then(GgufValue::as_usize)
+                .ok_or_else(|| {
+                    infernum::Error::InvalidShape(format!("Missing GGUF metadata: {key}"))
+                })
+        };
+
+        let get_f32 = |key: &str, default: f32| -> f32 {
+            metadata
+                .get(key)
+                .and_then(GgufValue::as_f32)
+                .unwrap_or(default)
+        };
+
+        let is_gemma3 = arch == "gemma3";
+        let model_type = if is_gemma3 {
+            "gemma3_text".to_string()
+        } else {
+            "gemma2".to_string()
+        };
+
+        let hidden_size = get_usize(&format!("{arch}.embedding_length"))?;
+        let num_hidden_layers = get_usize(&format!("{arch}.block_count"))?;
+        let num_attention_heads = get_usize(&format!("{arch}.attention.head_count"))?;
+        let num_key_value_heads = metadata
+            .get(&format!("{arch}.attention.head_count_kv"))
+            .and_then(GgufValue::as_usize)
+            .unwrap_or(num_attention_heads);
+
+        let head_dim = metadata
+            .get(&format!("{arch}.attention.key_length"))
+            .and_then(GgufValue::as_usize)
+            .unwrap_or(hidden_size / num_attention_heads);
+
+        let sliding_window = metadata
+            .get(&format!("{arch}.attention.sliding_window"))
+            .and_then(GgufValue::as_usize)
+            .filter(|&w| w > 0);
+
+        // Generate layer_types from pattern
+        let default_pattern = if is_gemma3 { 6 } else { 2 };
+        let sliding_window_pattern = Some(default_pattern);
+        let layer_types = (0..num_hidden_layers)
+            .map(|i| {
+                if (i + 1) % default_pattern != 0 {
+                    "sliding_attention".to_string()
+                } else {
+                    "full_attention".to_string()
+                }
+            })
+            .collect();
+
+        // Soft-capping: Gemma 2 has these in GGUF metadata, Gemma 3 does not
+        let attn_logit_softcapping = metadata
+            .get(&format!("{arch}.attn_logit_softcapping"))
+            .and_then(GgufValue::as_f32)
+            .filter(|&v| v > 0.0);
+        let final_logit_softcapping = metadata
+            .get(&format!("{arch}.final_logit_softcapping"))
+            .and_then(GgufValue::as_f32)
+            .filter(|&v| v > 0.0);
+
+        // query_pre_attn_scalar: derived from head_dim (not stored in GGUF)
+        let query_pre_attn_scalar = head_dim as f32;
+
+        Ok(Self {
+            model_type,
+            vocab_size: get_usize(&format!("{arch}.vocab_size"))
+                .or_else(|_| get_usize("tokenizer.ggml.tokens_count"))
+                .unwrap_or(256_000),
+            hidden_size,
+            intermediate_size: get_usize(&format!("{arch}.feed_forward_length"))?,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            rms_norm_eps: get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-6),
+            max_position_embeddings: get_usize(&format!("{arch}.context_length")).unwrap_or(8192),
+            tie_word_embeddings: true, // Gemma always ties
+            query_pre_attn_scalar,
+            sliding_window,
+            layer_types,
+            sliding_window_pattern,
+            attn_logit_softcapping,
+            final_logit_softcapping,
+            rope_theta: get_f32(&format!("{arch}.rope.freq_base"), 10000.0),
+            rope_local_base_freq: None, // Not stored in GGUF; dual-theta from Gemma 3 JSON only
+            has_qk_norm: is_gemma3,
+            #[allow(clippy::cast_possible_truncation)]
+            bos_token_id: metadata
+                .get("tokenizer.ggml.bos_token_id")
+                .and_then(GgufValue::as_usize)
+                .unwrap_or(2) as u32,
+            #[allow(clippy::cast_possible_truncation)]
+            eos_token_id: metadata
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(GgufValue::as_usize)
+                .unwrap_or(1) as u32,
+            quantization_config: None,
+        })
+    }
+
     /// Returns the effective sliding window for a given layer.
     ///
     /// - For `"sliding_attention"` layers: returns `Some(sliding_window)` if configured
@@ -357,5 +480,112 @@ mod tests {
         assert_eq!(cfg.layer_types.len(), 4);
         assert_eq!(cfg.layer_types[0], "sliding_attention");
         assert_eq!(cfg.layer_types[1], "full_attention");
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_gemma2() {
+        use infernum::GgufValue;
+        use std::collections::HashMap;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("gemma2".into()),
+        );
+        meta.insert("gemma2.embedding_length".into(), GgufValue::U32(2304));
+        meta.insert("gemma2.block_count".into(), GgufValue::U32(26));
+        meta.insert("gemma2.attention.head_count".into(), GgufValue::U32(8));
+        meta.insert("gemma2.attention.head_count_kv".into(), GgufValue::U32(4));
+        meta.insert("gemma2.attention.key_length".into(), GgufValue::U32(256));
+        meta.insert("gemma2.feed_forward_length".into(), GgufValue::U32(9216));
+        meta.insert("gemma2.context_length".into(), GgufValue::U32(8192));
+        meta.insert(
+            "gemma2.attention.layer_norm_rms_epsilon".into(),
+            GgufValue::F32(1e-6),
+        );
+        meta.insert("gemma2.rope.freq_base".into(), GgufValue::F32(10000.0));
+        meta.insert("gemma2.attn_logit_softcapping".into(), GgufValue::F32(50.0));
+        meta.insert(
+            "gemma2.final_logit_softcapping".into(),
+            GgufValue::F32(30.0),
+        );
+        meta.insert(
+            "gemma2.attention.sliding_window".into(),
+            GgufValue::U32(4096),
+        );
+        meta.insert("gemma2.vocab_size".into(), GgufValue::U32(256000));
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::U32(2));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(1));
+
+        let cfg = GemmaConfig::from_gguf_metadata(&meta).unwrap();
+
+        assert_eq!(cfg.model_type, "gemma2");
+        assert!(!cfg.is_gemma3());
+        assert!(!cfg.has_qk_norm);
+        assert_eq!(cfg.hidden_size, 2304);
+        assert_eq!(cfg.num_hidden_layers, 26);
+        assert_eq!(cfg.num_attention_heads, 8);
+        assert_eq!(cfg.num_key_value_heads, 4);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.intermediate_size, 9216);
+        assert_eq!(cfg.attn_logit_softcapping, Some(50.0));
+        assert_eq!(cfg.final_logit_softcapping, Some(30.0));
+        assert_eq!(cfg.sliding_window, Some(4096));
+        assert!(cfg.tie_word_embeddings);
+        assert_eq!(cfg.bos_token_id, 2);
+        assert_eq!(cfg.eos_token_id, 1);
+        assert!((cfg.query_pre_attn_scalar - 256.0).abs() < 1e-6);
+
+        // Gemma 2 pattern=2: layer 0=sliding, 1=full, 2=sliding, ...
+        assert_eq!(cfg.layer_types.len(), 26);
+        assert_eq!(cfg.layer_types[0], "sliding_attention");
+        assert_eq!(cfg.layer_types[1], "full_attention");
+        assert_eq!(cfg.effective_sliding_window(0), Some(4096));
+        assert_eq!(cfg.effective_sliding_window(1), None);
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_gemma3() {
+        use infernum::GgufValue;
+        use std::collections::HashMap;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("gemma3".into()),
+        );
+        meta.insert("gemma3.embedding_length".into(), GgufValue::U32(1152));
+        meta.insert("gemma3.block_count".into(), GgufValue::U32(18));
+        meta.insert("gemma3.attention.head_count".into(), GgufValue::U32(4));
+        meta.insert("gemma3.attention.head_count_kv".into(), GgufValue::U32(1));
+        meta.insert("gemma3.attention.key_length".into(), GgufValue::U32(256));
+        meta.insert("gemma3.feed_forward_length".into(), GgufValue::U32(6912));
+        meta.insert("gemma3.context_length".into(), GgufValue::U32(32768));
+        meta.insert(
+            "gemma3.attention.sliding_window".into(),
+            GgufValue::U32(1024),
+        );
+        meta.insert("gemma3.rope.freq_base".into(), GgufValue::F32(1_000_000.0));
+
+        let cfg = GemmaConfig::from_gguf_metadata(&meta).unwrap();
+
+        assert_eq!(cfg.model_type, "gemma3_text");
+        assert!(cfg.is_gemma3());
+        assert!(cfg.has_qk_norm);
+        assert_eq!(cfg.attn_logit_softcapping, None);
+        assert_eq!(cfg.final_logit_softcapping, None);
+        assert_eq!(cfg.sliding_window, Some(1024));
+
+        // Gemma 3 pattern=6: layers 0-4=sliding, 5=full, 6-10=sliding, 11=full, ...
+        assert_eq!(cfg.layer_types.len(), 18);
+        for i in 0_usize..18 {
+            if (i + 1) % 6 == 0 {
+                assert_eq!(cfg.layer_types[i], "full_attention", "layer {i}");
+                assert_eq!(cfg.effective_sliding_window(i), None, "layer {i}");
+            } else {
+                assert_eq!(cfg.layer_types[i], "sliding_attention", "layer {i}");
+                assert_eq!(cfg.effective_sliding_window(i), Some(1024), "layer {i}");
+            }
+        }
     }
 }

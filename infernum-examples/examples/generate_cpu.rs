@@ -1,4 +1,4 @@
-//! CPU text generation example (Llama family, SafeTensors + GGUF)
+//! CPU text generation example (multi-architecture, SafeTensors + GGUF)
 //!
 //! Usage:
 //!   cargo run --example generate_cpu --features cpu -- -m /path/to/model "Hello"
@@ -16,14 +16,18 @@ use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cpu::CpuBackend;
+use infernum_gemma::GemmaModel;
 use infernum_llama::LlamaModel;
+use infernum_qwen::QwenModel;
 use infernum_runtime::{Engine, Runtime};
 
-/// CPU text generation with Llama models (SafeTensors + GGUF)
+/// CPU text generation with LLMs (SafeTensors + GGUF)
 ///
-/// Supports Llama, Mistral, Mixtral, and other Llama-architecture models.
-/// SafeTensors models load as f32. GGUF models load quantized weights (Q8_0,
-/// Q4_0) with SIMD-accelerated dequantize-on-the-fly inference.
+/// Supports Llama, Mistral, Mixtral, Qwen, and Gemma model families.
+/// SafeTensors models load as f32 (Llama family only).
+/// GGUF models load quantized weights (Q8_0, Q4_0) with SIMD-accelerated
+/// dequantize-on-the-fly inference. Architecture is auto-detected from the
+/// GGUF metadata.
 /// Uses KV cache and nucleus sampling by default.
 #[derive(Parser)]
 #[command(name = "generate_cpu")]
@@ -118,35 +122,15 @@ impl Tokenizer {
     }
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    let is_gguf = cli.model.ends_with(".gguf");
-
+/// Run generation with a loaded model and tokenizer.
+fn run_model<M>(model: M, tokenizer: Tokenizer, cli: &Cli) -> Result<()>
+where
+    M: infernum::Model<B = CpuBackend> + Send + 'static,
+{
+    let model_config = model.config();
     println!(
-        "Loading model from: {} (CPU, {})",
-        cli.model,
-        if is_gguf { "GGUF" } else { "SafeTensors" }
-    );
-
-    let (model, tokenizer) = if is_gguf {
-        let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
-        let model = LlamaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
-        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?);
-        (model, tokenizer)
-    } else {
-        let model = LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?;
-        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
-        (model, tokenizer)
-    };
-
-    let num_layers = model.config().num_hidden_layers;
-    let hidden_size = model.config().hidden_size;
-
-    println!(
-        "Model loaded ({} layers, {} hidden, vocab {})",
-        num_layers,
-        hidden_size,
+        "Model loaded ({} layers, vocab {})",
+        model_config.num_layers,
         tokenizer.vocab_size(),
     );
 
@@ -229,4 +213,55 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Detect architecture from GGUF metadata.
+fn detect_gguf_arch(path: &str) -> Result<String> {
+    let loader = infernum::weights::gguf::GgufLoader::from_file(path)?;
+    let arch = loader
+        .metadata()
+        .get("general.architecture")
+        .and_then(infernum::GgufValue::as_str)
+        .unwrap_or("llama")
+        .to_string();
+    Ok(arch)
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let is_gguf = cli.model.ends_with(".gguf");
+
+    if is_gguf {
+        let arch = detect_gguf_arch(&cli.model)?;
+        println!("Loading model from: {} (CPU, GGUF, arch={arch})", cli.model);
+
+        let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
+        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?);
+
+        match arch.as_str() {
+            "llama" => {
+                let model = LlamaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
+                run_model(model, tokenizer, &cli)
+            }
+            "qwen2" => {
+                let model = QwenModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
+                run_model(model, tokenizer, &cli)
+            }
+            "gemma2" | "gemma3" => {
+                let model = GemmaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
+                run_model(model, tokenizer, &cli)
+            }
+            _ => {
+                eprintln!("Unsupported GGUF architecture: {arch}");
+                eprintln!("Supported: llama, qwen2, gemma2, gemma3");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("Loading model from: {} (CPU, SafeTensors)", cli.model);
+        let model = LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?;
+        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
+        run_model(model, tokenizer, &cli)
+    }
 }

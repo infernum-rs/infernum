@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use infernum::GenerateOptions;
 
 /// Files needed from a HuggingFace repo to load a SafeTensors model.
+#[allow(dead_code)]
 pub const REQUIRED_FILES: &[&str] = &[
     "config.json",
     "model.safetensors",
@@ -45,6 +46,7 @@ fn download_file(repo_id: &str, filename: &str, dest: &PathBuf) {
 /// Download a model from HuggingFace Hub and return the local directory path.
 ///
 /// Files are cached in `~/.cache/infernum/models/<org>/<model>/`.
+#[allow(dead_code)]
 pub fn download_model(repo_id: &str) -> PathBuf {
     download_model_files(repo_id, REQUIRED_FILES)
 }

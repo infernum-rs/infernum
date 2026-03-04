@@ -330,6 +330,7 @@ An implementation guide is a design and implementation plan for a feature or opt
    - Tests: `cargo test --all --features cuda -- --test-threads=1`
    - If all pass: commit and push.
    - Update the progress section in the implementation guide.
+   - **On non-main branches and worktrees, commit and push often.** Don't batch changes — frequent small commits make review easier and reduce risk of lost work.
 5. As a final step, consider whether the work warrants:
    - **Integration tests** — if it affects model output, adds a new weight format, or changes generation behavior.
    - **Examples** — if it adds a new user-facing capability that benefits from an interactive demo (e.g., a new inference mode, a new kernel type, a new model family).
