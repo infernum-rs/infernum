@@ -58,3 +58,7 @@ required-features = ["cuda"]
 [[example]]
 name = "generate_cpu"
 required-features = ["cpu"]
+
+[[example]]
+name = "bench_cpu"
+required-features = ["cpu"]

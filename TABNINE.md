@@ -285,7 +285,7 @@ The `bench_comparison.sh` script compares infernum vs llama.cpp decode throughpu
 **Prerequisites:**
 
 - CUDA GPU with `nvidia-smi`
-- llama.cpp built at `/home/amir/llama.cpp/` (with `llama-bench`, `llama-quantize`)
+- llama.cpp built locally (with `llama-bench`, `llama-quantize`, `convert_hf_to_gguf.py`)
 - Rust toolchain (`cargo`)
 - `hf` CLI with token: `pip install 'huggingface_hub[cli]'`
 - Python 3 with `torch`, `transformers`, `gguf` packages
