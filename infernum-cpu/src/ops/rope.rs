@@ -43,7 +43,7 @@ impl RopeOps for CpuBackend {
             }
         }
 
-        Ok(CpuTensor::from_f32(shape, &out))
+        Ok(CpuTensor::from_f32_vec(shape, out))
     }
 
     fn apply_rope_batched(
@@ -85,6 +85,6 @@ impl RopeOps for CpuBackend {
             }
         }
 
-        Ok(CpuTensor::from_f32(shape, &out))
+        Ok(CpuTensor::from_f32_vec(shape, out))
     }
 }

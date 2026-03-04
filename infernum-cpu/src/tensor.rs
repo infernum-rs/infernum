@@ -17,8 +17,34 @@ pub struct CpuTensor {
     dtype: DType,
 }
 
+/// Thread-local scratch buffer reused across forward-pass ops.
+///
+/// Avoids per-token heap allocations in matmul and other compute-heavy ops.
+/// The buffer grows to the high-water mark and is never shrunk, so after a
+/// few warm-up tokens the allocator is never called again.
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Borrow the thread-local scratch buffer, resized to at least `len` elements.
+///
+/// The closure receives a `&mut [f32]` of exactly `len` elements. It must not
+/// call any other function that also borrows `SCRATCH` (no re-entrancy).
+pub fn with_scratch<F, R>(len: usize, f: F) -> R
+where
+    F: FnOnce(&mut [f32]) -> R,
+{
+    SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0.0f32);
+        }
+        f(&mut buf[..len])
+    })
+}
+
 impl CpuTensor {
-    /// Create a tensor from an f32 slice.
+    /// Create a tensor from an f32 slice (copies data).
     #[must_use]
     pub fn from_f32(shape: &[usize], data: &[f32]) -> Self {
         let numel: usize = shape.iter().product();
@@ -30,6 +56,41 @@ impl CpuTensor {
         );
         Self {
             data: Arc::new(bytemuck::cast_slice(data).to_vec()),
+            offset: 0,
+            shape: shape.to_vec(),
+            dtype: DType::F32,
+        }
+    }
+
+    /// Create a tensor by taking ownership of a `Vec<f32>`, zero-copy.
+    ///
+    /// The vector is reinterpreted as raw bytes via `bytemuck`. This avoids
+    /// the extra copy that `from_f32` performs and should be preferred in
+    /// hot paths where the caller already owns the output buffer.
+    #[must_use]
+    pub fn from_f32_vec(shape: &[usize], mut data: Vec<f32>) -> Self {
+        let numel: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            numel,
+            "data len {} != shape product {numel}",
+            data.len()
+        );
+        // Reinterpret Vec<f32> as Vec<u8> without any copy.
+        // SAFETY:
+        //  - f32 is always 4 bytes, so len*4 and cap*4 fit in usize.
+        //  - The pointer, len, and capacity are all from a valid Vec<f32>,
+        //    so the resulting Vec<u8> is valid and the memory is properly owned.
+        //  - We `forget` the original Vec so it is not double-freed.
+        let len = data.len() * 4;
+        let cap = data.capacity() * 4;
+        let ptr = data.as_mut_ptr().cast::<u8>();
+        let bytes: Vec<u8> = unsafe {
+            std::mem::forget(data);
+            Vec::from_raw_parts(ptr, len, cap)
+        };
+        Self {
+            data: Arc::new(bytes),
             offset: 0,
             shape: shape.to_vec(),
             dtype: DType::F32,
@@ -167,6 +228,10 @@ impl CpuTensor {
 /// Stores quantized data and per-block scales separately, matching the
 /// GGUF loader output. Layout is row-major: `out_features` rows of
 /// `in_features` elements, with `in_features / 32` blocks per row.
+///
+/// Scales and mins are pre-decoded to f32 at load time so the forward
+/// pass pays no f16→f32 conversion cost (and avoids repeated CPU-feature
+/// detection inside the half crate).
 #[derive(Clone)]
 pub struct CpuQuantizedWeight {
     /// Logical shape: `[out_features, in_features]`
@@ -175,10 +240,17 @@ pub struct CpuQuantizedWeight {
     pub dtype: DType,
     /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
     pub data: Vec<u8>,
-    /// Per-block f16 scales as raw bytes (2 bytes per block)
-    pub scales: Vec<u8>,
-    /// Per-block f16 minimums as raw bytes (2 bytes per block, Q4_1 only)
-    pub mins: Option<Vec<u8>>,
+    /// Per-block scales decoded to f32 (one per block)
+    pub scales: Vec<f32>,
+    /// Per-block minimums decoded to f32 (one per block, Q4_1 only)
+    pub mins: Option<Vec<f32>>,
+}
+
+/// Decode a buffer of f16 values stored as raw little-endian bytes into f32.
+pub fn decode_f16_scales(raw: &[u8]) -> Vec<f32> {
+    raw.chunks_exact(2)
+        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect()
 }
 
 /// A linear weight — dense f32 or block-quantized.

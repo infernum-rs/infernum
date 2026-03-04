@@ -352,9 +352,9 @@ impl AttentionOps for CpuBackend {
             sliding_window,
         );
 
-        Ok(CpuTensor::from_f32(
+        Ok(CpuTensor::from_f32_vec(
             &[seq_len, num_heads, head_dim],
-            &output,
+            output,
         ))
     }
 
@@ -392,7 +392,7 @@ impl AttentionOps for CpuBackend {
             sliding_window,
         );
 
-        Ok(CpuTensor::from_f32(&[1, num_heads, head_dim], &output))
+        Ok(CpuTensor::from_f32_vec(&[1, num_heads, head_dim], output))
     }
 
     fn fused_attention_prefill_with_lse(
@@ -483,8 +483,8 @@ impl AttentionOps for CpuBackend {
         }
 
         Ok((
-            CpuTensor::from_f32(&[seq_len, num_heads, head_dim], &output),
-            CpuTensor::from_f32(&[seq_len, num_heads], &lse),
+            CpuTensor::from_f32_vec(&[seq_len, num_heads, head_dim], output),
+            CpuTensor::from_f32_vec(&[seq_len, num_heads], lse),
         ))
     }
 
@@ -520,7 +520,7 @@ impl AttentionOps for CpuBackend {
             }
         }
 
-        Ok(CpuTensor::from_f32(shape, &output))
+        Ok(CpuTensor::from_f32_vec(shape, output))
     }
 }
 
@@ -632,9 +632,9 @@ impl PagedAttentionOps for CpuBackend {
             }
         }
 
-        Ok(CpuTensor::from_f32(
+        Ok(CpuTensor::from_f32_vec(
             &[batch_size, num_heads, head_dim],
-            &output,
+            output,
         ))
     }
 
@@ -660,8 +660,8 @@ impl PagedAttentionOps for CpuBackend {
 
         let shape = [seq_len, paged_kv.num_kv_heads, paged_kv.head_dim];
         Ok((
-            CpuTensor::from_f32(&shape, &k_out),
-            CpuTensor::from_f32(&shape, &v_out),
+            CpuTensor::from_f32_vec(&shape, k_out),
+            CpuTensor::from_f32_vec(&shape, v_out),
         ))
     }
 }

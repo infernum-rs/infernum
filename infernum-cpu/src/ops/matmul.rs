@@ -89,8 +89,11 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
 /// Quantized linear: `input (M, K) × weight (N, K)_quantized → output (M, N)`.
 ///
 /// Weight is stored as `(out_features=N, in_features=K)` in block-quantized
-/// format. For each output element, we iterate over K/32 blocks, dequantizing
-/// on the fly and accumulating the dot product.
+/// format. Scales are pre-decoded to f32 in `CpuQuantizedWeight` so no
+/// f16→f32 conversion happens in the hot path.
+///
+/// Output neurons are computed in parallel with Rayon; each neuron is an
+/// independent dot product over `num_blocks_per_row` blocks.
 #[allow(clippy::many_single_char_names, clippy::too_many_lines)]
 fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<CpuTensor> {
     let i_shape = input.shape();
@@ -116,105 +119,101 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
     match weight.dtype {
         DType::Q8_0 => {
             let quants = &weight.data;
-            let scales_raw = &weight.scales;
+            let scales = &weight.scales;
             let quant_bytes_per_row = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
 
             for row in 0..m {
                 let inp = &input_data[row * k..(row + 1) * k];
                 let out_row = &mut output[row * n..(row + 1) * n];
 
-                for (neuron, out_val) in out_row.iter_mut().enumerate() {
-                    let q_row_start = neuron * quant_bytes_per_row;
-                    let s_row_start = neuron * num_blocks_per_row * 2;
-                    let mut acc = 0.0f32;
+                out_row
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(neuron, out_val)| {
+                        let q_row_start = neuron * quant_bytes_per_row;
+                        let s_row_start = neuron * num_blocks_per_row;
+                        let mut acc = 0.0f32;
 
-                    for blk in 0..num_blocks_per_row {
-                        let scale_bytes = &scales_raw[s_row_start + blk * 2..];
-                        let scale =
-                            half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
+                        for blk in 0..num_blocks_per_row {
+                            let scale = scales[s_row_start + blk];
+                            let q_start = q_row_start + blk * QUANTIZATION_BLOCK_SIZE;
+                            let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
 
-                        let q_start = q_row_start + blk * QUANTIZATION_BLOCK_SIZE;
-                        let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
-
-                        acc += simd::dot_q8_block(
-                            &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
-                            &quants[q_start..q_start + QUANTIZATION_BLOCK_SIZE],
-                            scale,
-                        );
-                    }
-                    *out_val = acc;
-                }
+                            acc += simd::dot_q8_block(
+                                &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                                &quants[q_start..q_start + QUANTIZATION_BLOCK_SIZE],
+                                scale,
+                            );
+                        }
+                        *out_val = acc;
+                    });
             }
         }
         DType::Q4_0 => {
             let packed = &weight.data;
-            let scales_raw = &weight.scales;
+            let scales = &weight.scales;
             let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
 
             for row in 0..m {
                 let inp = &input_data[row * k..(row + 1) * k];
                 let out_row = &mut output[row * n..(row + 1) * n];
 
-                for (neuron, out_val) in out_row.iter_mut().enumerate() {
-                    let p_row_start = neuron * packed_bytes_per_row;
-                    let s_row_start = neuron * num_blocks_per_row * 2;
-                    let mut acc = 0.0f32;
+                out_row
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(neuron, out_val)| {
+                        let p_row_start = neuron * packed_bytes_per_row;
+                        let s_row_start = neuron * num_blocks_per_row;
+                        let mut acc = 0.0f32;
 
-                    for blk in 0..num_blocks_per_row {
-                        let scale_bytes = &scales_raw[s_row_start + blk * 2..];
-                        let scale =
-                            half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
+                        for blk in 0..num_blocks_per_row {
+                            let scale = scales[s_row_start + blk];
+                            let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
+                            let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
 
-                        let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
-                        let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
-
-                        acc += simd::dot_q4_block(
-                            &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
-                            &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
-                            scale,
-                        );
-                    }
-                    *out_val = acc;
-                }
+                            acc += simd::dot_q4_block(
+                                &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                                &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
+                                scale,
+                            );
+                        }
+                        *out_val = acc;
+                    });
             }
         }
         DType::Q4_1 => {
             let packed = &weight.data;
-            let scales_raw = &weight.scales;
-            let mins_raw = weight
-                .mins
-                .as_ref()
-                .expect("Q4_1 weight missing mins buffer");
+            let scales = &weight.scales;
+            let mins = weight.mins.as_ref().expect("Q4_1 weight missing mins buffer");
             let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
 
             for row in 0..m {
                 let inp = &input_data[row * k..(row + 1) * k];
                 let out_row = &mut output[row * n..(row + 1) * n];
 
-                for (neuron, out_val) in out_row.iter_mut().enumerate() {
-                    let p_row_start = neuron * packed_bytes_per_row;
-                    let s_row_start = neuron * num_blocks_per_row * 2;
-                    let mut acc = 0.0f32;
+                out_row
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(neuron, out_val)| {
+                        let p_row_start = neuron * packed_bytes_per_row;
+                        let s_row_start = neuron * num_blocks_per_row;
+                        let mut acc = 0.0f32;
 
-                    for blk in 0..num_blocks_per_row {
-                        let scale_bytes = &scales_raw[s_row_start + blk * 2..];
-                        let scale =
-                            half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
-                        let min_bytes = &mins_raw[s_row_start + blk * 2..];
-                        let min = half::f16::from_le_bytes([min_bytes[0], min_bytes[1]]).to_f32();
+                        for blk in 0..num_blocks_per_row {
+                            let scale = scales[s_row_start + blk];
+                            let min = mins[s_row_start + blk];
+                            let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
+                            let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
 
-                        let p_start = p_row_start + blk * (QUANTIZATION_BLOCK_SIZE / 2);
-                        let inp_start = blk * QUANTIZATION_BLOCK_SIZE;
-
-                        acc += simd::dot_q4_1_block(
-                            &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
-                            &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
-                            scale,
-                            min,
-                        );
-                    }
-                    *out_val = acc;
-                }
+                            acc += simd::dot_q4_1_block(
+                                &inp[inp_start..inp_start + QUANTIZATION_BLOCK_SIZE],
+                                &packed[p_start..p_start + QUANTIZATION_BLOCK_SIZE / 2],
+                                scale,
+                                min,
+                            );
+                        }
+                        *out_val = acc;
+                    });
             }
         }
         other => {
@@ -226,7 +225,7 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
 
     let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
     out_shape.push(n);
-    Ok(CpuTensor::from_f32(&out_shape, &output))
+    Ok(CpuTensor::from_f32_vec(&out_shape, output))
 }
 
 impl MatmulOps for CpuBackend {
@@ -259,7 +258,7 @@ impl MatmulOps for CpuBackend {
 
         let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
         out_shape.push(n);
-        Ok(CpuTensor::from_f32(&out_shape, &output))
+        Ok(CpuTensor::from_f32_vec(&out_shape, output))
     }
 
     fn linear(input: &CpuTensor, weight: &CpuLinearWeight) -> Result<CpuTensor> {
@@ -284,7 +283,7 @@ impl MatmulOps for CpuBackend {
 
                 let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
                 out_shape.push(n);
-                Ok(CpuTensor::from_f32(&out_shape, &output))
+                Ok(CpuTensor::from_f32_vec(&out_shape, output))
             }
             CpuLinearWeight::Quantized(w) => quantized_linear(input, w),
         }
@@ -316,7 +315,7 @@ impl MatmulOps for CpuBackend {
         let num_blocks_per_row = k / QUANTIZATION_BLOCK_SIZE;
 
         let mut qdata = Vec::with_capacity(n * k);
-        let mut scales = Vec::with_capacity(n * num_blocks_per_row * 2);
+        let mut scales = Vec::with_capacity(n * num_blocks_per_row);
 
         for neuron in 0..n {
             let row = &data[neuron * k..(neuron + 1) * k];
@@ -327,8 +326,8 @@ impl MatmulOps for CpuBackend {
                 let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
                 let inv_scale = 1.0 / scale;
 
-                let scale_f16 = half::f16::from_f32(scale);
-                scales.extend_from_slice(&scale_f16.to_le_bytes());
+                // Store as f32 directly — no f16 round-trip needed for runtime quantization
+                scales.push(scale);
 
                 #[allow(clippy::cast_possible_truncation)]
                 for &v in block {
@@ -381,15 +380,15 @@ impl MatmulOps for CpuBackend {
                     shape: hq.shape.clone(),
                     dtype: hq.dtype,
                     data: hq.data.clone(),
-                    scales: hq.scales.clone(),
+                    scales: crate::tensor::decode_f16_scales(&hq.scales),
                     mins: None,
                 })),
                 DType::Q4_1 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
                     shape: hq.shape.clone(),
                     dtype: hq.dtype,
                     data: hq.data.clone(),
-                    scales: hq.scales.clone(),
-                    mins: hq.qzeros.clone(),
+                    scales: crate::tensor::decode_f16_scales(&hq.scales),
+                    mins: hq.qzeros.as_deref().map(crate::tensor::decode_f16_scales),
                 })),
                 other => Err(infernum::Error::UnsupportedDtype(format!(
                     "CPU backend does not support {other} quantized weights"
@@ -416,7 +415,7 @@ impl MatmulExtOps for CpuBackend {
 
         let mut out_shape = a_shape[..a_shape.len() - 1].to_vec();
         out_shape.push(n);
-        Ok(CpuTensor::from_f32(&out_shape, &output))
+        Ok(CpuTensor::from_f32_vec(&out_shape, output))
     }
 }
 
@@ -554,12 +553,12 @@ mod tests {
     }
 
     /// Helper: manually quantize f32 values to Q8_0 format.
-    /// Returns (data, scales) where data is int8 bytes and scales is f16 bytes.
-    fn manual_quantize_q8(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    /// Returns (data, scales) where data is int8 bytes and scales is Vec<f32>.
+    fn manual_quantize_q8(values: &[f32]) -> (Vec<u8>, Vec<f32>) {
         assert_eq!(values.len() % 32, 0);
         let num_blocks = values.len() / 32;
         let mut data = Vec::with_capacity(num_blocks * 32);
-        let mut scales = Vec::with_capacity(num_blocks * 2);
+        let mut scales = Vec::with_capacity(num_blocks);
 
         for blk in 0..num_blocks {
             let block = &values[blk * 32..(blk + 1) * 32];
@@ -567,8 +566,7 @@ mod tests {
             let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
             let inv_scale = 1.0 / scale;
 
-            let scale_f16 = half::f16::from_f32(scale);
-            scales.extend_from_slice(&scale_f16.to_le_bytes());
+            scales.push(scale);
 
             for &v in block {
                 let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
@@ -579,12 +577,12 @@ mod tests {
     }
 
     /// Helper: manually quantize f32 values to Q4_0 format.
-    /// Returns (data, scales) where data is packed nibbles and scales is f16 bytes.
-    fn manual_quantize_q4(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    /// Returns (data, scales) where data is packed nibbles and scales is Vec<f32>.
+    fn manual_quantize_q4(values: &[f32]) -> (Vec<u8>, Vec<f32>) {
         assert_eq!(values.len() % 32, 0);
         let num_blocks = values.len() / 32;
         let mut data = Vec::with_capacity(num_blocks * 16);
-        let mut scales = Vec::with_capacity(num_blocks * 2);
+        let mut scales = Vec::with_capacity(num_blocks);
 
         for blk in 0..num_blocks {
             let block = &values[blk * 32..(blk + 1) * 32];
@@ -592,8 +590,7 @@ mod tests {
             let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
             let inv_scale = 1.0 / scale;
 
-            let scale_f16 = half::f16::from_f32(scale);
-            scales.extend_from_slice(&scale_f16.to_le_bytes());
+            scales.push(scale);
 
             // Pack 32 values into 16 bytes (low nibble first, high nibble second)
             for i in 0..16 {
@@ -699,12 +696,12 @@ mod tests {
     }
 
     /// Manually quantize f32 weights to Q4_1 format (asymmetric, unsigned nibbles).
-    fn manual_quantize_q4_1(data: &[f32]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn manual_quantize_q4_1(data: &[f32]) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
         let block_size = 32;
         let num_blocks = data.len() / block_size;
         let mut packed = Vec::with_capacity(num_blocks * 16);
-        let mut scales = Vec::with_capacity(num_blocks * 2);
-        let mut mins = Vec::with_capacity(num_blocks * 2);
+        let mut scales = Vec::with_capacity(num_blocks);
+        let mut mins = Vec::with_capacity(num_blocks);
 
         for b in 0..num_blocks {
             let block = &data[b * block_size..(b + 1) * block_size];
@@ -715,20 +712,16 @@ mod tests {
             } else {
                 (max_val - min_val) / 15.0
             };
-            let scale_f16 = half::f16::from_f32(scale);
-            let min_f16 = half::f16::from_f32(min_val);
-            scales.extend_from_slice(&scale_f16.to_le_bytes());
-            mins.extend_from_slice(&min_f16.to_le_bytes());
+            scales.push(scale);
+            mins.push(min_val);
 
             // Quantize to 4-bit unsigned [0,15]
-            let s = scale_f16.to_f32();
-            let m = min_f16.to_f32();
             let mut nibbles = [0u8; 32];
             for i in 0..32 {
-                nibbles[i] = if s.abs() < f32::EPSILON {
+                nibbles[i] = if scale.abs() < f32::EPSILON {
                     0
                 } else {
-                    ((block[i] - m) / s).round().clamp(0.0, 15.0) as u8
+                    ((block[i] - min_val) / scale).round().clamp(0.0, 15.0) as u8
                 };
             }
             // Pack: byte[i] = nibbles[i] | (nibbles[i+16] << 4)

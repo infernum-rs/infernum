@@ -22,7 +22,7 @@ impl NormOps for CpuBackend {
             let row_out = &mut out[start..start + hidden_size];
             simd::vec_rmsnorm(row_in, weight_data, eps, row_out);
         }
-        Ok(CpuTensor::from_f32(input.shape(), &out))
+        Ok(CpuTensor::from_f32_vec(input.shape(), out))
     }
 
     fn rms_norm_inplace(input: &mut CpuTensor, weight: &CpuTensor, eps: f32) -> Result<()> {
@@ -69,8 +69,8 @@ impl NormOps for CpuBackend {
         }
 
         Ok((
-            CpuTensor::from_f32(residual.shape(), &updated),
-            CpuTensor::from_f32(residual.shape(), &normed),
+            CpuTensor::from_f32_vec(residual.shape(), updated),
+            CpuTensor::from_f32_vec(residual.shape(), normed),
         ))
     }
 }

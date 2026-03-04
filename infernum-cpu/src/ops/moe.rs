@@ -70,7 +70,7 @@ impl MoeOps for CpuBackend {
             }
         }
 
-        Ok(CpuTensor::from_f32(hidden.shape(), &output_data))
+        Ok(CpuTensor::from_f32_vec(hidden.shape(), output_data))
     }
 }
 
@@ -176,6 +176,6 @@ impl MoeSigmoidOps for CpuBackend {
             }
         }
 
-        Ok(CpuTensor::from_f32(hidden.shape(), &output_data))
+        Ok(CpuTensor::from_f32_vec(hidden.shape(), output_data))
     }
 }
