@@ -227,7 +227,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                         let v_t = B::as_dense_weight(&v).expect("checked dense");
                         KvProjWeight::<B>::Fused {
                             kv_dim: config.num_kv_heads() * config.head_dim(),
-                            weight: B::concat_inner_dim(k_t, v_t)?,
+                            weight: B::dense_weight(B::concat_inner_dim(k_t, v_t)?),
                         }
                     } else {
                         KvProjWeight::<B>::Separate {
@@ -348,7 +348,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                 let g = B::as_dense_weight(&gate_proj).expect("checked dense");
                 let u = B::as_dense_weight(&up_proj).expect("checked dense");
                 GateUpWeight::<B>::Fused {
-                    weight: B::concat_inner_dim(g, u)?,
+                    weight: B::dense_weight(B::concat_inner_dim(g, u)?),
                     intermediate_size: config.intermediate_size,
                 }
             } else {
@@ -460,7 +460,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                         B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
                     KvProjWeight::<B>::Fused {
                         kv_dim: config.num_kv_heads() * config.head_dim(),
-                        weight: fused_tensor,
+                        weight: B::dense_weight(fused_tensor),
                     }
                 } else {
                     let k_dev = B::upload_host_linear(&device, &k_host)?;
@@ -502,7 +502,7 @@ impl<B: LlamaOps> LlamaModel<B> {
                     let fused_tensor =
                         B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
                     GateUpWeight::<B>::Fused {
-                        weight: fused_tensor,
+                        weight: B::dense_weight(fused_tensor),
                         intermediate_size: config.intermediate_size,
                     }
                 } else {

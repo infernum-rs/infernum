@@ -35,9 +35,13 @@ use crate::Result;
 
 /// K+V projection storage: fused for dense weights, separate for quantized.
 pub enum KvProjWeight<B: Backend + MatmulOps> {
-    /// K and V weights concatenated into a single `(hidden, 2*kv_dim)` dense
-    /// tensor. After matmul the output columns split as `[k(kv_dim), v(kv_dim)]`.
-    Fused { weight: B::Tensor, kv_dim: usize },
+    /// K and V weights fused into a single `LinearWeight` with output dim
+    /// `2*kv_dim`. After linear the output columns split as
+    /// `[k(kv_dim), v(kv_dim)]`.
+    Fused {
+        weight: <B as MatmulOps>::LinearWeight,
+        kv_dim: usize,
+    },
     /// Separate K and V projections (used for quantized weights).
     Separate {
         k_proj: Box<<B as MatmulOps>::LinearWeight>,
@@ -47,11 +51,11 @@ pub enum KvProjWeight<B: Backend + MatmulOps> {
 
 /// Gate+Up projection storage: fused for dense weights, separate for quantized.
 pub enum GateUpWeight<B: Backend + MatmulOps> {
-    /// Gate and up weights concatenated into a single `(hidden, 2*intermediate)`
-    /// dense tensor. After matmul the output columns split as
+    /// Gate and up weights fused into a single `LinearWeight` with output dim
+    /// `2*intermediate`. After linear the output columns split as
     /// `[gate(intermediate), up(intermediate)]`.
     Fused {
-        weight: B::Tensor,
+        weight: <B as MatmulOps>::LinearWeight,
         intermediate_size: usize,
     },
     /// Separate gate and up projections (used for quantized weights).
@@ -79,7 +83,7 @@ pub fn compute_kv_proj<B: MatmulOps + TensorOps>(
 ) -> Result<(B::Tensor, B::Tensor)> {
     match kv_proj {
         KvProjWeight::<B>::Fused { weight, kv_dim } => {
-            let kv = B::matmul(hidden, weight)?;
+            let kv = B::linear(hidden, weight)?;
             B::split_inner_dim(&kv, *kv_dim, *kv_dim)
         }
         KvProjWeight::<B>::Separate { k_proj, v_proj } => {
@@ -101,7 +105,7 @@ pub fn compute_kv_proj_decode<B: MatmulOps + TensorOps>(
 ) -> Result<(B::Tensor, B::Tensor)> {
     match kv_proj {
         KvProjWeight::<B>::Fused { weight, kv_dim } => {
-            let kv = B::matmul(hidden, weight)?;
+            let kv = B::linear(hidden, weight)?;
             if batch_size == 1 {
                 let k = kv.slice_view(0, &[1, *kv_dim]);
                 let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
@@ -133,7 +137,7 @@ pub fn compute_gate_up<B: MatmulOps + TensorOps>(
             intermediate_size,
         } => {
             let seq_len = hidden.shape()[0];
-            let gate_up = B::matmul(hidden, weight)?;
+            let gate_up = B::linear(hidden, weight)?;
             if seq_len == 1 {
                 let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
                 let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
@@ -307,7 +311,7 @@ pub fn load_mlp_weights<B: MatmulOps + TensorOps>(
         let g = B::as_dense_weight(&gate).expect("checked dense");
         let u = B::as_dense_weight(&up).expect("checked dense");
         GateUpWeight::<B>::Fused {
-            weight: B::concat_inner_dim(g, u)?,
+            weight: B::dense_weight(B::concat_inner_dim(g, u)?),
             intermediate_size,
         }
     } else {
