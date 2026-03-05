@@ -913,6 +913,7 @@ dependencies = [
  "infernum-qwen",
  "infernum-runtime",
  "inventory",
+ "libc",
  "memmap2",
  "num-traits",
  "rand 0.8.5",

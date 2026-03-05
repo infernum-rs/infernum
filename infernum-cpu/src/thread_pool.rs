@@ -59,10 +59,17 @@ impl WorkerSlot {
 /// Workers spin on atomic flags rather than sleeping via futex/condvar.
 /// This trades CPU usage for latency — workers burn cycles when idle,
 /// but wake up in ~1µs instead of ~5-10µs.
+///
+/// When physical core topology is detected, each worker is pinned to a
+/// distinct physical core to avoid HT siblings competing for execution
+/// resources. The caller thread (task 0) is also pinned during dispatch.
 pub struct SpinPool {
     slots: Arc<Vec<WorkerSlot>>,
     _workers: Vec<std::thread::JoinHandle<()>>,
     num_threads: usize,
+    /// CPU ID to pin the caller thread to during dispatch (core 0).
+    /// `None` if topology detection failed.
+    caller_core: Option<usize>,
 }
 
 impl SpinPool {
@@ -82,13 +89,22 @@ impl SpinPool {
         }
         let slots = Arc::new(slots);
 
+        let physical_cores = detect_physical_cores();
+        let caller_core = physical_cores.as_ref().and_then(|c| c.first().copied());
+
         let mut workers = Vec::with_capacity(num_threads - 1);
 
         for worker_id in 1..num_threads {
             let slots_clone = Arc::clone(&slots);
+            let pin_core = physical_cores
+                .as_ref()
+                .and_then(|cores| cores.get(worker_id).copied());
             let handle = std::thread::Builder::new()
                 .name(format!("spin-worker-{worker_id}"))
                 .spawn(move || {
+                    if let Some(core_id) = pin_core {
+                        pin_to_core(core_id);
+                    }
                     worker_loop(&slots_clone[worker_id]);
                 })
                 .expect("failed to spawn spin-pool worker");
@@ -99,6 +115,7 @@ impl SpinPool {
             slots,
             _workers: workers,
             num_threads,
+            caller_core,
         }
     }
 
@@ -144,6 +161,21 @@ impl SpinPool {
 
         let tramp: fn(*const (), usize, usize) = trampoline::<F>;
         let data_ptr = (&task_fn as *const F).cast::<()>();
+
+        // Pin caller thread to its physical core (once per thread).
+        // This prevents the OS from scheduling it on an HT sibling
+        // of a pinned worker.
+        if let Some(core_id) = self.caller_core {
+            thread_local! {
+                static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            PINNED.with(|p| {
+                if !p.get() {
+                    pin_to_core(core_id);
+                    p.set(true);
+                }
+            });
+        }
 
         for worker_id in 1..num_tasks {
             self.slots[worker_id]
@@ -221,6 +253,71 @@ fn worker_loop(slot: &WorkerSlot) {
     }
 }
 
+/// Detect one logical CPU ID per physical core from Linux sysfs topology.
+///
+/// Reads `/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list`
+/// and picks the first (lowest-numbered) sibling from each unique group.
+/// Returns `None` if the sysfs topology is unavailable (non-Linux, containers, etc.).
+fn detect_physical_cores() -> Option<Vec<usize>> {
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    let cpu_dir = std::path::Path::new("/sys/devices/system/cpu");
+    if !cpu_dir.exists() {
+        return None;
+    }
+
+    // Collect unique physical core groups. Each group is identified by its
+    // thread_siblings_list (e.g., "0,8" means CPU 0 and CPU 8 share a core).
+    // We pick the lowest CPU id from each group.
+    let mut seen_groups = BTreeSet::new();
+    let mut physical = Vec::new();
+
+    // Iterate CPU indices 0..N until we stop finding them.
+    for cpu_id in 0..1024 {
+        let path = cpu_dir
+            .join(format!("cpu{cpu_id}"))
+            .join("topology/thread_siblings_list");
+        let Ok(content) = fs::read_to_string(&path) else {
+            if cpu_id == 0 {
+                return None; // Can't even read cpu0 — give up
+            }
+            break; // Past last CPU
+        };
+        let siblings = content.trim().to_string();
+        if seen_groups.insert(siblings) {
+            // First time seeing this sibling group — cpu_id is the representative
+            physical.push(cpu_id);
+        }
+    }
+
+    if physical.is_empty() {
+        None
+    } else {
+        Some(physical)
+    }
+}
+
+/// Pin the calling thread to a specific logical CPU.
+///
+/// Uses `sched_setaffinity` on Linux. Silently does nothing on failure
+/// or non-Linux platforms.
+fn pin_to_core(core_id: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(core_id, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core_id;
+    }
+}
+
 /// Global spin pool, lazily initialized.
 ///
 /// Returns a reference to a shared `SpinPool` with one thread per physical core.
@@ -230,14 +327,31 @@ pub fn global_pool() -> &'static SpinPool {
     static POOL: OnceLock<SpinPool> = OnceLock::new();
     POOL.get_or_init(|| {
         // Use RAYON_NUM_THREADS if set (for consistency with benchmarks),
-        // otherwise use available parallelism (usually physical core count).
+        // otherwise default to the number of physical cores. This avoids
+        // HT siblings competing for the same execution resources with
+        // spin-waiting workers.
         let n = std::env::var("RAYON_NUM_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(1)
+                detect_physical_cores().map_or_else(
+                    || {
+                        std::thread::available_parallelism()
+                            .map(std::num::NonZero::get)
+                            .unwrap_or(1)
+                    },
+                    |cores| {
+                        let n = cores.len();
+                        // Reserve one physical core for OS/interrupts when
+                        // there are enough cores. Spin-waiting threads on
+                        // all physical cores starve the OS scheduler.
+                        if n > 4 {
+                            n - 1
+                        } else {
+                            n
+                        }
+                    },
+                )
             });
         SpinPool::new(n)
     })

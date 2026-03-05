@@ -37,6 +37,10 @@ rand = "0.8"
 # Multi-threaded matmul
 rayon = "1.10"
 
+# Thread affinity (sched_setaffinity on Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 approx = "0.5"
 infernum-gemma = { path = "../infernum-gemma" }
