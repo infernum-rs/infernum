@@ -25,7 +25,7 @@ memmap2 = "0.9"
 # Half-precision types
 half = { version = "2.4", features = ["num-traits", "bytemuck"] }
 num-traits = "0.2"
-bytemuck = { version = "1.14", features = ["derive"] }
+bytemuck = { version = "1.14", features = ["derive", "extern_crate_alloc"] }
 
 # Config parsing
 serde = { version = "1.0", features = ["derive"] }
@@ -36,6 +36,13 @@ rand = "0.8"
 
 # Multi-threaded matmul
 rayon = "1.10"
+
+# Cross-platform physical core count detection
+num_cpus = "1.16"
+
+# Thread affinity (sched_setaffinity on Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 approx = "0.5"

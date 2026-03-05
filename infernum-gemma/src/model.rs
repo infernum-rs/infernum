@@ -487,9 +487,12 @@ impl<B: GemmaOps> GemmaModel<B> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim;
 
-        let q = B::linear(hidden, &weights.q_proj)?;
-        let (k, v) =
-            transformer::compute_kv_proj_decode::<B>(hidden, &weights.kv_proj, batch_size)?;
+        let (q, k, v) = transformer::compute_qkv_proj_decode::<B>(
+            hidden,
+            &weights.q_proj,
+            &weights.kv_proj,
+            batch_size,
+        )?;
 
         let mut q = q.reshape(&[batch_size, num_heads, head_dim]);
         let mut k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
@@ -688,7 +691,7 @@ impl<B: GemmaOps> GemmaModel<B> {
                 let v_t = B::as_dense_weight(&v).expect("checked dense");
                 KvProjWeight::<B>::Fused {
                     kv_dim,
-                    weight: B::concat_inner_dim(k_t, v_t)?,
+                    weight: B::dense_weight(B::concat_inner_dim(k_t, v_t)?),
                 }
             } else {
                 KvProjWeight::<B>::Separate {
@@ -718,7 +721,7 @@ impl<B: GemmaOps> GemmaModel<B> {
                 let g = B::as_dense_weight(&gate).expect("checked dense");
                 let u = B::as_dense_weight(&up).expect("checked dense");
                 GateUpWeight::<B>::Fused {
-                    weight: B::concat_inner_dim(g, u)?,
+                    weight: B::dense_weight(B::concat_inner_dim(g, u)?),
                     intermediate_size: config.intermediate_size,
                 }
             } else {
@@ -940,7 +943,7 @@ impl<B: GemmaOps> GemmaModel<B> {
                         B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
                     KvProjWeight::<B>::Fused {
                         kv_dim: config.num_key_value_heads * config.head_dim,
-                        weight: fused_tensor,
+                        weight: B::dense_weight(fused_tensor),
                     }
                 } else {
                     let k_dev = B::upload_host_linear(&device, &k_host)?;
@@ -998,7 +1001,7 @@ impl<B: GemmaOps> GemmaModel<B> {
                     let fused_tensor =
                         B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
                     GateUpWeight::<B>::Fused {
-                        weight: fused_tensor,
+                        weight: B::dense_weight(fused_tensor),
                         intermediate_size: config.intermediate_size,
                     }
                 } else {

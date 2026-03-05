@@ -17,8 +17,34 @@ pub struct CpuTensor {
     dtype: DType,
 }
 
+// Thread-local scratch buffer reused across forward-pass ops.
+//
+// Avoids per-token heap allocations in matmul and other compute-heavy ops.
+// The buffer grows to the high-water mark and is never shrunk, so after a
+// few warm-up tokens the allocator is never called again.
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Borrow the thread-local scratch buffer, resized to at least `len` elements.
+///
+/// The closure receives a `&mut [f32]` of exactly `len` elements. It must not
+/// call any other function that also borrows `SCRATCH` (no re-entrancy).
+pub fn with_scratch<F, R>(len: usize, f: F) -> R
+where
+    F: FnOnce(&mut [f32]) -> R,
+{
+    SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0.0f32);
+        }
+        f(&mut buf[..len])
+    })
+}
+
 impl CpuTensor {
-    /// Create a tensor from an f32 slice.
+    /// Create a tensor from an f32 slice (copies data).
     #[must_use]
     pub fn from_f32(shape: &[usize], data: &[f32]) -> Self {
         let numel: usize = shape.iter().product();
@@ -30,6 +56,41 @@ impl CpuTensor {
         );
         Self {
             data: Arc::new(bytemuck::cast_slice(data).to_vec()),
+            offset: 0,
+            shape: shape.to_vec(),
+            dtype: DType::F32,
+        }
+    }
+
+    /// Create a tensor by taking ownership of a `Vec<f32>`, zero-copy.
+    ///
+    /// The vector is reinterpreted as raw bytes via `bytemuck`. This avoids
+    /// the extra copy that `from_f32` performs and should be preferred in
+    /// hot paths where the caller already owns the output buffer.
+    #[must_use]
+    pub fn from_f32_vec(shape: &[usize], mut data: Vec<f32>) -> Self {
+        let numel: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            numel,
+            "data len {} != shape product {numel}",
+            data.len()
+        );
+        // Reinterpret Vec<f32> as Vec<u8> without any copy.
+        // SAFETY:
+        //  - f32 is always 4 bytes, so len*4 and cap*4 fit in usize.
+        //  - The pointer, len, and capacity are all from a valid Vec<f32>,
+        //    so the resulting Vec<u8> is valid and the memory is properly owned.
+        //  - We `forget` the original Vec so it is not double-freed.
+        let len = data.len() * 4;
+        let cap = data.capacity() * 4;
+        let ptr = data.as_mut_ptr().cast::<u8>();
+        let bytes: Vec<u8> = unsafe {
+            std::mem::forget(data);
+            Vec::from_raw_parts(ptr, len, cap)
+        };
+        Self {
+            data: Arc::new(bytes),
             offset: 0,
             shape: shape.to_vec(),
             dtype: DType::F32,
@@ -67,6 +128,20 @@ impl CpuTensor {
     pub fn from_raw(shape: &[usize], dtype: DType, data: Vec<u8>) -> Self {
         Self {
             data: Arc::new(data),
+            offset: 0,
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
+    /// Create a tensor that shares an existing `Arc<Vec<u8>>` (zero-copy).
+    ///
+    /// Used by the paged KV cache to avoid re-copying pool data on every
+    /// token append.
+    #[must_use]
+    pub fn from_arc(shape: &[usize], dtype: DType, data: Arc<Vec<u8>>) -> Self {
+        Self {
+            data,
             offset: 0,
             shape: shape.to_vec(),
             dtype,
@@ -160,6 +235,17 @@ impl CpuTensor {
             other => panic!("to_f32_vec: unsupported dtype {other}"),
         }
     }
+
+    /// Return f32 data as a `Cow`: zero-copy borrow if already F32,
+    /// or an owned conversion for BF16/F16.
+    #[must_use]
+    pub fn to_f32_cow(&self) -> std::borrow::Cow<'_, [f32]> {
+        if self.dtype == DType::F32 {
+            std::borrow::Cow::Borrowed(self.as_f32_slice())
+        } else {
+            std::borrow::Cow::Owned(self.to_f32_vec())
+        }
+    }
 }
 
 /// Block-quantized weight for CPU inference.
@@ -167,6 +253,10 @@ impl CpuTensor {
 /// Stores quantized data and per-block scales separately, matching the
 /// GGUF loader output. Layout is row-major: `out_features` rows of
 /// `in_features` elements, with `in_features / 32` blocks per row.
+///
+/// Scales and mins are pre-decoded to f32 at load time so the forward
+/// pass pays no f16→f32 conversion cost (and avoids repeated CPU-feature
+/// detection inside the half crate).
 #[derive(Clone)]
 pub struct CpuQuantizedWeight {
     /// Logical shape: `[out_features, in_features]`
@@ -175,19 +265,61 @@ pub struct CpuQuantizedWeight {
     pub dtype: DType,
     /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
     pub data: Vec<u8>,
-    /// Per-block f16 scales as raw bytes (2 bytes per block)
-    pub scales: Vec<u8>,
-    /// Per-block f16 minimums as raw bytes (2 bytes per block, Q4_1 only)
-    pub mins: Option<Vec<u8>>,
+    /// Per-block scales decoded to f32 (one per block)
+    pub scales: Vec<f32>,
+    /// Per-block minimums decoded to f32 (one per block, Q4_1 only)
+    pub mins: Option<Vec<f32>>,
+}
+
+/// Decode a buffer of f16 values stored as raw little-endian bytes into f32.
+#[must_use]
+pub fn decode_f16_scales(raw: &[u8]) -> Vec<f32> {
+    raw.chunks_exact(2)
+        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect()
 }
 
 /// A linear weight — dense f32 or block-quantized.
 #[derive(Clone)]
 pub enum CpuLinearWeight {
-    /// Dense f32 weight, pre-transposed to `(in_features, out_features)`.
-    Dense(CpuTensor),
+    /// Dense f32 weight.
+    ///
+    /// - `weight`: original layout `(in_features, out_features)` = `(K, N)`,
+    ///   used by `as_dense_weight()` for fusion ops like `concat_inner_dim`.
+    /// - `weight_nt`: pre-transposed to `(out_features, in_features)` = `(N, K)`,
+    ///   used by matmul/GEMV for contiguous dot products (avoids per-call transpose).
+    Dense {
+        weight: CpuTensor,
+        weight_nt: CpuTensor,
+    },
     /// Block-quantized weight in `(out_features, in_features)` layout.
     Quantized(CpuQuantizedWeight),
+}
+
+impl CpuLinearWeight {
+    /// Create a dense weight from a `(K, N)` tensor, pre-computing the transposed layout.
+    ///
+    /// The transposed copy is always stored as f32 (used by matmul kernels).
+    /// The original tensor is kept as-is for fusion ops like `concat_inner_dim`.
+    #[must_use]
+    pub fn new_dense(weight: CpuTensor) -> Self {
+        let shape = weight.shape();
+        assert!(shape.len() == 2, "Dense weight must be 2D, got {shape:?}");
+        let k = shape[0];
+        let n = shape[1];
+        let data = weight.to_f32_vec();
+
+        // Transpose (K, N) → (N, K)
+        let mut nt = vec![0.0f32; n * k];
+        for row in 0..k {
+            for col in 0..n {
+                nt[col * k + row] = data[row * n + col];
+            }
+        }
+        let weight_nt = CpuTensor::from_f32(&[n, k], &nt);
+
+        Self::Dense { weight, weight_nt }
+    }
 }
 
 impl Tensor for CpuTensor {

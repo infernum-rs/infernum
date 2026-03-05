@@ -47,7 +47,7 @@ impl TensorOps for CpuBackend {
                 out[j * rows + i] = data[i * cols + j];
             }
         }
-        Ok(CpuTensor::from_f32(&[cols, rows], &out))
+        Ok(CpuTensor::from_f32_vec(&[cols, rows], out))
     }
 
     fn split_inner_dim(
@@ -80,8 +80,8 @@ impl TensorOps for CpuBackend {
         shape_b.push(dim2);
 
         Ok((
-            CpuTensor::from_f32(&shape_a, &a),
-            CpuTensor::from_f32(&shape_b, &b),
+            CpuTensor::from_f32_vec(&shape_a, a),
+            CpuTensor::from_f32_vec(&shape_b, b),
         ))
     }
 
@@ -104,7 +104,7 @@ impl TensorOps for CpuBackend {
 
         let mut out_shape = a_shape[..a_shape.len() - 1].to_vec();
         out_shape.push(new_inner);
-        Ok(CpuTensor::from_f32(&out_shape, &out))
+        Ok(CpuTensor::from_f32_vec(&out_shape, out))
     }
 
     fn pad_inner_dim(tensor: &CpuTensor, new_width: usize) -> Result<CpuTensor> {
@@ -125,7 +125,7 @@ impl TensorOps for CpuBackend {
 
         let mut out_shape = shape[..shape.len() - 1].to_vec();
         out_shape.push(new_width);
-        Ok(CpuTensor::from_f32(&out_shape, &out))
+        Ok(CpuTensor::from_f32_vec(&out_shape, out))
     }
 
     fn broadcast_to_heads(tensor: &CpuTensor, num_heads: usize) -> Result<CpuTensor> {
@@ -143,7 +143,7 @@ impl TensorOps for CpuBackend {
                 out.extend_from_slice(row);
             }
         }
-        Ok(CpuTensor::from_f32(&[batch, num_heads, head_dim], &out))
+        Ok(CpuTensor::from_f32_vec(&[batch, num_heads, head_dim], out))
     }
 
     fn repeat_kv(tensor: &CpuTensor, num_repeats: usize) -> Result<CpuTensor> {
@@ -167,7 +167,10 @@ impl TensorOps for CpuBackend {
                 }
             }
         }
-        Ok(CpuTensor::from_f32(&[seq_len, new_heads, head_dim], &out))
+        Ok(CpuTensor::from_f32_vec(
+            &[seq_len, new_heads, head_dim],
+            out,
+        ))
     }
 
     fn concat_rows(parts: &[CpuTensor]) -> Result<CpuTensor> {
@@ -178,7 +181,7 @@ impl TensorOps for CpuBackend {
             data.extend_from_slice(part.as_f32_slice());
         }
         let rows = parts.len();
-        Ok(CpuTensor::from_f32(&[rows, cols], &data))
+        Ok(CpuTensor::from_f32_vec(&[rows, cols], data))
     }
 }
 

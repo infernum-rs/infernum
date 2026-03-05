@@ -3,14 +3,35 @@
 //! Provides architecture-specific SIMD kernels: AVX2+FMA on x86-64,
 //! NEON on AArch64. No scalar fallback — unsupported platforms are a
 //! compile error.
+//!
+//! Quantized integer dot products (Q8×Q8, Q4×Q8) have two tiers:
+//! - **AVX2**: `vpmaddubsw` + `vpmaddwd` (baseline x86-64)
+//! - **AVX-512 VNNI**: `vpdpbusd` (Cascade Lake+, Zen 4+) — single-instruction replacement
+//!
+//! The tier is selected at runtime via `is_x86_feature_detected!`.
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("infernum-cpu requires x86-64 (AVX2+FMA) or AArch64 (NEON)");
+
+/// Whether the CPU supports AVX-512 VNNI (runtime-detected, cached).
+#[cfg(target_arch = "x86_64")]
+fn has_vnni() -> bool {
+    use std::sync::OnceLock;
+    static HAS_VNNI: OnceLock<bool> = OnceLock::new();
+    *HAS_VNNI.get_or_init(|| {
+        is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512bw")
+    })
+}
 
 /// Check that the current CPU supports the required SIMD features.
 ///
@@ -74,6 +95,23 @@ pub fn vec_add_inplace(a: &mut [f32], b: &[f32]) {
     #[cfg(target_arch = "aarch64")]
     {
         neon::vec_add_inplace(a, b);
+    }
+}
+
+/// Scaled accumulate (AXPY): `out[i] += scale * src[i]`.
+#[inline]
+pub fn vec_axpy(out: &mut [f32], scale: f32, src: &[f32]) {
+    debug_assert_eq!(out.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2::vec_axpy(out, scale, src);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Fallback: scalar
+        for (o, s) in out.iter_mut().zip(src.iter()) {
+            *o = scale.mul_add(*s, *o);
+        }
     }
 }
 
@@ -193,6 +231,84 @@ pub fn dot_q4_1_block(input: &[f32], packed: &[u8], scale: f32, min: f32) -> f32
     }
 }
 
+/// Q8_0 row dot product: process all blocks for one neuron in a single call.
+///
+/// `input` is the full f32 input row (K elements), `quants` is the quantized
+/// row (K bytes), `scales` is the per-block scale array (K/32 elements).
+#[inline]
+#[must_use]
+pub fn dot_q8_row(input: &[f32], quants: &[u8], scales: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2::dot_q8_row(input, quants, scales)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Fallback: loop over blocks using per-block kernel
+        let mut acc = 0.0f32;
+        for (blk, &scale) in scales.iter().enumerate() {
+            let start = blk * 32;
+            acc += neon::dot_q8_block(&input[start..start + 32], &quants[start..start + 32], scale);
+        }
+        acc
+    }
+}
+
+/// Q4_0 row dot product: process all blocks for one neuron in a single call.
+///
+/// `input` is the full f32 input row (K elements), `packed` is the packed Q4
+/// row (K/2 bytes), `scales` is the per-block scale array (K/32 elements).
+#[inline]
+#[must_use]
+pub fn dot_q4_row(input: &[f32], packed: &[u8], scales: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2::dot_q4_row(input, packed, scales)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut acc = 0.0f32;
+        for (blk, &scale) in scales.iter().enumerate() {
+            let inp_start = blk * 32;
+            let p_start = blk * 16;
+            acc += neon::dot_q4_block(
+                &input[inp_start..inp_start + 32],
+                &packed[p_start..p_start + 16],
+                scale,
+            );
+        }
+        acc
+    }
+}
+
+/// Q4_1 row dot product: process all blocks for one neuron in a single call.
+///
+/// `input` is the full f32 input row (K elements), `packed` is the packed Q4_1
+/// row (K/2 bytes), `scales` and `mins` are per-block arrays (K/32 elements).
+#[inline]
+#[must_use]
+pub fn dot_q4_1_row(input: &[f32], packed: &[u8], scales: &[f32], mins: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2::dot_q4_1_row(input, packed, scales, mins)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut acc = 0.0f32;
+        for (blk, (&scale, &min)) in scales.iter().zip(mins.iter()).enumerate() {
+            let inp_start = blk * 32;
+            let p_start = blk * 16;
+            acc += neon::dot_q4_1_block(
+                &input[inp_start..inp_start + 32],
+                &packed[p_start..p_start + 16],
+                scale,
+                min,
+            );
+        }
+        acc
+    }
+}
+
 /// RMS norm: `out[i] = input[i] * weight[i] * rms_scale`
 /// where `rms_scale = 1.0 / sqrt(mean_of_squares + eps)`.
 #[inline]
@@ -202,6 +318,206 @@ pub fn vec_rmsnorm(input: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let rms = 1.0 / (ss / input.len() as f32 + eps).sqrt();
     for i in 0..input.len() {
         out[i] = input[i] * rms * weight[i];
+    }
+}
+
+// ---- Integer dot product dispatch (Q8×Q8, Q4×Q8) ----
+
+/// Quantize a row of f32 values to Q8_0 format (on-the-fly, for integer GEMV).
+///
+/// For each 32-element block: finds max_abs, computes `scale = max_abs / 127`,
+/// stores `round(input / scale)` as int8 and the scale as f32.
+///
+/// `out_quants` must have length K, `out_scales` must have length K/32.
+#[inline]
+pub fn quantize_row_q8(input: &[f32], out_quants: &mut [u8], out_scales: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2::quantize_row_q8(input, out_quants, out_scales);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::quantize_row_q8(input, out_quants, out_scales);
+    }
+}
+
+/// Q8_0 integer row dot product: weight_q8 × input_q8.
+///
+/// Both operands are pre-quantized Q8. Dispatches to VNNI or AVX2 integer kernels.
+#[inline]
+#[must_use]
+pub fn dot_q8_q8_row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants: &[u8],
+    weight_scales: &[f32],
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q8_q8_row(input_quants, input_scales, weight_quants, weight_scales)
+        } else {
+            avx2::dot_q8_q8_row(input_quants, input_scales, weight_quants, weight_scales)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::dot_q8_q8_row(input_quants, input_scales, weight_quants, weight_scales)
+    }
+}
+
+/// Q4_0 integer row dot product: weight_q4 × input_q8.
+///
+/// Weight nibbles are unpacked, then integer dot with pre-quantized Q8 input.
+#[inline]
+#[must_use]
+pub fn dot_q4_q8_row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed: &[u8],
+    weight_scales: &[f32],
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q4_q8_row(input_quants, input_scales, weight_packed, weight_scales)
+        } else {
+            avx2::dot_q4_q8_row(input_quants, input_scales, weight_packed, weight_scales)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::dot_q4_q8_row(input_quants, input_scales, weight_packed, weight_scales)
+    }
+}
+
+/// Q4_1 integer row dot product: weight_q4_1 × input_q8.
+///
+/// Uses integer dot for nibble×quant part, f32 for the min correction term.
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn dot_q4_1_q8_row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    input_row: &[f32],
+    weight_packed: &[u8],
+    weight_scales: &[f32],
+    weight_mins: &[f32],
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q4_1_q8_row(
+                input_quants,
+                input_scales,
+                input_row,
+                weight_packed,
+                weight_scales,
+                weight_mins,
+            )
+        } else {
+            avx2::dot_q4_1_q8_row(
+                input_quants,
+                input_scales,
+                input_row,
+                weight_packed,
+                weight_scales,
+                weight_mins,
+            )
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::dot_q4_1_q8_row(
+            input_quants,
+            input_scales,
+            input_row,
+            weight_packed,
+            weight_scales,
+            weight_mins,
+        )
+    }
+}
+
+// ---- Multi-row GEMV dispatchers ----
+
+/// 2-row Q8×Q8 GEMV: computes dot products for two adjacent weight rows
+/// against the same input vector. Returns `(dot0, dot1)`.
+#[inline]
+#[must_use]
+pub fn dot_q8_q8_2row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants_0: &[u8],
+    weight_scales_0: &[f32],
+    weight_quants_1: &[u8],
+    weight_scales_1: &[f32],
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q8_q8_2row(
+                input_quants,
+                input_scales,
+                weight_quants_0,
+                weight_scales_0,
+                weight_quants_1,
+                weight_scales_1,
+            )
+        } else {
+            // Fallback: two sequential single-row calls
+            let d0 =
+                avx2::dot_q8_q8_row(input_quants, input_scales, weight_quants_0, weight_scales_0);
+            let d1 =
+                avx2::dot_q8_q8_row(input_quants, input_scales, weight_quants_1, weight_scales_1);
+            (d0, d1)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let d0 = neon::dot_q8_q8_row(input_quants, input_scales, weight_quants_0, weight_scales_0);
+        let d1 = neon::dot_q8_q8_row(input_quants, input_scales, weight_quants_1, weight_scales_1);
+        (d0, d1)
+    }
+}
+
+/// 2-row Q4×Q8 GEMV: computes dot products for two adjacent Q4_0 weight rows
+/// against the same Q8 input vector. Returns `(dot0, dot1)`.
+#[inline]
+#[must_use]
+pub fn dot_q4_q8_2row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed_0: &[u8],
+    weight_scales_0: &[f32],
+    weight_packed_1: &[u8],
+    weight_scales_1: &[f32],
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q4_q8_2row(
+                input_quants,
+                input_scales,
+                weight_packed_0,
+                weight_scales_0,
+                weight_packed_1,
+                weight_scales_1,
+            )
+        } else {
+            let d0 =
+                avx2::dot_q4_q8_row(input_quants, input_scales, weight_packed_0, weight_scales_0);
+            let d1 =
+                avx2::dot_q4_q8_row(input_quants, input_scales, weight_packed_1, weight_scales_1);
+            (d0, d1)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let d0 = neon::dot_q4_q8_row(input_quants, input_scales, weight_packed_0, weight_scales_0);
+        let d1 = neon::dot_q4_q8_row(input_quants, input_scales, weight_packed_1, weight_scales_1);
+        (d0, d1)
     }
 }
 

@@ -17,7 +17,7 @@ impl EmbedOps for CpuBackend {
             let start = idx as usize * hidden_size;
             out.extend_from_slice(&table_data[start..start + hidden_size]);
         }
-        Ok(CpuTensor::from_f32(&[indices.len(), hidden_size], &out))
+        Ok(CpuTensor::from_f32_vec(&[indices.len(), hidden_size], out))
     }
 
     fn embedding_gather_tensor(

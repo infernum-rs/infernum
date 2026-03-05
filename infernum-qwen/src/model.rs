@@ -227,7 +227,7 @@ impl<B: QwenOps> QwenModel<B> {
                 let v_t = B::as_dense_weight(&v).expect("checked dense");
                 KvProjWeight::<B>::Fused {
                     kv_dim: config.num_kv_heads() * config.head_dim(),
-                    weight: B::concat_inner_dim(k_t, v_t)?,
+                    weight: B::dense_weight(B::concat_inner_dim(k_t, v_t)?),
                 }
             } else {
                 KvProjWeight::<B>::Separate {
@@ -463,7 +463,7 @@ impl<B: QwenOps> QwenModel<B> {
                         B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
                     KvProjWeight::<B>::Fused {
                         kv_dim: num_kv_heads * head_dim,
-                        weight: fused_tensor,
+                        weight: B::dense_weight(fused_tensor),
                     }
                 } else {
                     let k_dev = B::upload_host_linear(&device, &k_host)?;
@@ -537,7 +537,7 @@ impl<B: QwenOps> QwenModel<B> {
                     let fused_tensor =
                         B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
                     GateUpWeight::<B>::Fused {
-                        weight: fused_tensor,
+                        weight: B::dense_weight(fused_tensor),
                         intermediate_size: config.intermediate_size,
                     }
                 } else {
@@ -1275,9 +1275,12 @@ impl<B: QwenOps> QwenModel<B> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let mut q = B::linear(hidden, &weights.q_proj)?;
-        let (mut k, mut v) =
-            transformer::compute_kv_proj_decode::<B>(hidden, &weights.kv_proj, batch_size)?;
+        let (mut q, mut k, mut v) = transformer::compute_qkv_proj_decode::<B>(
+            hidden,
+            &weights.q_proj,
+            &weights.kv_proj,
+            batch_size,
+        )?;
 
         transformer::apply_qkv_bias::<B>(
             &mut q,
