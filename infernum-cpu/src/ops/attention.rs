@@ -597,8 +597,6 @@ impl PagedAttentionOps for CpuBackend {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<CpuTensor> {
-        use rayon::prelude::*;
-
         let q_shape = q.shape();
         let batch_size = q_shape[0];
         let num_heads = q_shape[1];
@@ -619,35 +617,37 @@ impl PagedAttentionOps for CpuBackend {
 
         let mut output = vec![0.0f32; batch_size * num_heads * head_dim];
 
-        // Process each (batch, head) pair in parallel.
-        // Each chunk of `head_dim` elements in `output` is independent.
-        output
-            .par_chunks_mut(head_dim)
-            .enumerate()
-            .for_each(|(bh_idx, out_head)| {
-                let b = bh_idx / num_heads;
-                let h = bh_idx % num_heads;
-                let kv_h = h / gqa_ratio;
+        // Find max seq_len across batch for scratch buffer sizing
+        let max_sl = sl_data.iter().copied().max().unwrap_or(0) as usize;
+        let mut scores = vec![0.0f32; max_sl];
 
+        // Process each (batch, head) pair sequentially.
+        // At decode time, work per head is tiny (seq_len dot products of dim 64),
+        // so rayon's scheduling overhead far exceeds the actual compute.
+        for bh_idx in 0..(batch_size * num_heads) {
+            let out_head = &mut output[bh_idx * head_dim..(bh_idx + 1) * head_dim];
+            let b = bh_idx / num_heads;
+            let h = bh_idx % num_heads;
+            let kv_h = h / gqa_ratio;
+
+            #[allow(clippy::cast_sign_loss)]
+            let seq_len = sl_data[b] as usize;
+            if seq_len == 0 {
+                continue;
+            }
+
+            let q_off = (b * num_heads + h) * head_dim;
+            let q_vec = &q_data[q_off..q_off + head_dim];
+            let bt_row = &bt_data[b * max_blocks_per_seq..];
+
+            let scores = &mut scores[..seq_len];
+
+            // Q × K dot products using SIMD
+            for pos in 0..seq_len {
+                let block_idx = pos / block_size;
+                let block_offset = pos % block_size;
                 #[allow(clippy::cast_sign_loss)]
-                let seq_len = sl_data[b] as usize;
-                if seq_len == 0 {
-                    return;
-                }
-
-                let q_off = (b * num_heads + h) * head_dim;
-                let q_vec = &q_data[q_off..q_off + head_dim];
-                let bt_row = &bt_data[b * max_blocks_per_seq..];
-
-                // Pre-allocated scores buffer (one per thread via rayon)
-                let mut scores = vec![0.0f32; seq_len];
-
-                // Q × K dot products using SIMD
-                for pos in 0..seq_len {
-                    let block_idx = pos / block_size;
-                    let block_offset = pos % block_size;
-                    #[allow(clippy::cast_sign_loss)]
-                    let phys_block = bt_row[block_idx] as usize;
+                let phys_block = bt_row[block_idx] as usize;
                     let k_off =
                         (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
 
@@ -664,7 +664,7 @@ impl PagedAttentionOps for CpuBackend {
                     let query_pos = seq_len - 1;
                     if query_pos >= window {
                         let cutoff = query_pos - window + 1;
-                        for s in &mut scores[..cutoff] {
+                        for s in scores[..cutoff].iter_mut() {
                             *s = f32::NEG_INFINITY;
                         }
                     }
@@ -673,13 +673,13 @@ impl PagedAttentionOps for CpuBackend {
                 // Softmax
                 let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
-                for s in &mut scores {
+                for s in scores.iter_mut() {
                     *s = (*s - max_s).exp();
                     sum += *s;
                 }
                 if sum > 0.0 {
                     let inv_sum = 1.0 / sum;
-                    for s in &mut scores {
+                    for s in scores.iter_mut() {
                         *s *= inv_sum;
                     }
                 }
@@ -697,7 +697,7 @@ impl PagedAttentionOps for CpuBackend {
                         crate::simd::vec_axpy(out_head, w, &v_data[v_off..v_off + head_dim]);
                     }
                 }
-            });
+            }
 
         Ok(CpuTensor::from_f32_vec(
             &[batch_size, num_heads, head_dim],
