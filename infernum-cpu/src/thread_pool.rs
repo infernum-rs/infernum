@@ -321,29 +321,36 @@ fn pin_to_core(core_id: usize) {
 ///
 /// Returns a reference to a shared `SpinPool` with one thread per physical core.
 /// The pool is created once and reused for all GEMV calls.
+///
+/// Thread count selection (in order of priority):
+/// 1. `RAYON_NUM_THREADS` env var (explicit override)
+/// 2. Linux sysfs topology → physical core count, capped by cgroup limit
+/// 3. macOS `sysctl hw.physicalcpu`
+/// 4. `available_parallelism() / 2` (assume HT, conservative)
 pub fn global_pool() -> &'static SpinPool {
     use std::sync::OnceLock;
     static POOL: OnceLock<SpinPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        // Use RAYON_NUM_THREADS if set (for consistency with benchmarks),
-        // otherwise default to the number of physical cores. This avoids
-        // HT siblings competing for the same execution resources with
-        // spin-waiting workers.
         let n = std::env::var("RAYON_NUM_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| {
-                detect_physical_cores().map_or_else(
-                    || {
-                        std::thread::available_parallelism()
-                            .map(std::num::NonZero::get)
-                            .unwrap_or(1)
-                    },
-                    |cores| cores.len(),
-                )
-            });
+            .unwrap_or_else(default_thread_count);
         SpinPool::new(n)
     })
+}
+
+/// Determine the optimal thread count for this machine.
+///
+/// Uses `num_cpus::get_physical()` for cross-platform physical core detection
+/// (Linux, macOS, Windows, FreeBSD), capped by `available_parallelism()` which
+/// respects cgroup CPU limits in containers. Without the cap, a container with
+/// `--cpus=4` would detect all host physical cores and over-subscribe.
+fn default_thread_count() -> usize {
+    let physical = num_cpus::get_physical();
+    let cgroup_limit = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(physical);
+    physical.min(cgroup_limit).max(1)
 }
 
 #[cfg(test)]
