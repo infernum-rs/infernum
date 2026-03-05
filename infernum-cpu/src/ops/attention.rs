@@ -126,8 +126,16 @@ impl PagedKvCacheOps for CpuBackend {
         for _ in 0..num_layers {
             let k_arc = Arc::new(vec![0u8; pool_byte_size]);
             let v_arc = Arc::new(vec![0u8; pool_byte_size]);
-            k_tensors.push(CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&k_arc)));
-            v_tensors.push(CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&v_arc)));
+            k_tensors.push(CpuTensor::from_arc(
+                &pool_shape,
+                DType::F32,
+                Arc::clone(&k_arc),
+            ));
+            v_tensors.push(CpuTensor::from_arc(
+                &pool_shape,
+                DType::F32,
+                Arc::clone(&v_arc),
+            ));
             k_pools.push(k_arc);
             v_pools.push(v_arc);
         }
@@ -189,10 +197,16 @@ impl PagedKvCacheOps for CpuBackend {
         }
 
         // Rebuild tensors sharing the pool Arc (zero-copy).
-        cache.k_tensors[layer_idx] =
-            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.k_pools[layer_idx]));
-        cache.v_tensors[layer_idx] =
-            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.v_pools[layer_idx]));
+        cache.k_tensors[layer_idx] = CpuTensor::from_arc(
+            &pool_shape,
+            DType::F32,
+            Arc::clone(&cache.k_pools[layer_idx]),
+        );
+        cache.v_tensors[layer_idx] = CpuTensor::from_arc(
+            &pool_shape,
+            DType::F32,
+            Arc::clone(&cache.v_pools[layer_idx]),
+        );
 
         Ok(())
     }
@@ -254,10 +268,16 @@ impl PagedKvCacheOps for CpuBackend {
         }
 
         // Rebuild tensors sharing the pool Arc (zero-copy).
-        cache.k_tensors[layer_idx] =
-            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.k_pools[layer_idx]));
-        cache.v_tensors[layer_idx] =
-            CpuTensor::from_arc(&pool_shape, DType::F32, Arc::clone(&cache.v_pools[layer_idx]));
+        cache.k_tensors[layer_idx] = CpuTensor::from_arc(
+            &pool_shape,
+            DType::F32,
+            Arc::clone(&cache.k_pools[layer_idx]),
+        );
+        cache.v_tensors[layer_idx] = CpuTensor::from_arc(
+            &pool_shape,
+            DType::F32,
+            Arc::clone(&cache.v_pools[layer_idx]),
+        );
 
         Ok(())
     }
@@ -577,6 +597,8 @@ impl PagedAttentionOps for CpuBackend {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<CpuTensor> {
+        use rayon::prelude::*;
+
         let q_shape = q.shape();
         let batch_size = q_shape[0];
         let num_heads = q_shape[1];
@@ -597,42 +619,53 @@ impl PagedAttentionOps for CpuBackend {
 
         let mut output = vec![0.0f32; batch_size * num_heads * head_dim];
 
-        for b in 0..batch_size {
-            #[allow(clippy::cast_sign_loss)]
-            let seq_len = sl_data[b] as usize;
-
-            for h in 0..num_heads {
+        // Process each (batch, head) pair in parallel.
+        // Each chunk of `head_dim` elements in `output` is independent.
+        output
+            .par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(bh_idx, out_head)| {
+                let b = bh_idx / num_heads;
+                let h = bh_idx % num_heads;
                 let kv_h = h / gqa_ratio;
+
+                #[allow(clippy::cast_sign_loss)]
+                let seq_len = sl_data[b] as usize;
+                if seq_len == 0 {
+                    return;
+                }
+
                 let q_off = (b * num_heads + h) * head_dim;
                 let q_vec = &q_data[q_off..q_off + head_dim];
+                let bt_row = &bt_data[b * max_blocks_per_seq..];
 
-                // Gather scores from paged blocks
-                let mut scores = Vec::with_capacity(seq_len);
+                // Pre-allocated scores buffer (one per thread via rayon)
+                let mut scores = vec![0.0f32; seq_len];
+
+                // Q × K dot products using SIMD
                 for pos in 0..seq_len {
                     let block_idx = pos / block_size;
                     let block_offset = pos % block_size;
                     #[allow(clippy::cast_sign_loss)]
-                    let phys_block = bt_data[b * max_blocks_per_seq + block_idx] as usize;
+                    let phys_block = bt_row[block_idx] as usize;
                     let k_off =
                         (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
 
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q_vec[d] * k_data[k_off + d];
-                    }
+                    let mut dot = crate::simd::dot_f32(q_vec, &k_data[k_off..k_off + head_dim]);
                     dot *= scale;
                     if let Some(cap) = softcap {
                         dot = cap * (dot / cap).tanh();
                     }
-                    scores.push(dot);
+                    scores[pos] = dot;
                 }
 
-                // Apply sliding window
-                let query_pos = seq_len - 1;
+                // Apply sliding window mask
                 if let Some(window) = sliding_window {
-                    for (pos, score) in scores.iter_mut().enumerate() {
-                        if query_pos >= window && pos < query_pos - window + 1 {
-                            *score = f32::NEG_INFINITY;
+                    let query_pos = seq_len - 1;
+                    if query_pos >= window {
+                        let cutoff = query_pos - window + 1;
+                        for s in &mut scores[..cutoff] {
+                            *s = f32::NEG_INFINITY;
                         }
                     }
                 }
@@ -645,28 +678,26 @@ impl PagedAttentionOps for CpuBackend {
                     sum += *s;
                 }
                 if sum > 0.0 {
+                    let inv_sum = 1.0 / sum;
                     for s in &mut scores {
-                        *s /= sum;
+                        *s *= inv_sum;
                     }
                 }
 
-                // Weighted V sum
-                let o_off = (b * num_heads + h) * head_dim;
+                // Weighted V accumulation using SIMD AXPY
                 for pos in 0..seq_len {
-                    if scores[pos] > 0.0 {
+                    let w = scores[pos];
+                    if w > 0.0 {
                         let block_idx = pos / block_size;
                         let block_offset = pos % block_size;
                         #[allow(clippy::cast_sign_loss)]
-                        let phys_block = bt_data[b * max_blocks_per_seq + block_idx] as usize;
+                        let phys_block = bt_row[block_idx] as usize;
                         let v_off =
                             (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
-                        for d in 0..head_dim {
-                            output[o_off + d] += scores[pos] * v_data[v_off + d];
-                        }
+                        crate::simd::vec_axpy(out_head, w, &v_data[v_off..v_off + head_dim]);
                     }
                 }
-            }
-        }
+            });
 
         Ok(CpuTensor::from_f32_vec(
             &[batch_size, num_heads, head_dim],
