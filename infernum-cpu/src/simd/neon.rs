@@ -314,4 +314,325 @@ unsafe fn dot_q4_1_block_inner(input: &[f32], packed: &[u8], scale: f32, min: f3
 }
 
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::vdupq_n_s32;
+use std::arch::aarch64::{vabsq_f32, vdupq_n_s32, vmaxq_f32, vmaxvq_f32, vst1q_s8};
+
+// ---- Integer dot product kernels (Q8×Q8, Q4×Q8) ----
+//
+// These keep computation in the integer domain (i16 multiply, i32 accumulate)
+// until the final per-block scale multiply. Uses the widening multiply approach:
+// load 8×i8 pairs → vmull_s8 → 8×i16 → vmlal_s8/vpaddlq → 4×i32 → accumulate.
+
+/// Inner helper: integer dot product of 32 int8 × int8 values, returning i32 sum.
+///
+/// Uses widening multiply: 8×i8 × 8×i8 → 8×i16, then pairwise-add to 4×i32.
+#[inline]
+unsafe fn dot_i8x32_inner(a: *const i8, b: *const i8) -> i32 {
+    use std::arch::aarch64::{
+        vaddq_s32, vaddvq_s32, vget_low_s8, vld1q_s8, vmull_high_s8, vmull_s8, vpaddlq_s16,
+    };
+
+    // Process 32 elements in 2 groups of 16
+    // Group 0: elements 0..15
+    let a0 = vld1q_s8(a);
+    let b0 = vld1q_s8(b);
+    let prod0_lo = vmull_s8(vget_low_s8(a0), vget_low_s8(b0)); // 8×i16
+    let prod0_hi = vmull_high_s8(a0, b0); // 8×i16
+    let sum0_lo = vpaddlq_s16(prod0_lo); // 4×i32 (pairwise add i16→i32)
+    let sum0_hi = vpaddlq_s16(prod0_hi); // 4×i32
+
+    // Group 1: elements 16..31
+    let a1 = vld1q_s8(a.add(16));
+    let b1 = vld1q_s8(b.add(16));
+    let prod1_lo = vmull_s8(vget_low_s8(a1), vget_low_s8(b1));
+    let prod1_hi = vmull_high_s8(a1, b1);
+    let sum1_lo = vpaddlq_s16(prod1_lo);
+    let sum1_hi = vpaddlq_s16(prod1_hi);
+
+    // Sum all 4×i32 accumulators
+    let total = vaddq_s32(vaddq_s32(sum0_lo, sum0_hi), vaddq_s32(sum1_lo, sum1_hi));
+    vaddvq_s32(total)
+}
+
+/// Q8×Q8 integer row dot product using NEON widening multiply.
+pub fn dot_q8_q8_row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants: &[u8],
+    weight_scales: &[f32],
+) -> f32 {
+    unsafe { dot_q8_q8_row_inner(input_quants, input_scales, weight_quants, weight_scales) }
+}
+
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+unsafe fn dot_q8_q8_row_inner(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants: &[u8],
+    weight_scales: &[f32],
+) -> f32 {
+    let num_blocks = weight_scales.len();
+    let iq = input_quants.as_ptr().cast::<i8>();
+    let wq = weight_quants.as_ptr().cast::<i8>();
+
+    let mut total = 0.0f32;
+
+    for blk in 0..num_blocks {
+        let blk_offset = blk * 32;
+        let combined_scale = *input_scales.get_unchecked(blk) * *weight_scales.get_unchecked(blk);
+
+        let dot_i32 = dot_i8x32_inner(wq.add(blk_offset), iq.add(blk_offset));
+
+        total += (dot_i32 as f32) * combined_scale;
+    }
+
+    total
+}
+
+/// Q4_0 integer row dot product using NEON: weight Q4 nibbles × input Q8.
+///
+/// Unpacks Q4_0 nibbles to int8, then integer dot with pre-quantized Q8 input.
+pub fn dot_q4_q8_row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed: &[u8],
+    weight_scales: &[f32],
+) -> f32 {
+    unsafe { dot_q4_q8_row_inner(input_quants, input_scales, weight_packed, weight_scales) }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::similar_names)]
+#[inline]
+unsafe fn dot_q4_q8_row_inner(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed: &[u8],
+    weight_scales: &[f32],
+) -> f32 {
+    use std::arch::aarch64::{
+        vaddq_s32, vaddvq_s32, vand_u8, vdup_n_u8, vget_low_s8, vld1q_s8, vmull_high_s8, vmull_s8,
+        vpaddlq_s16, vreinterpretq_s8_u8, vsubq_s8,
+    };
+
+    let num_blocks = weight_scales.len();
+    let iq = input_quants.as_ptr().cast::<i8>();
+    let wp = weight_packed.as_ptr();
+    let mask = vdup_n_u8(0x0F);
+    let bias = std::arch::aarch64::vdupq_n_s8(8);
+
+    let mut total = 0.0f32;
+
+    for blk in 0..num_blocks {
+        let combined_scale = *input_scales.get_unchecked(blk) * *weight_scales.get_unchecked(blk);
+        let inp_offset = blk * 32;
+        let wp_offset = blk * 16;
+
+        // Unpack 16 packed bytes → 32 int8 values
+        // Low nibbles = elements 0..15, high nibbles = elements 16..31
+        let raw_lo = vld1_u8(wp.add(wp_offset));
+        let raw_hi = vld1_u8(wp.add(wp_offset + 8));
+
+        // Extract low nibbles (elements 0..7 and 8..15)
+        let lo_0 = vand_u8(raw_lo, mask);
+        let lo_1 = vand_u8(raw_hi, mask);
+        // Extract high nibbles (elements 16..23 and 24..31)
+        let hi_0 = vshr_n_u8(raw_lo, 4);
+        let hi_1 = vshr_n_u8(raw_hi, 4);
+
+        // Combine into 16-byte vectors: [lo_0, lo_1] and [hi_0, hi_1]
+        let lo_16 = std::arch::aarch64::vcombine_u8(lo_0, lo_1); // elements 0..15
+        let hi_16 = std::arch::aarch64::vcombine_u8(hi_0, hi_1); // elements 16..31
+
+        // Subtract bias 8 to get signed range [-8, 7]
+        let lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_16), bias);
+        let hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_16), bias);
+
+        // Load input quants for this block
+        let inp_lo = vld1q_s8(iq.add(inp_offset));
+        let inp_hi = vld1q_s8(iq.add(inp_offset + 16));
+
+        // Integer dot product: widening multiply + pairwise accumulate
+        // Elements 0..15
+        let prod_lo_lo = vmull_s8(vget_low_s8(lo_s8), vget_low_s8(inp_lo));
+        let prod_lo_hi = vmull_high_s8(lo_s8, inp_lo);
+        let sum_lo = vaddq_s32(vpaddlq_s16(prod_lo_lo), vpaddlq_s16(prod_lo_hi));
+
+        // Elements 16..31
+        let prod_hi_lo = vmull_s8(vget_low_s8(hi_s8), vget_low_s8(inp_hi));
+        let prod_hi_hi = vmull_high_s8(hi_s8, inp_hi);
+        let sum_hi = vaddq_s32(vpaddlq_s16(prod_hi_lo), vpaddlq_s16(prod_hi_hi));
+
+        let dot_i32 = vaddvq_s32(vaddq_s32(sum_lo, sum_hi));
+        total += (dot_i32 as f32) * combined_scale;
+    }
+
+    total
+}
+
+/// Q4_1 integer row dot product using NEON: weight Q4_1 nibbles × input Q8.
+///
+/// Nibbles are unsigned [0,15]. Uses integer dot for nibble×quant part,
+/// f32 for the min correction term.
+pub fn dot_q4_1_q8_row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    input_row: &[f32],
+    weight_packed: &[u8],
+    weight_scales: &[f32],
+    weight_mins: &[f32],
+) -> f32 {
+    unsafe {
+        dot_q4_1_q8_row_inner(
+            input_quants,
+            input_scales,
+            input_row,
+            weight_packed,
+            weight_scales,
+            weight_mins,
+        )
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    clippy::too_many_arguments
+)]
+#[inline]
+unsafe fn dot_q4_1_q8_row_inner(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    input_row: &[f32],
+    weight_packed: &[u8],
+    weight_scales: &[f32],
+    weight_mins: &[f32],
+) -> f32 {
+    use std::arch::aarch64::{
+        vaddq_s32, vaddvq_s32, vand_u8, vcombine_u8, vdup_n_u8, vget_low_s8, vld1q_s8,
+        vmull_high_s8, vmull_s8, vpaddlq_s16, vreinterpretq_s8_u8,
+    };
+
+    let num_blocks = weight_scales.len();
+    let iq = input_quants.as_ptr().cast::<i8>();
+    let wp = weight_packed.as_ptr();
+    let inp_f32 = input_row.as_ptr();
+    let mask = vdup_n_u8(0x0F);
+
+    let mut total_dot = 0.0f32;
+    let mut total_min = 0.0f32;
+
+    for blk in 0..num_blocks {
+        let scale = *weight_scales.get_unchecked(blk);
+        let min = *weight_mins.get_unchecked(blk);
+        let input_scale = *input_scales.get_unchecked(blk);
+        let inp_offset = blk * 32;
+        let wp_offset = blk * 16;
+
+        // Unpack Q4_1 nibbles (unsigned, no bias)
+        let raw_lo = vld1_u8(wp.add(wp_offset));
+        let raw_hi = vld1_u8(wp.add(wp_offset + 8));
+        let lo_0 = vand_u8(raw_lo, mask);
+        let lo_1 = vand_u8(raw_hi, mask);
+        let hi_0 = vshr_n_u8(raw_lo, 4);
+        let hi_1 = vshr_n_u8(raw_hi, 4);
+        let lo_16 = vcombine_u8(lo_0, lo_1);
+        let hi_16 = vcombine_u8(hi_0, hi_1);
+
+        // Nibbles are unsigned [0,15]. Input quants are signed int8.
+        // Reinterpret nibbles as signed (values 0..15 fit in signed i8).
+        let lo_s8 = vreinterpretq_s8_u8(lo_16);
+        let hi_s8 = vreinterpretq_s8_u8(hi_16);
+
+        let inp_lo = vld1q_s8(iq.add(inp_offset));
+        let inp_hi = vld1q_s8(iq.add(inp_offset + 16));
+
+        // Integer dot: nibble × input_quant
+        let prod_lo_lo = vmull_s8(vget_low_s8(lo_s8), vget_low_s8(inp_lo));
+        let prod_lo_hi = vmull_high_s8(lo_s8, inp_lo);
+        let sum_lo = vaddq_s32(vpaddlq_s16(prod_lo_lo), vpaddlq_s16(prod_lo_hi));
+
+        let prod_hi_lo = vmull_s8(vget_low_s8(hi_s8), vget_low_s8(inp_hi));
+        let prod_hi_hi = vmull_high_s8(hi_s8, inp_hi);
+        let sum_hi = vaddq_s32(vpaddlq_s16(prod_hi_lo), vpaddlq_s16(prod_hi_hi));
+
+        let dot_i32 = vaddvq_s32(vaddq_s32(sum_lo, sum_hi));
+        total_dot += (dot_i32 as f32) * scale * input_scale;
+
+        // Min correction: sum(input_f32[blk]) * min
+        let mut block_sum = vdupq_n_f32(0.0);
+        for g in 0..4 {
+            block_sum = vaddq_f32(block_sum, vld1q_f32(inp_f32.add(inp_offset + g * 4)));
+        }
+        // Use 4 more groups for remaining 16 elements
+        for g in 0..4 {
+            block_sum = vaddq_f32(block_sum, vld1q_f32(inp_f32.add(inp_offset + 16 + g * 4)));
+        }
+        total_min += vaddvq_f32(block_sum) * min;
+    }
+
+    total_dot + total_min
+}
+
+/// NEON-accelerated quantization of f32 row to Q8_0 format.
+pub fn quantize_row_q8(input: &[f32], out_quants: &mut [u8], out_scales: &mut [f32]) {
+    unsafe { quantize_row_q8_inner(input, out_quants, out_scales) }
+}
+
+#[inline]
+unsafe fn quantize_row_q8_inner(input: &[f32], out_quants: &mut [u8], out_scales: &mut [f32]) {
+    use std::arch::aarch64::{
+        vcvtq_s32_f32, vmovn_high_s32, vmovn_s32, vqmovn_high_s16, vqmovn_s16,
+    };
+
+    let num_blocks = out_scales.len();
+
+    for blk in 0..num_blocks {
+        let blk_start = blk * 32;
+        let inp = input.as_ptr().add(blk_start);
+
+        // Find max absolute value across 32 elements using NEON
+        let mut max_abs_v = vdupq_n_f32(0.0);
+        for g in 0..8 {
+            let v = vld1q_f32(inp.add(g * 4));
+            max_abs_v = vmaxq_f32(max_abs_v, vabsq_f32(v));
+        }
+        let max_scalar = vmaxvq_f32(max_abs_v);
+
+        let scale = max_scalar / 127.0;
+        *out_scales.get_unchecked_mut(blk) = scale;
+
+        if scale == 0.0 {
+            for i in 0..32 {
+                *out_quants.get_unchecked_mut(blk_start + i) = 0;
+            }
+            continue;
+        }
+
+        let inv_scale = vdupq_n_f32(1.0 / scale);
+
+        // Quantize: round(input / scale), clamped to [-127, 127] by saturating narrow
+        // Process 32 floats → 8×i32 → 4×i16 → ... → 32×i8
+        let v0 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp), inv_scale));
+        let v1 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp.add(4)), inv_scale));
+        let v2 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp.add(8)), inv_scale));
+        let v3 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp.add(12)), inv_scale));
+        let v4 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp.add(16)), inv_scale));
+        let v5 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp.add(20)), inv_scale));
+        let v6 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp.add(24)), inv_scale));
+        let v7 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(inp.add(28)), inv_scale));
+
+        // Narrow: 4×i32 → 4×i16 (saturating), combine pairs → 8×i16
+        let n01 = vmovn_high_s32(vmovn_s32(v0), v1); // 8×i16
+        let n23 = vmovn_high_s32(vmovn_s32(v2), v3);
+        let n45 = vmovn_high_s32(vmovn_s32(v4), v5);
+        let n67 = vmovn_high_s32(vmovn_s32(v6), v7);
+
+        // Narrow: 8×i16 → 8×i8 (saturating), combine pairs → 16×i8
+        let b0 = vqmovn_high_s16(vqmovn_s16(n01), n23); // 16×i8
+        let b1 = vqmovn_high_s16(vqmovn_s16(n45), n67); // 16×i8
+
+        // Store 32 bytes
+        vst1q_s8(out_quants.as_mut_ptr().add(blk_start).cast::<i8>(), b0);
+        vst1q_s8(out_quants.as_mut_ptr().add(blk_start + 16).cast::<i8>(), b1);
+    }
+}

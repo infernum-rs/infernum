@@ -337,18 +337,7 @@ pub fn quantize_row_q8(input: &[f32], out_quants: &mut [u8], out_scales: &mut [f
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // Scalar fallback for NEON (integer dot not yet implemented for AArch64)
-        let block_size = 32;
-        for (blk, scale) in out_scales.iter_mut().enumerate() {
-            let start = blk * block_size;
-            let block = &input[start..start + block_size];
-            let max_abs = block.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-            *scale = max_abs / 127.0;
-            let inv = if *scale == 0.0 { 0.0 } else { 1.0 / *scale };
-            for (i, &v) in block.iter().enumerate() {
-                out_quants[start + i] = (v * inv).round().clamp(-127.0, 127.0) as i8 as u8;
-            }
-        }
+        neon::quantize_row_q8(input, out_quants, out_scales);
     }
 }
 
@@ -373,10 +362,7 @@ pub fn dot_q8_q8_row(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // Fallback: use existing f32-path row kernel
-        // (integer kernels not yet implemented for NEON)
-        let _ = (input_quants, input_scales);
-        unimplemented!("Q8×Q8 integer dot not yet implemented for AArch64")
+        neon::dot_q8_q8_row(input_quants, input_scales, weight_quants, weight_scales)
     }
 }
 
@@ -401,8 +387,7 @@ pub fn dot_q4_q8_row(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = (input_quants, input_scales);
-        unimplemented!("Q4×Q8 integer dot not yet implemented for AArch64")
+        neon::dot_q4_q8_row(input_quants, input_scales, weight_packed, weight_scales)
     }
 }
 
@@ -444,8 +429,14 @@ pub fn dot_q4_1_q8_row(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = (input_quants, input_scales);
-        unimplemented!("Q4_1×Q8 integer dot not yet implemented for AArch64")
+        neon::dot_q4_1_q8_row(
+            input_quants,
+            input_scales,
+            input_row,
+            weight_packed,
+            weight_scales,
+            weight_mins,
+        )
     }
 }
 
@@ -485,8 +476,9 @@ pub fn dot_q8_q8_2row(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = (input_quants, input_scales);
-        unimplemented!("Q8×Q8 2-row integer dot not yet implemented for AArch64")
+        let d0 = neon::dot_q8_q8_row(input_quants, input_scales, weight_quants_0, weight_scales_0);
+        let d1 = neon::dot_q8_q8_row(input_quants, input_scales, weight_quants_1, weight_scales_1);
+        (d0, d1)
     }
 }
 
@@ -523,8 +515,9 @@ pub fn dot_q4_q8_2row(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = (input_quants, input_scales);
-        unimplemented!("Q4×Q8 2-row integer dot not yet implemented for AArch64")
+        let d0 = neon::dot_q4_q8_row(input_quants, input_scales, weight_packed_0, weight_scales_0);
+        let d1 = neon::dot_q4_q8_row(input_quants, input_scales, weight_packed_1, weight_scales_1);
+        (d0, d1)
     }
 }
 

@@ -337,7 +337,7 @@ compute_gap() {
     fi
     python3 -c "
 l, i = float('${llama}'), float('${infernum}')
-if l == 0:
+if l == 0 or i == 0:
     print('—')
 else:
     ratio = l / i
