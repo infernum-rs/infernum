@@ -22,8 +22,9 @@ impl RopeOps for CpuBackend {
         let half_dim = head_dim / 2;
 
         let input_data = input.as_f32_slice();
-        let cos_data = cos_cache.as_f32_slice();
-        let sin_data = sin_cache.as_f32_slice();
+        // RoPE caches may be stored in model dtype (e.g. BF16); convert if needed.
+        let cos_data = cos_cache.to_f32_cow();
+        let sin_data = sin_cache.to_f32_cow();
 
         let mut out = vec![0.0f32; input_data.len()];
 
@@ -61,8 +62,9 @@ impl RopeOps for CpuBackend {
         let half_dim = head_dim / 2;
 
         let input_data = input.as_f32_slice();
-        let cos_data = cos_cache.as_f32_slice();
-        let sin_data = sin_cache.as_f32_slice();
+        // RoPE caches may be stored in model dtype (e.g. BF16); convert if needed.
+        let cos_data = cos_cache.to_f32_cow();
+        let sin_data = sin_cache.to_f32_cow();
         let pos_data = positions.as_i32_slice();
 
         let mut out = vec![0.0f32; input_data.len()];

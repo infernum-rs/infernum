@@ -235,6 +235,17 @@ impl CpuTensor {
             other => panic!("to_f32_vec: unsupported dtype {other}"),
         }
     }
+
+    /// Return f32 data as a `Cow`: zero-copy borrow if already F32,
+    /// or an owned conversion for BF16/F16.
+    #[must_use]
+    pub fn to_f32_cow(&self) -> std::borrow::Cow<'_, [f32]> {
+        if self.dtype == DType::F32 {
+            std::borrow::Cow::Borrowed(self.as_f32_slice())
+        } else {
+            std::borrow::Cow::Owned(self.to_f32_vec())
+        }
+    }
 }
 
 /// Block-quantized weight for CPU inference.

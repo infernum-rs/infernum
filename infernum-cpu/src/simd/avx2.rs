@@ -622,18 +622,19 @@ unsafe fn quantize_row_q8_inner(input: &[f32], out_quants: &mut [u8], out_scales
         let v2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(inp.add(16)), inv_scale));
         let v3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(inp.add(24)), inv_scale));
 
-        // packs_epi32: 8xi32 + 8xi32 → 16xi16 (with saturation)
-        let packed_16_01 = _mm256_packs_epi32(v0, v1); // interleaved lanes
+        // packs_epi32 operates per 128-bit lane, interleaving 4 from each operand:
+        //   Lane 0: v0[0:4], v1[0:4]   Lane 1: v0[4:8], v1[4:8]
+        // Fix with permute4x64(0xD8) to restore sequential order:
+        //   Lane 0: v0[0:4], v0[4:8]   Lane 1: v1[0:4], v1[4:8]
+        let packed_16_01 = _mm256_packs_epi32(v0, v1);
+        let packed_16_01 = _mm256_permute4x64_epi64(packed_16_01, 0xD8);
         let packed_16_23 = _mm256_packs_epi32(v2, v3);
+        let packed_16_23 = _mm256_permute4x64_epi64(packed_16_23, 0xD8);
 
-        // packs_epi16: 16xi16 + 16xi16 → 32xi8 (with saturation)
+        // Same lane-crossing issue applies to packs_epi16 → fix again
         use std::arch::x86_64::_mm256_packs_epi16;
         let packed_8 = _mm256_packs_epi16(packed_16_01, packed_16_23);
-
-        // Fix lane interleaving from packs: need to permute
-        // packs operates per 128-bit lane, so result is interleaved:
-        // [0,1,4,5 | 2,3,6,7] in 64-bit chunks → need [0,1,2,3 | 4,5,6,7]
-        let fixed = _mm256_permute4x64_epi64(packed_8, 0b11_01_10_00);
+        let fixed = _mm256_permute4x64_epi64(packed_8, 0xD8);
 
         // Store 32 bytes
         use std::arch::x86_64::_mm256_storeu_si256;
