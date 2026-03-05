@@ -18,6 +18,7 @@ pub mod logits;
 pub mod ops;
 pub mod simd;
 pub mod tensor;
+pub mod thread_pool;
 pub mod weights;
 
 use infernum::backend::Backend;

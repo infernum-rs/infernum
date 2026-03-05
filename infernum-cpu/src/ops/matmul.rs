@@ -21,6 +21,16 @@ use crate::simd;
 use crate::tensor::{CpuLinearWeight, CpuQuantizedWeight, CpuTensor};
 use crate::CpuBackend;
 
+/// Cast a `*mut T` to `usize` for safe capture in closures.
+///
+/// `usize` is `Send + Sync`, avoiding Rust 2021 closure field-capture issues
+/// with raw pointers. The caller must ensure disjoint access when used across
+/// threads, and that the pointer remains valid for the duration of use.
+#[inline(always)]
+fn ptr_to_usize<T>(p: *mut T) -> usize {
+    p as usize
+}
+
 /// Transpose `B (K,N)` → `Bᵀ (N,K)` in row-major order.
 #[allow(clippy::many_single_char_names)]
 fn transpose(b: &[f32], k: usize, n: usize) -> Vec<f32> {
@@ -61,22 +71,33 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
     let mut c = vec![0.0f32; m * n];
 
     if m == 1 {
-        // GEMV: parallel over chunks of output columns to amortize Rayon overhead.
+        // GEMV: parallel over chunks of output columns.
         let a_row = &a[..k];
-        // Each chunk processes ≥64 columns — balances parallelism vs. overhead.
-        let chunk_size = (n / rayon::current_num_threads()).max(64).min(n);
-        c.par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, c_chunk)| {
-                let col_start = chunk_idx * chunk_size;
-                for (i, out) in c_chunk.iter_mut().enumerate() {
-                    let col = col_start + i;
-                    let bt_row = &bt[col * k..(col + 1) * k];
-                    *out = simd::dot_f32(a_row, bt_row);
-                }
-            });
+        let pool = crate::thread_pool::global_pool();
+        let num_threads = pool.num_threads();
+        let chunk_size = (n / num_threads).max(64).min(n);
+        let c_addr = ptr_to_usize(c.as_mut_ptr());
+        let num_tasks = num_threads.min((n + chunk_size - 1) / chunk_size);
+        pool.dispatch(num_tasks, |task_id, _| {
+            let col_start = task_id * chunk_size;
+            let col_end = (col_start + chunk_size).min(n);
+            if col_start >= n {
+                return;
+            }
+            let c_chunk = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (c_addr as *mut f32).add(col_start),
+                    col_end - col_start,
+                )
+            };
+            for (i, out) in c_chunk.iter_mut().enumerate() {
+                let col = col_start + i;
+                let bt_row = &bt[col * k..(col + 1) * k];
+                *out = simd::dot_f32(a_row, bt_row);
+            }
+        });
     } else {
-        // Parallel over output rows
+        // Parallel over output rows (prefill — less latency-critical, keep rayon)
         c.par_chunks_mut(n).enumerate().for_each(|(row, c_row)| {
             let a_row = &a[row * k..(row + 1) * k];
             gemm_row(a_row, bt, c_row, k, n);
@@ -142,9 +163,9 @@ fn q8_gemv_parallel(
         }
     };
 
-    // Only parallelize when there's enough work to amortize rayon overhead.
-    // Each rayon task should process ≥128 neurons to justify scheduling cost.
-    let num_threads = rayon::current_num_threads();
+    // Only parallelize when there's enough work to amortize dispatch overhead.
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
     let min_neurons_per_task = 128;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
@@ -152,11 +173,20 @@ fn q8_gemv_parallel(
         // Round chunk_size to even for clean pair processing
         let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
         let chunk_size = (raw_chunk + 1) & !1; // round up to even
-        out.par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                gemv_body(chunk, chunk_idx * chunk_size);
-            });
+        let out_addr = ptr_to_usize(out.as_mut_ptr());
+        // SAFETY: each task writes to a disjoint slice [start..end].
+        // dispatch() blocks until all tasks complete, so out_addr is valid.
+        pool.dispatch(num_threads.min((n + chunk_size - 1) / chunk_size), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let chunk = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            gemv_body(chunk, start);
+        });
     }
 }
 
@@ -212,7 +242,8 @@ fn q4_gemv_parallel(
         }
     };
 
-    let num_threads = rayon::current_num_threads();
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
     let min_neurons_per_task = 128;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
@@ -220,11 +251,18 @@ fn q4_gemv_parallel(
         // Round chunk_size to even for clean pair processing
         let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
         let chunk_size = (raw_chunk + 1) & !1; // round up to even
-        out.par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                gemv_body(chunk, chunk_idx * chunk_size);
-            });
+        let out_addr = ptr_to_usize(out.as_mut_ptr());
+        pool.dispatch(num_threads.min((n + chunk_size - 1) / chunk_size), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let chunk = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            gemv_body(chunk, start);
+        });
     }
 }
 
@@ -259,17 +297,25 @@ fn q4_1_gemv_parallel(
         }
     };
 
-    let num_threads = rayon::current_num_threads();
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
     let min_neurons_per_task = 128;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
         let chunk_size = (n / num_threads).max(min_neurons_per_task).min(n);
-        out.par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                gemv_body(chunk, chunk_idx * chunk_size);
-            });
+        let out_addr = ptr_to_usize(out.as_mut_ptr());
+        pool.dispatch(num_threads.min((n + chunk_size - 1) / chunk_size), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let chunk = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            gemv_body(chunk, start);
+        });
     }
 }
 
