@@ -648,56 +648,55 @@ impl PagedAttentionOps for CpuBackend {
                 let block_offset = pos % block_size;
                 #[allow(clippy::cast_sign_loss)]
                 let phys_block = bt_row[block_idx] as usize;
-                    let k_off =
-                        (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
+                let k_off = (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
 
-                    let mut dot = crate::simd::dot_f32(q_vec, &k_data[k_off..k_off + head_dim]);
-                    dot *= scale;
-                    if let Some(cap) = softcap {
-                        dot = cap * (dot / cap).tanh();
-                    }
-                    scores[pos] = dot;
+                let mut dot = crate::simd::dot_f32(q_vec, &k_data[k_off..k_off + head_dim]);
+                dot *= scale;
+                if let Some(cap) = softcap {
+                    dot = cap * (dot / cap).tanh();
                 }
+                scores[pos] = dot;
+            }
 
-                // Apply sliding window mask
-                if let Some(window) = sliding_window {
-                    let query_pos = seq_len - 1;
-                    if query_pos >= window {
-                        let cutoff = query_pos - window + 1;
-                        for s in scores[..cutoff].iter_mut() {
-                            *s = f32::NEG_INFINITY;
-                        }
-                    }
-                }
-
-                // Softmax
-                let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - max_s).exp();
-                    sum += *s;
-                }
-                if sum > 0.0 {
-                    let inv_sum = 1.0 / sum;
-                    for s in scores.iter_mut() {
-                        *s *= inv_sum;
-                    }
-                }
-
-                // Weighted V accumulation using SIMD AXPY
-                for pos in 0..seq_len {
-                    let w = scores[pos];
-                    if w > 0.0 {
-                        let block_idx = pos / block_size;
-                        let block_offset = pos % block_size;
-                        #[allow(clippy::cast_sign_loss)]
-                        let phys_block = bt_row[block_idx] as usize;
-                        let v_off =
-                            (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
-                        crate::simd::vec_axpy(out_head, w, &v_data[v_off..v_off + head_dim]);
+            // Apply sliding window mask
+            if let Some(window) = sliding_window {
+                let query_pos = seq_len - 1;
+                if query_pos >= window {
+                    let cutoff = query_pos - window + 1;
+                    for s in scores[..cutoff].iter_mut() {
+                        *s = f32::NEG_INFINITY;
                     }
                 }
             }
+
+            // Softmax
+            let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max_s).exp();
+                sum += *s;
+            }
+            if sum > 0.0 {
+                let inv_sum = 1.0 / sum;
+                for s in scores.iter_mut() {
+                    *s *= inv_sum;
+                }
+            }
+
+            // Weighted V accumulation using SIMD AXPY
+            for pos in 0..seq_len {
+                let w = scores[pos];
+                if w > 0.0 {
+                    let block_idx = pos / block_size;
+                    let block_offset = pos % block_size;
+                    #[allow(clippy::cast_sign_loss)]
+                    let phys_block = bt_row[block_idx] as usize;
+                    let v_off =
+                        (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
+                    crate::simd::vec_axpy(out_head, w, &v_data[v_off..v_off + head_dim]);
+                }
+            }
+        }
 
         Ok(CpuTensor::from_f32_vec(
             &[batch_size, num_heads, head_dim],

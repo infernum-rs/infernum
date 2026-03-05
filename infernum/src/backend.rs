@@ -283,6 +283,23 @@ pub trait MatmulOps: Backend {
         Ok((a, b))
     }
 
+    /// Compute three independent linear projections from the same input in a
+    /// single parallel dispatch.
+    ///
+    /// Used for Q+K+V attention projections. Default: calls `linear` +
+    /// `linear_pair`. Backends may override to share input quantization
+    /// across all three and use a single thread-pool dispatch.
+    fn linear_triple(
+        input: &Self::Tensor,
+        w1: &Self::LinearWeight,
+        w2: &Self::LinearWeight,
+        w3: &Self::LinearWeight,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor)> {
+        let a = Self::linear(input, w1)?;
+        let (b, c) = Self::linear_pair(input, w2, w3)?;
+        Ok((a, b, c))
+    }
+
     /// Quantize f32 data to Q8 and wrap as a `LinearWeight`.
     ///
     /// Used to quantize the lm_head weight when the model uses quantized

@@ -672,6 +672,310 @@ fn quantized_linear_pair(
     ))
 }
 
+/// Fused triple quantized linear: single dispatch for three weight matrices.
+///
+/// Quantizes the input once (shared by all three matmuls), then each
+/// thread processes its output rows for all three matrices before
+/// signaling completion. Used for Q+K+V attention projections.
+/// Only supports the decode path (M=1) with matching dtypes.
+#[allow(clippy::too_many_lines)]
+fn quantized_linear_triple(
+    input: &CpuTensor,
+    w1: &CpuQuantizedWeight,
+    w2: &CpuQuantizedWeight,
+    w3: &CpuQuantizedWeight,
+) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
+    let i_shape = input.shape();
+    let m: usize = i_shape[..i_shape.len() - 1].iter().product();
+    let k = *i_shape.last().unwrap();
+
+    assert_eq!(k, w1.shape[1], "linear_triple: input K != w1 K");
+    assert_eq!(k, w2.shape[1], "linear_triple: input K != w2 K");
+    assert_eq!(k, w3.shape[1], "linear_triple: input K != w3 K");
+    assert_eq!(
+        k % QUANTIZATION_BLOCK_SIZE,
+        0,
+        "linear_triple: K not aligned to block size"
+    );
+
+    let n1 = w1.shape[0];
+    let n2 = w2.shape[0];
+    let n3 = w3.shape[0];
+    let num_blocks = k / QUANTIZATION_BLOCK_SIZE;
+
+    // Only fuse Q4_0/Q8_0 decode (M=1) with matching dtypes.
+    if m != 1 || w1.dtype != w2.dtype || w1.dtype != w3.dtype {
+        let a = quantized_linear(input, w1)?;
+        let b = quantized_linear(input, w2)?;
+        let c = quantized_linear(input, w3)?;
+        return Ok((a, b, c));
+    }
+
+    let input_data = input.as_f32_slice();
+    let inp = &input_data[..k];
+
+    // Quantize input once, shared by all three matmuls.
+    let mut inp_quants = vec![0u8; k];
+    let mut inp_scales = vec![0.0f32; num_blocks];
+    simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
+
+    let mut out1 = vec![0.0f32; n1];
+    let mut out2 = vec![0.0f32; n2];
+    let mut out3 = vec![0.0f32; n3];
+
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
+    let min_neurons = 64;
+
+    match w1.dtype {
+        DType::Q4_0 => {
+            let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
+
+            if n1 < num_threads * min_neurons
+                && n2 < num_threads * min_neurons
+                && n3 < num_threads * min_neurons
+            {
+                q4_gemv_body_inline(
+                    &mut out1,
+                    0,
+                    n1,
+                    &inp_quants,
+                    &inp_scales,
+                    &w1.data,
+                    &w1.scales,
+                    num_blocks,
+                    bpr,
+                );
+                q4_gemv_body_inline(
+                    &mut out2,
+                    0,
+                    n2,
+                    &inp_quants,
+                    &inp_scales,
+                    &w2.data,
+                    &w2.scales,
+                    num_blocks,
+                    bpr,
+                );
+                q4_gemv_body_inline(
+                    &mut out3,
+                    0,
+                    n3,
+                    &inp_quants,
+                    &inp_scales,
+                    &w3.data,
+                    &w3.scales,
+                    num_blocks,
+                    bpr,
+                );
+            } else {
+                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
+                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
+                let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
+                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+
+                pool.dispatch(num_threads, |task_id, _| {
+                    let start1 = task_id * chunk1;
+                    if start1 < n1 {
+                        let end1 = (start1 + chunk1).min(n1);
+                        let slice1 = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out1_addr as *mut f32).add(start1),
+                                end1 - start1,
+                            )
+                        };
+                        q4_gemv_body_inline(
+                            slice1,
+                            start1,
+                            end1 - start1,
+                            &inp_quants,
+                            &inp_scales,
+                            &w1.data,
+                            &w1.scales,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                    let start2 = task_id * chunk2;
+                    if start2 < n2 {
+                        let end2 = (start2 + chunk2).min(n2);
+                        let slice2 = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out2_addr as *mut f32).add(start2),
+                                end2 - start2,
+                            )
+                        };
+                        q4_gemv_body_inline(
+                            slice2,
+                            start2,
+                            end2 - start2,
+                            &inp_quants,
+                            &inp_scales,
+                            &w2.data,
+                            &w2.scales,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                    let start3 = task_id * chunk3;
+                    if start3 < n3 {
+                        let end3 = (start3 + chunk3).min(n3);
+                        let slice3 = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out3_addr as *mut f32).add(start3),
+                                end3 - start3,
+                            )
+                        };
+                        q4_gemv_body_inline(
+                            slice3,
+                            start3,
+                            end3 - start3,
+                            &inp_quants,
+                            &inp_scales,
+                            &w3.data,
+                            &w3.scales,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                });
+            }
+        }
+        DType::Q8_0 => {
+            let bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
+
+            if n1 < num_threads * min_neurons
+                && n2 < num_threads * min_neurons
+                && n3 < num_threads * min_neurons
+            {
+                q8_gemv_body_inline(
+                    &mut out1,
+                    0,
+                    n1,
+                    &inp_quants,
+                    &inp_scales,
+                    &w1.data,
+                    &w1.scales,
+                    num_blocks,
+                    bpr,
+                );
+                q8_gemv_body_inline(
+                    &mut out2,
+                    0,
+                    n2,
+                    &inp_quants,
+                    &inp_scales,
+                    &w2.data,
+                    &w2.scales,
+                    num_blocks,
+                    bpr,
+                );
+                q8_gemv_body_inline(
+                    &mut out3,
+                    0,
+                    n3,
+                    &inp_quants,
+                    &inp_scales,
+                    &w3.data,
+                    &w3.scales,
+                    num_blocks,
+                    bpr,
+                );
+            } else {
+                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
+                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
+                let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
+                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+
+                pool.dispatch(num_threads, |task_id, _| {
+                    let start1 = task_id * chunk1;
+                    if start1 < n1 {
+                        let end1 = (start1 + chunk1).min(n1);
+                        let slice1 = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out1_addr as *mut f32).add(start1),
+                                end1 - start1,
+                            )
+                        };
+                        q8_gemv_body_inline(
+                            slice1,
+                            start1,
+                            end1 - start1,
+                            &inp_quants,
+                            &inp_scales,
+                            &w1.data,
+                            &w1.scales,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                    let start2 = task_id * chunk2;
+                    if start2 < n2 {
+                        let end2 = (start2 + chunk2).min(n2);
+                        let slice2 = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out2_addr as *mut f32).add(start2),
+                                end2 - start2,
+                            )
+                        };
+                        q8_gemv_body_inline(
+                            slice2,
+                            start2,
+                            end2 - start2,
+                            &inp_quants,
+                            &inp_scales,
+                            &w2.data,
+                            &w2.scales,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                    let start3 = task_id * chunk3;
+                    if start3 < n3 {
+                        let end3 = (start3 + chunk3).min(n3);
+                        let slice3 = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out3_addr as *mut f32).add(start3),
+                                end3 - start3,
+                            )
+                        };
+                        q8_gemv_body_inline(
+                            slice3,
+                            start3,
+                            end3 - start3,
+                            &inp_quants,
+                            &inp_scales,
+                            &w3.data,
+                            &w3.scales,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                });
+            }
+        }
+        _ => {
+            let a = quantized_linear(input, w1)?;
+            let b = quantized_linear(input, w2)?;
+            let c = quantized_linear(input, w3)?;
+            return Ok((a, b, c));
+        }
+    }
+
+    let out_shape1 = vec![m, n1];
+    let out_shape2 = vec![m, n2];
+    let out_shape3 = vec![m, n3];
+    Ok((
+        CpuTensor::from_f32_vec(&out_shape1, out1),
+        CpuTensor::from_f32_vec(&out_shape2, out2),
+        CpuTensor::from_f32_vec(&out_shape3, out3),
+    ))
+}
+
 /// Q4_0 GEMV body: process `chunk_len` neurons starting at `neuron_offset`.
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -952,6 +1256,25 @@ impl MatmulOps for CpuBackend {
         let a = Self::linear(input, w1)?;
         let b = Self::linear(input, w2)?;
         Ok((a, b))
+    }
+
+    fn linear_triple(
+        input: &CpuTensor,
+        w1: &CpuLinearWeight,
+        w2: &CpuLinearWeight,
+        w3: &CpuLinearWeight,
+    ) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
+        if let (
+            CpuLinearWeight::Quantized(q1),
+            CpuLinearWeight::Quantized(q2),
+            CpuLinearWeight::Quantized(q3),
+        ) = (w1, w2, w3)
+        {
+            return quantized_linear_triple(input, q1, q2, q3);
+        }
+        let a = Self::linear(input, w1)?;
+        let (b, c) = Self::linear_pair(input, w2, w3)?;
+        Ok((a, b, c))
     }
 }
 

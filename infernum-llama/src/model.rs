@@ -1153,9 +1153,12 @@ impl<B: LlamaOps> LlamaModel<B> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let q = B::linear(hidden, &weights.q_proj)?;
-        let (k, v) =
-            transformer::compute_kv_proj_decode::<B>(hidden, &weights.kv_proj, batch_size)?;
+        let (q, k, v) = transformer::compute_qkv_proj_decode::<B>(
+            hidden,
+            &weights.q_proj,
+            &weights.kv_proj,
+            batch_size,
+        )?;
 
         let q = q.reshape(&[batch_size, num_heads, head_dim]);
         let k = k.reshape(&[batch_size, num_kv_heads, head_dim]);

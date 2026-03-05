@@ -114,6 +114,37 @@ pub fn compute_kv_proj_decode<B: MatmulOps + TensorOps>(
     }
 }
 
+/// Compute Q, K and V projections for batched decode in a single fused dispatch.
+///
+/// When the KV weight is `Separate` (quantized models), uses `linear_triple`
+/// to share input quantization across Q, K and V with a single thread-pool
+/// dispatch. When the KV weight is `Fused` (dense), falls back to separate
+/// `linear` + fused KV matmul.
+pub fn compute_qkv_proj_decode<B: MatmulOps + TensorOps>(
+    hidden: &B::Tensor,
+    q_proj: &<B as MatmulOps>::LinearWeight,
+    kv_proj: &KvProjWeight<B>,
+    batch_size: usize,
+) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
+    match kv_proj {
+        KvProjWeight::<B>::Separate { k_proj, v_proj } => {
+            B::linear_triple(hidden, q_proj, k_proj, v_proj)
+        }
+        KvProjWeight::<B>::Fused { weight, kv_dim } => {
+            let q = B::linear(hidden, q_proj)?;
+            let kv = B::linear(hidden, weight)?;
+            if batch_size == 1 {
+                let k = kv.slice_view(0, &[1, *kv_dim]);
+                let v = kv.slice_view(*kv_dim, &[1, *kv_dim]);
+                Ok((q, k, v))
+            } else {
+                let (k, v) = B::split_inner_dim(&kv, *kv_dim, *kv_dim)?;
+                Ok((q, k, v))
+            }
+        }
+    }
+}
+
 /// Compute gate and up projections from a [`GateUpWeight`].
 ///
 /// For fused weights, performs a single matmul and splits the output.

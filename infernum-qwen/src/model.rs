@@ -1275,9 +1275,12 @@ impl<B: QwenOps> QwenModel<B> {
         let num_kv_heads = self.tp_num_kv_heads;
         let head_dim = self.config.head_dim();
 
-        let mut q = B::linear(hidden, &weights.q_proj)?;
-        let (mut k, mut v) =
-            transformer::compute_kv_proj_decode::<B>(hidden, &weights.kv_proj, batch_size)?;
+        let (mut q, mut k, mut v) = transformer::compute_qkv_proj_decode::<B>(
+            hidden,
+            &weights.q_proj,
+            &weights.kv_proj,
+            batch_size,
+        )?;
 
         transformer::apply_qkv_bias::<B>(
             &mut q,
