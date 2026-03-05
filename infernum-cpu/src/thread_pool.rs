@@ -214,7 +214,6 @@ impl Drop for SpinPool {
         for slot in self.slots.iter().skip(1) {
             slot.status.store(SHUTDOWN, Ordering::Release);
         }
-        // Workers will see SHUTDOWN and exit their loop.
         // Join is handled by JoinHandle drop, but we drain explicitly to catch panics.
         for handle in self._workers.drain(..) {
             let _ = handle.join();
@@ -340,17 +339,7 @@ pub fn global_pool() -> &'static SpinPool {
                             .map(std::num::NonZero::get)
                             .unwrap_or(1)
                     },
-                    |cores| {
-                        let n = cores.len();
-                        // Reserve one physical core for OS/interrupts when
-                        // there are enough cores. Spin-waiting threads on
-                        // all physical cores starve the OS scheduler.
-                        if n > 4 {
-                            n - 1
-                        } else {
-                            n
-                        }
-                    },
+                    |cores| cores.len(),
                 )
             });
         SpinPool::new(n)

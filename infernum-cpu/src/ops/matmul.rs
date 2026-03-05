@@ -166,7 +166,7 @@ fn q8_gemv_parallel(
     // Only parallelize when there's enough work to amortize dispatch overhead.
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 128;
+    let min_neurons_per_task = 64;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
@@ -247,7 +247,7 @@ fn q4_gemv_parallel(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 128;
+    let min_neurons_per_task = 64;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
@@ -305,7 +305,7 @@ fn q4_1_gemv_parallel(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 128;
+    let min_neurons_per_task = 64;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
