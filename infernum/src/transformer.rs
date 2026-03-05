@@ -86,11 +86,7 @@ pub fn compute_kv_proj<B: MatmulOps + TensorOps>(
             let kv = B::linear(hidden, weight)?;
             B::split_inner_dim(&kv, *kv_dim, *kv_dim)
         }
-        KvProjWeight::<B>::Separate { k_proj, v_proj } => {
-            let k = B::linear(hidden, k_proj)?;
-            let v = B::linear(hidden, v_proj)?;
-            Ok((k, v))
-        }
+        KvProjWeight::<B>::Separate { k_proj, v_proj } => B::linear_pair(hidden, k_proj, v_proj),
     }
 }
 
@@ -114,11 +110,7 @@ pub fn compute_kv_proj_decode<B: MatmulOps + TensorOps>(
                 B::split_inner_dim(&kv, *kv_dim, *kv_dim)
             }
         }
-        KvProjWeight::<B>::Separate { k_proj, v_proj } => {
-            let k = B::linear(hidden, k_proj)?;
-            let v = B::linear(hidden, v_proj)?;
-            Ok((k, v))
-        }
+        KvProjWeight::<B>::Separate { k_proj, v_proj } => B::linear_pair(hidden, k_proj, v_proj),
     }
 }
 
@@ -147,9 +139,7 @@ pub fn compute_gate_up<B: MatmulOps + TensorOps>(
             }
         }
         GateUpWeight::<B>::Separate { gate_proj, up_proj } => {
-            let gate = B::linear(hidden, gate_proj)?;
-            let up = B::linear(hidden, up_proj)?;
-            Ok((gate, up))
+            B::linear_pair(hidden, gate_proj, up_proj)
         }
     }
 }

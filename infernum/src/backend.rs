@@ -267,6 +267,22 @@ pub trait MatmulOps: Backend {
     /// Check whether a `LinearWeight` is a dense (non-quantized) tensor.
     fn is_dense_weight(weight: &Self::LinearWeight) -> bool;
 
+    /// Compute two independent linear projections from the same input in a
+    /// single parallel dispatch.
+    ///
+    /// Default: just calls `linear` twice. Backends may override to fuse the
+    /// dispatches (e.g., CPU spin-pool processes both weight matrices before
+    /// syncing, keeping threads continuously busy).
+    fn linear_pair(
+        input: &Self::Tensor,
+        w1: &Self::LinearWeight,
+        w2: &Self::LinearWeight,
+    ) -> Result<(Self::Tensor, Self::Tensor)> {
+        let a = Self::linear(input, w1)?;
+        let b = Self::linear(input, w2)?;
+        Ok((a, b))
+    }
+
     /// Quantize f32 data to Q8 and wrap as a `LinearWeight`.
     ///
     /// Used to quantize the lm_head weight when the model uses quantized

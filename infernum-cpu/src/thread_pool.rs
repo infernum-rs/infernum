@@ -159,9 +159,7 @@ impl SpinPool {
                 .num_tasks
                 .store(num_tasks, Ordering::Relaxed);
             // Release fence: makes all preceding stores visible to the worker.
-            self.slots[worker_id]
-                .status
-                .store(READY, Ordering::Release);
+            self.slots[worker_id].status.store(READY, Ordering::Release);
         }
 
         // Execute task 0 on the calling thread.
