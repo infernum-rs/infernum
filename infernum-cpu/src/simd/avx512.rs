@@ -91,8 +91,8 @@ unsafe fn dot_q8_q8_row_inner(
         // vpdpbusd: 32 uint8×int8 → accumulate into 8 int32
         let prod_32 = dpbusd_256(_mm256_setzero_si256(), a_abs, b_signed);
 
-        let prod_f32 = _mm256_cvtepi32_ps(prod_32);
-        total = _mm256_fmadd_ps(prod_f32, combined_scale, total);
+        let dot_f32 = _mm256_cvtepi32_ps(prod_32);
+        total = _mm256_fmadd_ps(dot_f32, combined_scale, total);
     }
 
     hsum_256(total)

@@ -65,7 +65,7 @@ impl WorkerSlot {
 /// resources. The caller thread (task 0) is also pinned during dispatch.
 pub struct SpinPool {
     slots: Arc<Vec<WorkerSlot>>,
-    _workers: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
     num_threads: usize,
     /// CPU ID to pin the caller thread to during dispatch (core 0).
     /// `None` if topology detection failed.
@@ -80,6 +80,7 @@ impl SpinPool {
     ///
     /// # Panics
     /// Panics if `num_threads` is 0.
+    #[must_use]
     pub fn new(num_threads: usize) -> Self {
         assert!(num_threads > 0, "SpinPool needs at least 1 thread");
 
@@ -113,7 +114,7 @@ impl SpinPool {
 
         Self {
             slots,
-            _workers: workers,
+            workers,
             num_threads,
             caller_core,
         }
@@ -121,6 +122,7 @@ impl SpinPool {
 
     /// Number of threads in this pool (including the caller thread).
     #[inline]
+    #[must_use]
     pub fn num_threads(&self) -> usize {
         self.num_threads
     }
@@ -137,6 +139,13 @@ impl SpinPool {
     where
         F: Fn(usize, usize) + Sync,
     {
+        // Type-erased trampoline: casts data pointer back to &F and calls it.
+        fn trampoline<F: Fn(usize, usize) + Sync>(data: *const (), task_id: usize, n: usize) {
+            // SAFETY: data points to task_fn on the caller's stack, valid because
+            // dispatch() blocks until all workers complete.
+            unsafe { (&*data.cast::<F>())(task_id, n) };
+        }
+
         assert!(
             num_tasks <= self.num_threads,
             "dispatch: num_tasks ({num_tasks}) > num_threads ({})",
@@ -152,15 +161,8 @@ impl SpinPool {
             return;
         }
 
-        // Type-erased trampoline: casts data pointer back to &F and calls it.
-        fn trampoline<F: Fn(usize, usize) + Sync>(data: *const (), task_id: usize, n: usize) {
-            // SAFETY: data points to task_fn on the caller's stack, valid because
-            // dispatch() blocks until all workers complete.
-            unsafe { (&*data.cast::<F>())(task_id, n) };
-        }
-
         let tramp: fn(*const (), usize, usize) = trampoline::<F>;
-        let data_ptr = (&task_fn as *const F).cast::<()>();
+        let data_ptr = (&raw const task_fn).cast::<()>();
 
         // Pin caller thread to its physical core (once per thread).
         // This prevents the OS from scheduling it on an HT sibling
@@ -183,7 +185,7 @@ impl SpinPool {
                 .store(tramp as *mut (), Ordering::Relaxed);
             self.slots[worker_id]
                 .data
-                .store(data_ptr as *mut (), Ordering::Relaxed);
+                .store(data_ptr.cast_mut(), Ordering::Relaxed);
             self.slots[worker_id]
                 .task_id
                 .store(worker_id, Ordering::Relaxed);
@@ -215,7 +217,7 @@ impl Drop for SpinPool {
             slot.status.store(SHUTDOWN, Ordering::Release);
         }
         // Join is handled by JoinHandle drop, but we drain explicitly to catch panics.
-        for handle in self._workers.drain(..) {
+        for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
     }
@@ -308,7 +310,7 @@ fn pin_to_core(core_id: usize) {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             libc::CPU_ZERO(&mut set);
             libc::CPU_SET(core_id, &mut set);
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set);
         }
     }
     #[cfg(not(target_os = "linux"))]

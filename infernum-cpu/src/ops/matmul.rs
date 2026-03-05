@@ -26,7 +26,7 @@ use crate::CpuBackend;
 /// `usize` is `Send + Sync`, avoiding Rust 2021 closure field-capture issues
 /// with raw pointers. The caller must ensure disjoint access when used across
 /// threads, and that the pointer remains valid for the duration of use.
-#[inline(always)]
+#[inline]
 fn ptr_to_usize<T>(p: *mut T) -> usize {
     p as usize
 }
@@ -77,7 +77,7 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
         let num_threads = pool.num_threads();
         let chunk_size = (n / num_threads).max(64).min(n);
         let c_addr = ptr_to_usize(c.as_mut_ptr());
-        let num_tasks = num_threads.min((n + chunk_size - 1) / chunk_size);
+        let num_tasks = num_threads.min(n.div_ceil(chunk_size));
         pool.dispatch(num_tasks, |task_id, _| {
             let col_start = task_id * chunk_size;
             let col_end = (col_start + chunk_size).min(n);
@@ -176,20 +176,17 @@ fn q8_gemv_parallel(
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         // SAFETY: each task writes to a disjoint slice [start..end].
         // dispatch() blocks until all tasks complete, so out_addr is valid.
-        pool.dispatch(
-            num_threads.min((n + chunk_size - 1) / chunk_size),
-            |task_id, _| {
-                let start = task_id * chunk_size;
-                let end = (start + chunk_size).min(n);
-                if start >= n {
-                    return;
-                }
-                let chunk = unsafe {
-                    std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
-                };
-                gemv_body(chunk, start);
-            },
-        );
+        pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let chunk = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            gemv_body(chunk, start);
+        });
     }
 }
 
@@ -255,20 +252,17 @@ fn q4_gemv_parallel(
         let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
         let chunk_size = (raw_chunk + 1) & !1; // round up to even
         let out_addr = ptr_to_usize(out.as_mut_ptr());
-        pool.dispatch(
-            num_threads.min((n + chunk_size - 1) / chunk_size),
-            |task_id, _| {
-                let start = task_id * chunk_size;
-                let end = (start + chunk_size).min(n);
-                if start >= n {
-                    return;
-                }
-                let chunk = unsafe {
-                    std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
-                };
-                gemv_body(chunk, start);
-            },
-        );
+        pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let chunk = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            gemv_body(chunk, start);
+        });
     }
 }
 
@@ -311,20 +305,17 @@ fn q4_1_gemv_parallel(
     } else {
         let chunk_size = (n / num_threads).max(min_neurons_per_task).min(n);
         let out_addr = ptr_to_usize(out.as_mut_ptr());
-        pool.dispatch(
-            num_threads.min((n + chunk_size - 1) / chunk_size),
-            |task_id, _| {
-                let start = task_id * chunk_size;
-                let end = (start + chunk_size).min(n);
-                if start >= n {
-                    return;
-                }
-                let chunk = unsafe {
-                    std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
-                };
-                gemv_body(chunk, start);
-            },
-        );
+        pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let chunk = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            gemv_body(chunk, start);
+        });
     }
 }
 
@@ -705,10 +696,10 @@ fn quantized_linear_triple(
 
     // Only fuse Q4_0/Q8_0 decode (M=1) with matching dtypes.
     if m != 1 || w1.dtype != w2.dtype || w1.dtype != w3.dtype {
-        let a = quantized_linear(input, w1)?;
-        let b = quantized_linear(input, w2)?;
-        let c = quantized_linear(input, w3)?;
-        return Ok((a, b, c));
+        let out1 = quantized_linear(input, w1)?;
+        let out2 = quantized_linear(input, w2)?;
+        let out3 = quantized_linear(input, w3)?;
+        return Ok((out1, out2, out3));
     }
 
     let input_data = input.as_f32_slice();
@@ -959,10 +950,10 @@ fn quantized_linear_triple(
             }
         }
         _ => {
-            let a = quantized_linear(input, w1)?;
-            let b = quantized_linear(input, w2)?;
-            let c = quantized_linear(input, w3)?;
-            return Ok((a, b, c));
+            let out1 = quantized_linear(input, w1)?;
+            let out2 = quantized_linear(input, w2)?;
+            let out3 = quantized_linear(input, w3)?;
+            return Ok((out1, out2, out3));
         }
     }
 

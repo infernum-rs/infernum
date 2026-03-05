@@ -498,7 +498,7 @@ unsafe fn dot_q4_1_row_inner(input: &[f32], packed: &[u8], scales: &[f32], mins:
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m256i, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi16,
+    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi16,
     _mm256_sign_epi8,
 };
 
@@ -551,8 +551,8 @@ unsafe fn dot_q8_q8_row_inner(
         let prod_32 = _mm256_madd_epi16(prod_16, ones_16);
 
         // Convert to f32 and accumulate with combined scale
-        let prod_f32 = _mm256_cvtepi32_ps(prod_32);
-        total = _mm256_fmadd_ps(prod_f32, combined_scale, total);
+        let dot_f32 = _mm256_cvtepi32_ps(prod_32);
+        total = _mm256_fmadd_ps(dot_f32, combined_scale, total);
     }
 
     hsum_256(total)
@@ -569,6 +569,7 @@ pub fn quantize_row_q8(input: &[f32], out_quants: &mut [u8], out_scales: &mut [f
     unsafe { quantize_row_q8_inner(input, out_quants, out_scales) }
 }
 
+#[allow(clippy::items_after_statements)]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_row_q8_inner(input: &[f32], out_quants: &mut [u8], out_scales: &mut [f32]) {
     use std::arch::x86_64::{
@@ -576,7 +577,7 @@ unsafe fn quantize_row_q8_inner(input: &[f32], out_quants: &mut [u8], out_scales
     };
 
     let num_blocks = out_scales.len();
-    let mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFu32 as i32)); // abs mask
+    let mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFu32.cast_signed())); // abs mask
 
     for blk in 0..num_blocks {
         let blk_start = blk * 32;
@@ -592,10 +593,7 @@ unsafe fn quantize_row_q8_inner(input: &[f32], out_quants: &mut [u8], out_scales
 
         // Horizontal max
         let max_scalar = {
-            let hi = _mm256_extractf128_ps(max_abs, 1);
-            let lo = _mm256_castps256_ps128(max_abs);
-            let m = _mm_add_ps(lo, hi); // Actually want max, but add is ok — we'll scalar max below
-                                        // Just extract all 8 and scalar max
+            // Extract all 8 lanes and take scalar max
             let mut buf = [0.0f32; 8];
             _mm256_storeu_ps(buf.as_mut_ptr(), max_abs);
             buf.iter().copied().fold(0.0f32, f32::max)
@@ -658,7 +656,7 @@ pub fn dot_q4_q8_row(
     unsafe { dot_q4_q8_row_inner(input_quants, input_scales, weight_packed, weight_scales) }
 }
 
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::items_after_statements)]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_q4_q8_row_inner(
     input_quants: &[u8],
@@ -667,8 +665,7 @@ unsafe fn dot_q4_q8_row_inner(
     weight_scales: &[f32],
 ) -> f32 {
     use std::arch::x86_64::{
-        _mm256_and_si256, _mm256_or_si256, _mm256_set1_epi8, _mm256_slli_epi16, _mm256_srli_epi16,
-        _mm256_sub_epi8,
+        _mm256_and_si256, _mm256_set1_epi8, _mm256_srli_epi16, _mm256_sub_epi8,
     };
 
     let num_blocks = weight_scales.len();
@@ -751,7 +748,11 @@ pub fn dot_q4_1_q8_row(
     }
 }
 
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::items_after_statements
+)]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_q4_1_q8_row_inner(
     input_quants: &[u8],

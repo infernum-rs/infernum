@@ -618,7 +618,13 @@ impl PagedAttentionOps for CpuBackend {
         let mut output = vec![0.0f32; batch_size * num_heads * head_dim];
 
         // Find max seq_len across batch for scratch buffer sizing
-        let max_sl = sl_data.iter().copied().max().unwrap_or(0) as usize;
+        let max_sl: usize = sl_data
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .try_into()
+            .expect("seq_len must be non-negative");
         let mut scores = vec![0.0f32; max_sl];
 
         // Process each (batch, head) pair sequentially.
@@ -663,7 +669,7 @@ impl PagedAttentionOps for CpuBackend {
                 let query_pos = seq_len - 1;
                 if query_pos >= window {
                     let cutoff = query_pos - window + 1;
-                    for s in scores[..cutoff].iter_mut() {
+                    for s in &mut scores[..cutoff] {
                         *s = f32::NEG_INFINITY;
                     }
                 }

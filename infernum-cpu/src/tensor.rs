@@ -17,11 +17,11 @@ pub struct CpuTensor {
     dtype: DType,
 }
 
-/// Thread-local scratch buffer reused across forward-pass ops.
-///
-/// Avoids per-token heap allocations in matmul and other compute-heavy ops.
-/// The buffer grows to the high-water mark and is never shrunk, so after a
-/// few warm-up tokens the allocator is never called again.
+// Thread-local scratch buffer reused across forward-pass ops.
+//
+// Avoids per-token heap allocations in matmul and other compute-heavy ops.
+// The buffer grows to the high-water mark and is never shrunk, so after a
+// few warm-up tokens the allocator is never called again.
 thread_local! {
     static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -261,6 +261,7 @@ pub struct CpuQuantizedWeight {
 }
 
 /// Decode a buffer of f16 values stored as raw little-endian bytes into f32.
+#[must_use]
 pub fn decode_f16_scales(raw: &[u8]) -> Vec<f32> {
     raw.chunks_exact(2)
         .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
