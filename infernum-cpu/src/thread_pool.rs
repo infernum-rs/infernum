@@ -349,8 +349,8 @@ pub fn global_pool() -> &'static SpinPool {
 /// `--cpus=4` would detect all host physical cores and over-subscribe.
 fn default_thread_count() -> usize {
     let physical = num_cpus::get_physical();
-    let cgroup_limit = std::thread::available_parallelism()
-        .map_or(physical, std::num::NonZero::get);
+    let cgroup_limit =
+        std::thread::available_parallelism().map_or(physical, std::num::NonZero::get);
     physical.min(cgroup_limit).max(1)
 }
 
