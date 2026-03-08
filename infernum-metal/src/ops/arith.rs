@@ -70,8 +70,8 @@ fn read_f32(t: &MetalTensor) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infernum::backend::{TensorDataOps, TensorFactory};
     use crate::MetalContext;
+    use infernum::backend::{TensorDataOps, TensorFactory};
 
     fn ctx() -> MetalContext {
         MetalContext::new()

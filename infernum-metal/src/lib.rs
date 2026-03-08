@@ -18,12 +18,14 @@ pub mod context;
 pub mod logits;
 pub mod ops;
 pub mod tensor;
+pub mod weights;
 
 use infernum::backend::Backend;
 
 pub use context::MetalContext;
 pub use logits::MetalLogits;
 pub use tensor::MetalTensor;
+pub use weights::{MetalLinearWeight, MetalSafeTensorsLoader};
 
 /// Paged KV cache for Metal (block-based, used by most attention mechanisms).
 pub struct MetalPagedKvCache {

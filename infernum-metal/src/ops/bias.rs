@@ -13,7 +13,12 @@ impl BiasOps for MetalBackend {
         let cols = *shape.last().unwrap();
         let rows = input.numel() / cols;
 
-        assert_eq!(bias.numel(), cols, "bias_add: bias len {} != cols {cols}", bias.numel());
+        assert_eq!(
+            bias.numel(),
+            cols,
+            "bias_add: bias len {} != cols {cols}",
+            bias.numel()
+        );
 
         let mut data = input.as_f32_slice().to_vec();
         let bias_data = bias.as_f32_slice();
@@ -35,8 +40,8 @@ impl BiasOps for MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infernum::backend::{TensorDataOps, TensorFactory};
     use crate::MetalContext;
+    use infernum::backend::{TensorDataOps, TensorFactory};
 
     fn ctx() -> MetalContext {
         MetalContext::new()

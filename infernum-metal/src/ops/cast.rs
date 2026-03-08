@@ -52,13 +52,23 @@ impl CastOps for MetalBackend {
                 let bf16_data: Vec<half::bf16> =
                     f32_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
                 let bytes: &[u8] = bytemuck::cast_slice(&bf16_data);
-                Ok(MetalTensor::from_raw_bytes(&device, input.shape(), DType::BF16, bytes))
+                Ok(MetalTensor::from_raw_bytes(
+                    &device,
+                    input.shape(),
+                    DType::BF16,
+                    bytes,
+                ))
             }
             DType::F16 => {
                 let f16_data: Vec<half::f16> =
                     f32_data.iter().map(|&v| half::f16::from_f32(v)).collect();
                 let bytes: &[u8] = bytemuck::cast_slice(&f16_data);
-                Ok(MetalTensor::from_raw_bytes(&device, input.shape(), DType::F16, bytes))
+                Ok(MetalTensor::from_raw_bytes(
+                    &device,
+                    input.shape(),
+                    DType::F16,
+                    bytes,
+                ))
             }
             other => Err(infernum::Error::UnsupportedDtype(format!(
                 "cast_from_f32: unsupported target dtype {other}"
@@ -70,8 +80,8 @@ impl CastOps for MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infernum::backend::{TensorDataOps, TensorFactory};
     use crate::MetalContext;
+    use infernum::backend::{TensorDataOps, TensorFactory};
 
     fn ctx() -> MetalContext {
         MetalContext::new()
@@ -100,7 +110,8 @@ mod tests {
     fn test_from_raw_bytes_bf16() {
         let c = ctx();
         let f32_data = [1.0f32, 2.0, 3.0];
-        let bf16_data: Vec<half::bf16> = f32_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let bf16_data: Vec<half::bf16> =
+            f32_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
         let bytes: &[u8] = bytemuck::cast_slice(&bf16_data);
         let t = MetalBackend::from_raw_bytes(&c, &[3], DType::BF16, bytes).unwrap();
         let out = MetalBackend::to_f32_vec(&t).unwrap();

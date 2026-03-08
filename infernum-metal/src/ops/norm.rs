@@ -85,8 +85,8 @@ impl NormOps for MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infernum::backend::{TensorDataOps, TensorFactory};
     use crate::MetalContext;
+    use infernum::backend::{TensorDataOps, TensorFactory};
 
     fn ctx() -> MetalContext {
         MetalContext::new()
