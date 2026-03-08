@@ -31,19 +31,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check with Clippy (pedantic, deny warnings)
-        run: cargo clippy --all -- -W clippy::pedantic -D warnings
+        run: cargo clippy --all --exclude infernum-metal -- -W clippy::pedantic -D warnings
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run tests (no CUDA)
-        run: cargo test --all
+      - name: Run tests (no CUDA, no Metal)
+        run: cargo test --all --exclude infernum-metal
 
       - name: Run tests (force-fuse)
-        run: cargo test --all --features force-fuse
+        run: cargo test --all --exclude infernum-metal --features force-fuse
 
       - name: Run tests (no-fuse)
-        run: cargo test --all --features no-fuse
+        run: cargo test --all --exclude infernum-metal --features no-fuse
 
   # CPU backend integration tests (x86-64 + AArch64)
   check-cpu:
