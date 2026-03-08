@@ -16,6 +16,38 @@ use crate::tensor::MetalTensor;
 use crate::MetalBackend;
 use crate::MetalContext;
 
+// ---- Quantized weight type ----
+
+/// Block-quantized weight for Metal inference.
+///
+/// Stores quantized data and per-block scales separately, matching the
+/// GGUF loader output. Layout is row-major: `out_features` rows of
+/// `in_features` elements, with `in_features / 32` blocks per row.
+///
+/// Scales and mins are pre-decoded to f32 at load time so the forward
+/// pass pays no f16→f32 conversion cost.
+#[derive(Clone)]
+pub struct MetalQuantizedWeight {
+    /// Logical shape: `[out_features, in_features]`
+    pub shape: Vec<usize>,
+    /// Quantization format (`Q8_0`, `Q4_0`, or `Q4_1`)
+    pub dtype: DType,
+    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
+    pub data: Vec<u8>,
+    /// Per-block scales decoded to f32 (one per block)
+    pub scales: Vec<f32>,
+    /// Per-block minimums decoded to f32 (one per block, Q4_1 only)
+    pub mins: Option<Vec<f32>>,
+}
+
+/// Decode a buffer of f16 values stored as raw little-endian bytes into f32.
+#[must_use]
+pub fn decode_f16_scales(raw: &[u8]) -> Vec<f32> {
+    raw.chunks_exact(2)
+        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect()
+}
+
 // ---- Linear weight type ----
 
 /// Metal linear weight — dense or quantized.
@@ -30,11 +62,8 @@ pub enum MetalLinearWeight {
         /// Transposed for dot-product matmul
         weight_t: MetalTensor,
     },
-    /// Quantized weight — placeholder for future GPTQ/AWQ/Q8 support.
-    Quantized {
-        /// Raw quantized data
-        _data: MetalTensor,
-    },
+    /// Block-quantized weight in `(out_features, in_features)` layout.
+    Quantized(MetalQuantizedWeight),
 }
 
 impl MetalLinearWeight {

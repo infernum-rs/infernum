@@ -3,17 +3,159 @@
 //! Phase 1: CPU-side naive matmul via unified memory. This is correct
 //! but slow — the hot path for Metal performance will be MPSMatrixMultiplication
 //! or custom MSL kernels added later.
+//!
+//! Quantized weights (Q8_0, Q4_0, Q4_1) are stored in their original
+//! `(out_features, in_features)` layout. The quantized linear kernel iterates
+//! per output neuron (row), dequantizing blocks on the fly.
 
 use infernum::backend::MatmulOps;
+use infernum::dtype::{DType, QUANTIZATION_BLOCK_SIZE};
 use infernum::tensor::Tensor;
 use infernum::weights::host::HostLinearWeight;
-use infernum::DType;
 use infernum::Result;
 
 use crate::tensor::MetalTensor;
-use crate::weights::MetalLinearWeight;
+use crate::weights::{decode_f16_scales, MetalLinearWeight, MetalQuantizedWeight};
 use crate::MetalBackend;
 use crate::MetalContext;
+
+// ---------------------------------------------------------------------------
+// Quantized linear (CPU-side, Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Quantized linear: `input (M, K) × weight (N, K)_quantized → output (M, N)`.
+///
+/// Weight is stored as `(out_features=N, in_features=K)` in block-quantized
+/// format. Scales are pre-decoded to f32 so no f16→f32 conversion happens
+/// in the hot path.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
+)]
+fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Result<MetalTensor> {
+    let i_shape = input.shape();
+    let m: usize = i_shape[..i_shape.len() - 1].iter().product();
+    let k = *i_shape.last().unwrap();
+
+    let n = weight.shape[0]; // out_features
+    let wk = weight.shape[1]; // in_features
+    assert_eq!(
+        k, wk,
+        "quantized_linear: input dim {k} != weight in_features {wk}"
+    );
+    assert_eq!(
+        k % QUANTIZATION_BLOCK_SIZE,
+        0,
+        "quantized_linear: in_features {k} not divisible by block size {QUANTIZATION_BLOCK_SIZE}"
+    );
+
+    let num_blocks_per_row = k / QUANTIZATION_BLOCK_SIZE;
+    let input_data = input.as_f32_slice();
+    let mut output = vec![0.0f32; m * n];
+
+    match weight.dtype {
+        DType::Q8_0 => {
+            let quants = &weight.data;
+            let scales = &weight.scales;
+            let quant_bytes_per_row = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
+
+            for row in 0..m {
+                let inp = &input_data[row * k..(row + 1) * k];
+                for neuron in 0..n {
+                    let q_start = neuron * quant_bytes_per_row;
+                    let s_start = neuron * num_blocks_per_row;
+                    let mut sum = 0.0f32;
+                    for b in 0..num_blocks_per_row {
+                        let scale = scales[s_start + b];
+                        let block_start = q_start + b * QUANTIZATION_BLOCK_SIZE;
+                        let inp_start = b * QUANTIZATION_BLOCK_SIZE;
+                        for j in 0..QUANTIZATION_BLOCK_SIZE {
+                            let q = quants[block_start + j] as i8;
+                            sum += inp[inp_start + j] * f32::from(q) * scale;
+                        }
+                    }
+                    output[row * n + neuron] = sum;
+                }
+            }
+        }
+        DType::Q4_0 => {
+            let packed = &weight.data;
+            let scales = &weight.scales;
+            let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+
+            for row in 0..m {
+                let inp = &input_data[row * k..(row + 1) * k];
+                for neuron in 0..n {
+                    let p_start = neuron * packed_bytes_per_row;
+                    let s_start = neuron * num_blocks_per_row;
+                    let mut sum = 0.0f32;
+                    for b in 0..num_blocks_per_row {
+                        let scale = scales[s_start + b];
+                        let block_start = p_start + b * (QUANTIZATION_BLOCK_SIZE / 2);
+                        let inp_start = b * QUANTIZATION_BLOCK_SIZE;
+                        for j in 0..QUANTIZATION_BLOCK_SIZE / 2 {
+                            let byte = packed[block_start + j];
+                            let lo = i32::from(byte & 0x0F) - 8;
+                            let hi = i32::from(byte >> 4) - 8;
+                            sum += inp[inp_start + j] * lo as f32 * scale;
+                            sum += inp[inp_start + j + 16] * hi as f32 * scale;
+                        }
+                    }
+                    output[row * n + neuron] = sum;
+                }
+            }
+        }
+        DType::Q4_1 => {
+            let packed = &weight.data;
+            let scales = &weight.scales;
+            let mins = weight
+                .mins
+                .as_ref()
+                .expect("Q4_1 weight missing mins buffer");
+            let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+
+            for row in 0..m {
+                let inp = &input_data[row * k..(row + 1) * k];
+                for neuron in 0..n {
+                    let p_start = neuron * packed_bytes_per_row;
+                    let s_start = neuron * num_blocks_per_row;
+                    let mut sum = 0.0f32;
+                    for b in 0..num_blocks_per_row {
+                        let scale = scales[s_start + b];
+                        let min = mins[s_start + b];
+                        let block_start = p_start + b * (QUANTIZATION_BLOCK_SIZE / 2);
+                        let inp_start = b * QUANTIZATION_BLOCK_SIZE;
+                        for j in 0..QUANTIZATION_BLOCK_SIZE / 2 {
+                            let byte = packed[block_start + j];
+                            let lo = f32::from(byte & 0x0F);
+                            let hi = f32::from(byte >> 4);
+                            sum += inp[inp_start + j] * (lo * scale + min);
+                            sum += inp[inp_start + j + 16] * (hi * scale + min);
+                        }
+                    }
+                    output[row * n + neuron] = sum;
+                }
+            }
+        }
+        other => {
+            return Err(infernum::Error::UnsupportedDtype(format!(
+                "quantized_linear: unsupported dtype {other}"
+            )));
+        }
+    }
+
+    let device = metal::Device::system_default()
+        .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
+    let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
+    out_shape.push(n);
+    Ok(MetalTensor::from_f32(&device, &out_shape, &output))
+}
+
+// ---------------------------------------------------------------------------
+// MatmulOps
+// ---------------------------------------------------------------------------
 
 impl MatmulOps for MetalBackend {
     type LinearWeight = MetalLinearWeight;
@@ -79,16 +221,14 @@ impl MatmulOps for MetalBackend {
                 *out_shape.last_mut().unwrap() = n;
                 Ok(MetalTensor::from_f32(&device, &out_shape, &out))
             }
-            MetalLinearWeight::Quantized { .. } => Err(infernum::Error::Other(
-                "Metal quantized linear not yet implemented".into(),
-            )),
+            MetalLinearWeight::Quantized(w) => quantized_linear(input, w),
         }
     }
 
     fn as_dense_weight(weight: &MetalLinearWeight) -> Option<&MetalTensor> {
         match weight {
             MetalLinearWeight::Dense { weight, .. } => Some(weight),
-            MetalLinearWeight::Quantized { .. } => None,
+            MetalLinearWeight::Quantized(_) => None,
         }
     }
 
@@ -100,26 +240,48 @@ impl MatmulOps for MetalBackend {
         matches!(weight, MetalLinearWeight::Dense { .. })
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn quantize_to_q8(
-        device: &MetalContext,
+        _device: &MetalContext,
         shape: &[usize],
         data: &[f32],
     ) -> Result<MetalLinearWeight> {
-        // Phase 1: store as dense f32
         let out_features = shape[0];
         let in_features = shape[1];
+        assert_eq!(
+            in_features % QUANTIZATION_BLOCK_SIZE,
+            0,
+            "quantize_to_q8: in_features {in_features} not aligned to block size"
+        );
 
-        // Transpose: (out, in) → (in, out) for matmul-ready layout
-        let mut transposed = vec![0.0f32; data.len()];
-        for r in 0..out_features {
-            for c in 0..in_features {
-                transposed[c * out_features + r] = data[r * in_features + c];
+        let num_blocks_per_row = in_features / QUANTIZATION_BLOCK_SIZE;
+        let total_blocks = out_features * num_blocks_per_row;
+        let mut qdata = Vec::with_capacity(total_blocks * QUANTIZATION_BLOCK_SIZE);
+        let mut scales = Vec::with_capacity(total_blocks);
+
+        for row in 0..out_features {
+            let row_data = &data[row * in_features..(row + 1) * in_features];
+            for b in 0..num_blocks_per_row {
+                let block =
+                    &row_data[b * QUANTIZATION_BLOCK_SIZE..(b + 1) * QUANTIZATION_BLOCK_SIZE];
+                let max_abs = block.iter().copied().fold(0.0f32, |a, v| a.max(v.abs()));
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+                let inv_scale = 1.0 / scale;
+                scales.push(scale);
+                for &v in block {
+                    let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                    qdata.push(q.cast_unsigned());
+                }
             }
         }
 
-        let weight =
-            MetalTensor::from_f32(device.device(), &[in_features, out_features], &transposed);
-        Ok(MetalLinearWeight::new_dense(weight))
+        Ok(MetalLinearWeight::Quantized(MetalQuantizedWeight {
+            shape: shape.to_vec(),
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales,
+            mins: None,
+        }))
     }
 
     fn upload_host_linear(
@@ -146,9 +308,27 @@ impl MatmulOps for MetalBackend {
                     weight_t: f32_tensor,
                 })
             }
-            HostLinearWeight::Quantized(_q) => Err(infernum::Error::Other(
-                "Metal quantized weight upload not yet implemented".into(),
-            )),
+            HostLinearWeight::Quantized(hq) => match hq.dtype {
+                DType::Q8_0 | DType::Q4_0 => {
+                    Ok(MetalLinearWeight::Quantized(MetalQuantizedWeight {
+                        shape: hq.shape.clone(),
+                        dtype: hq.dtype,
+                        data: hq.data.clone(),
+                        scales: decode_f16_scales(&hq.scales),
+                        mins: None,
+                    }))
+                }
+                DType::Q4_1 => Ok(MetalLinearWeight::Quantized(MetalQuantizedWeight {
+                    shape: hq.shape.clone(),
+                    dtype: hq.dtype,
+                    data: hq.data.clone(),
+                    scales: decode_f16_scales(&hq.scales),
+                    mins: hq.qzeros.as_deref().map(decode_f16_scales),
+                })),
+                other => Err(infernum::Error::UnsupportedDtype(format!(
+                    "Metal backend does not support {other} quantized weights"
+                ))),
+            },
         }
     }
 }
@@ -192,5 +372,194 @@ mod tests {
         let result = out.as_f32_slice();
         // 1*1+2*3+3*5 = 22, 1*2+2*4+3*6 = 28
         assert_eq!(result, &[22.0, 28.0]);
+    }
+
+    #[test]
+    fn test_linear_q8() {
+        let c = ctx();
+        // 2 output neurons × 32 input features (1 block each)
+        // neuron 0: all quants = 1, scale = 2.0 → each element contributes input[i] * 1 * 2.0
+        // neuron 1: all quants = 2, scale = 0.5 → each element contributes input[i] * 2 * 0.5
+        let n = 2;
+        let k = QUANTIZATION_BLOCK_SIZE; // 32
+
+        // Build quantized weight data
+        let mut qdata = vec![0u8; n * k];
+        // neuron 0: quants = 1 (as i8 → u8)
+        for j in 0..k {
+            qdata[j] = 1_i8 as u8;
+        }
+        // neuron 1: quants = 2 (as i8 → u8)
+        for j in 0..k {
+            qdata[k + j] = 2_i8 as u8;
+        }
+        let scales = vec![2.0_f32, 0.5_f32];
+
+        let weight = MetalLinearWeight::Quantized(MetalQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales,
+            mins: None,
+        });
+
+        // Input: all 1.0
+        let input_data = vec![1.0f32; k];
+        let input = MetalBackend::from_f32_slice(&c, &[1, k], &input_data).unwrap();
+
+        let out = MetalBackend::linear(&input, &weight).unwrap();
+        assert_eq!(out.shape(), &[1, n]);
+        let result = out.as_f32_slice();
+        // neuron 0: sum(1.0 * 1 * 2.0) for 32 elements = 64.0
+        // neuron 1: sum(1.0 * 2 * 0.5) for 32 elements = 32.0
+        assert!(
+            (result[0] - 64.0).abs() < 1e-3,
+            "Q8 neuron 0: got {}, expected 64.0",
+            result[0]
+        );
+        assert!(
+            (result[1] - 32.0).abs() < 1e-3,
+            "Q8 neuron 1: got {}, expected 32.0",
+            result[1]
+        );
+    }
+
+    #[test]
+    fn test_linear_q4_0() {
+        let c = ctx();
+        // 1 output neuron × 32 input features (1 block)
+        // Pack nibbles: each byte has lo=3, hi=5 → dequantized lo = 3-8 = -5, hi = 5-8 = -3
+        let k = QUANTIZATION_BLOCK_SIZE;
+        let packed: Vec<u8> = vec![0x53; k / 2]; // lo=3, hi=5
+        let scale = 2.0_f32;
+
+        let weight = MetalLinearWeight::Quantized(MetalQuantizedWeight {
+            shape: vec![1, k],
+            dtype: DType::Q4_0,
+            data: packed,
+            scales: vec![scale],
+            mins: None,
+        });
+
+        // Input: all 1.0
+        let input_data = vec![1.0f32; k];
+        let input = MetalBackend::from_f32_slice(&c, &[1, k], &input_data).unwrap();
+
+        let out = MetalBackend::linear(&input, &weight).unwrap();
+        assert_eq!(out.shape(), &[1, 1]);
+        let result = out.as_f32_slice();
+        // 16 lo elements: (-5) * 2.0 * 1.0 = -10.0 each → -160.0
+        // 16 hi elements: (-3) * 2.0 * 1.0 = -6.0 each → -96.0
+        // Total: -256.0
+        assert!(
+            (result[0] - (-256.0)).abs() < 1e-3,
+            "Q4_0: got {}, expected -256.0",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_linear_q4_1() {
+        let c = ctx();
+        // 1 output neuron × 32 input features (1 block)
+        // Pack nibbles: each byte has lo=3, hi=5
+        // Q4_1: value = nibble * scale + min
+        let k = QUANTIZATION_BLOCK_SIZE;
+        let packed: Vec<u8> = vec![0x53; k / 2]; // lo=3, hi=5
+        let scale = 0.5_f32;
+        let min = -1.0_f32;
+
+        let weight = MetalLinearWeight::Quantized(MetalQuantizedWeight {
+            shape: vec![1, k],
+            dtype: DType::Q4_1,
+            data: packed,
+            scales: vec![scale],
+            mins: Some(vec![min]),
+        });
+
+        // Input: all 1.0
+        let input_data = vec![1.0f32; k];
+        let input = MetalBackend::from_f32_slice(&c, &[1, k], &input_data).unwrap();
+
+        let out = MetalBackend::linear(&input, &weight).unwrap();
+        assert_eq!(out.shape(), &[1, 1]);
+        let result = out.as_f32_slice();
+        // 16 lo elements: (3 * 0.5 + (-1.0)) * 1.0 = 0.5 each → 8.0
+        // 16 hi elements: (5 * 0.5 + (-1.0)) * 1.0 = 1.5 each → 24.0
+        // Total: 32.0
+        assert!(
+            (result[0] - 32.0).abs() < 1e-3,
+            "Q4_1: got {}, expected 32.0",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_quantize_to_q8_roundtrip() {
+        let c = ctx();
+        // Create a simple weight matrix and quantize it
+        let shape = [2, QUANTIZATION_BLOCK_SIZE];
+        let mut data = vec![0.0f32; 2 * QUANTIZATION_BLOCK_SIZE];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = (i as f32) * 0.1 - 3.2;
+        }
+
+        let weight = MetalBackend::quantize_to_q8(&c, &shape, &data).unwrap();
+        assert!(!MetalBackend::is_dense_weight(&weight));
+
+        // Run a linear operation to verify it produces reasonable output
+        let input_data = vec![1.0f32; QUANTIZATION_BLOCK_SIZE];
+        let input =
+            MetalBackend::from_f32_slice(&c, &[1, QUANTIZATION_BLOCK_SIZE], &input_data).unwrap();
+        let out = MetalBackend::linear(&input, &weight).unwrap();
+        assert_eq!(out.shape(), &[1, 2]);
+        // Just verify no crash and output is finite
+        for &v in out.as_f32_slice() {
+            assert!(
+                v.is_finite(),
+                "quantize_to_q8 roundtrip produced non-finite value"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upload_host_quantized_q8() {
+        use infernum::weights::host::{HostLinearWeight, HostQuantizedWeight};
+
+        let c = ctx();
+        let k = QUANTIZATION_BLOCK_SIZE;
+        let n = 1;
+
+        // Build a HostQuantizedWeight with Q8_0 data
+        let scale_f16 = half::f16::from_f32(1.0);
+        let mut scales_raw = Vec::new();
+        scales_raw.extend_from_slice(&scale_f16.to_le_bytes());
+
+        let qdata: Vec<u8> = (0..k as u8).collect();
+
+        let hq = HostQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            data: qdata.clone(),
+            scales: scales_raw,
+            qzeros: None,
+            group_size: None,
+            weight_scale: 1.0,
+            channel_scales: None,
+        };
+
+        let weight =
+            MetalBackend::upload_host_linear(&c, &HostLinearWeight::Quantized(hq)).unwrap();
+        assert!(!MetalBackend::is_dense_weight(&weight));
+
+        // Verify the data was loaded correctly
+        if let MetalLinearWeight::Quantized(q) = &weight {
+            assert_eq!(q.dtype, DType::Q8_0);
+            assert_eq!(q.shape, vec![n, k]);
+            assert_eq!(q.data, qdata);
+            assert!((q.scales[0] - 1.0).abs() < 1e-3);
+        } else {
+            panic!("Expected Quantized variant");
+        }
     }
 }
