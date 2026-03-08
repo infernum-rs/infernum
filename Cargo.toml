@@ -8,6 +8,7 @@ members = [
     "infernum-gemma",
     "infernum-llama",
     "infernum-macros",
+    "infernum-metal",
     "infernum-qwen",
     "infernum-runtime",
     "infernum-serve",
