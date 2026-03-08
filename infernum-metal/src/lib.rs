@@ -52,7 +52,7 @@ pub struct MetalKvCache {
     pub(crate) layers: Vec<MetalKvLayer>,
     pub(crate) num_kv_heads: usize,
     pub(crate) head_dim: usize,
-    pub(crate) device: metal::Device,
+    pub(crate) ctx: MetalContext,
 }
 
 pub(crate) struct MetalKvLayer {
@@ -61,7 +61,7 @@ pub(crate) struct MetalKvLayer {
     pub(crate) len: usize,
 }
 
-// SAFETY: MetalKvCache contains a Metal Device (thread-safe) and Vec data.
+// SAFETY: MetalKvCache contains a MetalContext (Arc-wrapped, thread-safe) and Vec data.
 unsafe impl Send for MetalKvCache {}
 
 /// Marker type for the Metal backend.

@@ -30,9 +30,7 @@ impl BiasOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        *input = MetalTensor::from_f32(&device, &shape, &data);
+        *input = MetalTensor::from_f32(input.context(), &shape, &data);
         Ok(())
     }
 }

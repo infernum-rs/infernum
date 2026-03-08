@@ -46,10 +46,8 @@ impl MoeOps for MetalBackend {
             let topk = &indexed[..num_experts_per_tok];
 
             let topk_sum: f32 = topk.iter().map(|(_, p)| p).sum();
-            let device = metal::Device::system_default()
-                .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
             let token = MetalTensor::from_f32(
-                &device,
+                hidden.context(),
                 &[1, hidden_dim],
                 &data[b * hidden_dim..(b + 1) * hidden_dim],
             );
@@ -68,9 +66,11 @@ impl MoeOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, hidden.shape(), &result))
+        Ok(MetalTensor::from_f32(
+            hidden.context(),
+            hidden.shape(),
+            &result,
+        ))
     }
 }
 
@@ -149,10 +149,8 @@ impl MoeSigmoidOps for MetalBackend {
             let topk = &indexed[..num_experts_per_tok];
 
             let topk_sum: f32 = topk.iter().map(|(_, s)| s).sum();
-            let device = metal::Device::system_default()
-                .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
             let token = MetalTensor::from_f32(
-                &device,
+                hidden.context(),
                 &[1, hidden_dim],
                 &data[b * hidden_dim..(b + 1) * hidden_dim],
             );
@@ -172,8 +170,10 @@ impl MoeSigmoidOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, hidden.shape(), &result))
+        Ok(MetalTensor::from_f32(
+            hidden.context(),
+            hidden.shape(),
+            &result,
+        ))
     }
 }

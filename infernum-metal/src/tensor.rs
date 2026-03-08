@@ -10,12 +10,19 @@ use metal::Buffer;
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 
+use crate::context::MetalContext;
+
 /// A Metal-resident tensor backed by a shared `MTLBuffer`.
 ///
 /// Uses `Arc<Buffer>` so clones and `slice_view` are cheap (shared backing).
 /// `StorageModeShared` gives both CPU and GPU access to the same memory.
+///
+/// Each tensor carries a [`MetalContext`] so that op trait methods (which
+/// are static and receive no device handle) can access the command queue
+/// and compute pipelines from any input tensor.
 #[derive(Clone)]
 pub struct MetalTensor {
+    ctx: MetalContext,
     buffer: Arc<Buffer>,
     /// Byte offset into the buffer (for slice_view).
     offset: usize,
@@ -34,12 +41,7 @@ impl MetalTensor {
     /// # Panics
     /// Panics if `data.len()` doesn't match the expected size for the shape and dtype.
     #[must_use]
-    pub fn from_raw_bytes(
-        device: &metal::DeviceRef,
-        shape: &[usize],
-        dtype: DType,
-        data: &[u8],
-    ) -> Self {
+    pub fn from_raw_bytes(ctx: &MetalContext, shape: &[usize], dtype: DType, data: &[u8]) -> Self {
         let numel: usize = shape.iter().product();
         let expected_bytes = if dtype.is_quantized() {
             // For quantized types, trust the caller's data length
@@ -54,13 +56,14 @@ impl MetalTensor {
             data.len()
         );
 
-        let buffer = device.new_buffer_with_data(
+        let buffer = ctx.device().new_buffer_with_data(
             data.as_ptr().cast(),
             data.len() as u64,
             metal::MTLResourceOptions::StorageModeShared,
         );
 
         Self {
+            ctx: ctx.clone(),
             buffer: Arc::new(buffer),
             offset: 0,
             shape: shape.to_vec(),
@@ -70,16 +73,16 @@ impl MetalTensor {
 
     /// Create a tensor from an f32 slice.
     #[must_use]
-    pub fn from_f32(device: &metal::DeviceRef, shape: &[usize], data: &[f32]) -> Self {
-        Self::from_raw_bytes(device, shape, DType::F32, bytemuck::cast_slice(data))
+    pub fn from_f32(ctx: &MetalContext, shape: &[usize], data: &[f32]) -> Self {
+        Self::from_raw_bytes(ctx, shape, DType::F32, bytemuck::cast_slice(data))
     }
 
     /// Create a zero-initialized tensor.
     #[must_use]
-    pub fn zeros(device: &metal::DeviceRef, shape: &[usize], dtype: DType) -> Self {
+    pub fn zeros(ctx: &MetalContext, shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
         let size_bytes = numel * dtype.size_in_bytes();
-        let buffer = device.new_buffer(
+        let buffer = ctx.device().new_buffer(
             size_bytes as u64,
             metal::MTLResourceOptions::StorageModeShared,
         );
@@ -90,11 +93,21 @@ impl MetalTensor {
         }
 
         Self {
+            ctx: ctx.clone(),
             buffer: Arc::new(buffer),
             offset: 0,
             shape: shape.to_vec(),
             dtype,
         }
+    }
+
+    /// Reference to the Metal context embedded in this tensor.
+    ///
+    /// Op implementations use this to access the device, command queue,
+    /// and compute pipeline states without needing an external device handle.
+    #[must_use]
+    pub fn context(&self) -> &MetalContext {
+        &self.ctx
     }
 
     /// Direct pointer to the tensor's data in shared memory.
@@ -209,6 +222,7 @@ impl Tensor for MetalTensor {
             self.numel()
         );
         Self {
+            ctx: self.ctx.clone(),
             buffer: Arc::clone(&self.buffer),
             offset: self.offset,
             shape: shape.to_vec(),
@@ -228,6 +242,7 @@ impl Tensor for MetalTensor {
             self.buffer.length()
         );
         Self {
+            ctx: self.ctx.clone(),
             buffer: Arc::clone(&self.buffer),
             offset: new_offset,
             shape: shape.to_vec(),

@@ -26,9 +26,7 @@ impl SwigluOps for MetalBackend {
         let u = up.as_f32_slice();
         assert_eq!(g.len(), u.len(), "swiglu: gate/up length mismatch");
         let out: Vec<f32> = g.iter().zip(u.iter()).map(|(g, u)| silu(*g) * u).collect();
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, gate.shape(), &out))
+        Ok(MetalTensor::from_f32(gate.context(), gate.shape(), &out))
     }
 }
 
@@ -38,9 +36,7 @@ impl GegluOps for MetalBackend {
         let u = up.as_f32_slice();
         assert_eq!(g.len(), u.len(), "geglu: gate/up length mismatch");
         let out: Vec<f32> = g.iter().zip(u.iter()).map(|(g, u)| gelu(*g) * u).collect();
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, gate.shape(), &out))
+        Ok(MetalTensor::from_f32(gate.context(), gate.shape(), &out))
     }
 }
 

@@ -24,7 +24,7 @@ impl AttentionOps for MetalBackend {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<MetalTensor> {
-        let (out, _) = attention_impl(q, k, v, offset, scale, softcap, sliding_window, false)?;
+        let (out, _) = attention_impl(q, k, v, offset, scale, softcap, sliding_window, false);
         Ok(out)
     }
 
@@ -39,7 +39,7 @@ impl AttentionOps for MetalBackend {
     ) -> Result<MetalTensor> {
         let kv_len = k.shape()[0];
         let offset = kv_len.saturating_sub(1);
-        let (out, _) = attention_impl(q, k, v, offset, scale, softcap, sliding_window, false)?;
+        let (out, _) = attention_impl(q, k, v, offset, scale, softcap, sliding_window, false);
         Ok(out)
     }
 
@@ -53,7 +53,16 @@ impl AttentionOps for MetalBackend {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<(MetalTensor, MetalTensor)> {
-        attention_impl(q, k, v, offset, scale, softcap, sliding_window, true)
+        Ok(attention_impl(
+            q,
+            k,
+            v,
+            offset,
+            scale,
+            softcap,
+            sliding_window,
+            true,
+        ))
     }
 
     fn combine_attention_with_lse(
@@ -85,9 +94,7 @@ impl AttentionOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, shape, &out))
+        Ok(MetalTensor::from_f32(out1.context(), shape, &out))
     }
 }
 
@@ -107,7 +114,7 @@ fn attention_impl(
     softcap: Option<f32>,
     sliding_window: Option<usize>,
     compute_lse: bool,
-) -> Result<(MetalTensor, MetalTensor)> {
+) -> (MetalTensor, MetalTensor) {
     let q_shape = q.shape();
     let seq_len = q_shape[0];
     let n_heads = q_shape[1];
@@ -184,11 +191,10 @@ fn attention_impl(
         }
     }
 
-    let device = metal::Device::system_default()
-        .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-    let out_tensor = MetalTensor::from_f32(&device, q_shape, &out);
-    let lse_tensor = MetalTensor::from_f32(&device, &[seq_len, n_heads], &lse_data);
-    Ok((out_tensor, lse_tensor))
+    let ctx = q.context();
+    let out_tensor = MetalTensor::from_f32(ctx, q_shape, &out);
+    let lse_tensor = MetalTensor::from_f32(ctx, &[seq_len, n_heads], &lse_data);
+    (out_tensor, lse_tensor)
 }
 
 // ---- Paged KV Cache ----
@@ -210,8 +216,8 @@ impl PagedKvCacheOps for MetalBackend {
         let mut v_pools = Vec::with_capacity(num_layers);
 
         for _ in 0..num_layers {
-            k_pools.push(MetalTensor::zeros(device.device(), &pool_shape, DType::F32));
-            v_pools.push(MetalTensor::zeros(device.device(), &pool_shape, DType::F32));
+            k_pools.push(MetalTensor::zeros(device, &pool_shape, DType::F32));
+            v_pools.push(MetalTensor::zeros(device, &pool_shape, DType::F32));
         }
 
         Ok(MetalPagedKvCache {
@@ -429,10 +435,8 @@ impl PagedAttentionOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
         Ok(MetalTensor::from_f32(
-            &device,
+            q.context(),
             &[batch_size, num_heads, head_dim],
             &output,
         ))
@@ -460,12 +464,11 @@ impl PagedAttentionOps for MetalBackend {
             v_out.extend_from_slice(&v_pool[off..off + head_stride]);
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
+        let ctx = paged_kv.k_pools[layer_idx].context();
         let shape = [seq_len, paged_kv.num_kv_heads, paged_kv.head_dim];
         Ok((
-            MetalTensor::from_f32(&device, &shape, &k_out),
-            MetalTensor::from_f32(&device, &shape, &v_out),
+            MetalTensor::from_f32(ctx, &shape, &k_out),
+            MetalTensor::from_f32(ctx, &shape, &v_out),
         ))
     }
 }
@@ -491,8 +494,8 @@ impl KvCacheOps for MetalBackend {
         let layer = &cache.layers[layer_idx];
         let shape = [layer.len, cache.num_kv_heads, cache.head_dim];
         (
-            MetalTensor::from_f32(&cache.device, &shape, &layer.k),
-            MetalTensor::from_f32(&cache.device, &shape, &layer.v),
+            MetalTensor::from_f32(&cache.ctx, &shape, &layer.k),
+            MetalTensor::from_f32(&cache.ctx, &shape, &layer.v),
         )
     }
 
@@ -506,8 +509,8 @@ impl KvCacheOps for MetalBackend {
         let n = len * stride;
         let shape = [len, cache.num_kv_heads, cache.head_dim];
         (
-            MetalTensor::from_f32(&cache.device, &shape, &layer.k[..n]),
-            MetalTensor::from_f32(&cache.device, &shape, &layer.v[..n]),
+            MetalTensor::from_f32(&cache.ctx, &shape, &layer.k[..n]),
+            MetalTensor::from_f32(&cache.ctx, &shape, &layer.v[..n]),
         )
     }
 }
@@ -519,10 +522,6 @@ mod tests {
     use infernum::backend::{AttentionOps, KvCacheOps, PagedAttentionOps, PagedKvCacheOps};
     use infernum::block_allocator::{BlockConfig, BlockTable};
     use infernum::tensor::Tensor;
-
-    fn device() -> metal::Device {
-        metal::Device::system_default().expect("No Metal device")
-    }
 
     fn ctx() -> MetalContext {
         MetalContext::new()
@@ -556,22 +555,20 @@ mod tests {
 
     #[test]
     fn test_paged_kv_cache_append_and_get_pools() {
-        let context = ctx();
-        let dev = device();
+        let c = ctx();
         let block_config = BlockConfig {
             block_size: 4,
             num_blocks: 2,
         };
         let mut cache =
-            MetalBackend::allocate_paged_kv_cache(&context, 1, &block_config, 1, 2, DType::F32)
-                .unwrap();
+            MetalBackend::allocate_paged_kv_cache(&c, 1, &block_config, 1, 2, DType::F32).unwrap();
 
         // Block table: seq positions 0..3 map to physical block 1
         let block_table = BlockTable::from_raw(vec![1], 3, 4);
 
         // K/V data: 3 tokens, 1 head, dim 2
-        let k = MetalTensor::from_f32(&dev, &[3, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let v = MetalTensor::from_f32(&dev, &[3, 1, 2], &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let k = MetalTensor::from_f32(&c, &[3, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let v = MetalTensor::from_f32(&c, &[3, 1, 2], &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
 
         MetalBackend::append_paged(&mut cache, 0, &block_table, &k, &v, 0).unwrap();
 
@@ -595,21 +592,19 @@ mod tests {
 
     #[test]
     fn test_gather_paged_kv() {
-        let context = ctx();
-        let dev = device();
+        let c = ctx();
         let block_config = BlockConfig {
             block_size: 2,
             num_blocks: 4,
         };
         let mut cache =
-            MetalBackend::allocate_paged_kv_cache(&context, 1, &block_config, 1, 2, DType::F32)
-                .unwrap();
+            MetalBackend::allocate_paged_kv_cache(&c, 1, &block_config, 1, 2, DType::F32).unwrap();
 
         // Two blocks: positions 0..1 in block 2, positions 2..3 in block 0
         let block_table = BlockTable::from_raw(vec![2, 0], 4, 2);
-        let k = MetalTensor::from_f32(&dev, &[4, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let k = MetalTensor::from_f32(&c, &[4, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let v = MetalTensor::from_f32(
-            &dev,
+            &c,
             &[4, 1, 2],
             &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
         );
@@ -631,35 +626,33 @@ mod tests {
 
     #[test]
     fn test_paged_attention_decode_single() {
-        let context = ctx();
-        let dev = device();
+        let c = ctx();
         let block_config = BlockConfig {
             block_size: 4,
             num_blocks: 2,
         };
         let mut cache =
-            MetalBackend::allocate_paged_kv_cache(&context, 1, &block_config, 1, 4, DType::F32)
-                .unwrap();
+            MetalBackend::allocate_paged_kv_cache(&c, 1, &block_config, 1, 4, DType::F32).unwrap();
 
         // 3 tokens in block 0
         let block_table = BlockTable::from_raw(vec![0], 3, 4);
         let k = MetalTensor::from_f32(
-            &dev,
+            &c,
             &[3, 1, 4],
             &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         );
         let v = MetalTensor::from_f32(
-            &dev,
+            &c,
             &[3, 1, 4],
             &[1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
         );
         MetalBackend::append_paged(&mut cache, 0, &block_table, &k, &v, 0).unwrap();
 
         // Query: batch=1, heads=1, dim=4
-        let q = MetalTensor::from_f32(&dev, &[1, 1, 4], &[0.0, 0.0, 1.0, 0.0]);
+        let q = MetalTensor::from_f32(&c, &[1, 1, 4], &[0.0, 0.0, 1.0, 0.0]);
         let (k_pool, v_pool) = MetalBackend::get_pools(&cache, 0);
-        let bt = MetalTensor::from_raw_bytes(&dev, &[1], DType::U32, bytemuck::cast_slice(&[0i32]));
-        let sl = MetalTensor::from_raw_bytes(&dev, &[1], DType::U32, bytemuck::cast_slice(&[3i32]));
+        let bt = MetalTensor::from_raw_bytes(&c, &[1], DType::U32, bytemuck::cast_slice(&[0i32]));
+        let sl = MetalTensor::from_raw_bytes(&c, &[1], DType::U32, bytemuck::cast_slice(&[3i32]));
 
         let out = MetalBackend::paged_attention_decode(
             &q, k_pool, v_pool, &bt, &sl, 4, 1, 3, None, None, None,
@@ -680,7 +673,7 @@ mod tests {
 
     #[test]
     fn test_contiguous_kv_cache_append_and_get() {
-        let dev = device();
+        let c = ctx();
         let mut cache = MetalKvCache {
             layers: vec![MetalKvLayer {
                 k: Vec::new(),
@@ -689,19 +682,19 @@ mod tests {
             }],
             num_kv_heads: 2,
             head_dim: 3,
-            device: dev.clone(),
+            ctx: c.clone(),
         };
 
         // Append 2 tokens: shape (2, 2, 3)
         let k = MetalTensor::from_f32(
-            &dev,
+            &c,
             &[2, 2, 3],
             &[
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
             ],
         );
         let v = MetalTensor::from_f32(
-            &dev,
+            &c,
             &[2, 2, 3],
             &[
                 -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, -11.0, -12.0,
@@ -733,7 +726,7 @@ mod tests {
     fn test_attention_with_kv_cache_round_trip() {
         // Verify that storing K/V in contiguous cache and using fused_attention_decode
         // produces valid output.
-        let dev = device();
+        let c = ctx();
         let mut cache = MetalKvCache {
             layers: vec![MetalKvLayer {
                 k: Vec::new(),
@@ -742,24 +735,24 @@ mod tests {
             }],
             num_kv_heads: 1,
             head_dim: 4,
-            device: dev.clone(),
+            ctx: c.clone(),
         };
 
         // Prefill: 3 tokens
         let k = MetalTensor::from_f32(
-            &dev,
+            &c,
             &[3, 1, 4],
             &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         );
         let v = MetalTensor::from_f32(
-            &dev,
+            &c,
             &[3, 1, 4],
             &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         );
         MetalBackend::append_kv(&mut cache, 0, &k, &v).unwrap();
 
         // Decode: query is 1 token
-        let q = MetalTensor::from_f32(&dev, &[1, 1, 4], &[0.0, 0.0, 1.0, 0.0]);
+        let q = MetalTensor::from_f32(&c, &[1, 1, 4], &[0.0, 0.0, 1.0, 0.0]);
         let (k_cached, v_cached) = MetalBackend::get_kv(&cache, 0);
 
         let out = MetalBackend::fused_attention_decode(&q, &k_cached, &v_cached, None, None, None)

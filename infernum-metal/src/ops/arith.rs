@@ -17,9 +17,7 @@ impl ArithOps for MetalBackend {
         let b_f32 = read_f32(b)?;
         assert_eq!(a_f32.len(), b_f32.len(), "add: length mismatch");
         let out: Vec<f32> = a_f32.iter().zip(b_f32.iter()).map(|(x, y)| x + y).collect();
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, a.shape(), &out))
+        Ok(MetalTensor::from_f32(a.context(), a.shape(), &out))
     }
 
     fn add_inplace(a: &mut MetalTensor, b: &MetalTensor) -> Result<()> {
@@ -33,17 +31,13 @@ impl ArithOps for MetalBackend {
         let b_f32 = read_f32(b)?;
         assert_eq!(a_f32.len(), b_f32.len(), "mul: length mismatch");
         let out: Vec<f32> = a_f32.iter().zip(b_f32.iter()).map(|(x, y)| x * y).collect();
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, a.shape(), &out))
+        Ok(MetalTensor::from_f32(a.context(), a.shape(), &out))
     }
 
     fn scale_inplace(a: &mut MetalTensor, scale: f32) -> Result<()> {
         let a_f32 = read_f32(a)?;
         let out: Vec<f32> = a_f32.iter().map(|x| x * scale).collect();
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        *a = MetalTensor::from_f32(&device, a.shape(), &out);
+        *a = MetalTensor::from_f32(a.context(), a.shape(), &out);
         Ok(())
     }
 }

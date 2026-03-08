@@ -45,9 +45,7 @@ impl RopeOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, shape, &out))
+        Ok(MetalTensor::from_f32(input.context(), shape, &out))
     }
 
     #[allow(
@@ -89,9 +87,7 @@ impl RopeOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, shape, &out))
+        Ok(MetalTensor::from_f32(input.context(), shape, &out))
     }
 }
 
@@ -130,9 +126,7 @@ impl RopeInterleavedOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, shape, &out))
+        Ok(MetalTensor::from_f32(input.context(), shape, &out))
     }
 }
 

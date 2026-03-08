@@ -146,11 +146,9 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
         }
     }
 
-    let device = metal::Device::system_default()
-        .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
     let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
     out_shape.push(n);
-    Ok(MetalTensor::from_f32(&device, &out_shape, &output))
+    Ok(MetalTensor::from_f32(input.context(), &out_shape, &output))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,11 +182,9 @@ impl MatmulOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
         let mut out_shape = a_shape.to_vec();
         *out_shape.last_mut().unwrap() = n;
-        Ok(MetalTensor::from_f32(&device, &out_shape, &out))
+        Ok(MetalTensor::from_f32(a.context(), &out_shape, &out))
     }
 
     fn linear(input: &MetalTensor, weight: &MetalLinearWeight) -> Result<MetalTensor> {
@@ -215,11 +211,9 @@ impl MatmulOps for MetalBackend {
                     }
                 }
 
-                let device = metal::Device::system_default()
-                    .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
                 let mut out_shape = input.shape().to_vec();
                 *out_shape.last_mut().unwrap() = n;
-                Ok(MetalTensor::from_f32(&device, &out_shape, &out))
+                Ok(MetalTensor::from_f32(input.context(), &out_shape, &out))
             }
             MetalLinearWeight::Quantized(w) => quantized_linear(input, w),
         }
@@ -290,12 +284,8 @@ impl MatmulOps for MetalBackend {
     ) -> Result<MetalLinearWeight> {
         match weight {
             HostLinearWeight::Dense(host) => {
-                let tensor = MetalTensor::from_raw_bytes(
-                    device.device(),
-                    &host.shape,
-                    host.dtype,
-                    &host.data,
-                );
+                let tensor =
+                    MetalTensor::from_raw_bytes(device, &host.shape, host.dtype, &host.data);
                 // Cast to f32 if needed for the transposed copy
                 let f32_tensor = if tensor.dtype() == DType::F32 {
                     tensor.clone()

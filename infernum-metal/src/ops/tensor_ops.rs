@@ -21,9 +21,7 @@ impl TensorOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, &[cols, rows], &out))
+        Ok(MetalTensor::from_f32(input.context(), &[cols, rows], &out))
     }
 
     fn split_inner_dim(
@@ -50,11 +48,10 @@ impl TensorOps for MetalBackend {
                 .copy_from_slice(&data[r * inner + dim1..r * inner + dim1 + dim2]);
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
+        let ctx = tensor.context();
         Ok((
-            MetalTensor::from_f32(&device, &[outer, dim1], &a),
-            MetalTensor::from_f32(&device, &[outer, dim2], &b),
+            MetalTensor::from_f32(ctx, &[outer, dim1], &a),
+            MetalTensor::from_f32(ctx, &[outer, dim2], &b),
         ))
     }
 
@@ -77,9 +74,11 @@ impl TensorOps for MetalBackend {
                 .copy_from_slice(&b_data[r * d2..(r + 1) * d2]);
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, &[outer, new_inner], &out))
+        Ok(MetalTensor::from_f32(
+            a.context(),
+            &[outer, new_inner],
+            &out,
+        ))
     }
 
     fn pad_inner_dim(tensor: &MetalTensor, new_width: usize) -> Result<MetalTensor> {
@@ -96,9 +95,11 @@ impl TensorOps for MetalBackend {
                 .copy_from_slice(&data[r * width..(r + 1) * width]);
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, &[outer, new_width], &out))
+        Ok(MetalTensor::from_f32(
+            tensor.context(),
+            &[outer, new_width],
+            &out,
+        ))
     }
 
     fn broadcast_to_heads(tensor: &MetalTensor, num_heads: usize) -> Result<MetalTensor> {
@@ -117,10 +118,8 @@ impl TensorOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
         Ok(MetalTensor::from_f32(
-            &device,
+            tensor.context(),
             &[batch, num_heads, head_dim],
             &out,
         ))
@@ -152,10 +151,8 @@ impl TensorOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
         Ok(MetalTensor::from_f32(
-            &device,
+            tensor.context(),
             &[seq, new_heads, head_dim],
             &out,
         ))
@@ -171,9 +168,11 @@ impl TensorOps for MetalBackend {
             out.extend_from_slice(p.as_f32_slice());
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, &[total_rows, cols], &out))
+        Ok(MetalTensor::from_f32(
+            parts[0].context(),
+            &[total_rows, cols],
+            &out,
+        ))
     }
 }
 

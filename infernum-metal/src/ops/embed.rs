@@ -20,10 +20,8 @@ impl EmbedOps for MetalBackend {
             out[i * hidden..(i + 1) * hidden].copy_from_slice(src);
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
         Ok(MetalTensor::from_f32(
-            &device,
+            table.context(),
             &[indices.len(), hidden],
             &out,
         ))

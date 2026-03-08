@@ -33,9 +33,11 @@ impl CastOps for MetalBackend {
             }
         };
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, input.shape(), &f32_data))
+        Ok(MetalTensor::from_f32(
+            input.context(),
+            input.shape(),
+            &f32_data,
+        ))
     }
 
     fn cast_from_f32(input: &MetalTensor, _target: DType) -> Result<MetalTensor> {

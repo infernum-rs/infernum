@@ -85,9 +85,7 @@ impl MetalLinearWeight {
             }
         }
 
-        let device =
-            metal::Device::system_default().expect("MetalLinearWeight::new_dense: no Metal device");
-        let weight_t = MetalTensor::from_f32(&device, &[cols, rows], &t_data);
+        let weight_t = MetalTensor::from_f32(weight.context(), &[cols, rows], &t_data);
 
         Self::Dense { weight, weight_t }
     }
@@ -229,7 +227,7 @@ impl WeightLoader<MetalBackend> for MetalSafeTensorsLoader {
             }
             DType::U32 => {
                 return Ok(MetalTensor::from_raw_bytes(
-                    self.context.device(),
+                    &self.context,
                     shape,
                     DType::U32,
                     data,
@@ -242,11 +240,7 @@ impl WeightLoader<MetalBackend> for MetalSafeTensorsLoader {
             }
         };
 
-        Ok(MetalTensor::from_f32(
-            self.context.device(),
-            shape,
-            &f32_data,
-        ))
+        Ok(MetalTensor::from_f32(&self.context, shape, &f32_data))
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -294,11 +288,8 @@ impl WeightLoader<MetalBackend> for MetalSafeTensorsLoader {
             }
         }
 
-        let weight = MetalTensor::from_f32(
-            self.context.device(),
-            &[in_features, out_features],
-            &transposed,
-        );
+        let weight =
+            MetalTensor::from_f32(&self.context, &[in_features, out_features], &transposed);
         Ok(MetalLinearWeight::new_dense(weight))
     }
 

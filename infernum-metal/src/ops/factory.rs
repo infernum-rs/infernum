@@ -10,7 +10,7 @@ use crate::MetalContext;
 
 impl TensorFactory for MetalBackend {
     fn from_f32_slice(device: &MetalContext, shape: &[usize], data: &[f32]) -> Result<MetalTensor> {
-        Ok(MetalTensor::from_f32(device.device(), shape, data))
+        Ok(MetalTensor::from_f32(device, shape, data))
     }
 
     fn from_raw_bytes(
@@ -19,19 +19,14 @@ impl TensorFactory for MetalBackend {
         dtype: DType,
         data: &[u8],
     ) -> Result<MetalTensor> {
-        Ok(MetalTensor::from_raw_bytes(
-            device.device(),
-            shape,
-            dtype,
-            data,
-        ))
+        Ok(MetalTensor::from_raw_bytes(device, shape, dtype, data))
     }
 
     fn from_u32_slice(device: &MetalContext, shape: &[usize], data: &[u32]) -> Result<MetalTensor> {
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
         Ok(MetalTensor::from_raw_bytes(
-            device.device(),
+            device,
             shape,
             DType::U32,
             bytes,
@@ -42,7 +37,7 @@ impl TensorFactory for MetalBackend {
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
         Ok(MetalTensor::from_raw_bytes(
-            device.device(),
+            device,
             shape,
             DType::U32,
             bytes,

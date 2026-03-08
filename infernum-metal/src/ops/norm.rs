@@ -29,9 +29,7 @@ impl NormOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-        Ok(MetalTensor::from_f32(&device, &shape, &out))
+        Ok(MetalTensor::from_f32(input.context(), &shape, &out))
     }
 
     fn rms_norm_inplace(input: &mut MetalTensor, weight: &MetalTensor, eps: f32) -> Result<()> {
@@ -73,11 +71,10 @@ impl NormOps for MetalBackend {
             }
         }
 
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
+        let ctx = input.context();
         Ok((
-            MetalTensor::from_f32(&device, &shape, &updated),
-            MetalTensor::from_f32(&device, &shape, &normed),
+            MetalTensor::from_f32(ctx, &shape, &updated),
+            MetalTensor::from_f32(ctx, &shape, &normed),
         ))
     }
 }
