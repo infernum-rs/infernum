@@ -1,0 +1,79 @@
+name: CI (Metal)
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'infernum-metal/**'
+      - 'infernum/**'
+      - 'infernum-macros/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'infernum-metal/**'
+      - 'infernum/**'
+      - 'infernum-macros/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check-metal:
+    runs-on: macos-14  # Apple Silicon (M1) runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-metal-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check with Clippy (pedantic, deny warnings)
+        run: cargo clippy -p infernum-metal -- -W clippy::pedantic -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run unit tests
+        run: cargo test -p infernum-metal
+
+      - name: Build Metal example
+        run: cargo build -p infernum-examples --features metal --example generate_metal
+
+  # Integration tests (downloads models, runs on Apple Silicon)
+  integration-metal:
+    runs-on: macos-14
+    needs: check-metal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-metal-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/infernum/models
+          key: infernum-models-metal-v1
+
+      - name: Run Metal integration tests
+        run: cargo test --release -p infernum-metal --features integration -- --test-threads=1
