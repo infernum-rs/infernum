@@ -6,11 +6,13 @@ edition = "2021"
 [features]
 default = []
 cuda = ["infernum-cuda/cuda"]
+metal = ["dep:infernum-metal"]
 nccl = ["cuda", "infernum-cuda/nccl"]
 
 [dependencies]
 infernum = { path = "../infernum" }
 infernum-cuda = { path = "../infernum-cuda", optional = true }
+infernum-metal = { path = "../infernum-metal", optional = true }
 infernum-runtime = { path = "../infernum-runtime" }
 
 axum = { version = "0.8", features = ["json"] }

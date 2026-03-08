@@ -9,6 +9,7 @@ build = "build.rs"
 default = []
 cpu = ["dep:infernum-cpu", "infernum-llama/cpu", "infernum-gemma/cpu", "infernum-qwen/cpu"]
 cuda = ["dep:cudarc", "infernum-cuda", "infernum-cuda/cuda", "infernum-serve/cuda", "infernum-llama/cuda", "infernum-gemma/cuda", "infernum-qwen/cuda", "infernum-deepseek/cuda"]
+metal = ["dep:infernum-metal"]
 nccl = ["cuda", "infernum-cuda/nccl", "infernum-llama/nccl", "infernum-gemma/nccl", "infernum-qwen/nccl"]
 
 [dependencies]
@@ -17,6 +18,7 @@ cudarc = { version = "0.12", optional = true }
 infernum = { path = "../infernum" }
 infernum-cpu = { path = "../infernum-cpu", optional = true }
 infernum-cuda = { path = "../infernum-cuda", optional = true }
+infernum-metal = { path = "../infernum-metal", optional = true }
 infernum-deepseek = { path = "../infernum-deepseek" }
 infernum-gemma = { path = "../infernum-gemma" }
 infernum-llama = { path = "../infernum-llama" }
@@ -58,3 +60,7 @@ required-features = ["cpu"]
 [[example]]
 name = "custom_graph_op"
 required-features = ["cpu"]
+
+[[example]]
+name = "generate_metal"
+required-features = ["metal"]
