@@ -161,13 +161,13 @@ jobs:
         run: cargo clippy --all --exclude infernum-metal --features cuda -- -W clippy::pedantic -D warnings
 
       - name: Build with CUDA
-        run: cargo build --features cuda
+        run: cargo build --exclude infernum-metal --features cuda
 
       - name: Run CUDA tests
-        run: cargo test --features cuda -- --test-threads=1
+        run: cargo test --exclude infernum-metal --features cuda -- --test-threads=1
 
       - name: Build examples (CUDA)
-        run: cargo build --features cuda --examples
+        run: cargo build --exclude infernum-metal --features cuda --examples
 
       - name: Build examples (NCCL)
         run: cargo build -p infernum-examples --features nccl --examples
