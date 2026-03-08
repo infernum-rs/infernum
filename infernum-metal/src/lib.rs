@@ -28,23 +28,40 @@ pub use tensor::MetalTensor;
 pub use weights::{MetalLinearWeight, MetalSafeTensorsLoader};
 
 /// Paged KV cache for Metal (block-based, used by most attention mechanisms).
+///
+/// Uses Metal buffers with `StorageModeShared` so the CPU can directly
+/// read/write the KV pool data through unified memory.
 pub struct MetalPagedKvCache {
-    // Placeholder — implemented in Step 8
-    _private: (),
+    /// Per-layer K pool tensors: shape `(num_blocks * block_size, num_kv_heads, head_dim)`.
+    pub(crate) k_pools: Vec<MetalTensor>,
+    /// Per-layer V pool tensors: same shape.
+    pub(crate) v_pools: Vec<MetalTensor>,
+    pub(crate) block_size: usize,
+    pub(crate) num_kv_heads: usize,
+    pub(crate) head_dim: usize,
 }
 
-// SAFETY: MetalPagedKvCache will contain Metal buffers which are thread-safe
-// when accessed through command buffers.
+// SAFETY: MetalTensor is Send+Sync; Metal shared-mode buffers are thread-safe.
 unsafe impl Send for MetalPagedKvCache {}
 
 /// Contiguous KV cache for Metal (used by DeepSeek MLA).
+///
+/// Stores per-layer K/V data that grows as tokens are appended.
+/// Data is kept in Metal buffers via unified memory.
 pub struct MetalKvCache {
-    // Placeholder — implemented in Step 9
-    _private: (),
+    pub(crate) layers: Vec<MetalKvLayer>,
+    pub(crate) num_kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) device: metal::Device,
 }
 
-// SAFETY: MetalKvCache will contain Metal buffers which are thread-safe
-// when accessed through command buffers.
+pub(crate) struct MetalKvLayer {
+    pub(crate) k: Vec<f32>,
+    pub(crate) v: Vec<f32>,
+    pub(crate) len: usize,
+}
+
+// SAFETY: MetalKvCache contains a Metal Device (thread-safe) and Vec data.
 unsafe impl Send for MetalKvCache {}
 
 /// Marker type for the Metal backend.

@@ -38,42 +38,11 @@ impl CastOps for MetalBackend {
         Ok(MetalTensor::from_f32(&device, input.shape(), &f32_data))
     }
 
-    fn cast_from_f32(input: &MetalTensor, target: DType) -> Result<MetalTensor> {
-        if target == DType::F32 {
-            return Ok(input.clone());
-        }
-
-        let f32_data = input.as_f32_slice();
-        let device = metal::Device::system_default()
-            .ok_or_else(|| infernum::Error::Other("No Metal device".into()))?;
-
-        match target {
-            DType::BF16 => {
-                let bf16_data: Vec<half::bf16> =
-                    f32_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
-                let bytes: &[u8] = bytemuck::cast_slice(&bf16_data);
-                Ok(MetalTensor::from_raw_bytes(
-                    &device,
-                    input.shape(),
-                    DType::BF16,
-                    bytes,
-                ))
-            }
-            DType::F16 => {
-                let f16_data: Vec<half::f16> =
-                    f32_data.iter().map(|&v| half::f16::from_f32(v)).collect();
-                let bytes: &[u8] = bytemuck::cast_slice(&f16_data);
-                Ok(MetalTensor::from_raw_bytes(
-                    &device,
-                    input.shape(),
-                    DType::F16,
-                    bytes,
-                ))
-            }
-            other => Err(infernum::Error::UnsupportedDtype(format!(
-                "cast_from_f32: unsupported target dtype {other}"
-            ))),
-        }
+    fn cast_from_f32(input: &MetalTensor, _target: DType) -> Result<MetalTensor> {
+        // Phase 1: all Metal ops work in F32, so we always keep tensors as F32.
+        // This prevents BF16/F16 tensors (e.g. RoPE caches) from propagating
+        // through the pipeline and hitting as_f32_slice() panics.
+        Ok(input.clone())
     }
 }
 
@@ -173,16 +142,14 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_f32_to_bf16_roundtrip() {
+    fn test_cast_from_f32_stays_f32() {
+        // Phase 1: cast_from_f32 always returns F32 regardless of target.
         let c = ctx();
         let data = [1.0f32, 2.5, -3.0, 0.0];
         let t = MetalBackend::from_f32_slice(&c, &[4], &data).unwrap();
-        let bf16 = MetalBackend::cast_from_f32(&t, DType::BF16).unwrap();
-        assert_eq!(bf16.dtype(), DType::BF16);
-        let back = MetalBackend::cast_to_f32(&bf16).unwrap();
-        let out = MetalBackend::to_f32_vec(&back).unwrap();
-        for (a, b) in out.iter().zip(data.iter()) {
-            assert!((a - b).abs() < 0.02, "bf16 roundtrip: {a} vs {b}");
-        }
+        let result = MetalBackend::cast_from_f32(&t, DType::BF16).unwrap();
+        assert_eq!(result.dtype(), DType::F32);
+        let out = MetalBackend::to_f32_vec(&result).unwrap();
+        assert_eq!(out, data);
     }
 }

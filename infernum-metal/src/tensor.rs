@@ -128,6 +128,44 @@ impl MetalTensor {
         bytemuck::cast_slice(self.as_bytes())
     }
 
+    /// Read the tensor data as an i32 slice (U32 dtype reinterpreted as i32).
+    ///
+    /// Block tables and positions are stored as U32 but contain signed values.
+    ///
+    /// # Panics
+    /// Panics if the dtype is not U32.
+    #[must_use]
+    pub fn as_i32_slice(&self) -> &[i32] {
+        assert_eq!(
+            self.dtype,
+            DType::U32,
+            "as_i32_slice: expected U32 tensor (i32 view)"
+        );
+        bytemuck::cast_slice(self.as_bytes())
+    }
+
+    /// Mutable f32 slice into the Metal buffer (unified memory).
+    ///
+    /// # Safety
+    /// The caller must ensure no GPU command buffer is concurrently
+    /// reading or writing to this buffer region.
+    ///
+    /// # Panics
+    /// Panics if the dtype is not F32.
+    #[must_use]
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn as_f32_slice_mut(&mut self) -> &mut [f32] {
+        assert_eq!(
+            self.dtype,
+            DType::F32,
+            "as_f32_slice_mut: expected F32 tensor"
+        );
+        let len = self.numel();
+        // Metal buffers with StorageModeShared are always page-aligned (4096 bytes),
+        // so casting to f32 (4-byte alignment) is safe.
+        unsafe { std::slice::from_raw_parts_mut(self.contents_ptr().cast::<f32>(), len) }
+    }
+
     /// Reference to the underlying Metal buffer.
     #[must_use]
     pub fn metal_buffer(&self) -> &Buffer {
