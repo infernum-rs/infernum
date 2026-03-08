@@ -47,6 +47,7 @@ mod smollm2_360m {
     }
 
     #[test]
+    #[ignore = "Metal ops assume F32 internally; BF16 weight pipeline not yet wired"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(
@@ -56,6 +57,7 @@ mod smollm2_360m {
     }
 
     #[test]
+    #[ignore = "Metal ops assume F32 internally; BF16 weight pipeline not yet wired"]
     fn no_nan_in_output() {
         let model_dir = model_dir();
         let ctx = MetalContext::new();

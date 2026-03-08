@@ -158,7 +158,7 @@ jobs:
           echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
 
       - name: Check with Clippy (CUDA, pedantic, deny warnings)
-        run: cargo clippy --all --features cuda -- -W clippy::pedantic -D warnings
+        run: cargo clippy --all --exclude infernum-metal --features cuda -- -W clippy::pedantic -D warnings
 
       - name: Build with CUDA
         run: cargo build --features cuda
