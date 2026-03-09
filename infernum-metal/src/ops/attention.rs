@@ -44,6 +44,20 @@ struct AttentionDecodeParams {
     sliding_window: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PagedAttentionDecodeParams {
+    batch_size: u32,
+    n_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    max_blocks_per_seq: u32,
+    scale: f32,
+    softcap: f32,
+    sliding_window: i32,
+}
+
 // ---- Fused Attention (GPU) ----
 
 impl AttentionOps for MetalBackend {
@@ -372,7 +386,12 @@ impl PagedKvCacheOps for MetalBackend {
 
 #[allow(clippy::needless_range_loop)]
 impl PagedAttentionOps for MetalBackend {
-    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
     fn paged_attention_decode(
         q: &MetalTensor,
         k_pool: &MetalTensor,
@@ -390,22 +409,16 @@ impl PagedAttentionOps for MetalBackend {
         let batch_size = q_shape[0];
         let num_heads = q_shape[1];
         let head_dim = q_shape[2];
-        let k_pool_shape = k_pool.shape();
-        let num_kv_heads = k_pool_shape[1];
-        let gqa_ratio = num_heads / num_kv_heads;
-
-        let q_data = q.as_f32_slice();
-        let k_data = k_pool.as_f32_slice();
-        let v_data = v_pool.as_f32_slice();
-        let bt_data = block_tables.as_i32_slice();
-        let sl_data = seq_lens.as_i32_slice();
+        let num_kv_heads = k_pool.shape()[1];
 
         let scale = scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
-        let kv_stride = num_kv_heads * head_dim;
 
-        let mut output = vec![0.0f32; batch_size * num_heads * head_dim];
+        let ctx = q.context();
+        let out_shape = [batch_size, num_heads, head_dim];
+        let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
 
-        // Max seq_len for scratch buffer
+        // Find max seq_len for threadgroup sizing
+        let sl_data = seq_lens.as_i32_slice();
         let max_sl: usize = sl_data
             .iter()
             .copied()
@@ -413,91 +426,39 @@ impl PagedAttentionOps for MetalBackend {
             .unwrap_or(0)
             .try_into()
             .expect("seq_len must be non-negative");
-        let mut scores = vec![0.0f32; max_sl];
 
-        for bh_idx in 0..(batch_size * num_heads) {
-            let out_head = &mut output[bh_idx * head_dim..(bh_idx + 1) * head_dim];
-            let b = bh_idx / num_heads;
-            let h = bh_idx % num_heads;
-            let kv_h = h / gqa_ratio;
+        let params = PagedAttentionDecodeParams {
+            batch_size: batch_size as u32,
+            n_heads: num_heads as u32,
+            kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            block_size: block_size as u32,
+            max_blocks_per_seq: max_blocks_per_seq as u32,
+            scale,
+            softcap: softcap.unwrap_or(0.0),
+            sliding_window: sliding_window.map_or(-1, |w| w as i32),
+        };
 
-            #[allow(clippy::cast_sign_loss)]
-            let seq_len = sl_data[b] as usize;
-            if seq_len == 0 {
-                continue;
-            }
+        let tg_size = reduction_threadgroup_size(max_sl.max(head_dim));
+        let num_threadgroups = batch_size * num_heads;
 
-            let q_off = (b * num_heads + h) * head_dim;
-            let q_vec = &q_data[q_off..q_off + head_dim];
-            let bt_row = &bt_data[b * max_blocks_per_seq..];
+        ctx.dispatch_threadgroups(
+            "paged_attention_decode_f32",
+            &[
+                (q.metal_buffer(), q.buffer_offset()),
+                (k_pool.metal_buffer(), k_pool.buffer_offset()),
+                (v_pool.metal_buffer(), v_pool.buffer_offset()),
+                (block_tables.metal_buffer(), block_tables.buffer_offset()),
+                (seq_lens.metal_buffer(), seq_lens.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            MTLSize::new(num_threadgroups as u64, 1, 1),
+            MTLSize::new(tg_size as u64, 1, 1),
+            tg_size * std::mem::size_of::<f32>(),
+        );
 
-            let scores = &mut scores[..seq_len];
-
-            // Q × K dot products
-            for pos in 0..seq_len {
-                let blk_idx = pos / block_size;
-                let blk_off = pos % block_size;
-                #[allow(clippy::cast_sign_loss)]
-                let phys_block = bt_row[blk_idx] as usize;
-                let k_off = (phys_block * block_size + blk_off) * kv_stride + kv_h * head_dim;
-
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    dot += q_vec[d] * k_data[k_off + d];
-                }
-                dot *= scale;
-                if let Some(cap) = softcap {
-                    dot = cap * (dot / cap).tanh();
-                }
-                scores[pos] = dot;
-            }
-
-            // Sliding window mask
-            if let Some(window) = sliding_window {
-                let query_pos = seq_len - 1;
-                if query_pos >= window {
-                    let cutoff = query_pos - window + 1;
-                    for s in &mut scores[..cutoff] {
-                        *s = f32::NEG_INFINITY;
-                    }
-                }
-            }
-
-            // Softmax
-            let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for s in scores.iter_mut() {
-                *s = (*s - max_s).exp();
-                sum += *s;
-            }
-            if sum > 0.0 {
-                let inv_sum = 1.0 / sum;
-                for s in scores.iter_mut() {
-                    *s *= inv_sum;
-                }
-            }
-
-            // Weighted V accumulation
-            for pos in 0..seq_len {
-                let w = scores[pos];
-                if w > 0.0 {
-                    let blk_idx = pos / block_size;
-                    let blk_off = pos % block_size;
-                    #[allow(clippy::cast_sign_loss)]
-                    let phys_block = bt_row[blk_idx] as usize;
-                    let v_off = (phys_block * block_size + blk_off) * kv_stride + kv_h * head_dim;
-                    for d in 0..head_dim {
-                        out_head[d] += w * v_data[v_off + d];
-                    }
-                }
-            }
-        }
-
-        Ok(MetalTensor::from_f32(
-            q.context(),
-            &[batch_size, num_heads, head_dim],
-            &output,
-        ))
+        Ok(out)
     }
 
     fn gather_paged_kv(
