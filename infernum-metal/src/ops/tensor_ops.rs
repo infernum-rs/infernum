@@ -1,27 +1,73 @@
-//! TensorOps implementation for Metal — tensor manipulation.
+//! TensorOps implementation for Metal — tensor manipulation via GPU kernels.
 
 use infernum::backend::TensorOps;
 use infernum::tensor::Tensor;
+use infernum::DType;
 use infernum::Result;
 
 use crate::tensor::MetalTensor;
 use crate::MetalBackend;
 
+// ---------------------------------------------------------------------------
+// Packed param structs — must match MSL struct layout
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TransposeParams {
+    rows: u32,
+    cols: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RepeatKvParams {
+    seq: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    num_repeats: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CopyStridedParams {
+    in_cols: u32,
+    out_cols: u32,
+    col_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PadInnerParams {
+    width: u32,
+    new_width: u32,
+}
+
 impl TensorOps for MetalBackend {
+    #[allow(clippy::cast_possible_truncation)]
     fn transpose_2d(input: &MetalTensor) -> Result<MetalTensor> {
         let shape = input.shape();
         assert_eq!(shape.len(), 2, "transpose_2d: expected 2D");
         let (rows, cols) = (shape[0], shape[1]);
-        let data = input.as_f32_slice();
+        let ctx = input.context();
+        let out = MetalTensor::zeros(ctx, &[cols, rows], DType::F32);
 
-        let mut out = vec![0.0f32; data.len()];
-        for r in 0..rows {
-            for c in 0..cols {
-                out[c * rows + r] = data[r * cols + c];
-            }
-        }
+        let params = TransposeParams {
+            rows: rows as u32,
+            cols: cols as u32,
+        };
 
-        Ok(MetalTensor::from_f32(input.context(), &[cols, rows], &out))
+        ctx.dispatch_1d(
+            "transpose_2d_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            rows * cols,
+        );
+
+        Ok(out)
     }
 
     fn split_inner_dim(
@@ -38,23 +84,25 @@ impl TensorOps for MetalBackend {
             "split_inner_dim: {dim1} + {dim2} != {inner}"
         );
 
+        // CPU-side: split is a stride-skipping read pattern that's awkward for
+        // copy_strided (which is designed for writes). Simple and correct.
+        let ctx = tensor.context();
         let data = tensor.as_f32_slice();
-        let mut a = vec![0.0f32; outer * dim1];
-        let mut b = vec![0.0f32; outer * dim2];
-
+        let mut a_data = vec![0.0f32; outer * dim1];
+        let mut b_data = vec![0.0f32; outer * dim2];
         for r in 0..outer {
-            a[r * dim1..(r + 1) * dim1].copy_from_slice(&data[r * inner..r * inner + dim1]);
-            b[r * dim2..(r + 1) * dim2]
+            a_data[r * dim1..(r + 1) * dim1].copy_from_slice(&data[r * inner..r * inner + dim1]);
+            b_data[r * dim2..(r + 1) * dim2]
                 .copy_from_slice(&data[r * inner + dim1..r * inner + dim1 + dim2]);
         }
 
-        let ctx = tensor.context();
         Ok((
-            MetalTensor::from_f32(ctx, &[outer, dim1], &a),
-            MetalTensor::from_f32(ctx, &[outer, dim2], &b),
+            MetalTensor::from_f32(ctx, &[outer, dim1], &a_data),
+            MetalTensor::from_f32(ctx, &[outer, dim2], &b_data),
         ))
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn concat_inner_dim(a: &MetalTensor, b: &MetalTensor) -> Result<MetalTensor> {
         let a_shape = a.shape();
         let b_shape = b.shape();
@@ -64,47 +112,76 @@ impl TensorOps for MetalBackend {
         let d2 = b_shape[1];
         let new_inner = d1 + d2;
 
-        let a_data = a.as_f32_slice();
-        let b_data = b.as_f32_slice();
-        let mut out = vec![0.0f32; outer * new_inner];
+        let ctx = a.context();
+        let out = MetalTensor::zeros(ctx, &[outer, new_inner], DType::F32);
 
-        for r in 0..outer {
-            out[r * new_inner..r * new_inner + d1].copy_from_slice(&a_data[r * d1..(r + 1) * d1]);
-            out[r * new_inner + d1..r * new_inner + d1 + d2]
-                .copy_from_slice(&b_data[r * d2..(r + 1) * d2]);
-        }
+        // Copy part a at col_offset=0
+        let params_a = CopyStridedParams {
+            in_cols: d1 as u32,
+            out_cols: new_inner as u32,
+            col_offset: 0,
+        };
+        ctx.dispatch_1d(
+            "copy_strided_f32",
+            &[
+                (a.metal_buffer(), a.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params_a),
+            outer * d1,
+        );
 
-        Ok(MetalTensor::from_f32(
-            a.context(),
-            &[outer, new_inner],
-            &out,
-        ))
+        // Copy part b at col_offset=d1
+        let params_b = CopyStridedParams {
+            in_cols: d2 as u32,
+            out_cols: new_inner as u32,
+            col_offset: d1 as u32,
+        };
+        ctx.dispatch_1d(
+            "copy_strided_f32",
+            &[
+                (b.metal_buffer(), b.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params_b),
+            outer * d2,
+        );
+
+        Ok(out)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn pad_inner_dim(tensor: &MetalTensor, new_width: usize) -> Result<MetalTensor> {
         let shape = tensor.shape();
         let outer = shape[0];
         let width = shape[1];
         assert!(new_width >= width, "pad_inner_dim: new_width < width");
 
-        let data = tensor.as_f32_slice();
-        let mut out = vec![0.0f32; outer * new_width];
+        let ctx = tensor.context();
+        let out = MetalTensor::zeros(ctx, &[outer, new_width], DType::F32);
 
-        for r in 0..outer {
-            out[r * new_width..r * new_width + width]
-                .copy_from_slice(&data[r * width..(r + 1) * width]);
-        }
+        let params = PadInnerParams {
+            width: width as u32,
+            new_width: new_width as u32,
+        };
 
-        Ok(MetalTensor::from_f32(
-            tensor.context(),
-            &[outer, new_width],
-            &out,
-        ))
+        ctx.dispatch_1d(
+            "pad_inner_f32",
+            &[
+                (tensor.metal_buffer(), tensor.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            outer * width,
+        );
+
+        Ok(out)
     }
 
     fn broadcast_to_heads(tensor: &MetalTensor, num_heads: usize) -> Result<MetalTensor> {
-        let shape = tensor.shape();
         // (batch, 1, head_dim) → (batch, num_heads, head_dim)
+        // This is equivalent to repeat_kv with kv_heads=1
+        let shape = tensor.shape();
         let batch = shape[0];
         let head_dim = shape[2];
         let data = tensor.as_f32_slice();
@@ -125,37 +202,38 @@ impl TensorOps for MetalBackend {
         ))
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn repeat_kv(tensor: &MetalTensor, num_repeats: usize) -> Result<MetalTensor> {
         if num_repeats == 1 {
             return Ok(tensor.clone());
         }
         let shape = tensor.shape();
-        // (seq, kv_heads, head_dim)
         let seq = shape[0];
         let kv_heads = shape[1];
         let head_dim = shape[2];
-        let data = tensor.as_f32_slice();
-
         let new_heads = kv_heads * num_repeats;
-        let mut out = vec![0.0f32; seq * new_heads * head_dim];
 
-        for s in 0..seq {
-            for kv in 0..kv_heads {
-                let src = &data[(s * kv_heads + kv) * head_dim..(s * kv_heads + kv + 1) * head_dim];
-                for rep in 0..num_repeats {
-                    let dst_head = kv * num_repeats + rep;
-                    out[(s * new_heads + dst_head) * head_dim
-                        ..(s * new_heads + dst_head + 1) * head_dim]
-                        .copy_from_slice(src);
-                }
-            }
-        }
+        let ctx = tensor.context();
+        let out = MetalTensor::zeros(ctx, &[seq, new_heads, head_dim], DType::F32);
 
-        Ok(MetalTensor::from_f32(
-            tensor.context(),
-            &[seq, new_heads, head_dim],
-            &out,
-        ))
+        let params = RepeatKvParams {
+            seq: seq as u32,
+            kv_heads: kv_heads as u32,
+            head_dim: head_dim as u32,
+            num_repeats: num_repeats as u32,
+        };
+
+        ctx.dispatch_1d(
+            "repeat_kv_f32",
+            &[
+                (tensor.metal_buffer(), tensor.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            seq * new_heads * head_dim,
+        );
+
+        Ok(out)
     }
 
     fn concat_rows(parts: &[MetalTensor]) -> Result<MetalTensor> {
@@ -163,6 +241,7 @@ impl TensorOps for MetalBackend {
         let cols = parts[0].shape()[parts[0].shape().len() - 1];
         let total_rows: usize = parts.iter().map(|p| p.numel() / cols).sum();
 
+        // Simple memcpy per part — contiguous f32 tensors
         let mut out = Vec::with_capacity(total_rows * cols);
         for p in parts {
             out.extend_from_slice(p.as_f32_slice());

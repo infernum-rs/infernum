@@ -19,6 +19,20 @@ use crate::weights::{decode_f16_scales, MetalLinearWeight, MetalQuantizedWeight}
 use crate::MetalBackend;
 use crate::MetalContext;
 
+use metal::MTLSize;
+
+/// Tile size for the tiled matmul kernel — must match TILE in matmul.metal.
+const TILE: u64 = 16;
+
+/// Packed params for the tiled matmul kernel.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatmulParams {
+    m: u32,
+    n: u32,
+    k: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Quantized linear (CPU-side, Phase 1)
 // ---------------------------------------------------------------------------
@@ -28,6 +42,9 @@ use crate::MetalContext;
 /// Weight is stored as `(out_features=N, in_features=K)` in block-quantized
 /// format. Scales are pre-decoded to f32 so no f16→f32 conversion happens
 /// in the hot path.
+///
+/// NOTE: Stays on CPU because quantized data lives in `Vec<u8>`, not on
+/// GPU buffers. Moving to GPU requires refactoring the weight storage.
 #[allow(
     clippy::many_single_char_names,
     clippy::cast_possible_wrap,
@@ -158,7 +175,7 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
 impl MatmulOps for MetalBackend {
     type LinearWeight = MetalLinearWeight;
 
-    #[allow(clippy::many_single_char_names)]
+    #[allow(clippy::many_single_char_names, clippy::cast_possible_truncation)]
     fn matmul(a: &MetalTensor, b: &MetalTensor) -> Result<MetalTensor> {
         // a: (..., M, K), b: (K, N) → (..., M, N)
         let a_shape = a.shape();
@@ -168,25 +185,37 @@ impl MatmulOps for MetalBackend {
         let m = a.numel() / k;
         assert_eq!(k, b_shape[0], "matmul: K mismatch");
 
-        let a_data = a.as_f32_slice();
-        let b_data = b.as_f32_slice();
-        let mut out = vec![0.0f32; m * n];
-
-        for row in 0..m {
-            for col in 0..n {
-                let mut sum = 0.0f32;
-                for i in 0..k {
-                    sum += a_data[row * k + i] * b_data[i * n + col];
-                }
-                out[row * n + col] = sum;
-            }
-        }
-
+        let ctx = a.context();
         let mut out_shape = a_shape.to_vec();
         *out_shape.last_mut().unwrap() = n;
-        Ok(MetalTensor::from_f32(a.context(), &out_shape, &out))
+        let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
+
+        let params = MatmulParams {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        };
+
+        let threadgroups = MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1);
+        let threads_per_group = MTLSize::new(TILE, TILE, 1);
+
+        ctx.dispatch_threadgroups(
+            "matmul_f32",
+            &[
+                (a.metal_buffer(), a.buffer_offset()),
+                (b.metal_buffer(), b.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            threadgroups,
+            threads_per_group,
+            0,
+        );
+
+        Ok(out)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn linear(input: &MetalTensor, weight: &MetalLinearWeight) -> Result<MetalTensor> {
         match weight {
             MetalLinearWeight::Dense { weight_t, .. } => {
@@ -196,24 +225,35 @@ impl MatmulOps for MetalBackend {
                 let k = wt_shape[1];
                 let m = input.numel() / k;
 
-                let in_data = input.as_f32_slice();
-                let wt_data = weight_t.as_f32_slice();
-                let mut out = vec![0.0f32; m * n];
-
-                // dot(input_row, weight_t_row) for each (m, n) pair
-                for row in 0..m {
-                    for col in 0..n {
-                        let mut sum = 0.0f32;
-                        for i in 0..k {
-                            sum += in_data[row * k + i] * wt_data[col * k + i];
-                        }
-                        out[row * n + col] = sum;
-                    }
-                }
-
+                let ctx = input.context();
                 let mut out_shape = input.shape().to_vec();
                 *out_shape.last_mut().unwrap() = n;
-                Ok(MetalTensor::from_f32(input.context(), &out_shape, &out))
+                let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
+
+                let params = MatmulParams {
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                };
+
+                let threadgroups =
+                    MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1);
+                let threads_per_group = MTLSize::new(TILE, TILE, 1);
+
+                ctx.dispatch_threadgroups(
+                    "linear_dense_f32",
+                    &[
+                        (input.metal_buffer(), input.buffer_offset()),
+                        (weight_t.metal_buffer(), weight_t.buffer_offset()),
+                        (out.metal_buffer(), out.buffer_offset()),
+                    ],
+                    bytemuck::bytes_of(&params),
+                    threadgroups,
+                    threads_per_group,
+                    0,
+                );
+
+                Ok(out)
             }
             MetalLinearWeight::Quantized(w) => quantized_linear(input, w),
         }
