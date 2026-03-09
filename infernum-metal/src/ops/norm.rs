@@ -6,17 +6,9 @@ use infernum::DType;
 use infernum::Result;
 use metal::MTLSize;
 
+use crate::context::reduction_threadgroup_size;
 use crate::tensor::MetalTensor;
 use crate::MetalBackend;
-
-/// Choose a threadgroup size for reduction kernels.
-/// Must be a power of 2 for the tree reduction, capped at 256.
-fn reduction_threadgroup_size(hidden: usize) -> usize {
-    let max_tg: usize = 256;
-    let tg = hidden.min(max_tg);
-    // Round down to nearest power of 2
-    1 << (usize::BITS - 1 - tg.leading_zeros())
-}
 
 impl NormOps for MetalBackend {
     #[allow(clippy::cast_possible_truncation)]

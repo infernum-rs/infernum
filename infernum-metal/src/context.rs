@@ -286,6 +286,20 @@ impl Default for MetalContext {
 }
 
 // ------------------------------------------------------------------
+// Public helpers
+// ------------------------------------------------------------------
+
+/// Choose a threadgroup size for reduction kernels.
+/// Must be a power of 2 for the tree reduction, capped at 256.
+#[must_use]
+pub fn reduction_threadgroup_size(n: usize) -> usize {
+    let max_tg: usize = 256;
+    let tg = n.min(max_tg);
+    // Round down to nearest power of 2
+    1 << (usize::BITS - 1 - tg.leading_zeros())
+}
+
+// ------------------------------------------------------------------
 // Internal helpers
 // ------------------------------------------------------------------
 

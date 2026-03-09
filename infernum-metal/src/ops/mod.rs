@@ -15,4 +15,5 @@ pub mod matmul_ext;
 pub mod moe;
 pub mod norm;
 pub mod rope;
+pub mod softmax;
 pub mod tensor_ops;
