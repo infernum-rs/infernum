@@ -1,12 +1,15 @@
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
-/// Dense matmul: C[row,col] = dot(A[row,:], B[:,col]).
-/// A is (M, K), B is (K, N), C is (M, N).
+/// Dense matmul using SIMD-group 8×8 matrix multiply-accumulate.
 ///
-/// Tiled with TILE×TILE threadgroups using shared memory.
-/// Each threadgroup computes a TILE×TILE block of C.
-constant constexpr uint TILE = 16;
+/// A is (M, K), B is (K, N), C is (M, N).
+/// Each SIMD-group (32 threads) computes one 8×8 output tile of C.
+/// Grid: threadgroups = (ceil(N/8), ceil(M/8), 1), threads_per_group = (32, 1, 1).
+///
+/// Uses threadgroup memory to zero-pad edge tiles so that
+/// simdgroup_load always reads valid data.
 
 struct MatmulParams {
     uint M;
@@ -19,90 +22,183 @@ kernel void matmul_f32(
     device const float* B           [[buffer(1)]],
     device float* C                 [[buffer(2)]],
     constant MatmulParams& params   [[buffer(3)]],
-    uint2 gid                       [[thread_position_in_grid]],
-    uint2 lid                       [[thread_position_in_threadgroup]])
+    uint2 group_id                  [[threadgroup_position_in_grid]],
+    uint simd_lane                  [[thread_index_in_simdgroup]])
 {
     const uint M = params.M;
     const uint N = params.N;
     const uint K = params.K;
 
-    const uint row = gid.y;
-    const uint col = gid.x;
+    const uint col_block = group_id.x;
+    const uint row_block = group_id.y;
 
-    threadgroup float tileA[TILE][TILE];
-    threadgroup float tileB[TILE][TILE];
+    const uint row_base = row_block * 8;
+    const uint col_base = col_block * 8;
 
-    float sum = 0.0f;
+    if (row_base >= M || col_base >= N) return;
 
-    const uint numTiles = (K + TILE - 1) / TILE;
-    for (uint t = 0; t < numTiles; t++) {
-        // Load A tile — all threads participate regardless of output bounds
-        const uint a_col = t * TILE + lid.x;
-        tileA[lid.y][lid.x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+    // Threadgroup scratch for padding edge tiles.
+    threadgroup float tgA[8][8];
+    threadgroup float tgB[8][8];
 
-        // Load B tile
-        const uint b_row = t * TILE + lid.y;
-        tileB[lid.y][lid.x] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+    simdgroup_float8x8 acc(0.0f);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint num_k_blocks = (K + 7) / 8;
 
-        for (uint i = 0; i < TILE; i++) {
-            sum += tileA[lid.y][i] * tileB[i][lid.x];
+    // Check if this tile touches edges (needs padding)
+    const bool edge_m = (row_base + 8 > M);
+    const bool edge_n = (col_base + 8 > N);
+    const bool edge_k = (K % 8 != 0);
+
+    for (uint kb = 0; kb < num_k_blocks; kb++) {
+        simdgroup_float8x8 a_tile, b_tile;
+        const uint k_base = kb * 8;
+        const bool k_edge = (kb == num_k_blocks - 1) && edge_k;
+
+        if (!edge_m && !k_edge) {
+            // Full A tile: load directly
+            simdgroup_load(a_tile, A + row_base * K + k_base, K);
+        } else {
+            // Pad A tile through threadgroup memory
+            // 32 threads cover 64 elements = 8×8
+            uint r = simd_lane / 8;
+            uint c = simd_lane % 8;
+            // Two passes for 64 elements with 32 threads
+            tgA[r][c] = (row_base + r < M && k_base + c < K) ?
+                A[(row_base + r) * K + k_base + c] : 0.0f;
+            tgA[r + 4][c] = (row_base + r + 4 < M && k_base + c < K) ?
+                A[(row_base + r + 4) * K + k_base + c] : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(a_tile, &tgA[0][0], 8);
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!edge_n && !k_edge) {
+            // Full B tile: load directly
+            simdgroup_load(b_tile, B + k_base * N + col_base, N);
+        } else {
+            uint r = simd_lane / 8;
+            uint c = simd_lane % 8;
+            tgB[r][c] = (k_base + r < K && col_base + c < N) ?
+                B[(k_base + r) * N + col_base + c] : 0.0f;
+            tgB[r + 4][c] = (k_base + r + 4 < K && col_base + c < N) ?
+                B[(k_base + r + 4) * N + col_base + c] : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(b_tile, &tgB[0][0], 8);
+        }
+
+        simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+
+        // Barrier needed if we used threadgroup memory and will reuse it
+        if (edge_m || edge_n || k_edge) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
-    // Only write output for valid positions
-    if (row < M && col < N) {
-        C[row * N + col] = sum;
+    // Store result
+    if (!edge_m && !edge_n) {
+        simdgroup_store(acc, C + row_base * N + col_base, N);
+    } else {
+        threadgroup float out_tile[8][8];
+        simdgroup_store(acc, &out_tile[0][0], 8);
+        uint r = simd_lane / 8;
+        uint c = simd_lane % 8;
+        if (row_base + r < M && col_base + c < N) {
+            C[(row_base + r) * N + col_base + c] = out_tile[r][c];
+        }
+        if (row_base + r + 4 < M && col_base + c < N) {
+            C[(row_base + r + 4) * N + col_base + c] = out_tile[r + 4][c];
+        }
     }
 }
 
-/// Dense linear: C[row,col] = dot(input[row,:], weight_t[col,:]).
-/// weight_t is (N, K) — pre-transposed (each row is one output neuron).
-/// input is (M, K), output is (M, N).
+/// Dense linear: C = input × weight_t^T.
+/// input is (M, K), weight_t is (N, K), output is (M, N).
 ///
-/// Same tiled GEMM but with B accessed in transposed layout.
+/// Uses SIMD-group 8×8 with column-major load to transpose weight_t.
 kernel void linear_dense_f32(
     device const float* input       [[buffer(0)]],
     device const float* weight_t    [[buffer(1)]],
     device float* output            [[buffer(2)]],
     constant MatmulParams& params   [[buffer(3)]],
-    uint2 gid                       [[thread_position_in_grid]],
-    uint2 lid                       [[thread_position_in_threadgroup]])
+    uint2 group_id                  [[threadgroup_position_in_grid]],
+    uint simd_lane                  [[thread_index_in_simdgroup]])
 {
     const uint M = params.M;
     const uint N = params.N;
     const uint K = params.K;
 
-    const uint row = gid.y;
-    const uint col = gid.x;
+    const uint col_block = group_id.x;
+    const uint row_block = group_id.y;
 
-    threadgroup float tileA[TILE][TILE];
-    threadgroup float tileW[TILE][TILE];
+    const uint row_base = row_block * 8;
+    const uint col_base = col_block * 8;
 
-    float sum = 0.0f;
+    if (row_base >= M || col_base >= N) return;
 
-    const uint numTiles = (K + TILE - 1) / TILE;
-    for (uint t = 0; t < numTiles; t++) {
-        const uint a_col = t * TILE + lid.x;
-        tileA[lid.y][lid.x] = (row < M && a_col < K) ? input[row * K + a_col] : 0.0f;
+    threadgroup float tgA[8][8];
+    threadgroup float tgB[8][8];
 
-        // weight_t[col, k] — each row is one output neuron
-        const uint w_col = t * TILE + lid.y;
-        tileW[lid.y][lid.x] = (col < N && w_col < K) ? weight_t[col * K + w_col] : 0.0f;
+    simdgroup_float8x8 acc(0.0f);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint num_k_blocks = (K + 7) / 8;
+    const bool edge_m = (row_base + 8 > M);
+    const bool edge_n = (col_base + 8 > N);
+    const bool edge_k = (K % 8 != 0);
 
-        for (uint i = 0; i < TILE; i++) {
-            sum += tileA[lid.y][i] * tileW[i][lid.x];
+    for (uint kb = 0; kb < num_k_blocks; kb++) {
+        simdgroup_float8x8 a_tile, b_tile;
+        const uint k_base = kb * 8;
+        const bool k_edge = (kb == num_k_blocks - 1) && edge_k;
+
+        // Load A tile: input[row_base..+8, k_base..+8]
+        if (!edge_m && !k_edge) {
+            simdgroup_load(a_tile, input + row_base * K + k_base, K);
+        } else {
+            uint r = simd_lane / 8;
+            uint c = simd_lane % 8;
+            tgA[r][c] = (row_base + r < M && k_base + c < K) ?
+                input[(row_base + r) * K + k_base + c] : 0.0f;
+            tgA[r + 4][c] = (row_base + r + 4 < M && k_base + c < K) ?
+                input[(row_base + r + 4) * K + k_base + c] : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(a_tile, &tgA[0][0], 8);
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Load B tile: need B[k,n] = weight_t[n,k]
+        // weight_t is (N,K), we want a (K,N) view — load column-major
+        if (!edge_n && !k_edge) {
+            simdgroup_load(b_tile, weight_t + col_base * K + k_base, K, ulong2(0, 0), true);
+        } else {
+            // Manually load transposed: tgB[k_local][n_local] = weight_t[n, k]
+            uint r = simd_lane / 8;  // k_local
+            uint c = simd_lane % 8;  // n_local
+            tgB[r][c] = (k_base + r < K && col_base + c < N) ?
+                weight_t[(col_base + c) * K + k_base + r] : 0.0f;
+            tgB[r + 4][c] = (k_base + r + 4 < K && col_base + c < N) ?
+                weight_t[(col_base + c) * K + k_base + r + 4] : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(b_tile, &tgB[0][0], 8);
+        }
+
+        simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+
+        if (edge_m || edge_n || k_edge) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
-    if (row < M && col < N) {
-        output[row * N + col] = sum;
+    if (!edge_m && !edge_n) {
+        simdgroup_store(acc, output + row_base * N + col_base, N);
+    } else {
+        threadgroup float out_tile[8][8];
+        simdgroup_store(acc, &out_tile[0][0], 8);
+        uint r = simd_lane / 8;
+        uint c = simd_lane % 8;
+        if (row_base + r < M && col_base + c < N) {
+            output[(row_base + r) * N + col_base + c] = out_tile[r][c];
+        }
+        if (row_base + r + 4 < M && col_base + c < N) {
+            output[(row_base + r + 4) * N + col_base + c] = out_tile[r + 4][c];
+        }
     }
 }

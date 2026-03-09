@@ -22,8 +22,11 @@ use crate::MetalContext;
 
 use metal::MTLSize;
 
-/// Tile size for the tiled matmul kernel — must match TILE in matmul.metal.
-const TILE: u64 = 16;
+/// Tile size for the SIMD-group matmul kernel (8×8 per SIMD-group).
+const TILE: u64 = 8;
+
+/// Threads per threadgroup for SIMD-group matmul: one SIMD-group = 32 threads.
+const SIMD_GROUP_SIZE: u64 = 32;
 
 /// Packed params for the tiled matmul kernel.
 #[repr(C)]
@@ -84,8 +87,10 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
 
         match weight.dtype {
             DType::Q8_0 => {
-                ctx.dispatch_1d(
-                    "gemv_q8_f32",
+                let threadgroups = MTLSize::new(n as u64, 1, 1);
+                let threads_per_group = MTLSize::new(SIMD_GROUP_SIZE, 1, 1);
+                ctx.dispatch_threadgroups(
+                    "gemv_q8_simd_f32",
                     &[
                         (input.metal_buffer(), input.buffer_offset()),
                         (&weight.data, 0),
@@ -93,13 +98,17 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
                         (out.metal_buffer(), out.buffer_offset()),
                     ],
                     bytemuck::bytes_of(&params),
-                    n,
+                    threadgroups,
+                    threads_per_group,
+                    0,
                 );
                 return Ok(out);
             }
             DType::Q4_0 => {
-                ctx.dispatch_1d(
-                    "gemv_q4_f32",
+                let threadgroups = MTLSize::new(n as u64, 1, 1);
+                let threads_per_group = MTLSize::new(SIMD_GROUP_SIZE, 1, 1);
+                ctx.dispatch_threadgroups(
+                    "gemv_q4_simd_f32",
                     &[
                         (input.metal_buffer(), input.buffer_offset()),
                         (&weight.data, 0),
@@ -107,7 +116,9 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
                         (out.metal_buffer(), out.buffer_offset()),
                     ],
                     bytemuck::bytes_of(&params),
-                    n,
+                    threadgroups,
+                    threads_per_group,
+                    0,
                 );
                 return Ok(out);
             }
@@ -357,7 +368,7 @@ impl MatmulOps for MetalBackend {
         };
 
         let threadgroups = MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1);
-        let threads_per_group = MTLSize::new(TILE, TILE, 1);
+        let threads_per_group = MTLSize::new(SIMD_GROUP_SIZE, 1, 1);
 
         ctx.dispatch_threadgroups(
             "matmul_f32",
@@ -398,7 +409,7 @@ impl MatmulOps for MetalBackend {
 
                 let threadgroups =
                     MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1);
-                let threads_per_group = MTLSize::new(TILE, TILE, 1);
+                let threads_per_group = MTLSize::new(SIMD_GROUP_SIZE, 1, 1);
 
                 ctx.dispatch_threadgroups(
                     "linear_dense_f32",

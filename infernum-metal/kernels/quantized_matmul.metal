@@ -197,3 +197,100 @@ kernel void gemv_q6k_f32(
 
     output[tid] = sum;
 }
+
+// ==========================================================================
+// SIMD-group cooperative Q8 GEMV: one SIMD-group (32 threads) per output
+// neuron. Each thread processes a strided subset of K-blocks and the
+// partial sums are reduced with simd_sum().
+// Grid: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
+// ==========================================================================
+kernel void gemv_q8_simd_f32(
+    device const float*  input         [[buffer(0)]],
+    device const uchar*  weight_data   [[buffer(1)]],
+    device const float*  weight_scales [[buffer(2)]],
+    device float*        output        [[buffer(3)]],
+    constant QuantizedLinearParams& params [[buffer(4)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint lane     [[thread_index_in_simdgroup]])
+{
+    const uint neuron = group_id;
+    if (neuron >= params.N) return;
+
+    const uint K = params.K;
+    const uint BLOCK_SIZE = 32;
+    const uint num_blocks = K / BLOCK_SIZE;
+    const uint quant_bytes_per_row = num_blocks * BLOCK_SIZE;
+
+    const uint q_start = neuron * quant_bytes_per_row;
+    const uint s_start = neuron * num_blocks;
+
+    float partial = 0.0f;
+
+    // Each of 32 lanes handles blocks [lane, lane+32, lane+64, ...]
+    for (uint b = lane; b < num_blocks; b += 32) {
+        float scale = weight_scales[s_start + b];
+        uint block_start = q_start + b * BLOCK_SIZE;
+        uint inp_start = b * BLOCK_SIZE;
+
+        float block_sum = 0.0f;
+        for (uint j = 0; j < BLOCK_SIZE; j++) {
+            float q = float(as_type<char>(weight_data[block_start + j]));
+            block_sum += input[inp_start + j] * q;
+        }
+        partial += block_sum * scale;
+    }
+
+    float result = simd_sum(partial);
+    if (lane == 0) {
+        output[neuron] = result;
+    }
+}
+
+// ==========================================================================
+// SIMD-group cooperative Q4_0 GEMV: one SIMD-group per output neuron.
+// Grid: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
+// ==========================================================================
+kernel void gemv_q4_simd_f32(
+    device const float*  input         [[buffer(0)]],
+    device const uchar*  weight_data   [[buffer(1)]],
+    device const float*  weight_scales [[buffer(2)]],
+    device float*        output        [[buffer(3)]],
+    constant QuantizedLinearParams& params [[buffer(4)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint lane     [[thread_index_in_simdgroup]])
+{
+    const uint neuron = group_id;
+    if (neuron >= params.N) return;
+
+    const uint K = params.K;
+    const uint BLOCK_SIZE = 32;
+    const uint HALF_BLOCK = BLOCK_SIZE / 2;
+    const uint num_blocks = K / BLOCK_SIZE;
+    const uint packed_bytes_per_row = num_blocks * HALF_BLOCK;
+
+    const uint p_start = neuron * packed_bytes_per_row;
+    const uint s_start = neuron * num_blocks;
+
+    float partial = 0.0f;
+
+    for (uint b = lane; b < num_blocks; b += 32) {
+        float scale = weight_scales[s_start + b];
+        uint block_start = p_start + b * HALF_BLOCK;
+        uint inp_start = b * BLOCK_SIZE;
+
+        float block_sum = 0.0f;
+        for (uint j = 0; j < HALF_BLOCK; j++) {
+            uchar byte_val = weight_data[block_start + j];
+            float lo = float(int(byte_val & 0x0F) - 8);
+            float hi = float(int(byte_val >> 4) - 8);
+            block_sum += input[inp_start + j] * lo;
+            block_sum += input[inp_start + j + 16] * hi;
+        }
+        partial += block_sum * scale;
+    }
+
+    float result = simd_sum(partial);
+    if (lane == 0) {
+        output[neuron] = result;
+    }
+}
