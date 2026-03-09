@@ -335,6 +335,11 @@ pub fn load_mlp_weights<B: MatmulOps + TensorOps>(
             weight: B::dense_weight(B::concat_inner_dim(g, u)?),
             intermediate_size,
         }
+    } else if let Some(fused) = B::try_concat_linear_rows(&gate, &up) {
+        GateUpWeight::<B>::Fused {
+            weight: fused,
+            intermediate_size,
+        }
     } else {
         GateUpWeight::<B>::Separate {
             gate_proj: Box::new(gate),

@@ -290,6 +290,18 @@ pub trait MatmulOps: Backend {
     /// Check whether a `LinearWeight` is a dense (non-quantized) tensor.
     fn is_dense_weight(weight: &Self::LinearWeight) -> bool;
 
+    /// Try to vertically concatenate two linear weights (append output rows).
+    ///
+    /// Both weights must have the same `in_features`. Returns `None` if
+    /// the weights cannot be fused (e.g., different dtypes, unsupported
+    /// format). Backends override this to fuse quantized Q4/Q8 weights.
+    fn try_concat_linear_rows(
+        _a: &Self::LinearWeight,
+        _b: &Self::LinearWeight,
+    ) -> Option<Self::LinearWeight> {
+        None
+    }
+
     /// Compute two independent linear projections from the same input in a
     /// single parallel dispatch.
     ///

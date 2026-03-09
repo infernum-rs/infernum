@@ -83,6 +83,65 @@ impl MetalQuantizedWeight {
             unsafe { std::slice::from_raw_parts(buf.contents().cast::<f32>(), len) }
         })
     }
+
+    /// Concatenate two quantized weights vertically (append output rows).
+    ///
+    /// Both must have the same `dtype`, `in_features`, and neither can have
+    /// mins. Produces a combined weight with
+    /// `out_features = a.out_features + b.out_features`.
+    ///
+    /// This is used to fuse K+V or gate+up projections so a single GEMV
+    /// dispatch processes both weight matrices.
+    #[must_use]
+    #[allow(clippy::similar_names)]
+    pub fn concat_rows(a: &Self, b: &Self) -> Self {
+        assert_eq!(a.dtype, b.dtype, "concat_rows: dtype mismatch");
+        assert_eq!(a.shape[1], b.shape[1], "concat_rows: K mismatch");
+        assert!(
+            a.mins.is_none() && b.mins.is_none(),
+            "concat_rows: mins not supported"
+        );
+
+        let device = a.ctx.device();
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+
+        let data_a_len = a.data.length() as usize;
+        let data_b_len = b.data.length() as usize;
+        let data_buf = device.new_buffer((data_a_len + data_b_len) as u64, opts);
+        // SAFETY: StorageModeShared buffers are CPU-accessible. We write
+        // before any GPU access.
+        unsafe {
+            let dst = data_buf.contents().cast::<u8>();
+            std::ptr::copy_nonoverlapping(a.data.contents().cast::<u8>(), dst, data_a_len);
+            std::ptr::copy_nonoverlapping(
+                b.data.contents().cast::<u8>(),
+                dst.add(data_a_len),
+                data_b_len,
+            );
+        }
+
+        let scales_a_len = a.scales.length() as usize;
+        let scales_b_len = b.scales.length() as usize;
+        let scales_buf = device.new_buffer((scales_a_len + scales_b_len) as u64, opts);
+        unsafe {
+            let dst = scales_buf.contents().cast::<u8>();
+            std::ptr::copy_nonoverlapping(a.scales.contents().cast::<u8>(), dst, scales_a_len);
+            std::ptr::copy_nonoverlapping(
+                b.scales.contents().cast::<u8>(),
+                dst.add(scales_a_len),
+                scales_b_len,
+            );
+        }
+
+        Self {
+            shape: vec![a.shape[0] + b.shape[0], a.shape[1]],
+            dtype: a.dtype,
+            ctx: a.ctx.clone(),
+            data: Arc::new(data_buf),
+            scales: Arc::new(scales_buf),
+            mins: None,
+        }
+    }
 }
 
 /// Decode a buffer of f16 values stored as raw little-endian bytes into f32.

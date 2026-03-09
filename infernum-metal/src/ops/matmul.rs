@@ -451,6 +451,25 @@ impl MatmulOps for MetalBackend {
         matches!(weight, MetalLinearWeight::Dense { .. })
     }
 
+    fn try_concat_linear_rows(
+        a: &MetalLinearWeight,
+        b: &MetalLinearWeight,
+    ) -> Option<MetalLinearWeight> {
+        match (a, b) {
+            (MetalLinearWeight::Quantized(qa), MetalLinearWeight::Quantized(qb))
+                if qa.dtype == qb.dtype
+                    && qa.shape[1] == qb.shape[1]
+                    && qa.mins.is_none()
+                    && qb.mins.is_none() =>
+            {
+                Some(MetalLinearWeight::Quantized(
+                    MetalQuantizedWeight::concat_rows(qa, qb),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn quantize_to_q8(
         device: &MetalContext,
