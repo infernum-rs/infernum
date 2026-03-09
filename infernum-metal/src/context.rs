@@ -61,8 +61,6 @@ struct ActiveEncoder {
     encoder: *mut metal::ComputeCommandEncoderRef,
     /// Number of dispatches encoded (for stats).
     dispatch_count: u32,
-    /// Kernel names dispatched in this batch (for per-kernel counting).
-    kernel_names: Vec<String>,
 }
 
 // SAFETY: Metal command buffers and encoders are thread-safe when used
@@ -210,11 +208,11 @@ impl MetalContext {
 
         let has_timing = self.inner.profile_per_kernel;
 
-        // Kernel entries (excluding _flush)
+        // Kernel entries (excluding internal stats entries)
         let mut entries: Vec<_> = stats
             .kernels
             .iter()
-            .filter(|(k, _)| *k != "_flush")
+            .filter(|(k, _)| !k.starts_with('_'))
             .collect();
 
         let total_dispatches: u64 = entries.iter().map(|(_, s)| s.count).sum();
@@ -256,28 +254,16 @@ impl MetalContext {
             }
         } else {
             // Dispatch count mode (no per-kernel timing)
+            let dispatches = stats.kernels.get("_dispatches").map_or(0, |d| d.count);
             let flush = stats.kernels.get("_flush");
             let flush_count = flush.map_or(0, |f| f.count);
             let total_ms = flush.map_or(0.0, |f| f.total_time.as_secs_f64() * 1000.0);
 
-            entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
-
             eprintln!();
             eprintln!(
-                "[Metal dispatch stats] {total_dispatches} dispatches in \
+                "[Metal dispatch stats] {dispatches} dispatches in \
                  {flush_count} flushes, {total_ms:.1}ms total GPU wait"
             );
-            eprintln!("{:<40} {:>8} {:>6}", "kernel", "calls", "%");
-            eprintln!("{}", "-".repeat(56));
-
-            for (name, ks) in &entries {
-                let pct = if total_dispatches > 0 {
-                    ks.count as f64 / total_dispatches as f64 * 100.0
-                } else {
-                    0.0
-                };
-                eprintln!("{name:<40} {c:>8} {pct:>5.1}%", c = ks.count);
-            }
         }
         eprintln!();
     }
@@ -312,17 +298,18 @@ impl MetalContext {
             cmd,
             encoder,
             dispatch_count: 0,
-            kernel_names: Vec::new(),
         });
         encoder
     }
 
-    /// After encoding a dispatch, record the kernel name and optionally
-    /// flush immediately for per-kernel timing.
+    /// After encoding a dispatch, increment the dispatch counter and
+    /// optionally flush immediately for per-kernel timing.
+    ///
+    /// In normal (non-profiling) mode, this is a single u32 increment —
+    /// no String allocation, no HashMap lookup, no Mutex lock.
     fn finish_dispatch(&self, active: &mut Option<ActiveEncoder>, kernel: &str) {
         let ae = active.as_mut().unwrap();
         ae.dispatch_count += 1;
-        ae.kernel_names.push(kernel.to_owned());
 
         if self.inner.profile_per_kernel {
             // Flush this single dispatch to get isolated GPU timing.
@@ -514,14 +501,11 @@ impl MetalContext {
         ae.cmd.wait_until_completed();
         let elapsed = t0.elapsed();
 
-        // Record per-kernel dispatch counts (no individual GPU timing).
-        // The elapsed time is the total for all dispatches in this batch.
+        // Record flush stats: count and total GPU wait time.
         {
             let mut stats = self.inner.stats.lock().unwrap();
-            for name in &ae.kernel_names {
-                let entry = stats.kernels.entry(name.clone()).or_default();
-                entry.count += 1;
-            }
+            let dispatch_entry = stats.kernels.entry("_dispatches".to_owned()).or_default();
+            dispatch_entry.count += u64::from(ae.dispatch_count);
             let flush_entry = stats.kernels.entry("_flush".to_owned()).or_default();
             flush_entry.count += 1;
             flush_entry.total_time += elapsed;
