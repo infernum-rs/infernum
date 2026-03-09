@@ -27,6 +27,10 @@ struct Cli {
     /// Number of tokens to generate
     #[arg(default_value_t = 128)]
     n_gen: usize,
+
+    /// Enable per-kernel GPU timing (slower, but shows time breakdown)
+    #[arg(long)]
+    profile: bool,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -107,7 +111,10 @@ fn bench_model<M: infernum::Model<B = MetalBackend> + Send + 'static>(
 
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
-    let ctx = MetalContext::new();
+    let mut ctx = MetalContext::new();
+    if cli.profile {
+        ctx.set_profile_per_kernel(true);
+    }
 
     let is_gguf = cli.model.ends_with(".gguf");
 

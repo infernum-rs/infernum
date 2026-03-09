@@ -78,6 +78,9 @@ struct MetalContextInner {
     stats: Mutex<DispatchStats>,
     /// Active command buffer + encoder, or None if no work is pending.
     active_encoder: Mutex<Option<ActiveEncoder>>,
+    /// When true, each dispatch uses its own command buffer for per-kernel
+    /// GPU timing. Much slower, but gives accurate per-kernel time breakdown.
+    profile_per_kernel: bool,
 }
 
 // SAFETY: Metal objects are thread-safe when accessed through command buffers.
@@ -116,6 +119,7 @@ impl MetalContext {
                 pipelines,
                 stats: Mutex::new(DispatchStats::default()),
                 active_encoder: Mutex::new(None),
+                profile_per_kernel: false,
             }),
         }
     }
@@ -139,6 +143,7 @@ impl MetalContext {
                 pipelines,
                 stats: Mutex::new(DispatchStats::default()),
                 active_encoder: Mutex::new(None),
+                profile_per_kernel: false,
             }),
         })
     }
@@ -173,14 +178,28 @@ impl MetalContext {
         self.inner.pipelines.contains_key(name)
     }
 
+    /// Enable per-kernel GPU timing profiling.
+    ///
+    /// When enabled, each dispatch uses its own command buffer and waits
+    /// for completion, giving accurate per-kernel GPU time. This is much
+    /// slower than normal batched execution — use only for profiling.
+    ///
+    /// Must be called before any dispatches (typically right after
+    /// construction). Requires exclusive access to the `Arc`.
+    pub fn set_profile_per_kernel(&mut self, enabled: bool) {
+        Arc::get_mut(&mut self.inner)
+            .expect("set_profile_per_kernel: MetalContext already shared")
+            .profile_per_kernel = enabled;
+    }
+
     // ------------------------------------------------------------------
     // Dispatch profiling
     // ------------------------------------------------------------------
 
     /// Print a summary of dispatch statistics to stderr.
     ///
-    /// Shows total GPU wait time (from `_flush` entries) and per-kernel
-    /// dispatch counts sorted by frequency.
+    /// In normal mode: shows per-kernel dispatch counts.
+    /// In `profile_per_kernel` mode: shows per-kernel GPU time breakdown.
     #[allow(clippy::cast_precision_loss)]
     pub fn print_dispatch_stats(&self) {
         let stats = self.inner.stats.lock().unwrap();
@@ -189,40 +208,76 @@ impl MetalContext {
             return;
         }
 
-        // Separate _flush (has timing) from kernel dispatches (counts only).
-        let flush = stats.kernels.get("_flush");
-        let total_dispatches: u64 = stats
-            .kernels
-            .iter()
-            .filter(|(k, _)| *k != "_flush")
-            .map(|(_, s)| s.count)
-            .sum();
-        let flush_count = flush.map_or(0, |f| f.count);
-        let total_ms = flush.map_or(0.0, |f| f.total_time.as_secs_f64() * 1000.0);
+        let has_timing = self.inner.profile_per_kernel;
 
-        eprintln!();
-        eprintln!(
-            "[Metal dispatch stats] {total_dispatches} dispatches in {flush_count} flushes, \
-             {total_ms:.1}ms total GPU wait"
-        );
-        eprintln!("{:<40} {:>8} {:>6}", "kernel", "calls", "%");
-        eprintln!("{}", "-".repeat(56));
-
-        // Sort kernel dispatches by count descending
+        // Kernel entries (excluding _flush)
         let mut entries: Vec<_> = stats
             .kernels
             .iter()
             .filter(|(k, _)| *k != "_flush")
             .collect();
-        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
 
-        for (name, ks) in &entries {
-            let pct = if total_dispatches > 0 {
-                ks.count as f64 / total_dispatches as f64 * 100.0
-            } else {
-                0.0
-            };
-            eprintln!("{name:<40} {c:>8} {pct:>5.1}%", c = ks.count);
+        let total_dispatches: u64 = entries.iter().map(|(_, s)| s.count).sum();
+
+        if has_timing {
+            // Per-kernel GPU timing mode
+            let total_time: Duration = entries.iter().map(|(_, s)| s.total_time).sum();
+            let total_ms = total_time.as_secs_f64() * 1000.0;
+
+            entries.sort_by(|a, b| b.1.total_time.cmp(&a.1.total_time));
+
+            eprintln!();
+            eprintln!(
+                "[Metal per-kernel GPU timing] {total_dispatches} dispatches, \
+                 {total_ms:.1}ms total GPU time"
+            );
+            eprintln!(
+                "{:<40} {:>8} {:>10} {:>10} {:>6}",
+                "kernel", "calls", "total(ms)", "avg(μs)", "%"
+            );
+            eprintln!("{}", "-".repeat(78));
+
+            for (name, ks) in &entries {
+                let ms = ks.total_time.as_secs_f64() * 1000.0;
+                let avg_us = if ks.count > 0 {
+                    ks.total_time.as_secs_f64() * 1_000_000.0 / ks.count as f64
+                } else {
+                    0.0
+                };
+                let pct = if total_ms > 0.0 {
+                    ms / total_ms * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "{name:<40} {c:>8} {ms:>9.1} {avg_us:>9.0} {pct:>5.1}%",
+                    c = ks.count
+                );
+            }
+        } else {
+            // Dispatch count mode (no per-kernel timing)
+            let flush = stats.kernels.get("_flush");
+            let flush_count = flush.map_or(0, |f| f.count);
+            let total_ms = flush.map_or(0.0, |f| f.total_time.as_secs_f64() * 1000.0);
+
+            entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+
+            eprintln!();
+            eprintln!(
+                "[Metal dispatch stats] {total_dispatches} dispatches in \
+                 {flush_count} flushes, {total_ms:.1}ms total GPU wait"
+            );
+            eprintln!("{:<40} {:>8} {:>6}", "kernel", "calls", "%");
+            eprintln!("{}", "-".repeat(56));
+
+            for (name, ks) in &entries {
+                let pct = if total_dispatches > 0 {
+                    ks.count as f64 / total_dispatches as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!("{name:<40} {c:>8} {pct:>5.1}%", c = ks.count);
+            }
         }
         eprintln!();
     }
@@ -262,6 +317,31 @@ impl MetalContext {
         encoder
     }
 
+    /// After encoding a dispatch, record the kernel name and optionally
+    /// flush immediately for per-kernel timing.
+    fn finish_dispatch(&self, active: &mut Option<ActiveEncoder>, kernel: &str) {
+        let ae = active.as_mut().unwrap();
+        ae.dispatch_count += 1;
+        ae.kernel_names.push(kernel.to_owned());
+
+        if self.inner.profile_per_kernel {
+            // Flush this single dispatch to get isolated GPU timing.
+            let ae = active.take().unwrap();
+            let enc = unsafe { &*ae.encoder };
+            enc.end_encoding();
+
+            let t0 = Instant::now();
+            ae.cmd.commit();
+            ae.cmd.wait_until_completed();
+            let elapsed = t0.elapsed();
+
+            let mut stats = self.inner.stats.lock().unwrap();
+            let entry = stats.kernels.entry(kernel.to_owned()).or_default();
+            entry.count += 1;
+            entry.total_time += elapsed;
+        }
+    }
+
     // ------------------------------------------------------------------
     // Dispatch helpers
     // ------------------------------------------------------------------
@@ -299,9 +379,7 @@ impl MetalContext {
         let group = MTLSize::new(tg, 1, 1);
         enc.dispatch_threads(grid, group);
 
-        let ae = active.as_mut().unwrap();
-        ae.dispatch_count += 1;
-        ae.kernel_names.push(pipeline.to_owned());
+        self.finish_dispatch(&mut active, pipeline);
     }
 
     /// Dispatch a 2-D compute kernel.
@@ -338,9 +416,7 @@ impl MetalContext {
         let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), 1);
         enc.dispatch_threads(grid, group);
 
-        let ae = active.as_mut().unwrap();
-        ae.dispatch_count += 1;
-        ae.kernel_names.push(pipeline.to_owned());
+        self.finish_dispatch(&mut active, pipeline);
     }
 
     /// Dispatch a compute kernel with explicit threadgroup counts.
@@ -379,9 +455,7 @@ impl MetalContext {
 
         enc.dispatch_thread_groups(threadgroups, threads_per_group);
 
-        let ae = active.as_mut().unwrap();
-        ae.dispatch_count += 1;
-        ae.kernel_names.push(pipeline.to_owned());
+        self.finish_dispatch(&mut active, pipeline);
     }
 
     /// Commit all pending GPU work and block until complete.
