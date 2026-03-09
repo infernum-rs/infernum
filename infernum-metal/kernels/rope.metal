@@ -72,3 +72,71 @@ kernel void apply_rope_batched_f32(
     output[base + pair_idx]            = x0 * cos_val - x1 * sin_val;
     output[base + half_dim + pair_idx] = x1 * cos_val + x0 * sin_val;
 }
+
+struct RopeQkParams {
+    uint q_heads;
+    uint k_heads;
+    uint head_dim;
+    uint half_dim;
+};
+
+/// Fused Q+K RoPE: apply RoPE to both Q and K in a single dispatch.
+///
+/// Thread grid: batch_size * (q_heads + k_heads) * half_dim, 1D.
+/// Threads in [0, batch*q_heads*half_dim) operate on Q.
+/// Remaining threads operate on K.
+kernel void apply_rope_qk_batched_f32(
+    device const float* q_input     [[buffer(0)]],
+    device const float* k_input     [[buffer(1)]],
+    device const float* cos_cache   [[buffer(2)]],
+    device const float* sin_cache   [[buffer(3)]],
+    device const int*   positions   [[buffer(4)]],
+    device float* q_output          [[buffer(5)]],
+    device float* k_output          [[buffer(6)]],
+    constant RopeQkParams& params   [[buffer(7)]],
+    uint tid                        [[thread_position_in_grid]])
+{
+    const uint q_heads  = params.q_heads;
+    const uint k_heads  = params.k_heads;
+    const uint head_dim = params.head_dim;
+    const uint half_dim = params.half_dim;
+
+    const uint q_stride = q_heads * half_dim;   // pairs per batch element for Q
+    const uint total_per_batch = q_stride + k_heads * half_dim;
+
+    const uint batch_idx = tid / total_per_batch;
+    const uint remainder = tid % total_per_batch;
+
+    const uint pos = uint(positions[batch_idx]);
+
+    // Determine if this thread processes Q or K
+    device const float* src;
+    device float* dst;
+    uint n_heads;
+    uint local_idx;
+
+    if (remainder < q_stride) {
+        src       = q_input;
+        dst       = q_output;
+        n_heads   = q_heads;
+        local_idx = remainder;
+    } else {
+        src       = k_input;
+        dst       = k_output;
+        n_heads   = k_heads;
+        local_idx = remainder - q_stride;
+    }
+
+    const uint p_idx = local_idx % half_dim;
+    const uint h     = local_idx / half_dim;
+    const uint base  = (batch_idx * n_heads + h) * head_dim;
+
+    float cv = cos_cache[pos * half_dim + p_idx];
+    float sv = sin_cache[pos * half_dim + p_idx];
+
+    float a = src[base + p_idx];
+    float b = src[base + half_dim + p_idx];
+
+    dst[base + p_idx]            = a * cv - b * sv;
+    dst[base + half_dim + p_idx] = b * cv + a * sv;
+}

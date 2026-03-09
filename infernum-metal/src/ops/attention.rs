@@ -378,31 +378,19 @@ impl PagedKvCacheOps for MetalBackend {
             max_blocks_per_seq: max_blocks_per_seq as u32,
         };
 
-        // Append K
-        ctx.dispatch_2d(
-            "append_kv_paged_batched_f32",
+        // Fused K+V append: single dispatch with 3D grid (elems, batch, 2)
+        ctx.dispatch_3d(
+            "append_kv_paged_batched_fused_f32",
             &[
                 (
                     cache.k_pools[layer_idx].metal_buffer(),
                     cache.k_pools[layer_idx].buffer_offset(),
                 ),
-                (k.metal_buffer(), k.buffer_offset()),
-                (block_tables.metal_buffer(), block_tables.buffer_offset()),
-                (positions.metal_buffer(), positions.buffer_offset()),
-            ],
-            bytemuck::bytes_of(&params),
-            total_per_token,
-            batch_size,
-        );
-
-        // Append V
-        ctx.dispatch_2d(
-            "append_kv_paged_batched_f32",
-            &[
                 (
                     cache.v_pools[layer_idx].metal_buffer(),
                     cache.v_pools[layer_idx].buffer_offset(),
                 ),
+                (k.metal_buffer(), k.buffer_offset()),
                 (v.metal_buffer(), v.buffer_offset()),
                 (block_tables.metal_buffer(), block_tables.buffer_offset()),
                 (positions.metal_buffer(), positions.buffer_offset()),
@@ -410,6 +398,7 @@ impl PagedKvCacheOps for MetalBackend {
             bytemuck::bytes_of(&params),
             total_per_token,
             batch_size,
+            2,
         );
 
         Ok(())

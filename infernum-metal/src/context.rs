@@ -419,6 +419,43 @@ impl MetalContext {
         self.finish_dispatch(&mut active, pipeline);
     }
 
+    /// Dispatch a compute kernel with a 3D thread grid.
+    pub fn dispatch_3d(
+        &self,
+        pipeline: &str,
+        buffers: &[(&metal::BufferRef, usize)],
+        params: &[u8],
+        width: usize,
+        height: usize,
+        depth: usize,
+    ) {
+        let pso = self.pipeline(pipeline);
+        let mut active = self.inner.active_encoder.lock().unwrap();
+        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let enc = unsafe { &*enc_ptr };
+
+        enc.set_compute_pipeline_state(pso);
+
+        for (idx, &(buf, offset)) in buffers.iter().enumerate() {
+            enc.set_buffer(idx as u64, Some(buf), offset as u64);
+        }
+
+        if !params.is_empty() {
+            let param_idx = buffers.len() as u64;
+            enc.set_bytes(param_idx, params.len() as u64, params.as_ptr().cast());
+        }
+
+        let max_total = pso.max_total_threads_per_threadgroup();
+        let max_w = pso.thread_execution_width();
+        let max_h = (max_total / max_w).min(height as u64);
+        let max_d = (max_total / (max_w * max_h)).max(1).min(depth as u64);
+        let grid = MTLSize::new(width as u64, height as u64, depth as u64);
+        let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), max_d);
+        enc.dispatch_threads(grid, group);
+
+        self.finish_dispatch(&mut active, pipeline);
+    }
+
     /// Dispatch a compute kernel with explicit threadgroup counts.
     ///
     /// Encodes onto the shared command buffer without committing.
