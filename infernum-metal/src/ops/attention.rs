@@ -1,17 +1,50 @@
 //! AttentionOps, PagedAttentionOps, PagedKvCacheOps, KvCacheOps implementations.
 //!
-//! Phase 1: CPU-side naive implementations.
+//! Fused prefill/decode attention dispatched to Metal GPU kernels.
+//! Paged attention, KV cache, and combine_attention_with_lse remain CPU-side.
 
+use bytemuck::{Pod, Zeroable};
 use infernum::backend::{AttentionOps, KvCacheOps, PagedAttentionOps, PagedKvCacheOps};
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::tensor::Tensor;
 use infernum::DType;
 use infernum::Result;
+use metal::MTLSize;
 
+use crate::context::reduction_threadgroup_size;
 use crate::tensor::MetalTensor;
 use crate::{MetalBackend, MetalContext, MetalKvCache, MetalPagedKvCache};
 
-// ---- Fused Attention ----
+// ---- GPU param structs ----
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AttentionPrefillParams {
+    seq_len: u32,
+    kv_len: u32,
+    n_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    offset: u32,
+    scale: f32,
+    softcap: f32,
+    sliding_window: i32,
+    compute_lse: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AttentionDecodeParams {
+    kv_len: u32,
+    n_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    scale: f32,
+    softcap: f32,
+    sliding_window: i32,
+}
+
+// ---- Fused Attention (GPU) ----
 
 impl AttentionOps for MetalBackend {
     #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
@@ -24,7 +57,8 @@ impl AttentionOps for MetalBackend {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<MetalTensor> {
-        let (out, _) = attention_impl(q, k, v, offset, scale, softcap, sliding_window, false);
+        let (out, _) =
+            attention_prefill_gpu(q, k, v, offset, scale, softcap, sliding_window, false);
         Ok(out)
     }
 
@@ -37,10 +71,14 @@ impl AttentionOps for MetalBackend {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<MetalTensor> {
-        let kv_len = k.shape()[0];
-        let offset = kv_len.saturating_sub(1);
-        let (out, _) = attention_impl(q, k, v, offset, scale, softcap, sliding_window, false);
-        Ok(out)
+        Ok(attention_decode_gpu(
+            q,
+            k,
+            v,
+            scale,
+            softcap,
+            sliding_window,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -53,7 +91,7 @@ impl AttentionOps for MetalBackend {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<(MetalTensor, MetalTensor)> {
-        Ok(attention_impl(
+        Ok(attention_prefill_gpu(
             q,
             k,
             v,
@@ -71,6 +109,7 @@ impl AttentionOps for MetalBackend {
         out2: &MetalTensor,
         lse2: &MetalTensor,
     ) -> Result<MetalTensor> {
+        // CPU-side: simple per-head rescaling, not compute-bound.
         let shape = out1.shape();
         let total = out1.numel();
         let head_dim = *shape.last().unwrap();
@@ -98,14 +137,14 @@ impl AttentionOps for MetalBackend {
     }
 }
 
-/// Generic attention implementation (prefill / decode / with LSE).
+/// Dispatch fused prefill attention on the GPU.
 #[allow(
     clippy::cast_precision_loss,
-    clippy::too_many_arguments,
-    clippy::needless_range_loop,
-    clippy::many_single_char_names
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments
 )]
-fn attention_impl(
+fn attention_prefill_gpu(
     q: &MetalTensor,
     k: &MetalTensor,
     v: &MetalTensor,
@@ -120,81 +159,100 @@ fn attention_impl(
     let n_heads = q_shape[1];
     let head_dim = q_shape[2];
     let kv_len = k.shape()[0];
+    let kv_heads = k.shape()[1];
 
     let scale = scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
-    let q_data = q.as_f32_slice();
-    let k_data = k.as_f32_slice();
-    let v_data = v.as_f32_slice();
+    let ctx = q.context();
+    let out = MetalTensor::zeros(ctx, q_shape, DType::F32);
+    let lse = MetalTensor::zeros(ctx, &[seq_len, n_heads], DType::F32);
+
+    let params = AttentionPrefillParams {
+        seq_len: seq_len as u32,
+        kv_len: kv_len as u32,
+        n_heads: n_heads as u32,
+        kv_heads: kv_heads as u32,
+        head_dim: head_dim as u32,
+        offset: offset as u32,
+        scale,
+        softcap: softcap.unwrap_or(0.0),
+        sliding_window: sliding_window.map_or(-1, |w| w as i32),
+        compute_lse: u32::from(compute_lse),
+    };
+
+    let tg_size = reduction_threadgroup_size(kv_len.max(head_dim));
+    let num_threadgroups = seq_len * n_heads;
+
+    ctx.dispatch_threadgroups(
+        "fused_attention_prefill_f32",
+        &[
+            (q.metal_buffer(), q.buffer_offset()),
+            (k.metal_buffer(), k.buffer_offset()),
+            (v.metal_buffer(), v.buffer_offset()),
+            (out.metal_buffer(), out.buffer_offset()),
+            (lse.metal_buffer(), lse.buffer_offset()),
+        ],
+        bytemuck::bytes_of(&params),
+        MTLSize::new(num_threadgroups as u64, 1, 1),
+        MTLSize::new(tg_size as u64, 1, 1),
+        tg_size * std::mem::size_of::<f32>(),
+    );
+
+    (out, lse)
+}
+
+/// Dispatch fused decode attention on the GPU (single query token).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn attention_decode_gpu(
+    q: &MetalTensor,
+    k: &MetalTensor,
+    v: &MetalTensor,
+    scale: Option<f32>,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
+) -> MetalTensor {
+    let q_shape = q.shape();
+    let n_heads = q_shape[1];
+    let head_dim = q_shape[2];
+    let kv_len = k.shape()[0];
     let kv_heads = k.shape()[1];
-    let kv_repeat = n_heads / kv_heads;
 
-    let mut out = vec![0.0f32; seq_len * n_heads * head_dim];
-    let mut lse_data = vec![0.0f32; seq_len * n_heads];
-
-    for s in 0..seq_len {
-        let q_pos = s + offset;
-        for h in 0..n_heads {
-            let kv_h = h / kv_repeat;
-            let q_base = (s * n_heads + h) * head_dim;
-
-            // Compute attention scores
-            let mut scores = vec![f32::NEG_INFINITY; kv_len];
-            for kv in 0..kv_len {
-                // Causal: only attend to positions <= q_pos
-                if kv > q_pos {
-                    continue;
-                }
-                // Sliding window
-                if let Some(w) = sliding_window {
-                    if q_pos.saturating_sub(w) > kv {
-                        continue;
-                    }
-                }
-                let k_base = (kv * kv_heads + kv_h) * head_dim;
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    dot += q_data[q_base + d] * k_data[k_base + d];
-                }
-                let mut score = dot * scale;
-                if let Some(cap) = softcap {
-                    score = cap * (score / cap).tanh();
-                }
-                scores[kv] = score;
-            }
-
-            // Softmax
-            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_score).exp()).collect();
-            let sum_exp: f32 = exp_scores.iter().sum();
-            for e in &mut exp_scores {
-                *e /= sum_exp;
-            }
-
-            // LSE
-            if compute_lse {
-                lse_data[s * n_heads + h] = max_score + sum_exp.ln();
-            }
-
-            // Weighted sum of V
-            let out_base = (s * n_heads + h) * head_dim;
-            for kv in 0..kv_len {
-                let w = exp_scores[kv];
-                if w == 0.0 {
-                    continue;
-                }
-                let v_base = (kv * kv_heads + kv_h) * head_dim;
-                for d in 0..head_dim {
-                    out[out_base + d] += w * v_data[v_base + d];
-                }
-            }
-        }
-    }
+    let scale = scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
     let ctx = q.context();
-    let out_tensor = MetalTensor::from_f32(ctx, q_shape, &out);
-    let lse_tensor = MetalTensor::from_f32(ctx, &[seq_len, n_heads], &lse_data);
-    (out_tensor, lse_tensor)
+    let out = MetalTensor::zeros(ctx, q_shape, DType::F32);
+
+    let params = AttentionDecodeParams {
+        kv_len: kv_len as u32,
+        n_heads: n_heads as u32,
+        kv_heads: kv_heads as u32,
+        head_dim: head_dim as u32,
+        scale,
+        softcap: softcap.unwrap_or(0.0),
+        sliding_window: sliding_window.map_or(-1, |w| w as i32),
+    };
+
+    let tg_size = reduction_threadgroup_size(kv_len.max(head_dim));
+
+    ctx.dispatch_threadgroups(
+        "fused_attention_decode_f32",
+        &[
+            (q.metal_buffer(), q.buffer_offset()),
+            (k.metal_buffer(), k.buffer_offset()),
+            (v.metal_buffer(), v.buffer_offset()),
+            (out.metal_buffer(), out.buffer_offset()),
+        ],
+        bytemuck::bytes_of(&params),
+        MTLSize::new(n_heads as u64, 1, 1),
+        MTLSize::new(tg_size as u64, 1, 1),
+        tg_size * std::mem::size_of::<f32>(),
+    );
+
+    out
 }
 
 // ---- Paged KV Cache ----
@@ -764,6 +822,189 @@ mod tests {
         assert!(
             out_data[2] > out_data[0] && out_data[2] > out_data[1],
             "Expected dim 2 to dominate: {out_data:?}"
+        );
+    }
+
+    // ---- GPU Attention Kernel Tests ----
+
+    #[test]
+    fn test_attention_prefill_causal_mask() {
+        // Prefill with 3 query positions. Verify causal masking:
+        // - q[0] at offset=0 can only see k[0]
+        // - q[1] at offset=0 can see k[0..1]
+        // - q[2] at offset=0 can see k[0..2]
+        let c = ctx();
+        // K/V: 3 tokens, 1 head, dim=4. K are orthogonal unit vectors.
+        let k = MetalTensor::from_f32(
+            &c,
+            &[3, 1, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        );
+        let v = MetalTensor::from_f32(
+            &c,
+            &[3, 1, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
+        );
+        // Q: 3 tokens, each matching a different K.
+        // q[0]=[1,0,0,0] -> only sees k[0], so out = v[0] = [1,0,0,0]
+        // q[2]=[0,0,1,0] -> sees k[0..2], highest dot with k[2]
+        let q = MetalTensor::from_f32(
+            &c,
+            &[3, 1, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        );
+
+        let out = MetalBackend::fused_attention_prefill(&q, &k, &v, 0, None, None, None).unwrap();
+        assert_eq!(out.shape(), &[3, 1, 4]);
+        let data = out.as_f32_slice();
+
+        // q[0] can only attend to k[0]: output should be exactly v[0]
+        assert!(
+            (data[0] - 1.0).abs() < 1e-5,
+            "q[0] should output v[0]: got {:?}",
+            &data[0..4]
+        );
+        // q[2] should have dim 2 dominating (highest dot with k[2])
+        assert!(
+            data[10] > data[8] && data[10] > data[9],
+            "q[2] dim 2 should dominate: {:?}",
+            &data[8..12]
+        );
+    }
+
+    #[test]
+    fn test_attention_decode_gqa() {
+        // GQA: 4 query heads, 2 KV heads. Heads 0,1 share kv_head 0; heads 2,3 share kv_head 1.
+        let c = ctx();
+        // 2 KV tokens, 2 KV heads, dim=2
+        let k = MetalTensor::from_f32(
+            &c,
+            &[2, 2, 2],
+            &[
+                1.0, 0.0, // kv_token=0, kv_head=0
+                0.0, 1.0, // kv_token=0, kv_head=1
+                0.0, 1.0, // kv_token=1, kv_head=0
+                1.0, 0.0, // kv_token=1, kv_head=1
+            ],
+        );
+        let v = MetalTensor::from_f32(
+            &c,
+            &[2, 2, 2],
+            &[
+                1.0, 0.0, // kv_token=0, kv_head=0: v=[1,0]
+                0.0, 1.0, // kv_token=0, kv_head=1: v=[0,1]
+                2.0, 0.0, // kv_token=1, kv_head=0: v=[2,0]
+                0.0, 2.0, // kv_token=1, kv_head=1: v=[0,2]
+            ],
+        );
+        // Q: 1 token, 4 heads, dim=2
+        let q = MetalTensor::from_f32(
+            &c,
+            &[1, 4, 2],
+            &[
+                1.0, 0.0, // head 0 -> kv_head 0, matches k[0,0]=[1,0]
+                0.0, 1.0, // head 1 -> kv_head 0, matches k[1,0]=[0,1]
+                0.0, 1.0, // head 2 -> kv_head 1, matches k[0,1]=[0,1]
+                1.0, 0.0, // head 3 -> kv_head 1, matches k[1,1]=[1,0]
+            ],
+        );
+
+        let out = MetalBackend::fused_attention_decode(&q, &k, &v, None, None, None).unwrap();
+        assert_eq!(out.shape(), &[1, 4, 2]);
+        let data = out.as_f32_slice();
+
+        // Head 0 (kv_head 0): q=[1,0] dot k[0,0]=[1,0]=1, k[1,0]=[0,1]=0 => v[0,0]=[1,0] dominates
+        assert!(data[0] > data[1], "Head 0 dim 0 should dominate: {data:?}");
+        // Head 1 (kv_head 0): q=[0,1] dot k[0,0]=[1,0]=0, k[1,0]=[0,1]=1 => v[1,0]=[2,0] dominates
+        assert!(
+            data[2] > data[3],
+            "Head 1 dim 0 should dominate (v=[2,0]): {data:?}"
+        );
+        // Head 2 (kv_head 1): q=[0,1] dot k[0,1]=[0,1]=1, k[1,1]=[1,0]=0 => v[0,1]=[0,1] dominates
+        assert!(data[5] > data[4], "Head 2 dim 1 should dominate: {data:?}");
+        // Head 3 (kv_head 1): q=[1,0] dot k[0,1]=[0,1]=0, k[1,1]=[1,0]=1 => v[1,1]=[0,2] dominates
+        assert!(
+            data[7] > data[6],
+            "Head 3 dim 1 should dominate (v=[0,2]): {data:?}"
+        );
+    }
+
+    #[test]
+    fn test_attention_prefill_with_lse() {
+        let c = ctx();
+        // Single token, single head, dim=2. K has 1 token.
+        let q = MetalTensor::from_f32(&c, &[1, 1, 2], &[1.0, 0.0]);
+        let k = MetalTensor::from_f32(&c, &[1, 1, 2], &[1.0, 0.0]);
+        let v = MetalTensor::from_f32(&c, &[1, 1, 2], &[3.0, 7.0]);
+
+        let (out, lse) =
+            MetalBackend::fused_attention_prefill_with_lse(&q, &k, &v, 0, None, None, None)
+                .unwrap();
+
+        assert_eq!(out.shape(), &[1, 1, 2]);
+        assert_eq!(lse.shape(), &[1, 1]);
+        let out_data = out.as_f32_slice();
+        let lse_data = lse.as_f32_slice();
+
+        // Only one KV token: output = V exactly, LSE = score (no other terms)
+        assert!(
+            (out_data[0] - 3.0).abs() < 1e-4,
+            "Single-token output should be V: {out_data:?}"
+        );
+        assert!(
+            (out_data[1] - 7.0).abs() < 1e-4,
+            "Single-token output should be V: {out_data:?}"
+        );
+        // LSE = max + ln(sum_exp) = score + ln(1) = score
+        // score = dot(q,k) * scale = 1.0 * (1/sqrt(2))
+        let expected_lse = 1.0 / 2.0f32.sqrt();
+        assert!(
+            (lse_data[0] - expected_lse).abs() < 1e-4,
+            "LSE should be score for single token: got {}, expected {}",
+            lse_data[0],
+            expected_lse
+        );
+    }
+
+    #[test]
+    fn test_attention_decode_sliding_window() {
+        let c = ctx();
+        // 4 KV tokens, 1 head, dim=4. Sliding window = 2.
+        // Decode query at position 3 should only attend to positions [2, 3].
+        let k = MetalTensor::from_f32(
+            &c,
+            &[4, 1, 4],
+            &[
+                1.0, 0.0, 0.0, 0.0, // pos 0 — should be masked
+                0.0, 1.0, 0.0, 0.0, // pos 1 — should be masked
+                0.0, 0.0, 1.0, 0.0, // pos 2 — visible
+                0.0, 0.0, 0.0, 1.0, // pos 3 — visible
+            ],
+        );
+        let v = MetalTensor::from_f32(
+            &c,
+            &[4, 1, 4],
+            &[
+                100.0, 0.0, 0.0, 0.0, // pos 0: if visible, would dominate
+                0.0, 100.0, 0.0, 0.0, // pos 1: if visible, would dominate
+                0.0, 0.0, 5.0, 0.0, // pos 2
+                0.0, 0.0, 0.0, 5.0, // pos 3
+            ],
+        );
+        // Q matches pos 0 strongly, but window should block it
+        let q = MetalTensor::from_f32(&c, &[1, 1, 4], &[1.0, 0.0, 0.0, 0.0]);
+
+        let out = MetalBackend::fused_attention_decode(&q, &k, &v, None, None, Some(2)).unwrap();
+        let data = out.as_f32_slice();
+
+        // Pos 0 and 1 should be masked. Output should be a mix of v[2] and v[3] only.
+        assert!(
+            data[0].abs() < 1e-4 && data[1].abs() < 1e-4,
+            "Dims 0,1 should be ~0 (masked positions): {data:?}"
+        );
+        assert!(
+            data[2] > 0.0 || data[3] > 0.0,
+            "Some visible position value should appear: {data:?}"
         );
     }
 }
