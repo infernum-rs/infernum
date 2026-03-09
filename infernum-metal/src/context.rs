@@ -61,6 +61,8 @@ struct ActiveEncoder {
     encoder: *mut metal::ComputeCommandEncoderRef,
     /// Number of dispatches encoded (for stats).
     dispatch_count: u32,
+    /// Kernel names dispatched in this batch (for per-kernel counting).
+    kernel_names: Vec<String>,
 }
 
 // SAFETY: Metal command buffers and encoders are thread-safe when used
@@ -175,21 +177,11 @@ impl MetalContext {
     // Dispatch profiling
     // ------------------------------------------------------------------
 
-    /// Record a kernel dispatch timing.
-    fn record_dispatch(&self, kernel: &str, elapsed: Duration) {
-        let mut stats = self.inner.stats.lock().unwrap();
-        let entry = stats
-            .kernels
-            .entry(kernel.to_string())
-            .or_insert_with(KernelStats::default);
-        entry.count += 1;
-        entry.total_time += elapsed;
-    }
-
     /// Print a summary of dispatch statistics to stderr.
     ///
-    /// Shows per-kernel call count, total time, average time per call,
-    /// and percentage of total GPU time.
+    /// Shows total GPU wait time (from `_flush` entries) and per-kernel
+    /// dispatch counts sorted by frequency.
+    #[allow(clippy::cast_precision_loss)]
     pub fn print_dispatch_stats(&self) {
         let stats = self.inner.stats.lock().unwrap();
         if stats.kernels.is_empty() {
@@ -197,40 +189,40 @@ impl MetalContext {
             return;
         }
 
-        let total_time: Duration = stats.kernels.values().map(|s| s.total_time).sum();
-        let total_count: u64 = stats.kernels.values().map(|s| s.count).sum();
-        let total_ms = total_time.as_secs_f64() * 1000.0;
-
-        // Sort by cumulative time descending
-        let mut entries: Vec<_> = stats.kernels.iter().collect();
-        entries.sort_by(|a, b| b.1.total_time.cmp(&a.1.total_time));
+        // Separate _flush (has timing) from kernel dispatches (counts only).
+        let flush = stats.kernels.get("_flush");
+        let total_dispatches: u64 = stats
+            .kernels
+            .iter()
+            .filter(|(k, _)| *k != "_flush")
+            .map(|(_, s)| s.count)
+            .sum();
+        let flush_count = flush.map_or(0, |f| f.count);
+        let total_ms = flush.map_or(0.0, |f| f.total_time.as_secs_f64() * 1000.0);
 
         eprintln!();
         eprintln!(
-            "[Metal dispatch stats] {total_count} dispatches, {total_ms:.1}ms total GPU wait"
+            "[Metal dispatch stats] {total_dispatches} dispatches in {flush_count} flushes, \
+             {total_ms:.1}ms total GPU wait"
         );
-        eprintln!(
-            "{:<40} {:>8} {:>10} {:>10} {:>6}",
-            "kernel", "calls", "total(ms)", "avg(μs)", "%"
-        );
-        eprintln!("{}", "-".repeat(78));
+        eprintln!("{:<40} {:>8} {:>6}", "kernel", "calls", "%");
+        eprintln!("{}", "-".repeat(56));
+
+        // Sort kernel dispatches by count descending
+        let mut entries: Vec<_> = stats
+            .kernels
+            .iter()
+            .filter(|(k, _)| *k != "_flush")
+            .collect();
+        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
 
         for (name, ks) in &entries {
-            let ms = ks.total_time.as_secs_f64() * 1000.0;
-            let avg_us = if ks.count > 0 {
-                ks.total_time.as_secs_f64() * 1_000_000.0 / ks.count as f64
+            let pct = if total_dispatches > 0 {
+                ks.count as f64 / total_dispatches as f64 * 100.0
             } else {
                 0.0
             };
-            let pct = if total_ms > 0.0 {
-                ms / total_ms * 100.0
-            } else {
-                0.0
-            };
-            eprintln!(
-                "{name:<40} {c:>8} {ms:>9.1} {avg_us:>9.0} {pct:>5.1}%",
-                c = ks.count
-            );
+            eprintln!("{name:<40} {c:>8} {pct:>5.1}%", c = ks.count);
         }
         eprintln!();
     }
@@ -265,6 +257,7 @@ impl MetalContext {
             cmd,
             encoder,
             dispatch_count: 0,
+            kernel_names: Vec::new(),
         });
         encoder
     }
@@ -306,7 +299,9 @@ impl MetalContext {
         let group = MTLSize::new(tg, 1, 1);
         enc.dispatch_threads(grid, group);
 
-        active.as_mut().unwrap().dispatch_count += 1;
+        let ae = active.as_mut().unwrap();
+        ae.dispatch_count += 1;
+        ae.kernel_names.push(pipeline.to_owned());
     }
 
     /// Dispatch a 2-D compute kernel.
@@ -343,7 +338,9 @@ impl MetalContext {
         let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), 1);
         enc.dispatch_threads(grid, group);
 
-        active.as_mut().unwrap().dispatch_count += 1;
+        let ae = active.as_mut().unwrap();
+        ae.dispatch_count += 1;
+        ae.kernel_names.push(pipeline.to_owned());
     }
 
     /// Dispatch a compute kernel with explicit threadgroup counts.
@@ -382,7 +379,9 @@ impl MetalContext {
 
         enc.dispatch_thread_groups(threadgroups, threads_per_group);
 
-        active.as_mut().unwrap().dispatch_count += 1;
+        let ae = active.as_mut().unwrap();
+        ae.dispatch_count += 1;
+        ae.kernel_names.push(pipeline.to_owned());
     }
 
     /// Commit all pending GPU work and block until complete.
@@ -402,7 +401,20 @@ impl MetalContext {
         let t0 = Instant::now();
         ae.cmd.commit();
         ae.cmd.wait_until_completed();
-        self.record_dispatch("_flush", t0.elapsed());
+        let elapsed = t0.elapsed();
+
+        // Record per-kernel dispatch counts (no individual GPU timing).
+        // The elapsed time is the total for all dispatches in this batch.
+        {
+            let mut stats = self.inner.stats.lock().unwrap();
+            for name in &ae.kernel_names {
+                let entry = stats.kernels.entry(name.clone()).or_default();
+                entry.count += 1;
+            }
+            let flush_entry = stats.kernels.entry("_flush".to_owned()).or_default();
+            flush_entry.count += 1;
+            flush_entry.total_time += elapsed;
+        }
     }
 }
 
