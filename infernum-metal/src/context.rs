@@ -10,7 +10,6 @@
 //! kernel implementations.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +48,25 @@ pub struct MetalContext {
     inner: Arc<MetalContextInner>,
 }
 
+/// Active command buffer + encoder for batching dispatches.
+///
+/// All dispatches within a decode step encode onto the same command buffer
+/// and compute encoder, eliminating per-dispatch command buffer overhead.
+/// `flush()` ends the encoder, commits the buffer, and waits.
+struct ActiveEncoder {
+    /// Owned (retained) command buffer.
+    cmd: metal::CommandBuffer,
+    /// Raw pointer to the active compute command encoder.
+    /// Valid as long as `cmd` is alive and `end_encoding()` hasn't been called.
+    encoder: *mut metal::ComputeCommandEncoderRef,
+    /// Number of dispatches encoded (for stats).
+    dispatch_count: u32,
+}
+
+// SAFETY: Metal command buffers and encoders are thread-safe when used
+// behind a Mutex (which we do via active_encoder).
+unsafe impl Send for ActiveEncoder {}
+
 struct MetalContextInner {
     device: Device,
     queue: metal::CommandQueue,
@@ -56,9 +74,8 @@ struct MetalContextInner {
     pipelines: HashMap<String, metal::ComputePipelineState>,
     /// Dispatch profiling stats (behind Mutex for interior mutability).
     stats: Mutex<DispatchStats>,
-    /// True when GPU dispatches have been committed but not yet waited on.
-    /// `flush()` drains pending work; CPU reads must call `flush()` first.
-    has_pending: AtomicBool,
+    /// Active command buffer + encoder, or None if no work is pending.
+    active_encoder: Mutex<Option<ActiveEncoder>>,
 }
 
 // SAFETY: Metal objects are thread-safe when accessed through command buffers.
@@ -96,7 +113,7 @@ impl MetalContext {
                 queue,
                 pipelines,
                 stats: Mutex::new(DispatchStats::default()),
-                has_pending: AtomicBool::new(false),
+                active_encoder: Mutex::new(None),
             }),
         }
     }
@@ -119,7 +136,7 @@ impl MetalContext {
                 queue,
                 pipelines,
                 stats: Mutex::new(DispatchStats::default()),
-                has_pending: AtomicBool::new(false),
+                active_encoder: Mutex::new(None),
             }),
         })
     }
@@ -152,12 +169,6 @@ impl MetalContext {
     #[must_use]
     pub fn has_pipeline(&self, name: &str) -> bool {
         self.inner.pipelines.contains_key(name)
-    }
-
-    /// Create a new command buffer from the queue.
-    #[must_use]
-    pub fn command_buffer(&self) -> &metal::CommandBufferRef {
-        self.inner.queue.new_command_buffer()
     }
 
     // ------------------------------------------------------------------
@@ -231,24 +242,41 @@ impl MetalContext {
     }
 
     // ------------------------------------------------------------------
+    // Shared encoder management
+    // ------------------------------------------------------------------
+
+    /// Get the active compute command encoder, creating a new command
+    /// buffer + encoder pair if none exists.
+    ///
+    /// Returns a raw pointer to the encoder. The caller must hold the
+    /// `active_encoder` lock for the duration of encoding.
+    fn ensure_encoder(
+        active: &mut Option<ActiveEncoder>,
+        queue: &metal::CommandQueue,
+    ) -> *mut metal::ComputeCommandEncoderRef {
+        if let Some(ref ae) = active {
+            return ae.encoder;
+        }
+        let cmd_ref = queue.new_command_buffer();
+        let cmd = cmd_ref.to_owned();
+        let enc = cmd_ref.new_compute_command_encoder();
+        let encoder = std::ptr::from_ref(enc).cast_mut();
+        *active = Some(ActiveEncoder {
+            cmd,
+            encoder,
+            dispatch_count: 0,
+        });
+        encoder
+    }
+
+    // ------------------------------------------------------------------
     // Dispatch helpers
     // ------------------------------------------------------------------
 
     /// Dispatch a 1-D compute kernel.
     ///
-    /// * `pipeline` — kernel function name (must be in the loaded metallib).
-    /// * `buffers`  — `(buffer, offset)` pairs bound in order to buffer
-    ///   indices 0, 1, 2, …
-    /// * `params`   — raw bytes bound to the *next* buffer index after
-    ///   `buffers`.  Pass `&[]` when the kernel has no extra parameters.
-    /// * `n`        — total number of threads to launch.
-    ///
-    /// Creates a command buffer, encodes the compute command, commits,
-    /// and **blocks** until completion.
-    ///
-    /// # Panics
-    /// Panics if the pipeline is not found or if the command buffer
-    /// reports an error.
+    /// Encodes onto the shared command buffer without committing.
+    /// Call [`flush`](Self::flush) to submit all pending work.
     #[allow(clippy::cast_possible_truncation)]
     pub fn dispatch_1d(
         &self,
@@ -258,8 +286,9 @@ impl MetalContext {
         n: usize,
     ) {
         let pso = self.pipeline(pipeline);
-        let cmd = self.command_buffer();
-        let enc = cmd.new_compute_command_encoder();
+        let mut active = self.inner.active_encoder.lock().unwrap();
+        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let enc = unsafe { &*enc_ptr };
 
         enc.set_compute_pipeline_state(pso);
 
@@ -276,18 +305,13 @@ impl MetalContext {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(tg, 1, 1);
         enc.dispatch_threads(grid, group);
-        enc.end_encoding();
 
-        let t0 = Instant::now();
-        cmd.commit();
-        self.inner.has_pending.store(true, Ordering::Release);
-        self.record_dispatch(pipeline, t0.elapsed());
+        active.as_mut().unwrap().dispatch_count += 1;
     }
 
     /// Dispatch a 2-D compute kernel.
     ///
-    /// Same as [`dispatch_1d`](Self::dispatch_1d) but launches a
-    /// `width × height` grid.
+    /// Encodes onto the shared command buffer without committing.
     #[allow(clippy::cast_possible_truncation)]
     pub fn dispatch_2d(
         &self,
@@ -298,8 +322,9 @@ impl MetalContext {
         height: usize,
     ) {
         let pso = self.pipeline(pipeline);
-        let cmd = self.command_buffer();
-        let enc = cmd.new_compute_command_encoder();
+        let mut active = self.inner.active_encoder.lock().unwrap();
+        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let enc = unsafe { &*enc_ptr };
 
         enc.set_compute_pipeline_state(pso);
 
@@ -317,27 +342,14 @@ impl MetalContext {
         let grid = MTLSize::new(width as u64, height as u64, 1);
         let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), 1);
         enc.dispatch_threads(grid, group);
-        enc.end_encoding();
 
-        let t0 = Instant::now();
-        cmd.commit();
-        self.inner.has_pending.store(true, Ordering::Release);
-        self.record_dispatch(pipeline, t0.elapsed());
+        active.as_mut().unwrap().dispatch_count += 1;
     }
 
     /// Dispatch a compute kernel with explicit threadgroup counts.
     ///
-    /// Unlike [`dispatch_1d`](Self::dispatch_1d), this uses
-    /// `dispatch_thread_groups` (not `dispatch_threads`), giving the
-    /// caller full control over the grid layout. Supports threadgroup
-    /// shared memory via `threadgroup_mem_len`.
-    ///
-    /// * `pipeline`            — kernel function name.
-    /// * `buffers`             — `(buffer, offset)` pairs.
-    /// * `params`              — raw bytes for extra parameters.
-    /// * `threadgroups`        — number of threadgroups `(x, y, z)`.
-    /// * `threads_per_group`   — threads per threadgroup `(x, y, z)`.
-    /// * `threadgroup_mem_len` — bytes of threadgroup memory (0 = none).
+    /// Encodes onto the shared command buffer without committing.
+    /// Supports threadgroup shared memory via `threadgroup_mem_len`.
     #[allow(clippy::cast_possible_truncation)]
     pub fn dispatch_threadgroups(
         &self,
@@ -349,8 +361,9 @@ impl MetalContext {
         threadgroup_mem_len: usize,
     ) {
         let pso = self.pipeline(pipeline);
-        let cmd = self.command_buffer();
-        let enc = cmd.new_compute_command_encoder();
+        let mut active = self.inner.active_encoder.lock().unwrap();
+        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let enc = unsafe { &*enc_ptr };
 
         enc.set_compute_pipeline_state(pso);
 
@@ -364,34 +377,31 @@ impl MetalContext {
         }
 
         if threadgroup_mem_len > 0 {
-            // Threadgroup memory index matches MSL [[threadgroup(N)]] attribute.
-            // All our kernels use [[threadgroup(0)]].
             enc.set_threadgroup_memory_length(0, threadgroup_mem_len as u64);
         }
 
         enc.dispatch_thread_groups(threadgroups, threads_per_group);
+
+        active.as_mut().unwrap().dispatch_count += 1;
+    }
+
+    /// Commit all pending GPU work and block until complete.
+    ///
+    /// Ends the active compute encoder, commits the command buffer, and
+    /// waits for completion. No-op if no work is pending.
+    pub fn flush(&self) {
+        let mut active = self.inner.active_encoder.lock().unwrap();
+        let Some(ae) = active.take() else {
+            return;
+        };
+
+        // End encoding and commit
+        let enc = unsafe { &*ae.encoder };
         enc.end_encoding();
 
         let t0 = Instant::now();
-        cmd.commit();
-        self.inner.has_pending.store(true, Ordering::Release);
-        self.record_dispatch(pipeline, t0.elapsed());
-    }
-
-    /// Ensure all committed GPU work has completed before CPU reads.
-    ///
-    /// Submits an empty command buffer and blocks until it completes.
-    /// Since command buffers execute in queue order, this guarantees all
-    /// prior dispatches have finished.  No-op if no work is pending.
-    pub fn flush(&self) {
-        if !self.inner.has_pending.load(Ordering::Acquire) {
-            return;
-        }
-        let t0 = Instant::now();
-        let cmd = self.command_buffer();
-        cmd.commit();
-        cmd.wait_until_completed();
-        self.inner.has_pending.store(false, Ordering::Release);
+        ae.cmd.commit();
+        ae.cmd.wait_until_completed();
         self.record_dispatch("_flush", t0.elapsed());
     }
 }
@@ -474,9 +484,7 @@ mod tests {
 
     #[test]
     fn test_context_creation() {
-        let ctx = MetalContext::new();
-        // Verify we can create a command buffer without panic
-        let _cmd = ctx.command_buffer();
+        let _ctx = MetalContext::new();
     }
 
     #[test]
