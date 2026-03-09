@@ -199,21 +199,29 @@ kernel void gemv_q6k_f32(
 }
 
 // ==========================================================================
-// SIMD-group cooperative Q8 GEMV: one SIMD-group (32 threads) per output
-// neuron. Each thread processes a strided subset of K-blocks and the
-// partial sums are reduced with simd_sum().
-// Grid: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
+// Optimized Q8_0 GEMV: 4 output neurons per threadgroup (4 SIMD-groups).
+//
+// Each SIMD-group (32 threads) handles one neuron. 4 SIMD-groups share
+// the same threadgroup, enabling future input-sharing optimizations.
+// Weight loads use uint4 (16 bytes = 16 int8 values) per thread.
+//
+// Grid: (ceil(N/4), 1, 1), threads_per_group = (128, 1, 1).
 // ==========================================================================
+constant constexpr uint Q8_ROWS_PER_TG = 4;
+
 kernel void gemv_q8_simd_f32(
     device const float*  input         [[buffer(0)]],
     device const uchar*  weight_data   [[buffer(1)]],
     device const float*  weight_scales [[buffer(2)]],
     device float*        output        [[buffer(3)]],
     constant QuantizedLinearParams& params [[buffer(4)]],
-    uint group_id [[threadgroup_position_in_grid]],
-    uint lane     [[thread_index_in_simdgroup]])
+    uint group_id  [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]])
 {
-    const uint neuron = group_id;
+    const uint simd_idx = tid / 32;  // which of 4 SIMD-groups
+    const uint lane = tid % 32;      // lane within SIMD-group
+
+    const uint neuron = group_id * Q8_ROWS_PER_TG + simd_idx;
     if (neuron >= params.N) return;
 
     const uint K = params.K;
@@ -221,22 +229,72 @@ kernel void gemv_q8_simd_f32(
     const uint num_blocks = K / BLOCK_SIZE;
     const uint quant_bytes_per_row = num_blocks * BLOCK_SIZE;
 
-    const uint q_start = neuron * quant_bytes_per_row;
-    const uint s_start = neuron * num_blocks;
+    device const uchar* row_data = weight_data + neuron * quant_bytes_per_row;
+    device const float* row_scales = weight_scales + neuron * num_blocks;
 
     float partial = 0.0f;
 
-    // Each of 32 lanes handles blocks [lane, lane+32, lane+64, ...]
+    // Each lane handles blocks [lane, lane+32, ...]
     for (uint b = lane; b < num_blocks; b += 32) {
-        float scale = weight_scales[s_start + b];
-        uint block_start = q_start + b * BLOCK_SIZE;
-        uint inp_start = b * BLOCK_SIZE;
+        float scale = row_scales[b];
+        device const uchar* block_ptr = row_data + b * BLOCK_SIZE;
+        device const float4* inp_ptr = (device const float4*)(input + b * BLOCK_SIZE);
 
+        // Load 32 bytes as 2 × uint4 (each uint4 = 16 bytes = 16 int8 values)
+        device const uint4* w_ptr = (device const uint4*)block_ptr;
+        uint4 w0 = w_ptr[0];  // bytes 0-15
+        uint4 w1 = w_ptr[1];  // bytes 16-31
+
+        // Load 32 input floats as 8 × float4
+        float4 x0 = inp_ptr[0];
+        float4 x1 = inp_ptr[1];
+        float4 x2 = inp_ptr[2];
+        float4 x3 = inp_ptr[3];
+        float4 x4 = inp_ptr[4];
+        float4 x5 = inp_ptr[5];
+        float4 x6 = inp_ptr[6];
+        float4 x7 = inp_ptr[7];
+
+        // Unpack and dot-product: extract bytes from uint4 components
+        // w0.x has bytes 0-3, w0.y has bytes 4-7, etc.
         float block_sum = 0.0f;
-        for (uint j = 0; j < BLOCK_SIZE; j++) {
-            float q = float(as_type<char>(weight_data[block_start + j]));
-            block_sum += input[inp_start + j] * q;
-        }
+
+        // Process w0 (16 bytes → 16 int8 values → pairs with x0..x3)
+        block_sum += x0.x * float(as_type<char4>(w0.x).x);
+        block_sum += x0.y * float(as_type<char4>(w0.x).y);
+        block_sum += x0.z * float(as_type<char4>(w0.x).z);
+        block_sum += x0.w * float(as_type<char4>(w0.x).w);
+        block_sum += x1.x * float(as_type<char4>(w0.y).x);
+        block_sum += x1.y * float(as_type<char4>(w0.y).y);
+        block_sum += x1.z * float(as_type<char4>(w0.y).z);
+        block_sum += x1.w * float(as_type<char4>(w0.y).w);
+        block_sum += x2.x * float(as_type<char4>(w0.z).x);
+        block_sum += x2.y * float(as_type<char4>(w0.z).y);
+        block_sum += x2.z * float(as_type<char4>(w0.z).z);
+        block_sum += x2.w * float(as_type<char4>(w0.z).w);
+        block_sum += x3.x * float(as_type<char4>(w0.w).x);
+        block_sum += x3.y * float(as_type<char4>(w0.w).y);
+        block_sum += x3.z * float(as_type<char4>(w0.w).z);
+        block_sum += x3.w * float(as_type<char4>(w0.w).w);
+
+        // Process w1 (16 bytes → 16 int8 values → pairs with x4..x7)
+        block_sum += x4.x * float(as_type<char4>(w1.x).x);
+        block_sum += x4.y * float(as_type<char4>(w1.x).y);
+        block_sum += x4.z * float(as_type<char4>(w1.x).z);
+        block_sum += x4.w * float(as_type<char4>(w1.x).w);
+        block_sum += x5.x * float(as_type<char4>(w1.y).x);
+        block_sum += x5.y * float(as_type<char4>(w1.y).y);
+        block_sum += x5.z * float(as_type<char4>(w1.y).z);
+        block_sum += x5.w * float(as_type<char4>(w1.y).w);
+        block_sum += x6.x * float(as_type<char4>(w1.z).x);
+        block_sum += x6.y * float(as_type<char4>(w1.z).y);
+        block_sum += x6.z * float(as_type<char4>(w1.z).z);
+        block_sum += x6.w * float(as_type<char4>(w1.z).w);
+        block_sum += x7.x * float(as_type<char4>(w1.w).x);
+        block_sum += x7.y * float(as_type<char4>(w1.w).y);
+        block_sum += x7.z * float(as_type<char4>(w1.w).z);
+        block_sum += x7.w * float(as_type<char4>(w1.w).w);
+
         partial += block_sum * scale;
     }
 
@@ -247,19 +305,31 @@ kernel void gemv_q8_simd_f32(
 }
 
 // ==========================================================================
-// SIMD-group cooperative Q4_0 GEMV: one SIMD-group per output neuron.
-// Grid: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
+// Optimized Q4_0 GEMV: 4 output neurons per threadgroup (4 SIMD-groups).
+//
+// Each SIMD-group handles one neuron. Weight block = 16 packed bytes
+// (32 nibbles) loaded as a single uint4. Input loaded as float4.
+//
+// Nibble layout: byte[j] → lo nibble = element j, hi nibble = element j+16.
+// Both offset by -8.
+//
+// Grid: (ceil(N/4), 1, 1), threads_per_group = (128, 1, 1).
 // ==========================================================================
+constant constexpr uint Q4_ROWS_PER_TG = 4;
+
 kernel void gemv_q4_simd_f32(
     device const float*  input         [[buffer(0)]],
     device const uchar*  weight_data   [[buffer(1)]],
     device const float*  weight_scales [[buffer(2)]],
     device float*        output        [[buffer(3)]],
     constant QuantizedLinearParams& params [[buffer(4)]],
-    uint group_id [[threadgroup_position_in_grid]],
-    uint lane     [[thread_index_in_simdgroup]])
+    uint group_id  [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]])
 {
-    const uint neuron = group_id;
+    const uint simd_idx = tid / 32;
+    const uint lane = tid % 32;
+
+    const uint neuron = group_id * Q4_ROWS_PER_TG + simd_idx;
     if (neuron >= params.N) return;
 
     const uint K = params.K;
@@ -268,24 +338,87 @@ kernel void gemv_q4_simd_f32(
     const uint num_blocks = K / BLOCK_SIZE;
     const uint packed_bytes_per_row = num_blocks * HALF_BLOCK;
 
-    const uint p_start = neuron * packed_bytes_per_row;
-    const uint s_start = neuron * num_blocks;
+    device const uchar* row_data = weight_data + neuron * packed_bytes_per_row;
+    device const float* row_scales = weight_scales + neuron * num_blocks;
 
     float partial = 0.0f;
 
     for (uint b = lane; b < num_blocks; b += 32) {
-        float scale = weight_scales[s_start + b];
-        uint block_start = p_start + b * HALF_BLOCK;
-        uint inp_start = b * BLOCK_SIZE;
+        float scale = row_scales[b];
+        device const uchar* block_ptr = row_data + b * HALF_BLOCK;
 
+        // Load all 16 packed bytes as a single uint4 (16 bytes)
+        uint4 packed = ((device const uint4*)block_ptr)[0];
+
+        // Load 32 input floats: first 16 for lo nibbles, next 16 for hi nibbles
+        uint inp_start = b * BLOCK_SIZE;
+        device const float4* lo_ptr = (device const float4*)(input + inp_start);
+        device const float4* hi_ptr = (device const float4*)(input + inp_start + 16);
+
+        float4 lo_x0 = lo_ptr[0];  // input[0..3]
+        float4 lo_x1 = lo_ptr[1];  // input[4..7]
+        float4 lo_x2 = lo_ptr[2];  // input[8..11]
+        float4 lo_x3 = lo_ptr[3];  // input[12..15]
+        float4 hi_x0 = hi_ptr[0];  // input[16..19]
+        float4 hi_x1 = hi_ptr[1];  // input[20..23]
+        float4 hi_x2 = hi_ptr[2];  // input[24..27]
+        float4 hi_x3 = hi_ptr[3];  // input[28..31]
+
+        // Unpack nibbles from packed uint4.
+        // packed.x = bytes 0-3, packed.y = bytes 4-7,
+        // packed.z = bytes 8-11, packed.w = bytes 12-15.
+        // byte[j]: lo nibble = element j (offset -8), hi nibble = element j+16 (offset -8).
         float block_sum = 0.0f;
-        for (uint j = 0; j < HALF_BLOCK; j++) {
-            uchar byte_val = weight_data[block_start + j];
-            float lo = float(int(byte_val & 0x0F) - 8);
-            float hi = float(int(byte_val >> 4) - 8);
-            block_sum += input[inp_start + j] * lo;
-            block_sum += input[inp_start + j + 16] * hi;
-        }
+
+        // Helper: extract lo/hi nibbles from 4 bytes in a uint
+        // Byte 0 of u: lo = (u & 0xF) - 8, hi = ((u >> 4) & 0xF) - 8
+        // Byte 1 of u: lo = ((u >> 8) & 0xF) - 8, hi = ((u >> 12) & 0xF) - 8
+        // etc.
+
+        // Process packed.x (bytes 0-3 → elements 0-3 lo, 16-19 hi)
+        uchar4 b0 = as_type<uchar4>(packed.x);
+        block_sum += lo_x0.x * float(int(b0.x & 0x0F) - 8);
+        block_sum += hi_x0.x * float(int(b0.x >> 4) - 8);
+        block_sum += lo_x0.y * float(int(b0.y & 0x0F) - 8);
+        block_sum += hi_x0.y * float(int(b0.y >> 4) - 8);
+        block_sum += lo_x0.z * float(int(b0.z & 0x0F) - 8);
+        block_sum += hi_x0.z * float(int(b0.z >> 4) - 8);
+        block_sum += lo_x0.w * float(int(b0.w & 0x0F) - 8);
+        block_sum += hi_x0.w * float(int(b0.w >> 4) - 8);
+
+        // Process packed.y (bytes 4-7 → elements 4-7 lo, 20-23 hi)
+        uchar4 b1 = as_type<uchar4>(packed.y);
+        block_sum += lo_x1.x * float(int(b1.x & 0x0F) - 8);
+        block_sum += hi_x1.x * float(int(b1.x >> 4) - 8);
+        block_sum += lo_x1.y * float(int(b1.y & 0x0F) - 8);
+        block_sum += hi_x1.y * float(int(b1.y >> 4) - 8);
+        block_sum += lo_x1.z * float(int(b1.z & 0x0F) - 8);
+        block_sum += hi_x1.z * float(int(b1.z >> 4) - 8);
+        block_sum += lo_x1.w * float(int(b1.w & 0x0F) - 8);
+        block_sum += hi_x1.w * float(int(b1.w >> 4) - 8);
+
+        // Process packed.z (bytes 8-11 → elements 8-11 lo, 24-27 hi)
+        uchar4 b2 = as_type<uchar4>(packed.z);
+        block_sum += lo_x2.x * float(int(b2.x & 0x0F) - 8);
+        block_sum += hi_x2.x * float(int(b2.x >> 4) - 8);
+        block_sum += lo_x2.y * float(int(b2.y & 0x0F) - 8);
+        block_sum += hi_x2.y * float(int(b2.y >> 4) - 8);
+        block_sum += lo_x2.z * float(int(b2.z & 0x0F) - 8);
+        block_sum += hi_x2.z * float(int(b2.z >> 4) - 8);
+        block_sum += lo_x2.w * float(int(b2.w & 0x0F) - 8);
+        block_sum += hi_x2.w * float(int(b2.w >> 4) - 8);
+
+        // Process packed.w (bytes 12-15 → elements 12-15 lo, 28-31 hi)
+        uchar4 b3 = as_type<uchar4>(packed.w);
+        block_sum += lo_x3.x * float(int(b3.x & 0x0F) - 8);
+        block_sum += hi_x3.x * float(int(b3.x >> 4) - 8);
+        block_sum += lo_x3.y * float(int(b3.y & 0x0F) - 8);
+        block_sum += hi_x3.y * float(int(b3.y >> 4) - 8);
+        block_sum += lo_x3.z * float(int(b3.z & 0x0F) - 8);
+        block_sum += hi_x3.z * float(int(b3.z >> 4) - 8);
+        block_sum += lo_x3.w * float(int(b3.w & 0x0F) - 8);
+        block_sum += hi_x3.w * float(int(b3.w >> 4) - 8);
+
         partial += block_sum * scale;
     }
 
