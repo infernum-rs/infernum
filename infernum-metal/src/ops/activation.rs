@@ -1,42 +1,50 @@
-//! SwigluOps and GegluOps implementations for Metal.
-//!
-//! Phase 1: CPU-side via unified memory.
+//! SwigluOps and GegluOps implementations for Metal — GPU kernel dispatch.
 
 use infernum::backend::{GegluOps, SwigluOps};
 use infernum::tensor::Tensor;
+use infernum::DType;
 use infernum::Result;
 
 use crate::tensor::MetalTensor;
 use crate::MetalBackend;
 
-/// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
-/// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
-fn gelu(x: f32) -> f32 {
-    let c = std::f32::consts::FRAC_2_PI.sqrt();
-    0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh())
-}
-
 impl SwigluOps for MetalBackend {
     fn swiglu(gate: &MetalTensor, up: &MetalTensor) -> Result<MetalTensor> {
-        let g = gate.as_f32_slice();
-        let u = up.as_f32_slice();
-        assert_eq!(g.len(), u.len(), "swiglu: gate/up length mismatch");
-        let out: Vec<f32> = g.iter().zip(u.iter()).map(|(g, u)| silu(*g) * u).collect();
-        Ok(MetalTensor::from_f32(gate.context(), gate.shape(), &out))
+        let n = gate.numel();
+        assert_eq!(n, up.numel(), "swiglu: gate/up length mismatch");
+        let ctx = gate.context();
+        let out = MetalTensor::zeros(ctx, gate.shape(), DType::F32);
+        ctx.dispatch_1d(
+            "swiglu_f32",
+            &[
+                (gate.metal_buffer(), gate.buffer_offset()),
+                (up.metal_buffer(), up.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            &[],
+            n,
+        );
+        Ok(out)
     }
 }
 
 impl GegluOps for MetalBackend {
     fn geglu(gate: &MetalTensor, up: &MetalTensor) -> Result<MetalTensor> {
-        let g = gate.as_f32_slice();
-        let u = up.as_f32_slice();
-        assert_eq!(g.len(), u.len(), "geglu: gate/up length mismatch");
-        let out: Vec<f32> = g.iter().zip(u.iter()).map(|(g, u)| gelu(*g) * u).collect();
-        Ok(MetalTensor::from_f32(gate.context(), gate.shape(), &out))
+        let n = gate.numel();
+        assert_eq!(n, up.numel(), "geglu: gate/up length mismatch");
+        let ctx = gate.context();
+        let out = MetalTensor::zeros(ctx, gate.shape(), DType::F32);
+        ctx.dispatch_1d(
+            "geglu_f32",
+            &[
+                (gate.metal_buffer(), gate.buffer_offset()),
+                (up.metal_buffer(), up.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            &[],
+            n,
+        );
+        Ok(out)
     }
 }
 

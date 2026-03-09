@@ -1,4 +1,4 @@
-//! BiasOps implementation for Metal — row-wise bias addition.
+//! BiasOps implementation for Metal — row-wise bias addition via GPU kernel.
 
 use infernum::backend::BiasOps;
 use infernum::tensor::Tensor;
@@ -9,9 +9,8 @@ use crate::MetalBackend;
 
 impl BiasOps for MetalBackend {
     fn bias_add_inplace(input: &mut MetalTensor, bias: &MetalTensor) -> Result<()> {
-        let shape = input.shape().to_vec();
-        let cols = *shape.last().unwrap();
-        let rows = input.numel() / cols;
+        let cols = *input.shape().last().unwrap();
+        let n = input.numel();
 
         assert_eq!(
             bias.numel(),
@@ -20,17 +19,18 @@ impl BiasOps for MetalBackend {
             bias.numel()
         );
 
-        let mut data = input.as_f32_slice().to_vec();
-        let bias_data = bias.as_f32_slice();
-
-        for r in 0..rows {
-            let offset = r * cols;
-            for c in 0..cols {
-                data[offset + c] += bias_data[c];
-            }
-        }
-
-        *input = MetalTensor::from_f32(input.context(), &shape, &data);
+        #[allow(clippy::cast_possible_truncation)]
+        let cols_u32 = cols as u32;
+        let ctx = input.context().clone();
+        ctx.dispatch_1d(
+            "bias_add_inplace_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (bias.metal_buffer(), bias.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&cols_u32),
+            n,
+        );
         Ok(())
     }
 }

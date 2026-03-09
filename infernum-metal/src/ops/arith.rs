@@ -1,7 +1,4 @@
-//! ArithOps implementation for Metal — element-wise arithmetic.
-//!
-//! Phase 1: CPU-side via unified memory. Metal compute kernels can be
-//! swapped in later for throughput.
+//! ArithOps implementation for Metal — element-wise arithmetic via GPU kernels.
 
 use infernum::backend::ArithOps;
 use infernum::tensor::Tensor;
@@ -13,51 +10,67 @@ use crate::MetalBackend;
 
 impl ArithOps for MetalBackend {
     fn add(a: &MetalTensor, b: &MetalTensor) -> Result<MetalTensor> {
-        let a_f32 = read_f32(a)?;
-        let b_f32 = read_f32(b)?;
-        assert_eq!(a_f32.len(), b_f32.len(), "add: length mismatch");
-        let out: Vec<f32> = a_f32.iter().zip(b_f32.iter()).map(|(x, y)| x + y).collect();
-        Ok(MetalTensor::from_f32(a.context(), a.shape(), &out))
+        let n = a.numel();
+        assert_eq!(n, b.numel(), "add: length mismatch");
+        let ctx = a.context();
+        let out = MetalTensor::zeros(ctx, a.shape(), DType::F32);
+        ctx.dispatch_1d(
+            "add_f32",
+            &[
+                (a.metal_buffer(), a.buffer_offset()),
+                (b.metal_buffer(), b.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            &[],
+            n,
+        );
+        Ok(out)
     }
 
     fn add_inplace(a: &mut MetalTensor, b: &MetalTensor) -> Result<()> {
-        let result = Self::add(a, b)?;
-        *a = result;
+        let n = a.numel();
+        assert_eq!(n, b.numel(), "add_inplace: length mismatch");
+        let ctx = a.context().clone();
+        ctx.dispatch_1d(
+            "add_inplace_f32",
+            &[
+                (a.metal_buffer(), a.buffer_offset()),
+                (b.metal_buffer(), b.buffer_offset()),
+            ],
+            &[],
+            n,
+        );
         Ok(())
     }
 
     fn mul(a: &MetalTensor, b: &MetalTensor) -> Result<MetalTensor> {
-        let a_f32 = read_f32(a)?;
-        let b_f32 = read_f32(b)?;
-        assert_eq!(a_f32.len(), b_f32.len(), "mul: length mismatch");
-        let out: Vec<f32> = a_f32.iter().zip(b_f32.iter()).map(|(x, y)| x * y).collect();
-        Ok(MetalTensor::from_f32(a.context(), a.shape(), &out))
+        let n = a.numel();
+        assert_eq!(n, b.numel(), "mul: length mismatch");
+        let ctx = a.context();
+        let out = MetalTensor::zeros(ctx, a.shape(), DType::F32);
+        ctx.dispatch_1d(
+            "mul_f32",
+            &[
+                (a.metal_buffer(), a.buffer_offset()),
+                (b.metal_buffer(), b.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            &[],
+            n,
+        );
+        Ok(out)
     }
 
     fn scale_inplace(a: &mut MetalTensor, scale: f32) -> Result<()> {
-        let a_f32 = read_f32(a)?;
-        let out: Vec<f32> = a_f32.iter().map(|x| x * scale).collect();
-        *a = MetalTensor::from_f32(a.context(), a.shape(), &out);
+        let n = a.numel();
+        let ctx = a.context().clone();
+        ctx.dispatch_1d(
+            "scale_inplace_f32",
+            &[(a.metal_buffer(), a.buffer_offset())],
+            bytemuck::bytes_of(&scale),
+            n,
+        );
         Ok(())
-    }
-}
-
-/// Helper: read tensor data as f32 regardless of stored dtype.
-fn read_f32(t: &MetalTensor) -> Result<Vec<f32>> {
-    let bytes = t.as_bytes();
-    match t.dtype() {
-        DType::F32 => Ok(bytemuck::cast_slice(bytes).to_vec()),
-        DType::BF16 => {
-            let bf16s: &[half::bf16] = bytemuck::cast_slice(bytes);
-            Ok(bf16s.iter().map(|v| v.to_f32()).collect())
-        }
-        DType::F16 => {
-            let f16s: &[half::f16] = bytemuck::cast_slice(bytes);
-            Ok(f16s.iter().map(|v| v.to_f32()).collect())
-        }
-        other => Err(infernum::Error::UnsupportedDtype(format!(
-            "arith read_f32: unsupported dtype {other}"
-        ))),
     }
 }
 
