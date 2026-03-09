@@ -16,12 +16,14 @@ use crate::tensor::MetalTensor;
 use crate::MetalBackend;
 use crate::MetalContext;
 
+use std::sync::Arc;
+
 // ---- Quantized weight type ----
 
 /// Block-quantized weight for Metal inference.
 ///
-/// Stores quantized data and per-block scales separately, matching the
-/// GGUF loader output. Layout is row-major: `out_features` rows of
+/// Stores quantized data and per-block scales in Metal buffers for GPU
+/// kernel dispatch. Layout is row-major: `out_features` rows of
 /// `in_features` elements.
 ///
 /// For `Q8_0`/`Q4_0`/`Q4_1`: `in_features / 32` blocks per row, scales
@@ -29,20 +31,58 @@ use crate::MetalContext;
 ///
 /// For `Q6_K`: raw packed super-blocks (210 bytes per 256 elements) stored
 /// directly in `data`. Scales and `d` are embedded in the super-block bytes;
-/// the `scales` and `mins` fields are empty.
+/// the `scales` buffer is a placeholder.
 #[derive(Clone)]
 pub struct MetalQuantizedWeight {
     /// Logical shape: `[out_features, in_features]`
     pub shape: Vec<usize>,
     /// Quantization format (`Q8_0`, `Q4_0`, `Q4_1`, or `Q6_K`)
     pub dtype: DType,
-    /// Raw quantized data — int8 bytes (Q8_0), packed nibbles (Q4_0/Q4_1),
-    /// or packed super-blocks (Q6_K, 210 bytes per 256 elements)
-    pub data: Vec<u8>,
-    /// Per-block scales decoded to f32 (one per block). Empty for Q6_K.
-    pub scales: Vec<f32>,
-    /// Per-block minimums decoded to f32 (one per block, Q4_1 only). Empty for Q6_K.
-    pub mins: Option<Vec<f32>>,
+    /// Metal context for GPU dispatch.
+    pub ctx: MetalContext,
+    /// Raw quantized data in a Metal buffer — int8 bytes (Q8_0), packed
+    /// nibbles (Q4_0/Q4_1), or packed super-blocks (Q6_K).
+    pub data: Arc<metal::Buffer>,
+    /// Per-block scales as f32 in a Metal buffer. Placeholder for Q6_K.
+    pub scales: Arc<metal::Buffer>,
+    /// Per-block mins as f32 in a Metal buffer (Q4_1 only).
+    pub mins: Option<Arc<metal::Buffer>>,
+}
+
+#[allow(clippy::cast_possible_truncation)]
+impl MetalQuantizedWeight {
+    /// Read data buffer contents as a byte slice (for CPU fallback).
+    ///
+    /// Safe because `StorageModeShared` buffers are CPU-accessible and
+    /// we synchronise via command buffer completion before reads.
+    #[must_use]
+    pub fn data_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.data.contents().cast::<u8>(),
+                self.data.length() as usize,
+            )
+        }
+    }
+
+    /// Read scales buffer contents as f32 slice (for CPU fallback).
+    #[must_use]
+    pub fn scales_f32(&self) -> &[f32] {
+        let len = self.scales.length() as usize / std::mem::size_of::<f32>();
+        if len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.scales.contents().cast::<f32>(), len) }
+    }
+
+    /// Read mins buffer contents as f32 slice (for CPU fallback).
+    #[must_use]
+    pub fn mins_f32(&self) -> Option<&[f32]> {
+        self.mins.as_ref().map(|buf| {
+            let len = buf.length() as usize / std::mem::size_of::<f32>();
+            unsafe { std::slice::from_raw_parts(buf.contents().cast::<f32>(), len) }
+        })
+    }
 }
 
 /// Decode a buffer of f16 values stored as raw little-endian bytes into f32.
