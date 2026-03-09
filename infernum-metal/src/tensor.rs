@@ -112,19 +112,17 @@ impl MetalTensor {
 
     /// Direct pointer to the tensor's data in shared memory.
     ///
-    /// # Safety
-    /// The caller must ensure no GPU command buffer is concurrently writing
-    /// to this buffer region.
+    /// Automatically flushes any pending GPU work to ensure data is
+    /// coherent before CPU access.
     #[must_use]
     pub fn contents_ptr(&self) -> *mut u8 {
+        self.ctx.flush();
         unsafe { self.buffer.contents().cast::<u8>().add(self.offset) }
     }
 
     /// Read the tensor data as a byte slice (CPU-side, unified memory).
     ///
-    /// # Safety
-    /// The caller must ensure no GPU command buffer is concurrently writing
-    /// to this buffer.
+    /// Automatically flushes pending GPU work first.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         let len = self.size_in_bytes();
@@ -159,9 +157,7 @@ impl MetalTensor {
 
     /// Mutable f32 slice into the Metal buffer (unified memory).
     ///
-    /// # Safety
-    /// The caller must ensure no GPU command buffer is concurrently
-    /// reading or writing to this buffer region.
+    /// Automatically flushes pending GPU work first.
     ///
     /// # Panics
     /// Panics if the dtype is not F32.
@@ -173,10 +169,20 @@ impl MetalTensor {
             DType::F32,
             "as_f32_slice_mut: expected F32 tensor"
         );
+        self.ctx.flush();
         let len = self.numel();
         // Metal buffers with StorageModeShared are always page-aligned (4096 bytes),
         // so casting to f32 (4-byte alignment) is safe.
-        unsafe { std::slice::from_raw_parts_mut(self.contents_ptr().cast::<f32>(), len) }
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer
+                    .contents()
+                    .cast::<u8>()
+                    .add(self.offset)
+                    .cast::<f32>(),
+                len,
+            )
+        }
     }
 
     /// Reference to the underlying Metal buffer.

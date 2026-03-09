@@ -342,7 +342,11 @@ impl PagedKvCacheOps for MetalBackend {
         cache.block_size
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_possible_truncation,
+        clippy::items_after_statements
+    )]
     fn append_paged_batched(
         cache: &mut MetalPagedKvCache,
         layer_idx: usize,
@@ -353,30 +357,60 @@ impl PagedKvCacheOps for MetalBackend {
         batch_size: usize,
         max_blocks_per_seq: usize,
     ) -> Result<()> {
-        let k_data = k.as_f32_slice();
-        let v_data = v.as_f32_slice();
-        let bt_data = block_tables.as_i32_slice();
-        let pos_data = positions.as_i32_slice();
-        let head_stride = cache.num_kv_heads * cache.head_dim;
+        let ctx = k.context();
+        let total_per_token = cache.num_kv_heads * cache.head_dim;
 
-        let k_pool = cache.k_pools[layer_idx].as_f32_slice_mut();
-        let v_pool = cache.v_pools[layer_idx].as_f32_slice_mut();
-
-        for b in 0..batch_size {
-            #[allow(clippy::cast_sign_loss)]
-            let pos = pos_data[b] as usize;
-            let block_idx = pos / cache.block_size;
-            let block_offset = pos % cache.block_size;
-            #[allow(clippy::cast_sign_loss)]
-            let physical_block = bt_data[b * max_blocks_per_seq + block_idx] as usize;
-            let dst_offset = (physical_block * cache.block_size + block_offset) * head_stride;
-            let src_offset = b * head_stride;
-
-            k_pool[dst_offset..dst_offset + head_stride]
-                .copy_from_slice(&k_data[src_offset..src_offset + head_stride]);
-            v_pool[dst_offset..dst_offset + head_stride]
-                .copy_from_slice(&v_data[src_offset..src_offset + head_stride]);
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct AppendKvPagedParams {
+            batch_size: u32,
+            block_size: u32,
+            num_kv_heads: u32,
+            head_dim: u32,
+            max_blocks_per_seq: u32,
         }
+
+        let params = AppendKvPagedParams {
+            batch_size: batch_size as u32,
+            block_size: cache.block_size as u32,
+            num_kv_heads: cache.num_kv_heads as u32,
+            head_dim: cache.head_dim as u32,
+            max_blocks_per_seq: max_blocks_per_seq as u32,
+        };
+
+        // Append K
+        ctx.dispatch_2d(
+            "append_kv_paged_batched_f32",
+            &[
+                (
+                    cache.k_pools[layer_idx].metal_buffer(),
+                    cache.k_pools[layer_idx].buffer_offset(),
+                ),
+                (k.metal_buffer(), k.buffer_offset()),
+                (block_tables.metal_buffer(), block_tables.buffer_offset()),
+                (positions.metal_buffer(), positions.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            total_per_token,
+            batch_size,
+        );
+
+        // Append V
+        ctx.dispatch_2d(
+            "append_kv_paged_batched_f32",
+            &[
+                (
+                    cache.v_pools[layer_idx].metal_buffer(),
+                    cache.v_pools[layer_idx].buffer_offset(),
+                ),
+                (v.metal_buffer(), v.buffer_offset()),
+                (block_tables.metal_buffer(), block_tables.buffer_offset()),
+                (positions.metal_buffer(), positions.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            total_per_token,
+            batch_size,
+        );
 
         Ok(())
     }
@@ -400,7 +434,7 @@ impl PagedAttentionOps for MetalBackend {
         seq_lens: &MetalTensor,
         block_size: usize,
         max_blocks_per_seq: usize,
-        _max_seq_len: usize,
+        max_seq_len: usize,
         scale: Option<f32>,
         softcap: Option<f32>,
         sliding_window: Option<usize>,
@@ -417,15 +451,9 @@ impl PagedAttentionOps for MetalBackend {
         let out_shape = [batch_size, num_heads, head_dim];
         let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
 
-        // Find max seq_len for threadgroup sizing
-        let sl_data = seq_lens.as_i32_slice();
-        let max_sl: usize = sl_data
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .try_into()
-            .expect("seq_len must be non-negative");
+        // Use the caller-provided max_seq_len for threadgroup sizing
+        // (avoids a GPU flush to read seq_lens on CPU).
+        let max_sl = max_seq_len;
 
         let params = PagedAttentionDecodeParams {
             batch_size: batch_size as u32,

@@ -72,6 +72,7 @@ fn detect_gguf_arch(path: &str) -> infernum::Result<String> {
 fn bench_model<M: infernum::Model<B = MetalBackend> + Send + 'static>(
     model: M,
     n_gen: usize,
+    ctx: &MetalContext,
 ) -> infernum::Result<()> {
     // 8-token prompt (same as other benchmarks for comparability)
     let prompt = vec![1u32, 15043, 29892, 920, 526, 366, 2599, 13];
@@ -82,6 +83,9 @@ fn bench_model<M: infernum::Model<B = MetalBackend> + Send + 'static>(
         max_new_tokens: n_gen,
         ..GenerateOptions::default()
     };
+
+    // Reset stats so we only measure the generation phase
+    ctx.reset_dispatch_stats();
 
     let start = Instant::now();
     let tokens = engine.generate(&prompt, &options)?;
@@ -95,6 +99,8 @@ fn bench_model<M: infernum::Model<B = MetalBackend> + Send + 'static>(
         elapsed.as_secs_f64(),
         tok_s,
     );
+
+    ctx.print_dispatch_stats();
 
     Ok(())
 }
@@ -146,7 +152,7 @@ fn main() -> infernum::Result<()> {
                 cfg.hidden_size,
                 model.dtype(),
             );
-            bench_model(model, cli.n_gen)
+            bench_model(model, cli.n_gen, &ctx)
         }
         "qwen" => {
             let model = if is_gguf {
@@ -161,7 +167,7 @@ fn main() -> infernum::Result<()> {
                 cfg.hidden_size,
                 model.dtype(),
             );
-            bench_model(model, cli.n_gen)
+            bench_model(model, cli.n_gen, &ctx)
         }
         "gemma" => {
             let model = if is_gguf {
@@ -176,7 +182,7 @@ fn main() -> infernum::Result<()> {
                 cfg.hidden_size,
                 model.dtype(),
             );
-            bench_model(model, cli.n_gen)
+            bench_model(model, cli.n_gen, &ctx)
         }
         other => panic!("Unsupported family: {other}"),
     }

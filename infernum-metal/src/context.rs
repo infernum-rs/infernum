@@ -10,9 +10,24 @@
 //! kernel implementations.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use metal::{Device, MTLSize};
+
+/// Per-kernel dispatch timing statistics.
+#[derive(Default)]
+struct KernelStats {
+    count: u64,
+    total_time: Duration,
+}
+
+/// Aggregate dispatch statistics for profiling.
+#[derive(Default)]
+struct DispatchStats {
+    kernels: HashMap<String, KernelStats>,
+}
 
 /// Compiled Metal shader library, embedded at build time.
 ///
@@ -39,6 +54,11 @@ struct MetalContextInner {
     queue: metal::CommandQueue,
     /// Preloaded compute pipeline states, keyed by kernel function name.
     pipelines: HashMap<String, metal::ComputePipelineState>,
+    /// Dispatch profiling stats (behind Mutex for interior mutability).
+    stats: Mutex<DispatchStats>,
+    /// True when GPU dispatches have been committed but not yet waited on.
+    /// `flush()` drains pending work; CPU reads must call `flush()` first.
+    has_pending: AtomicBool,
 }
 
 // SAFETY: Metal objects are thread-safe when accessed through command buffers.
@@ -75,6 +95,8 @@ impl MetalContext {
                 device,
                 queue,
                 pipelines,
+                stats: Mutex::new(DispatchStats::default()),
+                has_pending: AtomicBool::new(false),
             }),
         }
     }
@@ -96,6 +118,8 @@ impl MetalContext {
                 device,
                 queue,
                 pipelines,
+                stats: Mutex::new(DispatchStats::default()),
+                has_pending: AtomicBool::new(false),
             }),
         })
     }
@@ -134,6 +158,76 @@ impl MetalContext {
     #[must_use]
     pub fn command_buffer(&self) -> &metal::CommandBufferRef {
         self.inner.queue.new_command_buffer()
+    }
+
+    // ------------------------------------------------------------------
+    // Dispatch profiling
+    // ------------------------------------------------------------------
+
+    /// Record a kernel dispatch timing.
+    fn record_dispatch(&self, kernel: &str, elapsed: Duration) {
+        let mut stats = self.inner.stats.lock().unwrap();
+        let entry = stats
+            .kernels
+            .entry(kernel.to_string())
+            .or_insert_with(KernelStats::default);
+        entry.count += 1;
+        entry.total_time += elapsed;
+    }
+
+    /// Print a summary of dispatch statistics to stderr.
+    ///
+    /// Shows per-kernel call count, total time, average time per call,
+    /// and percentage of total GPU time.
+    pub fn print_dispatch_stats(&self) {
+        let stats = self.inner.stats.lock().unwrap();
+        if stats.kernels.is_empty() {
+            eprintln!("[Metal] No dispatch stats recorded.");
+            return;
+        }
+
+        let total_time: Duration = stats.kernels.values().map(|s| s.total_time).sum();
+        let total_count: u64 = stats.kernels.values().map(|s| s.count).sum();
+        let total_ms = total_time.as_secs_f64() * 1000.0;
+
+        // Sort by cumulative time descending
+        let mut entries: Vec<_> = stats.kernels.iter().collect();
+        entries.sort_by(|a, b| b.1.total_time.cmp(&a.1.total_time));
+
+        eprintln!();
+        eprintln!(
+            "[Metal dispatch stats] {total_count} dispatches, {total_ms:.1}ms total GPU wait"
+        );
+        eprintln!(
+            "{:<40} {:>8} {:>10} {:>10} {:>6}",
+            "kernel", "calls", "total(ms)", "avg(μs)", "%"
+        );
+        eprintln!("{}", "-".repeat(78));
+
+        for (name, ks) in &entries {
+            let ms = ks.total_time.as_secs_f64() * 1000.0;
+            let avg_us = if ks.count > 0 {
+                ks.total_time.as_secs_f64() * 1_000_000.0 / ks.count as f64
+            } else {
+                0.0
+            };
+            let pct = if total_ms > 0.0 {
+                ms / total_ms * 100.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "{name:<40} {c:>8} {ms:>9.1} {avg_us:>9.0} {pct:>5.1}%",
+                c = ks.count
+            );
+        }
+        eprintln!();
+    }
+
+    /// Reset all dispatch statistics.
+    pub fn reset_dispatch_stats(&self) {
+        let mut stats = self.inner.stats.lock().unwrap();
+        stats.kernels.clear();
     }
 
     // ------------------------------------------------------------------
@@ -184,8 +278,10 @@ impl MetalContext {
         enc.dispatch_threads(grid, group);
         enc.end_encoding();
 
+        let t0 = Instant::now();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.inner.has_pending.store(true, Ordering::Release);
+        self.record_dispatch(pipeline, t0.elapsed());
     }
 
     /// Dispatch a 2-D compute kernel.
@@ -223,8 +319,10 @@ impl MetalContext {
         enc.dispatch_threads(grid, group);
         enc.end_encoding();
 
+        let t0 = Instant::now();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.inner.has_pending.store(true, Ordering::Release);
+        self.record_dispatch(pipeline, t0.elapsed());
     }
 
     /// Dispatch a compute kernel with explicit threadgroup counts.
@@ -274,8 +372,27 @@ impl MetalContext {
         enc.dispatch_thread_groups(threadgroups, threads_per_group);
         enc.end_encoding();
 
+        let t0 = Instant::now();
+        cmd.commit();
+        self.inner.has_pending.store(true, Ordering::Release);
+        self.record_dispatch(pipeline, t0.elapsed());
+    }
+
+    /// Ensure all committed GPU work has completed before CPU reads.
+    ///
+    /// Submits an empty command buffer and blocks until it completes.
+    /// Since command buffers execute in queue order, this guarantees all
+    /// prior dispatches have finished.  No-op if no work is pending.
+    pub fn flush(&self) {
+        if !self.inner.has_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let t0 = Instant::now();
+        let cmd = self.command_buffer();
         cmd.commit();
         cmd.wait_until_completed();
+        self.inner.has_pending.store(false, Ordering::Release);
+        self.record_dispatch("_flush", t0.elapsed());
     }
 }
 
@@ -382,6 +499,7 @@ mod tests {
 
         let value: f32 = 42.0;
         ctx.dispatch_1d("fill_f32", &[(&buf, 0)], bytemuck::bytes_of(&value), n);
+        ctx.flush();
 
         let result: &[f32] = unsafe { std::slice::from_raw_parts(buf.contents().cast::<f32>(), n) };
         for (i, &v) in result.iter().enumerate() {
