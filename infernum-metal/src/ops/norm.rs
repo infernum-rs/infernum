@@ -1,35 +1,55 @@
-//! NormOps implementation for Metal — RMS normalization.
-//!
-//! Phase 1: CPU-side via unified memory.
+//! NormOps implementation for Metal — RMS normalization via GPU kernels.
 
 use infernum::backend::NormOps;
 use infernum::tensor::Tensor;
+use infernum::DType;
 use infernum::Result;
+use metal::MTLSize;
 
 use crate::tensor::MetalTensor;
 use crate::MetalBackend;
 
+/// Choose a threadgroup size for reduction kernels.
+/// Must be a power of 2 for the tree reduction, capped at 256.
+fn reduction_threadgroup_size(hidden: usize) -> usize {
+    let max_tg: usize = 256;
+    let tg = hidden.min(max_tg);
+    // Round down to nearest power of 2
+    1 << (usize::BITS - 1 - tg.leading_zeros())
+}
+
 impl NormOps for MetalBackend {
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_possible_truncation)]
     fn rms_norm(input: &MetalTensor, weight: &MetalTensor, eps: f32) -> Result<MetalTensor> {
         let shape = input.shape().to_vec();
         let hidden = *shape.last().unwrap();
         let rows = input.numel() / hidden;
 
-        let data = input.as_f32_slice();
-        let w = weight.as_f32_slice();
+        let ctx = input.context();
+        let out = MetalTensor::zeros(ctx, &shape, DType::F32);
 
-        let mut out = vec![0.0f32; data.len()];
-        for r in 0..rows {
-            let row = &data[r * hidden..(r + 1) * hidden];
-            let ms: f32 = row.iter().map(|x| x * x).sum::<f32>() / hidden as f32;
-            let scale = 1.0 / (ms + eps).sqrt();
-            for (i, x) in row.iter().enumerate() {
-                out[r * hidden + i] = x * scale * w[i];
-            }
-        }
+        let tg = reduction_threadgroup_size(hidden);
+        let hidden_u32 = hidden as u32;
 
-        Ok(MetalTensor::from_f32(input.context(), &shape, &out))
+        // Pack params: hidden (u32) + eps (f32)
+        let mut params = Vec::with_capacity(8);
+        params.extend_from_slice(bytemuck::bytes_of(&hidden_u32));
+        params.extend_from_slice(bytemuck::bytes_of(&eps));
+
+        ctx.dispatch_threadgroups(
+            "rms_norm_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (weight.metal_buffer(), weight.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            &params,
+            MTLSize::new(rows as u64, 1, 1),
+            MTLSize::new(tg as u64, 1, 1),
+            tg * std::mem::size_of::<f32>(),
+        );
+
+        Ok(out)
     }
 
     fn rms_norm_inplace(input: &mut MetalTensor, weight: &MetalTensor, eps: f32) -> Result<()> {
@@ -38,7 +58,7 @@ impl NormOps for MetalBackend {
         Ok(())
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_possible_truncation)]
     fn add_rmsnorm(
         residual: &MetalTensor,
         input: &MetalTensor,
@@ -49,33 +69,33 @@ impl NormOps for MetalBackend {
         let hidden = *shape.last().unwrap();
         let rows = input.numel() / hidden;
 
-        let res_data = residual.as_f32_slice();
-        let inp_data = input.as_f32_slice();
-        let w = weight.as_f32_slice();
-
-        let mut updated = vec![0.0f32; inp_data.len()];
-        let mut normed = vec![0.0f32; inp_data.len()];
-
-        for r in 0..rows {
-            let off = r * hidden;
-            // updated_residual = residual + input
-            for i in 0..hidden {
-                updated[off + i] = res_data[off + i] + inp_data[off + i];
-            }
-            // rmsnorm(updated_residual)
-            let row = &updated[off..off + hidden];
-            let ms: f32 = row.iter().map(|x| x * x).sum::<f32>() / hidden as f32;
-            let scale = 1.0 / (ms + eps).sqrt();
-            for i in 0..hidden {
-                normed[off + i] = row[i] * scale * w[i];
-            }
-        }
-
         let ctx = input.context();
-        Ok((
-            MetalTensor::from_f32(ctx, &shape, &updated),
-            MetalTensor::from_f32(ctx, &shape, &normed),
-        ))
+        let updated = MetalTensor::zeros(ctx, &shape, DType::F32);
+        let normed = MetalTensor::zeros(ctx, &shape, DType::F32);
+
+        let tg = reduction_threadgroup_size(hidden);
+        let hidden_u32 = hidden as u32;
+
+        let mut params = Vec::with_capacity(8);
+        params.extend_from_slice(bytemuck::bytes_of(&hidden_u32));
+        params.extend_from_slice(bytemuck::bytes_of(&eps));
+
+        ctx.dispatch_threadgroups(
+            "add_rmsnorm_f32",
+            &[
+                (residual.metal_buffer(), residual.buffer_offset()),
+                (input.metal_buffer(), input.buffer_offset()),
+                (weight.metal_buffer(), weight.buffer_offset()),
+                (updated.metal_buffer(), updated.buffer_offset()),
+                (normed.metal_buffer(), normed.buffer_offset()),
+            ],
+            &params,
+            MTLSize::new(rows as u64, 1, 1),
+            MTLSize::new(tg as u64, 1, 1),
+            tg * std::mem::size_of::<f32>(),
+        );
+
+        Ok((updated, normed))
     }
 }
 
@@ -128,5 +148,28 @@ mod tests {
         assert_eq!(u, [1.5, 0.5, -0.5]);
         let n = MetalBackend::to_f32_vec(&normed).unwrap();
         assert!(!n.iter().any(|x| x.is_nan()));
+    }
+
+    #[test]
+    fn test_rms_norm_large_hidden() {
+        let c = ctx();
+        let hidden = 256;
+        let data: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        let weights: Vec<f32> = vec![1.0; hidden];
+        let input = MetalBackend::from_f32_slice(&c, &[hidden], &data).unwrap();
+        let weight = MetalBackend::from_f32_slice(&c, &[hidden], &weights).unwrap();
+        let out = MetalBackend::rms_norm(&input, &weight, 1e-6).unwrap();
+        let result = MetalBackend::to_f32_vec(&out).unwrap();
+
+        // CPU reference
+        let ms: f32 = data.iter().map(|x| x * x).sum::<f32>() / hidden as f32;
+        let scale = 1.0 / (ms + 1e-6).sqrt();
+        for (i, (&gpu, &x)) in result.iter().zip(data.iter()).enumerate() {
+            let expected = x * scale;
+            assert!(
+                (gpu - expected).abs() < 1e-4,
+                "element {i}: gpu={gpu} vs cpu={expected}"
+            );
+        }
     }
 }

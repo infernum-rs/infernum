@@ -226,6 +226,57 @@ impl MetalContext {
         cmd.commit();
         cmd.wait_until_completed();
     }
+
+    /// Dispatch a compute kernel with explicit threadgroup counts.
+    ///
+    /// Unlike [`dispatch_1d`](Self::dispatch_1d), this uses
+    /// `dispatch_thread_groups` (not `dispatch_threads`), giving the
+    /// caller full control over the grid layout. Supports threadgroup
+    /// shared memory via `threadgroup_mem_len`.
+    ///
+    /// * `pipeline`            — kernel function name.
+    /// * `buffers`             — `(buffer, offset)` pairs.
+    /// * `params`              — raw bytes for extra parameters.
+    /// * `threadgroups`        — number of threadgroups `(x, y, z)`.
+    /// * `threads_per_group`   — threads per threadgroup `(x, y, z)`.
+    /// * `threadgroup_mem_len` — bytes of threadgroup memory (0 = none).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn dispatch_threadgroups(
+        &self,
+        pipeline: &str,
+        buffers: &[(&metal::BufferRef, usize)],
+        params: &[u8],
+        threadgroups: MTLSize,
+        threads_per_group: MTLSize,
+        threadgroup_mem_len: usize,
+    ) {
+        let pso = self.pipeline(pipeline);
+        let cmd = self.command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+
+        enc.set_compute_pipeline_state(pso);
+
+        for (idx, &(buf, offset)) in buffers.iter().enumerate() {
+            enc.set_buffer(idx as u64, Some(buf), offset as u64);
+        }
+
+        if !params.is_empty() {
+            let param_idx = buffers.len() as u64;
+            enc.set_bytes(param_idx, params.len() as u64, params.as_ptr().cast());
+        }
+
+        if threadgroup_mem_len > 0 {
+            // Threadgroup memory index matches MSL [[threadgroup(N)]] attribute.
+            // All our kernels use [[threadgroup(0)]].
+            enc.set_threadgroup_memory_length(0, threadgroup_mem_len as u64);
+        }
+
+        enc.dispatch_thread_groups(threadgroups, threads_per_group);
+        enc.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
 }
 
 impl Default for MetalContext {
