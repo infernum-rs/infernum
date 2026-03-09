@@ -62,5 +62,9 @@ name = "custom_graph_op"
 required-features = ["cpu"]
 
 [[example]]
+name = "bench_metal"
+required-features = ["metal"]
+
+[[example]]
 name = "generate_metal"
 required-features = ["metal"]

@@ -487,17 +487,15 @@ impl MatmulOps for MetalBackend {
             HostLinearWeight::Dense(host) => {
                 let tensor =
                     MetalTensor::from_raw_bytes(device, &host.shape, host.dtype, &host.data);
-                // Cast to f32 if needed for the transposed copy
+                // Cast to f32 if needed, then use new_dense() which pre-computes
+                // the transposed layout for efficient matmul
                 let f32_tensor = if tensor.dtype() == DType::F32 {
-                    tensor.clone()
+                    tensor
                 } else {
                     use infernum::backend::CastOps;
                     MetalBackend::cast_to_f32(&tensor)?
                 };
-                Ok(MetalLinearWeight::Dense {
-                    weight: tensor,
-                    weight_t: f32_tensor,
-                })
+                Ok(MetalLinearWeight::new_dense(f32_tensor))
             }
             HostLinearWeight::Quantized(hq) => match hq.dtype {
                 DType::Q8_0 | DType::Q4_0 => {
