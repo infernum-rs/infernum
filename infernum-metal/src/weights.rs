@@ -22,21 +22,26 @@ use crate::MetalContext;
 ///
 /// Stores quantized data and per-block scales separately, matching the
 /// GGUF loader output. Layout is row-major: `out_features` rows of
-/// `in_features` elements, with `in_features / 32` blocks per row.
+/// `in_features` elements.
 ///
-/// Scales and mins are pre-decoded to f32 at load time so the forward
-/// pass pays no f16→f32 conversion cost.
+/// For `Q8_0`/`Q4_0`/`Q4_1`: `in_features / 32` blocks per row, scales
+/// pre-decoded to f32 at load time.
+///
+/// For `Q6_K`: raw packed super-blocks (210 bytes per 256 elements) stored
+/// directly in `data`. Scales and `d` are embedded in the super-block bytes;
+/// the `scales` and `mins` fields are empty.
 #[derive(Clone)]
 pub struct MetalQuantizedWeight {
     /// Logical shape: `[out_features, in_features]`
     pub shape: Vec<usize>,
-    /// Quantization format (`Q8_0`, `Q4_0`, or `Q4_1`)
+    /// Quantization format (`Q8_0`, `Q4_0`, `Q4_1`, or `Q6_K`)
     pub dtype: DType,
-    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
+    /// Raw quantized data — int8 bytes (Q8_0), packed nibbles (Q4_0/Q4_1),
+    /// or packed super-blocks (Q6_K, 210 bytes per 256 elements)
     pub data: Vec<u8>,
-    /// Per-block scales decoded to f32 (one per block)
+    /// Per-block scales decoded to f32 (one per block). Empty for Q6_K.
     pub scales: Vec<f32>,
-    /// Per-block minimums decoded to f32 (one per block, Q4_1 only)
+    /// Per-block minimums decoded to f32 (one per block, Q4_1 only). Empty for Q6_K.
     pub mins: Option<Vec<f32>>,
 }
 
