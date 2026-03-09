@@ -1,7 +1,8 @@
-//! EmbedOps implementation for Metal — embedding lookup.
+//! EmbedOps implementation for Metal — embedding lookup via GPU kernel.
 
 use infernum::backend::EmbedOps;
 use infernum::tensor::Tensor;
+use infernum::DType;
 use infernum::Result;
 
 use crate::tensor::MetalTensor;
@@ -10,21 +11,33 @@ use crate::MetalBackend;
 impl EmbedOps for MetalBackend {
     #[allow(clippy::cast_possible_truncation)]
     fn embedding_gather(table: &MetalTensor, indices: &[u32]) -> Result<MetalTensor> {
-        let shape = table.shape();
-        let hidden = shape[1];
-        let data = table.as_f32_slice();
+        let hidden = table.shape()[1];
+        let n_tokens = indices.len();
+        let ctx = table.context();
 
-        let mut out = vec![0.0f32; indices.len() * hidden];
-        for (i, &idx) in indices.iter().enumerate() {
-            let src = &data[idx as usize * hidden..(idx as usize + 1) * hidden];
-            out[i * hidden..(i + 1) * hidden].copy_from_slice(src);
-        }
+        // Upload indices to a temporary Metal buffer
+        let idx_tensor = MetalTensor::from_raw_bytes(
+            ctx,
+            &[n_tokens],
+            DType::U32,
+            bytemuck::cast_slice(indices),
+        );
 
-        Ok(MetalTensor::from_f32(
-            table.context(),
-            &[indices.len(), hidden],
-            &out,
-        ))
+        let out = MetalTensor::zeros(ctx, &[n_tokens, hidden], DType::F32);
+        let hidden_u32 = hidden as u32;
+
+        ctx.dispatch_1d(
+            "embedding_gather_f32",
+            &[
+                (table.metal_buffer(), table.buffer_offset()),
+                (idx_tensor.metal_buffer(), idx_tensor.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&hidden_u32),
+            n_tokens * hidden,
+        );
+
+        Ok(out)
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -33,10 +46,23 @@ impl EmbedOps for MetalBackend {
         indices: &MetalTensor,
         seq_len: usize,
     ) -> Result<MetalTensor> {
-        // Read indices from shared memory
-        let idx_bytes = indices.as_bytes();
-        let idx_u32: &[u32] = bytemuck::cast_slice(idx_bytes);
-        Self::embedding_gather(table, &idx_u32[..seq_len])
+        let hidden = table.shape()[1];
+        let ctx = table.context();
+        let out = MetalTensor::zeros(ctx, &[seq_len, hidden], DType::F32);
+        let hidden_u32 = hidden as u32;
+
+        ctx.dispatch_1d(
+            "embedding_gather_f32",
+            &[
+                (table.metal_buffer(), table.buffer_offset()),
+                (indices.metal_buffer(), indices.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&hidden_u32),
+            seq_len * hidden,
+        );
+
+        Ok(out)
     }
 }
 
@@ -71,5 +97,16 @@ mod tests {
         let out = MetalBackend::embedding_gather_tensor(&table, &indices, 2).unwrap();
         let result = MetalBackend::to_f32_vec(&out).unwrap();
         assert_eq!(result, [3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_embedding_gather_duplicate_indices() {
+        let c = ctx();
+        let table =
+            MetalBackend::from_f32_slice(&c, &[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let out = MetalBackend::embedding_gather(&table, &[1, 1, 2]).unwrap();
+        let result = MetalBackend::to_f32_vec(&out).unwrap();
+        assert_eq!(result, [3.0, 4.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(out.shape(), &[3, 2]);
     }
 }

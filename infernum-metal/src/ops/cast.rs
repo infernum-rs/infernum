@@ -1,9 +1,7 @@
-//! CastOps implementation for Metal — dtype casting.
+//! CastOps implementation for Metal — dtype casting via GPU kernels.
 //!
-//! Phase 1: CPU-side casting via the shared buffer pointer.
-//! This is viable on Apple Silicon thanks to unified memory — the data
-//! doesn't move, we just reinterpret it. A Metal kernel can be added
-//! later for throughput.
+//! BF16→F32 and F16→F32 use dedicated GPU kernels.
+//! F32→F32 is a no-op clone.
 
 use infernum::backend::CastOps;
 use infernum::tensor::Tensor;
@@ -15,29 +13,42 @@ use crate::MetalBackend;
 
 impl CastOps for MetalBackend {
     fn cast_to_f32(input: &MetalTensor) -> Result<MetalTensor> {
-        let bytes = input.as_bytes();
-        let f32_data: Vec<f32> = match input.dtype() {
-            DType::F32 => return Ok(input.clone()),
+        match input.dtype() {
+            DType::F32 => Ok(input.clone()),
             DType::BF16 => {
-                let bf16s: &[half::bf16] = bytemuck::cast_slice(bytes);
-                bf16s.iter().map(|v| v.to_f32()).collect()
+                let ctx = input.context();
+                let n = input.numel();
+                let out = MetalTensor::zeros(ctx, input.shape(), DType::F32);
+                ctx.dispatch_1d(
+                    "cast_bf16_to_f32",
+                    &[
+                        (input.metal_buffer(), input.buffer_offset()),
+                        (out.metal_buffer(), out.buffer_offset()),
+                    ],
+                    &[],
+                    n,
+                );
+                Ok(out)
             }
             DType::F16 => {
-                let f16s: &[half::f16] = bytemuck::cast_slice(bytes);
-                f16s.iter().map(|v| v.to_f32()).collect()
+                let ctx = input.context();
+                let n = input.numel();
+                let out = MetalTensor::zeros(ctx, input.shape(), DType::F32);
+                ctx.dispatch_1d(
+                    "cast_f16_to_f32",
+                    &[
+                        (input.metal_buffer(), input.buffer_offset()),
+                        (out.metal_buffer(), out.buffer_offset()),
+                    ],
+                    &[],
+                    n,
+                );
+                Ok(out)
             }
-            other => {
-                return Err(infernum::Error::UnsupportedDtype(format!(
-                    "cast_to_f32: unsupported dtype {other}"
-                )));
-            }
-        };
-
-        Ok(MetalTensor::from_f32(
-            input.context(),
-            input.shape(),
-            &f32_data,
-        ))
+            other => Err(infernum::Error::UnsupportedDtype(format!(
+                "cast_to_f32: unsupported dtype {other}"
+            ))),
+        }
     }
 
     fn cast_from_f32(input: &MetalTensor, _target: DType) -> Result<MetalTensor> {
@@ -153,5 +164,18 @@ mod tests {
         assert_eq!(result.dtype(), DType::F32);
         let out = MetalBackend::to_f32_vec(&result).unwrap();
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_cast_f16_to_f32() {
+        let c = ctx();
+        let f32_data = [1.0f32, -2.5, 0.0, 42.0];
+        let f16_data: Vec<half::f16> = f32_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&f16_data);
+        let t = MetalBackend::from_raw_bytes(&c, &[4], DType::F16, bytes).unwrap();
+        let out = MetalBackend::to_f32_vec(&t).unwrap();
+        for (a, b) in out.iter().zip(f32_data.iter()) {
+            assert!((a - b).abs() < 0.01, "f16 roundtrip: {a} vs {b}");
+        }
     }
 }

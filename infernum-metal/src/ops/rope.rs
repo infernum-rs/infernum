@@ -1,13 +1,32 @@
-//! RopeOps and RopeInterleavedOps implementations for Metal.
-//!
-//! Phase 1: CPU-side via unified memory.
+//! RopeOps and RopeInterleavedOps implementations for Metal — GPU kernel dispatch.
 
 use infernum::backend::{RopeInterleavedOps, RopeOps};
 use infernum::tensor::Tensor;
+use infernum::DType;
 use infernum::Result;
 
 use crate::tensor::MetalTensor;
 use crate::MetalBackend;
+
+/// Packed params struct matching MSL `RopeParams`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeParams {
+    n_heads: u32,
+    head_dim: u32,
+    half_dim: u32,
+    pos_offset: u32,
+}
+
+/// Packed params struct matching MSL `RopeInterleavedParams`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeInterleavedParams {
+    n_heads: u32,
+    head_dim: u32,
+    n_pairs: u32,
+    pos_offset: u32,
+}
 
 impl RopeOps for MetalBackend {
     #[allow(clippy::cast_possible_truncation)]
@@ -17,42 +36,39 @@ impl RopeOps for MetalBackend {
         sin_cache: &MetalTensor,
         position_offset: usize,
     ) -> Result<MetalTensor> {
-        // input: (seq, heads, head_dim)
         let shape = input.shape();
         let seq_len = shape[0];
         let n_heads = shape[1];
         let head_dim = shape[2];
         let half_dim = head_dim / 2;
 
-        let data = input.as_f32_slice();
-        let cos = cos_cache.as_f32_slice();
-        let sin = sin_cache.as_f32_slice();
+        let ctx = input.context();
+        let out = MetalTensor::zeros(ctx, shape, DType::F32);
 
-        let mut out = data.to_vec();
+        let n = seq_len * n_heads * half_dim;
+        let params = RopeParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            half_dim: half_dim as u32,
+            pos_offset: position_offset as u32,
+        };
 
-        for s in 0..seq_len {
-            let pos = s + position_offset;
-            for h in 0..n_heads {
-                let base = (s * n_heads + h) * head_dim;
-                for d in 0..half_dim {
-                    let cos_val = cos[pos * half_dim + d];
-                    let sin_val = sin[pos * half_dim + d];
-                    let x0 = data[base + d];
-                    let x1 = data[base + half_dim + d];
-                    out[base + d] = x0 * cos_val - x1 * sin_val;
-                    out[base + half_dim + d] = x1 * cos_val + x0 * sin_val;
-                }
-            }
-        }
+        ctx.dispatch_1d(
+            "apply_rope_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (cos_cache.metal_buffer(), cos_cache.buffer_offset()),
+                (sin_cache.metal_buffer(), sin_cache.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            n,
+        );
 
-        Ok(MetalTensor::from_f32(input.context(), shape, &out))
+        Ok(out)
     }
 
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::needless_range_loop
-    )]
+    #[allow(clippy::cast_possible_truncation)]
     fn apply_rope_batched(
         input: &MetalTensor,
         cos_cache: &MetalTensor,
@@ -65,68 +81,72 @@ impl RopeOps for MetalBackend {
         let head_dim = shape[2];
         let half_dim = head_dim / 2;
 
-        let data = input.as_f32_slice();
-        let cos = cos_cache.as_f32_slice();
-        let sin = sin_cache.as_f32_slice();
-        let pos_data: &[i32] = bytemuck::cast_slice(positions.as_bytes());
+        let ctx = input.context();
+        let out = MetalTensor::zeros(ctx, shape, DType::F32);
 
-        let mut out = data.to_vec();
+        let n = batch_size * n_heads * half_dim;
+        let params = RopeParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            half_dim: half_dim as u32,
+            pos_offset: 0, // not used in batched variant
+        };
 
-        for b in 0..batch_size {
-            let pos = pos_data[b] as usize;
-            for h in 0..n_heads {
-                let base = (b * n_heads + h) * head_dim;
-                for d in 0..half_dim {
-                    let cos_val = cos[pos * half_dim + d];
-                    let sin_val = sin[pos * half_dim + d];
-                    let x0 = data[base + d];
-                    let x1 = data[base + half_dim + d];
-                    out[base + d] = x0 * cos_val - x1 * sin_val;
-                    out[base + half_dim + d] = x1 * cos_val + x0 * sin_val;
-                }
-            }
-        }
+        ctx.dispatch_1d(
+            "apply_rope_batched_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (cos_cache.metal_buffer(), cos_cache.buffer_offset()),
+                (sin_cache.metal_buffer(), sin_cache.buffer_offset()),
+                (positions.metal_buffer(), positions.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            n,
+        );
 
-        Ok(MetalTensor::from_f32(input.context(), shape, &out))
+        Ok(out)
     }
 }
 
 impl RopeInterleavedOps for MetalBackend {
+    #[allow(clippy::cast_possible_truncation)]
     fn apply_rope_interleaved(
         input: &MetalTensor,
         cos_cache: &MetalTensor,
         sin_cache: &MetalTensor,
         position_offset: usize,
     ) -> Result<MetalTensor> {
-        // Interleaved: pairs are (x[0], x[1]), (x[2], x[3]), ...
         let shape = input.shape();
         let seq_len = shape[0];
         let n_heads = shape[1];
         let head_dim = shape[2];
         let n_pairs = head_dim / 2;
 
-        let data = input.as_f32_slice();
-        let cos = cos_cache.as_f32_slice();
-        let sin = sin_cache.as_f32_slice();
+        let ctx = input.context();
+        let out = MetalTensor::zeros(ctx, shape, DType::F32);
 
-        let mut out = data.to_vec();
+        let n = seq_len * n_heads * n_pairs;
+        let params = RopeInterleavedParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            n_pairs: n_pairs as u32,
+            pos_offset: position_offset as u32,
+        };
 
-        for s in 0..seq_len {
-            let pos = s + position_offset;
-            for h in 0..n_heads {
-                let base = (s * n_heads + h) * head_dim;
-                for p in 0..n_pairs {
-                    let cos_val = cos[pos * n_pairs + p];
-                    let sin_val = sin[pos * n_pairs + p];
-                    let x0 = data[base + 2 * p];
-                    let x1 = data[base + 2 * p + 1];
-                    out[base + 2 * p] = x0 * cos_val - x1 * sin_val;
-                    out[base + 2 * p + 1] = x1 * cos_val + x0 * sin_val;
-                }
-            }
-        }
+        ctx.dispatch_1d(
+            "apply_rope_interleaved_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (cos_cache.metal_buffer(), cos_cache.buffer_offset()),
+                (sin_cache.metal_buffer(), sin_cache.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            n,
+        );
 
-        Ok(MetalTensor::from_f32(input.context(), shape, &out))
+        Ok(out)
     }
 }
 
