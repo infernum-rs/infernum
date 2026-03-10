@@ -51,11 +51,29 @@ impl CastOps for MetalBackend {
         }
     }
 
-    fn cast_from_f32(input: &MetalTensor, _target: DType) -> Result<MetalTensor> {
-        // Phase 1: all Metal ops work in F32, so we always keep tensors as F32.
-        // This prevents BF16/F16 tensors (e.g. RoPE caches) from propagating
-        // through the pipeline and hitting as_f32_slice() panics.
-        Ok(input.clone())
+    fn cast_from_f32(input: &MetalTensor, target: DType) -> Result<MetalTensor> {
+        if input.dtype() == target {
+            return Ok(input.clone());
+        }
+        match target {
+            DType::F16 => {
+                let ctx = input.context();
+                let n = input.numel();
+                let out = MetalTensor::zeros(ctx, input.shape(), DType::F16);
+                ctx.dispatch_1d(
+                    "cast_f32_to_f16",
+                    &[
+                        (input.metal_buffer(), input.buffer_offset()),
+                        (out.metal_buffer(), out.buffer_offset()),
+                    ],
+                    &[],
+                    n,
+                );
+                Ok(out)
+            }
+            // For other dtypes, keep F32 (no-op) to avoid breaking existing paths
+            _ => Ok(input.clone()),
+        }
     }
 }
 

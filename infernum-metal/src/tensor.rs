@@ -129,6 +129,21 @@ impl MetalTensor {
         unsafe { std::slice::from_raw_parts(self.contents_ptr(), len) }
     }
 
+    /// Mutable raw byte slice into the Metal buffer (unified memory).
+    ///
+    /// Automatically flushes pending GPU work first.
+    #[must_use]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.ctx.flush();
+        let len = self.size_in_bytes();
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer.contents().cast::<u8>().add(self.offset),
+                len,
+            )
+        }
+    }
+
     /// Read the tensor data as an f32 slice.
     ///
     /// # Panics

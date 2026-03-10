@@ -278,18 +278,26 @@ impl PagedKvCacheOps for MetalBackend {
         block_config: &BlockConfig,
         num_kv_heads: usize,
         head_dim: usize,
-        _cache_dtype: DType,
+        cache_dtype: DType,
     ) -> Result<MetalPagedKvCache> {
         let block_size = block_config.block_size;
         let num_blocks = block_config.num_blocks;
         let pool_shape = [num_blocks * block_size, num_kv_heads, head_dim];
 
+        // Use F16 for KV cache when model weights are quantized or F16,
+        // otherwise default to F32.
+        let pool_dtype = if cache_dtype.is_quantized() || cache_dtype == DType::F16 {
+            DType::F16
+        } else {
+            DType::F32
+        };
+
         let mut k_pools = Vec::with_capacity(num_layers);
         let mut v_pools = Vec::with_capacity(num_layers);
 
         for _ in 0..num_layers {
-            k_pools.push(MetalTensor::zeros(device, &pool_shape, DType::F32));
-            v_pools.push(MetalTensor::zeros(device, &pool_shape, DType::F32));
+            k_pools.push(MetalTensor::zeros(device, &pool_shape, pool_dtype));
+            v_pools.push(MetalTensor::zeros(device, &pool_shape, pool_dtype));
         }
 
         Ok(MetalPagedKvCache {
@@ -309,26 +317,30 @@ impl PagedKvCacheOps for MetalBackend {
         v: &MetalTensor,
         start_pos: usize,
     ) -> Result<()> {
-        let k_data = k.as_f32_slice();
-        let v_data = v.as_f32_slice();
         let head_stride = cache.num_kv_heads * cache.head_dim;
         let seq_len = k.shape()[0];
+        let elem_size = k.dtype().size_in_bytes();
+        let byte_stride = head_stride * elem_size;
 
-        let k_pool = cache.k_pools[layer_idx].as_f32_slice_mut();
-        let v_pool = cache.v_pools[layer_idx].as_f32_slice_mut();
+        k.context().flush();
+
+        let k_bytes = k.as_bytes();
+        let v_bytes = v.as_bytes();
+        let k_pool_bytes = cache.k_pools[layer_idx].as_bytes_mut();
+        let v_pool_bytes = cache.v_pools[layer_idx].as_bytes_mut();
 
         for t in 0..seq_len {
             let pos = start_pos + t;
             let block_idx = pos / cache.block_size;
             let block_offset = pos % cache.block_size;
             let physical_block = block_table.blocks()[block_idx];
-            let dst_offset = (physical_block * cache.block_size + block_offset) * head_stride;
-            let src_offset = t * head_stride;
+            let dst_byte = (physical_block * cache.block_size + block_offset) * byte_stride;
+            let src_byte = t * byte_stride;
 
-            k_pool[dst_offset..dst_offset + head_stride]
-                .copy_from_slice(&k_data[src_offset..src_offset + head_stride]);
-            v_pool[dst_offset..dst_offset + head_stride]
-                .copy_from_slice(&v_data[src_offset..src_offset + head_stride]);
+            k_pool_bytes[dst_byte..dst_byte + byte_stride]
+                .copy_from_slice(&k_bytes[src_byte..src_byte + byte_stride]);
+            v_pool_bytes[dst_byte..dst_byte + byte_stride]
+                .copy_from_slice(&v_bytes[src_byte..src_byte + byte_stride]);
         }
 
         Ok(())
@@ -495,26 +507,31 @@ impl PagedAttentionOps for MetalBackend {
     ) -> Result<(MetalTensor, MetalTensor)> {
         let seq_len = block_table.seq_len();
         let head_stride = paged_kv.num_kv_heads * paged_kv.head_dim;
-        let mut k_out = Vec::with_capacity(seq_len * head_stride);
-        let mut v_out = Vec::with_capacity(seq_len * head_stride);
-        let k_pool = paged_kv.k_pools[layer_idx].as_f32_slice();
-        let v_pool = paged_kv.v_pools[layer_idx].as_f32_slice();
+        let pool_dtype = paged_kv.k_pools[layer_idx].dtype();
+        let elem_size = pool_dtype.size_in_bytes();
+        let byte_stride = head_stride * elem_size;
+
+        let k_pool_bytes = paged_kv.k_pools[layer_idx].as_bytes();
+        let v_pool_bytes = paged_kv.v_pools[layer_idx].as_bytes();
+
+        let mut k_bytes = Vec::with_capacity(seq_len * byte_stride);
+        let mut v_bytes = Vec::with_capacity(seq_len * byte_stride);
 
         for pos in 0..seq_len {
             let block_idx = pos / paged_kv.block_size;
             let block_offset = pos % paged_kv.block_size;
             let phys_block = block_table.blocks()[block_idx];
-            let off = (phys_block * paged_kv.block_size + block_offset) * head_stride;
+            let off = (phys_block * paged_kv.block_size + block_offset) * byte_stride;
 
-            k_out.extend_from_slice(&k_pool[off..off + head_stride]);
-            v_out.extend_from_slice(&v_pool[off..off + head_stride]);
+            k_bytes.extend_from_slice(&k_pool_bytes[off..off + byte_stride]);
+            v_bytes.extend_from_slice(&v_pool_bytes[off..off + byte_stride]);
         }
 
         let ctx = paged_kv.k_pools[layer_idx].context();
         let shape = [seq_len, paged_kv.num_kv_heads, paged_kv.head_dim];
         Ok((
-            MetalTensor::from_f32(ctx, &shape, &k_out),
-            MetalTensor::from_f32(ctx, &shape, &v_out),
+            MetalTensor::from_raw_bytes(ctx, &shape, pool_dtype, &k_bytes),
+            MetalTensor::from_raw_bytes(ctx, &shape, pool_dtype, &v_bytes),
         ))
     }
 }
