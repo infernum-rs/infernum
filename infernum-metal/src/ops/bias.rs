@@ -2,6 +2,7 @@
 
 use infernum::backend::BiasOps;
 use infernum::tensor::Tensor;
+use infernum::DType;
 use infernum::Result;
 
 use crate::tensor::MetalTensor;
@@ -22,8 +23,13 @@ impl BiasOps for MetalBackend {
         #[allow(clippy::cast_possible_truncation)]
         let cols_u32 = cols as u32;
         let ctx = input.context().clone();
+        let kernel = if input.dtype() == DType::F16 {
+            "bias_add_inplace_f16"
+        } else {
+            "bias_add_inplace_f32"
+        };
         ctx.dispatch_1d(
-            "bias_add_inplace_f32",
+            kernel,
             &[
                 (input.metal_buffer(), input.buffer_offset()),
                 (bias.metal_buffer(), bias.buffer_offset()),

@@ -31,3 +31,26 @@ kernel void geglu_f32(
 {
     out[tid] = gelu(gate[tid]) * up[tid];
 }
+
+
+/// SwiGLU f16: out[i] = silu(gate[i]) * up[i].
+kernel void swiglu_f16(
+    device const half* gate    [[buffer(0)]],
+    device const half* up      [[buffer(1)]],
+    device half* out           [[buffer(2)]],
+    uint tid                   [[thread_position_in_grid]])
+{
+    float g = float(gate[tid]);
+    out[tid] = half(silu(g) * float(up[tid]));
+}
+
+/// GeGLU f16: out[i] = gelu(gate[i]) * up[i].
+kernel void geglu_f16(
+    device const half* gate    [[buffer(0)]],
+    device const half* up      [[buffer(1)]],
+    device half* out           [[buffer(2)]],
+    uint tid                   [[thread_position_in_grid]])
+{
+    float g = float(gate[tid]);
+    out[tid] = half(gelu(g) * float(up[tid]));
+}

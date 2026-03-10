@@ -10,3 +10,12 @@ kernel void bias_add_inplace_f32(
 {
     input[tid] += bias[tid % cols];
 }
+kernel void bias_add_inplace_f16(
+    device half* input          [[buffer(0)]],
+    device const float* bias    [[buffer(1)]],
+    constant uint& cols         [[buffer(2)]],
+    uint tid                    [[thread_position_in_grid]])
+{
+    input[tid] = half(float(input[tid]) + bias[tid % cols]);
+}
+

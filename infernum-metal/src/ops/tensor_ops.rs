@@ -113,7 +113,13 @@ impl TensorOps for MetalBackend {
         let new_inner = d1 + d2;
 
         let ctx = a.context();
-        let out = MetalTensor::zeros(ctx, &[outer, new_inner], DType::F32);
+        let out = MetalTensor::zeros(ctx, &[outer, new_inner], a.dtype());
+
+        let kernel = if a.dtype() == DType::F16 {
+            "copy_strided_f16"
+        } else {
+            "copy_strided_f32"
+        };
 
         // Copy part a at col_offset=0
         let params_a = CopyStridedParams {
@@ -122,7 +128,7 @@ impl TensorOps for MetalBackend {
             col_offset: 0,
         };
         ctx.dispatch_1d(
-            "copy_strided_f32",
+            kernel,
             &[
                 (a.metal_buffer(), a.buffer_offset()),
                 (out.metal_buffer(), out.buffer_offset()),
@@ -138,7 +144,7 @@ impl TensorOps for MetalBackend {
             col_offset: d1 as u32,
         };
         ctx.dispatch_1d(
-            "copy_strided_f32",
+            kernel,
             &[
                 (b.metal_buffer(), b.buffer_offset()),
                 (out.metal_buffer(), out.buffer_offset()),
@@ -214,7 +220,7 @@ impl TensorOps for MetalBackend {
         let new_heads = kv_heads * num_repeats;
 
         let ctx = tensor.context();
-        let out = MetalTensor::zeros(ctx, &[seq, new_heads, head_dim], DType::F32);
+        let out = MetalTensor::zeros(ctx, &[seq, new_heads, head_dim], tensor.dtype());
 
         let params = RepeatKvParams {
             seq: seq as u32,
@@ -223,8 +229,13 @@ impl TensorOps for MetalBackend {
             num_repeats: num_repeats as u32,
         };
 
+        let kernel = if tensor.dtype() == DType::F16 {
+            "repeat_kv_f16"
+        } else {
+            "repeat_kv_f32"
+        };
         ctx.dispatch_1d(
-            "repeat_kv_f32",
+            kernel,
             &[
                 (tensor.metal_buffer(), tensor.buffer_offset()),
                 (out.metal_buffer(), out.buffer_offset()),

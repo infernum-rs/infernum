@@ -83,3 +83,33 @@ kernel void pad_inner_f32(
     const uint col = tid % params.width;
     output[row * params.new_width + col] = input[row * params.width + col];
 }
+
+kernel void repeat_kv_f16(
+    device const half* input            [[buffer(0)]],
+    device half* output                 [[buffer(1)]],
+    constant RepeatKvParams& params     [[buffer(2)]],
+    uint tid                            [[thread_position_in_grid]])
+{
+    const uint kv_heads    = params.kv_heads;
+    const uint head_dim    = params.head_dim;
+    const uint num_repeats = params.num_repeats;
+    const uint new_heads   = kv_heads * num_repeats;
+
+    const uint d   = tid % head_dim;
+    const uint nh  = (tid / head_dim) % new_heads;
+    const uint s   = tid / (head_dim * new_heads);
+
+    const uint kv  = nh / num_repeats;
+    output[tid] = input[(s * kv_heads + kv) * head_dim + d];
+}
+
+kernel void copy_strided_f16(
+    device const half* input            [[buffer(0)]],
+    device half* output                 [[buffer(1)]],
+    constant CopyStridedParams& params  [[buffer(2)]],
+    uint tid                            [[thread_position_in_grid]])
+{
+    const uint row = tid / params.in_cols;
+    const uint col = tid % params.in_cols;
+    output[row * params.out_cols + params.col_offset + col] = input[row * params.in_cols + col];
+}

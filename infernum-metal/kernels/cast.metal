@@ -18,3 +18,13 @@ kernel void cast_f16_to_f32(
 {
     output[tid] = float(input[tid]);
 }
+
+
+/// Cast f32 to f16, elementwise.
+kernel void cast_f32_to_f16(
+    device const float* input   [[buffer(0)]],
+    device half* output         [[buffer(1)]],
+    uint tid                    [[thread_position_in_grid]])
+{
+    output[tid] = half(input[tid]);
+}

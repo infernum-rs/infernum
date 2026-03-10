@@ -13,9 +13,14 @@ impl SwigluOps for MetalBackend {
         let n = gate.numel();
         assert_eq!(n, up.numel(), "swiglu: gate/up length mismatch");
         let ctx = gate.context();
-        let out = MetalTensor::zeros(ctx, gate.shape(), DType::F32);
+        let out = MetalTensor::zeros(ctx, gate.shape(), gate.dtype());
+        let kernel = if gate.dtype() == DType::F16 {
+            "swiglu_f16"
+        } else {
+            "swiglu_f32"
+        };
         ctx.dispatch_1d(
-            "swiglu_f32",
+            kernel,
             &[
                 (gate.metal_buffer(), gate.buffer_offset()),
                 (up.metal_buffer(), up.buffer_offset()),
@@ -33,9 +38,14 @@ impl GegluOps for MetalBackend {
         let n = gate.numel();
         assert_eq!(n, up.numel(), "geglu: gate/up length mismatch");
         let ctx = gate.context();
-        let out = MetalTensor::zeros(ctx, gate.shape(), DType::F32);
+        let out = MetalTensor::zeros(ctx, gate.shape(), gate.dtype());
+        let kernel = if gate.dtype() == DType::F16 {
+            "geglu_f16"
+        } else {
+            "geglu_f32"
+        };
         ctx.dispatch_1d(
-            "geglu_f32",
+            kernel,
             &[
                 (gate.metal_buffer(), gate.buffer_offset()),
                 (up.metal_buffer(), up.buffer_offset()),

@@ -18,7 +18,7 @@ impl NormOps for MetalBackend {
         let rows = input.numel() / hidden;
 
         let ctx = input.context();
-        let out = MetalTensor::zeros(ctx, &shape, DType::F32);
+        let out = MetalTensor::zeros(ctx, &shape, input.dtype());
 
         let tg = reduction_threadgroup_size(hidden);
         let hidden_u32 = hidden as u32;
@@ -28,8 +28,13 @@ impl NormOps for MetalBackend {
         params.extend_from_slice(bytemuck::bytes_of(&hidden_u32));
         params.extend_from_slice(bytemuck::bytes_of(&eps));
 
+        let kernel = if input.dtype() == DType::F16 {
+            "rms_norm_f16"
+        } else {
+            "rms_norm_f32"
+        };
         ctx.dispatch_threadgroups(
-            "rms_norm_f32",
+            kernel,
             &[
                 (input.metal_buffer(), input.buffer_offset()),
                 (weight.metal_buffer(), weight.buffer_offset()),
@@ -62,8 +67,8 @@ impl NormOps for MetalBackend {
         let rows = input.numel() / hidden;
 
         let ctx = input.context();
-        let updated = MetalTensor::zeros(ctx, &shape, DType::F32);
-        let normed = MetalTensor::zeros(ctx, &shape, DType::F32);
+        let updated = MetalTensor::zeros(ctx, &shape, input.dtype());
+        let normed = MetalTensor::zeros(ctx, &shape, input.dtype());
 
         let tg = reduction_threadgroup_size(hidden);
         let hidden_u32 = hidden as u32;
@@ -72,8 +77,13 @@ impl NormOps for MetalBackend {
         params.extend_from_slice(bytemuck::bytes_of(&hidden_u32));
         params.extend_from_slice(bytemuck::bytes_of(&eps));
 
+        let kernel = if input.dtype() == DType::F16 {
+            "add_rmsnorm_f16"
+        } else {
+            "add_rmsnorm_f32"
+        };
         ctx.dispatch_threadgroups(
-            "add_rmsnorm_f32",
+            kernel,
             &[
                 (residual.metal_buffer(), residual.buffer_offset()),
                 (input.metal_buffer(), input.buffer_offset()),

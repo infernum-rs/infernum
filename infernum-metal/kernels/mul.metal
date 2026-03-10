@@ -10,3 +10,12 @@ kernel void mul_f32(
 {
     out[tid] = a[tid] * b[tid];
 }
+kernel void mul_f16(
+    device const half* a    [[buffer(0)]],
+    device const half* b    [[buffer(1)]],
+    device half* out        [[buffer(2)]],
+    uint tid                [[thread_position_in_grid]])
+{
+    out[tid] = a[tid] * b[tid];
+}
+

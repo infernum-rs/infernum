@@ -84,7 +84,9 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
         let ctx = input.context();
         let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
         out_shape.push(n);
-        let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
+        let out_dtype = input.dtype(); // match input dtype (F16 or F32)
+        let out = MetalTensor::zeros(ctx, &out_shape, out_dtype);
+        let use_f16 = input.dtype() == DType::F16;
 
         let params = QuantizedLinearParams {
             n: n as u32,
@@ -93,10 +95,15 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
 
         match weight.dtype {
             DType::Q8_0 => {
+                let kernel = if use_f16 {
+                    "gemv_q8_simd_f16"
+                } else {
+                    "gemv_q8_simd_f32"
+                };
                 let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_ROWS_PER_TG), 1, 1);
                 let threads_per_group = MTLSize::new(GEMV_THREADS_PER_TG, 1, 1);
                 ctx.dispatch_threadgroups(
-                    "gemv_q8_simd_f32",
+                    kernel,
                     &[
                         (input.metal_buffer(), input.buffer_offset()),
                         (&weight.data, 0),
@@ -111,10 +118,15 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
                 return Ok(out);
             }
             DType::Q4_0 => {
+                let kernel = if use_f16 {
+                    "gemv_q4_simd_f16"
+                } else {
+                    "gemv_q4_simd_f32"
+                };
                 let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_ROWS_PER_TG), 1, 1);
                 let threads_per_group = MTLSize::new(GEMV_THREADS_PER_TG, 1, 1);
                 ctx.dispatch_threadgroups(
-                    "gemv_q4_simd_f32",
+                    kernel,
                     &[
                         (input.metal_buffer(), input.buffer_offset()),
                         (&weight.data, 0),

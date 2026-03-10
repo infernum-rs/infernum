@@ -80,3 +80,38 @@ kernel void append_kv_paged_batched_fused_f32(
     device const float* data = (kv_idx == 0) ? k_data : v_data;
     pool[dst] = data[src];
 }
+
+
+/// Fused K+V paged append f16.
+kernel void append_kv_paged_batched_fused_f16(
+    device half*        k_pool     [[buffer(0)]],
+    device half*        v_pool     [[buffer(1)]],
+    device const half*  k_data     [[buffer(2)]],
+    device const half*  v_data     [[buffer(3)]],
+    device const int*   block_tables [[buffer(4)]],
+    device const int*   positions  [[buffer(5)]],
+    constant AppendKvPagedParams& p [[buffer(6)]],
+    uint3 tid [[thread_position_in_grid]])
+{
+    uint elem_idx = tid.x;
+    uint seq_idx  = tid.y;
+    uint kv_idx   = tid.z;
+
+    uint total_per_token = p.num_kv_heads * p.head_dim;
+    if (elem_idx >= total_per_token || seq_idx >= p.batch_size) return;
+
+    int position = positions[seq_idx];
+    uint logical_block  = uint(position) / p.block_size;
+    uint offset_in_blk  = uint(position) % p.block_size;
+    int physical_block   = block_tables[seq_idx * p.max_blocks_per_seq + logical_block];
+
+    uint head = elem_idx / p.head_dim;
+    uint dim  = elem_idx % p.head_dim;
+
+    uint dst = ((uint(physical_block) * p.block_size + offset_in_blk) * p.num_kv_heads + head) * p.head_dim + dim;
+    uint src = seq_idx * total_per_token + elem_idx;
+
+    device half* pool = (kv_idx == 0) ? k_pool : v_pool;
+    device const half* data = (kv_idx == 0) ? k_data : v_data;
+    pool[dst] = data[src];
+}

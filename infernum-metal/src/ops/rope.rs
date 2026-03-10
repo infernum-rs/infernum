@@ -53,7 +53,7 @@ impl RopeOps for MetalBackend {
         let half_dim = head_dim / 2;
 
         let ctx = input.context();
-        let out = MetalTensor::zeros(ctx, shape, DType::F32);
+        let out = MetalTensor::zeros(ctx, shape, input.dtype());
 
         let n = seq_len * n_heads * half_dim;
         let params = RopeParams {
@@ -63,8 +63,13 @@ impl RopeOps for MetalBackend {
             pos_offset: position_offset as u32,
         };
 
+        let kernel = if input.dtype() == DType::F16 {
+            "apply_rope_f16"
+        } else {
+            "apply_rope_f32"
+        };
         ctx.dispatch_1d(
-            "apply_rope_f32",
+            kernel,
             &[
                 (input.metal_buffer(), input.buffer_offset()),
                 (cos_cache.metal_buffer(), cos_cache.buffer_offset()),
@@ -135,8 +140,8 @@ impl RopeOps for MetalBackend {
         let half_dim = head_dim / 2;
 
         let ctx = q.context();
-        let q_out = MetalTensor::zeros(ctx, q_shape, DType::F32);
-        let k_out = MetalTensor::zeros(ctx, k_shape, DType::F32);
+        let q_out = MetalTensor::zeros(ctx, q_shape, q.dtype());
+        let k_out = MetalTensor::zeros(ctx, k_shape, q.dtype());
 
         let n = batch_size * (q_heads + k_heads) * half_dim;
         let params = RopeQkParams {
@@ -146,8 +151,13 @@ impl RopeOps for MetalBackend {
             half_dim: half_dim as u32,
         };
 
+        let kernel = if q.dtype() == DType::F16 {
+            "apply_rope_qk_batched_f16"
+        } else {
+            "apply_rope_qk_batched_f32"
+        };
         ctx.dispatch_1d(
-            "apply_rope_qk_batched_f32",
+            kernel,
             &[
                 (q.metal_buffer(), q.buffer_offset()),
                 (k.metal_buffer(), k.buffer_offset()),

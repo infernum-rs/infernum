@@ -379,8 +379,13 @@ impl PagedKvCacheOps for MetalBackend {
         };
 
         // Fused K+V append: single dispatch with 3D grid (elems, batch, 2)
+        let kernel = if k.dtype() == DType::F16 {
+            "append_kv_paged_batched_fused_f16"
+        } else {
+            "append_kv_paged_batched_fused_f32"
+        };
         ctx.dispatch_3d(
-            "append_kv_paged_batched_fused_f32",
+            kernel,
             &[
                 (
                     cache.k_pools[layer_idx].metal_buffer(),
@@ -438,7 +443,7 @@ impl PagedAttentionOps for MetalBackend {
 
         let ctx = q.context();
         let out_shape = [batch_size, num_heads, head_dim];
-        let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
+        let out = MetalTensor::zeros(ctx, &out_shape, q.dtype());
 
         // Use the caller-provided max_seq_len for threadgroup sizing
         // (avoids a GPU flush to read seq_lens on CPU).
@@ -459,8 +464,13 @@ impl PagedAttentionOps for MetalBackend {
         let tg_size = reduction_threadgroup_size(max_sl.max(head_dim));
         let num_threadgroups = batch_size * num_heads;
 
+        let kernel = if q.dtype() == DType::F16 {
+            "paged_attention_decode_f16"
+        } else {
+            "paged_attention_decode_f32"
+        };
         ctx.dispatch_threadgroups(
-            "paged_attention_decode_f32",
+            kernel,
             &[
                 (q.metal_buffer(), q.buffer_offset()),
                 (k_pool.metal_buffer(), k_pool.buffer_offset()),

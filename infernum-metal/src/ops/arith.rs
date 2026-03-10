@@ -13,9 +13,14 @@ impl ArithOps for MetalBackend {
         let n = a.numel();
         assert_eq!(n, b.numel(), "add: length mismatch");
         let ctx = a.context();
-        let out = MetalTensor::zeros(ctx, a.shape(), DType::F32);
+        let out = MetalTensor::zeros(ctx, a.shape(), a.dtype());
+        let kernel = if a.dtype() == DType::F16 {
+            "add_f16"
+        } else {
+            "add_f32"
+        };
         ctx.dispatch_1d(
-            "add_f32",
+            kernel,
             &[
                 (a.metal_buffer(), a.buffer_offset()),
                 (b.metal_buffer(), b.buffer_offset()),
@@ -31,8 +36,13 @@ impl ArithOps for MetalBackend {
         let n = a.numel();
         assert_eq!(n, b.numel(), "add_inplace: length mismatch");
         let ctx = a.context().clone();
+        let kernel = if a.dtype() == DType::F16 {
+            "add_inplace_f16"
+        } else {
+            "add_inplace_f32"
+        };
         ctx.dispatch_1d(
-            "add_inplace_f32",
+            kernel,
             &[
                 (a.metal_buffer(), a.buffer_offset()),
                 (b.metal_buffer(), b.buffer_offset()),
@@ -47,9 +57,14 @@ impl ArithOps for MetalBackend {
         let n = a.numel();
         assert_eq!(n, b.numel(), "mul: length mismatch");
         let ctx = a.context();
-        let out = MetalTensor::zeros(ctx, a.shape(), DType::F32);
+        let out = MetalTensor::zeros(ctx, a.shape(), a.dtype());
+        let kernel = if a.dtype() == DType::F16 {
+            "mul_f16"
+        } else {
+            "mul_f32"
+        };
         ctx.dispatch_1d(
-            "mul_f32",
+            kernel,
             &[
                 (a.metal_buffer(), a.buffer_offset()),
                 (b.metal_buffer(), b.buffer_offset()),
@@ -64,8 +79,13 @@ impl ArithOps for MetalBackend {
     fn scale_inplace(a: &mut MetalTensor, scale: f32) -> Result<()> {
         let n = a.numel();
         let ctx = a.context().clone();
+        let kernel = if a.dtype() == DType::F16 {
+            "scale_inplace_f16"
+        } else {
+            "scale_inplace_f32"
+        };
         ctx.dispatch_1d(
-            "scale_inplace_f32",
+            kernel,
             &[(a.metal_buffer(), a.buffer_offset())],
             bytemuck::bytes_of(&scale),
             n,
