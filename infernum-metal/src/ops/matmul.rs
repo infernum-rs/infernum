@@ -28,11 +28,17 @@ const TILE: u64 = 8;
 /// Threads per threadgroup for SIMD-group matmul: one SIMD-group = 32 threads.
 const SIMD_GROUP_SIZE: u64 = 32;
 
-/// Number of output neurons per threadgroup for quantized GEMV.
-const GEMV_ROWS_PER_TG: u64 = 4;
+/// Output rows per SIMD-group for quantized GEMV v2 (dot-product based).
+const GEMV_V2_NR: u64 = 4;
 
-/// Threads per threadgroup for quantized GEMV: 4 SIMD-groups × 32 threads.
-const GEMV_THREADS_PER_TG: u64 = GEMV_ROWS_PER_TG * SIMD_GROUP_SIZE;
+/// SIMD-groups per threadgroup for GEMV v2.
+const GEMV_V2_NSG: u64 = 2;
+
+/// Total rows per threadgroup for v2.
+const GEMV_V2_ROWS_PER_TG: u64 = GEMV_V2_NR * GEMV_V2_NSG;
+
+/// Threads per threadgroup for v2.
+const GEMV_V2_THREADS_PER_TG: u64 = GEMV_V2_NSG * SIMD_GROUP_SIZE;
 
 /// Packed params for the tiled matmul kernel.
 #[repr(C)]
@@ -96,12 +102,12 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
         match weight.dtype {
             DType::Q8_0 => {
                 let kernel = if use_f16 {
-                    "gemv_q8_simd_f16"
+                    "gemv_q8_simd_v2_f16"
                 } else {
-                    "gemv_q8_simd_f32"
+                    "gemv_q8_simd_v2_f32"
                 };
-                let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_ROWS_PER_TG), 1, 1);
-                let threads_per_group = MTLSize::new(GEMV_THREADS_PER_TG, 1, 1);
+                let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
+                let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
                 ctx.dispatch_threadgroups(
                     kernel,
                     &[
@@ -119,12 +125,12 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
             }
             DType::Q4_0 => {
                 let kernel = if use_f16 {
-                    "gemv_q4_simd_f16"
+                    "gemv_q4_simd_v2_f16"
                 } else {
-                    "gemv_q4_simd_f32"
+                    "gemv_q4_simd_v2_f32"
                 };
-                let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_ROWS_PER_TG), 1, 1);
-                let threads_per_group = MTLSize::new(GEMV_THREADS_PER_TG, 1, 1);
+                let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
+                let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
                 ctx.dispatch_threadgroups(
                     kernel,
                     &[
