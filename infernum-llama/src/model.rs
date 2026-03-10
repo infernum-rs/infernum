@@ -16,9 +16,9 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, MatmulExtOps, MatmulOps, MoeOps, NormOps,
-    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps, TensorFactory,
-    TensorOps,
+    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, FusedDecodeOps, MatmulExtOps, MatmulOps,
+    MoeOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps,
+    TensorFactory, TensorOps,
 };
 use infernum::block_allocator::BlockTable;
 use infernum::dtype::DType;
@@ -119,6 +119,7 @@ pub trait LlamaOps:
     + AttentionOps
     + PagedAttentionOps
     + PagedKvCacheOps
+    + FusedDecodeOps
     + MoeOps
 {
 }
@@ -139,6 +140,7 @@ impl<B> LlamaOps for B where
         + AttentionOps
         + PagedAttentionOps
         + PagedKvCacheOps
+        + FusedDecodeOps
         + MoeOps
 {
 }
@@ -1255,23 +1257,17 @@ impl<B: LlamaOps> LlamaModel<B> {
 
         let sliding_window = self.config.effective_sliding_window(layer_idx);
 
-        let (q, k) = B::apply_rope_qk_batched(
+        // Fused RoPE + KV cache append — single kernel launch
+        let q = B::rope_kv_append_batched(
             &q,
             &k,
+            &v,
             &self.cos_cache,
             &self.sin_cache,
             positions,
-            batch_size,
-        )?;
-
-        // Batched KV cache append — single kernel launch for all sequences
-        B::append_paged_batched(
             paged_kv,
             layer_idx,
-            &k,
-            &v,
             block_tables,
-            positions,
             batch_size,
             max_blocks_per_seq,
         )?;

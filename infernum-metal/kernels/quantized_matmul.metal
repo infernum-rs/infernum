@@ -909,3 +909,186 @@ kernel void gemv_q4_simd_v2_f16(
         }
     }
 }
+
+// ==========================================================================
+// Fused SwiGLU + GEMV kernels
+//
+// These read from a gate_up buffer of 2*K elements (gate in [0..K), up in
+// [K..2K)) and compute silu(gate[d]) * up[d] on-the-fly as the effective
+// input for the down projection GEMV.  This eliminates the separate SwiGLU
+// dispatch.
+//
+// Params: N = out_features of down_proj, K = intermediate_size (= in_features
+// of down_proj).  The gate_up buffer has 2*K elements.
+// ==========================================================================
+
+static inline half silu_h(half x) {
+    return x / (half(1.0h) + exp(-x));
+}
+
+// --------------------------------------------------------------------------
+// Fused SwiGLU + Q8_0 GEMV v2 — f16 output
+// --------------------------------------------------------------------------
+kernel void gemv_swiglu_q8_simd_v2_f16(
+    device const half*   gate_up       [[buffer(0)]],
+    device const uchar*  weight_data   [[buffer(1)]],
+    device const float*  weight_scales [[buffer(2)]],
+    device half*         output        [[buffer(3)]],
+    constant QuantizedLinearParams& params [[buffer(4)]],
+    uint group_id  [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane = tid % 32;
+
+    const uint row_base = group_id * ROWS_PER_TG_V2 + simd_idx * NR_V2;
+
+    const uint K = params.K;
+    const uint BLOCK_SIZE = 32;
+    const uint num_blocks = K / BLOCK_SIZE;
+    const uint quant_bytes_per_row = num_blocks * BLOCK_SIZE;
+
+    float sums[NR_V2] = {0.0f};
+
+    for (uint b = lane; b < num_blocks; b += 32) {
+        uint inp_start = b * BLOCK_SIZE;
+        // Load gate and up values, compute SwiGLU on-the-fly
+        device const half4* gate_h4 = (device const half4*)(gate_up + inp_start);
+        device const half4* up_h4   = (device const half4*)(gate_up + K + inp_start);
+        half4 x[8];
+        for (uint i = 0; i < 8; i++) {
+            half4 g = gate_h4[i];
+            half4 u = up_h4[i];
+            x[i] = half4(silu_h(g.x) * u.x, silu_h(g.y) * u.y,
+                         silu_h(g.z) * u.z, silu_h(g.w) * u.w);
+        }
+
+        for (uint r = 0; r < NR_V2; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) break;
+
+            float scale = weight_scales[neuron * num_blocks + b];
+            device const uchar* block_ptr = weight_data + neuron * quant_bytes_per_row + b * BLOCK_SIZE;
+
+            device const uint4* w_ptr = (device const uint4*)block_ptr;
+            uint4 w0 = w_ptr[0];
+            uint4 w1 = w_ptr[1];
+
+            half4 wh[8];
+            wh[0] = half4(as_type<char4>(w0.x));
+            wh[1] = half4(as_type<char4>(w0.y));
+            wh[2] = half4(as_type<char4>(w0.z));
+            wh[3] = half4(as_type<char4>(w0.w));
+            wh[4] = half4(as_type<char4>(w1.x));
+            wh[5] = half4(as_type<char4>(w1.y));
+            wh[6] = half4(as_type<char4>(w1.z));
+            wh[7] = half4(as_type<char4>(w1.w));
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 8; i++) {
+                block_sum += dot(x[i], wh[i]);
+            }
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < NR_V2; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) {
+                output[neuron] = half(result);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Fused SwiGLU + Q4_0 GEMV v2 — f16 output
+// --------------------------------------------------------------------------
+kernel void gemv_swiglu_q4_simd_v2_f16(
+    device const half*   gate_up       [[buffer(0)]],
+    device const uchar*  weight_data   [[buffer(1)]],
+    device const float*  weight_scales [[buffer(2)]],
+    device half*         output        [[buffer(3)]],
+    constant QuantizedLinearParams& params [[buffer(4)]],
+    uint group_id  [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane = tid % 32;
+
+    const uint row_base = group_id * ROWS_PER_TG_V2 + simd_idx * NR_V2;
+
+    const uint K = params.K;
+    const uint BLOCK_SIZE = 32;
+    const uint HALF_BLOCK = 16;
+    const uint num_blocks = K / BLOCK_SIZE;
+    const uint packed_bytes_per_row = num_blocks * HALF_BLOCK;
+
+    float sums[NR_V2] = {0.0f};
+
+    for (uint b = lane; b < num_blocks; b += 32) {
+        uint inp_start = b * BLOCK_SIZE;
+        // Load gate and up, apply SwiGLU for lo/hi halves of the block
+        device const half4* gate_lo = (device const half4*)(gate_up + inp_start);
+        device const half4* gate_hi = (device const half4*)(gate_up + inp_start + 16);
+        device const half4* up_lo   = (device const half4*)(gate_up + K + inp_start);
+        device const half4* up_hi   = (device const half4*)(gate_up + K + inp_start + 16);
+        half4 xl[4], xh[4];
+        for (uint i = 0; i < 4; i++) {
+            half4 g_lo = gate_lo[i];
+            half4 u_lo = up_lo[i];
+            xl[i] = half4(silu_h(g_lo.x) * u_lo.x, silu_h(g_lo.y) * u_lo.y,
+                          silu_h(g_lo.z) * u_lo.z, silu_h(g_lo.w) * u_lo.w);
+            half4 g_hi = gate_hi[i];
+            half4 u_hi = up_hi[i];
+            xh[i] = half4(silu_h(g_hi.x) * u_hi.x, silu_h(g_hi.y) * u_hi.y,
+                          silu_h(g_hi.z) * u_hi.z, silu_h(g_hi.w) * u_hi.w);
+        }
+
+        for (uint r = 0; r < NR_V2; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) break;
+
+            float scale = weight_scales[neuron * num_blocks + b];
+            device const uchar* block_ptr = weight_data + neuron * packed_bytes_per_row + b * HALF_BLOCK;
+
+            uint4 packed = ((device const uint4*)block_ptr)[0];
+            uchar4 p[4];
+            p[0] = as_type<uchar4>(packed.x);
+            p[1] = as_type<uchar4>(packed.y);
+            p[2] = as_type<uchar4>(packed.z);
+            p[3] = as_type<uchar4>(packed.w);
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 4; i++) {
+                half4 lo_w = half4(
+                    half(int(p[i].x & 0x0F) - 8),
+                    half(int(p[i].y & 0x0F) - 8),
+                    half(int(p[i].z & 0x0F) - 8),
+                    half(int(p[i].w & 0x0F) - 8)
+                );
+                half4 hi_w = half4(
+                    half(int(p[i].x >> 4) - 8),
+                    half(int(p[i].y >> 4) - 8),
+                    half(int(p[i].z >> 4) - 8),
+                    half(int(p[i].w >> 4) - 8)
+                );
+                block_sum += dot(xl[i], lo_w);
+                block_sum += dot(xh[i], hi_w);
+            }
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < NR_V2; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) {
+                output[neuron] = half(result);
+            }
+        }
+    }
+}

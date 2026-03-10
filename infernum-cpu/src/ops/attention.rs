@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use infernum::backend::{AttentionOps, KvCacheOps, PagedAttentionOps, PagedKvCacheOps};
+use infernum::backend::{
+    AttentionOps, FusedDecodeOps, KvCacheOps, PagedAttentionOps, PagedKvCacheOps,
+};
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
@@ -840,3 +842,5 @@ impl PagedAttentionOps for CpuBackend {
         ))
     }
 }
+
+impl FusedDecodeOps for CpuBackend {}

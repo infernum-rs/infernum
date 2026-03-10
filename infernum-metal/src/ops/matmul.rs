@@ -589,6 +589,58 @@ impl MatmulOps for MetalBackend {
             },
         }
     }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn swiglu_linear(
+        gate_up: &MetalTensor,
+        intermediate_size: usize,
+        down_proj: &MetalLinearWeight,
+    ) -> Option<Result<MetalTensor>> {
+        let MetalLinearWeight::Quantized(w) = down_proj else {
+            return None;
+        };
+        // Only support Q8_0/Q4_0 with f16 input (quantized decode pipeline)
+        if gate_up.dtype() != DType::F16 || !matches!(w.dtype, DType::Q8_0 | DType::Q4_0) {
+            return None;
+        }
+        let m = gate_up.numel() / (2 * intermediate_size);
+        if m != 1 {
+            return None;
+        }
+
+        let n = w.shape[0]; // out_features (hidden_size)
+        let ctx = gate_up.context();
+        let out = MetalTensor::zeros(ctx, &[1, n], DType::F16);
+
+        let params = QuantizedLinearParams {
+            n: n as u32,
+            k: intermediate_size as u32,
+        };
+
+        let kernel = match w.dtype {
+            DType::Q8_0 => "gemv_swiglu_q8_simd_v2_f16",
+            DType::Q4_0 => "gemv_swiglu_q4_simd_v2_f16",
+            _ => unreachable!(),
+        };
+
+        let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
+        let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
+        ctx.dispatch_threadgroups(
+            kernel,
+            &[
+                (gate_up.metal_buffer(), gate_up.buffer_offset()),
+                (&w.data, 0),
+                (&w.scales, 0),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            threadgroups,
+            threads_per_group,
+            0,
+        );
+
+        Some(Ok(out))
+    }
 }
 
 #[cfg(test)]

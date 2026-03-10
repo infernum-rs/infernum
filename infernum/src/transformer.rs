@@ -179,11 +179,40 @@ pub fn compute_gate_up<B: MatmulOps + TensorOps>(
 ///
 /// Computes `silu(gate) * up`, then projects down via `down_proj`.
 /// Calls all-reduce if a communicator is provided (tensor parallelism).
+///
+/// When gate+up weights are fused and seq_len == 1, tries the backend's
+/// `swiglu_linear` fused path to eliminate a separate SwiGLU dispatch.
 pub fn forward_mlp<B: MatmulOps + SwigluOps + TensorOps>(
     hidden: &B::Tensor,
     weights: &MlpWeights<B>,
     comm: Option<&B::Comm>,
 ) -> Result<B::Tensor> {
+    // Try fused SwiGLU + down_proj path (single dispatch) for decode.
+    if let GateUpWeight::<B>::Fused {
+        weight,
+        intermediate_size,
+    } = &weights.gate_up
+    {
+        let seq_len = hidden.shape()[0];
+        if seq_len == 1 {
+            let gate_up = B::linear(hidden, weight)?;
+            if let Some(result) = B::swiglu_linear(&gate_up, *intermediate_size, &weights.down_proj)
+            {
+                let mut out = result?;
+                maybe_all_reduce::<B>(comm, &mut out)?;
+                return Ok(out);
+            }
+            // Backend doesn't support fusion — fall through to unfused path
+            // using the already-computed gate_up.
+            let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
+            let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
+            let intermediate = B::swiglu(&gate, &up)?;
+            let mut out = B::linear(&intermediate, &weights.down_proj)?;
+            maybe_all_reduce::<B>(comm, &mut out)?;
+            return Ok(out);
+        }
+    }
+
     let (gate, up) = compute_gate_up::<B>(hidden, &weights.gate_up)?;
     let intermediate = B::swiglu(&gate, &up)?;
     let mut out = B::linear(&intermediate, &weights.down_proj)?;
@@ -198,6 +227,26 @@ pub fn forward_mlp_no_reduce<B: MatmulOps + SwigluOps + TensorOps>(
     hidden: &B::Tensor,
     weights: &MlpWeights<B>,
 ) -> Result<B::Tensor> {
+    // Try fused SwiGLU + down_proj path for decode.
+    if let GateUpWeight::<B>::Fused {
+        weight,
+        intermediate_size,
+    } = &weights.gate_up
+    {
+        let seq_len = hidden.shape()[0];
+        if seq_len == 1 {
+            let gate_up = B::linear(hidden, weight)?;
+            if let Some(result) = B::swiglu_linear(&gate_up, *intermediate_size, &weights.down_proj)
+            {
+                return result;
+            }
+            let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
+            let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
+            let intermediate = B::swiglu(&gate, &up)?;
+            return B::linear(&intermediate, &weights.down_proj);
+        }
+    }
+
     let (gate, up) = compute_gate_up::<B>(hidden, &weights.gate_up)?;
     let intermediate = B::swiglu(&gate, &up)?;
     B::linear(&intermediate, &weights.down_proj)

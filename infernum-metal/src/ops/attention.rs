@@ -4,7 +4,9 @@
 //! Paged attention, KV cache, and combine_attention_with_lse remain CPU-side.
 
 use bytemuck::{Pod, Zeroable};
-use infernum::backend::{AttentionOps, KvCacheOps, PagedAttentionOps, PagedKvCacheOps};
+use infernum::backend::{
+    AttentionOps, FusedDecodeOps, KvCacheOps, PagedAttentionOps, PagedKvCacheOps,
+};
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::tensor::Tensor;
 use infernum::DType;
@@ -575,6 +577,90 @@ impl KvCacheOps for MetalBackend {
             MetalTensor::from_f32(&cache.ctx, &shape, &layer.k[..n]),
             MetalTensor::from_f32(&cache.ctx, &shape, &layer.v[..n]),
         )
+    }
+}
+
+// ---- Fused decode ops ----
+
+/// Params for the fused RoPE + KV-cache append kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RopeKvAppendParams {
+    q_heads: u32,
+    k_heads: u32,
+    head_dim: u32,
+    half_dim: u32,
+    block_size: u32,
+    max_blocks_per_seq: u32,
+}
+
+impl FusedDecodeOps for MetalBackend {
+    #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+    fn rope_kv_append_batched(
+        q: &MetalTensor,
+        k: &MetalTensor,
+        v: &MetalTensor,
+        cos_cache: &MetalTensor,
+        sin_cache: &MetalTensor,
+        positions: &MetalTensor,
+        paged_kv: &mut MetalPagedKvCache,
+        layer_idx: usize,
+        block_tables: &MetalTensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<MetalTensor> {
+        let q_shape = q.shape();
+        let k_shape = k.shape();
+        let q_heads = q_shape[1];
+        let k_heads = k_shape[1];
+        let head_dim = q_shape[2];
+        let half_dim = head_dim / 2;
+
+        let ctx = q.context();
+        let q_out = MetalTensor::zeros(ctx, q_shape, q.dtype());
+
+        let params = RopeKvAppendParams {
+            q_heads: q_heads as u32,
+            k_heads: k_heads as u32,
+            head_dim: head_dim as u32,
+            half_dim: half_dim as u32,
+            block_size: paged_kv.block_size as u32,
+            max_blocks_per_seq: max_blocks_per_seq as u32,
+        };
+
+        let n = batch_size * (q_heads * half_dim + k_heads * half_dim + k_heads * head_dim);
+
+        let kernel = if q.dtype() == DType::F16 {
+            "rope_kv_append_fused_f16"
+        } else {
+            "rope_kv_append_fused_f32"
+        };
+
+        ctx.dispatch_1d(
+            kernel,
+            &[
+                (q.metal_buffer(), q.buffer_offset()),
+                (k.metal_buffer(), k.buffer_offset()),
+                (v.metal_buffer(), v.buffer_offset()),
+                (cos_cache.metal_buffer(), cos_cache.buffer_offset()),
+                (sin_cache.metal_buffer(), sin_cache.buffer_offset()),
+                (positions.metal_buffer(), positions.buffer_offset()),
+                (q_out.metal_buffer(), q_out.buffer_offset()),
+                (
+                    paged_kv.k_pools[layer_idx].metal_buffer(),
+                    paged_kv.k_pools[layer_idx].buffer_offset(),
+                ),
+                (
+                    paged_kv.v_pools[layer_idx].metal_buffer(),
+                    paged_kv.v_pools[layer_idx].buffer_offset(),
+                ),
+                (block_tables.metal_buffer(), block_tables.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            n,
+        );
+
+        Ok(q_out)
     }
 }
 

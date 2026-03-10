@@ -25,8 +25,9 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, NormOps,
-    PagedAttentionOps, PagedKvCacheOps, RopeOps, TensorDataOps, TensorFactory, TensorOps,
+    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, FusedDecodeOps, GegluOps, MatmulExtOps,
+    MatmulOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, TensorDataOps, TensorFactory,
+    TensorOps,
 };
 use infernum::block_allocator::BlockTable;
 use infernum::dtype::DType;
@@ -112,6 +113,7 @@ pub trait GemmaOps:
     + AttentionOps
     + PagedAttentionOps
     + PagedKvCacheOps
+    + FusedDecodeOps
 {
 }
 
@@ -131,6 +133,7 @@ impl<B> GemmaOps for B where
         + AttentionOps
         + PagedAttentionOps
         + PagedKvCacheOps
+        + FusedDecodeOps
 {
 }
 
@@ -516,15 +519,18 @@ impl<B: GemmaOps> GemmaModel<B> {
         )?;
 
         let (cos, sin) = self.rope_caches_for_layer(layer_idx);
-        let (q, k) = B::apply_rope_qk_batched(&q, &k, cos, sin, positions, batch_size)?;
 
-        B::append_paged_batched(
-            paged_kv,
-            layer_idx,
+        // Fused RoPE + KV cache append — single kernel launch
+        let q = B::rope_kv_append_batched(
+            &q,
             &k,
             &v,
-            block_tables,
+            cos,
+            sin,
             positions,
+            paged_kv,
+            layer_idx,
+            block_tables,
             batch_size,
             max_blocks_per_seq,
         )?;
