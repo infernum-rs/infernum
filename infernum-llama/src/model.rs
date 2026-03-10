@@ -1,0 +1,1524 @@
+//! Llama model implementation — fully generic over the compute backend.
+//!
+//! All forward pass methods, weight loading, and the model struct are
+//! generic over `B: Backend`. The only CUDA-specific code is the
+//! `ShardedLoadable` bridge in `cuda_model.rs` (behind `nccl` feature).
+
+#![allow(
+    clippy::struct_field_names, // _proj suffix is conventional for Llama weights
+    clippy::no_effect_underscore_binding,
+    clippy::doc_markdown, // tensor shape docs trigger false positives
+    dead_code, // generic types are only instantiated when a backend feature is enabled
+    unused_mut // variables are conditionally mutated via all_reduce
+)]
+
+use std::marker::PhantomData;
+use std::path::Path;
+
+use infernum::backend::{
+    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, MatmulExtOps, MatmulOps, MoeOps, NormOps,
+    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorDataOps, TensorFactory,
+    TensorOps,
+};
+use infernum::block_allocator::BlockTable;
+use infernum::dtype::DType;
+use infernum::shard::GpuConfig;
+use infernum::tensor::Tensor;
+use infernum::transformer::{self, GateUpWeight, KvProjWeight, MlpWeights};
+use infernum::Result;
+
+use crate::LlamaConfig;
+
+// ---- Weight types ----
+
+/// Weights for a single Llama attention layer
+pub(crate) struct LlamaAttentionWeights<B: Backend + MatmulOps> {
+    pub q_proj: <B as MatmulOps>::LinearWeight,
+    pub kv_proj: KvProjWeight<B>,
+    pub o_proj: <B as MatmulOps>::LinearWeight,
+}
+
+/// Feed-forward network weights: either a single dense MLP or a Mixture-of-Experts layer.
+pub(crate) enum FfnWeights<B: Backend + MatmulOps> {
+    /// Standard dense MLP (Llama, etc.)
+    Dense(Box<MlpWeights<B>>),
+    /// Mixture-of-Experts (Mixtral, etc.)
+    Moe {
+        /// Router gate weight, pre-transposed: shape `[hidden_size, num_experts]`
+        gate: B::Tensor,
+        /// Per-expert MLP weights
+        experts: Vec<MlpWeights<B>>,
+        /// How many experts to activate per token
+        num_experts_per_tok: usize,
+    },
+}
+
+/// Weights for a single Llama decoder layer
+pub(crate) struct LlamaLayerWeights<B: Backend + MatmulOps> {
+    pub input_layernorm: B::Tensor,
+    pub attention: LlamaAttentionWeights<B>,
+    pub post_attention_layernorm: B::Tensor,
+    pub ffn: FfnWeights<B>,
+}
+
+/// Complete Llama model, generic over the compute backend `B`.
+///
+/// The backend determines the tensor type and linear weight representation.
+/// CUDA-specific methods (loading, CUDA graph decode, `Model` impl) live
+/// in the `cuda_model` module.
+pub struct LlamaModel<B: Backend + MatmulOps> {
+    pub(crate) config: LlamaConfig,
+    pub(crate) dtype: DType,
+    pub(crate) device: B::DeviceHandle,
+    #[allow(dead_code)]
+    pub(crate) gpu_config: GpuConfig,
+
+    /// Optional communicator for tensor-parallel all-reduce.
+    /// `None` for single-GPU, `Some(comm)` for sharded models.
+    pub(crate) comm: Option<B::Comm>,
+
+    // Per-GPU head counts (== full counts for single-GPU, divided for TP)
+    pub(crate) tp_num_heads: usize,
+    pub(crate) tp_num_kv_heads: usize,
+
+    // Embeddings
+    pub(crate) embed_tokens: B::Tensor,
+
+    // Transformer layers
+    pub(crate) layers: Vec<LlamaLayerWeights<B>>,
+
+    // Final layer norm
+    pub(crate) norm: B::Tensor,
+
+    // Output projection (may be tied to embed_tokens)
+    pub(crate) lm_head: <B as MatmulOps>::LinearWeight,
+
+    // RoPE caches (stored in model dtype)
+    pub(crate) cos_cache: B::Tensor,
+    pub(crate) sin_cache: B::Tensor,
+
+    pub(crate) _backend: PhantomData<B>,
+}
+
+// ---- Trait alias for the full set of ops used by the generic forward pass ----
+
+/// Convenience alias: all op traits required by `LlamaModel` forward methods.
+pub trait LlamaOps:
+    Backend
+    + MatmulOps
+    + MatmulExtOps
+    + NormOps
+    + ArithOps
+    + SwigluOps
+    + CastOps
+    + EmbedOps
+    + TensorOps
+    + TensorFactory
+    + TensorDataOps
+    + RopeOps
+    + AttentionOps
+    + PagedAttentionOps
+    + PagedKvCacheOps
+    + MoeOps
+{
+}
+
+impl<B> LlamaOps for B where
+    B: Backend
+        + MatmulOps
+        + MatmulExtOps
+        + NormOps
+        + ArithOps
+        + SwigluOps
+        + CastOps
+        + EmbedOps
+        + TensorOps
+        + TensorFactory
+        + TensorDataOps
+        + RopeOps
+        + AttentionOps
+        + PagedAttentionOps
+        + PagedKvCacheOps
+        + MoeOps
+{
+}
+
+// ---- Generic forward pass methods ----
+
+impl<B: LlamaOps> LlamaModel<B> {
+    /// Get the model configuration
+    #[must_use]
+    pub fn config(&self) -> &LlamaConfig {
+        &self.config
+    }
+
+    /// Get the model's compute dtype
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Build the runtime-facing [`ModelConfig`](infernum::ModelConfig).
+    #[must_use]
+    pub fn model_config(&self) -> infernum::ModelConfig {
+        let c = self.config();
+        infernum::ModelConfig {
+            num_layers: c.num_hidden_layers,
+            max_seq_len: c.max_position_embeddings,
+            num_kv_heads: self.tp_num_kv_heads,
+            head_dim: c.head_dim(),
+            eos_token_id: c.eos_token_id,
+            cache_dtype: self.dtype,
+        }
+    }
+
+    // ---- Generic weight loading ----
+
+    /// Load model weights from a backend-agnostic weight loader.
+    ///
+    /// The loader handles format-specific details (SafeTensors, GGUF, etc.)
+    /// and backend-specific details (host→device transfer, quantization).
+    /// This method handles model-specific logic: weight names, fusing K+V
+    /// and gate+up projections, MoE layout, tied embeddings, RoPE caches.
+    ///
+    /// # Errors
+    /// Returns an error if any weight fails to load.
+    ///
+    /// # Panics
+    /// Panics if `as_dense_weight` returns `None` after `is_dense_weight`
+    /// returned `true` (indicates a backend bug).
+    #[allow(clippy::too_many_lines)]
+    pub fn load_weights(
+        device: B::DeviceHandle,
+        config: LlamaConfig,
+        loader: &impl infernum::WeightLoader<B>,
+    ) -> Result<Self> {
+        let qc = config.quantization_config.as_ref();
+
+        let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+        let dtype = if embed_dtype.is_quantized() {
+            DType::F32
+        } else {
+            embed_dtype
+        };
+
+        let embed_tokens = loader.load_tensor("model.embed_tokens.weight", dtype)?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            let layer = LlamaLayerWeights {
+                input_layernorm: loader
+                    .load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype)?,
+                attention: {
+                    let k = loader.load_linear(
+                        &format!("{prefix}.self_attn.k_proj.weight"),
+                        dtype,
+                        qc,
+                    )?;
+                    let v = loader.load_linear(
+                        &format!("{prefix}.self_attn.v_proj.weight"),
+                        dtype,
+                        qc,
+                    )?;
+                    let kv_proj = if B::is_dense_weight(&k) && B::is_dense_weight(&v) {
+                        let k_t = B::as_dense_weight(&k).expect("checked dense");
+                        let v_t = B::as_dense_weight(&v).expect("checked dense");
+                        KvProjWeight::<B>::Fused {
+                            kv_dim: config.num_kv_heads() * config.head_dim(),
+                            weight: B::dense_weight(B::concat_inner_dim(k_t, v_t)?),
+                        }
+                    } else if let Some(fused) = B::try_concat_linear_rows(&k, &v) {
+                        KvProjWeight::<B>::Fused {
+                            kv_dim: config.num_kv_heads() * config.head_dim(),
+                            weight: fused,
+                        }
+                    } else {
+                        KvProjWeight::<B>::Separate {
+                            k_proj: Box::new(k),
+                            v_proj: Box::new(v),
+                        }
+                    };
+                    LlamaAttentionWeights {
+                        q_proj: loader.load_linear(
+                            &format!("{prefix}.self_attn.q_proj.weight"),
+                            dtype,
+                            qc,
+                        )?,
+                        kv_proj,
+                        o_proj: loader.load_linear(
+                            &format!("{prefix}.self_attn.o_proj.weight"),
+                            dtype,
+                            qc,
+                        )?,
+                    }
+                },
+                post_attention_layernorm: loader
+                    .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
+                ffn: if config.is_moe() {
+                    Self::load_moe_weights(dtype, loader, &prefix, &config, qc)?
+                } else {
+                    FfnWeights::<B>::Dense(Box::new(Self::load_dense_mlp(
+                        dtype, loader, &prefix, &config, qc,
+                    )?))
+                },
+            };
+
+            layers.push(layer);
+        }
+
+        let norm = loader.load_tensor("model.norm.weight", dtype)?;
+
+        let lm_head = transformer::load_lm_head::<B>(
+            &device,
+            loader,
+            &embed_tokens,
+            config.tie_word_embeddings,
+            dtype,
+            qc,
+        )?;
+
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            None,
+            dtype,
+        )?;
+
+        Ok(Self {
+            tp_num_heads: config.num_attention_heads,
+            tp_num_kv_heads: config.num_kv_heads(),
+            dtype,
+            config,
+            device,
+            gpu_config: GpuConfig::Single,
+            comm: None,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+            _backend: PhantomData,
+        })
+    }
+
+    /// Load a dense MLP (gate_proj, up_proj, down_proj) for a single layer.
+    fn load_dense_mlp(
+        dtype: DType,
+        loader: &impl infernum::WeightLoader<B>,
+        layer_prefix: &str,
+        config: &LlamaConfig,
+        qc: Option<&infernum::QuantizationConfig>,
+    ) -> Result<MlpWeights<B>> {
+        transformer::load_mlp_weights(
+            loader,
+            &format!("{layer_prefix}.mlp"),
+            config.intermediate_size,
+            dtype,
+            qc,
+        )
+    }
+
+    /// Load MoE weights (router gate + per-expert MLPs) for a single layer.
+    fn load_moe_weights(
+        dtype: DType,
+        loader: &impl infernum::WeightLoader<B>,
+        layer_prefix: &str,
+        config: &LlamaConfig,
+        qc: Option<&infernum::QuantizationConfig>,
+    ) -> Result<FfnWeights<B>> {
+        let num_experts = config
+            .num_local_experts
+            .expect("MoE requires num_local_experts");
+        let num_experts_per_tok = config
+            .num_experts_per_tok
+            .expect("MoE requires num_experts_per_tok");
+
+        // Router gate: load as f32, transpose, cast to model dtype
+        let gate_name = format!("{layer_prefix}.block_sparse_moe.gate.weight");
+        let gate_f32 = loader.load_tensor(&gate_name, DType::F32)?;
+        let gate_transposed = B::transpose_2d(&gate_f32)?;
+        let gate = B::cast_from_f32(&gate_transposed, dtype)?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let ep = format!("{layer_prefix}.block_sparse_moe.experts.{e}");
+            let gate_proj = loader.load_linear(&format!("{ep}.w1.weight"), dtype, qc)?;
+            let up_proj = loader.load_linear(&format!("{ep}.w3.weight"), dtype, qc)?;
+            let gate_up = if B::is_dense_weight(&gate_proj) && B::is_dense_weight(&up_proj) {
+                let g = B::as_dense_weight(&gate_proj).expect("checked dense");
+                let u = B::as_dense_weight(&up_proj).expect("checked dense");
+                GateUpWeight::<B>::Fused {
+                    weight: B::dense_weight(B::concat_inner_dim(g, u)?),
+                    intermediate_size: config.intermediate_size,
+                }
+            } else if let Some(fused) = B::try_concat_linear_rows(&gate_proj, &up_proj) {
+                GateUpWeight::<B>::Fused {
+                    weight: fused,
+                    intermediate_size: config.intermediate_size,
+                }
+            } else {
+                GateUpWeight::<B>::Separate {
+                    gate_proj: Box::new(gate_proj),
+                    up_proj: Box::new(up_proj),
+                }
+            };
+            let down_proj = loader.load_linear(&format!("{ep}.w2.weight"), dtype, qc)?;
+            experts.push(MlpWeights { gate_up, down_proj });
+        }
+
+        Ok(FfnWeights::<B>::Moe {
+            gate,
+            experts,
+            num_experts_per_tok,
+        })
+    }
+
+    // ---- GGUF weight loading (generic over backend) ----
+
+    /// Load model weights from a GGUF file, generic over any backend.
+    ///
+    /// Uses GGUF tensor names (`token_embd.weight`, `blk.N.*`, etc.)
+    /// and the core [`GgufLoader`](infernum::weights::gguf::GgufLoader)
+    /// which returns host-side buffers. Uploads to the backend via
+    /// `B::upload_host_linear` and `B::from_f32_slice`.
+    ///
+    /// # Errors
+    /// Returns an error if any weight fails to load or upload.
+    ///
+    /// # Panics
+    /// Panics if the model config is MoE (MoE GGUF loading is not yet supported).
+    #[allow(clippy::too_many_lines)]
+    pub fn load_weights_gguf(
+        device: B::DeviceHandle,
+        config: LlamaConfig,
+        loader: &infernum::weights::gguf::GgufLoader,
+    ) -> Result<Self> {
+        use infernum::weights::format::FormatLoader;
+        use infernum::weights::format::{host_transpose_2d, host_unpermute_f32};
+        use infernum::weights::host::{host_concat_inner_dim, HostLinearWeight};
+
+        /// Load a GGUF tensor as a linear weight (dense or quantized).
+        /// Dense weights are transposed to matmul-ready layout on the host.
+        fn host_load_linear(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                    loader, name,
+                )?))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&tensor)?))
+            }
+        }
+
+        /// Load a GGUF Q/K weight with head-dimension unpermuting.
+        fn host_load_linear_unpermute(
+            loader: &infernum::weights::gguf::GgufLoader,
+            name: &str,
+            n_head: usize,
+        ) -> Result<HostLinearWeight> {
+            let dtype = FormatLoader::get_dtype(loader, name)?;
+            if dtype.is_quantized() {
+                Ok(HostLinearWeight::Quantized(
+                    FormatLoader::load_quantized_unpermute(loader, name, n_head)?,
+                ))
+            } else {
+                let tensor = FormatLoader::load_f32(loader, name)?;
+                let unpermuted = host_unpermute_f32(&tensor, n_head)?;
+                Ok(HostLinearWeight::Dense(host_transpose_2d(&unpermuted)?))
+            }
+        }
+
+        let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
+        let embed_tokens =
+            B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+
+        // Detect weight dtype from first layer's Q projection (embeddings are always F32).
+        let weight_dtype = FormatLoader::get_dtype(loader, "blk.0.attn_q.weight")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("blk.{i}");
+
+            let attn_norm_host =
+                FormatLoader::load_f32(loader, &format!("{prefix}.attn_norm.weight"))?;
+            let input_layernorm = B::from_f32_slice(
+                &device,
+                &attn_norm_host.shape,
+                attn_norm_host.as_f32_slice(),
+            )?;
+
+            let attention = {
+                let q_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_q.weight"),
+                    config.num_attention_heads,
+                )?;
+                let k_host = host_load_linear_unpermute(
+                    loader,
+                    &format!("{prefix}.attn_k.weight"),
+                    config.num_kv_heads(),
+                )?;
+                let v_host = host_load_linear(loader, &format!("{prefix}.attn_v.weight"))?;
+                let o_host = host_load_linear(loader, &format!("{prefix}.attn_output.weight"))?;
+
+                let q_dim = config.num_attention_heads * config.head_dim();
+                let kv_dim = config.num_kv_heads() * config.head_dim();
+
+                // Try to fuse Q+K+V → QkvFused, K+V → Fused, or keep Separate.
+                let (q_proj, kv_proj) =
+                    if let (HostLinearWeight::Dense(k_t), HostLinearWeight::Dense(v_t)) =
+                        (&k_host, &v_host)
+                    {
+                        let fused = host_concat_inner_dim(k_t, v_t);
+                        let fused_tensor =
+                            B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                        (
+                            B::upload_host_linear(&device, &q_host)?,
+                            KvProjWeight::<B>::Fused {
+                                kv_dim,
+                                weight: B::dense_weight(fused_tensor),
+                            },
+                        )
+                    } else {
+                        let q_dev = B::upload_host_linear(&device, &q_host)?;
+                        let k_dev = B::upload_host_linear(&device, &k_host)?;
+                        let v_dev = B::upload_host_linear(&device, &v_host)?;
+
+                        // Try K+V fusion first
+                        if let Some(kv_fused) = B::try_concat_linear_rows(&k_dev, &v_dev) {
+                            // Try Q+KV fusion for a single dispatch
+                            if let Some(qkv_fused) = B::try_concat_linear_rows(&q_dev, &kv_fused) {
+                                (
+                                    q_dev, // unused when QkvFused is matched
+                                    KvProjWeight::<B>::QkvFused {
+                                        weight: qkv_fused,
+                                        q_dim,
+                                        kv_dim,
+                                    },
+                                )
+                            } else {
+                                (
+                                    q_dev,
+                                    KvProjWeight::<B>::Fused {
+                                        kv_dim,
+                                        weight: kv_fused,
+                                    },
+                                )
+                            }
+                        } else {
+                            (
+                                q_dev,
+                                KvProjWeight::<B>::Separate {
+                                    k_proj: Box::new(k_dev),
+                                    v_proj: Box::new(v_dev),
+                                },
+                            )
+                        }
+                    };
+
+                LlamaAttentionWeights {
+                    q_proj,
+                    kv_proj,
+                    o_proj: B::upload_host_linear(&device, &o_host)?,
+                }
+            };
+
+            let ffn_norm_host =
+                FormatLoader::load_f32(loader, &format!("{prefix}.ffn_norm.weight"))?;
+            let post_attention_layernorm =
+                B::from_f32_slice(&device, &ffn_norm_host.shape, ffn_norm_host.as_f32_slice())?;
+
+            let ffn = {
+                assert!(!config.is_moe(), "MoE GGUF loading is not yet supported");
+                let gate_host = host_load_linear(loader, &format!("{prefix}.ffn_gate.weight"))?;
+                let up_host = host_load_linear(loader, &format!("{prefix}.ffn_up.weight"))?;
+
+                let gate_up = if let (HostLinearWeight::Dense(g), HostLinearWeight::Dense(u)) =
+                    (&gate_host, &up_host)
+                {
+                    let fused = host_concat_inner_dim(g, u);
+                    let fused_tensor =
+                        B::from_raw_bytes(&device, &fused.shape, fused.dtype, &fused.data)?;
+                    GateUpWeight::<B>::Fused {
+                        weight: B::dense_weight(fused_tensor),
+                        intermediate_size: config.intermediate_size,
+                    }
+                } else {
+                    let g_dev = B::upload_host_linear(&device, &gate_host)?;
+                    let u_dev = B::upload_host_linear(&device, &up_host)?;
+                    if let Some(fused) = B::try_concat_linear_rows(&g_dev, &u_dev) {
+                        GateUpWeight::<B>::Fused {
+                            weight: fused,
+                            intermediate_size: config.intermediate_size,
+                        }
+                    } else {
+                        GateUpWeight::<B>::Separate {
+                            gate_proj: Box::new(g_dev),
+                            up_proj: Box::new(u_dev),
+                        }
+                    }
+                };
+
+                FfnWeights::<B>::Dense(Box::new(MlpWeights {
+                    gate_up,
+                    down_proj: B::upload_host_linear(
+                        &device,
+                        &host_load_linear(loader, &format!("{prefix}.ffn_down.weight"))?,
+                    )?,
+                }))
+            };
+
+            layers.push(LlamaLayerWeights {
+                input_layernorm,
+                attention,
+                post_attention_layernorm,
+                ffn,
+            });
+        }
+
+        let norm_host = FormatLoader::load_f32(loader, "output_norm.weight")?;
+        let norm = B::from_f32_slice(&device, &norm_host.shape, norm_host.as_f32_slice())?;
+
+        // lm_head: check tied embeddings, quantized fallback
+        let lm_head = if config.tie_word_embeddings {
+            let embd_dtype = FormatLoader::get_dtype(loader, "token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                B::upload_host_linear(
+                    &device,
+                    &HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                        loader,
+                        "token_embd.weight",
+                    )?),
+                )?
+            } else {
+                let transposed = host_transpose_2d(&embed_host)?;
+                B::upload_host_linear(&device, &HostLinearWeight::Dense(transposed))?
+            }
+        } else if loader.contains("output.weight") {
+            B::upload_host_linear(&device, &host_load_linear(loader, "output.weight")?)?
+        } else {
+            let embd_dtype = FormatLoader::get_dtype(loader, "token_embd.weight")?;
+            if embd_dtype.is_quantized() {
+                B::upload_host_linear(
+                    &device,
+                    &HostLinearWeight::Quantized(FormatLoader::load_quantized(
+                        loader,
+                        "token_embd.weight",
+                    )?),
+                )?
+            } else {
+                let transposed = host_transpose_2d(&embed_host)?;
+                B::upload_host_linear(&device, &HostLinearWeight::Dense(transposed))?
+            }
+        };
+
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            None,
+            DType::F32,
+        )?;
+
+        Ok(Self {
+            tp_num_heads: config.num_attention_heads,
+            tp_num_kv_heads: config.num_kv_heads(),
+            dtype: weight_dtype,
+            config,
+            device,
+            gpu_config: GpuConfig::Single,
+            comm: None,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+            _backend: PhantomData,
+        })
+    }
+
+    /// Load a Llama model from a GGUF file.
+    ///
+    /// Parses the GGUF file (CPU-only), then uploads weights to the device
+    /// via the generic [`load_weights_gguf`](Self::load_weights_gguf) method.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be parsed or weights fail to load.
+    pub fn from_gguf(device: &B::DeviceHandle, gguf_path: impl AsRef<Path>) -> Result<Self> {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(gguf_path)?;
+        let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+        Self::load_weights_gguf(device.clone(), config, &loader)
+    }
+
+    /// Load a Llama model from a SafeTensors directory.
+    ///
+    /// Reads `config.json` for model configuration and loads weights from
+    /// `*.safetensors` files. The backend provides the weight loader via
+    /// [`SafeTensorsLoaderOps`](infernum::SafeTensorsLoaderOps).
+    ///
+    /// # Errors
+    /// Returns an error if the config is missing or weights fail to load.
+    pub fn from_pretrained(device: &B::DeviceHandle, model_path: impl AsRef<Path>) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
+        let model_path = model_path.as_ref();
+        let config = LlamaConfig::from_file(model_path.join("config.json"))?;
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights(device.clone(), config, &loader)
+    }
+
+    /// Load a Llama model with tensor-parallel sharding.
+    ///
+    /// Generic over any backend implementing [`SafeTensorsLoaderOps`].
+    /// The communicator is stored in the model for all-reduce calls.
+    ///
+    /// # Errors
+    /// Returns an error if loading fails or head counts are not divisible.
+    pub fn from_pretrained_sharded(
+        device: &B::DeviceHandle,
+        model_path: impl AsRef<Path>,
+        gpu_config: GpuConfig,
+        comm: Option<B::Comm>,
+    ) -> Result<Self>
+    where
+        B: infernum::SafeTensorsLoaderOps,
+    {
+        let model_path = model_path.as_ref();
+        let config = LlamaConfig::from_file(model_path.join("config.json"))?;
+        let loader = B::safetensors_loader(device, model_path)?;
+        Self::load_weights_sharded(device.clone(), config, &loader, gpu_config, comm)
+    }
+
+    // ---- Sharded weight loading (tensor parallelism) ----
+
+    /// Load model weights with tensor-parallel sharding, generic over backend.
+    ///
+    /// Splits attention and MLP projections across GPUs according to shard
+    /// strategy. The communicator is used for all-reduce after each parallel
+    /// region in the forward pass to synchronise partial results.
+    ///
+    /// If `gpu_config` is `Single`, falls back to the non-sharded
+    /// [`load_weights`](Self::load_weights) and attaches the communicator.
+    ///
+    /// # Errors
+    /// Returns an error if weight loading fails.
+    ///
+    /// # Panics
+    /// Panics if head counts or intermediate size are not divisible by
+    /// `world_size`.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    pub fn load_weights_sharded(
+        device: B::DeviceHandle,
+        config: LlamaConfig,
+        loader: &impl infernum::WeightLoader<B>,
+        gpu_config: GpuConfig,
+        comm: Option<B::Comm>,
+    ) -> Result<Self> {
+        use infernum::shard::{shard_strategy_for_weight, ShardStrategy};
+
+        let shard = match &gpu_config {
+            GpuConfig::Sharded(s) => *s,
+            GpuConfig::Single => {
+                return Self::load_weights(device, config, loader).map(|mut m| {
+                    m.comm = comm;
+                    m
+                })
+            }
+        };
+        let world_size = shard.world_size;
+
+        assert!(
+            config.num_attention_heads.is_multiple_of(world_size),
+            "num_attention_heads ({}) must be divisible by world_size ({world_size})",
+            config.num_attention_heads
+        );
+        assert!(
+            config.num_kv_heads().is_multiple_of(world_size),
+            "num_kv_heads ({}) must be divisible by world_size ({world_size})",
+            config.num_kv_heads()
+        );
+        assert!(
+            config.intermediate_size.is_multiple_of(world_size),
+            "intermediate_size ({}) must be divisible by world_size ({world_size})",
+            config.intermediate_size
+        );
+
+        let qc = config.quantization_config.as_ref();
+
+        let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
+        let dtype = if embed_dtype.is_quantized() {
+            DType::F32
+        } else {
+            embed_dtype
+        };
+
+        let embed_tokens = loader.load_tensor("model.embed_tokens.weight", dtype)?;
+
+        let tp_num_heads = config.num_attention_heads / world_size;
+        let tp_num_kv_heads = config.num_kv_heads() / world_size;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            let layer = LlamaLayerWeights {
+                input_layernorm: loader
+                    .load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype)?,
+                attention: {
+                    let q_name = format!("{prefix}.self_attn.q_proj.weight");
+                    let k_name = format!("{prefix}.self_attn.k_proj.weight");
+                    let v_name = format!("{prefix}.self_attn.v_proj.weight");
+                    let o_name = format!("{prefix}.self_attn.o_proj.weight");
+
+                    let q_proj = loader.load_linear_sharded(
+                        &q_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&q_name),
+                    )?;
+                    let k_proj = loader.load_linear_sharded(
+                        &k_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&k_name),
+                    )?;
+                    let v_proj = loader.load_linear_sharded(
+                        &v_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&v_name),
+                    )?;
+
+                    let kv_proj = KvProjWeight::<B>::Separate {
+                        k_proj: Box::new(k_proj),
+                        v_proj: Box::new(v_proj),
+                    };
+
+                    LlamaAttentionWeights {
+                        q_proj,
+                        kv_proj,
+                        o_proj: loader.load_linear_sharded(
+                            &o_name,
+                            dtype,
+                            qc,
+                            &shard,
+                            shard_strategy_for_weight(&o_name),
+                        )?,
+                    }
+                },
+                post_attention_layernorm: loader
+                    .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
+                ffn: if config.is_moe() {
+                    Self::load_moe_weights_sharded(dtype, loader, &prefix, &config, &shard, qc)?
+                } else {
+                    let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+                    let up_name = format!("{prefix}.mlp.up_proj.weight");
+                    let down_name = format!("{prefix}.mlp.down_proj.weight");
+
+                    let gate = loader.load_linear_sharded(
+                        &gate_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&gate_name),
+                    )?;
+                    let up = loader.load_linear_sharded(
+                        &up_name,
+                        dtype,
+                        qc,
+                        &shard,
+                        shard_strategy_for_weight(&up_name),
+                    )?;
+
+                    let gate_up = GateUpWeight::<B>::Separate {
+                        gate_proj: Box::new(gate),
+                        up_proj: Box::new(up),
+                    };
+
+                    FfnWeights::<B>::Dense(Box::new(MlpWeights {
+                        gate_up,
+                        down_proj: loader.load_linear_sharded(
+                            &down_name,
+                            dtype,
+                            qc,
+                            &shard,
+                            shard_strategy_for_weight(&down_name),
+                        )?,
+                    }))
+                },
+            };
+
+            layers.push(layer);
+        }
+
+        let norm = loader.load_tensor("model.norm.weight", dtype)?;
+        let lm_head = if config.tie_word_embeddings {
+            let embed_f32 = B::cast_to_f32(&embed_tokens)?;
+            let transposed = B::transpose_2d(&embed_f32)?;
+            B::dense_weight(B::cast_from_f32(&transposed, dtype)?)
+        } else {
+            loader.load_linear_sharded(
+                "lm_head.weight",
+                dtype,
+                None,
+                &shard,
+                ShardStrategy::Replicate,
+            )?
+        };
+
+        let (cos_cache, sin_cache) = transformer::build_rope_cache::<B>(
+            &device,
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            None,
+            dtype,
+        )?;
+
+        Ok(Self {
+            tp_num_heads,
+            tp_num_kv_heads,
+            dtype,
+            config,
+            device,
+            gpu_config,
+            comm,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_cache,
+            sin_cache,
+            _backend: PhantomData,
+        })
+    }
+
+    /// Load MoE weights with tensor-parallel sharding for a single layer.
+    fn load_moe_weights_sharded(
+        dtype: DType,
+        loader: &impl infernum::WeightLoader<B>,
+        layer_prefix: &str,
+        config: &LlamaConfig,
+        shard: &infernum::ShardConfig,
+        qc: Option<&infernum::QuantizationConfig>,
+    ) -> Result<FfnWeights<B>> {
+        use infernum::shard::ShardStrategy;
+
+        let num_experts = config
+            .num_local_experts
+            .expect("MoE requires num_local_experts");
+        let num_experts_per_tok = config
+            .num_experts_per_tok
+            .expect("MoE requires num_experts_per_tok");
+
+        let gate_name = format!("{layer_prefix}.block_sparse_moe.gate.weight");
+        let gate_f32 = loader.load_tensor(&gate_name, DType::F32)?;
+        let gate_transposed = B::transpose_2d(&gate_f32)?;
+        let gate = B::cast_from_f32(&gate_transposed, dtype)?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let ep = format!("{layer_prefix}.block_sparse_moe.experts.{e}");
+            let gate_proj = loader.load_linear_sharded(
+                &format!("{ep}.w1.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+            let up_proj = loader.load_linear_sharded(
+                &format!("{ep}.w3.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Column,
+            )?;
+
+            let gate_up = GateUpWeight::<B>::Separate {
+                gate_proj: Box::new(gate_proj),
+                up_proj: Box::new(up_proj),
+            };
+
+            let down_proj = loader.load_linear_sharded(
+                &format!("{ep}.w2.weight"),
+                dtype,
+                qc,
+                shard,
+                ShardStrategy::Row,
+            )?;
+
+            experts.push(MlpWeights { gate_up, down_proj });
+        }
+
+        Ok(FfnWeights::<B>::Moe {
+            gate,
+            experts,
+            num_experts_per_tok,
+        })
+    }
+
+    // ---- Helpers ----
+
+    fn embed(&self, input_ids: &[u32]) -> Result<B::Tensor> {
+        transformer::embed::<B>(&self.embed_tokens, input_ids)
+    }
+
+    pub(crate) fn maybe_all_reduce(&self, tensor: &mut B::Tensor) -> Result<()> {
+        transformer::maybe_all_reduce::<B>(self.comm.as_ref(), tensor)
+    }
+
+    // ---- Full forward pass (no KV cache) ----
+
+    /// Full forward pass without KV cache (recomputes everything).
+    ///
+    /// Returns raw logits tensor of shape `(seq_len, vocab_size)`.
+    ///
+    /// # Errors
+    /// Returns an error if any operation fails.
+    pub fn forward_full(&self, input_ids: &[u32]) -> Result<B::Tensor> {
+        let mut hidden = self.embed(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let normed = B::rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+            let seq_len = hidden.shape()[0];
+            let num_heads = self.tp_num_heads;
+            let num_kv_heads = self.tp_num_kv_heads;
+            let head_dim = self.config.head_dim();
+
+            let q = B::linear(&normed, &layer.attention.q_proj)?;
+            let (k, v) = transformer::compute_kv_proj::<B>(&normed, &layer.attention.kv_proj)?;
+
+            let q = q.reshape(&[seq_len, num_heads, head_dim]);
+            let k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
+            let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
+
+            let q = B::apply_rope(&q, &self.cos_cache, &self.sin_cache, 0)?;
+            let k = B::apply_rope(&k, &self.cos_cache, &self.sin_cache, 0)?;
+
+            let sliding_window = self.config.effective_sliding_window(layer_idx);
+            let attn_output =
+                B::fused_attention_prefill(&q, &k, &v, 0, None, None, sliding_window)?;
+            let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
+
+            let mut out = B::linear(&attn_output, &layer.attention.o_proj)?;
+            self.maybe_all_reduce(&mut out)?;
+
+            let (mut hidden2, normed) = B::add_rmsnorm(
+                &hidden,
+                &out,
+                &layer.post_attention_layernorm,
+                self.config.rms_norm_eps,
+            )?;
+
+            let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+            B::add_inplace(&mut hidden2, &mlp_output)?;
+            hidden = hidden2;
+        }
+
+        B::rms_norm_inplace(&mut hidden, &self.norm, self.config.rms_norm_eps)?;
+        self.lm_head_forward(&hidden)
+    }
+
+    // ---- Batched decode (host-side convenience) ----
+
+    /// Batched decode with host-side inputs.
+    ///
+    /// Converts host arrays to device tensors and calls
+    /// [`forward_batch_decode_tensors`](Self::forward_batch_decode_tensors).
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_batch_decode(
+        &self,
+        token_ids: &[u32],
+        paged_kv: &mut B::PagedKvCache,
+        block_tables: &[BlockTable],
+        positions: &[usize],
+    ) -> Result<B::Tensor> {
+        transformer::forward_batch_decode_host::<B, _>(
+            &self.device,
+            token_ids,
+            block_tables,
+            positions,
+            |tid, bt, sl, pos, bs, mbps, msl| {
+                self.forward_batch_decode_tensors(tid, paged_kv, bt, sl, pos, bs, mbps, msl)
+            },
+        )
+    }
+
+    // ---- Batched decode with paged KV cache (device tensors) ----
+
+    /// Batched decode forward pass with paged KV cache.
+    ///
+    /// Processes one token per sequence for `batch_size` sequences. All
+    /// inputs are device-side tensors — the engine uploads them before
+    /// calling this method.
+    ///
+    /// Returns logits of shape `(batch_size, vocab_size)`.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_decode_tensors(
+        &self,
+        token_ids: &B::Tensor,
+        paged_kv: &mut B::PagedKvCache,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<B::Tensor> {
+        let mut hidden = B::embedding_gather_tensor(&self.embed_tokens, token_ids, batch_size)?;
+
+        // Cast activations to F16 for quantized models: halves memory bandwidth
+        // for all downstream ops. lm_head_forward handles casting back to F32.
+        if self.dtype.is_quantized() {
+            hidden = B::cast_from_f32(&hidden, DType::F16)?;
+        }
+
+        let eps = self.config.rms_norm_eps;
+
+        // First layer: compute input norm explicitly (no previous MLP to fuse with)
+        let mut normed = B::rms_norm(&hidden, &self.layers[0].input_layernorm, eps)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Attention block (uses pre-computed normed input)
+            let attn_output = self.forward_attention_paged_decode_batched(
+                &normed,
+                &layer.attention,
+                layer_idx,
+                paged_kv,
+                block_tables,
+                seq_lens,
+                positions,
+                batch_size,
+                max_blocks_per_seq,
+                max_seq_len,
+            )?;
+
+            // Fused add + norm for post-attention
+            let (h, ffn_normed) =
+                B::add_rmsnorm(&hidden, &attn_output, &layer.post_attention_layernorm, eps)?;
+            hidden = h;
+
+            // FFN
+            let mlp_output = self.forward_ffn(&ffn_normed, &layer.ffn)?;
+
+            // Fused add + norm: adds MLP output to hidden and produces
+            // the normed input for the next layer (or final norm for the
+            // last layer).
+            let next_norm_weight = if layer_idx + 1 < self.layers.len() {
+                &self.layers[layer_idx + 1].input_layernorm
+            } else {
+                &self.norm
+            };
+            let (h, n) = B::add_rmsnorm(&hidden, &mlp_output, next_norm_weight, eps)?;
+            hidden = h;
+            normed = n;
+        }
+
+        // `normed` is already the final-normed hidden state
+        self.lm_head_forward(&normed.reshape(&[batch_size, self.config.hidden_size]))
+    }
+
+    // ---- Single-sequence prefill with paged KV cache ----
+
+    /// Single-sequence prefill with paged KV cache.
+    ///
+    /// Processes all prompt tokens, writing K/V into the paged cache via
+    /// the block table. Returns logits for the **last** token only.
+    ///
+    /// # Errors
+    /// Returns an error if the forward pass fails.
+    pub fn forward_prefill_paged(
+        &self,
+        input_ids: &[u32],
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &BlockTable,
+        start_pos: usize,
+    ) -> Result<B::Tensor> {
+        let seq_len = input_ids.len();
+
+        let mut hidden = self.embed(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_paged_prefill(
+                &hidden,
+                layer,
+                layer_idx,
+                paged_kv,
+                block_table,
+                start_pos,
+                seq_len,
+            )?;
+        }
+
+        let last = transformer::extract_last_row::<B>(&hidden, seq_len);
+        let normed = B::rms_norm(&last, &self.norm, self.config.rms_norm_eps)?;
+        self.lm_head_forward(&normed.reshape(&[1, self.config.hidden_size]))
+    }
+
+    // ---- Layer-level forward methods ----
+
+    /// Transformer layer forward pass for batched decode with paged KV cache.
+    ///
+    /// Note: The main decode path (`forward_batch_decode_tensors`) inlines
+    /// this logic with fused add+norm across layer boundaries. This method
+    /// is kept for single-layer testing or non-fused paths.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn forward_layer_paged_decode_batched(
+        &self,
+        hidden: &B::Tensor,
+        layer: &LlamaLayerWeights<B>,
+        layer_idx: usize,
+        paged_kv: &mut B::PagedKvCache,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<B::Tensor> {
+        let normed = B::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+        let attn_output = self.forward_attention_paged_decode_batched(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            paged_kv,
+            block_tables,
+            seq_lens,
+            positions,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
+        )?;
+
+        let (mut hidden, normed) = B::add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+        B::add_inplace(&mut hidden, &mlp_output)?;
+        Ok(hidden)
+    }
+
+    /// Batched attention decode with paged KV cache — single kernel launch.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_paged_decode_batched(
+        &self,
+        hidden: &B::Tensor,
+        weights: &LlamaAttentionWeights<B>,
+        layer_idx: usize,
+        paged_kv: &mut B::PagedKvCache,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<B::Tensor> {
+        let num_heads = self.tp_num_heads;
+        let num_kv_heads = self.tp_num_kv_heads;
+        let head_dim = self.config.head_dim();
+
+        let (q, k, v) = transformer::compute_qkv_proj_decode::<B>(
+            hidden,
+            &weights.q_proj,
+            &weights.kv_proj,
+            batch_size,
+        )?;
+
+        let q = q.reshape(&[batch_size, num_heads, head_dim]);
+        let k = k.reshape(&[batch_size, num_kv_heads, head_dim]);
+        let v = v.reshape(&[batch_size, num_kv_heads, head_dim]);
+
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
+
+        let (q, k) = B::apply_rope_qk_batched(
+            &q,
+            &k,
+            &self.cos_cache,
+            &self.sin_cache,
+            positions,
+            batch_size,
+        )?;
+
+        // Batched KV cache append — single kernel launch for all sequences
+        B::append_paged_batched(
+            paged_kv,
+            layer_idx,
+            &k,
+            &v,
+            block_tables,
+            positions,
+            batch_size,
+            max_blocks_per_seq,
+        )?;
+
+        // Batched paged attention decode — single kernel launch
+        let (k_pool, v_pool) = B::get_pools(paged_kv, layer_idx);
+        let attn_output = B::paged_attention_decode(
+            &q,
+            k_pool,
+            v_pool,
+            block_tables,
+            seq_lens,
+            B::block_size(paged_kv),
+            max_blocks_per_seq,
+            max_seq_len,
+            None,
+            None,
+            sliding_window,
+        )?;
+
+        let attn_output = attn_output.reshape(&[batch_size, num_heads * head_dim]);
+
+        let mut out = B::linear(&attn_output, &weights.o_proj)?;
+        self.maybe_all_reduce(&mut out)?;
+        Ok(out)
+    }
+
+    /// Transformer layer forward pass for single-sequence prefill with paged KV cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_paged_prefill(
+        &self,
+        hidden: &B::Tensor,
+        layer: &LlamaLayerWeights<B>,
+        layer_idx: usize,
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &BlockTable,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<B::Tensor> {
+        let normed = B::rms_norm(hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+
+        let attn_output = self.forward_attention_paged_prefill(
+            &normed,
+            &layer.attention,
+            layer_idx,
+            paged_kv,
+            block_table,
+            start_pos,
+            seq_len,
+        )?;
+
+        let (mut hidden, normed) = B::add_rmsnorm(
+            hidden,
+            &attn_output,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mlp_output = self.forward_ffn(&normed, &layer.ffn)?;
+        B::add_inplace(&mut hidden, &mlp_output)?;
+        Ok(hidden)
+    }
+
+    /// Attention for single-sequence prefill with paged KV cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_paged_prefill(
+        &self,
+        hidden: &B::Tensor,
+        weights: &LlamaAttentionWeights<B>,
+        layer_idx: usize,
+        paged_kv: &mut B::PagedKvCache,
+        block_table: &BlockTable,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<B::Tensor> {
+        let num_heads = self.tp_num_heads;
+        let num_kv_heads = self.tp_num_kv_heads;
+        let head_dim = self.config.head_dim();
+
+        let q = B::linear(hidden, &weights.q_proj)?;
+        let (k, v) = transformer::compute_kv_proj::<B>(hidden, &weights.kv_proj)?;
+
+        let q = q.reshape(&[seq_len, num_heads, head_dim]);
+        let k = k.reshape(&[seq_len, num_kv_heads, head_dim]);
+        let v = v.reshape(&[seq_len, num_kv_heads, head_dim]);
+
+        let q = B::apply_rope(&q, &self.cos_cache, &self.sin_cache, start_pos)?;
+        let k = B::apply_rope(&k, &self.cos_cache, &self.sin_cache, start_pos)?;
+
+        // Cast K/V to F16 for quantized models so they match the F16 KV cache.
+        let (k_cache, v_cache) = if self.dtype.is_quantized() {
+            (
+                B::cast_from_f32(&k, DType::F16)?,
+                B::cast_from_f32(&v, DType::F16)?,
+            )
+        } else {
+            (k.clone(), v.clone())
+        };
+        B::append_paged(
+            paged_kv,
+            layer_idx,
+            block_table,
+            &k_cache,
+            &v_cache,
+            start_pos,
+        )?;
+
+        let mut gather_table = block_table.clone();
+        gather_table.advance(seq_len);
+        let (k_contig, v_contig) = B::gather_paged_kv(paged_kv, layer_idx, &gather_table)?;
+
+        // Prefill attention kernel is F32-only; cast gathered KV if needed.
+        let k_contig = B::cast_to_f32(&k_contig)?;
+        let v_contig = B::cast_to_f32(&v_contig)?;
+
+        let sliding_window = self.config.effective_sliding_window(layer_idx);
+        let attn_output = B::fused_attention_prefill(
+            &q,
+            &k_contig,
+            &v_contig,
+            start_pos,
+            None,
+            None,
+            sliding_window,
+        )?;
+
+        let attn_output = attn_output.reshape(&[seq_len, num_heads * head_dim]);
+
+        let mut out = B::linear(&attn_output, &weights.o_proj)?;
+        self.maybe_all_reduce(&mut out)?;
+        Ok(out)
+    }
+
+    // ---- MLP / FFN ----
+
+    fn forward_mlp(&self, hidden: &B::Tensor, weights: &MlpWeights<B>) -> Result<B::Tensor> {
+        transformer::forward_mlp::<B>(hidden, weights, self.comm.as_ref())
+    }
+
+    /// Dispatch to dense MLP or MoE forward pass.
+    pub(crate) fn forward_ffn(&self, hidden: &B::Tensor, ffn: &FfnWeights<B>) -> Result<B::Tensor> {
+        match ffn {
+            FfnWeights::<B>::Dense(mlp) => self.forward_mlp(hidden, mlp),
+            FfnWeights::<B>::Moe {
+                gate,
+                experts,
+                num_experts_per_tok,
+            } => self.forward_moe(hidden, gate, experts, *num_experts_per_tok),
+        }
+    }
+
+    /// Forward pass through a Mixture-of-Experts layer.
+    fn forward_moe(
+        &self,
+        hidden: &B::Tensor,
+        gate: &B::Tensor,
+        experts: &[MlpWeights<B>],
+        num_experts_per_tok: usize,
+    ) -> Result<B::Tensor> {
+        let mut out = B::moe_forward_softmax(
+            hidden,
+            gate,
+            experts.len(),
+            num_experts_per_tok,
+            true,
+            |expert_idx, expert_input| {
+                transformer::forward_mlp_no_reduce::<B>(expert_input, &experts[expert_idx])
+            },
+        )?;
+        self.maybe_all_reduce(&mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn lm_head_forward(&self, hidden: &B::Tensor) -> Result<B::Tensor> {
+        transformer::lm_head_forward::<B>(hidden, &self.lm_head, self.dtype)
+    }
+}
+
+// ---- Model trait impl (generic over any backend) ----
+
+impl<B: LlamaOps + Send + 'static> infernum::Model for LlamaModel<B>
+where
+    <B as MatmulOps>::LinearWeight: Send + Sync,
+{
+    type B = B;
+    type KvCache = B::PagedKvCache;
+
+    fn config(&self) -> infernum::ModelConfig {
+        self.model_config()
+    }
+
+    fn device(&self) -> &B::DeviceHandle {
+        &self.device
+    }
+
+    fn allocate_kv_cache(&self, block_config: &infernum::BlockConfig) -> Result<Self::KvCache> {
+        let c = &self.config;
+        B::allocate_paged_kv_cache(
+            &self.device,
+            c.num_hidden_layers,
+            block_config,
+            self.tp_num_kv_heads,
+            c.head_dim(),
+            self.dtype,
+        )
+    }
+
+    fn forward(&self, input_ids: &[u32]) -> Result<B::Logits> {
+        let tensor = self.forward_full(input_ids)?;
+        Ok(B::logits_from_tensor(tensor))
+    }
+
+    fn forward_prefill(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut B::RuntimeState,
+        block_table: &BlockTable,
+        start_pos: usize,
+    ) -> Result<B::Logits> {
+        let tensor = self.forward_prefill_paged(input_ids, kv_cache, block_table, start_pos)?;
+        Ok(B::logits_from_tensor(tensor))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_decode(
+        &self,
+        token_ids: &B::Tensor,
+        kv_cache: &mut Self::KvCache,
+        _runtime_state: &mut B::RuntimeState,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<B::Logits> {
+        let tensor = self.forward_batch_decode_tensors(
+            token_ids,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            positions,
+            batch_size,
+            max_blocks_per_seq,
+            max_seq_len,
+        )?;
+        Ok(B::logits_from_tensor(tensor))
+    }
+}
