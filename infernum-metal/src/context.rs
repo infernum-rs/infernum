@@ -9,6 +9,7 @@
 //! threadgroup sizes, commit, and wait — reducing boilerplate across all
 //! kernel implementations.
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -63,8 +64,10 @@ struct ActiveEncoder {
     dispatch_count: u32,
 }
 
-// SAFETY: Metal command buffers and encoders are thread-safe when used
-// behind a Mutex (which we do via active_encoder).
+// SAFETY: Metal command buffers and encoders are accessed from a single
+// thread at a time (the model forward-pass thread). The UnsafeCell
+// protecting `active_encoder` relies on this single-threaded access
+// pattern — no concurrent mutation is possible.
 unsafe impl Send for ActiveEncoder {}
 
 struct MetalContextInner {
@@ -75,7 +78,11 @@ struct MetalContextInner {
     /// Dispatch profiling stats (behind Mutex for interior mutability).
     stats: Mutex<DispatchStats>,
     /// Active command buffer + encoder, or None if no work is pending.
-    active_encoder: Mutex<Option<ActiveEncoder>>,
+    ///
+    /// Uses `UnsafeCell` instead of `Mutex` because all encoding happens
+    /// on a single thread (the model forward-pass worker). Eliminating
+    /// the per-dispatch mutex lock/unlock overhead.
+    active_encoder: UnsafeCell<Option<ActiveEncoder>>,
     /// When true, each dispatch uses its own command buffer for per-kernel
     /// GPU timing. Much slower, but gives accurate per-kernel time breakdown.
     profile_per_kernel: bool,
@@ -116,7 +123,7 @@ impl MetalContext {
                 queue,
                 pipelines,
                 stats: Mutex::new(DispatchStats::default()),
-                active_encoder: Mutex::new(None),
+                active_encoder: UnsafeCell::new(None),
                 profile_per_kernel: false,
             }),
         }
@@ -140,7 +147,7 @@ impl MetalContext {
                 queue,
                 pipelines,
                 stats: Mutex::new(DispatchStats::default()),
-                active_encoder: Mutex::new(None),
+                active_encoder: UnsafeCell::new(None),
                 profile_per_kernel: false,
             }),
         })
@@ -278,11 +285,21 @@ impl MetalContext {
     // Shared encoder management
     // ------------------------------------------------------------------
 
+    /// Get mutable access to the active encoder state.
+    ///
+    /// # Safety
+    /// All encoding must happen on a single thread. This is guaranteed
+    /// by the engine's worker thread architecture — only one thread
+    /// calls forward passes and dispatch methods at a time.
+    #[allow(clippy::mut_from_ref)]
+    fn active_encoder_mut(&self) -> &mut Option<ActiveEncoder> {
+        unsafe { &mut *self.inner.active_encoder.get() }
+    }
+
     /// Get the active compute command encoder, creating a new command
     /// buffer + encoder pair if none exists.
     ///
-    /// Returns a raw pointer to the encoder. The caller must hold the
-    /// `active_encoder` lock for the duration of encoding.
+    /// Returns a raw pointer to the encoder.
     fn ensure_encoder(
         active: &mut Option<ActiveEncoder>,
         queue: &metal::CommandQueue,
@@ -346,8 +363,8 @@ impl MetalContext {
         n: usize,
     ) {
         let pso = self.pipeline(pipeline);
-        let mut active = self.inner.active_encoder.lock().unwrap();
-        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let active = self.active_encoder_mut();
+        let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
         enc.set_compute_pipeline_state(pso);
@@ -366,7 +383,7 @@ impl MetalContext {
         let group = MTLSize::new(tg, 1, 1);
         enc.dispatch_threads(grid, group);
 
-        self.finish_dispatch(&mut active, pipeline);
+        self.finish_dispatch(active, pipeline);
     }
 
     /// Dispatch a 2-D compute kernel.
@@ -382,8 +399,8 @@ impl MetalContext {
         height: usize,
     ) {
         let pso = self.pipeline(pipeline);
-        let mut active = self.inner.active_encoder.lock().unwrap();
-        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let active = self.active_encoder_mut();
+        let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
         enc.set_compute_pipeline_state(pso);
@@ -403,7 +420,7 @@ impl MetalContext {
         let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), 1);
         enc.dispatch_threads(grid, group);
 
-        self.finish_dispatch(&mut active, pipeline);
+        self.finish_dispatch(active, pipeline);
     }
 
     /// Dispatch a compute kernel with a 3D thread grid.
@@ -417,8 +434,8 @@ impl MetalContext {
         depth: usize,
     ) {
         let pso = self.pipeline(pipeline);
-        let mut active = self.inner.active_encoder.lock().unwrap();
-        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let active = self.active_encoder_mut();
+        let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
         enc.set_compute_pipeline_state(pso);
@@ -440,7 +457,7 @@ impl MetalContext {
         let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), max_d);
         enc.dispatch_threads(grid, group);
 
-        self.finish_dispatch(&mut active, pipeline);
+        self.finish_dispatch(active, pipeline);
     }
 
     /// Dispatch a compute kernel with explicit threadgroup counts.
@@ -458,8 +475,8 @@ impl MetalContext {
         threadgroup_mem_len: usize,
     ) {
         let pso = self.pipeline(pipeline);
-        let mut active = self.inner.active_encoder.lock().unwrap();
-        let enc_ptr = Self::ensure_encoder(&mut active, &self.inner.queue);
+        let active = self.active_encoder_mut();
+        let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
         enc.set_compute_pipeline_state(pso);
@@ -479,7 +496,7 @@ impl MetalContext {
 
         enc.dispatch_thread_groups(threadgroups, threads_per_group);
 
-        self.finish_dispatch(&mut active, pipeline);
+        self.finish_dispatch(active, pipeline);
     }
 
     /// Commit all pending GPU work and block until complete.
@@ -487,7 +504,7 @@ impl MetalContext {
     /// Ends the active compute encoder, commits the command buffer, and
     /// waits for completion. No-op if no work is pending.
     pub fn flush(&self) {
-        let mut active = self.inner.active_encoder.lock().unwrap();
+        let active = self.active_encoder_mut();
         let Some(ae) = active.take() else {
             return;
         };
