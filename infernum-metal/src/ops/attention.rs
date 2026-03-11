@@ -442,7 +442,7 @@ impl PagedAttentionOps for MetalBackend {
         seq_lens: &MetalTensor,
         block_size: usize,
         max_blocks_per_seq: usize,
-        max_seq_len: usize,
+        _max_seq_len: usize,
         scale: Option<f32>,
         softcap: Option<f32>,
         sliding_window: Option<usize>,
@@ -459,10 +459,6 @@ impl PagedAttentionOps for MetalBackend {
         let out_shape = [batch_size, num_heads, head_dim];
         let out = MetalTensor::zeros(ctx, &out_shape, q.dtype());
 
-        // Use the caller-provided max_seq_len for threadgroup sizing
-        // (avoids a GPU flush to read seq_lens on CPU).
-        let max_sl = max_seq_len;
-
         let params = PagedAttentionDecodeParams {
             batch_size: batch_size as u32,
             n_heads: num_heads as u32,
@@ -475,13 +471,14 @@ impl PagedAttentionOps for MetalBackend {
             sliding_window: sliding_window.map_or(-1, |w| w as i32),
         };
 
-        let tg_size = reduction_threadgroup_size(max_sl.max(head_dim));
         let num_threadgroups = batch_size * num_heads;
 
+        // Flash decode: 1 SIMD group (32 threads) per (batch, head).
+        // Online softmax — single pass over KV, no shared memory needed.
         let kernel = if q.dtype() == DType::F16 {
-            "paged_attention_decode_f16"
+            "paged_attention_flash_decode_f16"
         } else {
-            "paged_attention_decode_f32"
+            "paged_attention_flash_decode_f32"
         };
         ctx.dispatch_threadgroups(
             kernel,
@@ -495,8 +492,8 @@ impl PagedAttentionOps for MetalBackend {
             ],
             bytemuck::bytes_of(&params),
             MTLSize::new(num_threadgroups as u64, 1, 1),
-            MTLSize::new(tg_size as u64, 1, 1),
-            tg_size * std::mem::size_of::<f32>(),
+            MTLSize::new(32, 1, 1),
+            0,
         );
 
         Ok(out)
