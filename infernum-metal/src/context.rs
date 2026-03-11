@@ -309,7 +309,15 @@ impl MetalContext {
         }
         let cmd_ref = queue.new_command_buffer();
         let cmd = cmd_ref.to_owned();
-        let enc = cmd_ref.new_compute_command_encoder();
+
+        // Enqueue immediately so the GPU driver can begin scheduling
+        // work while we're still encoding subsequent dispatches.
+        cmd_ref.enqueue();
+
+        // Concurrent dispatch type lets the GPU reorder and overlap
+        // independent kernel dispatches within this command buffer.
+        let enc =
+            cmd_ref.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
         let encoder = std::ptr::from_ref(enc).cast_mut();
         *active = Some(ActiveEncoder {
             cmd,
