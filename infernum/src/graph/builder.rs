@@ -109,7 +109,6 @@ impl<B: Backend> Graph<B> {
     ///
     /// The primary node carries the actual `Op`. The secondary node is a
     /// `SecondOutput` that references the primary.
-    #[allow(dead_code)] // used by builder traits in later steps
     pub(crate) fn push_node_pair(
         &mut self,
         op: Op,
@@ -122,6 +121,28 @@ impl<B: Backend> Graph<B> {
         let primary = self.push_node(op, inputs, shape1, dtype1);
         let secondary = self.push_node(Op::SecondOutput { source: primary }, &[], shape2, dtype2);
         (primary, secondary)
+    }
+
+    /// Push a multi-output op (three outputs). Returns `(first, second, third)`.
+    ///
+    /// The first node carries the actual `Op`. The second and third nodes are
+    /// `SecondOutput` nodes referencing the primary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_node_triple(
+        &mut self,
+        op: Op,
+        inputs: &[NodeId],
+        shape1: Vec<usize>,
+        dtype1: DType,
+        shape2: Vec<usize>,
+        dtype2: DType,
+        shape3: Vec<usize>,
+        dtype3: DType,
+    ) -> (NodeId, NodeId, NodeId) {
+        let primary = self.push_node(op, inputs, shape1, dtype1);
+        let second = self.push_node(Op::SecondOutput { source: primary }, &[], shape2, dtype2);
+        let third = self.push_node(Op::SecondOutput { source: primary }, &[], shape3, dtype3);
+        (primary, second, third)
     }
 
     /// Get the shape of a node's output.
