@@ -8,6 +8,7 @@ mod builder;
 mod builder_traits;
 mod node;
 mod ops;
+mod planner;
 
 pub use builder::Graph;
 pub use builder_traits::{
@@ -17,6 +18,7 @@ pub use builder_traits::{
 };
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use ops::{MoeExpertIds, Op};
+pub use planner::{plan, BufferSlot, ExecutionPlan};
 
 #[cfg(test)]
 mod tests {

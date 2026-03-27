@@ -51,8 +51,8 @@ pub use weights::{QuantizationConfig, WeightLoader};
 
 pub use chat_template::{ChatMessage, ChatTemplate, RawTemplate};
 pub use graph::{
-    Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps,
-    GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphNode, GraphNormOps,
-    GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps, GraphRopeOps,
-    GraphSwigluOps, GraphTensorOps, NodeId, Op, WeightId, WeightMeta, WeightRef,
+    plan, BufferSlot, ExecutionPlan, Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps,
+    GraphCastOps, GraphEmbedOps, GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphNode,
+    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
+    GraphRopeOps, GraphSwigluOps, GraphTensorOps, NodeId, Op, WeightId, WeightMeta, WeightRef,
 };
