@@ -471,8 +471,6 @@ mod tests {
     // Builder traits tests
     // -----------------------------------------------------------------------
 
-    use super::builder_traits::*;
-
     #[test]
     fn graph_linear_shape_inference() {
         let mut graph = Graph::<TestBackend>::new();
