@@ -251,8 +251,8 @@ fn assign_offsets<B: Backend>(
         let idx = id.0 as usize;
         let node = &graph.nodes[idx];
 
-        // Input nodes use external buffers; side-effect ops produce no output.
-        if matches!(node.op, Op::Input) || is_side_effect_op(&node.op) {
+        // Side-effect ops produce no output buffer.
+        if is_side_effect_op(&node.op) {
             continue;
         }
 
@@ -463,10 +463,8 @@ mod tests {
         assert_eq!(exec.schedule.len(), 3);
         assert!(exec.arena_size > 0);
 
-        // Input should have no buffer slot.
-        assert!(exec.slot(input).is_none());
-
-        // Norm and linear should have buffer slots.
+        // All nodes should have buffer slots (including inputs).
+        assert!(exec.slot(input).is_some());
         assert!(exec.slot(normed).is_some());
         assert!(exec.slot(projected).is_some());
 
@@ -549,13 +547,11 @@ mod tests {
         // 2 inputs + primary + secondary = 4 nodes
         assert_eq!(exec.schedule.len(), 4);
 
-        // Both outputs should have buffer slots.
+        // All nodes should have buffer slots (including inputs).
         assert!(exec.slot(updated).is_some());
         assert!(exec.slot(normed).is_some());
-
-        // Inputs should not.
-        assert!(exec.slot(residual).is_none());
-        assert!(exec.slot(delta).is_none());
+        assert!(exec.slot(residual).is_some());
+        assert!(exec.slot(delta).is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -619,8 +615,13 @@ mod tests {
         let exec = plan(&graph);
 
         assert_eq!(exec.schedule.len(), 3);
+        // Side-effect op has no buffer slot.
         assert!(exec.slot(append).is_none());
-        assert_eq!(exec.arena_size, 0);
+        // Input nodes get buffer slots, so arena is non-zero.
+        assert!(exec.arena_size > 0);
+        // But both inputs share/reuse arena space since they're read before append.
+        assert!(exec.slot(k).is_some());
+        assert!(exec.slot(v).is_some());
     }
 
     // -----------------------------------------------------------------------

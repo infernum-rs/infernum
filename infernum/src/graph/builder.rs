@@ -145,6 +145,18 @@ impl<B: Backend> Graph<B> {
         (primary, second, third)
     }
 
+    /// All nodes in the graph (indexed by `NodeId`).
+    #[must_use]
+    pub fn nodes(&self) -> &[GraphNode] {
+        &self.nodes
+    }
+
+    /// Nodes marked as graph outputs.
+    #[must_use]
+    pub fn output_ids(&self) -> &[NodeId] {
+        &self.outputs
+    }
+
     /// Get the shape of a node's output.
     #[must_use]
     pub fn node_shape(&self, id: NodeId) -> &[usize] {

@@ -14,6 +14,7 @@
     clippy::module_name_repetitions
 )]
 
+pub mod executor;
 pub mod logits;
 pub mod ops;
 pub mod simd;

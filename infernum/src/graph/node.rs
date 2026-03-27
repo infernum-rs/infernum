@@ -10,6 +10,20 @@ use super::ops::Op;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
 
+impl NodeId {
+    /// Create a `NodeId` from a raw index.
+    #[must_use]
+    pub fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
+    /// Return the raw index.
+    #[must_use]
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
 /// Reference to a weight in the `WeightStore`. Can be either a plain tensor
 /// (embedding table, layernorm weight, `RoPE` cache) or a linear weight
 /// (dense, quantized, etc.).
