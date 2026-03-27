@@ -4,12 +4,15 @@
 //! It captures the full forward pass as a DAG of typed operations,
 //! enabling fusion, scheduling, and memory planning.
 
+mod arena;
 mod builder;
 mod builder_traits;
 mod node;
 mod ops;
 mod planner;
+mod weight_store;
 
+pub use arena::Arena;
 pub use builder::Graph;
 pub use builder_traits::{
     GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps, GraphGegluOps,
@@ -19,6 +22,7 @@ pub use builder_traits::{
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use ops::{MoeExpertIds, Op};
 pub use planner::{plan, BufferSlot, ExecutionPlan};
+pub use weight_store::WeightStore;
 
 #[cfg(test)]
 mod tests {
