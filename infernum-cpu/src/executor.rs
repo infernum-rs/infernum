@@ -10,7 +10,7 @@ use infernum::backend::{
 };
 use infernum::graph::{Arena, WeightStore};
 use infernum::tensor::Tensor;
-use infernum::{ExecutionPlan, GraphNode, NodeId, Op, Result};
+use infernum::{DType, ExecutionPlan, GraphNode, NodeId, Op, Result};
 
 use crate::tensor::{CpuLinearWeight, CpuTensor};
 use crate::CpuBackend;
@@ -25,16 +25,27 @@ fn read_tensor(
     let node = &nodes[node_id.index() as usize];
     let slot = plan.slot(node_id).expect("node has no buffer slot");
     let num_elements: usize = node.shape.iter().product();
-    let data = arena.f32_slice(slot.offset, num_elements);
-    CpuTensor::from_f32(&node.shape, data)
+    if node.dtype == DType::U32 {
+        let data = arena.u32_slice(slot.offset, num_elements);
+        CpuTensor::from_u32(&node.shape, data)
+    } else {
+        let data = arena.f32_slice(slot.offset, num_elements);
+        CpuTensor::from_f32(&node.shape, data)
+    }
 }
 
 /// Write a tensor into the arena at the plan's buffer slot for `node_id`.
 fn write_tensor(arena: &mut Arena, plan: &ExecutionPlan, node_id: NodeId, tensor: &CpuTensor) {
     if let Some(slot) = plan.slot(node_id) {
-        let src = tensor.as_f32_slice();
-        let dst = arena.f32_slice_mut(slot.offset, src.len());
-        dst.copy_from_slice(src);
+        if tensor.dtype() == DType::U32 {
+            let src = tensor.as_u32_slice();
+            let dst = arena.u32_slice_mut(slot.offset, src.len());
+            dst.copy_from_slice(src);
+        } else {
+            let src = tensor.as_f32_slice();
+            let dst = arena.f32_slice_mut(slot.offset, src.len());
+            dst.copy_from_slice(src);
+        }
     }
 }
 
@@ -441,5 +452,82 @@ mod tests {
             expected[1],
             result[1]
         );
+    }
+
+    /// Test 4: End-to-end Llama prefill graph with synthetic weights.
+    #[test]
+    fn llama_prefill_graph_synthetic() {
+        use infernum::graph::WeightId;
+        use infernum_llama::build_prefill_graph;
+        use infernum_llama::LlamaConfig;
+
+        let config: LlamaConfig = serde_json::from_str(
+            r#"{"vocab_size": 256, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 4, "rms_norm_eps": 1e-5, "rope_theta": 10000.0}"#,
+        )
+        .unwrap();
+
+        let seq_len = 8;
+        let head_dim = config.head_dim();
+        let half_dim = head_dim / 2;
+
+        let (graph, _model_weights) =
+            build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32);
+        let exec_plan = plan(&graph);
+        let mut arena = Arena::new(exec_plan.arena_size);
+
+        let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+
+        // Push tensor weights in registration order.
+        for i in 0..graph.tensor_weight_count() {
+            let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+            let size: usize = meta.shape.iter().product();
+            let data: Vec<f32> = (0..size).map(|j| (j as f32 * 0.01) % 1.0).collect();
+            weights.push_tensor_weight(CpuTensor::from_f32(&meta.shape, &data));
+        }
+
+        // Graph registers [N, K]; `new_dense` expects (K, N).
+        for i in 0..graph.linear_weight_count() {
+            let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+            let n = meta.shape[0];
+            let k = meta.shape[1];
+            let size = k * n;
+            let data: Vec<f32> = (0..size)
+                .map(|j| ((j as f32 * 0.001) - 0.5) * 0.1)
+                .collect();
+            let tensor = CpuTensor::from_f32(&[k, n], &data);
+            weights.push_linear_weight(CpuLinearWeight::new_dense(tensor));
+        }
+
+        let token_ids: Vec<u32> = (0..seq_len).map(|i| (i * 7 % 256) as u32).collect();
+        let input_ids = CpuTensor::from_u32(&[seq_len], &token_ids);
+        let cos_data: Vec<f32> = (0..seq_len * half_dim)
+            .map(|i| (i as f32 * 0.1).cos())
+            .collect();
+        let sin_data: Vec<f32> = (0..seq_len * half_dim)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let cos_cache = CpuTensor::from_f32(&[seq_len, half_dim], &cos_data);
+        let sin_cache = CpuTensor::from_f32(&[seq_len, half_dim], &sin_data);
+
+        let inputs = vec![input_ids, cos_cache, sin_cache];
+
+        let outputs = execute(
+            &exec_plan,
+            graph.nodes(),
+            &mut arena,
+            &weights,
+            &inputs,
+            graph.output_ids(),
+        )
+        .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape(), &[seq_len, config.vocab_size]);
+
+        let logits = outputs[0].as_f32_slice();
+        for (i, &v) in logits.iter().enumerate() {
+            assert!(!v.is_nan(), "NaN at logit index {i}");
+            assert!(!v.is_infinite(), "Inf at logit index {i}");
+        }
     }
 }

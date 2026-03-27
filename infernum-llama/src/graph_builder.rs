@@ -240,7 +240,7 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
     );
 
     // -- Graph inputs --
-    let input_ids = graph.add_input(&[seq_len], DType::F32);
+    let input_ids = graph.add_input(&[seq_len], DType::U32);
     let cos_input = graph.add_input(&[seq_len, head_dim / 2], DType::F32);
     let sin_input = graph.add_input(&[seq_len, head_dim / 2], DType::F32);
 

@@ -39,6 +39,20 @@ pub enum WeightRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WeightId(pub(crate) u32);
 
+impl WeightId {
+    /// Create a `WeightId` from a raw index.
+    #[must_use]
+    pub fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
+    /// Return the raw index.
+    #[must_use]
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
 /// Metadata for a registered weight (stored in the graph for shape inference).
 #[derive(Clone, Debug)]
 pub struct WeightMeta {

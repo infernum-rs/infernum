@@ -71,6 +71,44 @@ impl Arena {
         bytemuck::cast_slice_mut(&mut self.data[offset..end])
     }
 
+    /// Get an immutable `u32` slice at the given byte offset and element count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `offset + len * 4` exceeds the arena size
+    /// - `offset` is not 4-byte aligned
+    #[must_use]
+    pub fn u32_slice(&self, offset: usize, len: usize) -> &[u32] {
+        let byte_len = len * mem::size_of::<u32>();
+        let end = offset + byte_len;
+        assert!(
+            end <= self.data.len(),
+            "slice [{offset}..{end}) exceeds arena size {}",
+            self.data.len()
+        );
+        bytemuck::cast_slice(&self.data[offset..end])
+    }
+
+    /// Get a mutable `u32` slice at the given byte offset and element count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `offset + len * 4` exceeds the arena size
+    /// - `offset` is not 4-byte aligned
+    #[must_use]
+    pub fn u32_slice_mut(&mut self, offset: usize, len: usize) -> &mut [u32] {
+        let byte_len = len * mem::size_of::<u32>();
+        let end = offset + byte_len;
+        assert!(
+            end <= self.data.len(),
+            "slice [{offset}..{end}) exceeds arena size {}",
+            self.data.len()
+        );
+        bytemuck::cast_slice_mut(&mut self.data[offset..end])
+    }
+
     /// Total arena size in bytes.
     #[must_use]
     pub fn size(&self) -> usize {

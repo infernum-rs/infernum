@@ -192,6 +192,18 @@ impl<B: Backend> Graph<B> {
     pub fn linear_weight_meta(&self, id: WeightId) -> &WeightMeta {
         &self.linear_weights[id.0 as usize]
     }
+
+    /// Number of registered tensor weights.
+    #[must_use]
+    pub fn tensor_weight_count(&self) -> usize {
+        self.tensor_weights.len()
+    }
+
+    /// Number of registered linear weights.
+    #[must_use]
+    pub fn linear_weight_count(&self) -> usize {
+        self.linear_weights.len()
+    }
 }
 
 impl<B: Backend> Default for Graph<B> {
