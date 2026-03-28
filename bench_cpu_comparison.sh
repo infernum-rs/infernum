@@ -181,7 +181,7 @@ run_llama_bench() {
     echo "${json}" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(round(d["avg_ts"], 1))'
 }
 
-# Run infernum bench_cpu.
+# Run infernum bench_cpu (eager).
 run_infernum_bench() {
     local model_path="$1"
     if $DRY_RUN; then
@@ -195,6 +195,24 @@ run_infernum_bench() {
     local output toks
     output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
         "${model_path}" "${N_GEN}" "${thread_args[@]}" 2>/dev/null || true)
+    toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
+    echo "${toks:-ERR}"
+}
+
+# Run infernum bench_cpu --graph (graph executor, SafeTensors only).
+run_infernum_graph_bench() {
+    local model_dir="$1"
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+    local thread_args=()
+    if [[ -n "${THREADS}" ]]; then
+        thread_args=(-j "${THREADS}")
+    fi
+    local output toks
+    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
+        --graph "${model_dir}" "${N_GEN}" "${thread_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     echo "${toks:-ERR}"
 }
@@ -279,6 +297,7 @@ fi
 
 declare -A results_llama
 declare -A results_infernum
+declare -A results_graph
 
 all_benchmarks=("GGUF F32" "GGUF Q8_0" "GGUF Q4_0")
 
@@ -304,20 +323,26 @@ for bench in "${benchmarks[@]}"; do
         "GGUF F32")
             log "[${step}/${total}] GGUF F32 — llama.cpp"
             results_llama["GGUF F32"]=$(run_llama_bench "${GGUF_F32}")
-            log "[${step}/${total}] GGUF F32 — infernum"
+            log "[${step}/${total}] GGUF F32 — infernum (eager)"
             results_infernum["GGUF F32"]=$(run_infernum_bench "${GGUF_F32}")
+            log "[${step}/${total}] GGUF F32 — infernum (graph)"
+            results_graph["GGUF F32"]=$(run_infernum_graph_bench "${BASE_MODEL_DIR}")
             ;;
         "GGUF Q8_0")
             log "[${step}/${total}] GGUF Q8_0 — llama.cpp"
             results_llama["GGUF Q8_0"]=$(run_llama_bench "${GGUF_Q8}")
-            log "[${step}/${total}] GGUF Q8_0 — infernum"
+            log "[${step}/${total}] GGUF Q8_0 — infernum (eager)"
             results_infernum["GGUF Q8_0"]=$(run_infernum_bench "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — infernum (graph)"
+            results_graph["GGUF Q8_0"]=$(run_infernum_graph_bench "${GGUF_Q8}")
             ;;
         "GGUF Q4_0")
             log "[${step}/${total}] GGUF Q4_0 — llama.cpp"
             results_llama["GGUF Q4_0"]=$(run_llama_bench "${GGUF_Q4}")
-            log "[${step}/${total}] GGUF Q4_0 — infernum"
+            log "[${step}/${total}] GGUF Q4_0 — infernum (eager)"
             results_infernum["GGUF Q4_0"]=$(run_infernum_bench "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — infernum (graph)"
+            results_graph["GGUF Q4_0"]=$(run_infernum_graph_bench "${GGUF_Q4}")
             ;;
     esac
 done
@@ -357,23 +382,24 @@ if [[ -d "${LLAMA_CPP}/.git" ]]; then
 fi
 
 echo ""
-echo "## Infernum vs llama.cpp — ${MODEL_NAME} CPU decode throughput"
+echo "## Infernum vs llama.cpp — ${MODEL_NAME} CPU throughput"
 echo ""
 echo "- **CPU:** ${cpu_name} (${effective_threads} threads)"
-echo "- **Tokens generated:** ${N_GEN} (8-token prompt, greedy)"
+echo "- **Tokens:** ${N_GEN} (eager = decode, graph = prefill)"
 echo "- **infernum:** commit \`${infernum_commit}\`"
 echo "- **llama.cpp:** commit \`${llama_commit}\` (\`-ngl 0\`, ${LLAMA_BENCH_REPS} reps)"
 echo "- **Date:** $(date +%Y-%m-%d)"
 echo ""
-echo "| Format | llama.cpp (tok/s) | infernum (tok/s) | Gap (llama.cpp ÷ infernum) |"
-echo "| ------ | ----------------: | ---------------: | -------------------------: |"
+echo "| Format | llama.cpp (tok/s) | infernum eager (tok/s) | infernum graph (tok/s) | Gap (llama÷eager) |"
+echo "| ------ | ----------------: | ---------------------: | ---------------------: | ----------------: |"
 
 for bench in "${benchmarks[@]}"; do
     l="${results_llama[$bench]}"
     i="${results_infernum[$bench]}"
+    g="${results_graph[$bench]}"
     gap=$(compute_gap "${l}" "${i}")
 
-    printf "| %-14s | %17s | %16s | %26s |\n" "${bench}" "${l}" "${i}" "${gap}"
+    printf "| %-14s | %17s | %22s | %22s | %17s |\n" "${bench}" "${l}" "${i}" "${g}" "${gap}"
 done
 
 echo ""
