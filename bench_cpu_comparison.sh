@@ -129,7 +129,7 @@ download_hf_model() {
     if hf download "${repo_id}" "model.safetensors" --local-dir "${dest_dir}" --quiet 2>/dev/null; then
         :
     else
-        hf download "${repo_id}" --local-dir "${dest_dir}" --quiet 
+        hf download "${repo_id}" --local-dir "${dest_dir}" --quiet \
             --include "model.safetensors.index.json" "model-*.safetensors" 2>/dev/null || true
     fi
     for f in "${files[@]}"; do
@@ -179,7 +179,7 @@ run_llama_bench_decode() {
         thread_args=(-t "${THREADS}")
     fi
     local json
-    json=$("${LLAMA_BENCH}" -m "${gguf}" -p 0 -n "${N_TOKENS}" -r "${LLAMA_BENCH_REPS}" 
+    json=$("${LLAMA_BENCH}" -m "${gguf}" -p 0 -n "${N_TOKENS}" -r "${LLAMA_BENCH_REPS}" \
         -ngl 0 "${thread_args[@]}" -o jsonl 2>/dev/null)
     echo "${json}" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(round(d["avg_ts"], 1))'
 }
@@ -196,7 +196,7 @@ run_llama_bench_prefill() {
         thread_args=(-t "${THREADS}")
     fi
     local json
-    json=$("${LLAMA_BENCH}" -m "${gguf}" -p "${N_TOKENS}" -n 0 -r "${LLAMA_BENCH_REPS}" 
+    json=$("${LLAMA_BENCH}" -m "${gguf}" -p "${N_TOKENS}" -n 0 -r "${LLAMA_BENCH_REPS}" \
         -ngl 0 "${thread_args[@]}" -o jsonl 2>/dev/null)
     echo "${json}" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(round(d["avg_ts"], 1))'
 }
@@ -213,7 +213,7 @@ run_infernum_decode() {
         thread_args=(-j "${THREADS}")
     fi
     local output toks
-    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- 
+    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
         "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     echo "${toks:-ERR}"
@@ -231,7 +231,7 @@ run_infernum_prefill() {
         thread_args=(-j "${THREADS}")
     fi
     local output toks
-    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- 
+    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
         --graph "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     echo "${toks:-ERR}"
