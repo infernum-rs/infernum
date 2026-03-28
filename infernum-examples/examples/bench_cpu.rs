@@ -313,7 +313,9 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
     );
 
     // Build graph
-    let (graph, _model_weights) = build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+    let (mut graph, _model_weights) =
+        build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+    infernum::graph::optimizer::optimize(&mut graph);
     let exec_plan = plan(&graph);
 
     let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
@@ -458,7 +460,8 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
         let token = (pos % 256) as u32;
         let kv_len = pos; // KV cache has `pos` entries so far
 
-        let (decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
+        let (mut decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
+        infernum::graph::optimizer::optimize(&mut decode_graph);
         let decode_plan = plan(&decode_graph);
         let mut arena = Arena::new(decode_plan.arena_size);
 
@@ -506,7 +509,8 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
         let pos = prompt_len + step;
         let kv_len = pos;
 
-        let (decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
+        let (mut decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
+        infernum::graph::optimizer::optimize(&mut decode_graph);
         let decode_plan = plan(&decode_graph);
         let mut arena = Arena::new(decode_plan.arena_size);
 

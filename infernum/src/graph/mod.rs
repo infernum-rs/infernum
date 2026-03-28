@@ -9,6 +9,7 @@ mod builder;
 mod builder_traits;
 mod node;
 mod ops;
+pub mod optimizer;
 mod planner;
 mod weight_store;
 
@@ -17,7 +18,7 @@ pub use builder::Graph;
 pub use builder_traits::{
     GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps, GraphGegluOps,
     GraphMatmulExtOps, GraphMatmulOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps,
-    GraphRopeInterleavedOps, GraphRopeOps, GraphSwigluOps, GraphTensorOps,
+    GraphRopeInterleavedOps, GraphRopeOps, GraphSiluOps, GraphSwigluOps, GraphTensorOps,
 };
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use ops::{MoeExpertIds, Op};

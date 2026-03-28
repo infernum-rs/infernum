@@ -125,6 +125,18 @@ pub enum Op {
     /// Output: activated tensor.
     Geglu,
 
+    /// `SiLU` (`Swish`) activation: `x * sigmoid(x)`.
+    ///
+    /// Inputs: `(input)`.
+    /// Output: activated tensor.
+    Silu,
+
+    /// Element-wise multiplication.
+    ///
+    /// Inputs: `(a, b)`.
+    /// Output: `a * b`.
+    Mul,
+
     // --- Arithmetic ---
     /// Element-wise addition.
     ///

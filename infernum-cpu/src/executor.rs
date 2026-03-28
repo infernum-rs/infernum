@@ -118,8 +118,17 @@ pub fn execute(
                 // Write primary output (updated residual).
                 write_tensor(arena, plan, node_id, &updated);
 
-                // Write secondary output (normed) — the next NodeId.
-                let second_id = NodeId::from_index(node_id.index() + 1);
+                // Write secondary output (normed) — find the SecondOutput
+                // node that references this primary node.
+                #[allow(clippy::cast_possible_truncation)]
+                let second_id = nodes
+                    .iter()
+                    .enumerate()
+                    .find(
+                        |(_, n)| matches!(&n.op, Op::SecondOutput { source } if *source == node_id),
+                    )
+                    .map(|(i, _)| NodeId::from_index(i as u32))
+                    .expect("AddRmsNorm must have a SecondOutput");
                 write_tensor(arena, plan, second_id, &normed);
             }
 
@@ -174,6 +183,24 @@ pub fn execute(
                 let gate = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let up = read_tensor(arena, plan, nodes, node.inputs[1]);
                 let result = <CpuBackend as SwigluOps>::swiglu(&gate, &up)?;
+                write_tensor(arena, plan, node_id, &result);
+            }
+
+            Op::Silu => {
+                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let data = input.as_f32_slice();
+                let mut out = vec![0.0f32; data.len()];
+                for (o, &x) in out.iter_mut().zip(data.iter()) {
+                    *o = x / (1.0 + (-x).exp());
+                }
+                let result = CpuTensor::from_f32(&node.shape, &out);
+                write_tensor(arena, plan, node_id, &result);
+            }
+
+            Op::Mul => {
+                let a = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let b = read_tensor(arena, plan, nodes, node.inputs[1]);
+                let result = <CpuBackend as ArithOps>::mul(&a, &b)?;
                 write_tensor(arena, plan, node_id, &result);
             }
 
@@ -482,8 +509,9 @@ mod tests {
         let head_dim = config.head_dim();
         let half_dim = head_dim / 2;
 
-        let (graph, _model_weights) =
+        let (mut graph, _model_weights) =
             build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32);
+        infernum::graph::optimizer::optimize(&mut graph);
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);
 

@@ -12,12 +12,12 @@
 //! - Full causal attention (no sliding window)
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, RopeOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
     Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphMatmulOps, GraphNormOps,
-    GraphRopeOps, GraphSwigluOps, GraphTensorOps, WeightId,
+    GraphRopeOps, GraphSiluOps, GraphTensorOps, WeightId,
 };
 
 use crate::config::LlamaConfig;
@@ -69,20 +69,12 @@ pub struct ModelWeightIds {
 /// This is the subset of [`LlamaOps`](crate::model::LlamaOps) needed for
 /// the prefill graph — excludes paged KV cache, `MoE`, and cast ops.
 pub trait LlamaGraphOps:
-    Backend + MatmulOps + NormOps + ArithOps + SwigluOps + EmbedOps + TensorOps + RopeOps + AttentionOps
+    Backend + MatmulOps + NormOps + ArithOps + EmbedOps + TensorOps + RopeOps + AttentionOps
 {
 }
 
 impl<B> LlamaGraphOps for B where
-    B: Backend
-        + MatmulOps
-        + NormOps
-        + ArithOps
-        + SwigluOps
-        + EmbedOps
-        + TensorOps
-        + RopeOps
-        + AttentionOps
+    B: Backend + MatmulOps + NormOps + ArithOps + EmbedOps + TensorOps + RopeOps + AttentionOps
 {
 }
 
@@ -271,13 +263,14 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
         let attn_flat = graph.add_reshape(attn_out, &[seq_len, num_heads * head_dim]);
         let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
 
-        // 7. Fused residual add + post-attention RMS norm
-        let (h_updated, normed_post) =
-            graph.add_add_rmsnorm(h, attn_proj, lw.post_attention_layernorm, eps);
+        // 7. Residual add + post-attention RMS norm (primitives — optimizer fuses)
+        let h_updated = graph.add_add(h, attn_proj);
+        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm, eps);
 
-        // 8. FFN: SwiGLU MLP (fused pair — single dispatch, shared quantization)
+        // 8. FFN: SiLU + Mul MLP (primitives — optimizer fuses into Swiglu)
         let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
-        let activated = graph.add_swiglu(gate, up);
+        let gate_activated = graph.add_silu(gate);
+        let activated = graph.add_mul(gate_activated, up);
         let down = graph.add_linear(activated, lw.down_proj);
 
         // 9. Residual add
@@ -290,6 +283,9 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
     // -- LM head --
     let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
     graph.set_output(logits);
+
+    // -- Optimize: fuse primitives into efficient compound ops --
+    infernum::graph::optimizer::optimize(&mut graph);
 
     (graph, model_weights)
 }
@@ -402,13 +398,14 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
         let attn_flat = graph.add_reshape(attn_out, &[1, num_heads * head_dim]);
         let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
 
-        // 8. Fused residual add + post-attention RMS norm
-        let (h_updated, normed_post) =
-            graph.add_add_rmsnorm(h, attn_proj, lw.post_attention_layernorm, eps);
+        // 8. Residual add + post-attention RMS norm (primitives — optimizer fuses)
+        let h_updated = graph.add_add(h, attn_proj);
+        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm, eps);
 
-        // 9. FFN: SwiGLU MLP (fused pair)
+        // 9. FFN: SiLU + Mul MLP (primitives — optimizer fuses into Swiglu)
         let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
-        let activated = graph.add_swiglu(gate, up);
+        let gate_activated = graph.add_silu(gate);
+        let activated = graph.add_mul(gate_activated, up);
         let down = graph.add_linear(activated, lw.down_proj);
 
         // 10. Residual add
@@ -598,12 +595,6 @@ mod tests {
         }
         fn scale_inplace(_a: &mut DummyTensor, _scale: f32) -> infernum::Result<()> {
             Ok(())
-        }
-    }
-
-    impl infernum::backend::SwigluOps for TestBackend {
-        fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> infernum::Result<DummyTensor> {
-            Ok(DummyTensor)
         }
     }
 

@@ -238,6 +238,9 @@ pub trait GraphArithOps {
     /// In-place addition. Output shape = first input shape, same dtype.
     fn add_add_inplace(&mut self, a: NodeId, b: NodeId) -> NodeId;
 
+    /// Element-wise multiplication. Output shape = first input shape, same dtype.
+    fn add_mul(&mut self, a: NodeId, b: NodeId) -> NodeId;
+
     /// Uniform scalar scaling. Output shape = input shape, same dtype.
     fn add_scale(&mut self, input: NodeId, factor: f32) -> NodeId;
 }
@@ -253,6 +256,12 @@ impl<B: Backend + ArithOps> GraphArithOps for Graph<B> {
         let shape = self.node_shape(a).to_vec();
         let dtype = self.node_dtype(a);
         self.push_node(Op::AddInplace, &[a, b], shape, dtype)
+    }
+
+    fn add_mul(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let shape = self.node_shape(a).to_vec();
+        let dtype = self.node_dtype(a);
+        self.push_node(Op::Mul, &[a, b], shape, dtype)
     }
 
     fn add_scale(&mut self, input: NodeId, factor: f32) -> NodeId {
@@ -313,6 +322,24 @@ impl<B: Backend + GegluOps> GraphGegluOps for Graph<B> {
         let shape = self.node_shape(gate).to_vec();
         let dtype = self.node_dtype(gate);
         self.push_node(Op::Geglu, &[gate, up], shape, dtype)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SiluOps (primitive — no backend trait bound needed)
+// ---------------------------------------------------------------------------
+
+/// Graph builder methods for `SiLU` activation.
+pub trait GraphSiluOps {
+    /// `silu(input) = input * sigmoid(input)`. Output shape = input shape, same dtype.
+    fn add_silu(&mut self, input: NodeId) -> NodeId;
+}
+
+impl<B: Backend> GraphSiluOps for Graph<B> {
+    fn add_silu(&mut self, input: NodeId) -> NodeId {
+        let shape = self.node_shape(input).to_vec();
+        let dtype = self.node_dtype(input);
+        self.push_node(Op::Silu, &[input], shape, dtype)
     }
 }
 

@@ -54,5 +54,6 @@ pub use graph::{
     plan, BufferSlot, ExecutionPlan, Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps,
     GraphCastOps, GraphEmbedOps, GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphNode,
     GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
-    GraphRopeOps, GraphSwigluOps, GraphTensorOps, NodeId, Op, WeightId, WeightMeta, WeightRef,
+    GraphRopeOps, GraphSiluOps, GraphSwigluOps, GraphTensorOps, NodeId, Op, WeightId, WeightMeta,
+    WeightRef,
 };

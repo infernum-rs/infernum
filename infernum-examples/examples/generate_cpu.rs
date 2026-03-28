@@ -479,7 +479,8 @@ fn run_graph_generation(model_path: &str, tokenizer: &Tokenizer, cli: &Cli) -> R
         let seq_len = token_ids.len();
 
         // Build graph for current sequence length
-        let (graph, _) = build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32);
+        let (mut graph, _) = build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32);
+        infernum::graph::optimizer::optimize(&mut graph);
         let exec_plan = plan(&graph);
 
         // Build inputs
