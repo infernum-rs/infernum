@@ -4,6 +4,8 @@
 //! [`Op`] to the existing CPU SIMD kernels. Intermediate tensors are
 //! read from / written to a shared [`Arena`].
 
+use std::collections::HashMap;
+
 use infernum::backend::{
     ArithOps, AttentionOps, BiasOps, EmbedOps, MatmulExtOps, MatmulOps, NormOps, RopeOps,
     SwigluOps, TensorOps,
@@ -14,6 +16,114 @@ use infernum::{DType, ExecutionPlan, GraphNode, NodeId, Op, Result};
 
 use crate::tensor::{CpuLinearWeight, CpuTensor};
 use crate::CpuBackend;
+
+/// Persistent KV cache storage for decode-mode graph execution.
+///
+/// Instead of passing KV caches as graph inputs and copying them through
+/// the arena every step, this store holds pre-allocated buffers that grow
+/// via in-place append. This eliminates the O(seq_len) per-step copy cost.
+pub struct KvCacheStore {
+    /// Per-layer K cache: `[current_len, num_kv_heads, head_dim]` stored flat.
+    k_caches: Vec<Vec<f32>>,
+    /// Per-layer V cache: `[current_len, num_kv_heads, head_dim]` stored flat.
+    v_caches: Vec<Vec<f32>>,
+    /// Number of positions currently stored (same for all layers).
+    len: usize,
+    /// Number of KV heads (used to construct shapes).
+    num_kv_heads: usize,
+    /// Head dimension (used to construct shapes).
+    head_dim: usize,
+    /// Node IDs of the KV cache Input nodes in the graph, in order:
+    /// `[k_cache_0, v_cache_0, k_cache_1, v_cache_1, ...]`
+    cache_input_node_ids: Vec<NodeId>,
+    /// Node IDs of the `ConcatSeq` nodes that append to KV caches, in order:
+    /// `[k_concat_0, v_concat_0, k_concat_1, v_concat_1, ...]`
+    concat_node_ids: Vec<NodeId>,
+}
+
+impl KvCacheStore {
+    /// Create a new empty KV cache store.
+    ///
+    /// # Arguments
+    /// * `num_layers` — Number of transformer layers.
+    /// * `num_kv_heads` — Number of KV attention heads per layer.
+    /// * `head_dim` — Dimension of each attention head.
+    /// * `cache_input_node_ids` — `NodeId`s of KV cache Input nodes in the graph.
+    /// * `concat_node_ids` — `NodeId`s of `ConcatSeq` nodes that append to KV caches.
+    #[must_use]
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cache_input_node_ids: Vec<NodeId>,
+        concat_node_ids: Vec<NodeId>,
+    ) -> Self {
+        assert_eq!(cache_input_node_ids.len(), 2 * num_layers);
+        assert_eq!(concat_node_ids.len(), 2 * num_layers);
+        Self {
+            k_caches: (0..num_layers).map(|_| Vec::new()).collect(),
+            v_caches: (0..num_layers).map(|_| Vec::new()).collect(),
+            len: 0,
+            num_kv_heads,
+            head_dim,
+            cache_input_node_ids,
+            concat_node_ids,
+        }
+    }
+
+    /// Append a new K or V row to the specified layer's cache.
+    fn append(&mut self, layer: usize, is_key: bool, data: &[f32]) {
+        let row_size = self.num_kv_heads * self.head_dim;
+        assert_eq!(data.len(), row_size, "KV row size mismatch");
+        let cache = if is_key {
+            &mut self.k_caches[layer]
+        } else {
+            &mut self.v_caches[layer]
+        };
+        cache.extend_from_slice(data);
+    }
+
+    /// Get the full K or V cache for a layer as a `CpuTensor` view.
+    fn get_cache(&self, layer: usize, is_key: bool, len: usize) -> CpuTensor {
+        let cache = if is_key {
+            &self.k_caches[layer]
+        } else {
+            &self.v_caches[layer]
+        };
+        let shape = [len, self.num_kv_heads, self.head_dim];
+        CpuTensor::from_f32(&shape, &cache[..len * self.num_kv_heads * self.head_dim])
+    }
+
+    /// Check if a node ID is a KV cache input node.
+    fn is_cache_input(&self, node_id: NodeId) -> bool {
+        self.cache_input_node_ids.contains(&node_id)
+    }
+
+    /// Check if a node ID is a KV cache `ConcatSeq` node.
+    /// Returns `(layer_index, is_key)` if found.
+    fn cache_concat_info(&self, node_id: NodeId) -> Option<(usize, bool)> {
+        self.concat_node_ids
+            .iter()
+            .position(|&id| id == node_id)
+            .map(|pos| {
+                let layer = pos / 2;
+                let is_key = pos % 2 == 0;
+                (layer, is_key)
+            })
+    }
+
+    /// Current number of cached positions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if no positions are cached.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
 
 /// Read a tensor from the arena using the plan's buffer slot for `node_id`.
 fn read_tensor(
@@ -75,8 +185,13 @@ pub fn execute(
     weights: &WeightStore<CpuTensor, CpuLinearWeight>,
     inputs: &[CpuTensor],
     output_nodes: &[NodeId],
+    mut kv_cache: Option<&mut KvCacheStore>,
 ) -> Result<Vec<CpuTensor>> {
     let mut input_idx: usize = 0;
+    // Tensor overrides: nodes whose output lives outside the arena (e.g., KV
+    // caches in the persistent `KvCacheStore`). `read_tensor` is bypassed for
+    // these — the override is consumed directly instead of copying through arena.
+    let mut overrides: HashMap<NodeId, CpuTensor> = HashMap::new();
 
     for &node_id in &plan.schedule {
         let node = &nodes[node_id.index() as usize];
@@ -84,6 +199,13 @@ pub fn execute(
         match &node.op {
             // --- Input ---
             Op::Input => {
+                if kv_cache
+                    .as_ref()
+                    .is_some_and(|kv| kv.is_cache_input(node_id))
+                {
+                    // KV cache lives in the persistent store; skip arena copy.
+                    continue;
+                }
                 let tensor = &inputs[input_idx];
                 input_idx += 1;
                 write_tensor(arena, plan, node_id, tensor);
@@ -261,8 +383,13 @@ pub fn execute(
 
             Op::FusedAttentionDecode { softcap } => {
                 let q = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let k = read_tensor(arena, plan, nodes, node.inputs[1]);
-                let v = read_tensor(arena, plan, nodes, node.inputs[2]);
+                // K/V may be in overrides (persistent KV cache) instead of arena.
+                let k = overrides
+                    .remove(&node.inputs[1])
+                    .unwrap_or_else(|| read_tensor(arena, plan, nodes, node.inputs[1]));
+                let v = overrides
+                    .remove(&node.inputs[2])
+                    .unwrap_or_else(|| read_tensor(arena, plan, nodes, node.inputs[2]));
                 let result = <CpuBackend as AttentionOps>::fused_attention_decode(
                     &q, &k, &v, None, *softcap, None,
                 )?;
@@ -315,15 +442,31 @@ pub fn execute(
             }
 
             Op::ConcatSeq => {
-                let a = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let b = read_tensor(arena, plan, nodes, node.inputs[1]);
-                let a_data = a.as_f32_slice();
-                let b_data = b.as_f32_slice();
-                let mut data = Vec::with_capacity(a_data.len() + b_data.len());
-                data.extend_from_slice(a_data);
-                data.extend_from_slice(b_data);
-                let result = CpuTensor::from_f32_vec(&node.shape, data);
-                write_tensor(arena, plan, node_id, &result);
+                let concat_info = kv_cache
+                    .as_ref()
+                    .and_then(|kv| kv.cache_concat_info(node_id));
+
+                if let Some((layer, is_key)) = concat_info {
+                    // KV cache path: append new row to persistent buffer.
+                    // Store the result in `overrides` so downstream attention
+                    // reads directly — no arena copy of the full KV cache.
+                    let new_row = read_tensor(arena, plan, nodes, node.inputs[1]);
+                    let kv = kv_cache.as_mut().unwrap();
+                    kv.append(layer, is_key, new_row.as_f32_slice());
+                    let new_len = kv.len + 1;
+                    let full_cache = kv.get_cache(layer, is_key, new_len);
+                    overrides.insert(node_id, full_cache);
+                } else {
+                    let a = read_tensor(arena, plan, nodes, node.inputs[0]);
+                    let b = read_tensor(arena, plan, nodes, node.inputs[1]);
+                    let a_data = a.as_f32_slice();
+                    let b_data = b.as_f32_slice();
+                    let mut data = Vec::with_capacity(a_data.len() + b_data.len());
+                    data.extend_from_slice(a_data);
+                    data.extend_from_slice(b_data);
+                    let result = CpuTensor::from_f32_vec(&node.shape, data);
+                    write_tensor(arena, plan, node_id, &result);
+                }
             }
 
             Op::SliceView { offset, shape } => {
@@ -346,10 +489,19 @@ pub fn execute(
         }
     }
 
-    // Collect output tensors.
+    // Update persistent KV cache length after all layers have appended.
+    if let Some(kv) = kv_cache {
+        kv.len += 1;
+    }
+
+    // Collect output tensors (check overrides first, then arena).
     let outputs = output_nodes
         .iter()
-        .map(|&id| read_tensor(arena, plan, nodes, id))
+        .map(|&id| {
+            overrides
+                .remove(&id)
+                .unwrap_or_else(|| read_tensor(arena, plan, nodes, id))
+        })
         .collect();
 
     Ok(outputs)
@@ -386,6 +538,7 @@ mod tests {
             &weights,
             &[input_a, input_b],
             graph.output_ids(),
+            None,
         )
         .unwrap();
 
@@ -423,6 +576,7 @@ mod tests {
             &weights,
             &[input],
             graph.output_ids(),
+            None,
         )
         .unwrap();
 
@@ -468,6 +622,7 @@ mod tests {
             &weights,
             &[input],
             graph.output_ids(),
+            None,
         )
         .unwrap();
 
@@ -558,6 +713,7 @@ mod tests {
             &weights,
             &inputs,
             graph.output_ids(),
+            None,
         )
         .unwrap();
 

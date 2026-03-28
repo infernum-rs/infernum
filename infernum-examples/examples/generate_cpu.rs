@@ -500,6 +500,7 @@ fn run_graph_generation(model_path: &str, tokenizer: &Tokenizer, cli: &Cli) -> R
             &weights,
             &inputs,
             graph.output_ids(),
+            None,
         )?;
 
         // Argmax the last position's logits

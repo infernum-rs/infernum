@@ -24,9 +24,9 @@ use serde::Deserialize;
 use infernum::backend::MatmulOps;
 use infernum::dtype::DType;
 use infernum::graph::{plan, Arena, WeightId, WeightStore};
-use infernum::GenerateOptions;
 use infernum::Tensor;
-use infernum_cpu::executor::execute;
+use infernum::{GenerateOptions, NodeId, Op};
+use infernum_cpu::executor::{execute, KvCacheStore};
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
 use infernum_gemma::GemmaModel;
 use infernum_llama::{build_decode_graph, build_prefill_graph, LlamaConfig, LlamaModel};
@@ -348,6 +348,7 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
             &weights,
             &inputs,
             graph.output_ids(),
+            None,
         )?;
         assert_eq!(outputs[0].shape()[0], n_tokens);
         eprintln!("Warm-up done, output shape: {:?}", outputs[0].shape());
@@ -367,6 +368,7 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
             &weights,
             &inputs,
             graph.output_ids(),
+            None,
         )?;
         let elapsed = start.elapsed();
         if elapsed < best_elapsed {
@@ -390,11 +392,45 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
     Ok(())
 }
 
-/// Benchmark decode throughput using the graph executor.
+/// Find KV cache Input and ConcatSeq node IDs from a decode graph.
 ///
-/// Runs a prefill pass to build initial KV caches, then decodes `n_gen`
-/// tokens one at a time through the decode graph. The graph is rebuilt
-/// each step because KV cache shapes change as the sequence grows.
+/// Returns `(cache_input_ids, concat_ids)` where each vec contains entries
+/// in order `[k_layer0, v_layer0, k_layer1, v_layer1, ...]`.
+fn find_kv_cache_node_ids(
+    nodes: &[infernum::GraphNode],
+    num_layers: usize,
+) -> (Vec<NodeId>, Vec<NodeId>) {
+    // KV cache inputs are Input nodes after the first 3 (token, cos, sin).
+    let input_ids: Vec<NodeId> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n.op, Op::Input))
+        .skip(3) // skip token_id, cos, sin
+        .map(|(i, _)| NodeId::from_index(i as u32))
+        .collect();
+    assert_eq!(input_ids.len(), 2 * num_layers, "unexpected KV input count");
+
+    // ConcatSeq nodes (in graph order) correspond to KV cache appends.
+    let concat_ids: Vec<NodeId> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n.op, Op::ConcatSeq))
+        .map(|(i, _)| NodeId::from_index(i as u32))
+        .collect();
+    assert_eq!(
+        concat_ids.len(),
+        2 * num_layers,
+        "unexpected ConcatSeq count"
+    );
+
+    (input_ids, concat_ids)
+}
+
+/// Benchmark decode throughput using the graph executor with persistent KV caches.
+///
+/// Uses `KvCacheStore` to avoid copying KV caches through the arena every step.
+/// The graph is still rebuilt each step (node shapes depend on kv_len), but the
+/// expensive O(seq_len) KV cache copies are eliminated.
 fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
     let is_gguf = model_path.ends_with(".gguf");
 
@@ -420,6 +456,7 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
     let num_layers = config.num_hidden_layers;
     let head_dim = config.head_dim();
     let half_dim = head_dim / 2;
+    let num_kv_heads = config.num_kv_heads();
 
     eprintln!(
         "Model: {} layers, {} hidden (graph decode, n_gen={})",
@@ -444,61 +481,57 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
     let (all_cos, all_sin) =
         infernum::rope::precompute_rope_data(max_pos, head_dim, config.rope_theta);
 
-    // Initialize KV caches as zero-length tensors (will grow each decode step).
-    let num_kv_heads = config.num_kv_heads();
-    let mut k_caches: Vec<CpuTensor> = (0..num_layers)
-        .map(|_| CpuTensor::from_f32(&[0, num_kv_heads, head_dim], &[]))
-        .collect();
-    let mut v_caches: Vec<CpuTensor> = (0..num_layers)
-        .map(|_| CpuTensor::from_f32(&[0, num_kv_heads, head_dim], &[]))
-        .collect();
+    // Build decode graph once with kv_len=0. KvCacheStore intercepts all KV
+    // cache Input and ConcatSeq nodes, so the graph never touches KV data
+    // through the arena. The graph/plan/arena can be reused across all steps.
+    let (mut decode_graph, _) = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+    infernum::graph::optimizer::optimize(&mut decode_graph);
+    let decode_plan = plan(&decode_graph);
+    let mut arena = Arena::new(decode_plan.arena_size);
+    let logits_id = decode_graph.output_ids()[0];
 
-    // Warm-up: decode the prompt tokens one at a time (not timed)
-    eprintln!("Warm-up: decoding {} prompt tokens...", prompt_len);
-    let mut last_token = 0u32; // dummy start
-    for pos in 0..prompt_len {
-        let token = (pos % 256) as u32;
-        let kv_len = pos; // KV cache has `pos` entries so far
+    let (cache_input_ids, concat_ids) = find_kv_cache_node_ids(decode_graph.nodes(), num_layers);
 
-        let (mut decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
-        infernum::graph::optimizer::optimize(&mut decode_graph);
-        let decode_plan = plan(&decode_graph);
-        let mut arena = Arena::new(decode_plan.arena_size);
+    // Create persistent KV cache store.
+    let mut kv_cache = KvCacheStore::new(
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        cache_input_ids,
+        concat_ids,
+    );
 
-        // Build inputs: token, cos, sin, then per-layer k_cache, v_cache
-        let mut inputs = Vec::with_capacity(3 + 2 * num_layers);
-        inputs.push(CpuTensor::from_u32(&[1], &[token]));
+    // Helper: run one decode step, reusing the cached graph/plan/arena.
+    let run_decode_step = |pos: usize,
+                           token: u32,
+                           kv_cache: &mut KvCacheStore,
+                           arena: &mut Arena|
+     -> infernum::Result<Vec<CpuTensor>> {
         let cos_start = pos * half_dim;
-        inputs.push(CpuTensor::from_f32(
-            &[1, half_dim],
-            &all_cos[cos_start..cos_start + half_dim],
-        ));
-        inputs.push(CpuTensor::from_f32(
-            &[1, half_dim],
-            &all_sin[cos_start..cos_start + half_dim],
-        ));
+        let inputs = vec![
+            CpuTensor::from_u32(&[1], &[token]),
+            CpuTensor::from_f32(&[1, half_dim], &all_cos[cos_start..cos_start + half_dim]),
+            CpuTensor::from_f32(&[1, half_dim], &all_sin[cos_start..cos_start + half_dim]),
+        ];
 
-        for layer in 0..num_layers {
-            inputs.push(k_caches[layer].clone());
-            inputs.push(v_caches[layer].clone());
-        }
-
-        let outputs = execute(
+        execute(
             &decode_plan,
             decode_graph.nodes(),
-            &mut arena,
+            arena,
             &weights,
             &inputs,
-            decode_graph.output_ids(),
-        )?;
+            &[logits_id],
+            Some(kv_cache),
+        )
+    };
 
-        // outputs: [logits, k_0, k_1, ..., k_N, v_0, v_1, ..., v_N]
-        last_token = token; // in a real scenario we'd argmax the logits
-
-        for layer in 0..num_layers {
-            k_caches[layer] = outputs[1 + layer].clone();
-            v_caches[layer] = outputs[1 + num_layers + layer].clone();
-        }
+    // Warm-up: decode the prompt tokens one at a time (not timed)
+    eprintln!("Warm-up: decoding {prompt_len} prompt tokens...");
+    let mut last_token = 0u32;
+    for pos in 0..prompt_len {
+        let token = (pos % 256) as u32;
+        let _outputs = run_decode_step(pos, token, &mut kv_cache, &mut arena)?;
+        last_token = token;
     }
     eprintln!("Warm-up done.");
 
@@ -507,38 +540,7 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
 
     for step in 0..n_gen {
         let pos = prompt_len + step;
-        let kv_len = pos;
-
-        let (mut decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
-        infernum::graph::optimizer::optimize(&mut decode_graph);
-        let decode_plan = plan(&decode_graph);
-        let mut arena = Arena::new(decode_plan.arena_size);
-
-        let mut inputs = Vec::with_capacity(3 + 2 * num_layers);
-        inputs.push(CpuTensor::from_u32(&[1], &[last_token]));
-        let cos_start = pos * half_dim;
-        inputs.push(CpuTensor::from_f32(
-            &[1, half_dim],
-            &all_cos[cos_start..cos_start + half_dim],
-        ));
-        inputs.push(CpuTensor::from_f32(
-            &[1, half_dim],
-            &all_sin[cos_start..cos_start + half_dim],
-        ));
-
-        for layer in 0..num_layers {
-            inputs.push(k_caches[layer].clone());
-            inputs.push(v_caches[layer].clone());
-        }
-
-        let outputs = execute(
-            &decode_plan,
-            decode_graph.nodes(),
-            &mut arena,
-            &weights,
-            &inputs,
-            decode_graph.output_ids(),
-        )?;
+        let outputs = run_decode_step(pos, last_token, &mut kv_cache, &mut arena)?;
 
         // Argmax the logits for next token
         let logits = outputs[0].as_f32_slice();
@@ -548,12 +550,6 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
-
-        // Update KV caches
-        for layer in 0..num_layers {
-            k_caches[layer] = outputs[1 + layer].clone();
-            v_caches[layer] = outputs[1 + num_layers + layer].clone();
-        }
     }
 
     let elapsed = start.elapsed();
