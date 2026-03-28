@@ -132,26 +132,25 @@ fn topological_sort<B: Backend>(graph: &Graph<B>) -> Vec<NodeId> {
         }
 
         // Decrease in-degree for downstream consumers.
+        //
+        // Count ALL input edges from node j that reference either `id`
+        // itself or any of its SecondOutput nodes. A single consumer may
+        // reference multiple outputs of the same multi-output op (e.g.,
+        // Swiglu takes both outputs of a LinearPair).
         for (j, node) in graph.nodes.iter().enumerate() {
             if is_second_output[j] {
                 continue;
             }
-            if node.inputs.contains(&id) {
-                // Also check if any SecondOutput of `id` is in the inputs.
-                in_degree[j] -= 1;
+            let mut decrements = 0u32;
+            for &input in &node.inputs {
+                if input == id || second_outputs[id.0 as usize].contains(&input) {
+                    decrements += 1;
+                }
+            }
+            if decrements > 0 {
+                in_degree[j] -= decrements;
                 if in_degree[j] == 0 {
                     queue.push_back(NodeId(j as u32));
-                }
-            } else {
-                // Check if any SecondOutput of `id` is referenced.
-                for &second in &second_outputs[id.0 as usize] {
-                    if node.inputs.contains(&second) {
-                        in_degree[j] -= 1;
-                        if in_degree[j] == 0 {
-                            queue.push_back(NodeId(j as u32));
-                        }
-                        break;
-                    }
                 }
             }
         }
@@ -638,5 +637,189 @@ mod tests {
         // Quantized types get conservative fallback.
         assert_eq!(dtype_size_bytes(DType::Q8_0), 1);
         assert_eq!(dtype_size_bytes(DType::Q4_0), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8: LinearPair → consumer uses BOTH primary and SecondOutput
+    //
+    // This reproduces the bug where a node (like Swiglu) takes both outputs
+    // of a LinearPair as inputs. The if/else in the BFS decrement only
+    // counted one dependency edge instead of two.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn linear_pair_both_outputs_consumed() {
+        let mut graph = Graph::<TestBackend>::new();
+
+        let w1 = graph.register_linear_weight("w1", &[64, 128], DType::F32);
+        let w2 = graph.register_linear_weight("w2", &[64, 128], DType::F32);
+
+        let input = graph.add_input(&[4, 128], DType::F32);
+
+        // LinearPair: primary = gate, secondary = up
+        let (gate, up) = graph.push_node_pair(
+            Op::LinearPair { w1, w2 },
+            &[input],
+            vec![4, 64],
+            DType::F32,
+            vec![4, 64],
+            DType::F32,
+        );
+
+        // Swiglu takes BOTH outputs of the pair.
+        let activated = graph.push_node(Op::Swiglu, &[gate, up], vec![4, 64], DType::F32);
+        graph.set_output(activated);
+
+        // This panics before the fix: "scheduled 3 of 4 nodes"
+        let exec = plan(&graph);
+
+        assert_eq!(exec.schedule.len(), 4); // input, gate, up(second), swiglu
+        let pos = |id: NodeId| exec.schedule.iter().position(|&x| x == id).unwrap();
+        assert!(pos(gate) < pos(activated));
+        assert!(pos(up) < pos(activated));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9: LinearTriple → two SecondOutputs feed the same consumer
+    //
+    // Reproduces the break-in-else bug: a node takes the 2nd and 3rd
+    // outputs of a LinearTriple. The break after the first match means
+    // the second dependency is never decremented.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn linear_triple_two_second_outputs_same_consumer() {
+        let mut graph = Graph::<TestBackend>::new();
+
+        let w1 = graph.register_linear_weight("w1", &[64, 128], DType::F32);
+        let w2 = graph.register_linear_weight("w2", &[64, 128], DType::F32);
+        let w3 = graph.register_linear_weight("w3", &[64, 128], DType::F32);
+
+        let input = graph.add_input(&[4, 128], DType::F32);
+
+        // LinearTriple: primary = out1, second = out2, third = out3
+        let primary = graph.push_node(
+            Op::LinearTriple { w1, w2, w3 },
+            &[input],
+            vec![4, 64],
+            DType::F32,
+        );
+        let second = graph.push_node(
+            Op::SecondOutput { source: primary },
+            &[],
+            vec![4, 64],
+            DType::F32,
+        );
+        let third = graph.push_node(
+            Op::SecondOutput { source: primary },
+            &[],
+            vec![4, 64],
+            DType::F32,
+        );
+
+        // Consumer takes the 2nd and 3rd outputs (both SecondOutput nodes).
+        let consumer = graph.push_node(Op::Add, &[second, third], vec![4, 64], DType::F32);
+        graph.set_output(consumer);
+
+        let exec = plan(&graph);
+
+        assert_eq!(exec.schedule.len(), 5); // input, primary, second, third, consumer
+        let pos = |id: NodeId| exec.schedule.iter().position(|&x| x == id).unwrap();
+        assert!(pos(second) < pos(consumer));
+        assert!(pos(third) < pos(consumer));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10: Combined LinearTriple + LinearPair (mini Llama layer)
+    //
+    // Mimics one transformer layer: LinearTriple for Q/K/V, then
+    // downstream ops, then LinearPair for gate/up → Swiglu.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mini_llama_layer_topo_sort() {
+        let mut graph = Graph::<TestBackend>::new();
+
+        let wq = graph.register_linear_weight("q", &[64, 128], DType::F32);
+        let wk = graph.register_linear_weight("k", &[64, 128], DType::F32);
+        let wv = graph.register_linear_weight("v", &[64, 128], DType::F32);
+        let wo = graph.register_linear_weight("o", &[128, 64], DType::F32);
+        let wg = graph.register_linear_weight("gate", &[64, 128], DType::F32);
+        let wu = graph.register_linear_weight("up", &[64, 128], DType::F32);
+        let wd = graph.register_linear_weight("down", &[128, 64], DType::F32);
+        let norm_w = graph.register_tensor_weight("norm", &[128], DType::F32);
+
+        let input = graph.add_input(&[4, 128], DType::F32);
+
+        // Pre-attention norm
+        let normed = graph.push_node(
+            Op::RmsNorm {
+                weight: norm_w,
+                eps: 1e-5,
+            },
+            &[input],
+            vec![4, 128],
+            DType::F32,
+        );
+
+        // Q/K/V triple
+        let (q, k, v) = graph.push_node_triple(
+            Op::LinearTriple {
+                w1: wq,
+                w2: wk,
+                w3: wv,
+            },
+            &[normed],
+            vec![4, 64],
+            DType::F32,
+            vec![4, 64],
+            DType::F32,
+            vec![4, 64],
+            DType::F32,
+        );
+
+        // Attention (uses all three)
+        let attn = graph.push_node(
+            Op::FusedAttentionPrefill {
+                offset: 0,
+                scale: None,
+                softcap: None,
+                sliding_window: None,
+            },
+            &[q, k, v],
+            vec![4, 64],
+            DType::F32,
+        );
+
+        // Output projection
+        let proj = graph.push_node(Op::Linear { weight: wo }, &[attn], vec![4, 128], DType::F32);
+
+        // Residual add
+        let residual = graph.push_node(Op::Add, &[input, proj], vec![4, 128], DType::F32);
+
+        // Gate/Up pair → Swiglu
+        let (gate, up) = graph.push_node_pair(
+            Op::LinearPair { w1: wg, w2: wu },
+            &[residual],
+            vec![4, 64],
+            DType::F32,
+            vec![4, 64],
+            DType::F32,
+        );
+        let activated = graph.push_node(Op::Swiglu, &[gate, up], vec![4, 64], DType::F32);
+
+        // Down projection
+        let down = graph.push_node(
+            Op::Linear { weight: wd },
+            &[activated],
+            vec![4, 128],
+            DType::F32,
+        );
+        graph.set_output(down);
+
+        let exec = plan(&graph);
+
+        // All nodes must be scheduled.
+        assert_eq!(exec.schedule.len(), graph.len());
     }
 }

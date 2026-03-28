@@ -252,10 +252,8 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
         // 1. Pre-attention RMS norm
         let normed = graph.add_rms_norm(h, lw.input_layernorm, eps);
 
-        // 2. Q/K/V projections
-        let q = graph.add_linear(normed, lw.q_proj);
-        let k = graph.add_linear(normed, lw.k_proj);
-        let v = graph.add_linear(normed, lw.v_proj);
+        // 2. Q/K/V projections (fused triple — single dispatch, shared quantization)
+        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
 
         // 3. Reshape to 3D: [seq_len, num_heads, head_dim]
         let q_3d = graph.add_reshape(q, &[seq_len, num_heads, head_dim]);
@@ -277,9 +275,8 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
         let (h_updated, normed_post) =
             graph.add_add_rmsnorm(h, attn_proj, lw.post_attention_layernorm, eps);
 
-        // 8. FFN: SwiGLU MLP
-        let gate = graph.add_linear(normed_post, lw.gate_proj);
-        let up = graph.add_linear(normed_post, lw.up_proj);
+        // 8. FFN: SwiGLU MLP (fused pair — single dispatch, shared quantization)
+        let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
         let activated = graph.add_swiglu(gate, up);
         let down = graph.add_linear(activated, lw.down_proj);
 

@@ -325,9 +325,10 @@ fn q4_1_gemv_parallel(
 /// format. Scales are pre-decoded to f32 in `CpuQuantizedWeight` so no
 /// f16→f32 conversion happens in the hot path.
 ///
-/// Parallelism uses `rayon::join` binary-split instead of parallel iterators
-/// to minimize scheduling overhead. Each leaf task processes a contiguous
-/// chunk of output neurons sequentially.
+/// - **M=1 (decode):** single GEMV with thread-pool dispatch over N neurons.
+/// - **M>1 (prefill):** pre-quantize all M input rows, then single dispatch
+///   parallelized over N neurons. Each thread computes all M rows for its
+///   chunk of neurons, reusing weight data in cache across rows.
 #[allow(clippy::many_single_char_names, clippy::too_many_lines)]
 fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<CpuTensor> {
     let i_shape = input.shape();
@@ -350,91 +351,564 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
     let input_data = input.as_f32_slice();
     let mut output = vec![0.0f32; m * n];
 
-    // Pre-allocate buffers for on-the-fly Q8 quantization of the input row.
-    // Quantizing once per row (cost: K elements) is amortized over N output neurons.
-    let mut inp_quants = vec![0u8; k];
-    let mut inp_scales = vec![0.0f32; num_blocks_per_row];
+    if m == 1 {
+        // M=1 decode path: single-row GEMV (unchanged)
+        let mut inp_quants = vec![0u8; k];
+        let mut inp_scales = vec![0.0f32; num_blocks_per_row];
+        let inp = &input_data[..k];
+        simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
 
-    match weight.dtype {
-        DType::Q8_0 => {
-            let quants = &weight.data;
-            let scales = &weight.scales;
-            let quant_bytes_per_row = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
-
-            for row in 0..m {
-                let inp = &input_data[row * k..(row + 1) * k];
-                simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
-                let out_row = &mut output[row * n..(row + 1) * n];
-
+        match weight.dtype {
+            DType::Q8_0 => {
+                let bpr = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
                 q8_gemv_parallel(
-                    out_row,
+                    &mut output,
                     &inp_quants,
                     &inp_scales,
-                    quants,
-                    scales,
+                    &weight.data,
+                    &weight.scales,
                     num_blocks_per_row,
-                    quant_bytes_per_row,
+                    bpr,
                 );
             }
-        }
-        DType::Q4_0 => {
-            let packed = &weight.data;
-            let scales = &weight.scales;
-            let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
-
-            for row in 0..m {
-                let inp = &input_data[row * k..(row + 1) * k];
-                simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
-                let out_row = &mut output[row * n..(row + 1) * n];
-
+            DType::Q4_0 => {
+                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
                 q4_gemv_parallel(
-                    out_row,
+                    &mut output,
                     &inp_quants,
                     &inp_scales,
-                    packed,
-                    scales,
+                    &weight.data,
+                    &weight.scales,
                     num_blocks_per_row,
-                    packed_bytes_per_row,
+                    bpr,
                 );
             }
-        }
-        DType::Q4_1 => {
-            let packed = &weight.data;
-            let scales = &weight.scales;
-            let mins = weight
-                .mins
-                .as_ref()
-                .expect("Q4_1 weight missing mins buffer");
-            let packed_bytes_per_row = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
-
-            for row in 0..m {
-                let inp = &input_data[row * k..(row + 1) * k];
-                simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
-                let out_row = &mut output[row * n..(row + 1) * n];
-
+            DType::Q4_1 => {
+                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
                 q4_1_gemv_parallel(
-                    out_row,
+                    &mut output,
                     &inp_quants,
                     &inp_scales,
                     inp,
-                    packed,
-                    scales,
-                    mins,
+                    &weight.data,
+                    &weight.scales,
+                    weight
+                        .mins
+                        .as_ref()
+                        .expect("Q4_1 weight missing mins buffer"),
                     num_blocks_per_row,
-                    packed_bytes_per_row,
+                    bpr,
                 );
             }
+            other => {
+                return Err(infernum::Error::UnsupportedDtype(format!(
+                    "quantized_linear: unsupported dtype {other}"
+                )));
+            }
         }
-        other => {
-            return Err(infernum::Error::UnsupportedDtype(format!(
-                "quantized_linear: unsupported dtype {other}"
-            )));
+    } else {
+        // M>1 prefill path: pre-quantize all rows, single dispatch over N neurons.
+        let all_quants = quantize_all_rows(input_data, m, k, num_blocks_per_row);
+
+        match weight.dtype {
+            DType::Q8_0 => {
+                let bpr = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
+                quantized_gemm_parallel(
+                    &mut output,
+                    &all_quants,
+                    m,
+                    k,
+                    n,
+                    num_blocks_per_row,
+                    &weight.data,
+                    &weight.scales,
+                    bpr,
+                    q8_gemv_body_inline,
+                );
+            }
+            DType::Q4_0 => {
+                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+                quantized_gemm_parallel(
+                    &mut output,
+                    &all_quants,
+                    m,
+                    k,
+                    n,
+                    num_blocks_per_row,
+                    &weight.data,
+                    &weight.scales,
+                    bpr,
+                    q4_gemv_body_inline,
+                );
+            }
+            DType::Q4_1 => {
+                let packed = &weight.data;
+                let scales = &weight.scales;
+                let mins = weight
+                    .mins
+                    .as_ref()
+                    .expect("Q4_1 weight missing mins buffer");
+                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+
+                // Q4_1 needs original f32 input, so fall back to row-by-row
+                // (Q4_1 is rare enough that this path is acceptable)
+                let mut inp_quants = vec![0u8; k];
+                let mut inp_scales = vec![0.0f32; num_blocks_per_row];
+                for row in 0..m {
+                    let inp = &input_data[row * k..(row + 1) * k];
+                    simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
+                    q4_1_gemv_parallel(
+                        &mut output[row * n..(row + 1) * n],
+                        &inp_quants,
+                        &inp_scales,
+                        inp,
+                        packed,
+                        scales,
+                        mins,
+                        num_blocks_per_row,
+                        bpr,
+                    );
+                }
+            }
+            other => {
+                return Err(infernum::Error::UnsupportedDtype(format!(
+                    "quantized_linear: unsupported dtype {other}"
+                )));
+            }
         }
     }
 
     let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
     out_shape.push(n);
     Ok(CpuTensor::from_f32_vec(&out_shape, output))
+}
+
+/// Pre-quantize all M input rows to Q8 format.
+///
+/// Returns a flat buffer of `(quants, scales)` pairs laid out as:
+/// `[row0_quants(K bytes), row0_scales(num_blocks f32s), row1_quants, row1_scales, ...]`
+/// packed into a single `QuantizedRows` struct for cache-friendly access.
+struct QuantizedRows {
+    /// All quantized bytes: `M * K` bytes total, row-contiguous.
+    quants: Vec<u8>,
+    /// All scales: `M * num_blocks` f32s total, row-contiguous.
+    scales: Vec<f32>,
+}
+
+fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) -> QuantizedRows {
+    let mut quants = vec![0u8; m * k];
+    let mut scales = vec![0.0f32; m * num_blocks];
+
+    for row in 0..m {
+        let inp = &input_data[row * k..(row + 1) * k];
+        let q_out = &mut quants[row * k..(row + 1) * k];
+        let s_out = &mut scales[row * num_blocks..(row + 1) * num_blocks];
+        simd::quantize_row_q8(inp, q_out, s_out);
+    }
+
+    QuantizedRows { quants, scales }
+}
+
+/// Function pointer type for dtype-specific GEMV body kernels.
+///
+/// Parameters: `(output, neuron_offset, chunk_len, inp_quants, inp_scales,
+///               weight_data, weight_scales, num_blocks_per_row, bytes_per_row)`
+type GemvBodyFn = fn(&mut [f32], usize, usize, &[u8], &[f32], &[u8], &[f32], usize, usize);
+
+/// Batched quantized GEMM: single thread-pool dispatch over N neurons.
+///
+/// Each thread processes a chunk of output neurons, computing all M rows
+/// for each neuron before moving to the next. This maximizes weight data
+/// reuse in L1/L2 cache (each weight row is read once per thread, used
+/// M times).
+///
+/// The `gemv_body_fn` parameter selects the dtype-specific SIMD kernel
+/// (Q8_0 or Q4_0).
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+fn quantized_gemm_parallel(
+    output: &mut [f32],
+    all_rows: &QuantizedRows,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_blocks_per_row: usize,
+    weight_data: &[u8],
+    weight_scales: &[f32],
+    bytes_per_row: usize,
+    gemv_body_fn: GemvBodyFn,
+) {
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
+    let min_neurons_per_task = 64;
+
+    if n < num_threads * min_neurons_per_task {
+        // Too few neurons to parallelize — sequential over N, all M rows
+        for row in 0..m {
+            let q = &all_rows.quants[row * k..(row + 1) * k];
+            let s = &all_rows.scales[row * num_blocks_per_row..(row + 1) * num_blocks_per_row];
+            let out_row = &mut output[row * n..(row + 1) * n];
+            gemv_body_fn(
+                out_row,
+                0,
+                n,
+                q,
+                s,
+                weight_data,
+                weight_scales,
+                num_blocks_per_row,
+                bytes_per_row,
+            );
+        }
+    } else {
+        let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
+        let chunk_size = (raw_chunk + 1) & !1; // round up to even for pair processing
+        let num_tasks = num_threads.min(n.div_ceil(chunk_size));
+        let out_addr = ptr_to_usize(output.as_mut_ptr());
+
+        pool.dispatch(num_tasks, |task_id, _| {
+            let col_start = task_id * chunk_size;
+            let col_end = (col_start + chunk_size).min(n);
+            if col_start >= n {
+                return;
+            }
+            let chunk_len = col_end - col_start;
+
+            // For each input row, compute this thread's chunk of output neurons.
+            // Weight data for neurons [col_start..col_end] stays hot in cache
+            // across all M rows.
+            for row in 0..m {
+                let q = &all_rows.quants[row * k..(row + 1) * k];
+                let s = &all_rows.scales[row * num_blocks_per_row..(row + 1) * num_blocks_per_row];
+                let out_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (out_addr as *mut f32).add(row * n + col_start),
+                        chunk_len,
+                    )
+                };
+                gemv_body_fn(
+                    out_slice,
+                    col_start,
+                    chunk_len,
+                    q,
+                    s,
+                    weight_data,
+                    weight_scales,
+                    num_blocks_per_row,
+                    bytes_per_row,
+                );
+            }
+        });
+    }
+}
+
+/// Batched pair: pre-quantize all M rows, single dispatch over max(N1,N2) neurons.
+///
+/// Each thread computes all M rows for its chunk of neurons across both weight
+/// matrices in sequence, sharing input quantization and eliminating per-row
+/// dispatch overhead.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn quantized_linear_pair_batched(
+    input: &CpuTensor,
+    w1: &CpuQuantizedWeight,
+    w2: &CpuQuantizedWeight,
+) -> Result<(CpuTensor, CpuTensor)> {
+    let i_shape = input.shape();
+    let m: usize = i_shape[..i_shape.len() - 1].iter().product();
+    let k = *i_shape.last().unwrap();
+    let n1 = w1.shape[0];
+    let n2 = w2.shape[0];
+    let num_blocks = k / QUANTIZATION_BLOCK_SIZE;
+
+    let input_data = input.as_f32_slice();
+    let all_rows = quantize_all_rows(input_data, m, k, num_blocks);
+
+    let mut out1 = vec![0.0f32; m * n1];
+    let mut out2 = vec![0.0f32; m * n2];
+
+    let gemv_body_fn: GemvBodyFn = match w1.dtype {
+        DType::Q4_0 => q4_gemv_body_inline,
+        DType::Q8_0 => q8_gemv_body_inline,
+        _ => {
+            let a = quantized_linear(input, w1)?;
+            let b = quantized_linear(input, w2)?;
+            return Ok((a, b));
+        }
+    };
+
+    let bpr = match w1.dtype {
+        DType::Q4_0 => num_blocks * (QUANTIZATION_BLOCK_SIZE / 2),
+        _ => num_blocks * QUANTIZATION_BLOCK_SIZE,
+    };
+
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
+    let min_neurons = 64;
+    let n_max = n1.max(n2);
+
+    if n_max < num_threads * min_neurons {
+        for row in 0..m {
+            let q = &all_rows.quants[row * k..(row + 1) * k];
+            let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
+            gemv_body_fn(
+                &mut out1[row * n1..(row + 1) * n1],
+                0,
+                n1,
+                q,
+                s,
+                &w1.data,
+                &w1.scales,
+                num_blocks,
+                bpr,
+            );
+            gemv_body_fn(
+                &mut out2[row * n2..(row + 1) * n2],
+                0,
+                n2,
+                q,
+                s,
+                &w2.data,
+                &w2.scales,
+                num_blocks,
+                bpr,
+            );
+        }
+    } else {
+        let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
+        let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
+        let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+        let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+
+        pool.dispatch(num_threads, |task_id, _| {
+            for row in 0..m {
+                let q = &all_rows.quants[row * k..(row + 1) * k];
+                let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
+
+                let start1 = task_id * chunk1;
+                if start1 < n1 {
+                    let end1 = (start1 + chunk1).min(n1);
+                    let slice1 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out1_addr as *mut f32).add(row * n1 + start1),
+                            end1 - start1,
+                        )
+                    };
+                    gemv_body_fn(
+                        slice1,
+                        start1,
+                        end1 - start1,
+                        q,
+                        s,
+                        &w1.data,
+                        &w1.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                }
+                let start2 = task_id * chunk2;
+                if start2 < n2 {
+                    let end2 = (start2 + chunk2).min(n2);
+                    let slice2 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out2_addr as *mut f32).add(row * n2 + start2),
+                            end2 - start2,
+                        )
+                    };
+                    gemv_body_fn(
+                        slice2,
+                        start2,
+                        end2 - start2,
+                        q,
+                        s,
+                        &w2.data,
+                        &w2.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                }
+            }
+        });
+    }
+
+    let out_shape1 = vec![m, n1];
+    let out_shape2 = vec![m, n2];
+    Ok((
+        CpuTensor::from_f32_vec(&out_shape1, out1),
+        CpuTensor::from_f32_vec(&out_shape2, out2),
+    ))
+}
+
+/// Batched triple: pre-quantize all M rows, single dispatch for three weights.
+///
+/// Same strategy as pair but for Q/K/V attention projections.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn quantized_linear_triple_batched(
+    input: &CpuTensor,
+    w1: &CpuQuantizedWeight,
+    w2: &CpuQuantizedWeight,
+    w3: &CpuQuantizedWeight,
+) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
+    let i_shape = input.shape();
+    let m: usize = i_shape[..i_shape.len() - 1].iter().product();
+    let k = *i_shape.last().unwrap();
+    let n1 = w1.shape[0];
+    let n2 = w2.shape[0];
+    let n3 = w3.shape[0];
+    let num_blocks = k / QUANTIZATION_BLOCK_SIZE;
+
+    let input_data = input.as_f32_slice();
+    let all_rows = quantize_all_rows(input_data, m, k, num_blocks);
+
+    let mut out1 = vec![0.0f32; m * n1];
+    let mut out2 = vec![0.0f32; m * n2];
+    let mut out3 = vec![0.0f32; m * n3];
+
+    let gemv_body_fn: GemvBodyFn = match w1.dtype {
+        DType::Q4_0 => q4_gemv_body_inline,
+        DType::Q8_0 => q8_gemv_body_inline,
+        _ => {
+            let a = quantized_linear(input, w1)?;
+            let b = quantized_linear(input, w2)?;
+            let c = quantized_linear(input, w3)?;
+            return Ok((a, b, c));
+        }
+    };
+
+    let bpr = match w1.dtype {
+        DType::Q4_0 => num_blocks * (QUANTIZATION_BLOCK_SIZE / 2),
+        _ => num_blocks * QUANTIZATION_BLOCK_SIZE,
+    };
+
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
+    let min_neurons = 64;
+    let n_max = n1.max(n2).max(n3);
+
+    if n_max < num_threads * min_neurons {
+        for row in 0..m {
+            let q = &all_rows.quants[row * k..(row + 1) * k];
+            let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
+            gemv_body_fn(
+                &mut out1[row * n1..(row + 1) * n1],
+                0,
+                n1,
+                q,
+                s,
+                &w1.data,
+                &w1.scales,
+                num_blocks,
+                bpr,
+            );
+            gemv_body_fn(
+                &mut out2[row * n2..(row + 1) * n2],
+                0,
+                n2,
+                q,
+                s,
+                &w2.data,
+                &w2.scales,
+                num_blocks,
+                bpr,
+            );
+            gemv_body_fn(
+                &mut out3[row * n3..(row + 1) * n3],
+                0,
+                n3,
+                q,
+                s,
+                &w3.data,
+                &w3.scales,
+                num_blocks,
+                bpr,
+            );
+        }
+    } else {
+        let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
+        let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
+        let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
+        let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+        let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+        let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+
+        pool.dispatch(num_threads, |task_id, _| {
+            for row in 0..m {
+                let q = &all_rows.quants[row * k..(row + 1) * k];
+                let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
+
+                let start1 = task_id * chunk1;
+                if start1 < n1 {
+                    let end1 = (start1 + chunk1).min(n1);
+                    let slice1 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out1_addr as *mut f32).add(row * n1 + start1),
+                            end1 - start1,
+                        )
+                    };
+                    gemv_body_fn(
+                        slice1,
+                        start1,
+                        end1 - start1,
+                        q,
+                        s,
+                        &w1.data,
+                        &w1.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                }
+                let start2 = task_id * chunk2;
+                if start2 < n2 {
+                    let end2 = (start2 + chunk2).min(n2);
+                    let slice2 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out2_addr as *mut f32).add(row * n2 + start2),
+                            end2 - start2,
+                        )
+                    };
+                    gemv_body_fn(
+                        slice2,
+                        start2,
+                        end2 - start2,
+                        q,
+                        s,
+                        &w2.data,
+                        &w2.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                }
+                let start3 = task_id * chunk3;
+                if start3 < n3 {
+                    let end3 = (start3 + chunk3).min(n3);
+                    let slice3 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out3_addr as *mut f32).add(row * n3 + start3),
+                            end3 - start3,
+                        )
+                    };
+                    gemv_body_fn(
+                        slice3,
+                        start3,
+                        end3 - start3,
+                        q,
+                        s,
+                        &w3.data,
+                        &w3.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                }
+            }
+        });
+    }
+
+    let out_shape1 = vec![m, n1];
+    let out_shape2 = vec![m, n2];
+    let out_shape3 = vec![m, n3];
+    Ok((
+        CpuTensor::from_f32_vec(&out_shape1, out1),
+        CpuTensor::from_f32_vec(&out_shape2, out2),
+        CpuTensor::from_f32_vec(&out_shape3, out3),
+    ))
 }
 
 /// Compute two independent quantized matmuls in a single thread pool dispatch.
@@ -465,11 +939,16 @@ fn quantized_linear_pair(
     let n2 = w2.shape[0];
     let num_blocks = k / QUANTIZATION_BLOCK_SIZE;
 
-    // Only fuse Q4_0/Q8_0 decode (M=1) with matching dtypes.
-    if m != 1 || w1.dtype != w2.dtype {
+    // Only fuse matching dtypes (Q4_0 or Q8_0).
+    if w1.dtype != w2.dtype {
         let a = quantized_linear(input, w1)?;
         let b = quantized_linear(input, w2)?;
         return Ok((a, b));
+    }
+
+    // M>1: pre-quantize all rows, dispatch over N for both weights
+    if m > 1 {
+        return quantized_linear_pair_batched(input, w1, w2);
     }
 
     let input_data = input.as_f32_slice();
@@ -694,12 +1173,17 @@ fn quantized_linear_triple(
     let n3 = w3.shape[0];
     let num_blocks = k / QUANTIZATION_BLOCK_SIZE;
 
-    // Only fuse Q4_0/Q8_0 decode (M=1) with matching dtypes.
-    if m != 1 || w1.dtype != w2.dtype || w1.dtype != w3.dtype {
+    // Only fuse matching dtypes (Q4_0 or Q8_0).
+    if w1.dtype != w2.dtype || w1.dtype != w3.dtype {
         let out1 = quantized_linear(input, w1)?;
         let out2 = quantized_linear(input, w2)?;
         let out3 = quantized_linear(input, w3)?;
         return Ok((out1, out2, out3));
+    }
+
+    // M>1: pre-quantize all rows, dispatch over N for all three weights
+    if m > 1 {
+        return quantized_linear_triple_batched(input, w1, w2, w3);
     }
 
     let input_data = input.as_f32_slice();
