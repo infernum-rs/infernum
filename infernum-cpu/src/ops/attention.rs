@@ -289,7 +289,11 @@ impl PagedKvCacheOps for CpuBackend {
 ///
 /// Writes directly into `output` at the correct offset. Each (s, h) pair
 /// accesses a disjoint region so this is safe to call from multiple threads.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::many_single_char_names
+)]
 fn attention_head_unit(
     output: &mut [f32],
     q: &[f32],
@@ -371,7 +375,7 @@ fn attention_head_unit(
 ///
 /// Parallelized across the `(seq_pos, head)` dimension — each unit writes
 /// to a disjoint region of the output, so no synchronization is needed.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 fn causal_attention(
     q: &[f32],
     k: &[f32],
