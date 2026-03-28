@@ -291,7 +291,7 @@ pub enum CpuLinearWeight {
     /// - `weight`: original layout `(in_features, out_features)` = `(K, N)`,
     ///   used by `as_dense_weight()` for fusion ops like `concat_inner_dim`.
     /// - `weight_nt`: pre-transposed to `(out_features, in_features)` = `(N, K)`,
-    ///   used by matmul/GEMV for contiguous dot products (avoids per-call transpose).
+    ///   used by matmul/GEMV for contiguous dot products.
     Dense {
         weight: CpuTensor,
         weight_nt: CpuTensor,
@@ -320,6 +320,7 @@ impl CpuLinearWeight {
                 nt[col * k + row] = data[row * n + col];
             }
         }
+
         let weight_nt = CpuTensor::from_f32(&[n, k], &nt);
 
         Self::Dense { weight, weight_nt }

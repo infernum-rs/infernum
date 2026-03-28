@@ -5,7 +5,8 @@
 //! the host transpose applied by `WeightLoader`.
 //!
 //! Performance: B is transposed to `Bᵀ(N,K)` so that `C[m,n] = dot(A[m,:], Bᵀ[n,:])`
-//! becomes a contiguous SIMD dot product. Output rows are parallelized with Rayon.
+//! becomes a contiguous SIMD dot product. M>1 uses a cache-blocked tiled GEMM
+//! (AVX-512F 6×32 micro-kernel) parallelized across rows via the thread pool.
 //!
 //! Quantized weights (Q8_0, Q4_0) are stored in their original
 //! `(out_features, in_features)` layout. The quantized linear kernel iterates
@@ -15,7 +16,6 @@ use infernum::backend::{MatmulExtOps, MatmulOps};
 use infernum::dtype::{DType, QUANTIZATION_BLOCK_SIZE};
 use infernum::tensor::Tensor;
 use infernum::Result;
-use rayon::prelude::*;
 
 use crate::simd;
 use crate::tensor::{CpuLinearWeight, CpuQuantizedWeight, CpuTensor};
@@ -27,7 +27,7 @@ use crate::CpuBackend;
 /// with raw pointers. The caller must ensure disjoint access when used across
 /// threads, and that the pointer remains valid for the duration of use.
 #[inline]
-fn ptr_to_usize<T>(p: *mut T) -> usize {
+pub(crate) fn ptr_to_usize<T>(p: *mut T) -> usize {
     p as usize
 }
 
@@ -41,15 +41,6 @@ fn transpose(b: &[f32], k: usize, n: usize) -> Vec<f32> {
         }
     }
     bt
-}
-
-/// Compute one row of C: `C[m,:] = A[m,:] × Bᵀ` using SIMD dot products.
-#[allow(clippy::many_single_char_names)]
-fn gemm_row(a_row: &[f32], bt: &[f32], c_row: &mut [f32], k: usize, n: usize) {
-    for col in 0..n {
-        let bt_row = &bt[col * k..(col + 1) * k];
-        c_row[col] = simd::dot_f32(a_row, bt_row);
-    }
 }
 
 /// Standard gemm: `A (M,K) × B (K,N) → C (M,N)`.
@@ -97,10 +88,26 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
             }
         });
     } else {
-        // Parallel over output rows (prefill — less latency-critical, keep rayon)
-        c.par_chunks_mut(n).enumerate().for_each(|(row, c_row)| {
-            let a_row = &a[row * k..(row + 1) * k];
-            gemm_row(a_row, bt, c_row, k, n);
+        // Prefill: split M into chunks across threads, each calls tiled GEMM
+        // (which internally packs Bᵀ panels per thread for cache locality).
+        let pool = crate::thread_pool::global_pool();
+        let num_threads = pool.num_threads();
+        let rows_per_thread = (m / num_threads).max(1);
+        let num_tasks = num_threads.min(m.div_ceil(rows_per_thread));
+        let c_addr = ptr_to_usize(c.as_mut_ptr());
+
+        pool.dispatch(num_tasks, |task_id, _| {
+            let row_start = task_id * rows_per_thread;
+            let row_end = (row_start + rows_per_thread).min(m);
+            if row_start >= m {
+                return;
+            }
+            let chunk_m = row_end - row_start;
+            let a_chunk = &a[row_start * k..row_end * k];
+            let c_chunk = unsafe {
+                std::slice::from_raw_parts_mut((c_addr as *mut f32).add(row_start * n), chunk_m * n)
+            };
+            simd::gemm_f32_tiled(a_chunk, bt, c_chunk, chunk_m, k, n);
         });
     }
 
@@ -1585,7 +1592,6 @@ impl MatmulOps for CpuBackend {
     fn linear(input: &CpuTensor, weight: &CpuLinearWeight) -> Result<CpuTensor> {
         match weight {
             CpuLinearWeight::Dense { weight_nt, .. } => {
-                // Use pre-transposed weight (N,K) — no per-call transpose needed
                 let nt_shape = weight_nt.shape();
                 let n = nt_shape[0];
                 let k = nt_shape[1];

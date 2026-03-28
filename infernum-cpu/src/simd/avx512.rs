@@ -11,7 +11,8 @@
 use std::arch::x86_64::{
     __m256, __m256i, _mm256_add_ps, _mm256_castps256_ps128, _mm256_cvtepi32_ps,
     _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_set1_ps,
-    _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_ps, _mm_add_ss,
+    _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm512_add_ps, _mm512_fmadd_ps,
+    _mm512_loadu_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_storeu_ps, _mm_add_ps, _mm_add_ss,
     _mm_cvtss_f32, _mm_movehdup_ps, _mm_movehl_ps,
 };
 
@@ -420,4 +421,184 @@ unsafe fn dot_q4_q8_2row_inner(
     }
 
     (hsum_256(total0), hsum_256(total1))
+}
+
+// ---- Tiled F32 GEMM (AVX-512F + FMA) ----
+
+/// Cache-blocking tile sizes for the tiled GEMM.
+///
+/// - `KC` = 256 floats → 1 KB per row of A panel (fits comfortably in L1d=32 KB).
+/// - `NC` = 128 columns of Bᵀ → Bᵀ panel is NC×KC = 128×256 = 128 KB (fits in L2=1 MB
+///   with room for the A panel).
+const KC: usize = 256;
+const NC: usize = 128;
+
+/// Micro-kernel tile sizes: 6 rows of A × 32 columns of Bᵀ.
+const MR: usize = 6;
+const NR: usize = 32;
+
+/// Tiled F32 GEMM: `C[m,n] += A[m,k] * Bᵀ[n,k]`.
+///
+/// - `a` is row-major `(M, K)`.
+/// - `bt` is row-major `(N, K)` — i.e., B transposed so each "row" of `bt` is
+///   one column of the original B.
+/// - `c` is row-major `(M, N)`, must be zero-initialized by the caller.
+///
+/// Uses a 6×32 micro-kernel with AVX-512F FMA, with cache-blocked tiling
+/// (`KC=256`, `NC=128`) for L1/L2 locality. Edge tiles (M%6, N%32) fall back
+/// to scalar dot products.
+#[allow(clippy::many_single_char_names)]
+pub fn gemm_f32_tiled(a: &[f32], bt: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    unsafe { gemm_f32_tiled_inner(a, bt, c, m, k, n) }
+}
+
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[target_feature(enable = "avx512f")]
+unsafe fn gemm_f32_tiled_inner(a: &[f32], bt: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    let m_full = m - m % MR;
+
+    for k_start in (0..k).step_by(KC) {
+        let kc = KC.min(k - k_start);
+
+        for n_start in (0..n).step_by(NC) {
+            let nc = NC.min(n - n_start);
+            let n_full = nc - nc % NR;
+
+            // Process full MR×NR tiles.
+            for i in (0..m_full).step_by(MR) {
+                for j in (0..n_full).step_by(NR) {
+                    microkernel_6x32(a, bt, c, k, n, i, n_start + j, k_start, kc);
+                }
+                // N remainder (< 32 columns): scalar fallback.
+                if n_full < nc {
+                    for ii in i..i + MR {
+                        for jj in n_full..nc {
+                            let col = n_start + jj;
+                            let a_row = &a[ii * k + k_start..ii * k + k_start + kc];
+                            let bt_row = &bt[col * k + k_start..col * k + k_start + kc];
+                            c[ii * n + col] += super::dot_f32(a_row, bt_row);
+                        }
+                    }
+                }
+            }
+
+            // M remainder (< 6 rows): scalar fallback.
+            for ii in m_full..m {
+                for jj in 0..nc {
+                    let col = n_start + jj;
+                    let a_row = &a[ii * k + k_start..ii * k + k_start + kc];
+                    let bt_row = &bt[col * k + k_start..col * k + k_start + kc];
+                    c[ii * n + col] += super::dot_f32(a_row, bt_row);
+                }
+            }
+        }
+    }
+}
+
+/// 6×32 AVX-512F micro-kernel.
+///
+/// Computes a 6-row × 32-column tile of `C += A * Bᵀ` for a `kc`-length
+/// slice of the K dimension. Uses 12 zmm accumulators (6 rows × 2 zmm of
+/// 16 f32 each = 32 columns).
+///
+/// `bt` is (N,K) row-major. For each K step, gathers 32 values from NR
+/// rows of `bt` (stride = K) into a local buffer, then FMAs against 6
+/// broadcast A values.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::similar_names,
+    clippy::many_single_char_names
+)]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn microkernel_6x32(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    k: usize,
+    n: usize,
+    i: usize,
+    j: usize,
+    k_start: usize,
+    kc: usize,
+) {
+    let mut acc0a = _mm512_setzero_ps();
+    let mut acc0b = _mm512_setzero_ps();
+    let mut acc1a = _mm512_setzero_ps();
+    let mut acc1b = _mm512_setzero_ps();
+    let mut acc2a = _mm512_setzero_ps();
+    let mut acc2b = _mm512_setzero_ps();
+    let mut acc3a = _mm512_setzero_ps();
+    let mut acc3b = _mm512_setzero_ps();
+    let mut acc4a = _mm512_setzero_ps();
+    let mut acc4b = _mm512_setzero_ps();
+    let mut acc5a = _mm512_setzero_ps();
+    let mut acc5b = _mm512_setzero_ps();
+
+    let a_ptr = a.as_ptr();
+    let bt_ptr = bt.as_ptr();
+
+    // Row base offsets into A (row-major, stride = k).
+    let a_base0 = i * k + k_start;
+    let a_base1 = (i + 1) * k + k_start;
+    let a_base2 = (i + 2) * k + k_start;
+    let a_base3 = (i + 3) * k + k_start;
+    let a_base4 = (i + 4) * k + k_start;
+    let a_base5 = (i + 5) * k + k_start;
+
+    for p in 0..kc {
+        // Gather 32 Bᵀ values for K step p. bt is (N,K) row-major:
+        // bt[col, k_idx] = bt[col*k + k_idx]. Adjacent columns are
+        // K elements apart.
+        let mut pack = [0.0f32; NR];
+        for c_idx in 0..NR {
+            *pack.get_unchecked_mut(c_idx) = *bt_ptr.add((j + c_idx) * k + k_start + p);
+        }
+        let b_lo = _mm512_loadu_ps(pack.as_ptr());
+        let b_hi = _mm512_loadu_ps(pack.as_ptr().add(16));
+
+        let a0 = _mm512_set1_ps(*a_ptr.add(a_base0 + p));
+        acc0a = _mm512_fmadd_ps(a0, b_lo, acc0a);
+        acc0b = _mm512_fmadd_ps(a0, b_hi, acc0b);
+
+        let a1 = _mm512_set1_ps(*a_ptr.add(a_base1 + p));
+        acc1a = _mm512_fmadd_ps(a1, b_lo, acc1a);
+        acc1b = _mm512_fmadd_ps(a1, b_hi, acc1b);
+
+        let a2 = _mm512_set1_ps(*a_ptr.add(a_base2 + p));
+        acc2a = _mm512_fmadd_ps(a2, b_lo, acc2a);
+        acc2b = _mm512_fmadd_ps(a2, b_hi, acc2b);
+
+        let a3 = _mm512_set1_ps(*a_ptr.add(a_base3 + p));
+        acc3a = _mm512_fmadd_ps(a3, b_lo, acc3a);
+        acc3b = _mm512_fmadd_ps(a3, b_hi, acc3b);
+
+        let a4 = _mm512_set1_ps(*a_ptr.add(a_base4 + p));
+        acc4a = _mm512_fmadd_ps(a4, b_lo, acc4a);
+        acc4b = _mm512_fmadd_ps(a4, b_hi, acc4b);
+
+        let a5 = _mm512_set1_ps(*a_ptr.add(a_base5 + p));
+        acc5a = _mm512_fmadd_ps(a5, b_lo, acc5a);
+        acc5b = _mm512_fmadd_ps(a5, b_hi, acc5b);
+    }
+
+    // Store accumulators back to C (accumulate with existing partial sums).
+    let c_ptr = c.as_mut_ptr();
+
+    macro_rules! store_row {
+        ($row:expr, $acc_a:expr, $acc_b:expr) => {{
+            let c_off = $row * n + j;
+            let existing_a = _mm512_loadu_ps(c_ptr.add(c_off));
+            let existing_b = _mm512_loadu_ps(c_ptr.add(c_off + 16));
+            _mm512_storeu_ps(c_ptr.add(c_off), _mm512_add_ps(existing_a, $acc_a));
+            _mm512_storeu_ps(c_ptr.add(c_off + 16), _mm512_add_ps(existing_b, $acc_b));
+        }};
+    }
+
+    store_row!(i, acc0a, acc0b);
+    store_row!(i + 1, acc1a, acc1b);
+    store_row!(i + 2, acc2a, acc2b);
+    store_row!(i + 3, acc3a, acc3b);
+    store_row!(i + 4, acc4a, acc4b);
+    store_row!(i + 5, acc5a, acc5b);
 }

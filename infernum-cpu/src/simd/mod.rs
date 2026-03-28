@@ -33,6 +33,14 @@ fn has_vnni() -> bool {
     })
 }
 
+/// Whether the CPU supports AVX-512F (runtime-detected, cached).
+#[cfg(target_arch = "x86_64")]
+fn has_avx512f() -> bool {
+    use std::sync::OnceLock;
+    static HAS_AVX512F: OnceLock<bool> = OnceLock::new();
+    *HAS_AVX512F.get_or_init(|| is_x86_feature_detected!("avx512f"))
+}
+
 /// Check that the current CPU supports the required SIMD features.
 ///
 /// On AArch64 this always succeeds (NEON is baseline).
@@ -318,6 +326,34 @@ pub fn vec_rmsnorm(input: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let rms = 1.0 / (ss / input.len() as f32 + eps).sqrt();
     for i in 0..input.len() {
         out[i] = input[i] * rms * weight[i];
+    }
+}
+
+/// Tiled F32 GEMM: `C[m,n] = sum_k A[m,k] * Bᵀ[n,k]`.
+///
+/// - `a` is row-major `(M, K)`.
+/// - `bt` is row-major `(N, K)` — B transposed.
+/// - `c` is row-major `(M, N)`, must be zero-initialized by the caller.
+///
+/// Dispatches to AVX-512F tiled micro-kernel when available, otherwise
+/// falls back to row-by-row dot products.
+#[allow(clippy::many_single_char_names)]
+pub fn gemm_f32_tiled(a: &[f32], bt: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            avx512::gemm_f32_tiled(a, bt, c, m, k, n);
+            return;
+        }
+    }
+
+    // Scalar fallback: row-by-row dot products.
+    for row in 0..m {
+        let a_row = &a[row * k..(row + 1) * k];
+        for col in 0..n {
+            let bt_row = &bt[col * k..(col + 1) * k];
+            c[row * n + col] = dot_f32(a_row, bt_row);
+        }
     }
 }
 
