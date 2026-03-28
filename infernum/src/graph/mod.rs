@@ -687,4 +687,14 @@ mod tests {
         let out = graph.add_concat_inner_dim(a, b);
         assert_eq!(graph.node_shape(out), &[8, 384]);
     }
+
+    #[test]
+    fn graph_concat_seq_shape() {
+        let mut graph = Graph::<TestBackend>::new();
+
+        let a = graph.add_input(&[10, 4, 64], DType::F32);
+        let b = graph.add_input(&[1, 4, 64], DType::F32);
+        let out = graph.add_concat_seq(a, b);
+        assert_eq!(graph.node_shape(out), &[11, 4, 64]);
+    }
 }

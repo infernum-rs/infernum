@@ -167,8 +167,12 @@ impl CpuTensor {
     #[must_use]
     pub fn as_f32_slice(&self) -> &[f32] {
         assert_eq!(self.dtype, DType::F32, "expected F32 tensor");
+        let numel = self.numel();
+        if numel == 0 {
+            return &[];
+        }
         let start = self.offset;
-        let end = start + self.numel() * 4;
+        let end = start + numel * 4;
         bytemuck::cast_slice(&self.data[start..end])
     }
 

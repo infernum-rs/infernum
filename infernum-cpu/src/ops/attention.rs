@@ -399,8 +399,20 @@ fn causal_attention(
             for h in 0..num_heads {
                 attention_head_unit(
                     &mut output,
-                    q, k, v, s, h, kv_len, num_heads, num_kv_heads,
-                    head_dim, gqa_ratio, offset, scale, softcap, sliding_window,
+                    q,
+                    k,
+                    v,
+                    s,
+                    h,
+                    kv_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gqa_ratio,
+                    offset,
+                    scale,
+                    softcap,
+                    sliding_window,
                 );
             }
         }
@@ -416,20 +428,28 @@ fn causal_attention(
         let unit_end = (unit_start + chunk_size).min(total_units);
 
         // Safety: each task writes to disjoint (s, h) output slots.
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut(
-                out_addr as *mut f32,
-                total_units * head_dim,
-            )
-        };
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, total_units * head_dim) };
 
         for unit in unit_start..unit_end {
             let s = unit / num_heads;
             let h = unit % num_heads;
             attention_head_unit(
                 out_slice,
-                q, k, v, s, h, kv_len, num_heads, num_kv_heads,
-                head_dim, gqa_ratio, offset, scale, softcap, sliding_window,
+                q,
+                k,
+                v,
+                s,
+                h,
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                gqa_ratio,
+                offset,
+                scale,
+                softcap,
+                sliding_window,
             );
         }
     });

@@ -11,7 +11,9 @@ mod model;
 
 pub use chat_templates::{Llama3Template, MistralTemplate};
 pub use config::{LlamaConfig, QuantizationConfig};
-pub use graph_builder::{build_prefill_graph, LayerWeightIds, LlamaGraphOps, ModelWeightIds};
+pub use graph_builder::{
+    build_decode_graph, build_prefill_graph, LayerWeightIds, LlamaGraphOps, ModelWeightIds,
+};
 pub use model::LlamaModel;
 
 /// Mistral model (architecturally identical to Llama).

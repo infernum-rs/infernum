@@ -668,6 +668,10 @@ pub trait GraphTensorOps {
     /// `[..., a_last] + [..., b_last]` → `[..., a_last + b_last]`.
     fn add_concat_inner_dim(&mut self, a: NodeId, b: NodeId) -> NodeId;
 
+    /// Concatenate along the first (sequence) dimension.
+    /// `[a_seq, ...] + [b_seq, ...]` → `[a_seq + b_seq, ...]`.
+    fn add_concat_seq(&mut self, a: NodeId, b: NodeId) -> NodeId;
+
     /// Repeat KV heads. `(seq, heads, dim)` → `(seq, heads * num_repeats, dim)`.
     fn add_repeat_kv(&mut self, input: NodeId, num_repeats: usize) -> NodeId;
 
@@ -726,6 +730,17 @@ impl<B: Backend + TensorOps> GraphTensorOps for Graph<B> {
         *out_shape.last_mut().unwrap() += b_last;
 
         self.push_node(Op::ConcatInnerDim, &[a, b], out_shape, dtype)
+    }
+
+    fn add_concat_seq(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let a_shape = self.node_shape(a).to_vec();
+        let b_first = self.node_shape(b)[0];
+        let dtype = self.node_dtype(a);
+
+        let mut out_shape = a_shape;
+        out_shape[0] += b_first;
+
+        self.push_node(Op::ConcatSeq, &[a, b], out_shape, dtype)
     }
 
     fn add_repeat_kv(&mut self, input: NodeId, num_repeats: usize) -> NodeId {

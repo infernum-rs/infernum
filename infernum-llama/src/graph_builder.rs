@@ -294,6 +294,145 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
     (graph, model_weights)
 }
 
+// ---------------------------------------------------------------------------
+// Decode graph construction
+// ---------------------------------------------------------------------------
+
+/// Build a computation graph for single-token decode with KV cache.
+///
+/// The graph takes these inputs (in order):
+/// 1. `input_id` — single token ID, shape `[1]`
+/// 2. `cos_cache` — `RoPE` cosine for the current position, shape `[1, head_dim / 2]`
+/// 3. `sin_cache` — `RoPE` sine for the current position, shape `[1, head_dim / 2]`
+/// 4. For each layer `i`: `k_cache_i` of shape `[kv_len, num_kv_heads, head_dim]`
+/// 5. For each layer `i`: `v_cache_i` of shape `[kv_len, num_kv_heads, head_dim]`
+///
+/// And produces these outputs (in order):
+/// 1. `logits` of shape `[1, vocab_size]`
+/// 2. For each layer `i`: `full_k_i` of shape `[kv_len + 1, num_kv_heads, head_dim]`
+/// 3. For each layer `i`: `full_v_i` of shape `[kv_len + 1, num_kv_heads, head_dim]`
+///
+/// The caller feeds the updated K/V outputs back as inputs on the next step.
+///
+/// # Panics
+///
+/// Panics if the config describes an `MoE` model (`num_local_experts > 1`).
+#[must_use]
+pub fn build_decode_graph<B: LlamaGraphOps>(
+    config: &LlamaConfig,
+    kv_len: usize,
+    weight_dtype: DType,
+) -> (Graph<B>, ModelWeightIds) {
+    assert!(
+        !config.is_moe(),
+        "build_decode_graph does not support MoE models"
+    );
+
+    let mut graph = Graph::<B>::new();
+
+    let hidden = config.hidden_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads();
+    let head_dim = config.head_dim();
+    let kv_dim = num_kv_heads * head_dim;
+    let intermediate = config.intermediate_size;
+    let vocab_size = config.vocab_size;
+    let eps = config.rms_norm_eps;
+
+    // -- Register weights --
+    let model_weights = register_weights(
+        &mut graph,
+        config,
+        hidden,
+        kv_dim,
+        intermediate,
+        vocab_size,
+        weight_dtype,
+    );
+
+    // -- Graph inputs --
+    let input_id = graph.add_input(&[1], DType::U32);
+    let cos_input = graph.add_input(&[1, head_dim / 2], DType::F32);
+    let sin_input = graph.add_input(&[1, head_dim / 2], DType::F32);
+
+    // KV cache inputs: per-layer k and v
+    let num_layers = config.num_hidden_layers;
+    let mut k_cache_inputs = Vec::with_capacity(num_layers);
+    let mut v_cache_inputs = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], DType::F32));
+        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], DType::F32));
+    }
+
+    // -- Embedding --
+    let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_id);
+
+    // -- Transformer layers --
+    let mut k_outputs = Vec::with_capacity(num_layers);
+    let mut v_outputs = Vec::with_capacity(num_layers);
+
+    for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
+        // 1. Pre-attention RMS norm
+        let normed = graph.add_rms_norm(h, lw.input_layernorm, eps);
+
+        // 2. Q/K/V projections (fused triple)
+        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
+
+        // 3. Reshape to 3D: [1, num_heads, head_dim]
+        let q_3d = graph.add_reshape(q, &[1, num_heads, head_dim]);
+        let k_3d = graph.add_reshape(k, &[1, num_kv_heads, head_dim]);
+        let v_3d = graph.add_reshape(v, &[1, num_kv_heads, head_dim]);
+
+        // 4. RoPE — offset=0 because cos/sin inputs contain data for just the
+        //    current position (the caller pre-indexes into the RoPE table).
+        let q_rope = graph.add_rope(q_3d, cos_input, sin_input, 0);
+        let k_rope = graph.add_rope(k_3d, cos_input, sin_input, 0);
+
+        // 5. Concatenate new K/V with cached K/V
+        let full_k = graph.add_concat_seq(k_cache_inputs[layer_idx], k_rope);
+        let full_v = graph.add_concat_seq(v_cache_inputs[layer_idx], v_3d);
+
+        k_outputs.push(full_k);
+        v_outputs.push(full_v);
+
+        // 6. Decode attention: Q [1, heads, dim] against full K/V [kv_len+1, kv_heads, dim]
+        let attn_out = graph.add_fused_attention_decode(q_rope, full_k, full_v, None);
+
+        // 7. Reshape back to 2D and output projection
+        let attn_flat = graph.add_reshape(attn_out, &[1, num_heads * head_dim]);
+        let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
+
+        // 8. Fused residual add + post-attention RMS norm
+        let (h_updated, normed_post) =
+            graph.add_add_rmsnorm(h, attn_proj, lw.post_attention_layernorm, eps);
+
+        // 9. FFN: SwiGLU MLP (fused pair)
+        let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
+        let activated = graph.add_swiglu(gate, up);
+        let down = graph.add_linear(activated, lw.down_proj);
+
+        // 10. Residual add
+        h = graph.add_add_inplace(h_updated, down);
+    }
+
+    // -- Final norm --
+    let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
+
+    // -- LM head --
+    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
+
+    // -- Outputs: logits first, then per-layer K/V caches --
+    graph.set_output(logits);
+    for &k_out in &k_outputs {
+        graph.set_output(k_out);
+    }
+    for &v_out in &v_outputs {
+        graph.set_output(v_out);
+    }
+
+    (graph, model_weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

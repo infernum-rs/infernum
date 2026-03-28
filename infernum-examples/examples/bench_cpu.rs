@@ -1,15 +1,19 @@
 //! Benchmark for infernum CPU throughput.
 //!
-//! Two modes:
+//! Three modes:
 //! - **Eager (default):** Autoregressive decode — generates N tokens one-by-one
 //!   using the runtime engine with KV cache.
-//! - **Graph (`--graph`):** Prefill throughput — processes N tokens in a single
-//!   forward pass through the graph executor. Only supports SafeTensors, Llama family.
+//! - **Graph prefill (`--graph`):** Prefill throughput — processes N tokens in a
+//!   single forward pass through the graph executor. Only supports Llama family.
+//! - **Graph decode (`--graph-decode`):** Decode throughput — generates N tokens
+//!   one-by-one through the graph executor with KV cache management. Only supports
+//!   Llama family.
 //!
 //! Usage:
 //!   cargo run --release --example bench_cpu --features cpu -- /path/to/model.gguf 128
 //!   cargo run --release --example bench_cpu --features cpu -- /path/to/safetensors_dir 128
 //!   cargo run --release --example bench_cpu --features cpu -- --graph /path/to/safetensors_dir 128
+//!   cargo run --release --example bench_cpu --features cpu -- --graph-decode /path/to/model 128
 
 use std::path::Path;
 use std::time::Instant;
@@ -25,7 +29,7 @@ use infernum::Tensor;
 use infernum_cpu::executor::execute;
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
 use infernum_gemma::GemmaModel;
-use infernum_llama::{build_prefill_graph, LlamaConfig, LlamaModel};
+use infernum_llama::{build_decode_graph, build_prefill_graph, LlamaConfig, LlamaModel};
 use infernum_qwen::QwenModel;
 use infernum_runtime::Engine;
 
@@ -46,6 +50,10 @@ struct Cli {
     /// Use graph executor instead of eager engine (SafeTensors + Llama only)
     #[arg(long)]
     graph: bool,
+
+    /// Use graph executor for decode (autoregressive) throughput
+    #[arg(long)]
+    graph_decode: bool,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -380,6 +388,182 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
     Ok(())
 }
 
+/// Benchmark decode throughput using the graph executor.
+///
+/// Runs a prefill pass to build initial KV caches, then decodes `n_gen`
+/// tokens one at a time through the decode graph. The graph is rebuilt
+/// each step because KV cache shapes change as the sequence grows.
+fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
+    let is_gguf = model_path.ends_with(".gguf");
+
+    let config: LlamaConfig = if is_gguf {
+        let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+        LlamaConfig::from_gguf_metadata(gguf.metadata())?
+    } else {
+        let config_path = Path::new(model_path).join("config.json");
+        let data = std::fs::read_to_string(&config_path).map_err(|e| {
+            infernum::Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to read {}: {e}", config_path.display()),
+            ))
+        })?;
+        serde_json::from_str(&data).map_err(|e| {
+            infernum::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse config.json: {e}"),
+            ))
+        })?
+    };
+
+    let num_layers = config.num_hidden_layers;
+    let head_dim = config.head_dim();
+    let half_dim = head_dim / 2;
+
+    eprintln!(
+        "Model: {} layers, {} hidden (graph decode, n_gen={})",
+        num_layers, config.hidden_size, n_gen,
+    );
+
+    // Load weights using a temporary graph (weight order is consistent across graphs)
+    let prompt_len = 8;
+    let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+    eprintln!("Loading weights...");
+    {
+        let (tmp_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+        if is_gguf {
+            load_graph_weights_gguf(&tmp_graph, &config, model_path, &mut weights)?;
+        } else {
+            load_graph_weights_safetensors(&tmp_graph, model_path, &mut weights)?;
+        }
+    }
+
+    // Pre-compute RoPE for all positions we'll need
+    let max_pos = prompt_len + n_gen;
+    let (all_cos, all_sin) =
+        infernum::rope::precompute_rope_data(max_pos, head_dim, config.rope_theta);
+
+    // Initialize KV caches as zero-length tensors (will grow each decode step).
+    let num_kv_heads = config.num_kv_heads();
+    let mut k_caches: Vec<CpuTensor> = (0..num_layers)
+        .map(|_| CpuTensor::from_f32(&[0, num_kv_heads, head_dim], &[]))
+        .collect();
+    let mut v_caches: Vec<CpuTensor> = (0..num_layers)
+        .map(|_| CpuTensor::from_f32(&[0, num_kv_heads, head_dim], &[]))
+        .collect();
+
+    // Warm-up: decode the prompt tokens one at a time (not timed)
+    eprintln!("Warm-up: decoding {} prompt tokens...", prompt_len);
+    let mut last_token = 0u32; // dummy start
+    for pos in 0..prompt_len {
+        let token = (pos % 256) as u32;
+        let kv_len = pos; // KV cache has `pos` entries so far
+
+        let (decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
+        let decode_plan = plan(&decode_graph);
+        let mut arena = Arena::new(decode_plan.arena_size);
+
+        // Build inputs: token, cos, sin, then per-layer k_cache, v_cache
+        let mut inputs = Vec::with_capacity(3 + 2 * num_layers);
+        inputs.push(CpuTensor::from_u32(&[1], &[token]));
+        let cos_start = pos * half_dim;
+        inputs.push(CpuTensor::from_f32(
+            &[1, half_dim],
+            &all_cos[cos_start..cos_start + half_dim],
+        ));
+        inputs.push(CpuTensor::from_f32(
+            &[1, half_dim],
+            &all_sin[cos_start..cos_start + half_dim],
+        ));
+
+        for layer in 0..num_layers {
+            inputs.push(k_caches[layer].clone());
+            inputs.push(v_caches[layer].clone());
+        }
+
+        let outputs = execute(
+            &decode_plan,
+            decode_graph.nodes(),
+            &mut arena,
+            &weights,
+            &inputs,
+            decode_graph.output_ids(),
+        )?;
+
+        // outputs: [logits, k_0, k_1, ..., k_N, v_0, v_1, ..., v_N]
+        last_token = token; // in a real scenario we'd argmax the logits
+
+        for layer in 0..num_layers {
+            k_caches[layer] = outputs[1 + layer].clone();
+            v_caches[layer] = outputs[1 + num_layers + layer].clone();
+        }
+    }
+    eprintln!("Warm-up done.");
+
+    // --- Phase 2: Timed decode of n_gen tokens ---
+    let start = Instant::now();
+
+    for step in 0..n_gen {
+        let pos = prompt_len + step;
+        let kv_len = pos;
+
+        let (decode_graph, _) = build_decode_graph::<CpuBackend>(&config, kv_len, DType::F32);
+        let decode_plan = plan(&decode_graph);
+        let mut arena = Arena::new(decode_plan.arena_size);
+
+        let mut inputs = Vec::with_capacity(3 + 2 * num_layers);
+        inputs.push(CpuTensor::from_u32(&[1], &[last_token]));
+        let cos_start = pos * half_dim;
+        inputs.push(CpuTensor::from_f32(
+            &[1, half_dim],
+            &all_cos[cos_start..cos_start + half_dim],
+        ));
+        inputs.push(CpuTensor::from_f32(
+            &[1, half_dim],
+            &all_sin[cos_start..cos_start + half_dim],
+        ));
+
+        for layer in 0..num_layers {
+            inputs.push(k_caches[layer].clone());
+            inputs.push(v_caches[layer].clone());
+        }
+
+        let outputs = execute(
+            &decode_plan,
+            decode_graph.nodes(),
+            &mut arena,
+            &weights,
+            &inputs,
+            decode_graph.output_ids(),
+        )?;
+
+        // Argmax the logits for next token
+        let logits = outputs[0].as_f32_slice();
+        last_token = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+
+        // Update KV caches
+        for layer in 0..num_layers {
+            k_caches[layer] = outputs[1 + layer].clone();
+            v_caches[layer] = outputs[1 + num_layers + layer].clone();
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let tok_s = n_gen as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "{n_gen} tokens in {:.2}s = {:.1} tok/s",
+        elapsed.as_secs_f64(),
+        tok_s,
+    );
+
+    Ok(())
+}
+
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
 
@@ -388,7 +572,7 @@ fn main() -> infernum::Result<()> {
         std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
     }
 
-    if cli.graph {
+    if cli.graph || cli.graph_decode {
         let is_gguf = cli.model.ends_with(".gguf");
 
         let model_type = if is_gguf {
@@ -397,24 +581,33 @@ fn main() -> infernum::Result<()> {
             detect_model_type(&cli.model)?
         };
 
-        let family = match model_type.as_str() {
-            "llama" | "mistral" => "llama",
+        match model_type.as_str() {
+            "llama" | "mistral" => {}
             other => {
-                eprintln!("ERROR: --graph mode only supports Llama/Mistral, got: {other}");
+                eprintln!(
+                    "ERROR: --graph/--graph-decode mode only supports Llama/Mistral, got: {other}"
+                );
                 std::process::exit(1);
             }
         };
 
+        let mode = if cli.graph_decode {
+            "graph-decode"
+        } else {
+            "graph"
+        };
         eprintln!(
-            "Loading: {} (CPU, {}, {}, graph)",
+            "Loading: {} (CPU, {}, {}, {})",
             cli.model,
             if is_gguf { "GGUF" } else { "SafeTensors" },
             model_type,
+            mode,
         );
 
-        return match family {
-            "llama" => bench_graph(&cli.model, cli.n_gen),
-            _ => unreachable!(),
+        return if cli.graph_decode {
+            bench_graph_decode(&cli.model, cli.n_gen)
+        } else {
+            bench_graph(&cli.model, cli.n_gen)
         };
     }
 

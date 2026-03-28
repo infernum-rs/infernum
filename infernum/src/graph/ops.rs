@@ -300,6 +300,12 @@ pub enum Op {
     /// Output: concatenated tensor.
     ConcatInnerDim,
 
+    /// Concatenate along the first (sequence) dimension.
+    ///
+    /// Inputs: `(a, b)`.
+    /// Output: concatenated tensor. `[a_seq + b_seq, ...]`.
+    ConcatSeq,
+
     /// Repeat KV heads for grouped-query attention.
     ///
     /// Inputs: `(input)`.

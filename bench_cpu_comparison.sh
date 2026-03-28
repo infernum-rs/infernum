@@ -3,7 +3,7 @@
 #
 # Reports two separate tables:
 #   1. **Decode** — autoregressive token generation (seq_len=1 per step)
-#      llama.cpp (-p 0 -n N) vs infernum eager (Engine::generate) vs graph (—)
+#      llama.cpp (-p 0 -n N) vs infernum eager (Engine::generate) vs graph decode
 #   2. **Prefill** — prompt processing in one forward pass (seq_len=N)
 #      llama.cpp (-p N -n 0) vs eager (—) vs infernum graph executor
 #
@@ -237,6 +237,24 @@ run_infernum_prefill() {
     echo "${toks:-ERR}"
 }
 
+# Run infernum bench_cpu --graph-decode (graph decode).
+run_infernum_graph_decode() {
+    local model_path="$1"
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+    local thread_args=()
+    if [[ -n "${THREADS}" ]]; then
+        thread_args=(-j "${THREADS}")
+    fi
+    local output toks
+    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
+        --graph-decode "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
+    toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
+    echo "${toks:-ERR}"
+}
+
 # ── Preflight checks ─────────────────────────────────────────────────────────
 
 check_prerequisites() {
@@ -353,9 +371,10 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["GGUF F32"]=$(run_llama_bench_prefill "${GGUF_F32}")
             log "[${step}/${total}] GGUF F32 — infernum decode (eager)"
             decode_eager["GGUF F32"]=$(run_infernum_decode "${GGUF_F32}")
+            log "[${step}/${total}] GGUF F32 — infernum decode (graph)"
+            decode_graph["GGUF F32"]=$(run_infernum_graph_decode "${BASE_MODEL_DIR}")
             log "[${step}/${total}] GGUF F32 — infernum prefill (graph)"
             prefill_graph["GGUF F32"]=$(run_infernum_prefill "${BASE_MODEL_DIR}")
-            decode_graph["GGUF F32"]="—"
             prefill_eager["GGUF F32"]="—"
             ;;
         "GGUF Q8_0")
@@ -365,9 +384,10 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["GGUF Q8_0"]=$(run_llama_bench_prefill "${GGUF_Q8}")
             log "[${step}/${total}] GGUF Q8_0 — infernum decode (eager)"
             decode_eager["GGUF Q8_0"]=$(run_infernum_decode "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — infernum decode (graph)"
+            decode_graph["GGUF Q8_0"]=$(run_infernum_graph_decode "${GGUF_Q8}")
             log "[${step}/${total}] GGUF Q8_0 — infernum prefill (graph)"
             prefill_graph["GGUF Q8_0"]=$(run_infernum_prefill "${GGUF_Q8}")
-            decode_graph["GGUF Q8_0"]="—"
             prefill_eager["GGUF Q8_0"]="—"
             ;;
         "GGUF Q4_0")
@@ -377,9 +397,10 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["GGUF Q4_0"]=$(run_llama_bench_prefill "${GGUF_Q4}")
             log "[${step}/${total}] GGUF Q4_0 — infernum decode (eager)"
             decode_eager["GGUF Q4_0"]=$(run_infernum_decode "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — infernum decode (graph)"
+            decode_graph["GGUF Q4_0"]=$(run_infernum_graph_decode "${GGUF_Q4}")
             log "[${step}/${total}] GGUF Q4_0 — infernum prefill (graph)"
             prefill_graph["GGUF Q4_0"]=$(run_infernum_prefill "${GGUF_Q4}")
-            decode_graph["GGUF Q4_0"]="—"
             prefill_eager["GGUF Q4_0"]="—"
             ;;
     esac
@@ -439,13 +460,20 @@ echo ""
 echo "| Format | llama.cpp | eager | graph | ratio |"
 echo "| ------ | --------: | ----: | ----: | ----: |"
 
+best_of() {
+    local a="$1" b="$2"
+    if [[ "${a}" == "—" || "${a}" == "ERR" ]]; then echo "${b}"; return; fi
+    if [[ "${b}" == "—" || "${b}" == "ERR" ]]; then echo "${a}"; return; fi
+    python3 -c "print(max(float('${a}'), float('${b}')))"
+}
+
 for bench in "${benchmarks[@]}"; do
     l="${decode_llama[$bench]}"
     e="${decode_eager[$bench]}"
     g="${decode_graph[$bench]}"
-    r=$(compute_ratio "${l}" "${e}")
-    printf "| %-14s | %9s | %5s | %5s | %5s |
-" "${bench}" "${l}" "${e}" "${g}" "${r}"
+    best=$(best_of "${e}" "${g}")
+    r=$(compute_ratio "${l}" "${best}")
+    printf "| %-14s | %9s | %5s | %5s | %5s |\n" "${bench}" "${l}" "${e}" "${g}" "${r}"
 done
 
 # Prefill table

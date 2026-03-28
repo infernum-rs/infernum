@@ -287,6 +287,18 @@ pub fn execute(
                 write_tensor(arena, plan, node_id, &result);
             }
 
+            Op::ConcatSeq => {
+                let a = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let b = read_tensor(arena, plan, nodes, node.inputs[1]);
+                let a_data = a.as_f32_slice();
+                let b_data = b.as_f32_slice();
+                let mut data = Vec::with_capacity(a_data.len() + b_data.len());
+                data.extend_from_slice(a_data);
+                data.extend_from_slice(b_data);
+                let result = CpuTensor::from_f32_vec(&node.shape, data);
+                write_tensor(arena, plan, node_id, &result);
+            }
+
             Op::SliceView { offset, shape } => {
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let result = input.slice_view(*offset, shape);
