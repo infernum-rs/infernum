@@ -3,9 +3,9 @@
 #
 # Reports two separate tables:
 #   1. **Decode** — autoregressive token generation (seq_len=1 per step)
-#      llama.cpp (-p 0 -n N) vs infernum Engine::generate
+#      llama.cpp (-p 0 -n N) vs infernum eager (Engine::generate) vs graph (—)
 #   2. **Prefill** — prompt processing in one forward pass (seq_len=N)
-#      llama.cpp (-p N -n 0) vs infernum (not yet implemented for GPU)
+#      llama.cpp (-p N -n 0) vs eager (—) vs infernum graph (—, not yet implemented for GPU)
 #
 # Prerequisites:
 #   - CUDA GPU with nvidia-smi
@@ -353,11 +353,13 @@ fi
 
 # Decode results
 declare -A decode_llama
-declare -A decode_infernum
+declare -A decode_eager
+declare -A decode_graph
 
 # Prefill results
 declare -A prefill_llama
-declare -A prefill_infernum
+declare -A prefill_eager
+declare -A prefill_graph
 
 # All possible benchmarks in display order
 all_benchmarks=("F32" "BF16" "F16" "FP8" "GGUF Q8_0" "GGUF Q4_0" "GPTQ INT4")
@@ -386,58 +388,72 @@ for bench in "${benchmarks[@]}"; do
             decode_llama["F32"]=$(run_llama_bench_decode "${GGUF_F32}")
             log "[${step}/${total}] F32 — llama.cpp prefill"
             prefill_llama["F32"]=$(run_llama_bench_prefill "${GGUF_F32}")
-            log "[${step}/${total}] F32 — infernum decode (GGUF, no graphs)"
-            decode_infernum["F32"]=$(run_infernum_bench_no_graphs "${GGUF_F32}")
-            prefill_infernum["F32"]="—"
+            log "[${step}/${total}] F32 — infernum decode (eager, no graphs)"
+            decode_eager["F32"]=$(run_infernum_bench_no_graphs "${GGUF_F32}")
+            decode_graph["F32"]="—"
+            prefill_eager["F32"]="—"
+            prefill_graph["F32"]="—"
             ;;
         BF16)
             log "[${step}/${total}] BF16 — llama.cpp decode"
             decode_llama["BF16"]=$(run_llama_bench_decode "${GGUF_BF16}")
             log "[${step}/${total}] BF16 — llama.cpp prefill"
             prefill_llama["BF16"]=$(run_llama_bench_prefill "${GGUF_BF16}")
-            log "[${step}/${total}] BF16 — infernum decode"
-            decode_infernum["BF16"]=$(run_infernum_bench "${BASE_MODEL_DIR}")
-            prefill_infernum["BF16"]="—"
+            log "[${step}/${total}] BF16 — infernum decode (eager)"
+            decode_eager["BF16"]=$(run_infernum_bench "${BASE_MODEL_DIR}")
+            decode_graph["BF16"]="—"
+            prefill_eager["BF16"]="—"
+            prefill_graph["BF16"]="—"
             ;;
         F16)
             log "[${step}/${total}] F16 — llama.cpp decode"
             decode_llama["F16"]=$(run_llama_bench_decode "${GGUF_F16}")
             log "[${step}/${total}] F16 — llama.cpp prefill"
             prefill_llama["F16"]=$(run_llama_bench_prefill "${GGUF_F16}")
-            decode_infernum["F16"]="—"
-            prefill_infernum["F16"]="—"
+            decode_eager["F16"]="—"
+            decode_graph["F16"]="—"
+            prefill_eager["F16"]="—"
+            prefill_graph["F16"]="—"
             ;;
         FP8)
             decode_llama["FP8"]="—"
             prefill_llama["FP8"]="—"
-            log "[${step}/${total}] FP8 — infernum decode (no graphs)"
-            decode_infernum["FP8"]=$(run_infernum_bench_no_graphs "${FP8_MODEL_DIR}")
-            prefill_infernum["FP8"]="—"
+            log "[${step}/${total}] FP8 — infernum decode (eager, no graphs)"
+            decode_eager["FP8"]=$(run_infernum_bench_no_graphs "${FP8_MODEL_DIR}")
+            decode_graph["FP8"]="—"
+            prefill_eager["FP8"]="—"
+            prefill_graph["FP8"]="—"
             ;;
         "GGUF Q8_0")
             log "[${step}/${total}] GGUF Q8_0 — llama.cpp decode"
             decode_llama["GGUF Q8_0"]=$(run_llama_bench_decode "${GGUF_Q8}")
             log "[${step}/${total}] GGUF Q8_0 — llama.cpp prefill"
             prefill_llama["GGUF Q8_0"]=$(run_llama_bench_prefill "${GGUF_Q8}")
-            log "[${step}/${total}] GGUF Q8_0 — infernum decode (no graphs)"
-            decode_infernum["GGUF Q8_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q8}")
-            prefill_infernum["GGUF Q8_0"]="—"
+            log "[${step}/${total}] GGUF Q8_0 — infernum decode (eager, no graphs)"
+            decode_eager["GGUF Q8_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q8}")
+            decode_graph["GGUF Q8_0"]="—"
+            prefill_eager["GGUF Q8_0"]="—"
+            prefill_graph["GGUF Q8_0"]="—"
             ;;
         "GGUF Q4_0")
             log "[${step}/${total}] GGUF Q4_0 — llama.cpp decode"
             decode_llama["GGUF Q4_0"]=$(run_llama_bench_decode "${GGUF_Q4}")
             log "[${step}/${total}] GGUF Q4_0 — llama.cpp prefill"
             prefill_llama["GGUF Q4_0"]=$(run_llama_bench_prefill "${GGUF_Q4}")
-            log "[${step}/${total}] GGUF Q4_0 — infernum decode (no graphs)"
-            decode_infernum["GGUF Q4_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q4}")
-            prefill_infernum["GGUF Q4_0"]="—"
+            log "[${step}/${total}] GGUF Q4_0 — infernum decode (eager, no graphs)"
+            decode_eager["GGUF Q4_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q4}")
+            decode_graph["GGUF Q4_0"]="—"
+            prefill_eager["GGUF Q4_0"]="—"
+            prefill_graph["GGUF Q4_0"]="—"
             ;;
         "GPTQ INT4")
             decode_llama["GPTQ INT4"]="—"
             prefill_llama["GPTQ INT4"]="—"
-            log "[${step}/${total}] GPTQ INT4 — infernum decode (no graphs)"
-            decode_infernum["GPTQ INT4"]=$(run_infernum_bench_no_graphs "${GPTQ_MODEL_DIR}")
-            prefill_infernum["GPTQ INT4"]="—"
+            log "[${step}/${total}] GPTQ INT4 — infernum decode (eager, no graphs)"
+            decode_eager["GPTQ INT4"]=$(run_infernum_bench_no_graphs "${GPTQ_MODEL_DIR}")
+            decode_graph["GPTQ INT4"]="—"
+            prefill_eager["GPTQ INT4"]="—"
+            prefill_graph["GPTQ INT4"]="—"
             ;;
     esac
 done
@@ -477,8 +493,8 @@ echo "## Infernum vs llama.cpp — Llama 3.2 1B GPU throughput"
 echo ""
 echo "- **GPU:** ${gpu_name}"
 echo "- **Tokens:** ${N_TOKENS}"
-echo "- **infernum:** commit \`${infernum_commit}\` (buffer pool + CUDA graphs where supported)"
-echo "- **llama.cpp:** commit \`${llama_commit}\`" '(`-ngl 99`,' "${LLAMA_BENCH_REPS} reps)"
+echo "- **infernum:** commit `${infernum_commit}` (buffer pool + CUDA graphs where supported)"
+echo "- **llama.cpp:** commit `${llama_commit}`" '(`-ngl 99`,' "${LLAMA_BENCH_REPS} reps)"
 echo "- **Date:** $(date +%Y-%m-%d)"
 
 # Decode table
@@ -487,15 +503,16 @@ echo "### Decode throughput (tok/s)"
 echo ""
 echo "Autoregressive generation: each step processes 1 token, appending to KV cache."
 echo ""
-echo "| Format | llama.cpp | infernum | ratio |"
-echo "| ------ | --------: | -------: | ----: |"
+echo "| Format | llama.cpp | eager | graph | ratio |"
+echo "| ------ | --------: | ----: | ----: | ----: |"
 
 for bench in "${benchmarks[@]}"; do
     l="${decode_llama[$bench]}"
-    i="${decode_infernum[$bench]}"
-    r=$(compute_ratio "${l}" "${i}")
-    printf "| %-14s | %9s | %8s | %5s |
-" "${bench}" "${l}" "${i}" "${r}"
+    e="${decode_eager[$bench]}"
+    g="${decode_graph[$bench]}"
+    r=$(compute_ratio "${l}" "${e}")
+    printf "| %-14s | %9s | %5s | %5s | %5s |
+" "${bench}" "${l}" "${e}" "${g}" "${r}"
 done
 
 # Prefill table
@@ -504,15 +521,16 @@ echo "### Prefill throughput (tok/s)"
 echo ""
 echo "Prompt processing: all tokens processed in a single forward pass."
 echo ""
-echo "| Format | llama.cpp | infernum | ratio |"
-echo "| ------ | --------: | -------: | ----: |"
+echo "| Format | llama.cpp | eager | graph | ratio |"
+echo "| ------ | --------: | ----: | ----: | ----: |"
 
 for bench in "${benchmarks[@]}"; do
     l="${prefill_llama[$bench]}"
-    i="${prefill_infernum[$bench]}"
-    r=$(compute_ratio "${l}" "${i}")
-    printf "| %-14s | %9s | %8s | %5s |
-" "${bench}" "${l}" "${i}" "${r}"
+    e="${prefill_eager[$bench]}"
+    g="${prefill_graph[$bench]}"
+    r=$(compute_ratio "${l}" "${g}")
+    printf "| %-14s | %9s | %5s | %5s | %5s |
+" "${bench}" "${l}" "${e}" "${g}" "${r}"
 done
 
 echo ""

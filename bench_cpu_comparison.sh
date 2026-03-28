@@ -3,9 +3,9 @@
 #
 # Reports two separate tables:
 #   1. **Decode** — autoregressive token generation (seq_len=1 per step)
-#      llama.cpp (-p 0 -n N) vs infernum eager (Engine::generate)
+#      llama.cpp (-p 0 -n N) vs infernum eager (Engine::generate) vs graph (—)
 #   2. **Prefill** — prompt processing in one forward pass (seq_len=N)
-#      llama.cpp (-p N -n 0) vs infernum graph executor
+#      llama.cpp (-p N -n 0) vs eager (—) vs infernum graph executor
 #
 # Prerequisites:
 #   - llama.cpp built locally (with llama-bench, llama-quantize, convert_hf_to_gguf.py)
@@ -317,11 +317,13 @@ fi
 
 # Decode results
 declare -A decode_llama
-declare -A decode_infernum
+declare -A decode_eager
+declare -A decode_graph
 
 # Prefill results
 declare -A prefill_llama
-declare -A prefill_infernum
+declare -A prefill_eager
+declare -A prefill_graph
 
 all_benchmarks=("GGUF F32" "GGUF Q8_0" "GGUF Q4_0")
 
@@ -350,9 +352,11 @@ for bench in "${benchmarks[@]}"; do
             log "[${step}/${total}] GGUF F32 — llama.cpp prefill"
             prefill_llama["GGUF F32"]=$(run_llama_bench_prefill "${GGUF_F32}")
             log "[${step}/${total}] GGUF F32 — infernum decode (eager)"
-            decode_infernum["GGUF F32"]=$(run_infernum_decode "${GGUF_F32}")
+            decode_eager["GGUF F32"]=$(run_infernum_decode "${GGUF_F32}")
             log "[${step}/${total}] GGUF F32 — infernum prefill (graph)"
-            prefill_infernum["GGUF F32"]=$(run_infernum_prefill "${BASE_MODEL_DIR}")
+            prefill_graph["GGUF F32"]=$(run_infernum_prefill "${BASE_MODEL_DIR}")
+            decode_graph["GGUF F32"]="—"
+            prefill_eager["GGUF F32"]="—"
             ;;
         "GGUF Q8_0")
             log "[${step}/${total}] GGUF Q8_0 — llama.cpp decode"
@@ -360,9 +364,11 @@ for bench in "${benchmarks[@]}"; do
             log "[${step}/${total}] GGUF Q8_0 — llama.cpp prefill"
             prefill_llama["GGUF Q8_0"]=$(run_llama_bench_prefill "${GGUF_Q8}")
             log "[${step}/${total}] GGUF Q8_0 — infernum decode (eager)"
-            decode_infernum["GGUF Q8_0"]=$(run_infernum_decode "${GGUF_Q8}")
+            decode_eager["GGUF Q8_0"]=$(run_infernum_decode "${GGUF_Q8}")
             log "[${step}/${total}] GGUF Q8_0 — infernum prefill (graph)"
-            prefill_infernum["GGUF Q8_0"]=$(run_infernum_prefill "${GGUF_Q8}")
+            prefill_graph["GGUF Q8_0"]=$(run_infernum_prefill "${GGUF_Q8}")
+            decode_graph["GGUF Q8_0"]="—"
+            prefill_eager["GGUF Q8_0"]="—"
             ;;
         "GGUF Q4_0")
             log "[${step}/${total}] GGUF Q4_0 — llama.cpp decode"
@@ -370,9 +376,11 @@ for bench in "${benchmarks[@]}"; do
             log "[${step}/${total}] GGUF Q4_0 — llama.cpp prefill"
             prefill_llama["GGUF Q4_0"]=$(run_llama_bench_prefill "${GGUF_Q4}")
             log "[${step}/${total}] GGUF Q4_0 — infernum decode (eager)"
-            decode_infernum["GGUF Q4_0"]=$(run_infernum_decode "${GGUF_Q4}")
+            decode_eager["GGUF Q4_0"]=$(run_infernum_decode "${GGUF_Q4}")
             log "[${step}/${total}] GGUF Q4_0 — infernum prefill (graph)"
-            prefill_infernum["GGUF Q4_0"]=$(run_infernum_prefill "${GGUF_Q4}")
+            prefill_graph["GGUF Q4_0"]=$(run_infernum_prefill "${GGUF_Q4}")
+            decode_graph["GGUF Q4_0"]="—"
+            prefill_eager["GGUF Q4_0"]="—"
             ;;
     esac
 done
@@ -428,15 +436,16 @@ echo "### Decode throughput (tok/s)"
 echo ""
 echo "Autoregressive generation: each step processes 1 token, appending to KV cache."
 echo ""
-echo "| Format | llama.cpp | infernum | ratio |"
-echo "| ------ | --------: | -------: | ----: |"
+echo "| Format | llama.cpp | eager | graph | ratio |"
+echo "| ------ | --------: | ----: | ----: | ----: |"
 
 for bench in "${benchmarks[@]}"; do
     l="${decode_llama[$bench]}"
-    i="${decode_infernum[$bench]}"
-    r=$(compute_ratio "${l}" "${i}")
-    printf "| %-14s | %9s | %8s | %5s |
-" "${bench}" "${l}" "${i}" "${r}"
+    e="${decode_eager[$bench]}"
+    g="${decode_graph[$bench]}"
+    r=$(compute_ratio "${l}" "${e}")
+    printf "| %-14s | %9s | %5s | %5s | %5s |
+" "${bench}" "${l}" "${e}" "${g}" "${r}"
 done
 
 # Prefill table
@@ -445,15 +454,16 @@ echo "### Prefill throughput (tok/s)"
 echo ""
 echo "Prompt processing: all tokens processed in a single forward pass."
 echo ""
-echo "| Format | llama.cpp | infernum | ratio |"
-echo "| ------ | --------: | -------: | ----: |"
+echo "| Format | llama.cpp | eager | graph | ratio |"
+echo "| ------ | --------: | ----: | ----: | ----: |"
 
 for bench in "${benchmarks[@]}"; do
     l="${prefill_llama[$bench]}"
-    i="${prefill_infernum[$bench]}"
-    r=$(compute_ratio "${l}" "${i}")
-    printf "| %-14s | %9s | %8s | %5s |
-" "${bench}" "${l}" "${i}" "${r}"
+    e="${prefill_eager[$bench]}"
+    g="${prefill_graph[$bench]}"
+    r=$(compute_ratio "${l}" "${g}")
+    printf "| %-14s | %9s | %5s | %5s | %5s |
+" "${bench}" "${l}" "${e}" "${g}" "${r}"
 done
 
 echo ""
