@@ -1674,11 +1674,10 @@ pub fn vec_silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
 #[allow(clippy::many_single_char_names)]
 unsafe fn vec_silu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
     use std::arch::x86_64::{
-        __m512, __m512i, _mm512_add_ps, _mm512_castps_si512, _mm512_castsi512_ps,
-        _mm512_cvtps_epi32, _mm512_cvtepi32_ps, _mm512_fmadd_ps, _mm512_loadu_ps,
-        _mm512_max_ps, _mm512_min_ps, _mm512_mul_ps, _mm512_set1_ps,
-        _mm512_slli_epi32, _mm512_storeu_ps, _mm512_sub_ps,
-        _mm512_add_epi32,
+        __m512, __m512i, _mm512_add_epi32, _mm512_add_ps, _mm512_castps_si512, _mm512_castsi512_ps,
+        _mm512_cvtepi32_ps, _mm512_cvtps_epi32, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_max_ps,
+        _mm512_min_ps, _mm512_mul_ps, _mm512_set1_ps, _mm512_slli_epi32, _mm512_storeu_ps,
+        _mm512_sub_ps,
     };
 
     let n = gate.len();
@@ -1702,7 +1701,7 @@ unsafe fn vec_silu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
 
     // Clamp range to avoid overflow/underflow in exp.
     let exp_lo: __m512 = _mm512_set1_ps(-87.332_54_f32); // ln(FLT_MIN)
-    let exp_hi: __m512 = _mm512_set1_ps(88.722_84_f32);  // ln(FLT_MAX)
+    let exp_hi: __m512 = _mm512_set1_ps(88.722_84_f32); // ln(FLT_MAX)
 
     let gate_ptr = gate.as_ptr();
     let up_ptr = up.as_ptr();
@@ -1730,7 +1729,7 @@ unsafe fn vec_silu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
         let f: __m512 = _mm512_sub_ps(t, n_f);
 
         // Polynomial: 2^f ≈ c0 + f*(c1 + f*(c2 + f*(c3 + f*c4)))
-        let poly: __m512 = _mm512_fmadd_ps(c4, f,  c3);
+        let poly: __m512 = _mm512_fmadd_ps(c4, f, c3);
         let poly: __m512 = _mm512_fmadd_ps(poly, f, c2);
         let poly: __m512 = _mm512_fmadd_ps(poly, f, c1);
         let poly: __m512 = _mm512_fmadd_ps(poly, f, c0);
@@ -1739,9 +1738,8 @@ unsafe fn vec_silu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
         // poly * 2^n = poly with exponent += n
         let n_i: __m512i = _mm512_cvtps_epi32(n_f);
         let shift: __m512i = _mm512_slli_epi32(n_i, 23); // shift n into exponent position
-        let exp_val: __m512 = _mm512_castsi512_ps(
-            _mm512_add_epi32(_mm512_castps_si512(poly), shift)
-        );
+        let exp_val: __m512 =
+            _mm512_castsi512_ps(_mm512_add_epi32(_mm512_castps_si512(poly), shift));
 
         // sigmoid(-g) = exp(-g) / (1 + exp(-g))
         // silu(g) = g * sigmoid(g) = g / (1 + exp(-g))
@@ -1778,12 +1776,10 @@ pub fn vec_softmax_inplace(data: &mut [f32]) {
 #[target_feature(enable = "avx512f")]
 unsafe fn vec_softmax_inplace_inner(data: &mut [f32]) {
     use std::arch::x86_64::{
-        __m512, _mm512_add_ps, _mm512_castps_si512, _mm512_castsi512_ps,
-        _mm512_cvtepi32_ps, _mm512_cvtps_epi32, _mm512_fmadd_ps,
-        _mm512_loadu_ps, _mm512_max_ps, _mm512_min_ps, _mm512_mul_ps,
-        _mm512_reduce_add_ps, _mm512_reduce_max_ps, _mm512_set1_ps,
+        __m512, _mm512_add_epi32, _mm512_add_ps, _mm512_castps_si512, _mm512_castsi512_ps,
+        _mm512_cvtepi32_ps, _mm512_cvtps_epi32, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_max_ps,
+        _mm512_min_ps, _mm512_mul_ps, _mm512_reduce_add_ps, _mm512_reduce_max_ps, _mm512_set1_ps,
         _mm512_slli_epi32, _mm512_storeu_ps, _mm512_sub_ps,
-        _mm512_add_epi32,
     };
 
     let n = data.len();

@@ -469,9 +469,8 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                     );
 
                     // Scatter local contiguous output [m × chunk_n] into strided global output.
-                    let out_global = unsafe {
-                        std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n)
-                    };
+                    let out_global =
+                        unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
                     for row in 0..m {
                         let src = &local_out[row * chunk_n..(row + 1) * chunk_n];
                         let dst = &mut out_global[row * n + col_start..row * n + col_end];
@@ -568,11 +567,13 @@ fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) 
         for row in row_start..row_end {
             let inp = &input_data[row * k..(row + 1) * k];
             // Safety: each thread writes to disjoint row regions.
-            let q_out = unsafe {
-                std::slice::from_raw_parts_mut((q_addr as *mut u8).add(row * k), k)
-            };
+            let q_out =
+                unsafe { std::slice::from_raw_parts_mut((q_addr as *mut u8).add(row * k), k) };
             let s_out = unsafe {
-                std::slice::from_raw_parts_mut((s_addr as *mut f32).add(row * num_blocks), num_blocks)
+                std::slice::from_raw_parts_mut(
+                    (s_addr as *mut f32).add(row * num_blocks),
+                    num_blocks,
+                )
             };
             simd::quantize_row_q8(inp, q_out, s_out);
         }

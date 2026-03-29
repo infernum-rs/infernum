@@ -7,8 +7,7 @@
 use std::collections::HashMap;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, BiasOps, EmbedOps, MatmulExtOps, MatmulOps, NormOps, RopeOps,
-    TensorOps,
+    ArithOps, AttentionOps, BiasOps, EmbedOps, MatmulExtOps, MatmulOps, NormOps, RopeOps, TensorOps,
 };
 use infernum::graph::{Arena, WeightStore};
 use infernum::tensor::Tensor;
@@ -539,7 +538,6 @@ pub fn execute(
             // --- Unimplemented ---
             op => panic!("CPU executor: unimplemented op {op:?}"),
         }
-
     }
 
     // Update persistent KV cache length after all layers have appended.
