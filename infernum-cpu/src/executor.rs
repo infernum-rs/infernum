@@ -8,12 +8,13 @@ use std::collections::HashMap;
 
 use infernum::backend::{
     ArithOps, AttentionOps, BiasOps, EmbedOps, MatmulExtOps, MatmulOps, NormOps, RopeOps,
-    SwigluOps, TensorOps,
+    TensorOps,
 };
 use infernum::graph::{Arena, WeightStore};
 use infernum::tensor::Tensor;
 use infernum::{DType, ExecutionPlan, GraphNode, NodeId, Op, Result};
 
+use crate::simd;
 use crate::tensor::{CpuLinearWeight, CpuTensor};
 use crate::CpuBackend;
 
@@ -177,7 +178,7 @@ fn write_tensor(arena: &mut Arena, plan: &ExecutionPlan, node_id: NodeId, tensor
 /// # Errors
 ///
 /// Returns an error if any op kernel fails.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cast_ptr_alignment)]
 pub fn execute(
     plan: &ExecutionPlan,
     nodes: &[GraphNode],
@@ -302,10 +303,28 @@ pub fn execute(
 
             // --- Activations ---
             Op::Swiglu => {
-                let gate = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let up = read_tensor(arena, plan, nodes, node.inputs[1]);
-                let result = <CpuBackend as SwigluOps>::swiglu(&gate, &up)?;
-                write_tensor(arena, plan, node_id, &result);
+                // Zero-copy: read gate/up and write output directly in the arena.
+                // Safety: the planner guarantees all three slots are disjoint.
+                let gate_slot = plan.slot(node.inputs[0]).expect("gate has no slot");
+                let up_slot = plan.slot(node.inputs[1]).expect("up has no slot");
+                let out_slot = plan.slot(node_id).expect("swiglu output has no slot");
+                let num_elements: usize = node.shape.iter().product();
+                let base = arena.as_mut_ptr();
+                unsafe {
+                    let gate_data = std::slice::from_raw_parts(
+                        base.add(gate_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let up_data = std::slice::from_raw_parts(
+                        base.add(up_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let out_data = std::slice::from_raw_parts_mut(
+                        base.add(out_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    simd::vec_silu_mul(gate_data, up_data, out_data);
+                }
             }
 
             Op::Silu => {
@@ -320,18 +339,51 @@ pub fn execute(
             }
 
             Op::Mul => {
-                let a = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let b = read_tensor(arena, plan, nodes, node.inputs[1]);
-                let result = <CpuBackend as ArithOps>::mul(&a, &b)?;
-                write_tensor(arena, plan, node_id, &result);
+                let a_slot = plan.slot(node.inputs[0]).expect("mul input a has no slot");
+                let b_slot = plan.slot(node.inputs[1]).expect("mul input b has no slot");
+                let out_slot = plan.slot(node_id).expect("mul output has no slot");
+                let num_elements: usize = node.shape.iter().product();
+                let base = arena.as_mut_ptr();
+                unsafe {
+                    let a_data = std::slice::from_raw_parts(
+                        base.add(a_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let b_data = std::slice::from_raw_parts(
+                        base.add(b_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let out_data = std::slice::from_raw_parts_mut(
+                        base.add(out_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    simd::vec_mul(a_data, b_data, out_data);
+                }
             }
 
             // --- Arithmetic ---
             Op::Add | Op::AddInplace => {
-                let a = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let b = read_tensor(arena, plan, nodes, node.inputs[1]);
-                let result = <CpuBackend as ArithOps>::add(&a, &b)?;
-                write_tensor(arena, plan, node_id, &result);
+                // Zero-copy: read a/b and write output directly in the arena.
+                let a_slot = plan.slot(node.inputs[0]).expect("add input a has no slot");
+                let b_slot = plan.slot(node.inputs[1]).expect("add input b has no slot");
+                let out_slot = plan.slot(node_id).expect("add output has no slot");
+                let num_elements: usize = node.shape.iter().product();
+                let base = arena.as_mut_ptr();
+                unsafe {
+                    let a_data = std::slice::from_raw_parts(
+                        base.add(a_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let b_data = std::slice::from_raw_parts(
+                        base.add(b_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let out_data = std::slice::from_raw_parts_mut(
+                        base.add(out_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    simd::vec_add(a_data, b_data, out_data);
+                }
             }
 
             Op::Scale { factor } => {
@@ -487,6 +539,7 @@ pub fn execute(
             // --- Unimplemented ---
             op => panic!("CPU executor: unimplemented op {op:?}"),
         }
+
     }
 
     // Update persistent KV cache length after all layers have appended.

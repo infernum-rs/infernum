@@ -412,6 +412,54 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// Return a static label for this op, used by timing instrumentation.
+    #[must_use]
+    pub fn timing_category(&self) -> &'static str {
+        match self {
+            Self::Input => "Input",
+            Self::EmbeddingGather { .. } => "EmbeddingGather",
+            Self::RmsNorm { .. } => "RmsNorm",
+            Self::AddRmsNorm { .. } => "AddRmsNorm",
+            Self::SecondOutput { .. } => "SecondOutput",
+            Self::Linear { .. } => "Linear",
+            Self::LinearPair { .. } => "LinearPair",
+            Self::LinearTriple { .. } => "LinearTriple",
+            Self::Matmul => "Matmul",
+            Self::MatmulBf16F32 => "MatmulBf16F32",
+            Self::Swiglu => "Swiglu",
+            Self::Geglu => "Geglu",
+            Self::Silu => "Silu",
+            Self::Mul => "Mul",
+            Self::Add | Self::AddInplace => "Add",
+            Self::Scale { .. } => "Scale",
+            Self::BiasAdd { .. } => "BiasAdd",
+            Self::Rope { .. } => "Rope",
+            Self::RopeBatched { .. } => "RopeBatched",
+            Self::RopeInterleaved { .. } => "RopeInterleaved",
+            Self::FusedAttentionPrefill { .. } => "FusedAttentionPrefill",
+            Self::FusedAttentionDecode { .. } => "FusedAttentionDecode",
+            Self::PagedAttentionDecode { .. } => "PagedAttentionDecode",
+            Self::AppendPaged { .. } => "AppendPaged",
+            Self::AppendPagedBatched { .. } => "AppendPagedBatched",
+            Self::GatherPagedKv { .. } => "GatherPagedKv",
+            Self::Reshape { .. } => "Reshape",
+            Self::SliceView { .. } => "SliceView",
+            Self::Transpose2d => "Transpose2d",
+            Self::SplitInnerDim { .. } => "SplitInnerDim",
+            Self::ConcatInnerDim => "ConcatInnerDim",
+            Self::ConcatSeq => "ConcatSeq",
+            Self::RepeatKv { .. } => "RepeatKv",
+            Self::ExtractLastRow { .. } => "ExtractLastRow",
+            Self::CastToF32 | Self::CastFromF32 { .. } => "Cast",
+            Self::MoeDispatchSoftmax { .. } => "MoeDispatchSoftmax",
+            Self::MoeDispatchSigmoid { .. } => "MoeDispatchSigmoid",
+            Self::AllReduceSum => "AllReduceSum",
+            Self::LmHead { .. } => "LmHead",
+        }
+    }
+}
+
 /// Weight IDs for a single `MoE` expert's MLP.
 #[derive(Clone, Debug)]
 pub struct MoeExpertIds {

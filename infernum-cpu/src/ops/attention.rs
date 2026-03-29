@@ -292,7 +292,8 @@ impl PagedKvCacheOps for CpuBackend {
 #[allow(
     clippy::too_many_arguments,
     clippy::needless_range_loop,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    clippy::large_stack_arrays
 )]
 fn attention_head_unit(
     output: &mut [f32],
@@ -311,37 +312,45 @@ fn attention_head_unit(
     softcap: Option<f32>,
     sliding_window: Option<usize>,
 ) {
+    const MAX_STACK_KV: usize = 2048;
+
     let kv_h = h / gqa_ratio;
     let q_off = (s * num_heads + h) * head_dim;
     let q_vec = &q[q_off..q_off + head_dim];
 
-    // Compute attention scores
-    let mut scores = Vec::with_capacity(kv_len);
+    // Compute attention scores using SIMD dot products.
+    // Use stack array to avoid heap allocation (called ~245K times per iteration).
+    let mut stack_scores = [0.0f32; MAX_STACK_KV];
+    let mut heap_scores;
+    let scores: &mut [f32] = if kv_len <= MAX_STACK_KV {
+        &mut stack_scores[..kv_len]
+    } else {
+        heap_scores = vec![0.0f32; kv_len];
+        &mut heap_scores
+    };
+
     for kv_pos in 0..kv_len {
         let k_off = (kv_pos * num_kv_heads + kv_h) * head_dim;
         let k_vec = &k[k_off..k_off + head_dim];
-        let mut dot = 0.0f32;
-        for d in 0..head_dim {
-            dot += q_vec[d] * k_vec[d];
-        }
-        dot *= scale;
+        let mut dot = crate::simd::dot_f32(q_vec, k_vec) * scale;
 
         if let Some(cap) = softcap {
             dot = cap * (dot / cap).tanh();
         }
 
-        scores.push(dot);
+        scores[kv_pos] = dot;
     }
 
     // Causal mask + sliding window
     let query_pos = offset + s;
-    for kv_pos in 0..kv_len {
-        if kv_pos > query_pos {
-            scores[kv_pos] = f32::NEG_INFINITY;
-        }
-        if let Some(window) = sliding_window {
-            if query_pos >= window && kv_pos < query_pos - window + 1 {
-                scores[kv_pos] = f32::NEG_INFINITY;
+    for kv_pos in (query_pos + 1)..kv_len {
+        scores[kv_pos] = f32::NEG_INFINITY;
+    }
+    if let Some(window) = sliding_window {
+        if query_pos >= window {
+            let cutoff = query_pos - window + 1;
+            for score in &mut scores[..cutoff] {
+                *score = f32::NEG_INFINITY;
             }
         }
     }
@@ -349,24 +358,26 @@ fn attention_head_unit(
     // Softmax
     let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
-    for score in &mut scores {
+    for score in scores.iter_mut() {
         *score = (*score - max_score).exp();
         sum += *score;
     }
     if sum > 0.0 {
-        for score in &mut scores {
-            *score /= sum;
+        let inv_sum = 1.0 / sum;
+        for score in scores.iter_mut() {
+            *score *= inv_sum;
         }
     }
 
-    // Weighted sum of V
+    // Weighted sum of V using SIMD fused-multiply-add.
     let o_off = (s * num_heads + h) * head_dim;
+    let o_slice = &mut output[o_off..o_off + head_dim];
     for kv_pos in 0..kv_len {
-        if scores[kv_pos] > 0.0 {
+        let w = scores[kv_pos];
+        if w > 0.0 {
             let v_off = (kv_pos * num_kv_heads + kv_h) * head_dim;
-            for d in 0..head_dim {
-                output[o_off + d] += scores[kv_pos] * v[v_off + d];
-            }
+            let v_vec = &v[v_off..v_off + head_dim];
+            crate::simd::vec_fmadd(o_slice, v_vec, w);
         }
     }
 }

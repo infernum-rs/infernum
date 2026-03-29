@@ -52,7 +52,8 @@ impl ExecutionPlan {
 /// Panics if the graph contains cycles (should never happen for well-formed graphs).
 #[must_use]
 pub fn plan<B: Backend>(graph: &Graph<B>) -> ExecutionPlan {
-    let schedule = topological_sort(graph);
+    let full_schedule = topological_sort(graph);
+    let schedule = eliminate_dead_nodes(graph, full_schedule);
     let last_use = compute_last_use(graph, &schedule);
     let (buffer_slots, arena_size) = assign_offsets(graph, &schedule, &last_use);
     ExecutionPlan {
@@ -60,6 +61,38 @@ pub fn plan<B: Backend>(graph: &Graph<B>) -> ExecutionPlan {
         buffer_slots,
         arena_size,
     }
+}
+
+/// Remove nodes from the schedule that have no consumers and are not graph
+/// outputs or side-effect ops. This eliminates orphaned nodes left behind
+/// by fusion passes (e.g., Silu nodes orphaned by Swiglu fusion).
+fn eliminate_dead_nodes<B: Backend>(graph: &Graph<B>, schedule: Vec<NodeId>) -> Vec<NodeId> {
+    use std::collections::HashSet;
+
+    let n = graph.nodes.len();
+
+    // Build a set of all nodes that are consumed by at least one other node.
+    let mut is_consumed = vec![false; n];
+    for node in &graph.nodes {
+        for &input in &node.inputs {
+            is_consumed[input.0 as usize] = true;
+        }
+        if let Op::SecondOutput { source } = &node.op {
+            is_consumed[source.0 as usize] = true;
+        }
+    }
+
+    // Graph outputs are always live.
+    let output_set: HashSet<NodeId> = graph.outputs.iter().copied().collect();
+
+    schedule
+        .into_iter()
+        .filter(|&id| {
+            let idx = id.0 as usize;
+            // Keep if: consumed by another node, is a graph output, or has side effects.
+            is_consumed[idx] || output_set.contains(&id) || is_side_effect_op(&graph.nodes[idx].op)
+        })
+        .collect()
 }
 
 /// Size in bytes for a single element of a `DType`.

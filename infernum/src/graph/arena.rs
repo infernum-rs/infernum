@@ -33,6 +33,17 @@ impl Arena {
         }
     }
 
+    /// Returns a raw mutable pointer to the start of the arena's byte buffer.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure that any slices created from this pointer are
+    /// disjoint and that alignment requirements are met.
+    #[must_use]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+
     /// Get an immutable `f32` slice at the given byte offset and element count.
     ///
     /// # Panics

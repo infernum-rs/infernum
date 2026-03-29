@@ -77,6 +77,20 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Fused multiply-add: `dst[i] += src[i] * scalar`.
+#[inline]
+pub fn vec_fmadd(dst: &mut [f32], src: &[f32], scalar: f32) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2::vec_axpy(dst, scalar, src);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::vec_axpy(dst, scalar, src);
+    }
+}
+
 /// Element-wise addition: `out[i] = a[i] + b[i]`.
 #[inline]
 pub fn vec_add(a: &[f32], b: &[f32], out: &mut [f32]) {
@@ -166,17 +180,51 @@ pub fn sum_of_squares(a: &[f32]) -> f32 {
 }
 
 /// SiLU (Swish) activation fused with element-wise multiply: `out[i] = silu(gate[i]) * up[i]`.
+///
+/// Dispatches to AVX-512F vectorized exp (degree-4 polynomial, 16 floats/iter)
+/// when available, otherwise falls back to scalar.
 #[inline]
 pub fn vec_silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
     debug_assert_eq!(gate.len(), up.len());
     debug_assert_eq!(gate.len(), out.len());
     #[cfg(target_arch = "x86_64")]
     {
+        if has_avx512f() {
+            avx512::vec_silu_mul(gate, up, out);
+            return;
+        }
         avx2::vec_silu_mul(gate, up, out);
     }
     #[cfg(target_arch = "aarch64")]
     {
         neon::vec_silu_mul(gate, up, out);
+    }
+}
+
+/// In-place softmax: subtract max, exp, normalize by 1/sum.
+///
+/// Dispatches to AVX-512 vectorized exp when available.
+#[inline]
+pub fn vec_softmax_inplace(data: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            avx512::vec_softmax_inplace(data);
+            return;
+        }
+    }
+    // Scalar fallback.
+    let max = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for x in data.iter_mut() {
+        *x = (*x - max).exp();
+        sum += *x;
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for x in data.iter_mut() {
+            *x *= inv;
+        }
     }
 }
 
@@ -353,6 +401,54 @@ pub fn gemm_f32_tiled(a: &[f32], bt: &[f32], c: &mut [f32], m: usize, k: usize, 
         for col in 0..n {
             let bt_row = &bt[col * k..(col + 1) * k];
             c[row * n + col] = dot_f32(a_row, bt_row);
+        }
+    }
+}
+
+/// Tiled Q8×Q8 GEMM: `output[m, n] = inp_quants[m, k] · wt_quants[n, k]`
+/// with per-block scales.
+///
+/// Both operands are in Q8_0 format (blocks of 32 quant bytes + 1 f32 scale).
+/// Dispatches to AVX-512 VNNI tiled micro-kernel when available, otherwise
+/// falls back to row-by-row `dot_q8_q8_row`.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+pub fn gemm_q8_tiled(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants: &[u8],
+    wt_scales: &[f32],
+    m: usize,
+    n: usize,
+    num_blocks: usize,
+    bytes_per_row: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::gemm_q8_tiled(
+                output,
+                inp_quants,
+                inp_scales,
+                wt_quants,
+                wt_scales,
+                m,
+                n,
+                num_blocks,
+                bytes_per_row,
+            );
+            return;
+        }
+    }
+
+    // Scalar fallback: row-by-row Q8×Q8 dot products.
+    for row in 0..m {
+        let iq = &inp_quants[row * bytes_per_row..(row + 1) * bytes_per_row];
+        let is = &inp_scales[row * num_blocks..(row + 1) * num_blocks];
+        for col in 0..n {
+            let wq = &wt_quants[col * bytes_per_row..(col + 1) * bytes_per_row];
+            let ws = &wt_scales[col * num_blocks..(col + 1) * num_blocks];
+            output[row * n + col] = dot_q8_q8_row(iq, is, wq, ws);
         }
     }
 }

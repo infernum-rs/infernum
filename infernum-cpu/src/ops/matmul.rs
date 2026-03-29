@@ -420,18 +420,64 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
         match weight.dtype {
             DType::Q8_0 => {
                 let bpr = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
-                quantized_gemm_parallel(
-                    &mut output,
-                    &all_quants,
-                    m,
-                    k,
-                    n,
-                    num_blocks_per_row,
-                    &weight.data,
-                    &weight.scales,
-                    bpr,
-                    q8_gemv_body_inline,
-                );
+                let pool = crate::thread_pool::global_pool();
+                let num_threads = pool.num_threads();
+
+                // Split across N columns: all threads share input rows (hot in L3),
+                // each reads a subset of weight columns (fits in L2).
+                let cols_per_thread = (n / num_threads).max(1);
+                let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
+                let out_addr = ptr_to_usize(output.as_mut_ptr());
+                let wt_data_addr = weight.data.as_ptr() as usize;
+                let wt_scales_addr = weight.scales.as_ptr() as usize;
+
+                pool.dispatch(num_tasks, |task_id, _| {
+                    let col_start = task_id * cols_per_thread;
+                    let col_end = (col_start + cols_per_thread).min(n);
+                    if col_start >= n {
+                        return;
+                    }
+                    let chunk_n = col_end - col_start;
+
+                    // Create a temporary contiguous output buffer for this column chunk.
+                    let mut local_out = vec![0.0f32; m * chunk_n];
+
+                    // Weight slices for columns [col_start..col_end].
+                    let wt_data = unsafe {
+                        std::slice::from_raw_parts(
+                            (wt_data_addr as *const u8).add(col_start * bpr),
+                            chunk_n * bpr,
+                        )
+                    };
+                    let wt_scales = unsafe {
+                        std::slice::from_raw_parts(
+                            (wt_scales_addr as *const f32).add(col_start * num_blocks_per_row),
+                            chunk_n * num_blocks_per_row,
+                        )
+                    };
+
+                    simd::gemm_q8_tiled(
+                        &mut local_out,
+                        &all_quants.quants,
+                        &all_quants.scales,
+                        wt_data,
+                        wt_scales,
+                        m,
+                        chunk_n,
+                        num_blocks_per_row,
+                        bpr,
+                    );
+
+                    // Scatter local contiguous output [m × chunk_n] into strided global output.
+                    let out_global = unsafe {
+                        std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n)
+                    };
+                    for row in 0..m {
+                        let src = &local_out[row * chunk_n..(row + 1) * chunk_n];
+                        let dst = &mut out_global[row * n + col_start..row * n + col_end];
+                        dst.copy_from_slice(src);
+                    }
+                });
             }
             DType::Q4_0 => {
                 let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
@@ -506,12 +552,31 @@ fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) 
     let mut quants = vec![0u8; m * k];
     let mut scales = vec![0.0f32; m * num_blocks];
 
-    for row in 0..m {
-        let inp = &input_data[row * k..(row + 1) * k];
-        let q_out = &mut quants[row * k..(row + 1) * k];
-        let s_out = &mut scales[row * num_blocks..(row + 1) * num_blocks];
-        simd::quantize_row_q8(inp, q_out, s_out);
-    }
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
+    let rows_per_thread = (m / num_threads).max(1);
+    let num_tasks = num_threads.min(m.div_ceil(rows_per_thread));
+    let q_addr = quants.as_mut_ptr() as usize;
+    let s_addr = scales.as_mut_ptr() as usize;
+
+    pool.dispatch(num_tasks, |task_id, _| {
+        let row_start = task_id * rows_per_thread;
+        let row_end = (row_start + rows_per_thread).min(m);
+        if row_start >= m {
+            return;
+        }
+        for row in row_start..row_end {
+            let inp = &input_data[row * k..(row + 1) * k];
+            // Safety: each thread writes to disjoint row regions.
+            let q_out = unsafe {
+                std::slice::from_raw_parts_mut((q_addr as *mut u8).add(row * k), k)
+            };
+            let s_out = unsafe {
+                std::slice::from_raw_parts_mut((s_addr as *mut f32).add(row * num_blocks), num_blocks)
+            };
+            simd::quantize_row_q8(inp, q_out, s_out);
+        }
+    });
 
     QuantizedRows { quants, scales }
 }
