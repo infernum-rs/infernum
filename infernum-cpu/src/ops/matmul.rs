@@ -92,7 +92,7 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
         // (which internally packs Bᵀ panels per thread for cache locality).
         let pool = crate::thread_pool::global_pool();
         let num_threads = pool.num_threads();
-        let rows_per_thread = (m / num_threads).max(1);
+        let rows_per_thread = m.div_ceil(num_threads);
         let num_tasks = num_threads.min(m.div_ceil(rows_per_thread));
         let c_addr = ptr_to_usize(c.as_mut_ptr());
 
@@ -425,7 +425,7 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
 
                 // Split across N columns: all threads share input rows (hot in L3),
                 // each reads a subset of weight columns (fits in L2).
-                let cols_per_thread = (n / num_threads).max(1);
+                let cols_per_thread = n.div_ceil(num_threads);
                 let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
                 let out_addr = ptr_to_usize(output.as_mut_ptr());
                 let wt_data_addr = weight.data.as_ptr() as usize;
@@ -553,7 +553,7 @@ fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) 
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let rows_per_thread = (m / num_threads).max(1);
+    let rows_per_thread = m.div_ceil(num_threads);
     let num_tasks = num_threads.min(m.div_ceil(rows_per_thread));
     let q_addr = quants.as_mut_ptr() as usize;
     let s_addr = scales.as_mut_ptr() as usize;
