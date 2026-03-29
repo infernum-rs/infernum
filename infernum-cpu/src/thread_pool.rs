@@ -70,6 +70,9 @@ pub struct SpinPool {
     /// CPU ID to pin the caller thread to during dispatch (core 0).
     /// `None` if topology detection failed.
     caller_core: Option<usize>,
+    /// Ensures only one dispatch is active at a time, preventing concurrent
+    /// callers from corrupting worker slot state (e.g., during parallel tests).
+    dispatch_lock: std::sync::Mutex<()>,
 }
 
 impl SpinPool {
@@ -117,6 +120,7 @@ impl SpinPool {
             workers,
             num_threads,
             caller_core,
+            dispatch_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -160,6 +164,13 @@ impl SpinPool {
             task_fn(0, 1);
             return;
         }
+
+        // Serialize multi-task dispatches to prevent concurrent callers from
+        // corrupting worker slots. Single-task fast path above is lock-free.
+        let _guard = self
+            .dispatch_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let tramp: fn(*const (), usize, usize) = trampoline::<F>;
         let data_ptr = (&raw const task_fn).cast::<()>();
