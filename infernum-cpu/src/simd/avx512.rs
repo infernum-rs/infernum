@@ -967,7 +967,7 @@ unsafe fn microkernel_4x6(
 /// Micro-kernel row count for Q8 GEMM.
 const RM_Q8: usize = 4;
 /// Micro-kernel column count for Q8 GEMM.
-const RN_Q8: usize = 6;
+const RN_Q8: usize = 4;
 
 /// Tiled Q8×Q8 GEMM: `output[m, n] = inp_quants[m, k] · wt_quants[n, k]`
 /// with per-block scales.
@@ -976,7 +976,7 @@ const RN_Q8: usize = 6;
 /// blocks of 32 elements, each with a `[u8; 32]` quant array and one `f32`
 /// scale.
 ///
-/// Uses a 4×6 micro-kernel with AVX-512 VNNI for full tiles, falling back
+/// Uses a 4×4 micro-kernel with AVX-512 VNNI for full tiles, falling back
 /// to single-row `dot_q8_q8_row` for remainder rows/columns.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 pub fn gemm_q8_tiled(
@@ -1034,7 +1034,7 @@ unsafe fn gemm_q8_tiled_inner(
     // Full RM_Q8 × RN_Q8 tiles.
     for i in (0..m_full).step_by(RM_Q8) {
         for j in (0..n_full).step_by(RN_Q8) {
-            microkernel_q8_4x6(
+            microkernel_q8_4x4(
                 output,
                 inp_quants,
                 inp_scales,
@@ -1073,23 +1073,23 @@ unsafe fn gemm_q8_tiled_inner(
     }
 }
 
-/// Maximum number of quantization blocks supported per row.
-///
-/// Covers K up to 8192 (8192 / 32 = 256 blocks). Models with larger hidden
-/// dimensions would need this increased.
-const MAX_Q8_BLOCKS: usize = 256;
-
 /// 4×6 Q8×Q8 micro-kernel using AVX-512 VNNI inline assembly.
 ///
 /// Computes a 4-row × 6-column tile of the output matrix by accumulating
 /// dot products over all K blocks. Uses 24 ymm accumulators (ymm8-ymm31)
 /// that remain in registers across the entire block loop.
 ///
+/// Direct inline scale approach: each cell broadcasts the input scale
+/// directly from the register pointer, multiplies the int-dot result,
+/// then loads the weight scale pointer from the `ptrs[]` array, broadcasts
+/// the weight scale, and uses `vfmadd231ps` to accumulate. No combined-
+/// scale buffer is used, avoiding store-forwarding penalties.
+///
 /// Register map:
 /// - ymm0-ymm3: 4 input quant blocks (reloaded per K block)
 /// - ymm4: weight quants (reloaded per column within block)
 /// - ymm5: w_abs = vpsignb(w, w)
-/// - ymm6, ymm7: scratch (inp_signed, zero+dpbusd, cvt, scale)
+/// - ymm6, ymm7: scratch (dpbusd, cvt, scale broadcast)
 /// - ymm8-ymm11:  accumulators for col 0, rows 0-3
 /// - ymm12-ymm15: accumulators for col 1, rows 0-3
 /// - ymm16-ymm19: accumulators for col 2, rows 0-3
@@ -1097,16 +1097,21 @@ const MAX_Q8_BLOCKS: usize = 256;
 /// - ymm24-ymm27: accumulators for col 4, rows 0-3
 /// - ymm28-ymm31: accumulators for col 5, rows 0-3
 ///
-/// Combined scales are pre-computed on the stack: `combined[blk][col][row]` =
-/// `inp_scales[row][blk] * wt_scales[col][blk]`, laid out as
-/// `[num_blocks * RN_Q8 * RM_Q8]` f32 values. Per block the asm advances
-/// by 96 bytes (24 floats × 4 bytes).
+/// GPR map:
+/// - iq0-iq3 (in): input quant row pointers
+/// - is0-is3 (in): input scale row pointers (cast to byte ptrs)
+/// - q_limit (in): loop bound = num_blocks × 32
+/// - out_ptr (in): output array pointer
+/// - arr_ptr (in): pointer to `ptrs[]` array (12 pointers: wq×6, ws×6)
+/// - q_off (out): quant byte offset, incremented by 32 per block
+/// - s_off (out): scale f32 offset = q_off >> 3, computed per block
+/// - tmp (out): scratch GPR for pointer loads from `ptrs[]`
 #[allow(
+    dead_code,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::similar_names,
-    clippy::many_single_char_names,
-    clippy::large_stack_arrays
+    clippy::many_single_char_names
 )]
 #[inline]
 unsafe fn microkernel_q8_4x6(
@@ -1121,44 +1126,37 @@ unsafe fn microkernel_q8_4x6(
     i: usize,
     j: usize,
 ) {
-    debug_assert!(
-        num_blocks <= MAX_Q8_BLOCKS,
-        "num_blocks ({num_blocks}) exceeds MAX_Q8_BLOCKS ({MAX_Q8_BLOCKS})"
-    );
-
-    // Pre-compute combined scales on the stack: layout [blk][col][row].
-    // Uses MaybeUninit to avoid zeroing 24KB; every element is written
-    // before the asm block reads it.
-    let mut combined_scales_mem =
-        [std::mem::MaybeUninit::<f32>::uninit(); MAX_Q8_BLOCKS * RN_Q8 * RM_Q8];
-    for blk in 0..num_blocks {
-        for col in 0..RN_Q8 {
-            let ws = *wt_scales.get_unchecked((j + col) * num_blocks + blk);
-            for row in 0..RM_Q8 {
-                let is = *inp_scales.get_unchecked((i + row) * num_blocks + blk);
-                combined_scales_mem[blk * (RN_Q8 * RM_Q8) + col * RM_Q8 + row].write(is * ws);
-            }
-        }
-    }
-    let combined_scales = &*combined_scales_mem
-        .as_ptr()
-        .cast::<[f32; MAX_Q8_BLOCKS * RN_Q8 * RM_Q8]>();
-
-    // Pointers to input quant rows.
+    // Pointers to input quant rows (kept in registers for the hot path).
     let iq0 = inp_quants.as_ptr().add(i * bytes_per_row);
     let iq1 = inp_quants.as_ptr().add((i + 1) * bytes_per_row);
     let iq2 = inp_quants.as_ptr().add((i + 2) * bytes_per_row);
     let iq3 = inp_quants.as_ptr().add((i + 3) * bytes_per_row);
 
-    // Pointers to weight quant rows.
-    let wq0 = wt_quants.as_ptr().add(j * bytes_per_row);
-    let wq1 = wt_quants.as_ptr().add((j + 1) * bytes_per_row);
-    let wq2 = wt_quants.as_ptr().add((j + 2) * bytes_per_row);
-    let wq3 = wt_quants.as_ptr().add((j + 3) * bytes_per_row);
-    let wq4 = wt_quants.as_ptr().add((j + 4) * bytes_per_row);
-    let wq5 = wt_quants.as_ptr().add((j + 5) * bytes_per_row);
+    // Input scale pointers — kept in dedicated registers (used 24× per block).
+    let is0 = inp_scales.as_ptr().add(i * num_blocks).cast::<u8>();
+    let is1 = inp_scales.as_ptr().add((i + 1) * num_blocks).cast::<u8>();
+    let is2 = inp_scales.as_ptr().add((i + 2) * num_blocks).cast::<u8>();
+    let is3 = inp_scales.as_ptr().add((i + 3) * num_blocks).cast::<u8>();
 
-    let cs_ptr = combined_scales.as_ptr();
+    // Stack-allocated pointer array accessed via two-level indirection
+    // in the asm block. Layout (12 pointers, 96 bytes):
+    //   [0..6)  = wq0..wq5  (weight quant row pointers)
+    //   [6..12) = ws0..ws5  (weight scale col pointers)
+    let ptrs: [*const u8; 12] = [
+        wt_quants.as_ptr().add(j * bytes_per_row),
+        wt_quants.as_ptr().add((j + 1) * bytes_per_row),
+        wt_quants.as_ptr().add((j + 2) * bytes_per_row),
+        wt_quants.as_ptr().add((j + 3) * bytes_per_row),
+        wt_quants.as_ptr().add((j + 4) * bytes_per_row),
+        wt_quants.as_ptr().add((j + 5) * bytes_per_row),
+        wt_scales.as_ptr().add(j * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 1) * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 2) * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 3) * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 4) * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 5) * num_blocks).cast(),
+    ];
+
     let q_limit = num_blocks * 32; // loop limit in bytes
 
     // 24 output scalars: out[col * RM_Q8 + row].
@@ -1192,212 +1190,275 @@ unsafe fn microkernel_q8_4x6(
             "vpxord ymm30, ymm30, ymm30",
             "vpxord ymm31, ymm31, ymm31",
 
-            // Loop counters.
+            // Loop counter.
             "xor {q_off:e}, {q_off:e}",
-            "xor {cs_off:e}, {cs_off:e}",
 
             "2:",
+            // Compute scale offset: s_off = q_off >> 3
+            // (quant blocks are 32 bytes, scales are 4 bytes → ratio 8:1).
+            "mov {s_off}, {q_off}",
+            "shr {s_off}, 3",
+
             // Load 4 input quant blocks (32 bytes each) into ymm0-3.
             "vmovdqu ymm0, [{iq0} + {q_off}]",
             "vmovdqu ymm1, [{iq1} + {q_off}]",
             "vmovdqu ymm2, [{iq2} + {q_off}]",
             "vmovdqu ymm3, [{iq3} + {q_off}]",
 
-            // ---- Col 0 (wq0, acc ymm8-11, cs_off + 0..12) ----
-            "vmovdqu ymm4, [{wq0} + {q_off}]",
+            // ---- Col 0 ----
+            "mov {tmp}, [{arr_ptr} + 0*8]",
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 6*8]",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off}]",
+            "vbroadcastss ymm7, dword ptr [{is0} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm8, ymm6, ymm7",
             // row 1
             "vpsignb ymm7, ymm1, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 4]",
+            "vbroadcastss ymm7, dword ptr [{is1} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm9, ymm6, ymm7",
             // row 2
             "vpsignb ymm7, ymm2, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 8]",
+            "vbroadcastss ymm7, dword ptr [{is2} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm10, ymm6, ymm7",
             // row 3
             "vpsignb ymm7, ymm3, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 12]",
+            "vbroadcastss ymm7, dword ptr [{is3} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm11, ymm6, ymm7",
 
-            // ---- Col 1 (wq1, acc ymm12-15, cs_off + 16..28) ----
-            "vmovdqu ymm4, [{wq1} + {q_off}]",
+            // ---- Col 1 ----
+            "mov {tmp}, [{arr_ptr} + 1*8]",
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 7*8]",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 16]",
+            "vbroadcastss ymm7, dword ptr [{is0} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm12, ymm6, ymm7",
             // row 1
             "vpsignb ymm7, ymm1, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 20]",
+            "vbroadcastss ymm7, dword ptr [{is1} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm13, ymm6, ymm7",
             // row 2
             "vpsignb ymm7, ymm2, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 24]",
+            "vbroadcastss ymm7, dword ptr [{is2} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm14, ymm6, ymm7",
             // row 3
             "vpsignb ymm7, ymm3, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 28]",
+            "vbroadcastss ymm7, dword ptr [{is3} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm15, ymm6, ymm7",
 
-            // ---- Col 2 (wq2, acc ymm16-19, cs_off + 32..44) ----
-            "vmovdqu ymm4, [{wq2} + {q_off}]",
+            // ---- Col 2 ----
+            "mov {tmp}, [{arr_ptr} + 2*8]",
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 8*8]",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 32]",
+            "vbroadcastss ymm7, dword ptr [{is0} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm16, ymm6, ymm7",
             // row 1
             "vpsignb ymm7, ymm1, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 36]",
+            "vbroadcastss ymm7, dword ptr [{is1} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm17, ymm6, ymm7",
             // row 2
             "vpsignb ymm7, ymm2, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 40]",
+            "vbroadcastss ymm7, dword ptr [{is2} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm18, ymm6, ymm7",
             // row 3
             "vpsignb ymm7, ymm3, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 44]",
+            "vbroadcastss ymm7, dword ptr [{is3} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm19, ymm6, ymm7",
 
-            // ---- Col 3 (wq3, acc ymm20-23, cs_off + 48..60) ----
-            "vmovdqu ymm4, [{wq3} + {q_off}]",
+            // ---- Col 3 ----
+            "mov {tmp}, [{arr_ptr} + 3*8]",
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 9*8]",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 48]",
+            "vbroadcastss ymm7, dword ptr [{is0} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm20, ymm6, ymm7",
             // row 1
             "vpsignb ymm7, ymm1, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 52]",
+            "vbroadcastss ymm7, dword ptr [{is1} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm21, ymm6, ymm7",
             // row 2
             "vpsignb ymm7, ymm2, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 56]",
+            "vbroadcastss ymm7, dword ptr [{is2} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm22, ymm6, ymm7",
             // row 3
             "vpsignb ymm7, ymm3, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 60]",
+            "vbroadcastss ymm7, dword ptr [{is3} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm23, ymm6, ymm7",
 
-            // ---- Col 4 (wq4, acc ymm24-27, cs_off + 64..76) ----
-            "vmovdqu ymm4, [{wq4} + {q_off}]",
+            // ---- Col 4 ----
+            "mov {tmp}, [{arr_ptr} + 4*8]",
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 10*8]",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 64]",
+            "vbroadcastss ymm7, dword ptr [{is0} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm24, ymm6, ymm7",
             // row 1
             "vpsignb ymm7, ymm1, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 68]",
+            "vbroadcastss ymm7, dword ptr [{is1} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm25, ymm6, ymm7",
             // row 2
             "vpsignb ymm7, ymm2, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 72]",
+            "vbroadcastss ymm7, dword ptr [{is2} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm26, ymm6, ymm7",
             // row 3
             "vpsignb ymm7, ymm3, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 76]",
+            "vbroadcastss ymm7, dword ptr [{is3} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm27, ymm6, ymm7",
 
-            // ---- Col 5 (wq5, acc ymm28-31, cs_off + 80..92) ----
-            "vmovdqu ymm4, [{wq5} + {q_off}]",
+            // ---- Col 5 ----
+            "mov {tmp}, [{arr_ptr} + 5*8]",
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 11*8]",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 80]",
+            "vbroadcastss ymm7, dword ptr [{is0} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm28, ymm6, ymm7",
             // row 1
             "vpsignb ymm7, ymm1, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 84]",
+            "vbroadcastss ymm7, dword ptr [{is1} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm29, ymm6, ymm7",
             // row 2
             "vpsignb ymm7, ymm2, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 88]",
+            "vbroadcastss ymm7, dword ptr [{is2} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm30, ymm6, ymm7",
             // row 3
             "vpsignb ymm7, ymm3, ymm4",
-            "vpxord ymm6, ymm6, ymm6",
+            "vpxord  ymm6, ymm6, ymm6",
             "vpdpbusd ymm6, ymm5, ymm7",
             "vcvtdq2ps ymm6, ymm6",
-            "vbroadcastss ymm7, dword ptr [{cs_ptr} + {cs_off} + 92]",
+            "vbroadcastss ymm7, dword ptr [{is3} + {s_off}]",
+            "vmulps ymm6, ymm6, ymm7",
+            "vbroadcastss ymm7, dword ptr [{tmp} + {s_off}]",
             "vfmadd231ps ymm31, ymm6, ymm7",
 
             // Advance block.
             "add {q_off}, 32",
-            "add {cs_off}, 96",
             "cmp {q_off}, {q_limit}",
             "jb 2b",
 
@@ -1632,17 +1693,16 @@ unsafe fn microkernel_q8_4x6(
             iq1 = in(reg) iq1,
             iq2 = in(reg) iq2,
             iq3 = in(reg) iq3,
-            wq0 = in(reg) wq0,
-            wq1 = in(reg) wq1,
-            wq2 = in(reg) wq2,
-            wq3 = in(reg) wq3,
-            wq4 = in(reg) wq4,
-            wq5 = in(reg) wq5,
-            cs_ptr = in(reg) cs_ptr,
+            is0 = in(reg) is0,
+            is1 = in(reg) is1,
+            is2 = in(reg) is2,
+            is3 = in(reg) is3,
             q_limit = in(reg) q_limit,
             out_ptr = in(reg) out.as_mut_ptr(),
+            arr_ptr = in(reg) ptrs.as_ptr(),
             q_off = out(reg) _,
-            cs_off = out(reg) _,
+            s_off = out(reg) _,
+            tmp = out(reg) _,
             out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
             out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
             out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _,
@@ -1661,6 +1721,458 @@ unsafe fn microkernel_q8_4x6(
     for row in 0..RM_Q8 {
         for col in 0..RN_Q8 {
             *out_ptr.add((i + row) * n + (j + col)) = out[col * RM_Q8 + row];
+        }
+    }
+}
+
+/// 4×4 Q8×Q8 micro-kernel using AVX-512 VNNI inline assembly.
+///
+/// Computes a 4-row × 4-column tile of the output matrix by accumulating
+/// dot products over all K blocks. Uses 16 ymm accumulators (ymm8-ymm23)
+/// that remain in registers across the entire block loop.
+///
+/// Pre-broadcast scale approach: each block pre-loads all 4 input scales
+/// into ymm24-27 and reuses them across all 4 weight columns. The weight
+/// scale for the current column is broadcast into ymm28 once per column.
+///
+/// Register map:
+/// - ymm0-ymm3: 4 input quant blocks (reloaded per K block)
+/// - ymm4: weight quants (reloaded per column within block)
+/// - ymm5: w_abs = vpsignb(w, w)
+/// - ymm6, ymm7: scratch (dpbusd, cvt, mul)
+/// - ymm8-ymm11:  accumulators for col 0, rows 0-3
+/// - ymm12-ymm15: accumulators for col 1, rows 0-3
+/// - ymm16-ymm19: accumulators for col 2, rows 0-3
+/// - ymm20-ymm23: accumulators for col 3, rows 0-3
+/// - ymm24-ymm27: pre-broadcast input scales (is0-is3, reloaded per block)
+/// - ymm28: pre-broadcast weight scale (ws for current column)
+/// - ymm29-ymm31: unused (clobbered for safety)
+///
+/// GPR map:
+/// - iq0-iq3 (in): input quant row pointers
+/// - is0-is3 (in): input scale row pointers (cast to byte ptrs)
+/// - q_limit (in): loop bound = num_blocks × 32
+/// - out_ptr (in): output array pointer
+/// - arr_ptr (in): pointer to `ptrs[]` array (8 pointers: wq×4, ws×4)
+/// - q_off (out): quant byte offset, incremented by 32 per block
+/// - s_off (out): scale f32 offset = q_off >> 3, computed per block
+/// - tmp (out): scratch GPR for pointer loads from `ptrs[]`
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::similar_names, clippy::many_single_char_names)]
+#[inline]
+unsafe fn microkernel_q8_4x4(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants: &[u8],
+    wt_scales: &[f32],
+    n: usize,
+    num_blocks: usize,
+    bytes_per_row: usize,
+    i: usize,
+    j: usize,
+) {
+    // Pointers to input quant rows (kept in registers for the hot path).
+    let iq0 = inp_quants.as_ptr().add(i * bytes_per_row);
+    let iq1 = inp_quants.as_ptr().add((i + 1) * bytes_per_row);
+    let iq2 = inp_quants.as_ptr().add((i + 2) * bytes_per_row);
+    let iq3 = inp_quants.as_ptr().add((i + 3) * bytes_per_row);
+
+    // Input scale pointers — kept in dedicated registers (used 16× per block).
+    let is0 = inp_scales.as_ptr().add(i * num_blocks).cast::<u8>();
+    let is1 = inp_scales.as_ptr().add((i + 1) * num_blocks).cast::<u8>();
+    let is2 = inp_scales.as_ptr().add((i + 2) * num_blocks).cast::<u8>();
+    let is3 = inp_scales.as_ptr().add((i + 3) * num_blocks).cast::<u8>();
+
+    // Stack-allocated pointer array accessed via two-level indirection
+    // in the asm block. Layout (8 pointers, 64 bytes):
+    //   [0..4)  = wq0..wq3  (weight quant row pointers)
+    //   [4..8)  = ws0..ws3  (weight scale col pointers)
+    let ptrs: [*const u8; 8] = [
+        wt_quants.as_ptr().add(j * bytes_per_row),
+        wt_quants.as_ptr().add((j + 1) * bytes_per_row),
+        wt_quants.as_ptr().add((j + 2) * bytes_per_row),
+        wt_quants.as_ptr().add((j + 3) * bytes_per_row),
+        wt_scales.as_ptr().add(j * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 1) * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 2) * num_blocks).cast(),
+        wt_scales.as_ptr().add((j + 3) * num_blocks).cast(),
+    ];
+
+    let q_limit = num_blocks * 32; // loop limit in bytes
+
+    // 16 output scalars: out[col * RM_Q8 + row].
+    let mut out = [0.0f32; 4 * 4];
+
+    if num_blocks > 0 {
+        std::arch::asm!(
+            // Zero 16 accumulators (ymm8-ymm23).
+            "vpxord ymm8, ymm8, ymm8",
+            "vpxord ymm9, ymm9, ymm9",
+            "vpxord ymm10, ymm10, ymm10",
+            "vpxord ymm11, ymm11, ymm11",
+            "vpxord ymm12, ymm12, ymm12",
+            "vpxord ymm13, ymm13, ymm13",
+            "vpxord ymm14, ymm14, ymm14",
+            "vpxord ymm15, ymm15, ymm15",
+            "vpxord ymm16, ymm16, ymm16",
+            "vpxord ymm17, ymm17, ymm17",
+            "vpxord ymm18, ymm18, ymm18",
+            "vpxord ymm19, ymm19, ymm19",
+            "vpxord ymm20, ymm20, ymm20",
+            "vpxord ymm21, ymm21, ymm21",
+            "vpxord ymm22, ymm22, ymm22",
+            "vpxord ymm23, ymm23, ymm23",
+
+            // Loop counter.
+            "xor {q_off:e}, {q_off:e}",
+
+            "2:",
+            // Compute scale offset: s_off = q_off >> 3
+            // (quant blocks are 32 bytes, scales are 4 bytes → ratio 8:1).
+            "mov {s_off}, {q_off}",
+            "shr {s_off}, 3",
+
+            // Load 4 input quant blocks (32 bytes each) into ymm0-3.
+            "vmovdqu ymm0, [{iq0} + {q_off}]",
+            "vmovdqu ymm1, [{iq1} + {q_off}]",
+            "vmovdqu ymm2, [{iq2} + {q_off}]",
+            "vmovdqu ymm3, [{iq3} + {q_off}]",
+
+            // Pre-broadcast 4 input scales for this block.
+            "vbroadcastss ymm24, dword ptr [{is0} + {s_off}]",
+            "vbroadcastss ymm25, dword ptr [{is1} + {s_off}]",
+            "vbroadcastss ymm26, dword ptr [{is2} + {s_off}]",
+            "vbroadcastss ymm27, dword ptr [{is3} + {s_off}]",
+
+            // ---- Col 0 ----
+            "mov {tmp}, [{arr_ptr} + 0*8]",
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 4*8]",
+            "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm8, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm9, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm10, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "mov {tmp}, [{arr_ptr} + 1*8]",   // early-load wq1 ptr during dpbusd latency
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm11, ymm6, ymm7",
+
+            // ---- Col 1 ---- ({tmp} already has wq1 pointer)
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 5*8]",
+            "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm12, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm13, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm14, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "mov {tmp}, [{arr_ptr} + 2*8]",   // early-load wq2 ptr during dpbusd latency
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm15, ymm6, ymm7",
+
+            // ---- Col 2 ---- ({tmp} already has wq2 pointer)
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 6*8]",
+            "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm16, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm17, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm18, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "mov {tmp}, [{arr_ptr} + 3*8]",   // early-load wq3 ptr during dpbusd latency
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm19, ymm6, ymm7",
+
+            // ---- Col 3 ---- ({tmp} already has wq3 pointer)
+            "vmovdqu ymm4, [{tmp} + {q_off}]",
+            "mov {tmp}, [{arr_ptr} + 7*8]",
+            "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm20, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm21, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm22, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm23, ymm6, ymm7",
+
+            // Advance block.
+            "add {q_off}, 32",
+            "cmp {q_off}, {q_limit}",
+            "jb 2b",
+
+            // ---- Horizontal reduction ----
+            // Reduce each ymm accumulator (8 f32) → scalar, store to out[].
+            // For ymm16+, use EVEX vextractf32x4; for ymm8-15 use vextractf128.
+
+            // Col 0: ymm8 → out[0], ymm9 → out[1], ymm10 → out[2], ymm11 → out[3]
+            "vextractf128 xmm7, ymm8, 1",
+            "vextractf128 xmm6, ymm8, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr}], xmm7",
+
+            "vextractf128 xmm7, ymm9, 1",
+            "vextractf128 xmm6, ymm9, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 4], xmm7",
+
+            "vextractf128 xmm7, ymm10, 1",
+            "vextractf128 xmm6, ymm10, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 8], xmm7",
+
+            "vextractf128 xmm7, ymm11, 1",
+            "vextractf128 xmm6, ymm11, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 12], xmm7",
+
+            // Col 1: ymm12 → out[4], ymm13 → out[5], ymm14 → out[6], ymm15 → out[7]
+            "vextractf128 xmm7, ymm12, 1",
+            "vextractf128 xmm6, ymm12, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 16], xmm7",
+
+            "vextractf128 xmm7, ymm13, 1",
+            "vextractf128 xmm6, ymm13, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 20], xmm7",
+
+            "vextractf128 xmm7, ymm14, 1",
+            "vextractf128 xmm6, ymm14, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 24], xmm7",
+
+            "vextractf128 xmm7, ymm15, 1",
+            "vextractf128 xmm6, ymm15, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 28], xmm7",
+
+            // Col 2: ymm16 → out[8], ymm17 → out[9], ymm18 → out[10], ymm19 → out[11]
+            "vextractf32x4 xmm7, ymm16, 1",
+            "vextractf32x4 xmm6, ymm16, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 32], xmm7",
+
+            "vextractf32x4 xmm7, ymm17, 1",
+            "vextractf32x4 xmm6, ymm17, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 36], xmm7",
+
+            "vextractf32x4 xmm7, ymm18, 1",
+            "vextractf32x4 xmm6, ymm18, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 40], xmm7",
+
+            "vextractf32x4 xmm7, ymm19, 1",
+            "vextractf32x4 xmm6, ymm19, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 44], xmm7",
+
+            // Col 3: ymm20 → out[12], ymm21 → out[13], ymm22 → out[14], ymm23 → out[15]
+            "vextractf32x4 xmm7, ymm20, 1",
+            "vextractf32x4 xmm6, ymm20, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 48], xmm7",
+
+            "vextractf32x4 xmm7, ymm21, 1",
+            "vextractf32x4 xmm6, ymm21, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 52], xmm7",
+
+            "vextractf32x4 xmm7, ymm22, 1",
+            "vextractf32x4 xmm6, ymm22, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 56], xmm7",
+
+            "vextractf32x4 xmm7, ymm23, 1",
+            "vextractf32x4 xmm6, ymm23, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 60], xmm7",
+
+            iq0 = in(reg) iq0,
+            iq1 = in(reg) iq1,
+            iq2 = in(reg) iq2,
+            iq3 = in(reg) iq3,
+            is0 = in(reg) is0,
+            is1 = in(reg) is1,
+            is2 = in(reg) is2,
+            is3 = in(reg) is3,
+            q_limit = in(reg) q_limit,
+            out_ptr = in(reg) out.as_mut_ptr(),
+            arr_ptr = in(reg) ptrs.as_ptr(),
+            q_off = out(reg) _,
+            s_off = out(reg) _,
+            tmp = out(reg) _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
+            out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
+            out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _,
+            out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
+            out("ymm16") _, out("ymm17") _, out("ymm18") _, out("ymm19") _,
+            out("ymm20") _, out("ymm21") _, out("ymm22") _, out("ymm23") _,
+            out("ymm24") _, out("ymm25") _, out("ymm26") _, out("ymm27") _,
+            out("ymm28") _, out("ymm29") _, out("ymm30") _, out("ymm31") _,
+            options(nostack),
+        );
+    }
+
+    // Write results to output matrix.
+    // out layout: [col * 4 + row], output layout: row-major [row * n + col].
+    let out_ptr = output.as_mut_ptr();
+    for row in 0..4 {
+        for col in 0..4 {
+            *out_ptr.add((i + row) * n + (j + col)) = out[col * 4 + row];
         }
     }
 }

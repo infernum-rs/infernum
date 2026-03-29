@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use infernum::backend::{
-    ArithOps, AttentionOps, BiasOps, EmbedOps, MatmulExtOps, MatmulOps, NormOps, RopeOps, TensorOps,
+    AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps,
 };
 use infernum::graph::{Arena, WeightStore};
 use infernum::tensor::Tensor;
@@ -193,7 +193,10 @@ pub fn execute(
     // these — the override is consumed directly instead of copying through arena.
     let mut overrides: HashMap<NodeId, CpuTensor> = HashMap::new();
 
-    for &node_id in &plan.schedule {
+    let mut sched_idx = 0;
+    while sched_idx < plan.schedule.len() {
+        let node_id = plan.schedule[sched_idx];
+        sched_idx += 1;
         let node = &nodes[node_id.index() as usize];
 
         match &node.op {
@@ -222,26 +225,48 @@ pub fn execute(
                 write_tensor(arena, plan, node_id, &result);
             }
 
-            // --- Norm ---
+            // --- Norm (zero-copy) ---
             Op::RmsNorm { weight, eps } => {
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let inp_slot = plan
+                    .slot(node.inputs[0])
+                    .expect("rmsnorm input has no slot");
+                let out_slot = plan.slot(node_id).expect("rmsnorm output has no slot");
                 let w = weights.tensor_weight(*weight);
-                let result = <CpuBackend as NormOps>::rms_norm(&input, w, *eps)?;
-                write_tensor(arena, plan, node_id, &result);
+                let weight_data = w.as_f32_slice();
+                let hidden_size = weight_data.len();
+                let num_elements: usize = node.shape.iter().product();
+                let base = arena.as_mut_ptr();
+                unsafe {
+                    let input = std::slice::from_raw_parts(
+                        base.add(inp_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let output = std::slice::from_raw_parts_mut(
+                        base.add(out_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    crate::ops::norm::rms_norm_slices(
+                        input,
+                        weight_data,
+                        *eps,
+                        output,
+                        hidden_size,
+                    );
+                }
             }
 
             Op::AddRmsNorm { weight, eps } => {
-                let residual = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let delta = read_tensor(arena, plan, nodes, node.inputs[1]);
-                let w = weights.tensor_weight(*weight);
-                let (updated, normed) =
-                    <CpuBackend as NormOps>::add_rmsnorm(&residual, &delta, w, *eps)?;
+                let res_slot = plan
+                    .slot(node.inputs[0])
+                    .expect("add_rmsnorm residual has no slot");
+                let del_slot = plan
+                    .slot(node.inputs[1])
+                    .expect("add_rmsnorm delta has no slot");
+                let upd_slot = plan
+                    .slot(node_id)
+                    .expect("add_rmsnorm updated output has no slot");
 
-                // Write primary output (updated residual).
-                write_tensor(arena, plan, node_id, &updated);
-
-                // Write secondary output (normed) — find the SecondOutput
-                // node that references this primary node.
+                // Find the SecondOutput node for the normed result.
                 #[allow(clippy::cast_possible_truncation)]
                 let second_id = nodes
                     .iter()
@@ -251,7 +276,42 @@ pub fn execute(
                     )
                     .map(|(i, _)| NodeId::from_index(i as u32))
                     .expect("AddRmsNorm must have a SecondOutput");
-                write_tensor(arena, plan, second_id, &normed);
+                let nrm_slot = plan
+                    .slot(second_id)
+                    .expect("add_rmsnorm normed output has no slot");
+
+                let w = weights.tensor_weight(*weight);
+                let weight_data = w.as_f32_slice();
+                let hidden_size = weight_data.len();
+                let num_elements: usize = node.shape.iter().product();
+                let base = arena.as_mut_ptr();
+                unsafe {
+                    let residual = std::slice::from_raw_parts(
+                        base.add(res_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let delta = std::slice::from_raw_parts(
+                        base.add(del_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let updated = std::slice::from_raw_parts_mut(
+                        base.add(upd_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let normed = std::slice::from_raw_parts_mut(
+                        base.add(nrm_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    crate::ops::norm::add_rmsnorm_slices(
+                        residual,
+                        delta,
+                        weight_data,
+                        *eps,
+                        updated,
+                        normed,
+                        hidden_size,
+                    );
+                }
             }
 
             // --- Linear / Matmul ---
@@ -386,28 +446,177 @@ pub fn execute(
             }
 
             Op::Scale { factor } => {
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let mut result = input.clone();
-                <CpuBackend as ArithOps>::scale_inplace(&mut result, *factor)?;
-                write_tensor(arena, plan, node_id, &result);
+                // Zero-copy: copy input to output, then scale in-place.
+                let inp_slot = plan.slot(node.inputs[0]).expect("scale input has no slot");
+                let out_slot = plan.slot(node_id).expect("scale output has no slot");
+                let num_elements: usize = node.shape.iter().product();
+                if inp_slot.offset == out_slot.offset {
+                    // Aliased — scale in-place directly.
+                    let data = arena.f32_slice_mut(out_slot.offset, num_elements);
+                    simd::vec_scale(data, *factor);
+                } else {
+                    let base = arena.as_mut_ptr();
+                    unsafe {
+                        let src = std::slice::from_raw_parts(
+                            base.add(inp_slot.offset).cast::<f32>(),
+                            num_elements,
+                        );
+                        let dst = std::slice::from_raw_parts_mut(
+                            base.add(out_slot.offset).cast::<f32>(),
+                            num_elements,
+                        );
+                        dst.copy_from_slice(src);
+                        simd::vec_scale(dst, *factor);
+                    }
+                }
             }
 
             Op::BiasAdd { bias } => {
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let mut result = input.clone();
+                // Zero-copy: copy input to output, then add bias in-place.
+                let inp_slot = plan
+                    .slot(node.inputs[0])
+                    .expect("bias_add input has no slot");
+                let out_slot = plan.slot(node_id).expect("bias_add output has no slot");
                 let bias_w = weights.tensor_weight(*bias);
-                <CpuBackend as BiasOps>::bias_add_inplace(&mut result, bias_w)?;
-                write_tensor(arena, plan, node_id, &result);
+                let bias_data = bias_w.as_f32_slice();
+                let cols = bias_data.len();
+                let num_elements: usize = node.shape.iter().product();
+                let rows = num_elements / cols;
+                let base = arena.as_mut_ptr();
+                unsafe {
+                    let src = std::slice::from_raw_parts(
+                        base.add(inp_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    let dst = std::slice::from_raw_parts_mut(
+                        base.add(out_slot.offset).cast::<f32>(),
+                        num_elements,
+                    );
+                    if inp_slot.offset != out_slot.offset {
+                        dst.copy_from_slice(src);
+                    }
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            dst[row * cols + col] += bias_data[col];
+                        }
+                    }
+                }
             }
 
-            // --- RoPE ---
+            // --- RoPE (zero-copy, with pair fusion) ---
             Op::Rope { offset } => {
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let cos_cache = read_tensor(arena, plan, nodes, node.inputs[1]);
-                let sin_cache = read_tensor(arena, plan, nodes, node.inputs[2]);
-                let result =
-                    <CpuBackend as RopeOps>::apply_rope(&input, &cos_cache, &sin_cache, *offset)?;
-                write_tensor(arena, plan, node_id, &result);
+                let cos_node = &nodes[node.inputs[1].index() as usize];
+                let sin_node = &nodes[node.inputs[2].index() as usize];
+
+                // Check if cos/sin are f32 in the arena.
+                if cos_node.dtype != DType::F32 || sin_node.dtype != DType::F32 {
+                    // Fallback: cos/sin need dtype conversion.
+                    let input = read_tensor(arena, plan, nodes, node.inputs[0]);
+                    let cos_cache = read_tensor(arena, plan, nodes, node.inputs[1]);
+                    let sin_cache = read_tensor(arena, plan, nodes, node.inputs[2]);
+                    let result = <CpuBackend as RopeOps>::apply_rope(
+                        &input, &cos_cache, &sin_cache, *offset,
+                    )?;
+                    write_tensor(arena, plan, node_id, &result);
+                } else {
+                    // Check if the next scheduled op is also Rope with same
+                    // cos/sin inputs — if so, fuse both into one dispatch.
+                    let next_rope = if sched_idx < plan.schedule.len() {
+                        let next_id = plan.schedule[sched_idx];
+                        let next_node = &nodes[next_id.index() as usize];
+                        if let Op::Rope { offset: off2 } = &next_node.op {
+                            let n2_cos = &nodes[next_node.inputs[1].index() as usize];
+                            let n2_sin = &nodes[next_node.inputs[2].index() as usize];
+                            if next_node.inputs[1] == node.inputs[1]
+                                && next_node.inputs[2] == node.inputs[2]
+                                && n2_cos.dtype == DType::F32
+                                && n2_sin.dtype == DType::F32
+                            {
+                                Some((next_id, next_node, *off2))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let cos_slot = plan.slot(node.inputs[1]).expect("rope cos has no slot");
+                    let sin_slot = plan.slot(node.inputs[2]).expect("rope sin has no slot");
+                    let cos_elements: usize = cos_node.shape.iter().product();
+                    let sin_elements: usize = sin_node.shape.iter().product();
+
+                    let base = arena.as_mut_ptr();
+
+                    if let Some((next_id, next_node, offset_b)) = next_rope {
+                        // Fused pair: execute both ropes in a single dispatch.
+                        sched_idx += 1; // skip the second Rope
+
+                        let inp_a = plan.slot(node.inputs[0]).expect("rope A input");
+                        let out_a = plan.slot(node_id).expect("rope A output");
+                        let inp_b = plan.slot(next_node.inputs[0]).expect("rope B input");
+                        let out_b = plan.slot(next_id).expect("rope B output");
+
+                        unsafe {
+                            let cos_data = std::slice::from_raw_parts(
+                                base.add(cos_slot.offset).cast::<f32>(),
+                                cos_elements,
+                            );
+                            let sin_data = std::slice::from_raw_parts(
+                                base.add(sin_slot.offset).cast::<f32>(),
+                                sin_elements,
+                            );
+                            let op_a = crate::ops::rope::RopeOperand {
+                                inp_ptr: base.add(inp_a.offset) as usize,
+                                out_ptr: base.add(out_a.offset) as usize,
+                                seq_len: node.shape[0],
+                                num_heads: node.shape[1],
+                                head_dim: node.shape[2],
+                                offset: *offset,
+                            };
+                            let op_b = crate::ops::rope::RopeOperand {
+                                inp_ptr: base.add(inp_b.offset) as usize,
+                                out_ptr: base.add(out_b.offset) as usize,
+                                seq_len: next_node.shape[0],
+                                num_heads: next_node.shape[1],
+                                head_dim: next_node.shape[2],
+                                offset: offset_b,
+                            };
+                            crate::ops::rope::apply_rope_pair_slices(
+                                &op_a, &op_b, cos_data, sin_data,
+                            );
+                        }
+                    } else {
+                        // Single rope — no fusion possible.
+                        let inp_slot = plan.slot(node.inputs[0]).expect("rope input");
+                        let out_slot = plan.slot(node_id).expect("rope output");
+                        let num_elements: usize = node.shape.iter().product();
+                        unsafe {
+                            let input = std::slice::from_raw_parts(
+                                base.add(inp_slot.offset).cast::<f32>(),
+                                num_elements,
+                            );
+                            let cos_data = std::slice::from_raw_parts(
+                                base.add(cos_slot.offset).cast::<f32>(),
+                                cos_elements,
+                            );
+                            let sin_data = std::slice::from_raw_parts(
+                                base.add(sin_slot.offset).cast::<f32>(),
+                                sin_elements,
+                            );
+                            let output = std::slice::from_raw_parts_mut(
+                                base.add(out_slot.offset).cast::<f32>(),
+                                num_elements,
+                            );
+                            crate::ops::rope::apply_rope_slices(
+                                input, cos_data, sin_data, output, node.shape[0], node.shape[1],
+                                node.shape[2], *offset,
+                            );
+                        }
+                    }
+                }
             }
 
             // --- Attention ---
@@ -449,9 +658,25 @@ pub fn execute(
 
             // --- Shape / Data movement ---
             Op::Reshape { .. } => {
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let reshaped = input.reshape(&node.shape);
-                write_tensor(arena, plan, node_id, &reshaped);
+                // Zero-copy: if input and output share the same arena slot,
+                // this is purely a shape change — skip entirely.
+                let inp_slot = plan
+                    .slot(node.inputs[0])
+                    .expect("reshape input has no slot");
+                let out_slot = plan.slot(node_id).expect("reshape output has no slot");
+                if inp_slot.offset != out_slot.offset {
+                    // Different slots — direct arena-to-arena memcpy.
+                    let num_elements: usize = node.shape.iter().product();
+                    let byte_len = num_elements * std::mem::size_of::<f32>();
+                    let base = arena.as_mut_ptr();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            base.add(inp_slot.offset),
+                            base.add(out_slot.offset),
+                            byte_len,
+                        );
+                    }
+                }
             }
 
             Op::RepeatKv { num_repeats } => {
