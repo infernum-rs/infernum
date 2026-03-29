@@ -1127,16 +1127,22 @@ unsafe fn microkernel_q8_4x6(
     );
 
     // Pre-compute combined scales on the stack: layout [blk][col][row].
-    let mut combined_scales = [0.0f32; MAX_Q8_BLOCKS * RN_Q8 * RM_Q8];
+    // Uses MaybeUninit to avoid zeroing 24KB; every element is written
+    // before the asm block reads it.
+    let mut combined_scales_mem =
+        [std::mem::MaybeUninit::<f32>::uninit(); MAX_Q8_BLOCKS * RN_Q8 * RM_Q8];
     for blk in 0..num_blocks {
         for col in 0..RN_Q8 {
+            let ws = *wt_scales.get_unchecked((j + col) * num_blocks + blk);
             for row in 0..RM_Q8 {
-                *combined_scales.get_unchecked_mut(blk * (RN_Q8 * RM_Q8) + col * RM_Q8 + row) =
-                    *inp_scales.get_unchecked((i + row) * num_blocks + blk)
-                        * *wt_scales.get_unchecked((j + col) * num_blocks + blk);
+                let is = *inp_scales.get_unchecked((i + row) * num_blocks + blk);
+                combined_scales_mem[blk * (RN_Q8 * RM_Q8) + col * RM_Q8 + row].write(is * ws);
             }
         }
     }
+    let combined_scales = &*combined_scales_mem
+        .as_ptr()
+        .cast::<[f32; MAX_Q8_BLOCKS * RN_Q8 * RM_Q8]>();
 
     // Pointers to input quant rows.
     let iq0 = inp_quants.as_ptr().add(i * bytes_per_row);
