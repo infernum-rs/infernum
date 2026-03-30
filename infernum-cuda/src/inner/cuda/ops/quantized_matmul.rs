@@ -46,6 +46,11 @@ const DEQUANTIZE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/deq
 
 const CAST_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/cast.ptx"));
 
+// MMQ kernel: currently unused in production dispatch (dequant+cuBLAS is faster),
+// but kept for future optimization. Used by tests.
+#[allow(dead_code)]
+const MMQ_Q8_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/mmq_q8.ptx"));
+
 // ---------------------------------------------------------------------------
 // FP8 cuBLAS helpers
 // ---------------------------------------------------------------------------
@@ -563,6 +568,112 @@ pub fn quantized_matmul(input: &CudaTensor, weight: &QuantizedTensor) -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// MMQ path: WMMA int8 tensor core matmul for Q8_0 (Turing+ / sm_75+)
+// ---------------------------------------------------------------------------
+//
+// Quantize f32 activations to int8 (Q8_1), then use WMMA int8→int32 tensor
+// core matmul. Scales are applied after the integer accumulation. This avoids
+// the full dequant-to-F16 step and keeps data in int8 throughout.
+
+/// Ensure MMQ Q8 kernels are loaded.
+#[allow(dead_code)]
+fn ensure_mmq_q8_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
+    let module = "mmq_q8";
+    if !device.has_func(module, "mmq_q8_f32") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(MMQ_Q8_PTX),
+            module,
+            &["mmq_q8_f32", "quantize_activations_q8"],
+        )?;
+    }
+    Ok(())
+}
+
+/// Q8_0 MMQ matmul using WMMA int8 tensor cores.
+///
+/// `input`: f32 tensor (M, K)
+/// `weight`: Q8_0 quantized tensor (N, K)
+/// output: f32 tensor (M, N) = input @ dequant(weight)^T
+#[allow(dead_code)]
+fn mmq_matmul_q8(
+    input: &CudaTensor,
+    weight: &QuantizedTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaTensor> {
+    let ctx = input.context();
+    let device = ctx.device();
+
+    ensure_mmq_q8_kernels(device)?;
+
+    // 1. Quantize f32 activations to int8 + scales
+    let total_a = m * k;
+    let num_a_blocks = m * (k / 32);
+    let mut a_q8: CudaSlice<u8> = unsafe { device.alloc::<u8>(total_a)? }; // int8
+    let mut a_scales: CudaSlice<f32> = unsafe { device.alloc::<f32>(num_a_blocks)? };
+
+    {
+        let func = device
+            .get_func("mmq_q8", "quantize_activations_q8")
+            .unwrap();
+        let block_size = 256_u32;
+        let grid_size = (num_a_blocks as u32 + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    &mut a_q8,
+                    &mut a_scales,
+                    &input.cuda_slice(),
+                    m as i32,
+                    k as i32,
+                ),
+            )?;
+        }
+    }
+
+    // 2. Launch MMQ kernel
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[m, n], DType::F32)? };
+
+    let block_m = 64_usize;
+    let block_n = 64_usize;
+    let grid_x = (n + block_n - 1) / block_n;
+    let grid_y = (m + block_m - 1) / block_m;
+    let nwarps = 16_u32; // WARPS_M * WARPS_N = 4 * 4
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x as u32, grid_y as u32, 1),
+        block_dim: (32, nwarps, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let func = device.get_func("mmq_q8", "mmq_q8_f32").unwrap();
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                weight.data_slice(),
+                weight.scales_slice(),
+                &a_q8,
+                &a_scales,
+                m as i32,
+                n as i32,
+                k as i32,
+            ),
+        )?;
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Dequantize-then-cuBLAS path for prefill (M > 1)
 // ---------------------------------------------------------------------------
 //
@@ -636,8 +747,7 @@ fn dequant_cublas_matmul(
     ensure_cast_kernels(device)?;
 
     // 1. Dequantize weight (N, K) → F16 buffer
-    let mut w_f16: CudaSlice<u8> =
-        unsafe { device.alloc::<u8>(total_w * 2)? }; // 2 bytes per f16
+    let mut w_f16: CudaSlice<u8> = unsafe { device.alloc::<u8>(total_w * 2)? }; // 2 bytes per f16
 
     let block_size = 256_u32;
     let grid_size = ((total_w as u32) + block_size - 1) / block_size;
@@ -683,12 +793,7 @@ fn dequant_cublas_matmul(
             unsafe {
                 func.launch(
                     dequant_cfg,
-                    (
-                        &mut w_f16,
-                        weight.data_slice(),
-                        n as i32,
-                        k as i32,
-                    ),
+                    (&mut w_f16, weight.data_slice(), n as i32, k as i32),
                 )?;
             }
         }
@@ -730,14 +835,7 @@ fn dequant_cublas_matmul(
             shared_mem_bytes: 0,
         };
         unsafe {
-            func.launch(
-                cfg,
-                (
-                    &mut a_f16,
-                    &input.cuda_slice(),
-                    total_a as i32,
-                ),
-            )?;
+            func.launch(cfg, (&mut a_f16, &input.cuda_slice(), total_a as i32))?;
         }
     }
 
@@ -770,21 +868,21 @@ fn dequant_cublas_matmul(
         result::gemm_ex(
             *ctx.blas().handle(),
             sys::cublasOperation_t::CUBLAS_OP_T, // op(A) = transpose W_cm(K,N) → (N,K)
-            CUBLAS_OP_N,                          // op(B) = A_cm(K,M)
-            n as i32,                             // m (rows of op(A) and C)
-            m as i32,                             // n (cols of op(B) and C)
-            k as i32,                             // k (inner dim)
+            CUBLAS_OP_N,                         // op(B) = A_cm(K,M)
+            n as i32,                            // m (rows of op(A) and C)
+            m as i32,                            // n (cols of op(B) and C)
+            k as i32,                            // k (inner dim)
             (&raw const alpha).cast(),
-            *w_f16.device_ptr() as *const _,      // A = weight f16
+            *w_f16.device_ptr() as *const _, // A = weight f16
             f16_type,
-            k as i32,                             // lda = K (col-major stride of W_cm)
-            *a_f16.device_ptr() as *const _,      // B = activation f16
+            k as i32,                        // lda = K (col-major stride of W_cm)
+            *a_f16.device_ptr() as *const _, // B = activation f16
             f16_type,
-            k as i32,                             // ldb = K (col-major stride of A_cm)
+            k as i32, // ldb = K (col-major stride of A_cm)
             (&raw const beta).cast(),
             *output.cuda_slice_mut().device_ptr_mut() as *mut _,
             f32_type,
-            n as i32,                             // ldc = N
+            n as i32, // ldc = N
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
             sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
         )?;
@@ -833,14 +931,15 @@ fn quantized_matmul_2d(
         return quantized_gemv(input, weight, n, k);
     }
 
-    // Dequant + cuBLAS path for M > 1 (prefill): ~100× faster than tiled kernels
-    if m > 1
-        && matches!(
-            weight.dtype(),
-            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::GPTQ_INT4
-        )
-    {
-        return dequant_cublas_matmul(input, weight, m, n, k);
+    // Tensor-core paths for M > 1 (prefill)
+    if m > 1 {
+        match weight.dtype() {
+            // Dequant + cuBLAS: dequant to F16, then cuBLAS GEMM with tensor cores
+            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::GPTQ_INT4 => {
+                return dequant_cublas_matmul(input, weight, m, n, k);
+            }
+            _ => {}
+        }
     }
 
     let mut output = unsafe { CudaTensor::uninit(input.context(), &[m, n], DType::F32)? };
@@ -1425,7 +1524,7 @@ mod tests {
         let output = quantized_matmul(&input, &weight).unwrap();
         let result = output.to_vec::<f32>().unwrap();
 
-        // Q8 should match within ~1e-2 relative error
+        // Q8 should match within ~5% relative error
         for i in 0..m * n {
             let rel_err = if expected[i].abs() > 1e-6 {
                 (result[i] - expected[i]).abs() / expected[i].abs()
@@ -1442,6 +1541,79 @@ mod tests {
                 rel_err
             );
         }
+    }
+
+    #[test]
+    fn test_mmq_q8_kernel_direct() {
+        // Test the MMQ WMMA kernel directly (bypasses dispatch which uses dequant+cuBLAS)
+        let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+        let m = 4;
+        let k = 2048;
+        let n = 64;
+
+        let mut state: u64 = 42;
+        let mut rand_f32 = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let input_data: Vec<f32> = (0..m * k).map(|_| rand_f32()).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|_| rand_f32()).collect();
+
+        let input = CudaTensor::from_slice(&ctx, &[m, k], &input_data).unwrap();
+
+        // f32 reference
+        let mut expected = vec![0.0_f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0_f32;
+                for i in 0..k {
+                    acc += input_data[row * k + i] * w_data[col * k + i];
+                }
+                expected[row * n + col] = acc;
+            }
+        }
+
+        let (q_data, q_scales) = quantize_q8_host(&w_data, QUANTIZATION_BLOCK_SIZE);
+        let weight =
+            QuantizedTensor::from_raw(&ctx, &[n, k], DType::Q8_0, &q_data, &q_scales).unwrap();
+
+        let output = mmq_matmul_q8(&input, &weight, m, n, k).unwrap();
+        let result = output.to_vec::<f32>().unwrap();
+
+        // Double quantization (weights Q8_0 + activations Q8_1) has ~2× the noise
+        // of single quantization. Compare the average relative error across all
+        // elements to verify the kernel is correct (not just lucky on a few).
+        let mut total_rel_err = 0.0_f64;
+        let mut max_abs_err = 0.0_f32;
+        let mut count = 0_usize;
+        for i in 0..m * n {
+            let abs_err = (result[i] - expected[i]).abs();
+            if abs_err > max_abs_err {
+                max_abs_err = abs_err;
+            }
+            if expected[i].abs() > 0.1 {
+                total_rel_err += (abs_err / expected[i].abs()) as f64;
+                count += 1;
+            }
+        }
+        let avg_rel_err = if count > 0 {
+            total_rel_err / count as f64
+        } else {
+            0.0
+        };
+        // Average relative error should be well under 5% for double quantization
+        assert!(
+            avg_rel_err < 0.05,
+            "MMQ Q8 average relative error: {avg_rel_err:.4} (over {count} elements)",
+        );
+        assert!(
+            max_abs_err < 3.0,
+            "MMQ Q8 max absolute error: {max_abs_err:.4}",
+        );
     }
 
     #[test]
