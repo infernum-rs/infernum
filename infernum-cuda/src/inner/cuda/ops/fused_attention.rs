@@ -120,6 +120,29 @@ fn ensure_fused_prefill_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevic
     Ok(())
 }
 
+// Flash Attention v2 prefill kernel — single-pass online softmax, tiled K/V
+const FLASH_PREFILL_PTX: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/kernels/flash_prefill_attention.ptx"
+));
+
+const FLASH_PREFILL_KERNEL_NAMES: &[&str] = &[
+    "flash_prefill_attention_f32",
+    "flash_prefill_attention_with_lse_f32",
+];
+
+fn ensure_flash_prefill_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
+    let module_name = "flash_prefill_attention";
+    if !device.has_func(module_name, "flash_prefill_attention_f32") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(FLASH_PREFILL_PTX),
+            module_name,
+            FLASH_PREFILL_KERNEL_NAMES,
+        )?;
+    }
+    Ok(())
+}
+
 /// Fused attention for single-token decode.
 ///
 /// Computes `softmax(Q @ K^T * scale) @ V` in a single kernel, reading
@@ -293,42 +316,81 @@ pub fn fused_attention_prefill(
     let mut output = unsafe { CudaTensor::uninit(q.context(), &output_shape, dtype)? };
 
     let device = q.context().device();
-    ensure_fused_prefill_kernel(device)?;
-
-    let kernel_name = format!("fused_prefill_attention_{}", kernel_suffix(dtype));
-    let func = device
-        .get_func("fused_prefill_attention", &kernel_name)
-        .unwrap();
-
-    let block_size = 256_usize.min(total_len.next_power_of_two());
-    let shared_mem = (head_dim + block_size) * std::mem::size_of::<f32>();
-
-    let cfg = LaunchConfig {
-        grid_dim: (num_heads as u32, seq_q as u32, 1),
-        block_dim: (block_size as u32, 1, 1),
-        shared_mem_bytes: shared_mem as u32,
-    };
-
     let window_size = sliding_window.map_or(-1, |w| w as i32);
 
-    unsafe {
-        func.launch(
-            cfg,
-            (
-                output.cuda_slice_mut(),
-                &q.cuda_slice(),
-                &k.cuda_slice(),
-                &v.cuda_slice(),
-                scale,
-                softcap_val,
-                total_len as i32,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                offset as i32,
-                window_size,
-            ),
-        )?;
+    // Use Flash Attention (single-pass online softmax) for f32.
+    // Falls back to the old 3-pass kernel for f16/bf16 (not yet implemented in flash).
+    if dtype == DType::F32 {
+        ensure_flash_prefill_kernel(device)?;
+        let func = device
+            .get_func("flash_prefill_attention", "flash_prefill_attention_f32")
+            .unwrap();
+
+        // Flash kernel constants: BC=32 tile size, THREADS=128
+        let block_size = 128_usize;
+        let bc = 32_usize;
+        let shared_mem = (head_dim + bc * head_dim + bc) * std::mem::size_of::<f32>();
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads as u32, seq_q as u32, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: shared_mem as u32,
+        };
+
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    output.cuda_slice_mut(),
+                    &q.cuda_slice(),
+                    &k.cuda_slice(),
+                    &v.cuda_slice(),
+                    scale,
+                    softcap_val,
+                    total_len as i32,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    offset as i32,
+                    window_size,
+                ),
+            )?;
+        }
+    } else {
+        ensure_fused_prefill_kernel(device)?;
+        let kernel_name = format!("fused_prefill_attention_{}", kernel_suffix(dtype));
+        let func = device
+            .get_func("fused_prefill_attention", &kernel_name)
+            .unwrap();
+
+        let block_size = 256_usize.min(total_len.next_power_of_two());
+        let shared_mem = (head_dim + block_size) * std::mem::size_of::<f32>();
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads as u32, seq_q as u32, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: shared_mem as u32,
+        };
+
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    output.cuda_slice_mut(),
+                    &q.cuda_slice(),
+                    &k.cuda_slice(),
+                    &v.cuda_slice(),
+                    scale,
+                    softcap_val,
+                    total_len as i32,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    offset as i32,
+                    window_size,
+                ),
+            )?;
+        }
     }
 
     Ok(output)
@@ -577,22 +639,6 @@ pub fn fused_attention_prefill_with_lse(
     let mut lse = unsafe { CudaTensor::uninit(q.context(), &[seq_q, num_heads], DType::F32)? };
 
     let device = q.context().device();
-    ensure_fused_prefill_with_lse_kernel(device)?;
-
-    let kernel_name = format!("fused_prefill_attention_with_lse_{}", kernel_suffix(dtype));
-    let func = device
-        .get_func("fused_prefill_attention_with_lse", &kernel_name)
-        .unwrap();
-
-    let block_size = 256_usize.min(total_len.next_power_of_two());
-    let shared_mem = (head_dim + block_size) * std::mem::size_of::<f32>();
-
-    let cfg = LaunchConfig {
-        grid_dim: (num_heads as u32, seq_q as u32, 1),
-        block_dim: (block_size as u32, 1, 1),
-        shared_mem_bytes: shared_mem as u32,
-    };
-
     let mut window_size = sliding_window.map_or(-1, |w| w as i32);
     let mut total_len_i32 = total_len as i32;
     let mut num_heads_i32 = num_heads as i32;
@@ -605,6 +651,37 @@ pub fn fused_attention_prefill_with_lse(
     let q_slice = q.cuda_slice();
     let k_slice = k.cuda_slice();
     let v_slice = v.cuda_slice();
+
+    // Use Flash Attention for f32, fall back to old kernel for f16/bf16
+    let (module_name, kernel_name, block_size, shared_mem) = if dtype == DType::F32 {
+        ensure_flash_prefill_kernel(device)?;
+        let bc = 32_usize;
+        let bs = 128_usize;
+        let smem = (head_dim + bc * head_dim + bc) * std::mem::size_of::<f32>();
+        (
+            "flash_prefill_attention",
+            "flash_prefill_attention_with_lse_f32".to_string(),
+            bs,
+            smem,
+        )
+    } else {
+        ensure_fused_prefill_with_lse_kernel(device)?;
+        let bs = 256_usize.min(total_len.next_power_of_two());
+        let smem = (head_dim + bs) * std::mem::size_of::<f32>();
+        (
+            "fused_prefill_attention_with_lse",
+            format!("fused_prefill_attention_with_lse_{}", kernel_suffix(dtype)),
+            bs,
+            smem,
+        )
+    };
+
+    let func = device.get_func(module_name, &kernel_name).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, seq_q as u32, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
 
     let mut args: Vec<*mut c_void> = vec![
         std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
