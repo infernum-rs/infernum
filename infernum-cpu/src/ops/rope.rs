@@ -105,7 +105,12 @@ pub(crate) struct RopeOperand {
 /// # Safety
 /// The caller must ensure that the `inp_ptr`/`out_ptr` fields in each operand
 /// point to valid, disjoint f32 slices of the correct length.
-pub(crate) unsafe fn apply_rope_pair_slices(a: &RopeOperand, b: &RopeOperand, cos: &[f32], sin: &[f32]) {
+pub(crate) unsafe fn apply_rope_pair_slices(
+    a: &RopeOperand,
+    b: &RopeOperand,
+    cos: &[f32],
+    sin: &[f32],
+) {
     let total_a = a.seq_len * a.num_heads;
     let total_b = b.seq_len * b.num_heads;
     let total_units = total_a + total_b;

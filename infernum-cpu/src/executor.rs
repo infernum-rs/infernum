@@ -6,9 +6,7 @@
 
 use std::collections::HashMap;
 
-use infernum::backend::{
-    AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps,
-};
+use infernum::backend::{AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps};
 use infernum::graph::{Arena, WeightStore};
 use infernum::tensor::Tensor;
 use infernum::{DType, ExecutionPlan, GraphNode, NodeId, Op, Result};
@@ -611,8 +609,14 @@ pub fn execute(
                                 num_elements,
                             );
                             crate::ops::rope::apply_rope_slices(
-                                input, cos_data, sin_data, output, node.shape[0], node.shape[1],
-                                node.shape[2], *offset,
+                                input,
+                                cos_data,
+                                sin_data,
+                                output,
+                                node.shape[0],
+                                node.shape[1],
+                                node.shape[2],
+                                *offset,
                             );
                         }
                     }

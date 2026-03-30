@@ -356,8 +356,8 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
     let mut k_cache_inputs = Vec::with_capacity(num_layers);
     let mut v_cache_inputs = Vec::with_capacity(num_layers);
     for _ in 0..num_layers {
-        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], DType::F32));
-        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], DType::F32));
+        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
+        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
     }
 
     // -- Embedding --

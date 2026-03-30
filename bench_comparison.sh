@@ -211,7 +211,7 @@ run_infernum_bench() {
 
     local output toks
     # Try with CUDA graphs first (timeout guards against capture hangs)
-    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- 
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
         "${model_path}" "${N_TOKENS}" --graphs "${extra_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     if [[ -n "${toks}" ]]; then
@@ -221,7 +221,7 @@ run_infernum_bench() {
 
     # Fallback: no graphs
     log "  (CUDA graphs failed, retrying without)"
-    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- 
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
         "${model_path}" "${N_TOKENS}" "${extra_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     echo "${toks:-ERR}"
@@ -240,8 +240,44 @@ run_infernum_bench_no_graphs() {
     fi
 
     local output toks
-    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- 
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
         "${model_path}" "${N_TOKENS}" "${extra_args[@]}" 2>/dev/null || true)
+    toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
+    echo "${toks:-ERR}"
+}
+
+# Run infernum GPU graph prefill benchmark.
+# Usage: run_infernum_graph_prefill <safetensors_model_dir> [--dtype <dtype>]
+run_infernum_graph_prefill() {
+    local model_path="$1"
+    shift
+    local extra_args=("$@")
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+
+    local output toks
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
+        --graph "${model_path}" "${N_TOKENS}" "${extra_args[@]}" 2>/dev/null || true)
+    toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
+    echo "${toks:-ERR}"
+}
+
+# Run infernum GPU graph decode benchmark.
+# Usage: run_infernum_graph_decode <safetensors_model_dir> [--dtype <dtype>]
+run_infernum_graph_decode() {
+    local model_path="$1"
+    shift
+    local extra_args=("$@")
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+
+    local output toks
+    output=$(timeout 300 cargo run --release --example bench --features cuda -q -- \
+        --graph-decode "${model_path}" "${N_TOKENS}" "${extra_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     echo "${toks:-ERR}"
 }
@@ -390,9 +426,11 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["F32"]=$(run_llama_bench_prefill "${GGUF_F32}")
             log "[${step}/${total}] F32 — infernum decode (eager, no graphs)"
             decode_eager["F32"]=$(run_infernum_bench_no_graphs "${GGUF_F32}")
-            decode_graph["F32"]="—"
+            log "[${step}/${total}] F32 — infernum graph decode"
+            decode_graph["F32"]=$(run_infernum_graph_decode "${BASE_MODEL_DIR}" --dtype f32)
             prefill_eager["F32"]="—"
-            prefill_graph["F32"]="—"
+            log "[${step}/${total}] F32 — infernum graph prefill"
+            prefill_graph["F32"]=$(run_infernum_graph_prefill "${BASE_MODEL_DIR}" --dtype f32)
             ;;
         BF16)
             log "[${step}/${total}] BF16 — llama.cpp decode"
@@ -401,9 +439,11 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["BF16"]=$(run_llama_bench_prefill "${GGUF_BF16}")
             log "[${step}/${total}] BF16 — infernum decode (eager)"
             decode_eager["BF16"]=$(run_infernum_bench "${BASE_MODEL_DIR}")
-            decode_graph["BF16"]="—"
+            log "[${step}/${total}] BF16 — infernum graph decode"
+            decode_graph["BF16"]=$(run_infernum_graph_decode "${BASE_MODEL_DIR}")
             prefill_eager["BF16"]="—"
-            prefill_graph["BF16"]="—"
+            log "[${step}/${total}] BF16 — infernum graph prefill"
+            prefill_graph["BF16"]=$(run_infernum_graph_prefill "${BASE_MODEL_DIR}")
             ;;
         F16)
             log "[${step}/${total}] F16 — llama.cpp decode"
@@ -420,9 +460,11 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["FP8"]="—"
             log "[${step}/${total}] FP8 — infernum decode (eager, no graphs)"
             decode_eager["FP8"]=$(run_infernum_bench_no_graphs "${FP8_MODEL_DIR}")
-            decode_graph["FP8"]="—"
+            log "[${step}/${total}] FP8 — infernum graph decode"
+            decode_graph["FP8"]=$(run_infernum_graph_decode "${FP8_MODEL_DIR}")
             prefill_eager["FP8"]="—"
-            prefill_graph["FP8"]="—"
+            log "[${step}/${total}] FP8 — infernum graph prefill"
+            prefill_graph["FP8"]=$(run_infernum_graph_prefill "${FP8_MODEL_DIR}")
             ;;
         "GGUF Q8_0")
             log "[${step}/${total}] GGUF Q8_0 — llama.cpp decode"
@@ -431,9 +473,11 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["GGUF Q8_0"]=$(run_llama_bench_prefill "${GGUF_Q8}")
             log "[${step}/${total}] GGUF Q8_0 — infernum decode (eager, no graphs)"
             decode_eager["GGUF Q8_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q8}")
-            decode_graph["GGUF Q8_0"]="—"
+            log "[${step}/${total}] GGUF Q8_0 — infernum graph decode"
+            decode_graph["GGUF Q8_0"]=$(run_infernum_graph_decode "${GGUF_Q8}")
             prefill_eager["GGUF Q8_0"]="—"
-            prefill_graph["GGUF Q8_0"]="—"
+            log "[${step}/${total}] GGUF Q8_0 — infernum graph prefill"
+            prefill_graph["GGUF Q8_0"]=$(run_infernum_graph_prefill "${GGUF_Q8}")
             ;;
         "GGUF Q4_0")
             log "[${step}/${total}] GGUF Q4_0 — llama.cpp decode"
@@ -442,18 +486,22 @@ for bench in "${benchmarks[@]}"; do
             prefill_llama["GGUF Q4_0"]=$(run_llama_bench_prefill "${GGUF_Q4}")
             log "[${step}/${total}] GGUF Q4_0 — infernum decode (eager, no graphs)"
             decode_eager["GGUF Q4_0"]=$(run_infernum_bench_no_graphs "${GGUF_Q4}")
-            decode_graph["GGUF Q4_0"]="—"
+            log "[${step}/${total}] GGUF Q4_0 — infernum graph decode"
+            decode_graph["GGUF Q4_0"]=$(run_infernum_graph_decode "${GGUF_Q4}")
             prefill_eager["GGUF Q4_0"]="—"
-            prefill_graph["GGUF Q4_0"]="—"
+            log "[${step}/${total}] GGUF Q4_0 — infernum graph prefill"
+            prefill_graph["GGUF Q4_0"]=$(run_infernum_graph_prefill "${GGUF_Q4}")
             ;;
         "GPTQ INT4")
             decode_llama["GPTQ INT4"]="—"
             prefill_llama["GPTQ INT4"]="—"
             log "[${step}/${total}] GPTQ INT4 — infernum decode (eager, no graphs)"
             decode_eager["GPTQ INT4"]=$(run_infernum_bench_no_graphs "${GPTQ_MODEL_DIR}")
-            decode_graph["GPTQ INT4"]="—"
+            log "[${step}/${total}] GPTQ INT4 — infernum graph decode"
+            decode_graph["GPTQ INT4"]=$(run_infernum_graph_decode "${GPTQ_MODEL_DIR}")
             prefill_eager["GPTQ INT4"]="—"
-            prefill_graph["GPTQ INT4"]="—"
+            log "[${step}/${total}] GPTQ INT4 — infernum graph prefill"
+            prefill_graph["GPTQ INT4"]=$(run_infernum_graph_prefill "${GPTQ_MODEL_DIR}")
             ;;
     esac
 done

@@ -1757,7 +1757,12 @@ unsafe fn microkernel_q8_4x6(
 /// - q_off (out): quant byte offset, incremented by 32 per block
 /// - s_off (out): scale f32 offset = q_off >> 3, computed per block
 /// - tmp (out): scratch GPR for pointer loads from `ptrs[]`
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::similar_names, clippy::many_single_char_names)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::many_single_char_names
+)]
 #[inline]
 unsafe fn microkernel_q8_4x4(
     output: &mut [f32],

@@ -61,7 +61,7 @@ fn quantize_activations_to_fp8(
     let device = ctx.device();
 
     let module_name = "fp8_quantize";
-    if !device.has_func(module_name, "fused_absmax_quantize_f32") {
+    if !device.has_func(module_name, "absmax_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(FP8_QUANTIZE_PTX),
             module_name,
@@ -74,7 +74,6 @@ fn quantize_activations_to_fp8(
     }
 
     let mut max_bits = device.alloc_zeros::<u32>(1)?;
-    let mut block_counter = device.alloc_zeros::<u32>(1)?;
     let mut act_fp8 = unsafe { device.alloc::<u8>(numel)? };
     let mut d_inv_scale = unsafe { device.alloc::<f32>(1)? };
 
@@ -89,19 +88,28 @@ fn quantize_activations_to_fp8(
         shared_mem_bytes: shared_mem as u32,
     };
 
-    let func = device
-        .get_func(module_name, "fused_absmax_quantize_f32")
-        .unwrap();
+    // Two-kernel approach: absmax reduction, then quantize.
+    //
+    // The fused single-kernel version uses a spin-wait grid sync that
+    // requires ALL blocks to be concurrently resident on the GPU.
+    // This deadlocks when `blocks` exceeds the device's occupancy limit
+    // (observed at ~80 blocks on L4 with 30 SMs).  The two-kernel path
+    // adds one extra launch (~5 µs) but is correct for any input size.
 
+    let absmax_func = device.get_func(module_name, "absmax_f32").unwrap();
     unsafe {
-        func.launch(
+        absmax_func.launch(cfg, (&input.cuda_slice(), &mut max_bits, numel as i32))?;
+    }
+
+    let quant_func = device.get_func(module_name, "quantize_f32_to_fp8").unwrap();
+    unsafe {
+        quant_func.launch(
             cfg,
             (
                 &input.cuda_slice(),
                 &mut act_fp8,
-                &mut max_bits,
+                &max_bits,
                 &mut d_inv_scale,
-                &mut block_counter,
                 numel as i32,
             ),
         )?;

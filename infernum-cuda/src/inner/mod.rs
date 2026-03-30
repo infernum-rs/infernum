@@ -3,6 +3,7 @@ pub mod cuda;
 pub mod cuda_logits;
 pub mod cuda_runtime_state;
 mod error;
+pub mod executor;
 pub mod model;
 pub mod weights;
 
