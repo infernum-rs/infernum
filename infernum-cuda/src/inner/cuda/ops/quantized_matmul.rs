@@ -42,6 +42,10 @@ const FP8_QUANTIZE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/f
 
 const SCALE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/scale.ptx"));
 
+const DEQUANTIZE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/dequantize.ptx"));
+
+const CAST_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/cast.ptx"));
+
 // ---------------------------------------------------------------------------
 // FP8 cuBLAS helpers
 // ---------------------------------------------------------------------------
@@ -558,6 +562,237 @@ pub fn quantized_matmul(input: &CudaTensor, weight: &QuantizedTensor) -> Result<
     }
 }
 
+// ---------------------------------------------------------------------------
+// Dequantize-then-cuBLAS path for prefill (M > 1)
+// ---------------------------------------------------------------------------
+//
+// For large M (prefill), the naive per-element tiled matmul kernels are very
+// slow because they can't use tensor cores. Instead:
+// 1. Dequantize the weight matrix to F16 in a trivially-parallel kernel
+// 2. Cast F32 activations to F16
+// 3. Call cuBLAS gemm_ex with F16 × F16 → F32 (tensor cores)
+//
+// The temporary F16 buffers cost O(N×K + M×K) bytes but the cuBLAS GEMM
+// is ~100× faster than the tiled kernels for typical prefill sizes.
+
+/// Ensure dequantize kernels are loaded.
+fn ensure_dequant_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
+    let module = "dequantize";
+    if !device.has_func(module, "dequant_q8_f16") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(DEQUANTIZE_PTX),
+            module,
+            &[
+                "dequant_q8_f16",
+                "dequant_q4_f16",
+                "dequant_q6k_f16",
+                "dequant_gptq_f16",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Ensure cast kernels are loaded.
+fn ensure_cast_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
+    let module = "cast";
+    if !device.has_func(module, "cast_f32_to_f16") {
+        device.load_ptx(
+            cudarc::nvrtc::Ptx::from_src(CAST_PTX),
+            module,
+            &[
+                "cast_f32_to_f16",
+                "cast_f16_to_f32",
+                "cast_f32_to_bf16",
+                "cast_bf16_to_f32",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Dequantize weight to F16, cast activations to F16, then cuBLAS GEMM.
+///
+/// `input`: f32 tensor (M, K)
+/// `weight`: quantized tensor (N, K) — stored transposed (row n = output n)
+/// output: f32 tensor (M, N) = input @ dequant(weight)^T
+#[allow(clippy::too_many_arguments)]
+fn dequant_cublas_matmul(
+    input: &CudaTensor,
+    weight: &QuantizedTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaTensor> {
+    use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    use cudarc::cublas::{result, sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    let ctx = input.context();
+    let device = ctx.device();
+    let total_w = n * k;
+
+    ensure_dequant_kernels(device)?;
+    ensure_cast_kernels(device)?;
+
+    // 1. Dequantize weight (N, K) → F16 buffer
+    let mut w_f16: CudaSlice<u8> =
+        unsafe { device.alloc::<u8>(total_w * 2)? }; // 2 bytes per f16
+
+    let block_size = 256_u32;
+    let grid_size = ((total_w as u32) + block_size - 1) / block_size;
+    let dequant_cfg = LaunchConfig {
+        grid_dim: (grid_size, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    match weight.dtype() {
+        DType::Q8_0 => {
+            let func = device.get_func("dequantize", "dequant_q8_f16").unwrap();
+            unsafe {
+                func.launch(
+                    dequant_cfg,
+                    (
+                        &mut w_f16,
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::Q4_0 => {
+            let func = device.get_func("dequantize", "dequant_q4_f16").unwrap();
+            unsafe {
+                func.launch(
+                    dequant_cfg,
+                    (
+                        &mut w_f16,
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::Q6_K => {
+            let func = device.get_func("dequantize", "dequant_q6k_f16").unwrap();
+            unsafe {
+                func.launch(
+                    dequant_cfg,
+                    (
+                        &mut w_f16,
+                        weight.data_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::GPTQ_INT4 => {
+            let group_size = weight
+                .group_size()
+                .expect("GPTQ_INT4 weight must have group_size");
+            let qzeros = weight
+                .qzeros_slice()
+                .expect("GPTQ_INT4 weight must have qzeros");
+            let func = device.get_func("dequantize", "dequant_gptq_f16").unwrap();
+            unsafe {
+                func.launch(
+                    dequant_cfg,
+                    (
+                        &mut w_f16,
+                        weight.data_slice(),
+                        weight.scales_slice(),
+                        qzeros,
+                        n as i32,
+                        k as i32,
+                        group_size as i32,
+                    ),
+                )?;
+            }
+        }
+        other => panic!("dequant_cublas_matmul: unsupported dtype {other}"),
+    }
+
+    // 2. Cast f32 activations (M, K) → F16
+    let total_a = m * k;
+    let mut a_f16: CudaSlice<u8> = unsafe { device.alloc::<u8>(total_a * 2)? };
+    {
+        let func = device.get_func("cast", "cast_f32_to_f16").unwrap();
+        let grid = ((total_a as u32) + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    &mut a_f16,
+                    &input.cuda_slice(),
+                    total_a as i32,
+                ),
+            )?;
+        }
+    }
+
+    // 3. cuBLAS GEMM: output(M,N) = input_f16(M,K) @ weight_f16(N,K)^T
+    //    In cuBLAS column-major: C^T(N,M) = W(N,K) @ A^T(K,M)
+    //    W is (N,K) row-major = (K,N) col-major, so op(A)=N gives (K,N)^T = (N,K)? No.
+    //    W_f16 is (N,K) row-major. In col-major that's a (K,N) matrix.
+    //    We want W^T @ ... but W_f16 in col-major is already (K,N).
+    //    A_f16 is (M,K) row-major = (K,M) col-major.
+    //    C = A @ W^T → C^T = W @ A^T
+    //    In col-major: C_cm(N,M) = W_cm(K,N)^T(N,K) @ A_cm(K,M)
+    //    So: op(A)=CUBLAS_OP_T on W_cm, op(B)=CUBLAS_OP_N on A_cm
+    //
+    //    Actually simpler: cuBLAS computes D = alpha * op(A) * op(B) + beta * C
+    //    We want row-major: Out(M,N) = A(M,K) * W(N,K)^T
+    //    Row-major trick: treat as col-major transposed:
+    //    Out_cm(N,M) = W_cm * A_cm where W is (N,K) rm = (K,N) cm, A is (M,K) rm = (K,M) cm
+    //    But we need (N,M) = (N,K) * (K,M)
+    //    So: op(A) = CUBLAS_OP_T on W_cm(K,N) → (N,K), op(B) = CUBLAS_OP_N on A_cm(K,M)
+    //    Result: (N,K) * (K,M) = (N,M) → stored as (N,M) col-major = (M,N) row-major ✓
+
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[m, n], DType::F32)? };
+
+    let f16_type = sys::cudaDataType_t::CUDA_R_16F;
+    let f32_type = sys::cudaDataType_t::CUDA_R_32F;
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+
+    unsafe {
+        result::gemm_ex(
+            *ctx.blas().handle(),
+            sys::cublasOperation_t::CUBLAS_OP_T, // op(A) = transpose W_cm(K,N) → (N,K)
+            CUBLAS_OP_N,                          // op(B) = A_cm(K,M)
+            n as i32,                             // m (rows of op(A) and C)
+            m as i32,                             // n (cols of op(B) and C)
+            k as i32,                             // k (inner dim)
+            (&raw const alpha).cast(),
+            *w_f16.device_ptr() as *const _,      // A = weight f16
+            f16_type,
+            k as i32,                             // lda = K (col-major stride of W_cm)
+            *a_f16.device_ptr() as *const _,      // B = activation f16
+            f16_type,
+            k as i32,                             // ldb = K (col-major stride of A_cm)
+            (&raw const beta).cast(),
+            *output.cuda_slice_mut().device_ptr_mut() as *mut _,
+            f32_type,
+            n as i32,                             // ldc = N
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )?;
+    }
+
+    Ok(output)
+}
+
 #[allow(clippy::too_many_lines)]
 fn quantized_matmul_2d(
     input: &CudaTensor,
@@ -596,6 +831,16 @@ fn quantized_matmul_2d(
         )
     {
         return quantized_gemv(input, weight, n, k);
+    }
+
+    // Dequant + cuBLAS path for M > 1 (prefill): ~100× faster than tiled kernels
+    if m > 1
+        && matches!(
+            weight.dtype(),
+            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::GPTQ_INT4
+        )
+    {
+        return dequant_cublas_matmul(input, weight, m, n, k);
     }
 
     let mut output = unsafe { CudaTensor::uninit(input.context(), &[m, n], DType::F32)? };
@@ -1522,11 +1767,12 @@ mod tests {
         let output = quantized_matmul(&input, &weight).unwrap();
         let result = output.to_vec::<f32>().unwrap();
 
-        // Should match closely (only f32 rounding differences)
+        // Allow slightly more error: when M > 1, weights are dequantized to
+        // F16 before cuBLAS GEMM, which introduces ~1e-3 rounding vs pure F32.
         for i in 0..m * n {
             let diff = (result[i] - expected[i]).abs();
             assert!(
-                diff < 1e-3,
+                diff < 5e-3,
                 "Q4 mismatch at [{}, {}]: got {} expected {} (diff={:.6})",
                 i / n,
                 i % n,
@@ -1643,11 +1889,12 @@ mod tests {
         let result_gpu = quantized_matmul(&input, &weight).unwrap();
         let result = result_gpu.to_vec::<f32>().unwrap();
 
-        // Should match exactly (both use same dequantized values)
+        // Allow slightly more error: when M > 1, weights are dequantized to
+        // F16 before cuBLAS GEMM, which introduces ~1e-3 rounding vs pure F32.
         for i in 0..m * n {
             let diff = (result[i] - expected[i]).abs();
             assert!(
-                diff < 1e-3,
+                diff < 5e-3,
                 "Q4 quantized vs dequantized f32 mismatch at {}: {} vs {} (diff={:.6})",
                 i,
                 result[i],
