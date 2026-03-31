@@ -352,11 +352,7 @@ pub fn execute(
             }
 
             "linear_triple" => {
-                let op = node
-                    .op
-                    .as_any()
-                    .downcast_ref::<LinearTripleOp>()
-                    .unwrap();
+                let op = node.op.as_any().downcast_ref::<LinearTripleOp>().unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let lw1 = weights.linear_weight(op.w1);
                 let lw2 = weights.linear_weight(op.w2);
@@ -424,12 +420,8 @@ pub fn execute(
             "mul" => {
                 let (a_nid, a_oidx) = node.inputs[0];
                 let (b_nid, b_oidx) = node.inputs[1];
-                let a_slot = plan
-                    .slot(a_nid, a_oidx)
-                    .expect("mul input a has no slot");
-                let b_slot = plan
-                    .slot(b_nid, b_oidx)
-                    .expect("mul input b has no slot");
+                let a_slot = plan.slot(a_nid, a_oidx).expect("mul input a has no slot");
+                let b_slot = plan.slot(b_nid, b_oidx).expect("mul input b has no slot");
                 let out_slot = plan.slot(node_id, 0).expect("mul output has no slot");
                 let num_elements: usize = node.output_shapes[0].iter().product();
                 let base = arena.as_mut_ptr();
@@ -455,12 +447,8 @@ pub fn execute(
                 // Zero-copy: read a/b and write output directly in the arena.
                 let (a_nid, a_oidx) = node.inputs[0];
                 let (b_nid, b_oidx) = node.inputs[1];
-                let a_slot = plan
-                    .slot(a_nid, a_oidx)
-                    .expect("add input a has no slot");
-                let b_slot = plan
-                    .slot(b_nid, b_oidx)
-                    .expect("add input b has no slot");
+                let a_slot = plan.slot(a_nid, a_oidx).expect("add input a has no slot");
+                let b_slot = plan.slot(b_nid, b_oidx).expect("add input b has no slot");
                 let out_slot = plan.slot(node_id, 0).expect("add output has no slot");
                 let num_elements: usize = node.output_shapes[0].iter().product();
                 let base = arena.as_mut_ptr();
@@ -572,8 +560,7 @@ pub fn execute(
                         let next_id = plan.schedule[sched_idx];
                         let next_node = &nodes[next_id.index() as usize];
                         if next_node.op.name() == "rope" {
-                            let next_op =
-                                next_node.op.as_any().downcast_ref::<RopeOp>().unwrap();
+                            let next_op = next_node.op.as_any().downcast_ref::<RopeOp>().unwrap();
                             let n2_cos_ref = next_node.inputs[1];
                             let n2_sin_ref = next_node.inputs[2];
                             let n2_cos_node = &nodes[n2_cos_ref.0.index() as usize];
@@ -616,7 +603,9 @@ pub fn execute(
                         let inp_a = plan.slot(inp_a_nid, inp_a_oidx).expect("rope A input");
                         let out_a = plan.slot(node_id, 0).expect("rope A output");
                         let (next_inp_nid, next_inp_oidx) = next_node.inputs[0];
-                        let inp_b = plan.slot(next_inp_nid, next_inp_oidx).expect("rope B input");
+                        let inp_b = plan
+                            .slot(next_inp_nid, next_inp_oidx)
+                            .expect("rope B input");
                         let out_b = plan.slot(next_id, 0).expect("rope B output");
 
                         let next_shape = &next_node.output_shapes[0];
@@ -757,11 +746,7 @@ pub fn execute(
             }
 
             "extract_last_row" => {
-                let op = node
-                    .op
-                    .as_any()
-                    .downcast_ref::<ExtractLastRowOp>()
-                    .unwrap();
+                let op = node.op.as_any().downcast_ref::<ExtractLastRowOp>().unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let shape = &node.output_shapes[0];
                 let inner_size: usize = shape[1..].iter().product();
@@ -777,11 +762,7 @@ pub fn execute(
             }
 
             "split_inner_dim" => {
-                let op = node
-                    .op
-                    .as_any()
-                    .downcast_ref::<SplitInnerDimOp>()
-                    .unwrap();
+                let op = node.op.as_any().downcast_ref::<SplitInnerDimOp>().unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let inner = *input.shape().last().expect("non-empty shape");
                 let right_size = inner - op.left_size;

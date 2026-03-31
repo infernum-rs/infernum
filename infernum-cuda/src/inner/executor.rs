@@ -15,8 +15,8 @@ use infernum::backend::{
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, BiasAddOp, CastFromF32Op, EmbeddingGatherOp, ExtractLastRowOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, GegluOp, LinearOp, LinearPairOp,
-    LinearTripleOp, LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeOp,
-    RopeBatchedOp, RopeInterleavedOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    LinearTripleOp, LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp, RopeInterleavedOp,
+    RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -46,7 +46,12 @@ fn take(buffers: &mut [Vec<Option<CudaTensor>>], node_id: NodeId, output_idx: u3
 }
 
 /// Store a tensor in the node buffer.
-fn store(buffers: &mut [Vec<Option<CudaTensor>>], node_id: NodeId, output_idx: u32, tensor: CudaTensor) {
+fn store(
+    buffers: &mut [Vec<Option<CudaTensor>>],
+    node_id: NodeId,
+    output_idx: u32,
+    tensor: CudaTensor,
+) {
     buffers[node_id.index() as usize][output_idx as usize] = Some(tensor);
 }
 
@@ -98,7 +103,11 @@ pub fn execute(
 
             // --- Embedding ---
             "embedding_gather" => {
-                let op = node.op.as_any().downcast_ref::<EmbeddingGatherOp>().unwrap();
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<EmbeddingGatherOp>()
+                    .unwrap();
                 let token_ids = read(&buffers, node.inputs[0]);
                 let table_w = weights.tensor_weight(op.table);
                 let seq_len = node.output_shapes[0][0];
@@ -268,7 +277,11 @@ pub fn execute(
             }
 
             "rope_interleaved" => {
-                let op = node.op.as_any().downcast_ref::<RopeInterleavedOp>().unwrap();
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<RopeInterleavedOp>()
+                    .unwrap();
                 let input = read(&buffers, node.inputs[0]);
                 let cos_cache = read(&buffers, node.inputs[1]);
                 let sin_cache = read(&buffers, node.inputs[2]);
@@ -280,7 +293,11 @@ pub fn execute(
 
             // --- Attention ---
             "fused_attention_prefill" => {
-                let op = node.op.as_any().downcast_ref::<FusedAttentionPrefillOp>().unwrap();
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<FusedAttentionPrefillOp>()
+                    .unwrap();
                 let q = read(&buffers, node.inputs[0]);
                 let k = read(&buffers, node.inputs[1]);
                 let v = read(&buffers, node.inputs[2]);
@@ -297,7 +314,11 @@ pub fn execute(
             }
 
             "fused_attention_decode" => {
-                let op = node.op.as_any().downcast_ref::<FusedAttentionDecodeOp>().unwrap();
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<FusedAttentionDecodeOp>()
+                    .unwrap();
                 let q = read(&buffers, node.inputs[0]);
                 let k = read(&buffers, node.inputs[1]);
                 let v = read(&buffers, node.inputs[2]);

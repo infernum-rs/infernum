@@ -12,7 +12,7 @@
 //! - Full causal attention (no sliding window)
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, RopeOps, TensorOps,
+    ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
@@ -69,12 +69,20 @@ pub struct ModelWeightIds {
 /// This is the subset of [`LlamaOps`](crate::model::LlamaOps) needed for
 /// the prefill graph — excludes paged KV cache, `MoE`, and cast ops.
 pub trait LlamaGraphOps:
-    Backend + MatmulOps + NormOps + ArithOps + EmbedOps + TensorOps + RopeOps + AttentionOps
+    Backend + MatmulOps + NormOps + ArithOps + EmbedOps + TensorOps + RopeOps + AttentionOps + SwigluOps
 {
 }
 
 impl<B> LlamaGraphOps for B where
-    B: Backend + MatmulOps + NormOps + ArithOps + EmbedOps + TensorOps + RopeOps + AttentionOps
+    B: Backend
+        + MatmulOps
+        + NormOps
+        + ArithOps
+        + EmbedOps
+        + TensorOps
+        + RopeOps
+        + AttentionOps
+        + SwigluOps
 {
 }
 
@@ -86,7 +94,7 @@ impl<B> LlamaGraphOps for B where
 ///
 /// Weight names match the `SafeTensors` naming convention used by
 /// [`LlamaModel::load_weights`](crate::LlamaModel).
-fn register_weights<B: Backend>(
+fn register_weights<B: Backend + MatmulOps>(
     graph: &mut Graph<B>,
     config: &LlamaConfig,
     hidden: usize,
@@ -282,7 +290,7 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
 
     // -- LM head --
     let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
-    graph.set_output(logits);
+    graph.set_output(logits.0);
 
     // -- Optimize: fuse primitives into efficient compound ops --
     infernum::graph::optimizer::optimize(&mut graph);
@@ -419,12 +427,12 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
     let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
 
     // -- Outputs: logits first, then per-layer K/V caches --
-    graph.set_output(logits);
+    graph.set_output(logits.0);
     for &k_out in &k_outputs {
-        graph.set_output(k_out);
+        graph.set_output(k_out.0);
     }
     for &v_out in &v_outputs {
-        graph.set_output(v_out);
+        graph.set_output(v_out.0);
     }
 
     (graph, model_weights)
@@ -433,8 +441,6 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use infernum::graph::Op;
 
     /// Minimal backend for graph construction tests. Matches the pattern
     /// used in `infernum/src/graph/mod.rs` tests.
@@ -695,6 +701,12 @@ mod tests {
         }
     }
 
+    impl infernum::backend::SwigluOps for TestBackend {
+        fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     /// Llama 3.2 1B-like config for testing.
     fn test_config() -> LlamaConfig {
         serde_json::from_str(
@@ -719,8 +731,9 @@ mod tests {
 
         assert_eq!(graph.output_ids().len(), 1);
         let logits_id = graph.output_ids()[0];
-        assert_eq!(graph.node_shape(logits_id), &[seq_len, config.vocab_size]);
-        assert_eq!(graph.node_dtype(logits_id), DType::F32);
+        let logits_ref = (logits_id, 0);
+        assert_eq!(graph.node_shape(logits_ref), &[seq_len, config.vocab_size]);
+        assert_eq!(graph.node_dtype(logits_ref), DType::F32);
     }
 
     #[test]
@@ -732,7 +745,7 @@ mod tests {
         let input_count = graph
             .nodes()
             .iter()
-            .filter(|n| matches!(n.op, Op::Input))
+            .filter(|n| n.op.name() == "input")
             .count();
         assert_eq!(input_count, 3);
     }
@@ -845,6 +858,6 @@ mod tests {
         let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16);
 
         let logits_id = graph.output_ids()[0];
-        assert_eq!(graph.node_shape(logits_id), &[seq_len, 32000]);
+        assert_eq!(graph.node_shape((logits_id, 0)), &[seq_len, 32000]);
     }
 }
