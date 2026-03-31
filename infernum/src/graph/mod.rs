@@ -10,7 +10,6 @@ mod builder_traits;
 pub mod builtin_ops;
 mod node;
 mod op_node;
-mod ops;
 pub mod optimizer;
 mod planner;
 mod weight_store;
@@ -25,7 +24,6 @@ pub use builder_traits::{
 pub use builtin_ops::MoeExpertIds;
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use op_node::{OpNode, OutputRef};
-pub use ops::Op;
 pub use planner::{plan, BufferSlot, ExecutionPlan};
 pub use weight_store::WeightStore;
 

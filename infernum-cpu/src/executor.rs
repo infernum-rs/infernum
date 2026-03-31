@@ -185,7 +185,7 @@ fn write_tensor(
 /// * `nodes` — Graph nodes (indexed by `NodeId`).
 /// * `arena` — Pre-allocated byte arena for intermediate tensors.
 /// * `weights` — Loaded model weights (embedding, norm, linear, bias, etc.).
-/// * `inputs` — External input tensors, one per `Op::Input` in schedule order.
+/// * `inputs` — External input tensors, one per `InputOp` in schedule order.
 /// * `output_nodes` — `NodeId`s of the graph outputs to collect.
 ///
 /// # Errors

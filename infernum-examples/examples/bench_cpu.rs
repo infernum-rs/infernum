@@ -23,9 +23,10 @@ use serde::Deserialize;
 
 use infernum::backend::MatmulOps;
 use infernum::dtype::DType;
+use infernum::graph::GraphNode;
 use infernum::graph::{plan, Arena, WeightId, WeightStore};
 use infernum::Tensor;
-use infernum::{GenerateOptions, NodeId, Op};
+use infernum::{GenerateOptions, NodeId};
 use infernum_cpu::executor::{execute, KvCacheStore};
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
 use infernum_gemma::GemmaModel;
@@ -397,14 +398,14 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
 /// Returns `(cache_input_ids, concat_ids)` where each vec contains entries
 /// in order `[k_layer0, v_layer0, k_layer1, v_layer1, ...]`.
 fn find_kv_cache_node_ids(
-    nodes: &[infernum::GraphNode],
+    nodes: &[GraphNode<CpuBackend>],
     num_layers: usize,
 ) -> (Vec<NodeId>, Vec<NodeId>) {
     // KV cache inputs are Input nodes after the first 3 (token, cos, sin).
     let input_ids: Vec<NodeId> = nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| matches!(n.op, Op::Input))
+        .filter(|(_, n)| n.op.name() == "input")
         .skip(3) // skip token_id, cos, sin
         .map(|(i, _)| NodeId::from_index(i as u32))
         .collect();
@@ -414,7 +415,7 @@ fn find_kv_cache_node_ids(
     let concat_ids: Vec<NodeId> = nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| matches!(n.op, Op::ConcatSeq))
+        .filter(|(_, n)| n.op.name() == "concat_seq")
         .map(|(i, _)| NodeId::from_index(i as u32))
         .collect();
     assert_eq!(
