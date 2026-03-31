@@ -4,20 +4,21 @@ use std::marker::PhantomData;
 
 use smallvec::SmallVec;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, MatmulOps};
 use crate::dtype::DType;
 
+use super::builtin_ops::InputOp;
 use super::node::{GraphNode, NodeId, WeightId, WeightMeta};
-use super::ops::Op;
+use super::op_node::{OpNode, OutputRef};
 
 /// A computation graph parameterised by a backend.
 ///
-/// Nodes represent operations; edges (stored as `NodeId` lists in each
+/// Nodes represent operations; edges (stored as `OutputRef` lists in each
 /// `GraphNode`) represent data dependencies. Weights are registered
 /// separately and referenced by `WeightId`.
-pub struct Graph<B: Backend> {
+pub struct Graph<B: Backend + MatmulOps> {
     /// All nodes in topological (insertion) order.
-    pub(crate) nodes: Vec<GraphNode>,
+    pub(crate) nodes: Vec<GraphNode<B>>,
     /// Nodes marked as graph outputs.
     pub(crate) outputs: Vec<NodeId>,
     /// Registered tensor weights (layernorm, embedding, `RoPE`, bias, etc.).
@@ -27,7 +28,7 @@ pub struct Graph<B: Backend> {
     _backend: PhantomData<B>,
 }
 
-impl<B: Backend> Graph<B> {
+impl<B: Backend + MatmulOps> Graph<B> {
     /// Create an empty computation graph.
     #[must_use]
     pub fn new() -> Self {
@@ -76,9 +77,16 @@ impl<B: Backend> Graph<B> {
         id
     }
 
-    /// Add an input node (e.g., token IDs).
-    pub fn add_input(&mut self, shape: &[usize], dtype: DType) -> NodeId {
-        self.push_node(Op::Input, &[], shape.to_vec(), dtype)
+    /// Add an input node (e.g., token IDs). Returns an `OutputRef`.
+    pub fn add_input(&mut self, shape: &[usize], dtype: DType) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(InputOp {
+                shape: shape.to_vec(),
+                dtype,
+            }),
+            &[],
+        );
+        (node_id, 0)
     }
 
     /// Mark a node as a graph output.
@@ -86,68 +94,79 @@ impl<B: Backend> Graph<B> {
         self.outputs.push(node);
     }
 
-    /// Push a single-output node and return its `NodeId`.
+    /// Add a node to the graph. Performs shape/dtype inference via the op's
+    /// `output_shapes` and `output_dtypes` methods.
+    ///
+    /// Returns the `NodeId` of the newly created node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of provided `inputs` does not match the op's
+    /// expected input count (`op.num_inputs()`).
     #[allow(clippy::cast_possible_truncation)] // graph will never have 2^32 nodes
-    pub(crate) fn push_node(
-        &mut self,
-        op: Op,
-        inputs: &[NodeId],
-        shape: Vec<usize>,
-        dtype: DType,
-    ) -> NodeId {
-        let id = NodeId(self.nodes.len() as u32);
+    pub fn add_node(&mut self, op: Box<dyn OpNode<B>>, inputs: &[OutputRef]) -> NodeId {
+        let input_shapes: Vec<&[usize]> = inputs
+            .iter()
+            .map(|&(nid, oidx)| self.output_shape(nid, oidx))
+            .collect();
+        let input_dtypes: Vec<DType> = inputs
+            .iter()
+            .map(|&(nid, oidx)| self.output_dtype(nid, oidx))
+            .collect();
+
+        assert_eq!(
+            inputs.len(),
+            op.num_inputs(),
+            "Op '{}' expects {} inputs, got {}",
+            op.name(),
+            op.num_inputs(),
+            inputs.len()
+        );
+
+        let output_shapes = op.output_shapes(&input_shapes);
+        let output_dtypes = op.output_dtypes(&input_dtypes);
+
+        let node_id = NodeId(self.nodes.len() as u32);
         self.nodes.push(GraphNode {
             op,
             inputs: SmallVec::from_slice(inputs),
-            shape,
-            dtype,
+            output_shapes,
+            output_dtypes,
         });
-        id
+        node_id
     }
 
-    /// Push a multi-output op (two outputs). Returns `(primary, secondary)`.
-    ///
-    /// The primary node carries the actual `Op`. The secondary node is a
-    /// `SecondOutput` that references the primary.
-    pub(crate) fn push_node_pair(
-        &mut self,
-        op: Op,
-        inputs: &[NodeId],
-        shape1: Vec<usize>,
-        dtype1: DType,
-        shape2: Vec<usize>,
-        dtype2: DType,
-    ) -> (NodeId, NodeId) {
-        let primary = self.push_node(op, inputs, shape1, dtype1);
-        let secondary = self.push_node(Op::SecondOutput { source: primary }, &[], shape2, dtype2);
-        (primary, secondary)
+    /// Get the shape of a specific output of a node.
+    #[must_use]
+    pub fn output_shape(&self, id: NodeId, output_idx: u32) -> &[usize] {
+        &self.nodes[id.0 as usize].output_shapes[output_idx as usize]
     }
 
-    /// Push a multi-output op (three outputs). Returns `(first, second, third)`.
+    /// Get the dtype of a specific output of a node.
+    #[must_use]
+    pub fn output_dtype(&self, id: NodeId, output_idx: u32) -> DType {
+        self.nodes[id.0 as usize].output_dtypes[output_idx as usize]
+    }
+
+    /// Get the shape of the output referenced by an `OutputRef`.
     ///
-    /// The first node carries the actual `Op`. The second and third nodes are
-    /// `SecondOutput` nodes referencing the primary.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_node_triple(
-        &mut self,
-        op: Op,
-        inputs: &[NodeId],
-        shape1: Vec<usize>,
-        dtype1: DType,
-        shape2: Vec<usize>,
-        dtype2: DType,
-        shape3: Vec<usize>,
-        dtype3: DType,
-    ) -> (NodeId, NodeId, NodeId) {
-        let primary = self.push_node(op, inputs, shape1, dtype1);
-        let second = self.push_node(Op::SecondOutput { source: primary }, &[], shape2, dtype2);
-        let third = self.push_node(Op::SecondOutput { source: primary }, &[], shape3, dtype3);
-        (primary, second, third)
+    /// Convenience method equivalent to `output_shape(ref.0, ref.1)`.
+    #[must_use]
+    pub fn node_shape(&self, output_ref: OutputRef) -> &[usize] {
+        self.output_shape(output_ref.0, output_ref.1)
+    }
+
+    /// Get the dtype of the output referenced by an `OutputRef`.
+    ///
+    /// Convenience method equivalent to `output_dtype(ref.0, ref.1)`.
+    #[must_use]
+    pub fn node_dtype(&self, output_ref: OutputRef) -> DType {
+        self.output_dtype(output_ref.0, output_ref.1)
     }
 
     /// All nodes in the graph (indexed by `NodeId`).
     #[must_use]
-    pub fn nodes(&self) -> &[GraphNode] {
+    pub fn nodes(&self) -> &[GraphNode<B>] {
         &self.nodes
     }
 
@@ -155,18 +174,6 @@ impl<B: Backend> Graph<B> {
     #[must_use]
     pub fn output_ids(&self) -> &[NodeId] {
         &self.outputs
-    }
-
-    /// Get the shape of a node's output.
-    #[must_use]
-    pub fn node_shape(&self, id: NodeId) -> &[usize] {
-        &self.nodes[id.0 as usize].shape
-    }
-
-    /// Get the dtype of a node's output.
-    #[must_use]
-    pub fn node_dtype(&self, id: NodeId) -> DType {
-        self.nodes[id.0 as usize].dtype
     }
 
     /// Total number of nodes in the graph.
@@ -206,7 +213,7 @@ impl<B: Backend> Graph<B> {
     }
 }
 
-impl<B: Backend> Default for Graph<B> {
+impl<B: Backend + MatmulOps> Default for Graph<B> {
     fn default() -> Self {
         Self::new()
     }

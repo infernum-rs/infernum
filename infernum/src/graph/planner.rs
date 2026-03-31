@@ -10,12 +10,11 @@
 
 use std::collections::VecDeque;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, MatmulOps};
 use crate::dtype::DType;
 
 use super::builder::Graph;
 use super::node::NodeId;
-use super::ops::Op;
 
 /// A planned buffer allocation within the arena.
 #[derive(Clone, Debug)]
@@ -31,18 +30,22 @@ pub struct BufferSlot {
 pub struct ExecutionPlan {
     /// Nodes in topological execution order.
     pub schedule: Vec<NodeId>,
-    /// Buffer slot for each node's primary output, indexed by `NodeId`.
+    /// Buffer slot for each node output, indexed by `(NodeId.index(), output_index)`.
+    /// Outer vec indexed by `NodeId.index()`, inner vec by output index.
     /// `None` for `Input` nodes (they use external buffers) and side-effect ops.
-    pub buffer_slots: Vec<Option<BufferSlot>>,
+    pub buffer_slots: Vec<Vec<Option<BufferSlot>>>,
     /// Total arena size in bytes (peak memory usage).
     pub arena_size: usize,
 }
 
 impl ExecutionPlan {
-    /// Get the buffer slot for a given node.
+    /// Get the buffer slot for a given node's output.
     #[must_use]
-    pub fn slot(&self, id: NodeId) -> Option<&BufferSlot> {
-        self.buffer_slots[id.0 as usize].as_ref()
+    pub fn slot(&self, node: NodeId, output_idx: u32) -> Option<&BufferSlot> {
+        self.buffer_slots
+            .get(node.0 as usize)
+            .and_then(|outputs| outputs.get(output_idx as usize))
+            .and_then(|s| s.as_ref())
     }
 }
 
@@ -51,7 +54,7 @@ impl ExecutionPlan {
 /// # Panics
 /// Panics if the graph contains cycles (should never happen for well-formed graphs).
 #[must_use]
-pub fn plan<B: Backend>(graph: &Graph<B>) -> ExecutionPlan {
+pub fn plan<B: Backend + MatmulOps>(graph: &Graph<B>) -> ExecutionPlan {
     let full_schedule = topological_sort(graph);
     let schedule = eliminate_dead_nodes(graph, full_schedule);
     let last_use = compute_last_use(graph, &schedule);
@@ -66,19 +69,20 @@ pub fn plan<B: Backend>(graph: &Graph<B>) -> ExecutionPlan {
 /// Remove nodes from the schedule that have no consumers and are not graph
 /// outputs or side-effect ops. This eliminates orphaned nodes left behind
 /// by fusion passes (e.g., Silu nodes orphaned by Swiglu fusion).
-fn eliminate_dead_nodes<B: Backend>(graph: &Graph<B>, schedule: Vec<NodeId>) -> Vec<NodeId> {
+fn eliminate_dead_nodes<B: Backend + MatmulOps>(
+    graph: &Graph<B>,
+    schedule: Vec<NodeId>,
+) -> Vec<NodeId> {
     use std::collections::HashSet;
 
     let n = graph.nodes.len();
 
-    // Build a set of all nodes that are consumed by at least one other node.
+    // Build a set of all node IDs that are consumed by at least one other node.
+    // An input `(src_node, output_idx)` means `src_node` is consumed.
     let mut is_consumed = vec![false; n];
     for node in &graph.nodes {
-        for &input in &node.inputs {
-            is_consumed[input.0 as usize] = true;
-        }
-        if let Op::SecondOutput { source } = &node.op {
-            is_consumed[source.0 as usize] = true;
+        for &(src_node, _output_idx) in &node.inputs {
+            is_consumed[src_node.0 as usize] = true;
         }
     }
 
@@ -89,8 +93,9 @@ fn eliminate_dead_nodes<B: Backend>(graph: &Graph<B>, schedule: Vec<NodeId>) -> 
         .into_iter()
         .filter(|&id| {
             let idx = id.0 as usize;
+            let node = &graph.nodes[idx];
             // Keep if: consumed by another node, is a graph output, or has side effects.
-            is_consumed[idx] || output_set.contains(&id) || is_side_effect_op(&graph.nodes[idx].op)
+            is_consumed[idx] || output_set.contains(&id) || node.op.is_side_effect()
         })
         .collect()
 }
@@ -109,47 +114,31 @@ const fn dtype_size_bytes(dtype: DType) -> usize {
     }
 }
 
-/// Returns `true` if the op is a side-effect-only operation that produces no
-/// output buffer.
-const fn is_side_effect_op(op: &Op) -> bool {
-    matches!(op, Op::AppendPaged { .. } | Op::AppendPagedBatched { .. })
-}
-
 /// Topological sort using Kahn's algorithm.
 ///
-/// `SecondOutput` nodes are not included in the main BFS — they are inserted
-/// immediately after their source node so that both outputs are available
-/// before any downstream consumer runs.
+/// Standard BFS over nodes. Each node's inputs are `OutputRef = (NodeId, u32)`;
+/// the `NodeId` part gives the predecessor.
 #[allow(clippy::cast_possible_truncation)] // graph will never have 2^32 nodes
-fn topological_sort<B: Backend>(graph: &Graph<B>) -> Vec<NodeId> {
+#[allow(clippy::needless_range_loop)]
+fn topological_sort<B: Backend + MatmulOps>(graph: &Graph<B>) -> Vec<NodeId> {
     let n = graph.nodes.len();
     if n == 0 {
         return Vec::new();
     }
 
-    // Identify SecondOutput nodes and build in-degree for the rest.
+    // Build in-degree for each node: count distinct predecessor NodeIds
+    // (not output indices — multiple inputs from the same node count once
+    // per input edge for scheduling purposes, but we use the simpler
+    // approach of counting the number of input edges).
     let mut in_degree = vec![0u32; n];
-    let mut second_outputs: Vec<Vec<NodeId>> = vec![Vec::new(); n];
-    let mut is_second_output = vec![false; n];
-
     for (i, node) in graph.nodes.iter().enumerate() {
-        if let Op::SecondOutput { source } = &node.op {
-            is_second_output[i] = true;
-            second_outputs[source.0 as usize].push(NodeId(i as u32));
-        } else {
-            for &_input in &node.inputs {
-                // Only count edges to non-SecondOutput nodes.
-                if !is_second_output[i] {
-                    in_degree[i] += 1;
-                }
-            }
-        }
+        in_degree[i] = node.inputs.len() as u32;
     }
 
-    // Seed the queue with nodes that have zero in-degree (excluding SecondOutput).
+    // Seed the queue with nodes that have zero in-degree.
     let mut queue = VecDeque::new();
     for i in 0..n {
-        if !is_second_output[i] && in_degree[i] == 0 {
+        if in_degree[i] == 0 {
             queue.push_back(NodeId(i as u32));
         }
     }
@@ -159,24 +148,11 @@ fn topological_sort<B: Backend>(graph: &Graph<B>) -> Vec<NodeId> {
     while let Some(id) = queue.pop_front() {
         schedule.push(id);
 
-        // Insert any SecondOutput nodes immediately after their source.
-        for &second in &second_outputs[id.0 as usize] {
-            schedule.push(second);
-        }
-
         // Decrease in-degree for downstream consumers.
-        //
-        // Count ALL input edges from node j that reference either `id`
-        // itself or any of its SecondOutput nodes. A single consumer may
-        // reference multiple outputs of the same multi-output op (e.g.,
-        // Swiglu takes both outputs of a LinearPair).
         for (j, node) in graph.nodes.iter().enumerate() {
-            if is_second_output[j] {
-                continue;
-            }
             let mut decrements = 0u32;
-            for &input in &node.inputs {
-                if input == id || second_outputs[id.0 as usize].contains(&input) {
+            for &(src_node, _) in &node.inputs {
+                if src_node == id {
                     decrements += 1;
                 }
             }
@@ -189,11 +165,9 @@ fn topological_sort<B: Backend>(graph: &Graph<B>) -> Vec<NodeId> {
         }
     }
 
-    let non_second_count = is_second_output.iter().filter(|&&b| !b).count();
-    let second_count = n - non_second_count;
     assert_eq!(
         schedule.len(),
-        non_second_count + second_count,
+        n,
         "Graph contains a cycle: scheduled {} of {} nodes",
         schedule.len(),
         n,
@@ -202,38 +176,49 @@ fn topological_sort<B: Backend>(graph: &Graph<B>) -> Vec<NodeId> {
     schedule
 }
 
-/// For each node, compute the latest execution step where it is still needed
-/// as an input (i.e., its "last use"). Graph outputs are live until the last step.
-fn compute_last_use<B: Backend>(graph: &Graph<B>, schedule: &[NodeId]) -> Vec<usize> {
+/// For each `(node, output_index)`, compute the latest execution step where
+/// it is still needed as an input. Graph outputs are live until the last step.
+///
+/// Returns a flat vector indexed by a key derived from `(node_index, output_index)`.
+/// We use a `Vec<Vec<usize>>` where outer = node index, inner = output index.
+fn compute_last_use<B: Backend + MatmulOps>(
+    graph: &Graph<B>,
+    schedule: &[NodeId],
+) -> Vec<Vec<usize>> {
     let n = graph.nodes.len();
-    // Default to 0; we'll update with max step.
-    let mut last_use = vec![0usize; n];
+    // Initialise per-output last-use to 0.
+    let mut last_use: Vec<Vec<usize>> = graph
+        .nodes
+        .iter()
+        .map(|node| vec![0usize; node.output_shapes.len()])
+        .collect();
 
     for (step, &id) in schedule.iter().enumerate() {
         let node = &graph.nodes[id.0 as usize];
-        for &input in &node.inputs {
-            let idx = input.0 as usize;
-            if step > last_use[idx] {
-                last_use[idx] = step;
-            }
-        }
-
-        // SecondOutput references its source — the source must stay live at
-        // least until this step.
-        if let Op::SecondOutput { source } = &node.op {
-            let idx = source.0 as usize;
-            if step > last_use[idx] {
-                last_use[idx] = step;
+        for &(src_node, src_output) in &node.inputs {
+            let idx = src_node.0 as usize;
+            let oidx = src_output as usize;
+            if oidx < last_use[idx].len() && step > last_use[idx][oidx] {
+                last_use[idx][oidx] = step;
             }
         }
     }
 
     // Graph outputs are live until the final step.
-    if let Some(&last_step) = schedule.len().checked_sub(1).as_ref() {
+    if let Some(last_step) = schedule.len().checked_sub(1) {
         for &out in &graph.outputs {
             let idx = out.0 as usize;
-            if last_step > last_use[idx] {
-                last_use[idx] = last_step;
+            // Graph outputs reference a NodeId — all outputs of that node
+            // that are used as graph outputs should be kept alive.
+            // In practice, graph outputs are NodeIds pointing at the node,
+            // and consumers select specific output indices. We keep all
+            // outputs of output nodes alive (conservative but correct).
+            if idx < n {
+                for oidx in 0..last_use[idx].len() {
+                    if last_step > last_use[idx][oidx] {
+                        last_use[idx][oidx] = last_step;
+                    }
+                }
             }
         }
     }
@@ -241,7 +226,7 @@ fn compute_last_use<B: Backend>(graph: &Graph<B>, schedule: &[NodeId]) -> Vec<us
     last_use
 }
 
-/// Compute the buffer size in bytes for a node's output.
+/// Compute the buffer size in bytes for a single output.
 fn buffer_size(shape: &[usize], dtype: DType) -> usize {
     let elements: usize = shape.iter().product();
     elements * dtype_size_bytes(dtype)
@@ -252,26 +237,32 @@ fn buffer_size(shape: &[usize], dtype: DType) -> usize {
 /// Maintains a sorted free list of `(offset, size)` gaps. When a buffer dies
 /// (its `last_use < current_step`), its range is returned to the free list
 /// and merged with adjacent gaps.
+///
+/// Each node may produce multiple outputs, each needing its own buffer slot.
 #[allow(clippy::cast_possible_truncation)]
-fn assign_offsets<B: Backend>(
+#[allow(clippy::needless_range_loop)]
+fn assign_offsets<B: Backend + MatmulOps>(
     graph: &Graph<B>,
     schedule: &[NodeId],
-    last_use: &[usize],
-) -> (Vec<Option<BufferSlot>>, usize) {
-    let n = graph.nodes.len();
-    let mut buffer_slots: Vec<Option<BufferSlot>> = vec![None; n];
+    last_use: &[Vec<usize>],
+) -> (Vec<Vec<Option<BufferSlot>>>, usize) {
+    let mut buffer_slots: Vec<Vec<Option<BufferSlot>>> = graph
+        .nodes
+        .iter()
+        .map(|node| vec![None; node.output_shapes.len().max(1)])
+        .collect();
     let mut arena_size: usize = 0;
 
     // Free list: sorted by offset. Each entry is (offset, size).
     let mut free_list: Vec<(usize, usize)> = Vec::new();
 
     // Track which buffers are currently live so we can free them.
-    // (node_index, offset, size, last_use_step)
-    let mut live_buffers: Vec<(usize, usize, usize, usize)> = Vec::new();
+    // (node_index, output_index, offset, size, last_use_step)
+    let mut live_buffers: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
 
     for (step, &id) in schedule.iter().enumerate() {
         // Free buffers whose last_use < current step.
-        live_buffers.retain(|&(_, offset, size, last_step)| {
+        live_buffers.retain(|&(_, _, offset, size, last_step)| {
             if last_step < step {
                 insert_free_range(&mut free_list, offset, size);
                 false
@@ -282,37 +273,46 @@ fn assign_offsets<B: Backend>(
 
         let idx = id.0 as usize;
         let node = &graph.nodes[idx];
+        let num_outputs = node.output_shapes.len();
 
         // Side-effect ops produce no output buffer.
-        if is_side_effect_op(&node.op) {
+        if node.op.is_side_effect() || num_outputs == 0 {
             continue;
         }
 
-        let size = buffer_size(&node.shape, node.dtype);
-        if size == 0 {
-            buffer_slots[idx] = Some(BufferSlot { offset: 0, size: 0 });
-            continue;
-        }
-
-        // Find first-fit gap in the free list.
-        let offset = if let Some(pos) = free_list.iter().position(|&(_, s)| s >= size) {
-            let (gap_offset, gap_size) = free_list[pos];
-            if gap_size == size {
-                free_list.remove(pos);
-            } else {
-                // Shrink the gap.
-                free_list[pos] = (gap_offset + size, gap_size - size);
+        // Allocate a buffer for each output of this node.
+        for oidx in 0..num_outputs {
+            let size = buffer_size(&node.output_shapes[oidx], node.output_dtypes[oidx]);
+            if size == 0 {
+                buffer_slots[idx][oidx] = Some(BufferSlot { offset: 0, size: 0 });
+                continue;
             }
-            gap_offset
-        } else {
-            // Extend the arena.
-            let offset = arena_size;
-            arena_size += size;
-            offset
-        };
 
-        buffer_slots[idx] = Some(BufferSlot { offset, size });
-        live_buffers.push((idx, offset, size, last_use[idx]));
+            // Find first-fit gap in the free list.
+            let offset = if let Some(pos) = free_list.iter().position(|&(_, s)| s >= size) {
+                let (gap_offset, gap_size) = free_list[pos];
+                if gap_size == size {
+                    free_list.remove(pos);
+                } else {
+                    // Shrink the gap.
+                    free_list[pos] = (gap_offset + size, gap_size - size);
+                }
+                gap_offset
+            } else {
+                // Extend the arena.
+                let offset = arena_size;
+                arena_size += size;
+                offset
+            };
+
+            buffer_slots[idx][oidx] = Some(BufferSlot { offset, size });
+            let lu = last_use
+                .get(idx)
+                .and_then(|v| v.get(oidx))
+                .copied()
+                .unwrap_or(step);
+            live_buffers.push((idx, oidx, offset, size, lu));
+        }
     }
 
     (buffer_slots, arena_size)
@@ -368,6 +368,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::dtype::DType;
+    use crate::graph::builder_traits::*;
 
     // Re-use the TestBackend from the parent module's tests. We can't access
     // it directly (it's inside a `#[cfg(test)]` block), so we define a minimal
@@ -447,6 +448,202 @@ mod tests {
         }
     }
 
+    impl crate::backend::MatmulOps for TestBackend {
+        type LinearWeight = DummyTensor;
+
+        fn matmul(_a: &DummyTensor, _b: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn linear(_input: &DummyTensor, _weight: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn dense_weight(tensor: DummyTensor) -> DummyTensor {
+            tensor
+        }
+        fn is_dense_weight(_weight: &DummyTensor) -> bool {
+            true
+        }
+        fn quantize_to_q8(
+            _device: &(),
+            _shape: &[usize],
+            _data: &[f32],
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn upload_host_linear(
+            _device: &(),
+            _weight: &crate::weights::host::HostLinearWeight,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl crate::backend::NormOps for TestBackend {
+        fn rms_norm(
+            _input: &DummyTensor,
+            _weight: &DummyTensor,
+            _eps: f32,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn rms_norm_inplace(
+            _input: &mut DummyTensor,
+            _weight: &DummyTensor,
+            _eps: f32,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+        fn add_rmsnorm(
+            _residual: &DummyTensor,
+            _input: &DummyTensor,
+            _weight: &DummyTensor,
+            _eps: f32,
+        ) -> crate::Result<(DummyTensor, DummyTensor)> {
+            Ok((DummyTensor, DummyTensor))
+        }
+    }
+
+    impl crate::backend::ArithOps for TestBackend {
+        fn add(_a: &DummyTensor, _b: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn add_inplace(_a: &mut DummyTensor, _b: &DummyTensor) -> crate::Result<()> {
+            Ok(())
+        }
+        fn mul(_a: &DummyTensor, _b: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn scale_inplace(_a: &mut DummyTensor, _scale: f32) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::backend::AttentionOps for TestBackend {
+        fn fused_attention_prefill(
+            _q: &DummyTensor,
+            _k: &DummyTensor,
+            _v: &DummyTensor,
+            _offset: usize,
+            _scale: Option<f32>,
+            _softcap: Option<f32>,
+            _sliding_window: Option<usize>,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn fused_attention_decode(
+            _q: &DummyTensor,
+            _k: &DummyTensor,
+            _v: &DummyTensor,
+            _scale: Option<f32>,
+            _softcap: Option<f32>,
+            _sliding_window: Option<usize>,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn fused_attention_prefill_with_lse(
+            _q: &DummyTensor,
+            _k: &DummyTensor,
+            _v: &DummyTensor,
+            _offset: usize,
+            _scale: Option<f32>,
+            _softcap: Option<f32>,
+            _sliding_window: Option<usize>,
+        ) -> crate::Result<(DummyTensor, DummyTensor)> {
+            Ok((DummyTensor, DummyTensor))
+        }
+        fn combine_attention_with_lse(
+            _out1: &DummyTensor,
+            _lse1: &DummyTensor,
+            _out2: &DummyTensor,
+            _lse2: &DummyTensor,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl crate::backend::SwigluOps for TestBackend {
+        fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl crate::backend::TensorOps for TestBackend {
+        fn transpose_2d(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn split_inner_dim(
+            _tensor: &DummyTensor,
+            _dim1: usize,
+            _dim2: usize,
+        ) -> crate::Result<(DummyTensor, DummyTensor)> {
+            Ok((DummyTensor, DummyTensor))
+        }
+        fn concat_inner_dim(_a: &DummyTensor, _b: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn pad_inner_dim(_tensor: &DummyTensor, _new_width: usize) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn broadcast_to_heads(
+            _tensor: &DummyTensor,
+            _num_heads: usize,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn repeat_kv(_tensor: &DummyTensor, _num_repeats: usize) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn concat_rows(_parts: &[DummyTensor]) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl crate::backend::PagedKvCacheOps for TestBackend {
+        fn allocate_paged_kv_cache(
+            _device: &(),
+            _num_layers: usize,
+            _block_config: &crate::block_allocator::BlockConfig,
+            _num_kv_heads: usize,
+            _head_dim: usize,
+            _cache_dtype: DType,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn append_paged(
+            _cache: &mut (),
+            _layer_idx: usize,
+            _block_table: &crate::block_allocator::BlockTable,
+            _k: &DummyTensor,
+            _v: &DummyTensor,
+            _start_pos: usize,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn get_pools(_cache: &(), _layer_idx: usize) -> (&DummyTensor, &DummyTensor) {
+            static DUMMY: DummyTensor = DummyTensor;
+            (&DUMMY, &DUMMY)
+        }
+
+        fn block_size(_cache: &()) -> usize {
+            16
+        }
+
+        fn append_paged_batched(
+            _cache: &mut (),
+            _layer_idx: usize,
+            _k: &DummyTensor,
+            _v: &DummyTensor,
+            _block_tables: &DummyTensor,
+            _positions: &DummyTensor,
+            _batch_size: usize,
+            _max_blocks_per_seq: usize,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test 1: Empty graph
     // -----------------------------------------------------------------------
@@ -473,22 +670,9 @@ mod tests {
         let proj_w = graph.register_linear_weight("proj.weight", &[512, 512], DType::BF16);
 
         let input = graph.add_input(&[8, 512], DType::BF16);
-        let normed = graph.push_node(
-            Op::RmsNorm {
-                weight: norm_w,
-                eps: 1e-5,
-            },
-            &[input],
-            vec![8, 512],
-            DType::BF16,
-        );
-        let projected = graph.push_node(
-            Op::Linear { weight: proj_w },
-            &[normed],
-            vec![8, 512],
-            DType::BF16,
-        );
-        graph.set_output(projected);
+        let normed = graph.add_rms_norm(input, norm_w, 1e-5);
+        let projected = graph.add_linear(normed, proj_w);
+        graph.set_output(projected.0);
 
         let exec = plan(&graph);
 
@@ -496,14 +680,14 @@ mod tests {
         assert!(exec.arena_size > 0);
 
         // All nodes should have buffer slots (including inputs).
-        assert!(exec.slot(input).is_some());
-        assert!(exec.slot(normed).is_some());
-        assert!(exec.slot(projected).is_some());
+        assert!(exec.slot(input.0, 0).is_some());
+        assert!(exec.slot(normed.0, 0).is_some());
+        assert!(exec.slot(projected.0, 0).is_some());
 
         // Schedule must respect dependencies: input before norm, norm before linear.
         let pos = |id: NodeId| exec.schedule.iter().position(|&x| x == id).unwrap();
-        assert!(pos(input) < pos(normed));
-        assert!(pos(normed) < pos(projected));
+        assert!(pos(input.0) < pos(normed.0));
+        assert!(pos(normed.0) < pos(projected.0));
     }
 
     // -----------------------------------------------------------------------
@@ -518,15 +702,10 @@ mod tests {
 
         // All same shape/dtype so buffers are interchangeable.
         let input = graph.add_input(&[4, 128], DType::F32);
-        let a = graph.push_node(
-            Op::Scale { factor: 1.0 },
-            &[input],
-            vec![4, 128],
-            DType::F32,
-        );
-        let b = graph.push_node(Op::Scale { factor: 2.0 }, &[a], vec![4, 128], DType::F32);
-        let c = graph.push_node(Op::Scale { factor: 3.0 }, &[b], vec![4, 128], DType::F32);
-        graph.set_output(c);
+        let a = graph.add_scale(input, 1.0);
+        let b = graph.add_scale(a, 2.0);
+        let c = graph.add_scale(b, 3.0);
+        graph.set_output(c.0);
 
         let exec = plan(&graph);
 
@@ -534,8 +713,8 @@ mod tests {
 
         // A is only used by B. Once B runs, A's buffer can be freed.
         // C should be able to reuse A's offset.
-        let slot_a = exec.slot(a).unwrap();
-        let slot_c = exec.slot(c).unwrap();
+        let slot_a = exec.slot(a.0, 0).unwrap();
+        let slot_c = exec.slot(c.0, 0).unwrap();
         assert_eq!(
             slot_a.offset, slot_c.offset,
             "C should reuse A's buffer offset"
@@ -559,31 +738,21 @@ mod tests {
         let residual = graph.add_input(&[4, 256], DType::F32);
         let delta = graph.add_input(&[4, 256], DType::F32);
 
-        let (updated, normed) = graph.push_node_pair(
-            Op::AddRmsNorm {
-                weight: norm_w,
-                eps: 1e-6,
-            },
-            &[residual, delta],
-            vec![4, 256],
-            DType::F32,
-            vec![4, 256],
-            DType::F32,
-        );
+        let (updated, normed) = graph.add_add_rmsnorm(residual, delta, norm_w, 1e-6);
 
-        graph.set_output(updated);
-        graph.set_output(normed);
+        graph.set_output(updated.0);
+        graph.set_output(normed.0);
 
         let exec = plan(&graph);
 
-        // 2 inputs + primary + secondary = 4 nodes
-        assert_eq!(exec.schedule.len(), 4);
+        // 2 inputs + 1 multi-output node = 3 nodes
+        assert_eq!(exec.schedule.len(), 3);
 
-        // All nodes should have buffer slots (including inputs).
-        assert!(exec.slot(updated).is_some());
-        assert!(exec.slot(normed).is_some());
-        assert!(exec.slot(residual).is_some());
-        assert!(exec.slot(delta).is_some());
+        // Both outputs should have buffer slots.
+        assert!(exec.slot(updated.0, updated.1).is_some());
+        assert!(exec.slot(normed.0, normed.1).is_some());
+        assert!(exec.slot(residual.0, 0).is_some());
+        assert!(exec.slot(delta.0, 0).is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -595,20 +764,10 @@ mod tests {
         let mut graph = Graph::<TestBackend>::new();
 
         let input = graph.add_input(&[4, 64], DType::BF16);
-        let a = graph.push_node(
-            Op::Scale { factor: 1.0 },
-            &[input],
-            vec![4, 64],
-            DType::BF16,
-        );
-        let b = graph.push_node(
-            Op::Scale { factor: 2.0 },
-            &[input],
-            vec![4, 64],
-            DType::BF16,
-        );
-        let c = graph.push_node(Op::Add, &[a, b], vec![4, 64], DType::BF16);
-        graph.set_output(c);
+        let a = graph.add_scale(input, 1.0);
+        let b = graph.add_scale(input, 2.0);
+        let c = graph.add_add(a, b);
+        graph.set_output(c.0);
 
         let exec = plan(&graph);
 
@@ -616,10 +775,10 @@ mod tests {
 
         // Verify topological order: input before A and B, both A and B before C.
         let pos = |id: NodeId| exec.schedule.iter().position(|&x| x == id).unwrap();
-        assert!(pos(input) < pos(a));
-        assert!(pos(input) < pos(b));
-        assert!(pos(a) < pos(c));
-        assert!(pos(b) < pos(c));
+        assert!(pos(input.0) < pos(a.0));
+        assert!(pos(input.0) < pos(b.0));
+        assert!(pos(a.0) < pos(c.0));
+        assert!(pos(b.0) < pos(c.0));
     }
 
     // -----------------------------------------------------------------------
@@ -634,26 +793,18 @@ mod tests {
         let v = graph.add_input(&[8, 64], DType::BF16);
 
         // AppendPaged is a side-effect op — no output buffer.
-        let append = graph.push_node(
-            Op::AppendPaged {
-                layer_idx: 0,
-                start_pos: 0,
-            },
-            &[k, v],
-            vec![],
-            DType::BF16,
-        );
+        let append = graph.add_append_paged(k, v, 0, 0);
 
         let exec = plan(&graph);
 
         assert_eq!(exec.schedule.len(), 3);
         // Side-effect op has no buffer slot.
-        assert!(exec.slot(append).is_none());
+        // append is (NodeId, 0) but op has 0 outputs — no slot.
+        assert!(exec.slot(append.0, 0).is_none());
         // Input nodes get buffer slots, so arena is non-zero.
         assert!(exec.arena_size > 0);
-        // But both inputs share/reuse arena space since they're read before append.
-        assert!(exec.slot(k).is_some());
-        assert!(exec.slot(v).is_some());
+        assert!(exec.slot(k.0, 0).is_some());
+        assert!(exec.slot(v.0, 0).is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -673,11 +824,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 8: LinearPair → consumer uses BOTH primary and SecondOutput
+    // Test 8: LinearPair → consumer uses BOTH outputs
     //
-    // This reproduces the bug where a node (like Swiglu) takes both outputs
-    // of a LinearPair as inputs. The if/else in the BFS decrement only
-    // counted one dependency edge instead of two.
+    // A node (like Swiglu) takes both outputs of a LinearPair as inputs.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -689,39 +838,26 @@ mod tests {
 
         let input = graph.add_input(&[4, 128], DType::F32);
 
-        // LinearPair: primary = gate, secondary = up
-        let (gate, up) = graph.push_node_pair(
-            Op::LinearPair { w1, w2 },
-            &[input],
-            vec![4, 64],
-            DType::F32,
-            vec![4, 64],
-            DType::F32,
-        );
+        // LinearPair: output 0 = gate, output 1 = up
+        let (gate, up) = graph.add_linear_pair(input, w1, w2);
 
         // Swiglu takes BOTH outputs of the pair.
-        let activated = graph.push_node(Op::Swiglu, &[gate, up], vec![4, 64], DType::F32);
-        graph.set_output(activated);
+        let activated = graph.add_swiglu(gate, up);
+        graph.set_output(activated.0);
 
-        // This panics before the fix: "scheduled 3 of 4 nodes"
         let exec = plan(&graph);
 
-        assert_eq!(exec.schedule.len(), 4); // input, gate, up(second), swiglu
+        assert_eq!(exec.schedule.len(), 3); // input, linear_pair, swiglu
         let pos = |id: NodeId| exec.schedule.iter().position(|&x| x == id).unwrap();
-        assert!(pos(gate) < pos(activated));
-        assert!(pos(up) < pos(activated));
+        assert!(pos(gate.0) < pos(activated.0));
     }
 
     // -----------------------------------------------------------------------
-    // Test 9: LinearTriple → two SecondOutputs feed the same consumer
-    //
-    // Reproduces the break-in-else bug: a node takes the 2nd and 3rd
-    // outputs of a LinearTriple. The break after the first match means
-    // the second dependency is never decremented.
+    // Test 9: LinearTriple → consumer uses multiple outputs
     // -----------------------------------------------------------------------
 
     #[test]
-    fn linear_triple_two_second_outputs_same_consumer() {
+    fn linear_triple_outputs_consumed() {
         let mut graph = Graph::<TestBackend>::new();
 
         let w1 = graph.register_linear_weight("w1", &[64, 128], DType::F32);
@@ -730,43 +866,24 @@ mod tests {
 
         let input = graph.add_input(&[4, 128], DType::F32);
 
-        // LinearTriple: primary = out1, second = out2, third = out3
-        let primary = graph.push_node(
-            Op::LinearTriple { w1, w2, w3 },
-            &[input],
-            vec![4, 64],
-            DType::F32,
-        );
-        let second = graph.push_node(
-            Op::SecondOutput { source: primary },
-            &[],
-            vec![4, 64],
-            DType::F32,
-        );
-        let third = graph.push_node(
-            Op::SecondOutput { source: primary },
-            &[],
-            vec![4, 64],
-            DType::F32,
-        );
+        // LinearTriple: outputs 0, 1, 2
+        let (out1, out2, out3) = graph.add_linear_triple(input, w1, w2, w3);
 
-        // Consumer takes the 2nd and 3rd outputs (both SecondOutput nodes).
-        let consumer = graph.push_node(Op::Add, &[second, third], vec![4, 64], DType::F32);
-        graph.set_output(consumer);
+        // Consumer takes the 2nd and 3rd outputs.
+        let consumer = graph.add_add(out2, out3);
+        graph.set_output(consumer.0);
+        // Also keep the first output alive.
+        graph.set_output(out1.0);
 
         let exec = plan(&graph);
 
-        assert_eq!(exec.schedule.len(), 5); // input, primary, second, third, consumer
+        assert_eq!(exec.schedule.len(), 3); // input, linear_triple, add
         let pos = |id: NodeId| exec.schedule.iter().position(|&x| x == id).unwrap();
-        assert!(pos(second) < pos(consumer));
-        assert!(pos(third) < pos(consumer));
+        assert!(pos(out2.0) < pos(consumer.0));
     }
 
     // -----------------------------------------------------------------------
     // Test 10: Combined LinearTriple + LinearPair (mini Llama layer)
-    //
-    // Mimics one transformer layer: LinearTriple for Q/K/V, then
-    // downstream ops, then LinearPair for gate/up → Swiglu.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -785,70 +902,27 @@ mod tests {
         let input = graph.add_input(&[4, 128], DType::F32);
 
         // Pre-attention norm
-        let normed = graph.push_node(
-            Op::RmsNorm {
-                weight: norm_w,
-                eps: 1e-5,
-            },
-            &[input],
-            vec![4, 128],
-            DType::F32,
-        );
+        let normed = graph.add_rms_norm(input, norm_w, 1e-5);
 
         // Q/K/V triple
-        let (q, k, v) = graph.push_node_triple(
-            Op::LinearTriple {
-                w1: wq,
-                w2: wk,
-                w3: wv,
-            },
-            &[normed],
-            vec![4, 64],
-            DType::F32,
-            vec![4, 64],
-            DType::F32,
-            vec![4, 64],
-            DType::F32,
-        );
+        let (q, k, v) = graph.add_linear_triple(normed, wq, wk, wv);
 
         // Attention (uses all three)
-        let attn = graph.push_node(
-            Op::FusedAttentionPrefill {
-                offset: 0,
-                scale: None,
-                softcap: None,
-                sliding_window: None,
-            },
-            &[q, k, v],
-            vec![4, 64],
-            DType::F32,
-        );
+        let attn = graph.add_fused_attention_prefill(q, k, v, 0, None, None, None);
 
         // Output projection
-        let proj = graph.push_node(Op::Linear { weight: wo }, &[attn], vec![4, 128], DType::F32);
+        let proj = graph.add_linear(attn, wo);
 
         // Residual add
-        let residual = graph.push_node(Op::Add, &[input, proj], vec![4, 128], DType::F32);
+        let residual = graph.add_add(input, proj);
 
         // Gate/Up pair → Swiglu
-        let (gate, up) = graph.push_node_pair(
-            Op::LinearPair { w1: wg, w2: wu },
-            &[residual],
-            vec![4, 64],
-            DType::F32,
-            vec![4, 64],
-            DType::F32,
-        );
-        let activated = graph.push_node(Op::Swiglu, &[gate, up], vec![4, 64], DType::F32);
+        let (gate, up) = graph.add_linear_pair(residual, wg, wu);
+        let activated = graph.add_swiglu(gate, up);
 
         // Down projection
-        let down = graph.push_node(
-            Op::Linear { weight: wd },
-            &[activated],
-            vec![4, 128],
-            DType::F32,
-        );
-        graph.set_output(down);
+        let down = graph.add_linear(activated, wd);
+        graph.set_output(down.0);
 
         let exec = plan(&graph);
 

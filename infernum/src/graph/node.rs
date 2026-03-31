@@ -2,9 +2,10 @@
 
 use smallvec::SmallVec;
 
+use crate::backend::{Backend, MatmulOps};
 use crate::dtype::DType;
 
-use super::ops::Op;
+use super::op_node::{OpNode, OutputRef};
 
 /// Index into `Graph::nodes`. Lightweight handle returned by `add_*` methods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -64,15 +65,25 @@ pub struct WeightMeta {
     pub dtype: DType,
 }
 
-/// A node in the computation graph.
-#[derive(Clone, Debug)]
-pub struct GraphNode {
+/// A node in the computation graph, parameterised by the backend.
+pub struct GraphNode<B: Backend + MatmulOps> {
     /// The operation this node performs.
-    pub op: Op,
-    /// Input node IDs (edges in the graph).
-    pub inputs: SmallVec<[NodeId; 4]>,
-    /// Shape of the primary output.
-    pub shape: Vec<usize>,
-    /// Data type of the primary output.
-    pub dtype: DType,
+    pub op: Box<dyn OpNode<B>>,
+    /// Input references (edges in the graph): `(node_id, output_index)`.
+    pub inputs: SmallVec<[OutputRef; 4]>,
+    /// Shapes of each output tensor.
+    pub output_shapes: Vec<Vec<usize>>,
+    /// Data types of each output tensor.
+    pub output_dtypes: Vec<DType>,
+}
+
+impl<B: Backend + MatmulOps> std::fmt::Debug for GraphNode<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphNode")
+            .field("op", &self.op.name())
+            .field("inputs", &self.inputs)
+            .field("output_shapes", &self.output_shapes)
+            .field("output_dtypes", &self.output_dtypes)
+            .finish()
+    }
 }

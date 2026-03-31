@@ -5,6 +5,8 @@
 //! stores `Box<dyn OpNode<B>>` inside each node, decoupling the static
 //! graph structure from the concrete op implementations.
 
+use std::any::Any;
+
 use crate::backend::{Backend, MatmulOps};
 use crate::dtype::DType;
 use crate::Result;
@@ -53,4 +55,7 @@ pub trait OpNode<B: Backend + MatmulOps>: Send + Sync + std::fmt::Debug {
     fn is_side_effect(&self) -> bool {
         false
     }
+
+    /// Downcast to a concrete type for optimizer fusion passes.
+    fn as_any(&self) -> &dyn Any;
 }

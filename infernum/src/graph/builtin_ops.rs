@@ -6,6 +6,8 @@
 //! interface (KV cache, communicator, closure-based dispatch) panic at
 //! runtime and must be handled specially by the executor.
 
+use std::any::Any;
+
 use crate::backend::{
     ArithOps, AttentionOps, Backend, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, NormOps,
     RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
@@ -73,6 +75,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for InputOp {
     ) -> Result<Vec<B::Tensor>> {
         panic!("InputOp is handled specially by the executor")
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +125,9 @@ impl<B: Backend + MatmulOps + EmbedOps> OpNode<B> for EmbeddingGatherOp {
         let result = B::embedding_gather_tensor(table, inputs[0], seq_len)?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +172,9 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormOp {
         let result = B::rms_norm(inputs[0], w, self.eps)?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +218,9 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for AddRmsNormOp {
         let w = weights.tensor_weight(self.weight);
         let (updated, normed) = B::add_rmsnorm(inputs[0], inputs[1], w, self.eps)?;
         Ok(vec![updated, normed])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -253,6 +267,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearOp {
         let w = weights.linear_weight(self.weight);
         let result = B::linear(inputs[0], w)?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -306,6 +323,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearPairOp {
         let w2 = weights.linear_weight(self.w2);
         let (r1, r2) = B::linear_pair(inputs[0], w1, w2)?;
         Ok(vec![r1, r2])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -368,6 +388,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
         let (r1, r2, r3) = B::linear_triple(inputs[0], w1, w2, w3)?;
         Ok(vec![r1, r2, r3])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +427,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::matmul(inputs[0], inputs[1])?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -443,6 +469,9 @@ impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
         let result = B::matmul_bf16_f32(inputs[0], inputs[1])?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +509,9 @@ impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
         let result = B::swiglu(inputs[0], inputs[1])?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +548,9 @@ impl<B: Backend + MatmulOps + GegluOps> OpNode<B> for GegluOp {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::geglu(inputs[0], inputs[1])?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -557,6 +592,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
              direct execution is not supported"
         )
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +629,9 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::add(inputs[0], inputs[1])?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -631,6 +672,9 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
         let result = B::add(inputs[0], inputs[1])?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +709,9 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for MulOp {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::mul(inputs[0], inputs[1])?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -710,6 +757,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for ScaleOp {
              handled specially by the executor"
         )
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +804,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for BiasAddOp {
              handled specially by the executor"
         )
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +846,9 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeOp {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::apply_rope(inputs[0], inputs[1], inputs[2], self.offset)?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -836,6 +892,9 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeBatchedOp {
             B::apply_rope_batched(inputs[0], inputs[1], inputs[2], inputs[3], self.batch_size)?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +935,9 @@ impl<B: Backend + MatmulOps + RopeInterleavedOps> OpNode<B> for RopeInterleavedO
     ) -> Result<Vec<B::Tensor>> {
         let result = B::apply_rope_interleaved(inputs[0], inputs[1], inputs[2], self.offset)?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -932,6 +994,9 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionPrefillO
         )?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -973,6 +1038,9 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionDecodeOp
         let result =
             B::fused_attention_decode(inputs[0], inputs[1], inputs[2], None, self.softcap, None)?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1025,6 +1093,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
     ) -> Result<Vec<B::Tensor>> {
         panic!("PagedAttentionDecodeOp requires KV cache access; handled specially by the executor")
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1141,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedOp {
     fn is_side_effect(&self) -> bool {
         true
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,6 +1186,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
     }
     fn is_side_effect(&self) -> bool {
         true
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1163,6 +1240,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for GatherPagedKvOp {
     ) -> Result<Vec<B::Tensor>> {
         panic!("GatherPagedKvOp requires KV cache access; handled specially by the executor")
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1202,6 +1282,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for ReshapeOp {
         _device: &B::DeviceHandle,
     ) -> Result<Vec<B::Tensor>> {
         panic!("ReshapeOp is a zero-copy view; handled specially by the executor")
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1245,6 +1328,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
     ) -> Result<Vec<B::Tensor>> {
         panic!("SliceViewOp is a zero-copy view; handled specially by the executor")
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,6 +1367,9 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for Transpose2dOp {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::transpose_2d(inputs[0])?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1331,6 +1420,9 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
         let (left, right) = B::split_inner_dim(inputs[0], self.left_size, right_size)?;
         Ok(vec![left, right])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,6 +1463,9 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for ConcatInnerDimOp {
         let result = B::concat_inner_dim(inputs[0], inputs[1])?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,6 +1505,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for ConcatSeqOp {
         _device: &B::DeviceHandle,
     ) -> Result<Vec<B::Tensor>> {
         panic!("ConcatSeqOp requires backend-specific concat; handled by the executor")
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1453,6 +1551,9 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for RepeatKvOp {
         let result = B::repeat_kv(inputs[0], self.num_repeats)?;
         Ok(vec![result])
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,6 +1594,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
     ) -> Result<Vec<B::Tensor>> {
         panic!("ExtractLastRowOp is a zero-copy view; handled specially by the executor")
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1631,9 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastToF32Op {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::cast_to_f32(inputs[0])?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1565,6 +1672,9 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastFromF32Op {
     ) -> Result<Vec<B::Tensor>> {
         let result = B::cast_from_f32(inputs[0], self.target)?;
         Ok(vec![result])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1615,6 +1725,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSoftmaxOp {
             "MoeDispatchSoftmaxOp requires closure-based expert dispatch; 
              handled by the executor"
         )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1675,6 +1788,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSigmoidOp {
              handled by the executor"
         )
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1711,6 +1827,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for AllReduceSumOp {
         _device: &B::DeviceHandle,
     ) -> Result<Vec<B::Tensor>> {
         panic!("AllReduceSumOp requires communicator access; handled by the executor")
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1756,5 +1875,8 @@ impl<B: Backend + MatmulOps> OpNode<B> for LmHeadOp {
         _device: &B::DeviceHandle,
     ) -> Result<Vec<B::Tensor>> {
         panic!("LmHeadOp requires dtype-dependent dispatch; handled by the executor")
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

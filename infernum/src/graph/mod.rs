@@ -22,9 +22,10 @@ pub use builder_traits::{
     GraphMatmulExtOps, GraphMatmulOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps,
     GraphRopeInterleavedOps, GraphRopeOps, GraphSiluOps, GraphSwigluOps, GraphTensorOps,
 };
+pub use builtin_ops::MoeExpertIds;
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use op_node::{OpNode, OutputRef};
-pub use ops::{MoeExpertIds, Op};
+pub use ops::Op;
 pub use planner::{plan, BufferSlot, ExecutionPlan};
 pub use weight_store::WeightStore;
 
@@ -127,16 +128,9 @@ mod tests {
         assert_eq!(graph.node_dtype(input), DType::BF16);
 
         // Reshape to (2, 256)
-        let reshaped = graph.push_node(
-            Op::Reshape {
-                shape: smallvec::smallvec![2, 256],
-            },
-            &[input],
-            vec![2, 256],
-            DType::BF16,
-        );
+        let reshaped = graph.add_reshape(input, &[2, 256]);
 
-        graph.set_output(reshaped);
+        graph.set_output(reshaped.0);
 
         assert_eq!(graph.len(), 2);
         assert!(!graph.is_empty());
@@ -144,7 +138,7 @@ mod tests {
 
         // Verify the output was recorded.
         assert_eq!(graph.outputs.len(), 1);
-        assert_eq!(graph.outputs[0], reshaped);
+        assert_eq!(graph.outputs[0], reshaped.0);
     }
 
     #[test]
@@ -177,34 +171,21 @@ mod tests {
         let input = graph.add_input(&[8, 512], DType::BF16);
 
         // RmsNorm
-        let normed = graph.push_node(
-            Op::RmsNorm {
-                weight: norm_w,
-                eps: 1e-5,
-            },
-            &[input],
-            vec![8, 512],
-            DType::BF16,
-        );
+        let normed = graph.add_rms_norm(input, norm_w, 1e-5);
 
         // Linear
-        let projected = graph.push_node(
-            Op::Linear { weight: proj_w },
-            &[normed],
-            vec![8, 512],
-            DType::BF16,
-        );
+        let projected = graph.add_linear(normed, proj_w);
 
         // Residual add
-        let added = graph.push_node(Op::Add, &[input, projected], vec![8, 512], DType::BF16);
+        let added = graph.add_add(input, projected);
 
-        graph.set_output(added);
+        graph.set_output(added.0);
 
         assert_eq!(graph.len(), 4); // input, norm, linear, add
         assert_eq!(graph.node_shape(added), &[8, 512]);
 
         // Verify connectivity: the add node should have 2 inputs.
-        let add_node = &graph.nodes[added.0 as usize];
+        let add_node = &graph.nodes[added.0 .0 as usize];
         assert_eq!(add_node.inputs.len(), 2);
         assert_eq!(add_node.inputs[0], input);
         assert_eq!(add_node.inputs[1], projected);
@@ -219,30 +200,23 @@ mod tests {
         let residual = graph.add_input(&[4, 256], DType::F32);
         let delta = graph.add_input(&[4, 256], DType::F32);
 
-        let (updated_residual, normalized) = graph.push_node_pair(
-            Op::AddRmsNorm {
-                weight: norm_w,
-                eps: 1e-6,
-            },
-            &[residual, delta],
-            vec![4, 256],
-            DType::F32,
-            vec![4, 256],
-            DType::F32,
-        );
+        let (updated_residual, normalized) = graph.add_add_rmsnorm(residual, delta, norm_w, 1e-6);
 
-        assert_eq!(graph.len(), 4); // 2 inputs + primary + secondary
+        // Single multi-output node: 2 inputs + 1 add_rmsnorm = 3 nodes
+        assert_eq!(graph.len(), 3);
         assert_eq!(graph.node_shape(updated_residual), &[4, 256]);
         assert_eq!(graph.node_shape(normalized), &[4, 256]);
         assert_eq!(graph.node_dtype(updated_residual), DType::F32);
         assert_eq!(graph.node_dtype(normalized), DType::F32);
 
-        // The secondary node should be a SecondOutput referencing the primary.
-        let secondary_node = &graph.nodes[normalized.0 as usize];
-        match &secondary_node.op {
-            Op::SecondOutput { source } => assert_eq!(*source, updated_residual),
-            other => panic!("Expected SecondOutput, got {other:?}"),
-        }
+        // Both outputs should reference the same node.
+        assert_eq!(updated_residual.0, normalized.0);
+        assert_eq!(updated_residual.1, 0);
+        assert_eq!(normalized.1, 1);
+
+        // The node should be named "add_rms_norm".
+        let node = &graph.nodes[updated_residual.0 .0 as usize];
+        assert_eq!(node.op.name(), "add_rms_norm");
     }
 
     #[test]
@@ -252,12 +226,12 @@ mod tests {
         let a = graph.add_input(&[1, 128], DType::F32);
         let b = graph.add_input(&[1, 128], DType::F32);
 
-        graph.set_output(a);
-        graph.set_output(b);
+        graph.set_output(a.0);
+        graph.set_output(b.0);
 
         assert_eq!(graph.outputs.len(), 2);
-        assert_eq!(graph.outputs[0], a);
-        assert_eq!(graph.outputs[1], b);
+        assert_eq!(graph.outputs[0], a.0);
+        assert_eq!(graph.outputs[1], b.0);
     }
 
     #[test]
@@ -564,7 +538,7 @@ mod tests {
         let output = graph.add_linear(flat, o_proj);
         assert_eq!(graph.node_shape(output), &[seq_len, hidden]);
 
-        graph.set_output(output);
+        graph.set_output(output.0);
 
         // Total nodes: 3 inputs (cos, sin, hidden) + norm + 3 linears +
         //   3 reshapes + 2 ropes + attention + reshape + linear = 15

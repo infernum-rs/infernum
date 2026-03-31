@@ -462,6 +462,7 @@ impl Op {
 
 /// Weight IDs for a single `MoE` expert's MLP.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_field_names)]
 pub struct MoeExpertIds {
     /// Gate projection weight ID.
     pub gate_proj: WeightId,

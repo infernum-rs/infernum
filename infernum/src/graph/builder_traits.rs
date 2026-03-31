@@ -1,11 +1,9 @@
 //! Graph builder traits — conditionally implemented on `Graph<B>`
 //! when the backend `B` implements the corresponding op trait.
 //!
-//! Each method performs shape inference from its inputs and pushes a
-//! new node (or nodes) into the graph. This keeps model-building code
-//! high-level while ensuring shapes are tracked at construction time.
-
-use smallvec::SmallVec;
+//! Each method constructs the appropriate op struct from `builtin_ops`,
+//! boxes it, and calls `graph.add_node()`. Shape inference is handled
+//! by the op's `output_shapes()` method.
 
 use crate::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
@@ -14,8 +12,17 @@ use crate::backend::{
 use crate::dtype::DType;
 
 use super::builder::Graph;
-use super::node::{NodeId, WeightId};
-use super::ops::Op;
+use super::builtin_ops::{
+    AddInplaceOp, AddOp, AddRmsNormOp, AppendPagedBatchedOp, AppendPagedOp, BiasAddOp,
+    CastFromF32Op, CastToF32Op, ConcatInnerDimOp, ConcatSeqOp, EmbeddingGatherOp, ExtractLastRowOp,
+    FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp, LinearOp,
+    LinearPairOp, LinearTripleOp, LmHeadOp, MatmulBf16F32Op, MatmulOp, MulOp,
+    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp,
+    RopeInterleavedOp as RopeIntOp, RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp,
+    Transpose2dOp,
+};
+use super::node::WeightId;
+use super::op_node::OutputRef;
 
 // ---------------------------------------------------------------------------
 // EmbedOps
@@ -26,22 +33,24 @@ pub trait GraphEmbedOps {
     /// Embedding table lookup.
     ///
     /// `table` is a tensor weight with shape `(vocab_size, embed_dim)`.
-    /// `token_ids` is a node with shape `(seq_len,)`.
+    /// `token_ids` is an output reference with shape `(seq_len,)`.
     /// Output shape: `(seq_len, embed_dim)`.
-    fn add_embedding_gather(&mut self, table: WeightId, token_ids: NodeId) -> NodeId;
+    fn add_embedding_gather(&mut self, table: WeightId, token_ids: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + EmbedOps> GraphEmbedOps for Graph<B> {
-    fn add_embedding_gather(&mut self, table: WeightId, token_ids: NodeId) -> NodeId {
-        let seq_len = self.node_shape(token_ids)[0];
+impl<B: Backend + MatmulOps + EmbedOps> GraphEmbedOps for Graph<B> {
+    fn add_embedding_gather(&mut self, table: WeightId, token_ids: OutputRef) -> OutputRef {
         let embed_dim = self.tensor_weight_meta(table).shape[1];
         let dtype = self.tensor_weight_meta(table).dtype;
-        self.push_node(
-            Op::EmbeddingGather { table },
+        let node_id = self.add_node(
+            Box::new(EmbeddingGatherOp {
+                table,
+                embed_dim,
+                dtype,
+            }),
             &[token_ids],
-            vec![seq_len, embed_dim],
-            dtype,
-        )
+        );
+        (node_id, 0)
     }
 }
 
@@ -52,7 +61,7 @@ impl<B: Backend + EmbedOps> GraphEmbedOps for Graph<B> {
 /// Graph builder methods for normalization operations.
 pub trait GraphNormOps {
     /// RMS normalization. Output shape = input shape, same dtype.
-    fn add_rms_norm(&mut self, input: NodeId, weight: WeightId, eps: f32) -> NodeId;
+    fn add_rms_norm(&mut self, input: OutputRef, weight: WeightId, eps: f32) -> OutputRef;
 
     /// Fused residual add + RMS norm.
     ///
@@ -60,37 +69,28 @@ pub trait GraphNormOps {
     /// shape and dtype as `residual`.
     fn add_add_rmsnorm(
         &mut self,
-        residual: NodeId,
-        delta: NodeId,
+        residual: OutputRef,
+        delta: OutputRef,
         weight: WeightId,
         eps: f32,
-    ) -> (NodeId, NodeId);
+    ) -> (OutputRef, OutputRef);
 }
 
-impl<B: Backend + NormOps> GraphNormOps for Graph<B> {
-    fn add_rms_norm(&mut self, input: NodeId, weight: WeightId, eps: f32) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        self.push_node(Op::RmsNorm { weight, eps }, &[input], shape, dtype)
+impl<B: Backend + MatmulOps + NormOps> GraphNormOps for Graph<B> {
+    fn add_rms_norm(&mut self, input: OutputRef, weight: WeightId, eps: f32) -> OutputRef {
+        let node_id = self.add_node(Box::new(RmsNormOp { weight, eps }), &[input]);
+        (node_id, 0)
     }
 
     fn add_add_rmsnorm(
         &mut self,
-        residual: NodeId,
-        delta: NodeId,
+        residual: OutputRef,
+        delta: OutputRef,
         weight: WeightId,
         eps: f32,
-    ) -> (NodeId, NodeId) {
-        let shape = self.node_shape(residual).to_vec();
-        let dtype = self.node_dtype(residual);
-        self.push_node_pair(
-            Op::AddRmsNorm { weight, eps },
-            &[residual, delta],
-            shape.clone(),
-            dtype,
-            shape,
-            dtype,
-        )
+    ) -> (OutputRef, OutputRef) {
+        let node_id = self.add_node(Box::new(AddRmsNormOp { weight, eps }), &[residual, delta]);
+        ((node_id, 0), (node_id, 1))
     }
 }
 
@@ -103,104 +103,86 @@ pub trait GraphMatmulOps {
     /// Linear projection. Input `[..., in_features]` → output `[..., out_features]`.
     ///
     /// `out_features` is inferred from `weight` metadata `shape[0]`.
-    fn add_linear(&mut self, input: NodeId, weight: WeightId) -> NodeId;
+    fn add_linear(&mut self, input: OutputRef, weight: WeightId) -> OutputRef;
 
     /// Paired linear projection from the same input.
     ///
     /// Returns `(out1, out2)` where each output has its own `out_features`
     /// inferred from the respective weight metadata.
-    fn add_linear_pair(&mut self, input: NodeId, w1: WeightId, w2: WeightId) -> (NodeId, NodeId);
+    fn add_linear_pair(
+        &mut self,
+        input: OutputRef,
+        w1: WeightId,
+        w2: WeightId,
+    ) -> (OutputRef, OutputRef);
 
     /// Triple linear projection from the same input (Q/K/V).
     ///
     /// Returns `(out1, out2, out3)`.
     fn add_linear_triple(
         &mut self,
-        input: NodeId,
+        input: OutputRef,
         w1: WeightId,
         w2: WeightId,
         w3: WeightId,
-    ) -> (NodeId, NodeId, NodeId);
+    ) -> (OutputRef, OutputRef, OutputRef);
 
     /// Raw matrix multiplication. `[M, K] × [K, N] → [M, N]`.
-    fn add_matmul(&mut self, a: NodeId, b: NodeId) -> NodeId;
+    fn add_matmul(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 }
 
 impl<B: Backend + MatmulOps> GraphMatmulOps for Graph<B> {
-    fn add_linear(&mut self, input: NodeId, weight: WeightId) -> NodeId {
-        let in_shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
+    fn add_linear(&mut self, input: OutputRef, weight: WeightId) -> OutputRef {
         let out_features = self.linear_weight_meta(weight).shape[0];
-        let mut out_shape = in_shape;
-        *out_shape
-            .last_mut()
-            .expect("input must have at least one dimension") = out_features;
-        self.push_node(Op::Linear { weight }, &[input], out_shape, dtype)
+        let node_id = self.add_node(
+            Box::new(LinearOp {
+                weight,
+                out_features,
+            }),
+            &[input],
+        );
+        (node_id, 0)
     }
 
-    fn add_linear_pair(&mut self, input: NodeId, w1: WeightId, w2: WeightId) -> (NodeId, NodeId) {
-        let in_shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
+    fn add_linear_pair(
+        &mut self,
+        input: OutputRef,
+        w1: WeightId,
+        w2: WeightId,
+    ) -> (OutputRef, OutputRef) {
         let out1 = self.linear_weight_meta(w1).shape[0];
         let out2 = self.linear_weight_meta(w2).shape[0];
-        let mut shape1 = in_shape.clone();
-        *shape1
-            .last_mut()
-            .expect("input must have at least one dimension") = out1;
-        let mut shape2 = in_shape;
-        *shape2
-            .last_mut()
-            .expect("input must have at least one dimension") = out2;
-        self.push_node_pair(
-            Op::LinearPair { w1, w2 },
-            &[input],
-            shape1,
-            dtype,
-            shape2,
-            dtype,
-        )
+        let node_id = self.add_node(Box::new(LinearPairOp { w1, w2, out1, out2 }), &[input]);
+        ((node_id, 0), (node_id, 1))
     }
 
     fn add_linear_triple(
         &mut self,
-        input: NodeId,
+        input: OutputRef,
         w1: WeightId,
         w2: WeightId,
         w3: WeightId,
-    ) -> (NodeId, NodeId, NodeId) {
-        let in_shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        let o1 = self.linear_weight_meta(w1).shape[0];
-        let o2 = self.linear_weight_meta(w2).shape[0];
-        let o3 = self.linear_weight_meta(w3).shape[0];
-        let mut s1 = in_shape.clone();
-        *s1.last_mut()
-            .expect("input must have at least one dimension") = o1;
-        let mut s2 = in_shape.clone();
-        *s2.last_mut()
-            .expect("input must have at least one dimension") = o2;
-        let mut s3 = in_shape;
-        *s3.last_mut()
-            .expect("input must have at least one dimension") = o3;
-        self.push_node_triple(
-            Op::LinearTriple { w1, w2, w3 },
+    ) -> (OutputRef, OutputRef, OutputRef) {
+        let out1 = self.linear_weight_meta(w1).shape[0];
+        let out2 = self.linear_weight_meta(w2).shape[0];
+        let out3 = self.linear_weight_meta(w3).shape[0];
+        let node_id = self.add_node(
+            Box::new(LinearTripleOp {
+                w1,
+                w2,
+                w3,
+                out1,
+                out2,
+                out3,
+            }),
             &[input],
-            s1,
-            dtype,
-            s2,
-            dtype,
-            s3,
-            dtype,
-        )
+        );
+        ((node_id, 0), (node_id, 1), (node_id, 2))
     }
 
-    fn add_matmul(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let a_shape = self.node_shape(a);
-        let b_shape = self.node_shape(b);
-        let m = a_shape[0];
-        let n = b_shape[1];
-        let dtype = self.node_dtype(a);
-        self.push_node(Op::Matmul, &[a, b], vec![m, n], dtype)
+    fn add_matmul(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(MatmulOp), &[a, b]);
+        (node_id, 0)
     }
 }
 
@@ -213,16 +195,13 @@ pub trait GraphMatmulExtOps {
     /// Mixed-precision matmul: bf16 inputs → f32 output.
     ///
     /// `[M, K] × [K, N] → [M, N]` with dtype `F32`.
-    fn add_matmul_bf16_f32(&mut self, a: NodeId, b: NodeId) -> NodeId;
+    fn add_matmul_bf16_f32(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulExtOps> GraphMatmulExtOps for Graph<B> {
-    fn add_matmul_bf16_f32(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let a_shape = self.node_shape(a);
-        let b_shape = self.node_shape(b);
-        let m = a_shape[0];
-        let n = b_shape[1];
-        self.push_node(Op::MatmulBf16F32, &[a, b], vec![m, n], DType::F32)
+impl<B: Backend + MatmulOps + MatmulExtOps> GraphMatmulExtOps for Graph<B> {
+    fn add_matmul_bf16_f32(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(MatmulBf16F32Op), &[a, b]);
+        (node_id, 0)
     }
 }
 
@@ -233,41 +212,37 @@ impl<B: Backend + MatmulExtOps> GraphMatmulExtOps for Graph<B> {
 /// Graph builder methods for arithmetic operations.
 pub trait GraphArithOps {
     /// Element-wise addition. Output shape = first input shape, same dtype.
-    fn add_add(&mut self, a: NodeId, b: NodeId) -> NodeId;
+    fn add_add(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 
     /// In-place addition. Output shape = first input shape, same dtype.
-    fn add_add_inplace(&mut self, a: NodeId, b: NodeId) -> NodeId;
+    fn add_add_inplace(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 
     /// Element-wise multiplication. Output shape = first input shape, same dtype.
-    fn add_mul(&mut self, a: NodeId, b: NodeId) -> NodeId;
+    fn add_mul(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 
     /// Uniform scalar scaling. Output shape = input shape, same dtype.
-    fn add_scale(&mut self, input: NodeId, factor: f32) -> NodeId;
+    fn add_scale(&mut self, input: OutputRef, factor: f32) -> OutputRef;
 }
 
-impl<B: Backend + ArithOps> GraphArithOps for Graph<B> {
-    fn add_add(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let shape = self.node_shape(a).to_vec();
-        let dtype = self.node_dtype(a);
-        self.push_node(Op::Add, &[a, b], shape, dtype)
+impl<B: Backend + MatmulOps + ArithOps> GraphArithOps for Graph<B> {
+    fn add_add(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(AddOp), &[a, b]);
+        (node_id, 0)
     }
 
-    fn add_add_inplace(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let shape = self.node_shape(a).to_vec();
-        let dtype = self.node_dtype(a);
-        self.push_node(Op::AddInplace, &[a, b], shape, dtype)
+    fn add_add_inplace(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(AddInplaceOp), &[a, b]);
+        (node_id, 0)
     }
 
-    fn add_mul(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let shape = self.node_shape(a).to_vec();
-        let dtype = self.node_dtype(a);
-        self.push_node(Op::Mul, &[a, b], shape, dtype)
+    fn add_mul(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(MulOp), &[a, b]);
+        (node_id, 0)
     }
 
-    fn add_scale(&mut self, input: NodeId, factor: f32) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        self.push_node(Op::Scale { factor }, &[input], shape, dtype)
+    fn add_scale(&mut self, input: OutputRef, factor: f32) -> OutputRef {
+        let node_id = self.add_node(Box::new(ScaleOp { factor }), &[input]);
+        (node_id, 0)
     }
 }
 
@@ -278,14 +253,13 @@ impl<B: Backend + ArithOps> GraphArithOps for Graph<B> {
 /// Graph builder methods for bias addition.
 pub trait GraphBiasOps {
     /// Bias addition. Output shape = input shape, same dtype.
-    fn add_bias_add(&mut self, input: NodeId, bias: WeightId) -> NodeId;
+    fn add_bias_add(&mut self, input: OutputRef, bias: WeightId) -> OutputRef;
 }
 
-impl<B: Backend + BiasOps> GraphBiasOps for Graph<B> {
-    fn add_bias_add(&mut self, input: NodeId, bias: WeightId) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        self.push_node(Op::BiasAdd { bias }, &[input], shape, dtype)
+impl<B: Backend + MatmulOps + BiasOps> GraphBiasOps for Graph<B> {
+    fn add_bias_add(&mut self, input: OutputRef, bias: WeightId) -> OutputRef {
+        let node_id = self.add_node(Box::new(BiasAddOp { bias }), &[input]);
+        (node_id, 0)
     }
 }
 
@@ -296,14 +270,13 @@ impl<B: Backend + BiasOps> GraphBiasOps for Graph<B> {
 /// Graph builder methods for `SwiGLU` activation.
 pub trait GraphSwigluOps {
     /// `silu(gate) * up`. Output shape = gate shape, same dtype.
-    fn add_swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId;
+    fn add_swiglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + SwigluOps> GraphSwigluOps for Graph<B> {
-    fn add_swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
-        let shape = self.node_shape(gate).to_vec();
-        let dtype = self.node_dtype(gate);
-        self.push_node(Op::Swiglu, &[gate, up], shape, dtype)
+impl<B: Backend + MatmulOps + SwigluOps> GraphSwigluOps for Graph<B> {
+    fn add_swiglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(SwigluOp), &[gate, up]);
+        (node_id, 0)
     }
 }
 
@@ -314,32 +287,30 @@ impl<B: Backend + SwigluOps> GraphSwigluOps for Graph<B> {
 /// Graph builder methods for `GeGLU` activation.
 pub trait GraphGegluOps {
     /// `gelu(gate) * up`. Output shape = gate shape, same dtype.
-    fn add_geglu(&mut self, gate: NodeId, up: NodeId) -> NodeId;
+    fn add_geglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + GegluOps> GraphGegluOps for Graph<B> {
-    fn add_geglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
-        let shape = self.node_shape(gate).to_vec();
-        let dtype = self.node_dtype(gate);
-        self.push_node(Op::Geglu, &[gate, up], shape, dtype)
+impl<B: Backend + MatmulOps + GegluOps> GraphGegluOps for Graph<B> {
+    fn add_geglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(GegluOp), &[gate, up]);
+        (node_id, 0)
     }
 }
 
 // ---------------------------------------------------------------------------
-// SiluOps (primitive — no backend trait bound needed)
+// SiluOps (primitive — used for pre-fusion SiLU)
 // ---------------------------------------------------------------------------
 
 /// Graph builder methods for `SiLU` activation.
 pub trait GraphSiluOps {
     /// `silu(input) = input * sigmoid(input)`. Output shape = input shape, same dtype.
-    fn add_silu(&mut self, input: NodeId) -> NodeId;
+    fn add_silu(&mut self, input: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend> GraphSiluOps for Graph<B> {
-    fn add_silu(&mut self, input: NodeId) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        self.push_node(Op::Silu, &[input], shape, dtype)
+impl<B: Backend + MatmulOps> GraphSiluOps for Graph<B> {
+    fn add_silu(&mut self, input: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(SiluOp), &[input]);
+        (node_id, 0)
     }
 }
 
@@ -350,21 +321,21 @@ impl<B: Backend> GraphSiluOps for Graph<B> {
 /// Graph builder methods for type-casting operations.
 pub trait GraphCastOps {
     /// Cast to f32. Output shape = input shape, dtype = `F32`.
-    fn add_cast_to_f32(&mut self, input: NodeId) -> NodeId;
+    fn add_cast_to_f32(&mut self, input: OutputRef) -> OutputRef;
 
     /// Cast from f32 to `target` dtype. Output shape = input shape.
-    fn add_cast_from_f32(&mut self, input: NodeId, target: DType) -> NodeId;
+    fn add_cast_from_f32(&mut self, input: OutputRef, target: DType) -> OutputRef;
 }
 
-impl<B: Backend + CastOps> GraphCastOps for Graph<B> {
-    fn add_cast_to_f32(&mut self, input: NodeId) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        self.push_node(Op::CastToF32, &[input], shape, DType::F32)
+impl<B: Backend + MatmulOps + CastOps> GraphCastOps for Graph<B> {
+    fn add_cast_to_f32(&mut self, input: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(CastToF32Op), &[input]);
+        (node_id, 0)
     }
 
-    fn add_cast_from_f32(&mut self, input: NodeId, target: DType) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        self.push_node(Op::CastFromF32 { target }, &[input], shape, target)
+    fn add_cast_from_f32(&mut self, input: OutputRef, target: DType) -> OutputRef {
+        let node_id = self.add_node(Box::new(CastFromF32Op { target }), &[input]);
+        (node_id, 0)
     }
 }
 
@@ -375,43 +346,51 @@ impl<B: Backend + CastOps> GraphCastOps for Graph<B> {
 /// Graph builder methods for rotary positional embeddings (half-rotation).
 pub trait GraphRopeOps {
     /// Apply `RoPE`. Output shape = input shape, same dtype.
-    fn add_rope(&mut self, input: NodeId, cos: NodeId, sin: NodeId, offset: usize) -> NodeId;
+    fn add_rope(
+        &mut self,
+        input: OutputRef,
+        cos: OutputRef,
+        sin: OutputRef,
+        offset: usize,
+    ) -> OutputRef;
 
     /// Batched `RoPE` with per-token positions.
     /// Output shape = input shape, same dtype.
     fn add_rope_batched(
         &mut self,
-        input: NodeId,
-        cos: NodeId,
-        sin: NodeId,
-        positions: NodeId,
+        input: OutputRef,
+        cos: OutputRef,
+        sin: OutputRef,
+        positions: OutputRef,
         batch_size: usize,
-    ) -> NodeId;
+    ) -> OutputRef;
 }
 
-impl<B: Backend + RopeOps> GraphRopeOps for Graph<B> {
-    fn add_rope(&mut self, input: NodeId, cos: NodeId, sin: NodeId, offset: usize) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        self.push_node(Op::Rope { offset }, &[input, cos, sin], shape, dtype)
+impl<B: Backend + MatmulOps + RopeOps> GraphRopeOps for Graph<B> {
+    fn add_rope(
+        &mut self,
+        input: OutputRef,
+        cos: OutputRef,
+        sin: OutputRef,
+        offset: usize,
+    ) -> OutputRef {
+        let node_id = self.add_node(Box::new(RopeOp { offset }), &[input, cos, sin]);
+        (node_id, 0)
     }
 
     fn add_rope_batched(
         &mut self,
-        input: NodeId,
-        cos: NodeId,
-        sin: NodeId,
-        positions: NodeId,
+        input: OutputRef,
+        cos: OutputRef,
+        sin: OutputRef,
+        positions: OutputRef,
         batch_size: usize,
-    ) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        self.push_node(
-            Op::RopeBatched { batch_size },
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(RopeBatchedOp { batch_size }),
             &[input, cos, sin, positions],
-            shape,
-            dtype,
-        )
+        );
+        (node_id, 0)
     }
 }
 
@@ -424,29 +403,23 @@ pub trait GraphRopeInterleavedOps {
     /// Apply interleaved `RoPE`. Output shape = input shape, same dtype.
     fn add_rope_interleaved(
         &mut self,
-        input: NodeId,
-        cos: NodeId,
-        sin: NodeId,
+        input: OutputRef,
+        cos: OutputRef,
+        sin: OutputRef,
         offset: usize,
-    ) -> NodeId;
+    ) -> OutputRef;
 }
 
-impl<B: Backend + RopeInterleavedOps> GraphRopeInterleavedOps for Graph<B> {
+impl<B: Backend + MatmulOps + RopeInterleavedOps> GraphRopeInterleavedOps for Graph<B> {
     fn add_rope_interleaved(
         &mut self,
-        input: NodeId,
-        cos: NodeId,
-        sin: NodeId,
+        input: OutputRef,
+        cos: OutputRef,
+        sin: OutputRef,
         offset: usize,
-    ) -> NodeId {
-        let shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        self.push_node(
-            Op::RopeInterleaved { offset },
-            &[input, cos, sin],
-            shape,
-            dtype,
-        )
+    ) -> OutputRef {
+        let node_id = self.add_node(Box::new(RopeIntOp { offset }), &[input, cos, sin]);
+        (node_id, 0)
     }
 }
 
@@ -460,66 +433,57 @@ pub trait GraphAttentionOps {
     #[allow(clippy::too_many_arguments)]
     fn add_fused_attention_prefill(
         &mut self,
-        q: NodeId,
-        k: NodeId,
-        v: NodeId,
+        q: OutputRef,
+        k: OutputRef,
+        v: OutputRef,
         offset: usize,
         scale: Option<f32>,
         softcap: Option<f32>,
         sliding_window: Option<usize>,
-    ) -> NodeId;
+    ) -> OutputRef;
 
     /// Fused attention for single-token decode. Output shape = Q shape, same dtype.
     fn add_fused_attention_decode(
         &mut self,
-        q: NodeId,
-        k: NodeId,
-        v: NodeId,
+        q: OutputRef,
+        k: OutputRef,
+        v: OutputRef,
         softcap: Option<f32>,
-    ) -> NodeId;
+    ) -> OutputRef;
 }
 
-impl<B: Backend + AttentionOps> GraphAttentionOps for Graph<B> {
+impl<B: Backend + MatmulOps + AttentionOps> GraphAttentionOps for Graph<B> {
     fn add_fused_attention_prefill(
         &mut self,
-        q: NodeId,
-        k: NodeId,
-        v: NodeId,
+        q: OutputRef,
+        k: OutputRef,
+        v: OutputRef,
         offset: usize,
         scale: Option<f32>,
         softcap: Option<f32>,
         sliding_window: Option<usize>,
-    ) -> NodeId {
-        let shape = self.node_shape(q).to_vec();
-        let dtype = self.node_dtype(q);
-        self.push_node(
-            Op::FusedAttentionPrefill {
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(FusedAttentionPrefillOp {
                 offset,
                 scale,
                 softcap,
                 sliding_window,
-            },
+            }),
             &[q, k, v],
-            shape,
-            dtype,
-        )
+        );
+        (node_id, 0)
     }
 
     fn add_fused_attention_decode(
         &mut self,
-        q: NodeId,
-        k: NodeId,
-        v: NodeId,
+        q: OutputRef,
+        k: OutputRef,
+        v: OutputRef,
         softcap: Option<f32>,
-    ) -> NodeId {
-        let shape = self.node_shape(q).to_vec();
-        let dtype = self.node_dtype(q);
-        self.push_node(
-            Op::FusedAttentionDecode { softcap },
-            &[q, k, v],
-            shape,
-            dtype,
-        )
+    ) -> OutputRef {
+        let node_id = self.add_node(Box::new(FusedAttentionDecodeOp { softcap }), &[q, k, v]);
+        (node_id, 0)
     }
 }
 
@@ -534,48 +498,45 @@ pub trait GraphPagedAttentionOps {
     #[allow(clippy::too_many_arguments)]
     fn add_paged_attention_decode(
         &mut self,
-        q: NodeId,
-        block_tables: NodeId,
-        seq_lens: NodeId,
-        positions: NodeId,
+        q: OutputRef,
+        block_tables: OutputRef,
+        seq_lens: OutputRef,
+        positions: OutputRef,
         layer_idx: usize,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         block_size: usize,
         sliding_window: Option<usize>,
-    ) -> NodeId;
+    ) -> OutputRef;
 }
 
-impl<B: Backend + PagedAttentionOps> GraphPagedAttentionOps for Graph<B> {
+impl<B: Backend + MatmulOps + PagedAttentionOps> GraphPagedAttentionOps for Graph<B> {
     fn add_paged_attention_decode(
         &mut self,
-        q: NodeId,
-        block_tables: NodeId,
-        seq_lens: NodeId,
-        positions: NodeId,
+        q: OutputRef,
+        block_tables: OutputRef,
+        seq_lens: OutputRef,
+        positions: OutputRef,
         layer_idx: usize,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         block_size: usize,
         sliding_window: Option<usize>,
-    ) -> NodeId {
-        let shape = self.node_shape(q).to_vec();
-        let dtype = self.node_dtype(q);
-        self.push_node(
-            Op::PagedAttentionDecode {
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(PagedAttentionDecodeOp {
                 layer_idx,
                 num_heads,
                 num_kv_heads,
                 head_dim,
                 block_size,
                 sliding_window,
-            },
+            }),
             &[q, block_tables, seq_lens, positions],
-            shape,
-            dtype,
-        )
+        );
+        (node_id, 0)
     }
 }
 
@@ -587,26 +548,27 @@ impl<B: Backend + PagedAttentionOps> GraphPagedAttentionOps for Graph<B> {
 pub trait GraphPagedKvCacheOps {
     /// Append K/V to paged cache (single sequence, side-effect op).
     ///
-    /// Output is a placeholder node with shape `[0]`.
+    /// Returns a dummy `OutputRef` (the op produces no output tensors,
+    /// but a node is created for scheduling).
     fn add_append_paged(
         &mut self,
-        k: NodeId,
-        v: NodeId,
+        k: OutputRef,
+        v: OutputRef,
         layer_idx: usize,
         start_pos: usize,
-    ) -> NodeId;
+    ) -> OutputRef;
 
     /// Batched append K/V to paged cache (side-effect op).
     ///
-    /// Output is a placeholder node with shape `[0]`.
+    /// Returns a dummy `OutputRef`.
     fn add_append_paged_batched(
         &mut self,
-        k: NodeId,
-        v: NodeId,
-        block_tables: NodeId,
-        seq_lens: NodeId,
+        k: OutputRef,
+        v: OutputRef,
+        block_tables: OutputRef,
+        seq_lens: OutputRef,
         layer_idx: usize,
-    ) -> NodeId;
+    ) -> OutputRef;
 
     /// Gather K/V from paged cache.
     ///
@@ -618,44 +580,42 @@ pub trait GraphPagedKvCacheOps {
         num_kv_heads: usize,
         head_dim: usize,
         dtype: DType,
-    ) -> (NodeId, NodeId);
+    ) -> (OutputRef, OutputRef);
 }
 
-impl<B: Backend + PagedKvCacheOps> GraphPagedKvCacheOps for Graph<B> {
+impl<B: Backend + MatmulOps + PagedKvCacheOps> GraphPagedKvCacheOps for Graph<B> {
     fn add_append_paged(
         &mut self,
-        k: NodeId,
-        v: NodeId,
+        k: OutputRef,
+        v: OutputRef,
         layer_idx: usize,
         start_pos: usize,
-    ) -> NodeId {
-        let dtype = self.node_dtype(k);
-        self.push_node(
-            Op::AppendPaged {
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(AppendPagedOp {
                 layer_idx,
                 start_pos,
-            },
+            }),
             &[k, v],
-            vec![0],
-            dtype,
-        )
+        );
+        // Side-effect op with 0 outputs. Return (node_id, 0) as a
+        // scheduling handle; there is no actual output tensor.
+        (node_id, 0)
     }
 
     fn add_append_paged_batched(
         &mut self,
-        k: NodeId,
-        v: NodeId,
-        block_tables: NodeId,
-        seq_lens: NodeId,
+        k: OutputRef,
+        v: OutputRef,
+        block_tables: OutputRef,
+        seq_lens: OutputRef,
         layer_idx: usize,
-    ) -> NodeId {
-        let dtype = self.node_dtype(k);
-        self.push_node(
-            Op::AppendPagedBatched { layer_idx },
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(AppendPagedBatchedOp { layer_idx }),
             &[k, v, block_tables, seq_lens],
-            vec![0],
-            dtype,
-        )
+        );
+        (node_id, 0)
     }
 
     fn add_gather_paged_kv(
@@ -665,16 +625,18 @@ impl<B: Backend + PagedKvCacheOps> GraphPagedKvCacheOps for Graph<B> {
         num_kv_heads: usize,
         head_dim: usize,
         dtype: DType,
-    ) -> (NodeId, NodeId) {
-        let shape = vec![kv_len, num_kv_heads, head_dim];
-        self.push_node_pair(
-            Op::GatherPagedKv { layer_idx },
+    ) -> (OutputRef, OutputRef) {
+        let node_id = self.add_node(
+            Box::new(GatherPagedKvOp {
+                layer_idx,
+                kv_len,
+                num_kv_heads,
+                head_dim,
+                dtype,
+            }),
             &[],
-            shape.clone(),
-            dtype,
-            shape,
-            dtype,
-        )
+        );
+        ((node_id, 0), (node_id, 1))
     }
 }
 
@@ -685,124 +647,74 @@ impl<B: Backend + PagedKvCacheOps> GraphPagedKvCacheOps for Graph<B> {
 /// Graph builder methods for tensor reshaping and manipulation.
 pub trait GraphTensorOps {
     /// Reshape (zero-copy view). Output shape = provided shape.
-    fn add_reshape(&mut self, input: NodeId, shape: &[usize]) -> NodeId;
+    fn add_reshape(&mut self, input: OutputRef, shape: &[usize]) -> OutputRef;
 
     /// Split inner dimension. Input `[..., total]` →
     /// `([..., left_size], [..., total - left_size])`.
-    fn add_split_inner_dim(&mut self, input: NodeId, left_size: usize) -> (NodeId, NodeId);
+    fn add_split_inner_dim(&mut self, input: OutputRef, left_size: usize)
+        -> (OutputRef, OutputRef);
 
     /// Concatenate along inner dimension.
     /// `[..., a_last] + [..., b_last]` → `[..., a_last + b_last]`.
-    fn add_concat_inner_dim(&mut self, a: NodeId, b: NodeId) -> NodeId;
+    fn add_concat_inner_dim(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 
     /// Concatenate along the first (sequence) dimension.
     /// `[a_seq, ...] + [b_seq, ...]` → `[a_seq + b_seq, ...]`.
-    fn add_concat_seq(&mut self, a: NodeId, b: NodeId) -> NodeId;
+    fn add_concat_seq(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 
     /// Repeat KV heads. `(seq, heads, dim)` → `(seq, heads * num_repeats, dim)`.
-    fn add_repeat_kv(&mut self, input: NodeId, num_repeats: usize) -> NodeId;
+    fn add_repeat_kv(&mut self, input: OutputRef, num_repeats: usize) -> OutputRef;
 
     /// Extract last row. `(seq_len, hidden)` → `(1, hidden)`.
-    fn add_extract_last_row(&mut self, input: NodeId, seq_len: usize) -> NodeId;
+    fn add_extract_last_row(&mut self, input: OutputRef, seq_len: usize) -> OutputRef;
 
     /// 2D transpose. `(M, N)` → `(N, M)`.
-    fn add_transpose_2d(&mut self, input: NodeId) -> NodeId;
+    fn add_transpose_2d(&mut self, input: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + TensorOps> GraphTensorOps for Graph<B> {
-    fn add_reshape(&mut self, input: NodeId, shape: &[usize]) -> NodeId {
-        let dtype = self.node_dtype(input);
-        self.push_node(
-            Op::Reshape {
-                shape: SmallVec::from_slice(shape),
-            },
+impl<B: Backend + MatmulOps + TensorOps> GraphTensorOps for Graph<B> {
+    fn add_reshape(&mut self, input: OutputRef, shape: &[usize]) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(ReshapeOp {
+                shape: shape.to_vec(),
+            }),
             &[input],
-            shape.to_vec(),
-            dtype,
-        )
+        );
+        (node_id, 0)
     }
 
-    fn add_split_inner_dim(&mut self, input: NodeId, left_size: usize) -> (NodeId, NodeId) {
-        let in_shape = self.node_shape(input).to_vec();
-        let dtype = self.node_dtype(input);
-        let total = *in_shape
-            .last()
-            .expect("input must have at least one dimension");
-        let right_size = total - left_size;
-
-        let mut shape1 = in_shape.clone();
-        *shape1.last_mut().unwrap() = left_size;
-        let mut shape2 = in_shape;
-        *shape2.last_mut().unwrap() = right_size;
-
-        self.push_node_pair(
-            Op::SplitInnerDim { left_size },
-            &[input],
-            shape1,
-            dtype,
-            shape2,
-            dtype,
-        )
+    fn add_split_inner_dim(
+        &mut self,
+        input: OutputRef,
+        left_size: usize,
+    ) -> (OutputRef, OutputRef) {
+        let node_id = self.add_node(Box::new(SplitInnerDimOp { left_size }), &[input]);
+        ((node_id, 0), (node_id, 1))
     }
 
-    fn add_concat_inner_dim(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let a_shape = self.node_shape(a).to_vec();
-        let b_last = *self
-            .node_shape(b)
-            .last()
-            .expect("b must have at least one dimension");
-        let dtype = self.node_dtype(a);
-
-        let mut out_shape = a_shape;
-        *out_shape.last_mut().unwrap() += b_last;
-
-        self.push_node(Op::ConcatInnerDim, &[a, b], out_shape, dtype)
+    fn add_concat_inner_dim(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(ConcatInnerDimOp), &[a, b]);
+        (node_id, 0)
     }
 
-    fn add_concat_seq(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let a_shape = self.node_shape(a).to_vec();
-        let b_first = self.node_shape(b)[0];
-        let dtype = self.node_dtype(a);
-
-        let mut out_shape = a_shape;
-        out_shape[0] += b_first;
-
-        self.push_node(Op::ConcatSeq, &[a, b], out_shape, dtype)
+    fn add_concat_seq(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(ConcatSeqOp), &[a, b]);
+        (node_id, 0)
     }
 
-    fn add_repeat_kv(&mut self, input: NodeId, num_repeats: usize) -> NodeId {
-        let in_shape = self.node_shape(input);
-        // Input: (seq, heads, dim)
-        let seq = in_shape[0];
-        let heads = in_shape[1];
-        let dim = in_shape[2];
-        let dtype = self.node_dtype(input);
-        self.push_node(
-            Op::RepeatKv { num_repeats },
-            &[input],
-            vec![seq, heads * num_repeats, dim],
-            dtype,
-        )
+    fn add_repeat_kv(&mut self, input: OutputRef, num_repeats: usize) -> OutputRef {
+        let node_id = self.add_node(Box::new(RepeatKvOp { num_repeats }), &[input]);
+        (node_id, 0)
     }
 
-    fn add_extract_last_row(&mut self, input: NodeId, seq_len: usize) -> NodeId {
-        let in_shape = self.node_shape(input);
-        let hidden = in_shape[1];
-        let dtype = self.node_dtype(input);
-        self.push_node(
-            Op::ExtractLastRow { seq_len },
-            &[input],
-            vec![1, hidden],
-            dtype,
-        )
+    fn add_extract_last_row(&mut self, input: OutputRef, seq_len: usize) -> OutputRef {
+        let node_id = self.add_node(Box::new(ExtractLastRowOp { seq_len }), &[input]);
+        (node_id, 0)
     }
 
-    fn add_transpose_2d(&mut self, input: NodeId) -> NodeId {
-        let in_shape = self.node_shape(input);
-        let m = in_shape[0];
-        let n = in_shape[1];
-        let dtype = self.node_dtype(input);
-        self.push_node(Op::Transpose2d, &[input], vec![n, m], dtype)
+    fn add_transpose_2d(&mut self, input: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(Transpose2dOp), &[input]);
+        (node_id, 0)
     }
 }
 
@@ -810,23 +722,26 @@ impl<B: Backend + TensorOps> GraphTensorOps for Graph<B> {
 // LM Head — always available (unconditional on Graph<B>)
 // ---------------------------------------------------------------------------
 
-impl<B: Backend> Graph<B> {
+impl<B: Backend + MatmulOps> Graph<B> {
     /// Add an LM head projection: `hidden → logits`.
     ///
     /// Output shape: `(seq_len, vocab_size)` where `vocab_size` comes
     /// from the weight metadata `shape[0]`.
-    pub fn add_lm_head(&mut self, input: NodeId, weight: WeightId, weight_dtype: DType) -> NodeId {
-        let in_shape = self.node_shape(input).to_vec();
+    pub fn add_lm_head(
+        &mut self,
+        input: OutputRef,
+        weight: WeightId,
+        weight_dtype: DType,
+    ) -> OutputRef {
         let vocab_size = self.linear_weight_meta(weight).shape[0];
-        let seq_len = in_shape[0];
-        self.push_node(
-            Op::LmHead {
+        let node_id = self.add_node(
+            Box::new(LmHeadOp {
                 weight,
-                dtype: weight_dtype,
-            },
+                weight_dtype,
+                vocab_size,
+            }),
             &[input],
-            vec![seq_len, vocab_size],
-            DType::F32,
-        )
+        );
+        (node_id, 0)
     }
 }
