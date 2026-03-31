@@ -673,4 +673,64 @@ mod tests {
         let out = graph.add_concat_seq(a, b);
         assert_eq!(graph.node_shape(out), &[11, 4, 64]);
     }
+
+    // --- Custom op extensibility test ---
+
+    /// Example custom op: element-wise ReLU.
+    ///
+    /// Demonstrates that downstream crates can define their own `OpNode`
+    /// implementations and register them in a `Graph` via `add_node`.
+    #[derive(Debug)]
+    struct ReluOp;
+
+    impl OpNode<TestBackend> for ReluOp {
+        fn name(&self) -> &'static str {
+            "relu"
+        }
+
+        fn num_inputs(&self) -> usize {
+            1
+        }
+
+        fn num_outputs(&self) -> usize {
+            1
+        }
+
+        fn output_shapes(&self, inputs: &[&[usize]]) -> Vec<Vec<usize>> {
+            // Identity shape — ReLU is element-wise.
+            vec![inputs[0].to_vec()]
+        }
+
+        fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+            vec![input_dtypes[0]]
+        }
+
+        fn execute(
+            &self,
+            _inputs: &[&DummyTensor],
+            _weights: &crate::graph::WeightStore<DummyTensor, DummyTensor>,
+            _device: &(),
+        ) -> crate::Result<Vec<DummyTensor>> {
+            Ok(vec![DummyTensor])
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn custom_op_can_be_registered() {
+        let mut graph = Graph::<TestBackend>::new();
+
+        let input = graph.add_input(&[4, 256], DType::BF16);
+        let relu_id = graph.add_node(Box::new(ReluOp), &[input]);
+        let relu_out: OutputRef = (relu_id, 0);
+
+        assert_eq!(graph.node_shape(relu_out), &[4, 256]);
+        assert_eq!(graph.node_dtype(relu_out), DType::BF16);
+
+        let node = &graph.nodes()[relu_id.index() as usize];
+        assert_eq!(node.op.name(), "relu");
+    }
 }
