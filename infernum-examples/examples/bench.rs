@@ -31,7 +31,7 @@ use infernum::graph::{plan, WeightId, WeightStore};
 use infernum::tensor::Tensor;
 use infernum::weights::WeightLoader;
 use infernum::GenerateOptions;
-use infernum_cuda::cuda::ops::{argmax_last_scalar, LinearWeight};
+use infernum_cuda::cuda::ops::{argmax_last_scalar, cast_f32_to_bf16, LinearWeight};
 use infernum_cuda::cuda::{CudaContext, CudaTensor};
 use infernum_cuda::executor;
 use infernum_cuda::CudaBackend;
@@ -252,13 +252,18 @@ fn load_graph_weights_gguf(
 
     let loader = infernum_cuda::GgufLoader::from_file(gguf_path)?;
 
-    // Tensor weights (embeddings, layernorms) — always loaded as f32.
-    // GGUF files may store them quantized (Q8_0, Q4_0), and load_f32
-    // handles dequantization while load_bf16 does not.
+    // Tensor weights (embeddings, layernorms) — loaded as f32 (load_f32
+    // handles dequantization of Q8_0/Q4_0), then cast to the compute dtype
+    // so that BF16 kernels (rmsnorm, embedding_gather) receive BF16 data.
     for i in 0..graph.tensor_weight_count() {
         let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
         let gguf_name = safetensors_to_gguf_name(&meta.name);
-        let tensor = loader.load_f32(ctx, &gguf_name)?;
+        let tensor_f32 = loader.load_f32(ctx, &gguf_name)?;
+        let tensor = if weight_dtype == DType::BF16 {
+            cast_f32_to_bf16(&tensor_f32)?
+        } else {
+            tensor_f32
+        };
         weights.push_tensor_weight(tensor);
     }
 
@@ -620,10 +625,10 @@ fn main() -> infernum::Result<()> {
 
         let is_gguf = cli.model.ends_with(".gguf");
 
-        // GGUF tensor weights may be quantized; force f32 compute dtype
-        // since load_f32 handles dequantization and quantized matmul
-        // computes in f32 internally.
-        let weight_dtype = if is_gguf { DType::F32 } else { weight_dtype };
+        // GGUF tensor weights may be quantized; use bf16 compute dtype
+        // for faster attention/elementwise ops. quantized_matmul handles
+        // BF16 activations internally (cast to F16 for cuBLAS).
+        let weight_dtype = if is_gguf { DType::BF16 } else { weight_dtype };
 
         let model_type = if is_gguf {
             "llama".to_string() // GGUF graph mode only supports Llama/Mistral

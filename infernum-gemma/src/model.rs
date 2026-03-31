@@ -671,7 +671,7 @@ impl<B: GemmaOps> GemmaModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };
@@ -895,18 +895,19 @@ impl<B: GemmaOps> GemmaModel<B> {
         /// llama.cpp's `convert_hf_to_gguf.py` already adds +1.0 to all Gemma
         /// norm weights during conversion, so GGUF files store them in standard
         /// `x * w` form.  We load them directly without further adjustment.
-        fn host_load_gemma_norm<B2: Backend + TensorFactory>(
+        fn host_load_gemma_norm<B2: Backend + TensorFactory + CastOps>(
             loader: &infernum::weights::gguf::GgufLoader,
             device: &B2::DeviceHandle,
             name: &str,
         ) -> Result<B2::Tensor> {
             let host = FormatLoader::load_f32(loader, name)?;
-            B2::from_f32_slice(device, &host.shape, host.as_f32_slice())
+            let f32_tensor = B2::from_f32_slice(device, &host.shape, host.as_f32_slice())?;
+            B2::cast_from_f32(&f32_tensor, B2::QUANTIZED_COMPUTE_DTYPE)
         }
 
         let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
-        let embed_tokens =
-            B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+        let embed_f32 = B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+        let embed_tokens = B::cast_from_f32(&embed_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -1056,7 +1057,7 @@ impl<B: GemmaOps> GemmaModel<B> {
             config.max_position_embeddings,
             local_theta,
             None,
-            DType::F32,
+            B::QUANTIZED_COMPUTE_DTYPE,
         )?;
 
         let (cos_cache_global, sin_cache_global) = if config.rope_local_base_freq.is_some() {
@@ -1066,7 +1067,7 @@ impl<B: GemmaOps> GemmaModel<B> {
                 config.max_position_embeddings,
                 config.rope_theta,
                 None,
-                DType::F32,
+                B::QUANTIZED_COMPUTE_DTYPE,
             )?;
             (Some(cos_g), Some(sin_g))
         } else {
@@ -1079,7 +1080,7 @@ impl<B: GemmaOps> GemmaModel<B> {
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
             tp_num_kv_heads: config.num_key_value_heads,
-            dtype: DType::F32,
+            dtype: B::QUANTIZED_COMPUTE_DTYPE,
             config,
             device,
             gpu_config: GpuConfig::Single,
@@ -1194,7 +1195,7 @@ impl<B: GemmaOps> GemmaModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };

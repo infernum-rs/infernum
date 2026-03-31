@@ -4,9 +4,10 @@
 //! in `Q8_0`, `Q4_0`, `Q6_K`, `F8E4M3`, `GPTQ_INT4`, or `AWQ_INT4` format.
 //! Input activations may be F32, BF16, or F16; output is always F32.
 //! For prefill (M > 1), the dequant+cuBLAS path casts activations to F16
-//! internally. For decode (M = 1), the GEMV path requires F32 and casts
-//! automatically if needed. Dequantization happens on-the-fly inside the
-//! kernel — the full f32 weight matrix never exists in GPU memory.
+//! internally. For decode (M = 1), the GEMV path natively handles F32 and
+//! BF16 via dedicated quantization kernels (F16 is cast to F32 if needed).
+//! Dequantization happens on-the-fly inside the kernel — the full f32 weight
+//! matrix never exists in GPU memory.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -333,11 +334,14 @@ fn quantized_matmul_fp8_cublas(
 // GEMV: M=1 decode fast path for quantized formats
 // ---------------------------------------------------------------------------
 
-/// Quantize f32 activations to `Q8_1` format on the GPU.
+/// Quantize F32 or BF16 activations to `Q8_1` format on the GPU.
 ///
 /// Returns `(data [K] as i8, scales [K/32] as f32, sums [K/32] as f32)`.
 /// Each 32-element block gets: `scale = absmax / 127`, `qi = round(v / scale)`,
 /// `sum = scale * Σqi`.
+///
+/// BF16 input is handled by a dedicated kernel that converts BF16→F32 inline,
+/// avoiding a separate cast kernel launch.
 ///
 /// Scratch buffers are pool-backed when the context has a buffer pool enabled,
 /// making this function safe to call during CUDA graph capture (after a warmup
@@ -348,6 +352,11 @@ fn quantize_activations_to_q8_1(
     k: usize,
 ) -> Result<(PooledSlice<i8>, PooledSlice<f32>, PooledSlice<f32>)> {
     assert_eq!(k % 32, 0, "K must be divisible by 32 for Q8_1 quantization");
+    assert!(
+        matches!(input.dtype(), DType::F32 | DType::BF16),
+        "quantize_activations_to_q8_1: unsupported input dtype {}",
+        input.dtype()
+    );
 
     let device = ctx.device();
     let num_blocks = k / 32;
@@ -369,15 +378,22 @@ fn quantize_activations_to_q8_1(
                 "gemv_q8_f32",
                 "gemv_q4_f32",
                 "quantize_f32_to_q8_1",
+                "quantize_bf16_to_q8_1",
                 "gemv_q8_q8_dp4a",
                 "gemv_q4_q8_dp4a",
                 "gemv_q6k_q8_dp4a",
+                "gemv_q8_q8_dp4a_bf16",
+                "gemv_q4_q8_dp4a_bf16",
+                "gemv_q6k_q8_dp4a_bf16",
             ],
         )?;
     }
-    let func = device
-        .get_func(module_name, "quantize_f32_to_q8_1")
-        .unwrap();
+
+    let kernel_name = match input.dtype() {
+        DType::BF16 => "quantize_bf16_to_q8_1",
+        _ => "quantize_f32_to_q8_1",
+    };
+    let func = device.get_func(module_name, kernel_name).unwrap();
 
     let cfg = LaunchConfig {
         grid_dim: (num_blocks as u32, 1, 1),
@@ -403,14 +419,17 @@ fn quantize_activations_to_q8_1(
 
 /// GEMV kernel for M=1 decode: `output[1, N] = input[1, K] @ dequant(weight[N, K])^T`
 ///
-/// Quantizes f32 activations to `Q8_1` on-the-fly, then uses `dp4a` integer dot
-/// products for ~4× compute throughput and ~4× bandwidth reduction vs f32.
+/// Quantizes F32 or BF16 activations to `Q8_1` on-the-fly, then uses `dp4a`
+/// integer dot products for ~4× compute throughput and ~4× bandwidth reduction
+/// vs f32. BF16 input is handled natively by a dedicated quantization kernel,
+/// avoiding an extra BF16→F32 cast.
 #[allow(clippy::too_many_lines)]
 fn quantized_gemv(
     input: &CudaTensor,
     weight: &QuantizedTensor,
     n: usize,
     k: usize,
+    output_dtype: DType,
 ) -> Result<CudaTensor> {
     // Multi-warp GEMV: NWARPS warps per output row, K-split across all threads
     const NWARPS: u32 = 4;
@@ -418,10 +437,19 @@ fn quantized_gemv(
     let ctx = input.context();
     let device = ctx.device();
 
-    // Quantize activations: f32 [K] → Q8_1 (int8 data + f32 scales + f32 sums)
+    // Quantize activations: f32/bf16 [K] → Q8_1 (int8 data + f32 scales + f32 sums)
     let (act_data, act_scales, act_sums) = quantize_activations_to_q8_1(ctx, input, k)?;
 
-    let mut output = unsafe { CudaTensor::uninit(ctx, &[1, n], DType::F32)? };
+    // BF16 output: use fused _bf16 GEMV variants that convert f32→bf16 at
+    // the final write, avoiding a separate cast kernel launch.
+    // GPTQ has no BF16 variant — falls back to F32 output (caller casts).
+    let use_bf16_output = output_dtype == DType::BF16 && weight.dtype() != DType::GPTQ_INT4;
+    let out_dtype = if use_bf16_output {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[1, n], out_dtype)? };
 
     let module_name = "quantized_matmul";
 
@@ -433,7 +461,12 @@ fn quantized_gemv(
 
     match weight.dtype() {
         DType::Q8_0 => {
-            let func = device.get_func(module_name, "gemv_q8_q8_dp4a").unwrap();
+            let kernel = if use_bf16_output {
+                "gemv_q8_q8_dp4a_bf16"
+            } else {
+                "gemv_q8_q8_dp4a"
+            };
+            let func = device.get_func(module_name, kernel).unwrap();
             unsafe {
                 func.launch(
                     cfg,
@@ -450,7 +483,12 @@ fn quantized_gemv(
             }
         }
         DType::Q4_0 => {
-            let func = device.get_func(module_name, "gemv_q4_q8_dp4a").unwrap();
+            let kernel = if use_bf16_output {
+                "gemv_q4_q8_dp4a_bf16"
+            } else {
+                "gemv_q4_q8_dp4a"
+            };
+            let func = device.get_func(module_name, kernel).unwrap();
             unsafe {
                 func.launch(
                     cfg,
@@ -468,7 +506,12 @@ fn quantized_gemv(
             }
         }
         DType::Q6_K => {
-            let func = device.get_func(module_name, "gemv_q6k_q8_dp4a").unwrap();
+            let kernel = if use_bf16_output {
+                "gemv_q6k_q8_dp4a_bf16"
+            } else {
+                "gemv_q6k_q8_dp4a"
+            };
+            let func = device.get_func(module_name, kernel).unwrap();
             unsafe {
                 func.launch(
                     cfg,
@@ -536,7 +579,7 @@ fn quantized_gemv(
 ///
 /// Dispatches to the appropriate kernel based on `weight.dtype()`.
 /// For M > 1 (prefill), activations are cast to F16 internally for cuBLAS.
-/// For M = 1 (decode GEMV), activations are cast to F32 if needed.
+/// For M = 1 (decode GEMV), F32 and BF16 are handled natively; F16 is cast.
 ///
 /// # Errors
 /// Returns an error if kernel compilation or launch fails.
@@ -949,28 +992,38 @@ fn quantized_matmul_2d(
                 "gemv_q8_f32",
                 "gemv_q4_f32",
                 "quantize_f32_to_q8_1",
+                "quantize_bf16_to_q8_1",
                 "gemv_q8_q8_dp4a",
                 "gemv_q4_q8_dp4a",
                 "gemv_q6k_q8_dp4a",
+                "gemv_q8_q8_dp4a_bf16",
+                "gemv_q4_q8_dp4a_bf16",
+                "gemv_q6k_q8_dp4a_bf16",
             ],
         )?;
     }
 
-    // GEMV fast path for M=1 decode (requires F32 activations)
+    // GEMV fast path for M=1 decode
+    // quantize_activations_to_q8_1 handles both F32 and BF16 natively,
+    // so we only need to cast F16 input (rare for quantized models).
+    // The output dtype matches the input dtype — for BF16, the fused _bf16
+    // GEMV variants convert f32→bf16 at the final write, avoiding a
+    // separate cast kernel launch.
     if m == 1
         && matches!(
             weight.dtype(),
             DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::GPTQ_INT4
         )
     {
+        let output_dtype = input.dtype();
         let input_f32;
-        let gemv_input = if input.dtype() == DType::F32 {
+        let gemv_input = if matches!(input.dtype(), DType::F32 | DType::BF16) {
             input
         } else {
             input_f32 = cast_to_f32(input)?;
             &input_f32
         };
-        return quantized_gemv(gemv_input, weight, n, k);
+        return quantized_gemv(gemv_input, weight, n, k, output_dtype);
     }
 
     // Tensor-core paths for M > 1 (prefill)

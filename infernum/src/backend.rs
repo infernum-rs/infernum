@@ -98,6 +98,12 @@ pub trait Backend: 'static {
     /// Used by generic `Model` impls to return backend-specific logits
     /// from forward passes without knowing the concrete type.
     fn logits_from_tensor(tensor: Self::Tensor) -> Self::Logits;
+
+    /// Computation dtype used when the model's embedding weights are
+    /// quantized (and thus don't imply a native dtype). CUDA backends
+    /// return `BF16` for faster Tensor Core ops; CPU backends return
+    /// `F32` since they only support f32 tensors.
+    const QUANTIZED_COMPUTE_DTYPE: crate::dtype::DType = crate::dtype::DType::F32;
 }
 
 // ---- Op traits ----

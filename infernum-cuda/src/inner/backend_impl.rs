@@ -33,6 +33,8 @@ impl Backend for CudaBackend {
     fn logits_from_tensor(tensor: CudaTensor) -> CudaLogits {
         CudaLogits::new(tensor)
     }
+
+    const QUANTIZED_COMPUTE_DTYPE: DType = DType::BF16;
 }
 
 // ---- Tensor factory ----

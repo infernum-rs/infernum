@@ -182,7 +182,7 @@ impl<B: QwenOps> QwenModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };
@@ -433,8 +433,8 @@ impl<B: QwenOps> QwenModel<B> {
         assert!(!config.is_moe(), "MoE GGUF loading is not yet supported");
 
         let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
-        let embed_tokens =
-            B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+        let embed_f32 = B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+        let embed_tokens = B::cast_from_f32(&embed_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
         let num_kv_heads = config.num_kv_heads();
         let head_dim = config.head_dim();
@@ -445,11 +445,13 @@ impl<B: QwenOps> QwenModel<B> {
 
             let attn_norm_host =
                 FormatLoader::load_f32(loader, &format!("{prefix}.attn_norm.weight"))?;
-            let input_layernorm = B::from_f32_slice(
+            let input_layernorm_f32 = B::from_f32_slice(
                 &device,
                 &attn_norm_host.shape,
                 attn_norm_host.as_f32_slice(),
             )?;
+            let input_layernorm =
+                B::cast_from_f32(&input_layernorm_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
             let attention = {
                 let k_host = host_load_linear(loader, &format!("{prefix}.attn_k.weight"))?;
@@ -482,29 +484,40 @@ impl<B: QwenOps> QwenModel<B> {
                 // (unlike Llama). The converter writes them in HF sequential-
                 // half layout, which matches our RoPE directly.
                 let q_bias = host_load_bias(loader, &format!("{prefix}.attn_q.bias"))?
-                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .map(|h| {
+                        let f32_t = B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?;
+                        B::cast_from_f32(&f32_t, B::QUANTIZED_COMPUTE_DTYPE)
+                    })
                     .transpose()?;
                 let k_bias = host_load_bias(loader, &format!("{prefix}.attn_k.bias"))?
-                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .map(|h| {
+                        let f32_t = B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?;
+                        B::cast_from_f32(&f32_t, B::QUANTIZED_COMPUTE_DTYPE)
+                    })
                     .transpose()?;
                 let v_bias_host = host_load_bias(loader, &format!("{prefix}.attn_v.bias"))?;
                 let v_bias = v_bias_host
                     .as_ref()
-                    .map(|h| B::from_f32_slice(&device, &h.shape, h.as_f32_slice()))
+                    .map(|h| {
+                        let f32_t = B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?;
+                        B::cast_from_f32(&f32_t, B::QUANTIZED_COMPUTE_DTYPE)
+                    })
                     .transpose()?;
 
                 // Optional QK-norm (Qwen3 has these, Qwen2/2.5 do not)
                 let q_norm = if loader.contains(&format!("{prefix}.attn_q_norm.weight")) {
                     let h =
                         FormatLoader::load_f32(loader, &format!("{prefix}.attn_q_norm.weight"))?;
-                    Some(B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?)
+                    let f32_t = B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?;
+                    Some(B::cast_from_f32(&f32_t, B::QUANTIZED_COMPUTE_DTYPE)?)
                 } else {
                     None
                 };
                 let k_norm = if loader.contains(&format!("{prefix}.attn_k_norm.weight")) {
                     let h =
                         FormatLoader::load_f32(loader, &format!("{prefix}.attn_k_norm.weight"))?;
-                    Some(B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?)
+                    let f32_t = B::from_f32_slice(&device, &h.shape, h.as_f32_slice())?;
+                    Some(B::cast_from_f32(&f32_t, B::QUANTIZED_COMPUTE_DTYPE)?)
                 } else {
                     None
                 };
@@ -523,8 +536,10 @@ impl<B: QwenOps> QwenModel<B> {
 
             let ffn_norm_host =
                 FormatLoader::load_f32(loader, &format!("{prefix}.ffn_norm.weight"))?;
-            let post_attention_layernorm =
+            let post_attn_f32 =
                 B::from_f32_slice(&device, &ffn_norm_host.shape, ffn_norm_host.as_f32_slice())?;
+            let post_attention_layernorm =
+                B::cast_from_f32(&post_attn_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
             let ffn = {
                 let gate_host = host_load_linear(loader, &format!("{prefix}.ffn_gate.weight"))?;
@@ -567,7 +582,8 @@ impl<B: QwenOps> QwenModel<B> {
         }
 
         let norm_host = FormatLoader::load_f32(loader, "output_norm.weight")?;
-        let norm = B::from_f32_slice(&device, &norm_host.shape, norm_host.as_f32_slice())?;
+        let norm_f32 = B::from_f32_slice(&device, &norm_host.shape, norm_host.as_f32_slice())?;
+        let norm = B::cast_from_f32(&norm_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
         // lm_head: check tied embeddings or explicit output weight
         let lm_head = if config.tie_word_embeddings {
@@ -609,13 +625,13 @@ impl<B: QwenOps> QwenModel<B> {
             config.max_position_embeddings,
             config.rope_theta,
             None,
-            DType::F32,
+            B::QUANTIZED_COMPUTE_DTYPE,
         )?;
 
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
             tp_num_kv_heads: num_kv_heads,
-            dtype: DType::F32,
+            dtype: B::QUANTIZED_COMPUTE_DTYPE,
             config,
             device,
             gpu_config: GpuConfig::Single,
@@ -720,7 +736,7 @@ impl<B: QwenOps> QwenModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };

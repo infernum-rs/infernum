@@ -197,7 +197,7 @@ impl<B: LlamaOps> LlamaModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };
@@ -428,8 +428,8 @@ impl<B: LlamaOps> LlamaModel<B> {
         }
 
         let embed_host = FormatLoader::load_f32(loader, "token_embd.weight")?;
-        let embed_tokens =
-            B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+        let embed_f32 = B::from_f32_slice(&device, &embed_host.shape, embed_host.as_f32_slice())?;
+        let embed_tokens = B::cast_from_f32(&embed_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -437,11 +437,13 @@ impl<B: LlamaOps> LlamaModel<B> {
 
             let attn_norm_host =
                 FormatLoader::load_f32(loader, &format!("{prefix}.attn_norm.weight"))?;
-            let input_layernorm = B::from_f32_slice(
+            let input_layernorm_f32 = B::from_f32_slice(
                 &device,
                 &attn_norm_host.shape,
                 attn_norm_host.as_f32_slice(),
             )?;
+            let input_layernorm =
+                B::cast_from_f32(&input_layernorm_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
             let attention = {
                 let k_host = host_load_linear_unpermute(
@@ -487,8 +489,10 @@ impl<B: LlamaOps> LlamaModel<B> {
 
             let ffn_norm_host =
                 FormatLoader::load_f32(loader, &format!("{prefix}.ffn_norm.weight"))?;
-            let post_attention_layernorm =
+            let post_attn_f32 =
                 B::from_f32_slice(&device, &ffn_norm_host.shape, ffn_norm_host.as_f32_slice())?;
+            let post_attention_layernorm =
+                B::cast_from_f32(&post_attn_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
             let ffn = {
                 assert!(!config.is_moe(), "MoE GGUF loading is not yet supported");
@@ -532,7 +536,8 @@ impl<B: LlamaOps> LlamaModel<B> {
         }
 
         let norm_host = FormatLoader::load_f32(loader, "output_norm.weight")?;
-        let norm = B::from_f32_slice(&device, &norm_host.shape, norm_host.as_f32_slice())?;
+        let norm_f32 = B::from_f32_slice(&device, &norm_host.shape, norm_host.as_f32_slice())?;
+        let norm = B::cast_from_f32(&norm_f32, B::QUANTIZED_COMPUTE_DTYPE)?;
 
         // lm_head: check tied embeddings, quantized fallback
         let lm_head = if config.tie_word_embeddings {
@@ -573,13 +578,13 @@ impl<B: LlamaOps> LlamaModel<B> {
             config.max_position_embeddings,
             config.rope_theta,
             None,
-            DType::F32,
+            B::QUANTIZED_COMPUTE_DTYPE,
         )?;
 
         Ok(Self {
             tp_num_heads: config.num_attention_heads,
             tp_num_kv_heads: config.num_kv_heads(),
-            dtype: DType::F32,
+            dtype: B::QUANTIZED_COMPUTE_DTYPE,
             config,
             device,
             gpu_config: GpuConfig::Single,
@@ -705,7 +710,7 @@ impl<B: LlamaOps> LlamaModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };

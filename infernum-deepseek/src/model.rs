@@ -322,7 +322,7 @@ impl<B: DeepSeekOps> DeepSeekModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };
@@ -575,7 +575,7 @@ impl<B: DeepSeekOps> DeepSeekModel<B> {
 
         let embed_dtype = loader.get_dtype("model.embed_tokens.weight")?;
         let dtype = if embed_dtype.is_quantized() {
-            DType::F32
+            B::QUANTIZED_COMPUTE_DTYPE
         } else {
             embed_dtype
         };

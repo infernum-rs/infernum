@@ -390,6 +390,57 @@ extern "C" __global__ void quantize_f32_to_q8_1(
     }
 }
 
+// BF16 variant: identical logic but reads bf16 (unsigned short) input
+extern "C" __global__ void quantize_bf16_to_q8_1(
+    signed char*            __restrict__ out_data,
+    float*                  __restrict__ out_scales,
+    float*                  __restrict__ out_sums,
+    const unsigned short*   __restrict__ input,
+    const int K
+) {
+    const int block_idx = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..31
+    const int base_k = block_idx * 32;
+
+    if (base_k + tid >= K) return;
+
+    // Load bf16 and convert to f32 via bit shift (bf16 = upper 16 bits of f32)
+    unsigned int f32_bits = ((unsigned int)input[base_k + tid]) << 16;
+    float val;
+    memcpy(&val, &f32_bits, 4);
+    float abs_val = fabsf(val);
+
+    // Warp reduction: find max absolute value
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_xor_sync(0xFFFFFFFF, abs_val, offset);
+        abs_val = fmaxf(abs_val, other);
+    }
+
+    float d = abs_val / 127.0f;
+    float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+
+    // Quantize
+    int qi = __float2int_rn(val * inv_d);
+    qi = max(-128, min(127, qi));
+
+    // Write quantized value
+    out_data[base_k + tid] = (signed char)qi;
+
+    // Warp reduction: sum of quantized values
+    int qi_sum = qi;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qi_sum += __shfl_xor_sync(0xFFFFFFFF, qi_sum, offset);
+    }
+
+    // Lane 0 writes scale and weighted sum
+    if (tid == 0) {
+        out_scales[block_idx] = d;
+        out_sums[block_idx] = d * (float)qi_sum;
+    }
+}
+
 // -----------------------------------------------------------------------
 // dp4a GEMV kernels: multi-warp K-splitting with dp4a
 // -----------------------------------------------------------------------
@@ -469,6 +520,82 @@ extern "C" __global__ void gemv_q8_q8_dp4a(
     } else {
         if (lane == 0) {
             output[n] = acc;
+        }
+    }
+}
+
+// Q8_0 × Q8_1 dp4a GEMV — BF16 output variant
+// Identical to gemv_q8_q8_dp4a but writes bf16 (upper 16 bits of f32) output,
+// eliminating a separate f32→bf16 cast kernel launch in the decode path.
+extern "C" __global__ void gemv_q8_q8_dp4a_bf16(
+    unsigned short*     __restrict__ output,
+    const signed char*  __restrict__ act_data,
+    const float*        __restrict__ act_scales,
+    const signed char*  __restrict__ weight_data,
+    const unsigned short* __restrict__ weight_scales,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        float d_a = act_scales[b];
+
+        const int4* w_v = (const int4*)(weight_data + n * K + b * 32);
+        const int4* a_v = (const int4*)(act_data + b * 32);
+
+        int4 w0 = w_v[0], w1 = w_v[1];
+        int4 a0 = a_v[0], a1 = a_v[1];
+
+        int sumi = 0;
+        sumi = __dp4a(w0.x, a0.x, sumi);
+        sumi = __dp4a(w0.y, a0.y, sumi);
+        sumi = __dp4a(w0.z, a0.z, sumi);
+        sumi = __dp4a(w0.w, a0.w, sumi);
+        sumi = __dp4a(w1.x, a1.x, sumi);
+        sumi = __dp4a(w1.y, a1.y, sumi);
+        sumi = __dp4a(w1.z, a1.z, sumi);
+        sumi = __dp4a(w1.w, a1.w, sumi);
+
+        acc += d_w * d_a * (float)sumi;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &sum, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
+        }
+    } else {
+        if (lane == 0) {
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &acc, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
         }
     }
 }
@@ -619,6 +746,137 @@ extern "C" __global__ void gemv_q6k_q8_dp4a(
     }
 }
 
+// Q6_K × Q8_1 dp4a GEMV — BF16 output variant
+// Identical to gemv_q6k_q8_dp4a but writes bf16 (upper 16 bits of f32) output.
+extern "C" __global__ void gemv_q6k_q8_dp4a_bf16(
+    unsigned short*     __restrict__ output,
+    const signed char*  __restrict__ act_data,
+    const float*        __restrict__ act_scales,
+    const float*        __restrict__ act_sums,
+    const unsigned char* __restrict__ weight_data,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+
+    const int blocks_per_row = K / 32;
+    const int sblocks_per_row = K / 256;
+    const int block_bytes = 210;
+
+    float acc = 0.0f;
+    const int ones = 0x01010101;
+
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        int sb = b / 8;
+        int row8 = b % 8;
+
+        int sb_offset = (n * sblocks_per_row + sb) * block_bytes;
+        const unsigned char* ql     = weight_data + sb_offset;
+        const unsigned char* qh     = weight_data + sb_offset + 128;
+        const signed char*   scales = (const signed char*)(weight_data + sb_offset + 128 + 64);
+        float d = f16_to_f32(*(const unsigned short*)(weight_data + sb_offset + 128 + 64 + 16));
+
+        float d_a = act_scales[b];
+
+        int ql_base = (row8 / 4) * 64 + (row8 % 2) * 32;
+        int ql_nibble_hi = ((row8 % 4) >= 2) ? 1 : 0;
+
+        int qh_base = (row8 / 4) * 32;
+        int qh_shift = (row8 % 4) * 2;
+
+        int sc0 = (int)scales[row8 * 2];
+        int sc1 = (int)scales[row8 * 2 + 1];
+
+        int sumi0 = 0, sumi1 = 0;
+        int asum0 = 0, asum1 = 0;
+
+        const int* a_ptr = (const int*)(act_data + b * 32);
+
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            int col32_start = g * 4;
+
+            unsigned char ql_b0 = ql[ql_base + col32_start + 0];
+            unsigned char ql_b1 = ql[ql_base + col32_start + 1];
+            unsigned char ql_b2 = ql[ql_base + col32_start + 2];
+            unsigned char ql_b3 = ql[ql_base + col32_start + 3];
+
+            int ql0, ql1, ql2, ql3;
+            if (ql_nibble_hi == 0) {
+                ql0 = ql_b0 & 0x0F; ql1 = ql_b1 & 0x0F;
+                ql2 = ql_b2 & 0x0F; ql3 = ql_b3 & 0x0F;
+            } else {
+                ql0 = ql_b0 >> 4; ql1 = ql_b1 >> 4;
+                ql2 = ql_b2 >> 4; ql3 = ql_b3 >> 4;
+            }
+
+            unsigned char qh_b0 = qh[qh_base + col32_start + 0];
+            unsigned char qh_b1 = qh[qh_base + col32_start + 1];
+            unsigned char qh_b2 = qh[qh_base + col32_start + 2];
+            unsigned char qh_b3 = qh[qh_base + col32_start + 3];
+
+            int qh0 = (qh_b0 >> qh_shift) & 0x03;
+            int qh1 = (qh_b1 >> qh_shift) & 0x03;
+            int qh2 = (qh_b2 >> qh_shift) & 0x03;
+            int qh3 = (qh_b3 >> qh_shift) & 0x03;
+
+            int q_packed = (ql0 | (qh0 << 4))
+                         | ((ql1 | (qh1 << 4)) << 8)
+                         | ((ql2 | (qh2 << 4)) << 16)
+                         | ((ql3 | (qh3 << 4)) << 24);
+
+            int a_val = a_ptr[g];
+
+            if (g < 4) {
+                sumi0 = __dp4a(q_packed, a_val, sumi0);
+                asum0 = __dp4a(ones, a_val, asum0);
+            } else {
+                sumi1 = __dp4a(q_packed, a_val, sumi1);
+                asum1 = __dp4a(ones, a_val, asum1);
+            }
+        }
+
+        acc += d * (float)sc0 * d_a * ((float)sumi0 - 32.0f * (float)asum0);
+        acc += d * (float)sc1 * d_a * ((float)sumi1 - 32.0f * (float)asum1);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &sum, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
+        }
+    } else {
+        if (lane == 0) {
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &acc, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
+        }
+    }
+}
+
 // Q4_0 × Q8_1 dp4a GEMV (multi-warp, with zero-point correction)
 extern "C" __global__ void gemv_q4_q8_dp4a(
     float*              __restrict__ output,
@@ -696,6 +954,87 @@ extern "C" __global__ void gemv_q4_q8_dp4a(
     } else {
         if (lane == 0) {
             output[n] = acc;
+        }
+    }
+}
+
+// Q4_0 × Q8_1 dp4a GEMV — BF16 output variant
+// Identical to gemv_q4_q8_dp4a but writes bf16 (upper 16 bits of f32) output.
+extern "C" __global__ void gemv_q4_q8_dp4a_bf16(
+    unsigned short*     __restrict__ output,
+    const signed char*  __restrict__ act_data,
+    const float*        __restrict__ act_scales,
+    const float*        __restrict__ act_sums,
+    const unsigned char* __restrict__ weight_data,
+    const unsigned short* __restrict__ weight_scales,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        float d_w = f16_to_f32(weight_scales[n * blocks_per_row + b]);
+        float d_a = act_scales[b];
+        float s_a = act_sums[b];
+
+        const int4* w_v = (const int4*)(weight_data + n * (K / 2) + b * 16);
+        int4 w = w_v[0];
+
+        const int4* a_v = (const int4*)(act_data + b * 32);
+        int4 a_lo = a_v[0], a_hi = a_v[1];
+
+        int sumi = 0;
+        unsigned int uw[4] = {(unsigned int)w.x, (unsigned int)w.y,
+                              (unsigned int)w.z, (unsigned int)w.w};
+        int al[4] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w};
+        int ah[4] = {a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int lo = (int)(uw[i] & 0x0F0F0F0Fu);
+            int hi = (int)((uw[i] >> 4) & 0x0F0F0F0Fu);
+            sumi = __dp4a(lo, al[i], sumi);
+            sumi = __dp4a(hi, ah[i], sumi);
+        }
+
+        acc += d_w * (d_a * (float)sumi - 8.0f * s_a);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) {
+            smem[warp_id] = acc;
+        }
+        __syncthreads();
+
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) {
+                sum += smem[w];
+            }
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &sum, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
+        }
+    } else {
+        if (lane == 0) {
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &acc, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
         }
     }
 }

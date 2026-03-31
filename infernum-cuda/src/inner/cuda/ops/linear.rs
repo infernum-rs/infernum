@@ -29,12 +29,17 @@ pub fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
         LinearWeight::Dense(w) => matmul(input, w),
         LinearWeight::Quantized(w) => {
             let dtype = input.dtype();
-            let output_f32 = quantized_matmul(input, w)?;
-            match dtype {
-                DType::F32 => Ok(output_f32),
-                DType::BF16 => cast_f32_to_bf16(&output_f32),
-                DType::F16 => cast_f32_to_f16(&output_f32),
-                other => panic!("Quantized matmul not supported for dtype {other}"),
+            let output = quantized_matmul(input, w)?;
+            if output.dtype() == dtype {
+                // GEMV path already returned the correct dtype (e.g. BF16)
+                Ok(output)
+            } else {
+                match dtype {
+                    DType::F32 => Ok(output),
+                    DType::BF16 => cast_f32_to_bf16(&output),
+                    DType::F16 => cast_f32_to_f16(&output),
+                    other => panic!("Quantized matmul not supported for dtype {other}"),
+                }
             }
         }
     }
