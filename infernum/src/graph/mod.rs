@@ -7,6 +7,7 @@
 mod arena;
 mod builder;
 mod builder_traits;
+pub mod builtin_ops;
 mod node;
 mod op_node;
 mod ops;

@@ -17,8 +17,8 @@ pub type OutputRef = (NodeId, u32);
 
 /// An executable operation node in the computation graph.
 ///
-/// Each implementor describes one logical operation (matmul, RMSNorm,
-/// RoPE, etc.) and knows how to infer output shapes/dtypes and execute
+/// Each implementor describes one logical operation (matmul, `RMSNorm`,
+/// `RoPE`, etc.) and knows how to infer output shapes/dtypes and execute
 /// on a concrete backend.
 pub trait OpNode<B: Backend + MatmulOps>: Send + Sync + std::fmt::Debug {
     /// Human-readable name for debugging and profiling (e.g., `"matmul"`).
