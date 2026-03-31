@@ -595,10 +595,10 @@ fn ensure_mmq_q8_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) ->
     Ok(())
 }
 
-/// Q8_0 MMQ matmul using WMMA int8 tensor cores.
+/// `Q8_0` MMQ matmul using WMMA int8 tensor cores.
 ///
 /// `input`: f32 tensor (M, K)
-/// `weight`: Q8_0 quantized tensor (N, K)
+/// `weight`: `Q8_0` quantized tensor (N, K)
 /// output: f32 tensor (M, N) = input @ dequant(weight)^T
 #[allow(dead_code)]
 fn mmq_matmul_q8(
@@ -738,7 +738,7 @@ fn ensure_cast_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> R
 /// The dequantized F16 weight buffer is cached on the `QuantizedTensor` via
 /// `OnceLock`, so repeated calls (across prefill tokens / layers) pay the
 /// dequant cost only once. Activation F16 buffers use the pool allocator.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn dequant_cublas_matmul(
     input: &CudaTensor,
     weight: &QuantizedTensor,
@@ -910,8 +910,8 @@ fn dequant_cublas_matmul(
             (&raw const alpha).cast(),
             *w_f16.device_ptr() as *const _, // A = weight f16
             f16_type,
-            k as i32,              // lda = K (col-major stride of W_cm)
-            a_f16_ptr as *const _, // B = activation f16
+            k as i32,         // lda = K (col-major stride of W_cm)
+            a_f16_ptr.cast(), // B = activation f16
             f16_type,
             k as i32, // ldb = K (col-major stride of A_cm)
             (&raw const beta).cast(),

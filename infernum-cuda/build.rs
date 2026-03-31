@@ -52,8 +52,8 @@ mod cuda {
 
     /// Returns the minimum compute architecture for a given kernel.
     ///
-    /// Kernels using WMMA (tensor core) intrinsics need at least sm_75 (Turing).
-    /// Everything else targets sm_70 (Volta) for broader compatibility.
+    /// Kernels using WMMA (tensor core) intrinsics need at least `sm_75` (Turing).
+    /// Everything else targets `sm_70` (Volta) for broader compatibility.
     fn compute_arch_for(stem: &str) -> &'static str {
         if stem.starts_with("mmq") {
             "compute_75" // WMMA int8 tensor cores (Turing+)

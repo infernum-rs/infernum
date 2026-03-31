@@ -6,6 +6,7 @@ use infernum::Result;
 
 /// A linear layer weight that is either a dense matrix (pre-transposed for
 /// standard matmul) or a quantized tensor (dequantized on-the-fly in the kernel).
+#[allow(clippy::large_enum_variant)]
 pub enum LinearWeight {
     /// Pre-transposed dense weight: shape `(in_features, out_features)`.
     Dense(CudaTensor),
