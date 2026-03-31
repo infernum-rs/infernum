@@ -14,9 +14,9 @@ use infernum::backend::{
 };
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, BiasAddOp, CastFromF32Op, EmbeddingGatherOp, ExtractLastRowOp,
-    FusedAttentionDecodeOp, FusedAttentionPrefillOp, GegluOp, LinearOp, LinearPairOp,
-    LinearTripleOp, LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp, RopeInterleavedOp,
-    RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
+    LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp, RopeInterleavedOp, RopeOp, ScaleOp,
+    SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
