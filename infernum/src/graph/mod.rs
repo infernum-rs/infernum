@@ -8,6 +8,7 @@ mod arena;
 mod builder;
 mod builder_traits;
 mod node;
+mod op_node;
 mod ops;
 pub mod optimizer;
 mod planner;
@@ -21,6 +22,7 @@ pub use builder_traits::{
     GraphRopeInterleavedOps, GraphRopeOps, GraphSiluOps, GraphSwigluOps, GraphTensorOps,
 };
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
+pub use op_node::{OpNode, OutputRef};
 pub use ops::{MoeExpertIds, Op};
 pub use planner::{plan, BufferSlot, ExecutionPlan};
 pub use weight_store::WeightStore;
