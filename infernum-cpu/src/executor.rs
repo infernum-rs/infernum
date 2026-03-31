@@ -1,15 +1,20 @@
 //! Graph executor for the CPU backend.
 //!
 //! Walks an [`ExecutionPlan`] in topological order and dispatches each
-//! [`Op`] to the existing CPU SIMD kernels. Intermediate tensors are
+//! operation to the existing CPU SIMD kernels. Intermediate tensors are
 //! read from / written to a shared [`Arena`].
 
 use std::collections::HashMap;
 
 use infernum::backend::{AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps};
-use infernum::graph::{Arena, WeightStore};
+use infernum::graph::builtin_ops::{
+    AddRmsNormOp, BiasAddOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeOp,
+    FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, RepeatKvOp,
+    RmsNormOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+};
+use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
-use infernum::{DType, ExecutionPlan, GraphNode, NodeId, Op, Result};
+use infernum::{DType, ExecutionPlan, NodeId, Result};
 
 use crate::simd;
 use crate::tensor::{CpuLinearWeight, CpuTensor};
@@ -123,28 +128,39 @@ impl KvCacheStore {
     }
 }
 
-/// Read a tensor from the arena using the plan's buffer slot for `node_id`.
+/// Read a tensor from the arena using the plan's buffer slot for an `OutputRef`.
 fn read_tensor(
     arena: &Arena,
     plan: &ExecutionPlan,
-    nodes: &[GraphNode],
-    node_id: NodeId,
+    nodes: &[GraphNode<CpuBackend>],
+    output_ref: OutputRef,
 ) -> CpuTensor {
+    let (node_id, output_idx) = output_ref;
     let node = &nodes[node_id.index() as usize];
-    let slot = plan.slot(node_id).expect("node has no buffer slot");
-    let num_elements: usize = node.shape.iter().product();
-    if node.dtype == DType::U32 {
+    let slot = plan
+        .slot(node_id, output_idx)
+        .expect("node output has no buffer slot");
+    let shape = &node.output_shapes[output_idx as usize];
+    let dtype = node.output_dtypes[output_idx as usize];
+    let num_elements: usize = shape.iter().product();
+    if dtype == DType::U32 {
         let data = arena.u32_slice(slot.offset, num_elements);
-        CpuTensor::from_u32(&node.shape, data)
+        CpuTensor::from_u32(shape, data)
     } else {
         let data = arena.f32_slice(slot.offset, num_elements);
-        CpuTensor::from_f32(&node.shape, data)
+        CpuTensor::from_f32(shape, data)
     }
 }
 
-/// Write a tensor into the arena at the plan's buffer slot for `node_id`.
-fn write_tensor(arena: &mut Arena, plan: &ExecutionPlan, node_id: NodeId, tensor: &CpuTensor) {
-    if let Some(slot) = plan.slot(node_id) {
+/// Write a tensor into the arena at the plan's buffer slot for a node output.
+fn write_tensor(
+    arena: &mut Arena,
+    plan: &ExecutionPlan,
+    node_id: NodeId,
+    output_idx: u32,
+    tensor: &CpuTensor,
+) {
+    if let Some(slot) = plan.slot(node_id, output_idx) {
         if tensor.dtype() == DType::U32 {
             let src = tensor.as_u32_slice();
             let dst = arena.u32_slice_mut(slot.offset, src.len());
@@ -159,7 +175,7 @@ fn write_tensor(arena: &mut Arena, plan: &ExecutionPlan, node_id: NodeId, tensor
 
 /// Execute a computation graph on the CPU backend.
 ///
-/// Walks the `plan.schedule` in topological order, dispatching each [`Op`]
+/// Walks the `plan.schedule` in topological order, dispatching each operation
 /// to the appropriate CPU SIMD kernel. Intermediate tensors are stored in
 /// the shared `arena`.
 ///
@@ -178,7 +194,7 @@ fn write_tensor(arena: &mut Arena, plan: &ExecutionPlan, node_id: NodeId, tensor
 #[allow(clippy::too_many_lines, clippy::cast_ptr_alignment)]
 pub fn execute(
     plan: &ExecutionPlan,
-    nodes: &[GraphNode],
+    nodes: &[GraphNode<CpuBackend>],
     arena: &mut Arena,
     weights: &WeightStore<CpuTensor, CpuLinearWeight>,
     inputs: &[CpuTensor],
@@ -196,10 +212,11 @@ pub fn execute(
         let node_id = plan.schedule[sched_idx];
         sched_idx += 1;
         let node = &nodes[node_id.index() as usize];
+        let op_name = node.op.name();
 
-        match &node.op {
+        match op_name {
             // --- Input ---
-            Op::Input => {
+            "input" => {
                 if kv_cache
                     .as_ref()
                     .is_some_and(|kv| kv.is_cache_input(node_id))
@@ -209,30 +226,37 @@ pub fn execute(
                 }
                 let tensor = &inputs[input_idx];
                 input_idx += 1;
-                write_tensor(arena, plan, node_id, tensor);
+                write_tensor(arena, plan, node_id, 0, tensor);
             }
 
             // --- Embedding ---
-            Op::EmbeddingGather { table } => {
+            "embedding_gather" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<EmbeddingGatherOp>()
+                    .unwrap();
                 let token_ids = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let table_w = weights.tensor_weight(*table);
-                let seq_len = node.shape[0];
+                let table_w = weights.tensor_weight(op.table);
+                let seq_len = node.output_shapes[0][0];
                 let result = <CpuBackend as EmbedOps>::embedding_gather_tensor(
                     table_w, &token_ids, seq_len,
                 )?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
             // --- Norm (zero-copy) ---
-            Op::RmsNorm { weight, eps } => {
+            "rms_norm" => {
+                let op = node.op.as_any().downcast_ref::<RmsNormOp>().unwrap();
+                let (inp_nid, inp_oidx) = node.inputs[0];
                 let inp_slot = plan
-                    .slot(node.inputs[0])
+                    .slot(inp_nid, inp_oidx)
                     .expect("rmsnorm input has no slot");
-                let out_slot = plan.slot(node_id).expect("rmsnorm output has no slot");
-                let w = weights.tensor_weight(*weight);
+                let out_slot = plan.slot(node_id, 0).expect("rmsnorm output has no slot");
+                let w = weights.tensor_weight(op.weight);
                 let weight_data = w.as_f32_slice();
                 let hidden_size = weight_data.len();
-                let num_elements: usize = node.shape.iter().product();
+                let num_elements: usize = node.output_shapes[0].iter().product();
                 let base = arena.as_mut_ptr();
                 unsafe {
                     let input = std::slice::from_raw_parts(
@@ -246,42 +270,34 @@ pub fn execute(
                     crate::ops::norm::rms_norm_slices(
                         input,
                         weight_data,
-                        *eps,
+                        op.eps,
                         output,
                         hidden_size,
                     );
                 }
             }
 
-            Op::AddRmsNorm { weight, eps } => {
+            "add_rms_norm" => {
+                let op = node.op.as_any().downcast_ref::<AddRmsNormOp>().unwrap();
+                let (res_nid, res_oidx) = node.inputs[0];
+                let (del_nid, del_oidx) = node.inputs[1];
                 let res_slot = plan
-                    .slot(node.inputs[0])
+                    .slot(res_nid, res_oidx)
                     .expect("add_rmsnorm residual has no slot");
                 let del_slot = plan
-                    .slot(node.inputs[1])
+                    .slot(del_nid, del_oidx)
                     .expect("add_rmsnorm delta has no slot");
                 let upd_slot = plan
-                    .slot(node_id)
+                    .slot(node_id, 0)
                     .expect("add_rmsnorm updated output has no slot");
-
-                // Find the SecondOutput node for the normed result.
-                #[allow(clippy::cast_possible_truncation)]
-                let second_id = nodes
-                    .iter()
-                    .enumerate()
-                    .find(
-                        |(_, n)| matches!(&n.op, Op::SecondOutput { source } if *source == node_id),
-                    )
-                    .map(|(i, _)| NodeId::from_index(i as u32))
-                    .expect("AddRmsNorm must have a SecondOutput");
                 let nrm_slot = plan
-                    .slot(second_id)
+                    .slot(node_id, 1)
                     .expect("add_rmsnorm normed output has no slot");
 
-                let w = weights.tensor_weight(*weight);
+                let w = weights.tensor_weight(op.weight);
                 let weight_data = w.as_f32_slice();
                 let hidden_size = weight_data.len();
-                let num_elements: usize = node.shape.iter().product();
+                let num_elements: usize = node.output_shapes[0].iter().product();
                 let base = arena.as_mut_ptr();
                 unsafe {
                     let residual = std::slice::from_raw_parts(
@@ -304,7 +320,7 @@ pub fn execute(
                         residual,
                         delta,
                         weight_data,
-                        *eps,
+                        op.eps,
                         updated,
                         normed,
                         hidden_size,
@@ -313,59 +329,69 @@ pub fn execute(
             }
 
             // --- Linear / Matmul ---
-            Op::Linear { weight } | Op::LmHead { weight, .. } => {
+            "lm_head" | "linear" => {
+                let weight = if op_name == "lm_head" {
+                    node.op.as_any().downcast_ref::<LmHeadOp>().unwrap().weight
+                } else {
+                    node.op.as_any().downcast_ref::<LinearOp>().unwrap().weight
+                };
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let w = weights.linear_weight(*weight);
+                let w = weights.linear_weight(weight);
                 let result = <CpuBackend as MatmulOps>::linear(&input, w)?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::LinearPair { w1, w2 } => {
+            "linear_pair" => {
+                let op = node.op.as_any().downcast_ref::<LinearPairOp>().unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let lw1 = weights.linear_weight(*w1);
-                let lw2 = weights.linear_weight(*w2);
+                let lw1 = weights.linear_weight(op.w1);
+                let lw2 = weights.linear_weight(op.w2);
                 let (out1, out2) = <CpuBackend as MatmulOps>::linear_pair(&input, lw1, lw2)?;
-                write_tensor(arena, plan, node_id, &out1);
-                let second_id = NodeId::from_index(node_id.index() + 1);
-                write_tensor(arena, plan, second_id, &out2);
+                write_tensor(arena, plan, node_id, 0, &out1);
+                write_tensor(arena, plan, node_id, 1, &out2);
             }
 
-            Op::LinearTriple { w1, w2, w3 } => {
+            "linear_triple" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<LinearTripleOp>()
+                    .unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let lw1 = weights.linear_weight(*w1);
-                let lw2 = weights.linear_weight(*w2);
-                let lw3 = weights.linear_weight(*w3);
+                let lw1 = weights.linear_weight(op.w1);
+                let lw2 = weights.linear_weight(op.w2);
+                let lw3 = weights.linear_weight(op.w3);
                 let (out1, out2, out3) =
                     <CpuBackend as MatmulOps>::linear_triple(&input, lw1, lw2, lw3)?;
-                write_tensor(arena, plan, node_id, &out1);
-                let second_id = NodeId::from_index(node_id.index() + 1);
-                write_tensor(arena, plan, second_id, &out2);
-                let third_id = NodeId::from_index(node_id.index() + 2);
-                write_tensor(arena, plan, third_id, &out3);
+                write_tensor(arena, plan, node_id, 0, &out1);
+                write_tensor(arena, plan, node_id, 1, &out2);
+                write_tensor(arena, plan, node_id, 2, &out3);
             }
 
-            Op::Matmul => {
+            "matmul" => {
                 let a = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let b = read_tensor(arena, plan, nodes, node.inputs[1]);
                 let result = <CpuBackend as MatmulOps>::matmul(&a, &b)?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::MatmulBf16F32 => {
+            "matmul_bf16_f32" => {
                 let a = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let b = read_tensor(arena, plan, nodes, node.inputs[1]);
                 let result = <CpuBackend as MatmulExtOps>::matmul_bf16_f32(&a, &b)?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
             // --- Activations ---
-            Op::Swiglu => {
+            "swiglu" => {
                 // Zero-copy: read gate/up and write output directly in the arena.
                 // Safety: the planner guarantees all three slots are disjoint.
-                let gate_slot = plan.slot(node.inputs[0]).expect("gate has no slot");
-                let up_slot = plan.slot(node.inputs[1]).expect("up has no slot");
-                let out_slot = plan.slot(node_id).expect("swiglu output has no slot");
-                let num_elements: usize = node.shape.iter().product();
+                let (gate_nid, gate_oidx) = node.inputs[0];
+                let (up_nid, up_oidx) = node.inputs[1];
+                let gate_slot = plan.slot(gate_nid, gate_oidx).expect("gate has no slot");
+                let up_slot = plan.slot(up_nid, up_oidx).expect("up has no slot");
+                let out_slot = plan.slot(node_id, 0).expect("swiglu output has no slot");
+                let num_elements: usize = node.output_shapes[0].iter().product();
                 let base = arena.as_mut_ptr();
                 unsafe {
                     let gate_data = std::slice::from_raw_parts(
@@ -384,22 +410,28 @@ pub fn execute(
                 }
             }
 
-            Op::Silu => {
+            "silu" => {
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let data = input.as_f32_slice();
                 let mut out = vec![0.0f32; data.len()];
                 for (o, &x) in out.iter_mut().zip(data.iter()) {
                     *o = x / (1.0 + (-x).exp());
                 }
-                let result = CpuTensor::from_f32(&node.shape, &out);
-                write_tensor(arena, plan, node_id, &result);
+                let result = CpuTensor::from_f32(&node.output_shapes[0], &out);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::Mul => {
-                let a_slot = plan.slot(node.inputs[0]).expect("mul input a has no slot");
-                let b_slot = plan.slot(node.inputs[1]).expect("mul input b has no slot");
-                let out_slot = plan.slot(node_id).expect("mul output has no slot");
-                let num_elements: usize = node.shape.iter().product();
+            "mul" => {
+                let (a_nid, a_oidx) = node.inputs[0];
+                let (b_nid, b_oidx) = node.inputs[1];
+                let a_slot = plan
+                    .slot(a_nid, a_oidx)
+                    .expect("mul input a has no slot");
+                let b_slot = plan
+                    .slot(b_nid, b_oidx)
+                    .expect("mul input b has no slot");
+                let out_slot = plan.slot(node_id, 0).expect("mul output has no slot");
+                let num_elements: usize = node.output_shapes[0].iter().product();
                 let base = arena.as_mut_ptr();
                 unsafe {
                     let a_data = std::slice::from_raw_parts(
@@ -419,12 +451,18 @@ pub fn execute(
             }
 
             // --- Arithmetic ---
-            Op::Add | Op::AddInplace => {
+            "add" | "add_inplace" => {
                 // Zero-copy: read a/b and write output directly in the arena.
-                let a_slot = plan.slot(node.inputs[0]).expect("add input a has no slot");
-                let b_slot = plan.slot(node.inputs[1]).expect("add input b has no slot");
-                let out_slot = plan.slot(node_id).expect("add output has no slot");
-                let num_elements: usize = node.shape.iter().product();
+                let (a_nid, a_oidx) = node.inputs[0];
+                let (b_nid, b_oidx) = node.inputs[1];
+                let a_slot = plan
+                    .slot(a_nid, a_oidx)
+                    .expect("add input a has no slot");
+                let b_slot = plan
+                    .slot(b_nid, b_oidx)
+                    .expect("add input b has no slot");
+                let out_slot = plan.slot(node_id, 0).expect("add output has no slot");
+                let num_elements: usize = node.output_shapes[0].iter().product();
                 let base = arena.as_mut_ptr();
                 unsafe {
                     let a_data = std::slice::from_raw_parts(
@@ -443,15 +481,19 @@ pub fn execute(
                 }
             }
 
-            Op::Scale { factor } => {
+            "scale" => {
+                let op = node.op.as_any().downcast_ref::<ScaleOp>().unwrap();
                 // Zero-copy: copy input to output, then scale in-place.
-                let inp_slot = plan.slot(node.inputs[0]).expect("scale input has no slot");
-                let out_slot = plan.slot(node_id).expect("scale output has no slot");
-                let num_elements: usize = node.shape.iter().product();
+                let (inp_nid, inp_oidx) = node.inputs[0];
+                let inp_slot = plan
+                    .slot(inp_nid, inp_oidx)
+                    .expect("scale input has no slot");
+                let out_slot = plan.slot(node_id, 0).expect("scale output has no slot");
+                let num_elements: usize = node.output_shapes[0].iter().product();
                 if inp_slot.offset == out_slot.offset {
                     // Aliased — scale in-place directly.
                     let data = arena.f32_slice_mut(out_slot.offset, num_elements);
-                    simd::vec_scale(data, *factor);
+                    simd::vec_scale(data, op.factor);
                 } else {
                     let base = arena.as_mut_ptr();
                     unsafe {
@@ -464,21 +506,23 @@ pub fn execute(
                             num_elements,
                         );
                         dst.copy_from_slice(src);
-                        simd::vec_scale(dst, *factor);
+                        simd::vec_scale(dst, op.factor);
                     }
                 }
             }
 
-            Op::BiasAdd { bias } => {
+            "bias_add" => {
+                let op = node.op.as_any().downcast_ref::<BiasAddOp>().unwrap();
                 // Zero-copy: copy input to output, then add bias in-place.
+                let (inp_nid, inp_oidx) = node.inputs[0];
                 let inp_slot = plan
-                    .slot(node.inputs[0])
+                    .slot(inp_nid, inp_oidx)
                     .expect("bias_add input has no slot");
-                let out_slot = plan.slot(node_id).expect("bias_add output has no slot");
-                let bias_w = weights.tensor_weight(*bias);
+                let out_slot = plan.slot(node_id, 0).expect("bias_add output has no slot");
+                let bias_w = weights.tensor_weight(op.bias);
                 let bias_data = bias_w.as_f32_slice();
                 let cols = bias_data.len();
-                let num_elements: usize = node.shape.iter().product();
+                let num_elements: usize = node.output_shapes[0].iter().product();
                 let rows = num_elements / cols;
                 let base = arena.as_mut_ptr();
                 unsafe {
@@ -502,35 +546,44 @@ pub fn execute(
             }
 
             // --- RoPE (zero-copy, with pair fusion) ---
-            Op::Rope { offset } => {
-                let cos_node = &nodes[node.inputs[1].index() as usize];
-                let sin_node = &nodes[node.inputs[2].index() as usize];
+            "rope" => {
+                let op = node.op.as_any().downcast_ref::<RopeOp>().unwrap();
+                let cos_ref = node.inputs[1];
+                let sin_ref = node.inputs[2];
+                let cos_node = &nodes[cos_ref.0.index() as usize];
+                let sin_node = &nodes[sin_ref.0.index() as usize];
 
                 // Check if cos/sin are f32 in the arena.
-                if cos_node.dtype != DType::F32 || sin_node.dtype != DType::F32 {
+                if cos_node.output_dtypes[cos_ref.1 as usize] != DType::F32
+                    || sin_node.output_dtypes[sin_ref.1 as usize] != DType::F32
+                {
                     // Fallback: cos/sin need dtype conversion.
                     let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                    let cos_cache = read_tensor(arena, plan, nodes, node.inputs[1]);
-                    let sin_cache = read_tensor(arena, plan, nodes, node.inputs[2]);
+                    let cos_cache = read_tensor(arena, plan, nodes, cos_ref);
+                    let sin_cache = read_tensor(arena, plan, nodes, sin_ref);
                     let result = <CpuBackend as RopeOps>::apply_rope(
-                        &input, &cos_cache, &sin_cache, *offset,
+                        &input, &cos_cache, &sin_cache, op.offset,
                     )?;
-                    write_tensor(arena, plan, node_id, &result);
+                    write_tensor(arena, plan, node_id, 0, &result);
                 } else {
                     // Check if the next scheduled op is also Rope with same
                     // cos/sin inputs — if so, fuse both into one dispatch.
                     let next_rope = if sched_idx < plan.schedule.len() {
                         let next_id = plan.schedule[sched_idx];
                         let next_node = &nodes[next_id.index() as usize];
-                        if let Op::Rope { offset: off2 } = &next_node.op {
-                            let n2_cos = &nodes[next_node.inputs[1].index() as usize];
-                            let n2_sin = &nodes[next_node.inputs[2].index() as usize];
-                            if next_node.inputs[1] == node.inputs[1]
-                                && next_node.inputs[2] == node.inputs[2]
-                                && n2_cos.dtype == DType::F32
-                                && n2_sin.dtype == DType::F32
+                        if next_node.op.name() == "rope" {
+                            let next_op =
+                                next_node.op.as_any().downcast_ref::<RopeOp>().unwrap();
+                            let n2_cos_ref = next_node.inputs[1];
+                            let n2_sin_ref = next_node.inputs[2];
+                            let n2_cos_node = &nodes[n2_cos_ref.0.index() as usize];
+                            let n2_sin_node = &nodes[n2_sin_ref.0.index() as usize];
+                            if n2_cos_ref == cos_ref
+                                && n2_sin_ref == sin_ref
+                                && n2_cos_node.output_dtypes[n2_cos_ref.1 as usize] == DType::F32
+                                && n2_sin_node.output_dtypes[n2_sin_ref.1 as usize] == DType::F32
                             {
-                                Some((next_id, next_node, *off2))
+                                Some((next_id, next_node, next_op.offset))
                             } else {
                                 None
                             }
@@ -541,22 +594,32 @@ pub fn execute(
                         None
                     };
 
-                    let cos_slot = plan.slot(node.inputs[1]).expect("rope cos has no slot");
-                    let sin_slot = plan.slot(node.inputs[2]).expect("rope sin has no slot");
-                    let cos_elements: usize = cos_node.shape.iter().product();
-                    let sin_elements: usize = sin_node.shape.iter().product();
+                    let cos_slot = plan
+                        .slot(cos_ref.0, cos_ref.1)
+                        .expect("rope cos has no slot");
+                    let sin_slot = plan
+                        .slot(sin_ref.0, sin_ref.1)
+                        .expect("rope sin has no slot");
+                    let cos_shape = &cos_node.output_shapes[cos_ref.1 as usize];
+                    let sin_shape = &sin_node.output_shapes[sin_ref.1 as usize];
+                    let cos_elements: usize = cos_shape.iter().product();
+                    let sin_elements: usize = sin_shape.iter().product();
 
                     let base = arena.as_mut_ptr();
+                    let shape = &node.output_shapes[0];
 
                     if let Some((next_id, next_node, offset_b)) = next_rope {
                         // Fused pair: execute both ropes in a single dispatch.
                         sched_idx += 1; // skip the second Rope
 
-                        let inp_a = plan.slot(node.inputs[0]).expect("rope A input");
-                        let out_a = plan.slot(node_id).expect("rope A output");
-                        let inp_b = plan.slot(next_node.inputs[0]).expect("rope B input");
-                        let out_b = plan.slot(next_id).expect("rope B output");
+                        let (inp_a_nid, inp_a_oidx) = node.inputs[0];
+                        let inp_a = plan.slot(inp_a_nid, inp_a_oidx).expect("rope A input");
+                        let out_a = plan.slot(node_id, 0).expect("rope A output");
+                        let (next_inp_nid, next_inp_oidx) = next_node.inputs[0];
+                        let inp_b = plan.slot(next_inp_nid, next_inp_oidx).expect("rope B input");
+                        let out_b = plan.slot(next_id, 0).expect("rope B output");
 
+                        let next_shape = &next_node.output_shapes[0];
                         unsafe {
                             let cos_data = std::slice::from_raw_parts(
                                 base.add(cos_slot.offset).cast::<f32>(),
@@ -569,17 +632,17 @@ pub fn execute(
                             let op_a = crate::ops::rope::RopeOperand {
                                 inp_ptr: base.add(inp_a.offset) as usize,
                                 out_ptr: base.add(out_a.offset) as usize,
-                                seq_len: node.shape[0],
-                                num_heads: node.shape[1],
-                                head_dim: node.shape[2],
-                                offset: *offset,
+                                seq_len: shape[0],
+                                num_heads: shape[1],
+                                head_dim: shape[2],
+                                offset: op.offset,
                             };
                             let op_b = crate::ops::rope::RopeOperand {
                                 inp_ptr: base.add(inp_b.offset) as usize,
                                 out_ptr: base.add(out_b.offset) as usize,
-                                seq_len: next_node.shape[0],
-                                num_heads: next_node.shape[1],
-                                head_dim: next_node.shape[2],
+                                seq_len: next_shape[0],
+                                num_heads: next_shape[1],
+                                head_dim: next_shape[2],
                                 offset: offset_b,
                             };
                             crate::ops::rope::apply_rope_pair_slices(
@@ -588,9 +651,10 @@ pub fn execute(
                         }
                     } else {
                         // Single rope — no fusion possible.
-                        let inp_slot = plan.slot(node.inputs[0]).expect("rope input");
-                        let out_slot = plan.slot(node_id).expect("rope output");
-                        let num_elements: usize = node.shape.iter().product();
+                        let (inp_nid, inp_oidx) = node.inputs[0];
+                        let inp_slot = plan.slot(inp_nid, inp_oidx).expect("rope input");
+                        let out_slot = plan.slot(node_id, 0).expect("rope output");
+                        let num_elements: usize = shape.iter().product();
                         unsafe {
                             let input = std::slice::from_raw_parts(
                                 base.add(inp_slot.offset).cast::<f32>(),
@@ -609,14 +673,8 @@ pub fn execute(
                                 num_elements,
                             );
                             crate::ops::rope::apply_rope_slices(
-                                input,
-                                cos_data,
-                                sin_data,
-                                output,
-                                node.shape[0],
-                                node.shape[1],
-                                node.shape[2],
-                                *offset,
+                                input, cos_data, sin_data, output, shape[0], shape[1], shape[2],
+                                op.offset,
                             );
                         }
                     }
@@ -624,12 +682,12 @@ pub fn execute(
             }
 
             // --- Attention ---
-            Op::FusedAttentionPrefill {
-                offset,
-                scale,
-                softcap,
-                sliding_window,
-            } => {
+            "fused_attention_prefill" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<FusedAttentionPrefillOp>()
+                    .unwrap();
                 let q = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let k = read_tensor(arena, plan, nodes, node.inputs[1]);
                 let v = read_tensor(arena, plan, nodes, node.inputs[2]);
@@ -637,40 +695,48 @@ pub fn execute(
                     &q,
                     &k,
                     &v,
-                    *offset,
-                    *scale,
-                    *softcap,
-                    *sliding_window,
+                    op.offset,
+                    op.scale,
+                    op.softcap,
+                    op.sliding_window,
                 )?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::FusedAttentionDecode { softcap } => {
+            "fused_attention_decode" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<FusedAttentionDecodeOp>()
+                    .unwrap();
                 let q = read_tensor(arena, plan, nodes, node.inputs[0]);
                 // K/V may be in overrides (persistent KV cache) instead of arena.
+                let k_ref = node.inputs[1];
+                let v_ref = node.inputs[2];
                 let k = overrides
-                    .remove(&node.inputs[1])
-                    .unwrap_or_else(|| read_tensor(arena, plan, nodes, node.inputs[1]));
+                    .remove(&k_ref.0)
+                    .unwrap_or_else(|| read_tensor(arena, plan, nodes, k_ref));
                 let v = overrides
-                    .remove(&node.inputs[2])
-                    .unwrap_or_else(|| read_tensor(arena, plan, nodes, node.inputs[2]));
+                    .remove(&v_ref.0)
+                    .unwrap_or_else(|| read_tensor(arena, plan, nodes, v_ref));
                 let result = <CpuBackend as AttentionOps>::fused_attention_decode(
-                    &q, &k, &v, None, *softcap, None,
+                    &q, &k, &v, None, op.softcap, None,
                 )?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
             // --- Shape / Data movement ---
-            Op::Reshape { .. } => {
+            "reshape" => {
                 // Zero-copy: if input and output share the same arena slot,
                 // this is purely a shape change — skip entirely.
+                let (inp_nid, inp_oidx) = node.inputs[0];
                 let inp_slot = plan
-                    .slot(node.inputs[0])
+                    .slot(inp_nid, inp_oidx)
                     .expect("reshape input has no slot");
-                let out_slot = plan.slot(node_id).expect("reshape output has no slot");
+                let out_slot = plan.slot(node_id, 0).expect("reshape output has no slot");
                 if inp_slot.offset != out_slot.offset {
                     // Different slots — direct arena-to-arena memcpy.
-                    let num_elements: usize = node.shape.iter().product();
+                    let num_elements: usize = node.output_shapes[0].iter().product();
                     let byte_len = num_elements * std::mem::size_of::<f32>();
                     let base = arena.as_mut_ptr();
                     unsafe {
@@ -683,45 +749,56 @@ pub fn execute(
                 }
             }
 
-            Op::RepeatKv { num_repeats } => {
+            "repeat_kv" => {
+                let op = node.op.as_any().downcast_ref::<RepeatKvOp>().unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let result = <CpuBackend as TensorOps>::repeat_kv(&input, *num_repeats)?;
-                write_tensor(arena, plan, node_id, &result);
+                let result = <CpuBackend as TensorOps>::repeat_kv(&input, op.num_repeats)?;
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::ExtractLastRow { seq_len } => {
+            "extract_last_row" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<ExtractLastRowOp>()
+                    .unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let inner_size: usize = node.shape[1..].iter().product();
-                let offset = (seq_len - 1) * inner_size;
-                let result = input.slice_view(offset, &node.shape);
-                write_tensor(arena, plan, node_id, &result);
+                let shape = &node.output_shapes[0];
+                let inner_size: usize = shape[1..].iter().product();
+                let offset = (op.seq_len - 1) * inner_size;
+                let result = input.slice_view(offset, shape);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::Transpose2d => {
+            "transpose_2d" => {
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let result = <CpuBackend as TensorOps>::transpose_2d(&input)?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::SplitInnerDim { left_size } => {
+            "split_inner_dim" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<SplitInnerDimOp>()
+                    .unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let inner = *input.shape().last().expect("non-empty shape");
-                let right_size = inner - left_size;
+                let right_size = inner - op.left_size;
                 let (left, right) =
-                    <CpuBackend as TensorOps>::split_inner_dim(&input, *left_size, right_size)?;
-                write_tensor(arena, plan, node_id, &left);
-                let second_id = NodeId::from_index(node_id.index() + 1);
-                write_tensor(arena, plan, second_id, &right);
+                    <CpuBackend as TensorOps>::split_inner_dim(&input, op.left_size, right_size)?;
+                write_tensor(arena, plan, node_id, 0, &left);
+                write_tensor(arena, plan, node_id, 1, &right);
             }
 
-            Op::ConcatInnerDim => {
+            "concat_inner_dim" => {
                 let a = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let b = read_tensor(arena, plan, nodes, node.inputs[1]);
                 let result = <CpuBackend as TensorOps>::concat_inner_dim(&a, &b)?;
-                write_tensor(arena, plan, node_id, &result);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
-            Op::ConcatSeq => {
+            "concat_seq" => {
                 let concat_info = kv_cache
                     .as_ref()
                     .and_then(|kv| kv.cache_concat_info(node_id));
@@ -744,28 +821,26 @@ pub fn execute(
                     let mut data = Vec::with_capacity(a_data.len() + b_data.len());
                     data.extend_from_slice(a_data);
                     data.extend_from_slice(b_data);
-                    let result = CpuTensor::from_f32_vec(&node.shape, data);
-                    write_tensor(arena, plan, node_id, &result);
+                    let result = CpuTensor::from_f32_vec(&node.output_shapes[0], data);
+                    write_tensor(arena, plan, node_id, 0, &result);
                 }
             }
 
-            Op::SliceView { offset, shape } => {
+            "slice_view" => {
+                let op = node.op.as_any().downcast_ref::<SliceViewOp>().unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let result = input.slice_view(*offset, shape);
-                write_tensor(arena, plan, node_id, &result);
+                let result = input.slice_view(op.offset, &op.shape);
+                write_tensor(arena, plan, node_id, 0, &result);
             }
 
             // --- Cast (no-op on CPU: all data is f32) ---
-            Op::CastToF32 | Op::CastFromF32 { .. } => {
+            "cast_to_f32" | "cast_from_f32" => {
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                write_tensor(arena, plan, node_id, &input);
+                write_tensor(arena, plan, node_id, 0, &input);
             }
 
-            // --- Multi-output secondary (already handled by parent op) ---
-            Op::SecondOutput { .. } => {}
-
             // --- Unimplemented ---
-            op => panic!("CPU executor: unimplemented op {op:?}"),
+            name => panic!("CPU executor: unimplemented op {name:?}"),
         }
     }
 
@@ -780,7 +855,7 @@ pub fn execute(
         .map(|&id| {
             overrides
                 .remove(&id)
-                .unwrap_or_else(|| read_tensor(arena, plan, nodes, id))
+                .unwrap_or_else(|| read_tensor(arena, plan, nodes, (id, 0)))
         })
         .collect();
 
@@ -802,7 +877,7 @@ mod tests {
         let a = graph.add_input(&[4], DType::F32);
         let b = graph.add_input(&[4], DType::F32);
         let c = graph.add_add(a, b);
-        graph.set_output(c);
+        graph.set_output(c.0);
 
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);
@@ -835,7 +910,7 @@ mod tests {
         let w_id = graph.register_linear_weight("proj", &[2, 3], DType::F32);
         let input_node = graph.add_input(&[1, 3], DType::F32);
         let output_node = graph.add_linear(input_node, w_id);
-        graph.set_output(output_node);
+        graph.set_output(output_node.0);
 
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);
@@ -877,7 +952,7 @@ mod tests {
         let input_node = graph.add_input(&[1, 4], DType::F32);
         let normed = graph.add_rms_norm(input_node, norm_w_id, 1e-5);
         let output_node = graph.add_linear(normed, proj_w_id);
-        graph.set_output(output_node);
+        graph.set_output(output_node.0);
 
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);
@@ -929,6 +1004,10 @@ mod tests {
     }
 
     /// Test 4: End-to-end Llama prefill graph with synthetic weights.
+    ///
+    /// Gated behind `integration` until `infernum-llama` is migrated to the
+    /// new graph IR.
+    #[cfg(feature = "integration")]
     #[test]
     fn llama_prefill_graph_synthetic() {
         use infernum::graph::WeightId;
