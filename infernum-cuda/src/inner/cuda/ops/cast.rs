@@ -20,6 +20,7 @@ const KERNEL_NAMES: &[&str] = &[
     "cast_f16_to_f32",
     "cast_f32_to_bf16",
     "cast_bf16_to_f32",
+    "cast_bf16_to_f16",
 ];
 
 fn ensure_cast_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {

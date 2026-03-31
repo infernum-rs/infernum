@@ -2,8 +2,11 @@
 //!
 //! Performs `output = input @ dequantize(weight)^T` where weights are stored
 //! in `Q8_0`, `Q4_0`, `Q6_K`, `F8E4M3`, `GPTQ_INT4`, or `AWQ_INT4` format.
-//! Input activations and output remain f32. Dequantization happens on-the-fly
-//! inside the kernel — the full f32 weight matrix never exists in GPU memory.
+//! Input activations may be F32, BF16, or F16; output is always F32.
+//! For prefill (M > 1), the dequant+cuBLAS path casts activations to F16
+//! internally. For decode (M = 1), the GEMV path requires F32 and casts
+//! automatically if needed. Dequantization happens on-the-fly inside the
+//! kernel — the full f32 weight matrix never exists in GPU memory.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -16,6 +19,7 @@ use cudarc::cublaslt::MatmulShared;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice, LaunchAsync, LaunchConfig};
 
 use crate::cuda::buffer_pool::PooledSlice;
+use crate::cuda::ops::cast_to_f32;
 use crate::cuda::quantized::QuantizedTensor;
 use crate::cuda::CudaContext;
 use crate::cuda::CudaTensor;
@@ -526,11 +530,13 @@ fn quantized_gemv(
 
 /// Quantized linear projection: `output = input @ dequant(weight)^T`
 ///
-/// - `input`: f32 tensor of shape `(M, K)` or `(batch, M, K)`
+/// - `input`: tensor of shape `(M, K)` or `(batch, M, K)` — F32, BF16, or F16
 /// - `weight`: quantized tensor of shape `(N, K)` (stored transposed, as in `HuggingFace` convention)
 /// - output: f32 tensor of shape `(M, N)` or `(batch, M, N)`
 ///
 /// Dispatches to the appropriate kernel based on `weight.dtype()`.
+/// For M > 1 (prefill), activations are cast to F16 internally for cuBLAS.
+/// For M = 1 (decode GEMV), activations are cast to F32 if needed.
 ///
 /// # Errors
 /// Returns an error if kernel compilation or launch fails.
@@ -716,6 +722,7 @@ fn ensure_cast_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> R
                 "cast_f16_to_f32",
                 "cast_f32_to_bf16",
                 "cast_bf16_to_f32",
+                "cast_bf16_to_f16",
             ],
         )?;
     }
@@ -724,9 +731,13 @@ fn ensure_cast_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> R
 
 /// Dequantize weight to F16, cast activations to F16, then cuBLAS GEMM.
 ///
-/// `input`: f32 tensor (M, K)
+/// `input`: tensor of any dtype (F32, BF16, or F16) with shape (M, K)
 /// `weight`: quantized tensor (N, K) — stored transposed (row n = output n)
 /// output: f32 tensor (M, N) = input @ dequant(weight)^T
+///
+/// The dequantized F16 weight buffer is cached on the `QuantizedTensor` via
+/// `OnceLock`, so repeated calls (across prefill tokens / layers) pay the
+/// dequant cost only once. Activation F16 buffers use the pool allocator.
 #[allow(clippy::too_many_arguments)]
 fn dequant_cublas_matmul(
     input: &CudaTensor,
@@ -746,115 +757,139 @@ fn dequant_cublas_matmul(
     ensure_dequant_kernels(device)?;
     ensure_cast_kernels(device)?;
 
-    // 1. Dequantize weight (N, K) → F16 buffer
-    let mut w_f16: CudaSlice<u8> = unsafe { device.alloc::<u8>(total_w * 2)? }; // 2 bytes per f16
+    // 1. Dequantize weight (N, K) → F16 buffer (cached across calls)
+    let w_f16 = weight.dequant_f16().get_or_init(|| {
+        let mut buf: CudaSlice<u8> = unsafe {
+            device
+                .alloc::<u8>(total_w * 2)
+                .expect("GPU alloc for dequant cache")
+        };
 
-    let block_size = 256_u32;
-    let grid_size = ((total_w as u32) + block_size - 1) / block_size;
-    let dequant_cfg = LaunchConfig {
-        grid_dim: (grid_size, 1, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    match weight.dtype() {
-        DType::Q8_0 => {
-            let func = device.get_func("dequantize", "dequant_q8_f16").unwrap();
-            unsafe {
-                func.launch(
-                    dequant_cfg,
-                    (
-                        &mut w_f16,
-                        weight.data_slice(),
-                        weight.scales_slice(),
-                        n as i32,
-                        k as i32,
-                    ),
-                )?;
-            }
-        }
-        DType::Q4_0 => {
-            let func = device.get_func("dequantize", "dequant_q4_f16").unwrap();
-            unsafe {
-                func.launch(
-                    dequant_cfg,
-                    (
-                        &mut w_f16,
-                        weight.data_slice(),
-                        weight.scales_slice(),
-                        n as i32,
-                        k as i32,
-                    ),
-                )?;
-            }
-        }
-        DType::Q6_K => {
-            let func = device.get_func("dequantize", "dequant_q6k_f16").unwrap();
-            unsafe {
-                func.launch(
-                    dequant_cfg,
-                    (&mut w_f16, weight.data_slice(), n as i32, k as i32),
-                )?;
-            }
-        }
-        DType::GPTQ_INT4 => {
-            let group_size = weight
-                .group_size()
-                .expect("GPTQ_INT4 weight must have group_size");
-            let qzeros = weight
-                .qzeros_slice()
-                .expect("GPTQ_INT4 weight must have qzeros");
-            let func = device.get_func("dequantize", "dequant_gptq_f16").unwrap();
-            unsafe {
-                func.launch(
-                    dequant_cfg,
-                    (
-                        &mut w_f16,
-                        weight.data_slice(),
-                        weight.scales_slice(),
-                        qzeros,
-                        n as i32,
-                        k as i32,
-                        group_size as i32,
-                    ),
-                )?;
-            }
-        }
-        other => panic!("dequant_cublas_matmul: unsupported dtype {other}"),
-    }
-
-    // 2. Cast f32 activations (M, K) → F16
-    let total_a = m * k;
-    let mut a_f16: CudaSlice<u8> = unsafe { device.alloc::<u8>(total_a * 2)? };
-    {
-        let func = device.get_func("cast", "cast_f32_to_f16").unwrap();
-        let grid = ((total_a as u32) + block_size - 1) / block_size;
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
+        let block_size = 256_u32;
+        let grid_size = ((total_w as u32) + block_size - 1) / block_size;
+        let dequant_cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
             block_dim: (block_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe {
-            func.launch(cfg, (&mut a_f16, &input.cuda_slice(), total_a as i32))?;
+
+        match weight.dtype() {
+            DType::Q8_0 => {
+                let func = device.get_func("dequantize", "dequant_q8_f16").unwrap();
+                unsafe {
+                    func.launch(
+                        dequant_cfg,
+                        (
+                            &mut buf,
+                            weight.data_slice(),
+                            weight.scales_slice(),
+                            n as i32,
+                            k as i32,
+                        ),
+                    )
+                    .expect("dequant Q8 kernel launch");
+                }
+            }
+            DType::Q4_0 => {
+                let func = device.get_func("dequantize", "dequant_q4_f16").unwrap();
+                unsafe {
+                    func.launch(
+                        dequant_cfg,
+                        (
+                            &mut buf,
+                            weight.data_slice(),
+                            weight.scales_slice(),
+                            n as i32,
+                            k as i32,
+                        ),
+                    )
+                    .expect("dequant Q4 kernel launch");
+                }
+            }
+            DType::Q6_K => {
+                let func = device.get_func("dequantize", "dequant_q6k_f16").unwrap();
+                unsafe {
+                    func.launch(
+                        dequant_cfg,
+                        (&mut buf, weight.data_slice(), n as i32, k as i32),
+                    )
+                    .expect("dequant Q6K kernel launch");
+                }
+            }
+            DType::GPTQ_INT4 => {
+                let group_size = weight
+                    .group_size()
+                    .expect("GPTQ_INT4 weight must have group_size");
+                let qzeros = weight
+                    .qzeros_slice()
+                    .expect("GPTQ_INT4 weight must have qzeros");
+                let func = device.get_func("dequantize", "dequant_gptq_f16").unwrap();
+                unsafe {
+                    func.launch(
+                        dequant_cfg,
+                        (
+                            &mut buf,
+                            weight.data_slice(),
+                            weight.scales_slice(),
+                            qzeros,
+                            n as i32,
+                            k as i32,
+                            group_size as i32,
+                        ),
+                    )
+                    .expect("dequant GPTQ kernel launch");
+                }
+            }
+            other => panic!("dequant_cublas_matmul: unsupported dtype {other}"),
         }
-    }
+
+        buf
+    });
+
+    // 2. Cast activations (M, K) → F16 (dtype-aware: skip cast for F16 input)
+    let total_a = m * k;
+    let input_dtype = input.dtype();
+    let block_size = 256_u32;
+
+    // For F16 input we can use the raw slice directly; for F32/BF16 we cast
+    // into a pool-allocated buffer.
+    let a_f16_pooled;
+    let a_f16_ptr: *const u8 = match input_dtype {
+        DType::F16 => *input.cuda_slice().device_ptr() as *const u8,
+        DType::BF16 => {
+            a_f16_pooled = unsafe { ctx.pool_alloc::<u8>(total_a * 2)? };
+            let func = device.get_func("cast", "cast_bf16_to_f16").unwrap();
+            let grid = ((total_a as u32) + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                func.launch(cfg, (&*a_f16_pooled, &input.cuda_slice(), total_a as i32))?;
+            }
+            *a_f16_pooled.device_ptr() as *const u8
+        }
+        DType::F32 => {
+            a_f16_pooled = unsafe { ctx.pool_alloc::<u8>(total_a * 2)? };
+            let func = device.get_func("cast", "cast_f32_to_f16").unwrap();
+            let grid = ((total_a as u32) + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                func.launch(cfg, (&*a_f16_pooled, &input.cuda_slice(), total_a as i32))?;
+            }
+            *a_f16_pooled.device_ptr() as *const u8
+        }
+        other => panic!("dequant_cublas_matmul: unsupported input dtype {other}"),
+    };
 
     // 3. cuBLAS GEMM: output(M,N) = input_f16(M,K) @ weight_f16(N,K)^T
-    //    In cuBLAS column-major: C^T(N,M) = W(N,K) @ A^T(K,M)
-    //    W is (N,K) row-major = (K,N) col-major, so op(A)=N gives (K,N)^T = (N,K)? No.
-    //    W_f16 is (N,K) row-major. In col-major that's a (K,N) matrix.
-    //    We want W^T @ ... but W_f16 in col-major is already (K,N).
-    //    A_f16 is (M,K) row-major = (K,M) col-major.
-    //    C = A @ W^T → C^T = W @ A^T
-    //    In col-major: C_cm(N,M) = W_cm(K,N)^T(N,K) @ A_cm(K,M)
-    //    So: op(A)=CUBLAS_OP_T on W_cm, op(B)=CUBLAS_OP_N on A_cm
-    //
-    //    Actually simpler: cuBLAS computes D = alpha * op(A) * op(B) + beta * C
-    //    We want row-major: Out(M,N) = A(M,K) * W(N,K)^T
-    //    Row-major trick: treat as col-major transposed:
-    //    Out_cm(N,M) = W_cm * A_cm where W is (N,K) rm = (K,N) cm, A is (M,K) rm = (K,M) cm
-    //    But we need (N,M) = (N,K) * (K,M)
-    //    So: op(A) = CUBLAS_OP_T on W_cm(K,N) → (N,K), op(B) = CUBLAS_OP_N on A_cm(K,M)
+    //    Row-major trick: treat as col-major transposed.
+    //    op(A) = CUBLAS_OP_T on W_cm(K,N) → (N,K), op(B) = CUBLAS_OP_N on A_cm(K,M)
     //    Result: (N,K) * (K,M) = (N,M) → stored as (N,M) col-major = (M,N) row-major ✓
 
     let mut output = unsafe { CudaTensor::uninit(ctx, &[m, n], DType::F32)? };
@@ -875,8 +910,8 @@ fn dequant_cublas_matmul(
             (&raw const alpha).cast(),
             *w_f16.device_ptr() as *const _, // A = weight f16
             f16_type,
-            k as i32,                        // lda = K (col-major stride of W_cm)
-            *a_f16.device_ptr() as *const _, // B = activation f16
+            k as i32,              // lda = K (col-major stride of W_cm)
+            a_f16_ptr as *const _, // B = activation f16
             f16_type,
             k as i32, // ldb = K (col-major stride of A_cm)
             (&raw const beta).cast(),
@@ -921,14 +956,21 @@ fn quantized_matmul_2d(
         )?;
     }
 
-    // GEMV fast path for M=1 decode
+    // GEMV fast path for M=1 decode (requires F32 activations)
     if m == 1
         && matches!(
             weight.dtype(),
             DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::GPTQ_INT4
         )
     {
-        return quantized_gemv(input, weight, n, k);
+        let input_f32;
+        let gemv_input = if input.dtype() == DType::F32 {
+            input
+        } else {
+            input_f32 = cast_to_f32(input)?;
+            &input_f32
+        };
+        return quantized_gemv(gemv_input, weight, n, k);
     }
 
     // Tensor-core paths for M > 1 (prefill)
@@ -941,6 +983,15 @@ fn quantized_matmul_2d(
             _ => {}
         }
     }
+
+    // All remaining paths (FP8, AWQ, naive tiled) expect F32 activations.
+    let input_f32;
+    let input = if input.dtype() == DType::F32 {
+        input
+    } else {
+        input_f32 = cast_to_f32(input)?;
+        &input_f32
+    };
 
     let mut output = unsafe { CudaTensor::uninit(input.context(), &[m, n], DType::F32)? };
 

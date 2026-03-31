@@ -1,4 +1,4 @@
-use crate::cuda::ops::{cast_f32_to_bf16, cast_f32_to_f16, cast_to_f32, matmul, quantized_matmul};
+use crate::cuda::ops::{cast_f32_to_bf16, cast_f32_to_f16, matmul, quantized_matmul};
 use crate::cuda::{CudaTensor, QuantizedTensor};
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
@@ -28,12 +28,7 @@ pub fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
         LinearWeight::Dense(w) => matmul(input, w),
         LinearWeight::Quantized(w) => {
             let dtype = input.dtype();
-            let input_f32 = if dtype == DType::F32 {
-                input.slice_view(0, input.shape())
-            } else {
-                cast_to_f32(input)?
-            };
-            let output_f32 = quantized_matmul(&input_f32, w)?;
+            let output_f32 = quantized_matmul(input, w)?;
             match dtype {
                 DType::F32 => Ok(output_f32),
                 DType::BF16 => cast_f32_to_bf16(&output_f32),
