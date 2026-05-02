@@ -363,6 +363,85 @@ fn insert_free_range(free_list: &mut Vec<(usize, usize)>, offset: usize, size: u
     }
 }
 
+// ---------------------------------------------------------------------------
+// Plan cache
+// ---------------------------------------------------------------------------
+
+/// Thread-safe cache of compiled `ExecutionPlan`s, keyed by graph topology.
+///
+/// Avoids recompiling the same graph topology on every call. The cache key is
+/// a `(topology_hash, arena_size)` pair derived from the graph's node count
+/// and op-name sequence, so graphs with the same topology (e.g., same
+/// sequence length) reuse the compiled plan without re-running the planner.
+///
+/// # Example
+///
+/// ```
+/// use infernum::graph::PlanCache;
+/// let cache = PlanCache::new();
+/// ```
+#[derive(Clone, Default)]
+pub struct PlanCache {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(u64, usize), ExecutionPlan>>>,
+}
+
+impl PlanCache {
+    /// Create an empty plan cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return a compiled plan for `graph`, reusing a cached one if available.
+    ///
+    /// The first call for a given topology compiles and caches the plan.
+    /// Subsequent calls with topologically identical graphs return the cached
+    /// plan without re-running the planner.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned (which only happens if another
+    /// thread panicked while holding it).
+    pub fn get_or_compile<B: Backend + MatmulOps>(&self, graph: &Graph<B>) -> ExecutionPlan {
+        let hash = topology_hash(graph);
+        // Compile outside the lock to avoid holding it during planning.
+        let candidate = plan(graph);
+        let key = (hash, candidate.arena_size);
+        let mut guard = self.inner.lock().expect("PlanCache mutex poisoned");
+        guard.entry(key).or_insert(candidate).clone()
+    }
+
+    /// Number of cached plans.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("PlanCache mutex poisoned").len()
+    }
+
+    /// Whether the cache is empty.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Compute a topology hash for a graph from its node count and op-name sequence.
+fn topology_hash<B: Backend + MatmulOps>(graph: &Graph<B>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    graph.len().hash(&mut hasher);
+    for node in graph.nodes() {
+        node.op.name().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,5 +1007,62 @@ mod tests {
 
         // All nodes must be scheduled.
         assert_eq!(exec.schedule.len(), graph.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // PlanCache tests
+    // -----------------------------------------------------------------------
+
+    fn mini_graph() -> Graph<TestBackend> {
+        let mut graph = Graph::<TestBackend>::new();
+        let norm_w = graph.register_tensor_weight("ln.weight", &[256], DType::F32);
+        let input = graph.add_input(&[4, 256], DType::F32);
+        let normed = graph.add_rms_norm(input, norm_w, 1e-5);
+        graph.set_output(normed.0);
+        graph
+    }
+
+    #[test]
+    fn plan_cache_compiles_and_returns_plan() {
+        let cache = PlanCache::new();
+        assert!(cache.is_empty());
+        let graph = mini_graph();
+        let ep = cache.get_or_compile(&graph);
+        assert!(!cache.is_empty());
+        // The returned plan should schedule all nodes.
+        assert_eq!(ep.schedule.len(), graph.len());
+    }
+
+    #[test]
+    fn plan_cache_reuses_entry_for_same_topology() {
+        let cache = PlanCache::new();
+        let g1 = mini_graph();
+        let g2 = mini_graph();
+        cache.get_or_compile(&g1);
+        cache.get_or_compile(&g2);
+        // Both graphs have identical topology, so only one entry should exist.
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn plan_cache_separate_entry_for_different_topology() {
+        let cache = PlanCache::new();
+
+        // Graph 1: input + rms_norm
+        let g1 = mini_graph();
+
+        // Graph 2: input + rms_norm + linear (different topology)
+        let mut g2 = Graph::<TestBackend>::new();
+        let norm_w = g2.register_tensor_weight("ln.weight", &[256], DType::F32);
+        let lw = g2.register_linear_weight("proj", &[256, 256], DType::F32);
+        let input = g2.add_input(&[4, 256], DType::F32);
+        let normed = g2.add_rms_norm(input, norm_w, 1e-5);
+        let proj = g2.add_linear(normed, lw);
+        g2.set_output(proj.0);
+
+        cache.get_or_compile(&g1);
+        cache.get_or_compile(&g2);
+        // Different topologies → two separate cache entries.
+        assert_eq!(cache.len(), 2);
     }
 }

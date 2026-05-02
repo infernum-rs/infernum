@@ -24,7 +24,7 @@ pub use builder_traits::{
 pub use builtin_ops::MoeExpertIds;
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use op_node::{OpNode, OutputRef};
-pub use planner::{plan, BufferSlot, ExecutionPlan};
+pub use planner::{plan, BufferSlot, ExecutionPlan, PlanCache};
 pub use weight_store::WeightStore;
 
 #[cfg(test)]
