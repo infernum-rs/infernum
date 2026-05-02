@@ -139,15 +139,13 @@ mod smollm2_360m_q8 {
 /// Verifies that the CPU graph executor produces identical per-position
 /// argmax predictions as the eager CPU forward pass on SmolLM2-360M.
 mod smollm2_360m_graph {
-    use infernum::graph::{plan as compile_plan, WeightId};
+    use infernum::graph::{plan as compile_plan, Arena};
     use infernum::tokenizer::LlamaTokenizer;
     use infernum::transformer::build_rope_cache;
-    use infernum::WeightLoader as _;
-    use infernum_cpu::executor::{execute, Arena};
-    use infernum_cpu::weights::CpuSafeTensorsLoader;
+    use infernum_cpu::executor::execute;
     use infernum_cpu::{CpuBackend, CpuTensor};
     use infernum_llama::graph_builder::{build_prefill_graph, load_graph_weights_safetensors};
-    use infernum_llama::{LlamaConfig, LlamaModel};
+    use infernum_llama::LlamaModel;
 
     use super::*;
 
@@ -190,7 +188,7 @@ mod smollm2_360m_graph {
             head_dim,
             seq_len,
             config.rope_theta,
-            config.rope_scaling.as_ref(),
+            None,
             infernum::dtype::DType::F32,
         )
         .expect("rope cache");
@@ -301,5 +299,84 @@ mod smollm2_360m_q4 {
             output.contains("Paris"),
             "Expected 'Paris' in Q4_0 output, got: {output}"
         );
+    }
+}
+
+// ─── SmolLM2-360M via LlamaGraphEngine ───────────────────────────────────────
+
+/// End-to-end generation test using `LlamaGraphEngine` on real SmolLM2-360M
+/// SafeTensors weights (~700MB).  Verifies that the graph-mode prefill +
+/// autoregressive decode loop produces correct output and no out-of-vocab tokens.
+mod smollm2_360m_graph_engine {
+    use infernum::tokenizer::LlamaTokenizer;
+    use infernum_llama::LlamaGraphEngine;
+
+    use super::*;
+
+    const REPO: &str = "HuggingFaceTB/SmolLM2-360M";
+
+    fn model_dir() -> PathBuf {
+        download_model(REPO)
+    }
+
+    /// Graph-mode generation produces "Paris" for the standard prompt.
+    #[test]
+    fn capital_of_france() {
+        let model_dir = model_dir();
+        let engine =
+            LlamaGraphEngine::from_pretrained(&model_dir).expect("Failed to load LlamaGraphEngine");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let prompt_ids = tokenizer
+            .encode("The capital of France is", true)
+            .expect("tokenize");
+        let eos = engine.config().eos_token_id;
+
+        let output_ids = engine
+            .generate(&prompt_ids, 30, eos)
+            .expect("graph generation failed");
+
+        // Decode only the newly generated tokens (everything after the prompt).
+        let new_ids = &output_ids[prompt_ids.len()..];
+        let output = tokenizer.decode(new_ids).expect("decode");
+
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in graph engine output, got: {output}"
+        );
+    }
+
+    /// Prefill + one decode step produces tokens within the vocab range.
+    #[test]
+    fn no_oob_tokens() {
+        let model_dir = model_dir();
+        let engine =
+            LlamaGraphEngine::from_pretrained(&model_dir).expect("Failed to load LlamaGraphEngine");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
+
+        let prompt_ids = tokenizer.encode("Hello world", true).expect("tokenize");
+        let eos = engine.config().eos_token_id;
+        let vocab_size = engine.config().vocab_size;
+
+        // Generate just one new token — enough to exercise both prefill and decode.
+        let output_ids = engine
+            .generate(&prompt_ids, 1, eos)
+            .expect("graph generation failed");
+
+        assert!(
+            output_ids.len() >= prompt_ids.len(),
+            "Output shorter than prompt: {} < {}",
+            output_ids.len(),
+            prompt_ids.len()
+        );
+
+        for &tok in &output_ids {
+            assert!(
+                (tok as usize) < vocab_size,
+                "Generated token {tok} is out of vocab range {vocab_size}"
+            );
+        }
     }
 }
