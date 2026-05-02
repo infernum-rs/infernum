@@ -791,7 +791,13 @@ pub fn execute(
                     let new_row = read_tensor(arena, plan, nodes, node.inputs[1]);
                     let kv = kv_cache.as_mut().unwrap();
                     kv.append(layer, is_key, new_row.as_f32_slice());
-                    let new_len = kv.len + 1;
+                    // Compute actual length from vec size to avoid stale `len` field.
+                    let row_elems = kv.num_kv_heads * kv.head_dim;
+                    let new_len = if is_key {
+                        kv.k_caches[layer].len() / row_elems
+                    } else {
+                        kv.v_caches[layer].len() / row_elems
+                    };
                     let full_cache = kv.get_cache(layer, is_key, new_len);
                     overrides.insert(node_id, full_cache);
                 } else {
