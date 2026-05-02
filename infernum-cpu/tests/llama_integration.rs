@@ -380,3 +380,130 @@ mod smollm2_360m_graph_engine {
         }
     }
 }
+
+// ─── LlamaGraphEngine + GGUF Q8_0 / Q4_0 ────────────────────────────────────
+
+/// Verifies that [`LlamaGraphEngine::from_gguf`] can load Q8_0 and Q4_0 GGUF
+/// files and run the full prefill + autoregressive decode loop using quantized
+/// weights.  Uses the same SmolLM2-360M GGUF files as the eager GGUF tests
+/// above, so no additional downloads are required when both modules run.
+mod smollm2_360m_graph_engine_gguf {
+    use infernum::tokenizer::LlamaTokenizer;
+    use infernum_llama::LlamaGraphEngine;
+
+    use super::*;
+
+    fn tokenizer_dir() -> PathBuf {
+        download_model_files(
+            "HuggingFaceTB/SmolLM2-360M-Instruct",
+            &["tokenizer.json", "tokenizer_config.json"],
+        )
+    }
+
+    // ── Q8_0 ──────────────────────────────────────────────────────────────────
+
+    const Q8_REPO: &str = "bartowski/SmolLM2-360M-Instruct-GGUF";
+    const Q8_FILE: &str = "SmolLM2-360M-Instruct-Q8_0.gguf";
+
+    fn q8_gguf_path() -> PathBuf {
+        download_model_files(Q8_REPO, &[Q8_FILE]).join(Q8_FILE)
+    }
+
+    /// Graph engine loaded from Q8_0 GGUF produces in-vocab tokens with no crashes.
+    #[test]
+    fn q8_no_oob_tokens() {
+        let path = q8_gguf_path();
+        let engine = LlamaGraphEngine::from_gguf(&path).expect("Failed to load Q8_0 GGUF");
+        let eos = engine.config().eos_token_id;
+        // BOS=0, "Hello"=15339 in GPT2 BPE (SmolLM2 vocab)
+        let output_ids = engine
+            .generate(&[0, 15339], 5, eos)
+            .expect("graph generation failed");
+        assert!(!output_ids.is_empty(), "Graph engine produced no output tokens");
+        for &tok in &output_ids {
+            assert!(
+                (tok as usize) < engine.config().vocab_size,
+                "Generated token {tok} is out-of-vocab"
+            );
+        }
+    }
+
+    /// Graph engine loaded from Q8_0 GGUF generates "Paris" for the standard prompt.
+    #[test]
+    fn q8_capital_of_france() {
+        let path = q8_gguf_path();
+        let engine = LlamaGraphEngine::from_gguf(&path).expect("Failed to load Q8_0 GGUF");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&tokenizer_dir()).expect("Failed to load tokenizer");
+
+        let prompt_ids = tokenizer
+            .encode("The capital of France is", true)
+            .expect("tokenize");
+        let eos = engine.config().eos_token_id;
+
+        let output_ids = engine
+            .generate(&prompt_ids, 30, eos)
+            .expect("graph generation failed");
+
+        let new_ids = &output_ids[prompt_ids.len()..];
+        let output = tokenizer.decode(new_ids).expect("decode");
+
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in Q8_0 graph engine output, got: {output}"
+        );
+    }
+
+    // ── Q4_0 ──────────────────────────────────────────────────────────────────
+
+    const Q4_REPO: &str = "bartowski/SmolLM2-360M-Instruct-GGUF";
+    const Q4_FILE: &str = "SmolLM2-360M-Instruct-Q4_0.gguf";
+
+    fn q4_gguf_path() -> PathBuf {
+        download_model_files(Q4_REPO, &[Q4_FILE]).join(Q4_FILE)
+    }
+
+    /// Graph engine loaded from Q4_0 GGUF produces in-vocab tokens with no crashes.
+    #[test]
+    fn q4_no_oob_tokens() {
+        let path = q4_gguf_path();
+        let engine = LlamaGraphEngine::from_gguf(&path).expect("Failed to load Q4_0 GGUF");
+        let eos = engine.config().eos_token_id;
+        let output_ids = engine
+            .generate(&[0, 15339], 5, eos)
+            .expect("graph generation failed");
+        assert!(!output_ids.is_empty(), "Graph engine produced no output tokens");
+        for &tok in &output_ids {
+            assert!(
+                (tok as usize) < engine.config().vocab_size,
+                "Generated token {tok} is out-of-vocab"
+            );
+        }
+    }
+
+    /// Graph engine loaded from Q4_0 GGUF generates "Paris" for the standard prompt.
+    #[test]
+    fn q4_capital_of_france() {
+        let path = q4_gguf_path();
+        let engine = LlamaGraphEngine::from_gguf(&path).expect("Failed to load Q4_0 GGUF");
+        let tokenizer =
+            LlamaTokenizer::from_pretrained(&tokenizer_dir()).expect("Failed to load tokenizer");
+
+        let prompt_ids = tokenizer
+            .encode("The capital of France is", true)
+            .expect("tokenize");
+        let eos = engine.config().eos_token_id;
+
+        let output_ids = engine
+            .generate(&prompt_ids, 30, eos)
+            .expect("graph generation failed");
+
+        let new_ids = &output_ids[prompt_ids.len()..];
+        let output = tokenizer.decode(new_ids).expect("decode");
+
+        assert!(
+            output.contains("Paris"),
+            "Expected 'Paris' in Q4_0 graph engine output, got: {output}"
+        );
+    }
+}

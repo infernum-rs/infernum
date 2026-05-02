@@ -497,6 +497,174 @@ pub fn load_graph_weights_safetensors(
     Ok(store)
 }
 
+// ---------------------------------------------------------------------------
+// GGUF weight loader helpers
+// ---------------------------------------------------------------------------
+
+/// Map a SafeTensors-convention weight name to its GGUF tensor name.
+///
+/// Handles the top-level tensors (`model.embed_tokens.weight`, `model.norm.weight`,
+/// `lm_head.weight`) and all per-layer projections / norms.
+///
+/// # Panics
+///
+/// Panics on an unrecognised layer suffix (indicates a bug in weight registration).
+#[cfg(feature = "cpu")]
+fn safetensors_to_gguf_name(name: &str) -> String {
+    match name {
+        "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
+        "model.norm.weight" => return "output_norm.weight".to_string(),
+        "lm_head.weight" => return "output.weight".to_string(),
+        _ => {}
+    }
+    if let Some(rest) = name.strip_prefix("model.layers.") {
+        let dot = rest.find('.').expect("malformed layer weight name");
+        let layer_idx = &rest[..dot];
+        let suffix = &rest[dot + 1..];
+        let gguf_suffix = match suffix {
+            "input_layernorm.weight" => "attn_norm.weight",
+            "post_attention_layernorm.weight" => "ffn_norm.weight",
+            "self_attn.q_proj.weight" => "attn_q.weight",
+            "self_attn.k_proj.weight" => "attn_k.weight",
+            "self_attn.v_proj.weight" => "attn_v.weight",
+            "self_attn.o_proj.weight" => "attn_output.weight",
+            "mlp.gate_proj.weight" => "ffn_gate.weight",
+            "mlp.up_proj.weight" => "ffn_up.weight",
+            "mlp.down_proj.weight" => "ffn_down.weight",
+            other => panic!("Unknown layer suffix: {other}"),
+        };
+        return format!("blk.{layer_idx}.{gguf_suffix}");
+    }
+    panic!("Unknown weight name: {name}");
+}
+
+/// Returns `true` if this GGUF tensor name is a Q or K projection that needs
+/// the GGUF row-permutation reversal before use.
+#[cfg(feature = "cpu")]
+fn needs_unpermute(gguf_name: &str) -> bool {
+    gguf_name.ends_with(".attn_q.weight") || gguf_name.ends_with(".attn_k.weight")
+}
+
+/// Load model weights from a GGUF file into a [`WeightStore`] for graph
+/// execution on the CPU backend.
+///
+/// Weights are loaded in their native quantization format (Q8_0, Q4_0, F32,
+/// etc.) using the same quantized kernels as the eager path. Dequantization
+/// happens lazily inside each matmul kernel, so no extra memory is needed for
+/// a full-precision copy of the weights.
+///
+/// # Arguments
+///
+/// * `graph` — A graph built for this model (used only to read weight metadata
+///   and determine slot order). A 1-token prefill graph is sufficient.
+/// * `config` — Llama model configuration (used for `num_attention_heads` /
+///   `num_key_value_heads` when un-permuting Q/K rows).
+/// * `gguf_path` — Path to the `.gguf` file.
+///
+/// # Errors
+///
+/// Returns an error if the GGUF file cannot be opened, a required tensor is
+/// missing, or a weight cannot be uploaded to the CPU backend (e.g. unsupported
+/// quantization type such as Q6_K).
+#[cfg(feature = "cpu")]
+pub fn load_graph_weights_gguf(
+    graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
+    config: &LlamaConfig,
+    gguf_path: &std::path::Path,
+) -> infernum::Result<
+    infernum::graph::WeightStore<
+        infernum_cpu::tensor::CpuTensor,
+        infernum_cpu::tensor::CpuLinearWeight,
+    >,
+> {
+    use infernum::graph::WeightId;
+    use infernum::weights::format::{host_transpose_2d, host_unpermute_f32, FormatLoader};
+    use infernum::weights::host::HostLinearWeight;
+    use infernum_cpu::tensor::CpuTensor;
+    use infernum_cpu::CpuBackend;
+
+    let loader = infernum::weights::gguf::GgufLoader::from_file(
+        gguf_path.to_str().ok_or_else(|| {
+            infernum::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "GGUF path is not valid UTF-8",
+            ))
+        })?,
+    )?;
+
+    let tensor_count = graph.tensor_weight_count();
+    let linear_count = graph.linear_weight_count();
+    let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
+
+    // ── Tensor weights (embeddings, layernorms) — always loaded as F32 ───────
+    for i in 0..tensor_count {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let gguf_name = safetensors_to_gguf_name(&meta.name);
+        let host = loader.load_f32(&gguf_name)?;
+        store.push_tensor_weight(CpuTensor::from_f32(&host.shape, host.as_f32_slice()));
+    }
+
+    // ── Linear weights — loaded in native format (quantized or dense) ─────────
+    for i in 0..linear_count {
+        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let gguf_name = safetensors_to_gguf_name(&meta.name);
+
+        // Resolve the actual GGUF name, falling back to tied embeddings.
+        let actual_name = if loader.contains(&gguf_name) {
+            gguf_name.clone()
+        } else if meta.name == "lm_head.weight" {
+            "token_embd.weight".to_string()
+        } else {
+            return Err(infernum::Error::WeightNotFound(gguf_name));
+        };
+
+        let dtype = FormatLoader::get_dtype(&loader, &actual_name)?;
+
+        let host_linear = if dtype.is_quantized() {
+            // Preserve native quantization — fast Q8_0/Q4_0 kernels will be
+            // used at inference time.  Q/K projections need GGUF un-permuting
+            // so that the HuggingFace-convention RoPE is correct.
+            if needs_unpermute(&gguf_name) {
+                let n_head = if gguf_name.contains("attn_q") {
+                    config.num_attention_heads
+                } else {
+                    config
+                        .num_key_value_heads
+                        .unwrap_or(config.num_attention_heads)
+                };
+                HostLinearWeight::Quantized(FormatLoader::load_quantized_unpermute(
+                    &loader,
+                    &actual_name,
+                    n_head,
+                )?)
+            } else {
+                HostLinearWeight::Quantized(FormatLoader::load_quantized(&loader, &actual_name)?)
+            }
+        } else {
+            // Dense path: load as F32, un-permute Q/K rows if required, then transpose.
+            let host = loader.load_f32(&actual_name)?;
+            let host = if needs_unpermute(&gguf_name) {
+                let n_head = if gguf_name.contains("attn_q") {
+                    config.num_attention_heads
+                } else {
+                    config
+                        .num_key_value_heads
+                        .unwrap_or(config.num_attention_heads)
+                };
+                host_unpermute_f32(&host, n_head)?
+            } else {
+                host
+            };
+            HostLinearWeight::Dense(host_transpose_2d(&host)?)
+        };
+
+        let linear = CpuBackend::upload_host_linear(&(), &host_linear)?;
+        store.push_linear_weight(linear);
+    }
+
+    Ok(store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

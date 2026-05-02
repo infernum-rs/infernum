@@ -32,7 +32,8 @@ use infernum_cpu::CpuBackend;
 
 use crate::config::LlamaConfig;
 use crate::graph_builder::{
-    build_decode_graph, build_prefill_graph, load_graph_weights_safetensors,
+    build_decode_graph, build_prefill_graph, load_graph_weights_gguf,
+    load_graph_weights_safetensors,
 };
 
 // ---------------------------------------------------------------------------
@@ -147,6 +148,49 @@ impl LlamaGraphEngine {
         let prefill_arena_size = plan(&pf_graph).arena_size;
 
         // Decode arena: single decode step with kv_len = representative_prefill_len.
+        let (mut dec_graph, _) =
+            build_decode_graph::<CpuBackend>(&config, representative_prefill_len, DType::F32);
+        optimizer::optimize(&mut dec_graph);
+        let decode_arena_size = plan(&dec_graph).arena_size;
+
+        Ok(Self {
+            config,
+            weights,
+            prefill_arena_size,
+            decode_arena_size,
+        })
+    }
+
+    /// Load a Llama-family model from a GGUF file.
+    ///
+    /// Weights are stored in their native quantization format (Q8_0, Q4_0,
+    /// F32, etc.) and dequantized lazily inside each matmul kernel.
+    ///
+    /// # Errors
+    /// Returns an error if the GGUF file cannot be opened, cannot be parsed,
+    /// or contains unsupported quantization types (e.g. Q6_K).
+    pub fn from_gguf(gguf_path: &Path) -> Result<Self> {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(
+            gguf_path.to_str().ok_or_else(|| {
+                infernum::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "GGUF path is not valid UTF-8",
+                ))
+            })?,
+        )?;
+        let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+
+        // Build a 1-token prefill graph to determine weight slot order.
+        let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+        let weights = load_graph_weights_gguf(&dummy_graph, &config, gguf_path)?;
+
+        // Pre-compute representative arena sizes.
+        let representative_prefill_len = 512.min(config.max_position_embeddings);
+        let (mut pf_graph, _) =
+            build_prefill_graph::<CpuBackend>(&config, representative_prefill_len, DType::F32);
+        optimizer::optimize(&mut pf_graph);
+        let prefill_arena_size = plan(&pf_graph).arena_size;
+
         let (mut dec_graph, _) =
             build_decode_graph::<CpuBackend>(&config, representative_prefill_len, DType::F32);
         optimizer::optimize(&mut dec_graph);
