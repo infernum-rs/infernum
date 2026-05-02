@@ -51,6 +51,8 @@ impl KvCacheStore {
     /// * `num_layers` — Number of transformer layers.
     /// * `num_kv_heads` — Number of KV attention heads per layer.
     /// * `head_dim` — Dimension of each attention head.
+    /// * `max_seq_len` — Maximum sequence length to pre-allocate for (avoids
+    ///   `Vec` reallocations during generation).
     /// * `cache_input_node_ids` — `NodeId`s of KV cache Input nodes in the graph.
     /// * `concat_node_ids` — `NodeId`s of `ConcatSeq` nodes that append to KV caches.
     #[must_use]
@@ -58,14 +60,17 @@ impl KvCacheStore {
         num_layers: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        max_seq_len: usize,
         cache_input_node_ids: Vec<NodeId>,
         concat_node_ids: Vec<NodeId>,
     ) -> Self {
         assert_eq!(cache_input_node_ids.len(), 2 * num_layers);
         assert_eq!(concat_node_ids.len(), 2 * num_layers);
+        let row_size = num_kv_heads * head_dim;
+        let cap = max_seq_len * row_size;
         Self {
-            k_caches: (0..num_layers).map(|_| Vec::new()).collect(),
-            v_caches: (0..num_layers).map(|_| Vec::new()).collect(),
+            k_caches: (0..num_layers).map(|_| Vec::with_capacity(cap)).collect(),
+            v_caches: (0..num_layers).map(|_| Vec::with_capacity(cap)).collect(),
             len: 0,
             num_kv_heads,
             head_dim,
@@ -117,6 +122,7 @@ impl KvCacheStore {
 
     /// Current number of cached positions.
     #[must_use]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.len
     }

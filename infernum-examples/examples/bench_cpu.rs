@@ -499,11 +499,12 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
 
     let (cache_input_ids, concat_ids) = find_kv_cache_node_ids(decode_graph.nodes(), num_layers);
 
-    // Create persistent KV cache store.
+    // Create persistent KV cache store, pre-allocated to avoid reallocations.
     let mut kv_cache = KvCacheStore::new(
         num_layers,
         num_kv_heads,
         head_dim,
+        config.max_position_embeddings,
         cache_input_ids,
         concat_ids,
     );

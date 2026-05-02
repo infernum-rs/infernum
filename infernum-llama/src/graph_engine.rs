@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use infernum::graph::{optimizer, plan, Arena, NodeId, WeightStore};
+use infernum::graph::{optimizer, plan, Arena, ExecutionPlan, Graph, NodeId, WeightStore};
 use infernum::rope::precompute_rope_data;
 use infernum::{DType, Result};
 use infernum_cpu::executor::{execute, KvCacheStore};
@@ -62,10 +62,6 @@ impl KvStore {
             num_kv_heads,
             head_dim,
         }
-    }
-
-    fn len(&self) -> usize {
-        self.k[0].len() / (self.num_kv_heads * self.head_dim)
     }
 
     fn get_layer(&self, layer: usize, kv_len: usize) -> (CpuTensor, CpuTensor) {
@@ -132,6 +128,23 @@ fn find_kv_cache_node_ids(
 // LlamaGraphEngine
 // ---------------------------------------------------------------------------
 
+/// Pre-compiled decode state cached in [`LlamaGraphEngine`].
+///
+/// Built once in the constructor and reused across all `generate()` calls.
+/// Each call allocates a fresh [`Arena`] so that stale residual activations
+/// from the previous call never bleed into the new sequence.
+struct DecodeCache {
+    graph: Graph<CpuBackend>,
+    plan: ExecutionPlan,
+    logits_id: NodeId,
+    cache_input_ids: Vec<NodeId>,
+    concat_ids: Vec<NodeId>,
+    /// Pre-computed RoPE tables up to `max_position_embeddings`.
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+    half_dim: usize,
+}
+
 /// CPU graph-mode engine for Llama-family models.
 ///
 /// Loads weights once, pre-compiles a single decode graph (at `kv_len = 0`),
@@ -140,7 +153,40 @@ fn find_kv_cache_node_ids(
 pub struct LlamaGraphEngine {
     config: LlamaConfig,
     weights: WeightStore<CpuTensor, CpuLinearWeight>,
-    decode_arena_size: usize,
+    decode: DecodeCache,
+}
+
+/// Build the decode cache for a given config.
+///
+/// Compiles the decode graph once at `kv_len=0`, runs the optimizer and
+/// memory planner, discovers KV cache node IDs, and pre-computes the full
+/// RoPE table up to `max_position_embeddings`.  Stored in `LlamaGraphEngine`
+/// so that `generate()` pays zero setup cost per call.
+fn build_decode_cache(config: &LlamaConfig) -> Result<DecodeCache> {
+    let head_dim = config.head_dim();
+    let half_dim = head_dim / 2;
+    let num_layers = config.num_hidden_layers;
+
+    let (mut graph, _) = build_decode_graph::<CpuBackend>(config, 0, DType::F32);
+    optimizer::optimize(&mut graph);
+    let ep = plan(&graph);
+    let logits_id = graph.output_ids()[0];
+    let (cache_input_ids, concat_ids) = find_kv_cache_node_ids(graph.nodes(), num_layers);
+
+    // Pre-compute RoPE up to max_position_embeddings.
+    let max_pos = config.max_position_embeddings;
+    let (cos, sin) = precompute_rope_data(max_pos, head_dim, config.rope_theta);
+
+    Ok(DecodeCache {
+        graph,
+        plan: ep,
+        logits_id,
+        cache_input_ids,
+        concat_ids,
+        cos,
+        sin,
+        half_dim,
+    })
 }
 
 impl LlamaGraphEngine {
@@ -169,17 +215,11 @@ impl LlamaGraphEngine {
         let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
         let weights = load_graph_weights_safetensors(&dummy_graph, model_dir, &config)?;
 
-        // Pre-compute the decode arena size from a kv_len=0 graph.
-        // The KvCacheStore path bypasses all KV-related arena writes, so the
-        // arena size is independent of sequence length.
-        let (mut dec_graph, _) = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
-        optimizer::optimize(&mut dec_graph);
-        let decode_arena_size = plan(&dec_graph).arena_size;
-
+        let decode = build_decode_cache(&config)?;
         Ok(Self {
             config,
             weights,
-            decode_arena_size,
+            decode,
         })
     }
 
@@ -206,15 +246,11 @@ impl LlamaGraphEngine {
         let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
         let weights = load_graph_weights_gguf(&dummy_graph, &config, gguf_path)?;
 
-        // Pre-compute the decode arena size from a kv_len=0 graph.
-        let (mut dec_graph, _) = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
-        optimizer::optimize(&mut dec_graph);
-        let decode_arena_size = plan(&dec_graph).arena_size;
-
+        let decode = build_decode_cache(&config)?;
         Ok(Self {
             config,
             weights,
-            decode_arena_size,
+            decode,
         })
     }
 
@@ -236,34 +272,40 @@ impl LlamaGraphEngine {
         eos_token_id: u32,
     ) -> Result<Vec<u32>> {
         let config = &self.config;
-        let head_dim = config.head_dim();
-        let half_dim = head_dim / 2;
         let num_layers = config.num_hidden_layers;
         let num_kv_heads = config.num_kv_heads();
-        let vocab_size = config.vocab_size;
+        let head_dim = config.head_dim();
 
-        // Build the decode graph once at kv_len=0.  The KvCacheStore keeps the
-        // growing KV state outside the arena, so this single graph/plan/arena
-        // is valid for all positions.
-        let (mut decode_graph, _) = build_decode_graph::<CpuBackend>(config, 0, DType::F32);
-        optimizer::optimize(&mut decode_graph);
-        let decode_plan = plan(&decode_graph);
-        let mut arena = Arena::new(decode_plan.arena_size.max(self.decode_arena_size));
-        let logits_id = decode_graph.output_ids()[0];
+        let dc = &self.decode;
+        let half_dim = dc.half_dim;
 
-        let (cache_input_ids, concat_ids) =
-            find_kv_cache_node_ids(decode_graph.nodes(), num_layers);
+        // Fresh per-sequence KV cache — reuses the pre-compiled graph/plan/arena.
+        // Pre-allocate to max_position_embeddings to avoid Vec reallocations.
         let mut kv_cache = KvCacheStore::new(
             num_layers,
             num_kv_heads,
             head_dim,
-            cache_input_ids,
-            concat_ids,
+            config.max_position_embeddings,
+            dc.cache_input_ids.clone(),
+            dc.concat_ids.clone(),
         );
 
-        // Pre-compute RoPE for all positions we'll need.
+        // Allocate a fresh arena for this generation sequence.
+        // The plan arena_size is constant (graph compiled at kv_len=0),
+        // so allocation is cheap and reuse across calls would be safe,
+        // but a fresh arena avoids any stale-data hazards during debugging.
+        let mut arena = Arena::new(dc.plan.arena_size);
+
+        // Use the pre-computed RoPE table when the sequence fits; otherwise
+        // extend on the fly (rare: only when prompt + new tokens > max_position_embeddings).
         let max_pos = prompt_ids.len() + max_new_tokens;
-        let (all_cos, all_sin) = precompute_rope_data(max_pos, head_dim, config.rope_theta);
+        let rope_extended;
+        let (cos, sin): (&[f32], &[f32]) = if max_pos * half_dim <= dc.cos.len() {
+            (&dc.cos, &dc.sin)
+        } else {
+            rope_extended = precompute_rope_data(max_pos, head_dim, config.rope_theta);
+            (&rope_extended.0, &rope_extended.1)
+        };
 
         // Helper closure: run one decode step at position `pos` with token `token`.
         let run_step = |pos: usize,
@@ -274,16 +316,16 @@ impl LlamaGraphEngine {
             let cos_start = pos * half_dim;
             let inputs = vec![
                 CpuTensor::from_u32(&[1], &[token]),
-                CpuTensor::from_f32(&[1, half_dim], &all_cos[cos_start..cos_start + half_dim]),
-                CpuTensor::from_f32(&[1, half_dim], &all_sin[cos_start..cos_start + half_dim]),
+                CpuTensor::from_f32(&[1, half_dim], &cos[cos_start..cos_start + half_dim]),
+                CpuTensor::from_f32(&[1, half_dim], &sin[cos_start..cos_start + half_dim]),
             ];
             execute(
-                &decode_plan,
-                decode_graph.nodes(),
+                &dc.plan,
+                dc.graph.nodes(),
                 arena,
                 &self.weights,
                 &inputs,
-                &[logits_id],
+                &[dc.logits_id],
                 Some(kv_cache),
             )
         };
@@ -308,8 +350,7 @@ impl LlamaGraphEngine {
             &mut kv_cache,
             &mut arena,
         )?;
-        let logits = outputs[0].to_f32_vec();
-        let first_token = argmax(&logits[..vocab_size]);
+        let first_token = argmax(outputs[0].as_f32_slice());
         if first_token == eos_token_id {
             return Ok(token_ids);
         }
@@ -320,8 +361,7 @@ impl LlamaGraphEngine {
             let pos = prompt_ids.len() + step;
             let last_token = *token_ids.last().unwrap();
             let outputs = run_step(pos, last_token, &mut kv_cache, &mut arena)?;
-            let logits = outputs[0].to_f32_vec();
-            let next_token = argmax(&logits[..vocab_size]);
+            let next_token = argmax(outputs[0].as_f32_slice());
             if next_token == eos_token_id {
                 break;
             }
@@ -572,7 +612,7 @@ impl infernum::Model for LlamaGraphEngine {
             }
         }
 
-        let mut arena = Arena::new(ep.arena_size.max(self.decode_arena_size));
+        let mut arena = Arena::new(ep.arena_size.max(self.decode.plan.arena_size));
         let output_nodes = graph.output_ids().to_vec();
         let outputs = execute(
             &ep,
