@@ -11,6 +11,8 @@ mod model;
 
 pub use chat_templates::{Llama3Template, MistralTemplate};
 pub use config::{LlamaConfig, QuantizationConfig};
+#[cfg(feature = "cpu")]
+pub use graph_builder::load_graph_weights_safetensors;
 pub use graph_builder::{
     build_decode_graph, build_prefill_graph, LayerWeightIds, LlamaGraphOps, ModelWeightIds,
 };

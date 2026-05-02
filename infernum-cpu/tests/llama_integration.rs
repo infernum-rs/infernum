@@ -134,6 +134,119 @@ mod smollm2_360m_q8 {
     }
 }
 
+// ─── SmolLM2-360M graph execution vs eager ──────────────────────────────────
+
+/// Verifies that the CPU graph executor produces identical per-position
+/// argmax predictions as the eager CPU forward pass on SmolLM2-360M.
+mod smollm2_360m_graph {
+    use infernum::graph::{plan as compile_plan, WeightId};
+    use infernum::tokenizer::LlamaTokenizer;
+    use infernum::transformer::build_rope_cache;
+    use infernum::WeightLoader as _;
+    use infernum_cpu::executor::{execute, Arena};
+    use infernum_cpu::weights::CpuSafeTensorsLoader;
+    use infernum_cpu::{CpuBackend, CpuTensor};
+    use infernum_llama::graph_builder::{build_prefill_graph, load_graph_weights_safetensors};
+    use infernum_llama::{LlamaConfig, LlamaModel};
+
+    use super::*;
+
+    const REPO: &str = "HuggingFaceTB/SmolLM2-360M";
+
+    fn model_dir() -> PathBuf {
+        download_model(REPO)
+    }
+
+    /// Graph prefill logits match eager logits (same argmax per position).
+    #[test]
+    #[ignore = "requires model download (~700MB)"]
+    fn graph_matches_eager_logits() {
+        let model_dir = model_dir();
+
+        // ── Eager forward pass ────────────────────────────────────────────────
+        let eager_model =
+            LlamaModel::<CpuBackend>::from_pretrained(&(), &model_dir).expect("eager model load");
+        let tokenizer = LlamaTokenizer::from_pretrained(&model_dir).expect("tokenizer load");
+        let prompt = "The capital of France is";
+        let input_ids = tokenizer.encode(prompt, true).expect("tokenize");
+        let seq_len = input_ids.len();
+
+        let eager_logits_tensor = eager_model.forward_full(&input_ids).expect("eager forward");
+        let eager_logits = eager_logits_tensor.to_f32_vec();
+        let config = eager_model.config().clone();
+        let vocab_size = config.vocab_size;
+
+        // ── Graph build + weight load ─────────────────────────────────────────
+        let (graph, _weight_ids) =
+            build_prefill_graph::<CpuBackend>(&config, seq_len, infernum::dtype::DType::F32);
+
+        let weights =
+            load_graph_weights_safetensors(&graph, &model_dir, &config).expect("weight loading");
+
+        // ── RoPE inputs ───────────────────────────────────────────────────────
+        let head_dim = config.head_dim();
+        let (cos_full, sin_full) = build_rope_cache::<CpuBackend>(
+            &(),
+            head_dim,
+            seq_len,
+            config.rope_theta,
+            config.rope_scaling.as_ref(),
+            infernum::dtype::DType::F32,
+        )
+        .expect("rope cache");
+
+        // ── Execute graph ─────────────────────────────────────────────────────
+        let token_tensor = CpuTensor::from_u32(&[seq_len], &input_ids);
+        let inputs = vec![token_tensor, cos_full, sin_full];
+
+        let ep = compile_plan(&graph);
+        let mut arena = Arena::new(ep.arena_size);
+        let output_nodes = graph.output_ids().to_vec();
+
+        let outputs = execute(
+            &ep,
+            graph.nodes(),
+            &mut arena,
+            &weights,
+            &inputs,
+            &output_nodes,
+            None,
+        )
+        .expect("graph execute");
+
+        let graph_logits = outputs[0].to_f32_vec();
+
+        // ── Verify: argmax must match at every position ───────────────────────
+        assert_eq!(
+            graph_logits.len(),
+            eager_logits.len(),
+            "logit tensor length mismatch"
+        );
+        for pos in 0..seq_len {
+            let row = &graph_logits[pos * vocab_size..(pos + 1) * vocab_size];
+            let graph_tok = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+
+            let eager_row = &eager_logits[pos * vocab_size..(pos + 1) * vocab_size];
+            let eager_tok = eager_row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+
+            assert_eq!(
+                graph_tok, eager_tok,
+                "argmax mismatch at position {pos}: graph={graph_tok} eager={eager_tok}"
+            );
+        }
+    }
+}
+
 // ─── SmolLM2-360M GGUF Q4_0 (mixed Q4_0/Q4_1) ──────────────────────────────
 
 /// SmolLM2-360M quantized to Q4_0 (~200MB GGUF).

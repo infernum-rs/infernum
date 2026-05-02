@@ -48,6 +48,6 @@ libc = "0.2"
 approx = "0.5"
 infernum-runtime = { path = "../infernum-runtime" }
 infernum-gemma = { path = "../infernum-gemma" }
-infernum-llama = { path = "../infernum-llama" }
+infernum-llama = { path = "../infernum-llama", features = ["cpu"] }
 infernum-qwen = { path = "../infernum-qwen" }
 ureq = { version = "3", features = ["json"] }

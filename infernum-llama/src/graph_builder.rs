@@ -438,6 +438,65 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
     (graph, model_weights)
 }
 
+// ---------------------------------------------------------------------------
+// CPU weight loading (feature-gated)
+// ---------------------------------------------------------------------------
+
+/// Load model weights from a SafeTensors directory into a `WeightStore` for
+/// graph execution on the CPU backend.
+///
+/// The caller must have already built a graph (via [`build_prefill_graph`] or
+/// [`build_decode_graph`]) so that the `WeightStore` slot order matches the
+/// graph's registered weight order.
+///
+/// # Arguments
+///
+/// * `graph` — A graph built for this model (used only to read weight metadata).
+/// * `model_dir` — Directory containing `.safetensors` files and `config.json`.
+/// * `config` — Llama model configuration (used to resolve quantization config).
+///
+/// # Errors
+///
+/// Returns an error if the directory contains no `.safetensors` files, if a
+/// required weight is missing, or if a weight cannot be converted to the
+/// target dtype.
+#[cfg(feature = "cpu")]
+pub fn load_graph_weights_safetensors(
+    graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
+    model_dir: &std::path::Path,
+    _config: &LlamaConfig,
+) -> infernum::Result<
+    infernum::graph::WeightStore<
+        infernum_cpu::tensor::CpuTensor,
+        infernum_cpu::tensor::CpuLinearWeight,
+    >,
+> {
+    use infernum::graph::WeightId;
+    use infernum::WeightLoader as _;
+    use infernum_cpu::CpuSafeTensorsLoader;
+
+    let loader = CpuSafeTensorsLoader::new(model_dir)?;
+
+    let tensor_count = graph.tensor_weight_count();
+    let linear_count = graph.linear_weight_count();
+
+    let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
+
+    for i in 0..tensor_count {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
+        store.push_tensor_weight(tensor);
+    }
+
+    for i in 0..linear_count {
+        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let weight = loader.load_linear(&meta.name, meta.dtype, None)?;
+        store.push_linear_weight(weight);
+    }
+
+    Ok(store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
