@@ -261,6 +261,10 @@ fn worker_loop(
             continue;
         }
 
+        // Save the generation we woke up for before executing the task.
+        // This is used after the task completes to guard against stale signals.
+        let my_gen = last_gen;
+
         // The Acquire on generation ensures we see the trampoline/data stores.
         let tramp_ptr = state.trampoline.load(Ordering::Relaxed);
         let data_ptr = state.data.load(Ordering::Relaxed);
@@ -270,8 +274,21 @@ fn worker_loop(
         let tramp: fn(*const (), usize, usize) = unsafe { std::mem::transmute(tramp_ptr) };
         tramp(data_ptr.cast_const(), worker_id, num_tasks);
 
-        // Signal completion.
-        completion.completed.fetch_add(1, Ordering::Release);
+        // Only signal completion if the dispatch we participated in is still
+        // current.  Under heavy preemption a worker can be descheduled between
+        // executing the task and reaching this point.  If the main thread has
+        // already timed out waiting (impossible with our blocking wait) *or* if
+        // a new dispatch has been issued (generation changed), the old worker's
+        // fetch_add would corrupt the new round's counter, causing the main
+        // thread to exit its spin loop one completion short and return while a
+        // worker from the new round is still writing.  The generation check
+        // makes such stale workers silently discard their signal — the main
+        // thread already exited correctly (it saw `num_tasks - 1` from the real
+        // workers), and the new round's counter remains uncorrupted.
+        let current_gen = state.generation.load(Ordering::Acquire);
+        if current_gen == my_gen {
+            completion.completed.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -411,6 +428,41 @@ mod tests {
             });
             // 0 + 1 + 2 + 3 = 6
             assert_eq!(sum.load(Ordering::Relaxed), 6);
+        }
+    }
+
+    /// Stress test for the generation-keyed completion race.
+    ///
+    /// Without the generation check in `worker_loop`, a worker preempted
+    /// between "execute task" and "fetch_add(1)" can fire its stale
+    /// increment into the *next* dispatch's counter, causing the main thread
+    /// to exit the spin loop one completion short. That manifests here as a
+    /// sum that doesn't equal the expected value — proving a worker was still
+    /// running when `dispatch` returned.
+    ///
+    /// Run with many threads and many iterations to stress the timing window.
+    #[test]
+    fn test_repeated_dispatch_race_stress() {
+        let num_threads = (std::thread::available_parallelism().map_or(4, std::num::NonZero::get))
+            .min(16)
+            .max(2);
+        let pool = SpinPool::new(num_threads);
+        let expected: u64 = (0..num_threads as u64).sum(); // 0+1+…+(N-1)
+
+        for iteration in 0..500 {
+            let sum = AtomicU64::new(0);
+            pool.dispatch(num_threads, |task_id, _| {
+                // Simulate a tiny amount of work so tasks finish at slightly
+                // different times, increasing the probability of catching a
+                // worker that is slow to signal completion.
+                std::hint::spin_loop();
+                sum.fetch_add(task_id as u64, Ordering::Relaxed);
+            });
+            let got = sum.load(Ordering::Relaxed);
+            assert_eq!(
+                got, expected,
+                "iteration {iteration}: sum={got} expected={expected} (race detected)"
+            );
         }
     }
 

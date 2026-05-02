@@ -7,7 +7,7 @@ build = "build.rs"
 
 [features]
 default = []
-cpu = ["dep:infernum-cpu"]
+cpu = ["dep:infernum-cpu", "infernum-llama/cpu"]
 cuda = ["dep:cudarc", "infernum-cuda", "infernum-cuda/cuda", "infernum-serve/cuda"]
 nccl = ["cuda", "infernum-cuda/nccl"]
 

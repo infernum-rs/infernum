@@ -30,7 +30,9 @@ use infernum::{GenerateOptions, NodeId};
 use infernum_cpu::executor::{execute, KvCacheStore};
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
 use infernum_gemma::GemmaModel;
-use infernum_llama::{build_decode_graph, build_prefill_graph, LlamaConfig, LlamaModel};
+use infernum_llama::{
+    build_decode_graph, build_prefill_graph, LlamaConfig, LlamaGraphEngine, LlamaModel,
+};
 use infernum_qwen::QwenModel;
 use infernum_runtime::Engine;
 
@@ -55,6 +57,10 @@ struct Cli {
     /// Use graph executor for decode (autoregressive) throughput
     #[arg(long)]
     graph_decode: bool,
+
+    /// Use LlamaGraphEngine for decode throughput (SafeTensors or GGUF)
+    #[arg(long)]
+    graph_engine: bool,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -565,12 +571,78 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
     Ok(())
 }
 
+/// Benchmark decode throughput using [`LlamaGraphEngine`].
+///
+/// Loads the model via `from_pretrained` (SafeTensors) or `from_gguf` (GGUF),
+/// runs an 8-token warm-up prefill, then measures autoregressive decode of
+/// `n_gen` tokens and reports tok/s.
+fn bench_graph_engine(model_path: &str, n_gen: usize) -> infernum::Result<()> {
+    let is_gguf = model_path.ends_with(".gguf");
+
+    eprintln!(
+        "Loading: {model_path} (CPU, {}, llama, graph-engine)",
+        if is_gguf { "GGUF" } else { "SafeTensors" }
+    );
+
+    let engine = if is_gguf {
+        LlamaGraphEngine::from_gguf(std::path::Path::new(model_path))?
+    } else {
+        LlamaGraphEngine::from_pretrained(std::path::Path::new(model_path))?
+    };
+
+    let config = engine.config();
+    eprintln!(
+        "Model: {} layers, {} hidden (graph-engine, n_gen={})",
+        config.num_hidden_layers, config.hidden_size, n_gen,
+    );
+
+    let eos = config.eos_token_id;
+
+    // 8-token prompt (same as bench_model / bench_graph_decode)
+    let prompt: Vec<u32> = vec![1, 15043, 29892, 920, 526, 366, 2599, 13];
+
+    // Warm-up
+    eprintln!("Warm-up run...");
+    engine.generate(&prompt, 8, eos)?;
+    eprintln!("Warm-up done.");
+
+    // Timed runs — take best of 3
+    let mut best_elapsed = std::time::Duration::MAX;
+    for iter in 0..3 {
+        let start = Instant::now();
+        engine.generate(&prompt, n_gen, eos)?;
+        let elapsed = start.elapsed();
+        if elapsed < best_elapsed {
+            best_elapsed = elapsed;
+        }
+        eprintln!(
+            "  iter {}: {:.2}s ({:.1} tok/s)",
+            iter + 1,
+            elapsed.as_secs_f64(),
+            n_gen as f64 / elapsed.as_secs_f64(),
+        );
+    }
+
+    let tok_s = n_gen as f64 / best_elapsed.as_secs_f64();
+    println!(
+        "{n_gen} tokens in {:.2}s = {:.1} tok/s",
+        best_elapsed.as_secs_f64(),
+        tok_s,
+    );
+
+    Ok(())
+}
+
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
 
     if let Some(threads) = cli.threads {
         // Set thread count for rayon / internal parallelism if supported
         std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+    }
+
+    if cli.graph_engine {
+        return bench_graph_engine(&cli.model, cli.n_gen);
     }
 
     if cli.graph || cli.graph_decode {

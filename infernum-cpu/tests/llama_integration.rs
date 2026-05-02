@@ -419,7 +419,10 @@ mod smollm2_360m_graph_engine_gguf {
         let output_ids = engine
             .generate(&[0, 15339], 5, eos)
             .expect("graph generation failed");
-        assert!(!output_ids.is_empty(), "Graph engine produced no output tokens");
+        assert!(
+            !output_ids.is_empty(),
+            "Graph engine produced no output tokens"
+        );
         for &tok in &output_ids {
             assert!(
                 (tok as usize) < engine.config().vocab_size,
@@ -472,7 +475,10 @@ mod smollm2_360m_graph_engine_gguf {
         let output_ids = engine
             .generate(&[0, 15339], 5, eos)
             .expect("graph generation failed");
-        assert!(!output_ids.is_empty(), "Graph engine produced no output tokens");
+        assert!(
+            !output_ids.is_empty(),
+            "Graph engine produced no output tokens"
+        );
         for &tok in &output_ids {
             assert!(
                 (tok as usize) < engine.config().vocab_size,

@@ -490,7 +490,14 @@ pub fn load_graph_weights_safetensors(
 
     for i in 0..linear_count {
         let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
-        let weight = loader.load_linear(&meta.name, meta.dtype, None)?;
+        // Handle tied embeddings: some models (e.g. SmolLM2) do not store
+        // `lm_head.weight` separately — it is shared with `embed_tokens`.
+        let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {
+            "model.embed_tokens.weight"
+        } else {
+            &meta.name
+        };
+        let weight = loader.load_linear(name, meta.dtype, None)?;
         store.push_linear_weight(weight);
     }
 
@@ -583,14 +590,13 @@ pub fn load_graph_weights_gguf(
     use infernum_cpu::tensor::CpuTensor;
     use infernum_cpu::CpuBackend;
 
-    let loader = infernum::weights::gguf::GgufLoader::from_file(
-        gguf_path.to_str().ok_or_else(|| {
+    let loader =
+        infernum::weights::gguf::GgufLoader::from_file(gguf_path.to_str().ok_or_else(|| {
             infernum::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "GGUF path is not valid UTF-8",
             ))
-        })?,
-    )?;
+        })?)?;
 
     let tensor_count = graph.tensor_weight_count();
     let linear_count = graph.linear_weight_count();
