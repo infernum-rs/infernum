@@ -597,21 +597,25 @@ fn bench_graph_engine(model_path: &str, n_gen: usize) -> infernum::Result<()> {
         config.num_hidden_layers, config.hidden_size, n_gen,
     );
 
-    let eos = config.eos_token_id;
+    // Use u32::MAX as a "never stop" EOS sentinel so the bench always runs
+    // exactly n_gen decode steps, matching bench_graph_decode's behaviour.
+    // Instruction-tuned models generate real EOS quickly on bare prompts,
+    // which would make the denominator dishonest.
+    let no_eos = u32::MAX;
 
-    // 8-token prompt (same as bench_model / bench_graph_decode)
-    let prompt: Vec<u32> = vec![1, 15043, 29892, 920, 526, 366, 2599, 13];
+    // Open-ended story prompt — token IDs for
+    // "Once upon a time in a land far away, there lived a"
+    // (SmolLM2 / LLaMA tokenizer, 13 tokens).
+    let prompt: Vec<u32> = vec![6403, 1980, 253, 655, 281, 253, 1666, 1869, 2025, 28, 665, 4161, 253];
 
-    // Warm-up
-    eprintln!("Warm-up run...");
-    engine.generate(&prompt, 8, eos)?;
-    eprintln!("Warm-up done.");
-
-    // Timed runs — take best of 3
+    // No warm-up: a warm-up run would pre-populate the PlanCache for every
+    // decode step (each kv_len produces a distinct graph hash), making the
+    // timed runs trivially fast (pure cache hits). All 3 timed runs include
+    // the same cold-cache JIT cost, so best-of-3 still captures steady-state.
     let mut best_elapsed = std::time::Duration::MAX;
     for iter in 0..3 {
         let start = Instant::now();
-        engine.generate(&prompt, n_gen, eos)?;
+        engine.generate(&prompt, n_gen, no_eos)?;
         let elapsed = start.elapsed();
         if elapsed < best_elapsed {
             best_elapsed = elapsed;
