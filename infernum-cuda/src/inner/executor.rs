@@ -437,7 +437,11 @@ pub fn execute(
 ///
 /// # Errors
 /// Returns an error if any kernel launch fails.
-#[allow(clippy::too_many_lines, clippy::missing_panics_doc, clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    clippy::too_many_arguments
+)]
 pub fn execute_indirect(
     plan: &ExecutionPlan,
     nodes: &[GraphNode<CudaBackend>],
