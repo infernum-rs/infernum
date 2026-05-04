@@ -575,8 +575,10 @@ fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
 /// Benchmark decode throughput using [`LlamaGraphEngine`].
 ///
 /// Loads the model via `from_pretrained` (SafeTensors) or `from_gguf` (GGUF),
-/// runs an 8-token warm-up prefill, then measures autoregressive decode of
-/// `n_gen` tokens and reports tok/s.
+/// then measures autoregressive decode of `n_gen` tokens from a single BOS
+/// token prompt and reports tok/s. The single-token prompt makes prompt
+/// processing overhead negligible so the result is directly comparable to
+/// `bench_graph_decode`.
 fn bench_graph_engine(model_path: &str, n_gen: usize) -> infernum::Result<()> {
     let is_gguf = model_path.ends_with(".gguf");
 
@@ -603,10 +605,10 @@ fn bench_graph_engine(model_path: &str, n_gen: usize) -> infernum::Result<()> {
     // which would make the denominator dishonest.
     let no_eos = u32::MAX;
 
-    // Open-ended story prompt — token IDs for
-    // "Once upon a time in a land far away, there lived a"
-    // (SmolLM2 / LLaMA tokenizer, 13 tokens).
-    let prompt: Vec<u32> = vec![6403, 1980, 253, 655, 281, 253, 1666, 1869, 2025, 28, 665, 4161, 253];
+    // Single BOS token prompt so prompt-processing overhead is negligible
+    // (1 step) and the timed output is directly comparable to bench_graph_decode,
+    // which times only the pure decode phase.
+    let prompt: Vec<u32> = vec![1];
 
     // No warm-up: a warm-up run would pre-populate the PlanCache for every
     // decode step (each kv_len produces a distinct graph hash), making the
