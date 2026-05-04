@@ -40,6 +40,7 @@ infernum-macros = { path = "../infernum-macros" }
 half = { version = "2.4", features = ["num-traits", "bytemuck"] }
 num-traits = "0.2"
 bytemuck = { version = "1.14", features = ["derive"] }
+smallvec = "1"
 
 # File format parsers (CPU-only, no GPU deps)
 memmap2 = "0.9"

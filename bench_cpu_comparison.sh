@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# bench_cpu_comparison.sh — Compare infernum vs llama.cpp CPU decode throughput
+# bench_cpu_comparison.sh — Compare infernum vs llama.cpp CPU throughput
 #
-# Benchmarks a model across GGUF quantization formats on CPU.
-# Outputs a Markdown table to stdout.
+# Reports two separate tables:
+#   1. **Decode** — autoregressive token generation (seq_len=1 per step)
+#      llama.cpp (-p 0 -n N) vs infernum eager (Engine::generate) vs graph decode
+#   2. **Prefill** — prompt processing in one forward pass (seq_len=N)
+#      llama.cpp (-p N -n 0) vs eager (—) vs infernum graph executor
 #
 # Prerequisites:
 #   - llama.cpp built locally (with llama-bench, llama-quantize, convert_hf_to_gguf.py)
@@ -17,7 +20,7 @@
 #   ./bench_cpu_comparison.sh --dry-run             # Show what would run
 #   ./bench_cpu_comparison.sh --threads 4           # Override thread count
 #   ./bench_cpu_comparison.sh --llama-cpp /path/to  # Override llama.cpp location
-#   ./bench_cpu_comparison.sh --n-gen 256           # Override token count
+#   ./bench_cpu_comparison.sh --n-tokens 256        # Override token count
 #
 # Available test names (case-insensitive, comma-separated):
 #   f32, q8, q4, all (default)
@@ -34,7 +37,7 @@ CONVERT_SCRIPT="${LLAMA_CPP}/convert_hf_to_gguf.py"
 MODEL_CACHE="$HOME/.cache/infernum/models"
 GGUF_DIR="/tmp"
 
-N_GEN=128
+N_TOKENS=128
 LLAMA_BENCH_REPS=3
 THREADS=""  # empty = use system default (all cores)
 
@@ -58,18 +61,18 @@ while [[ $# -gt 0 ]]; do
         --tests=*)    TESTS_FILTER="${1#--tests=}"; shift ;;
         --threads)    THREADS="$2"; shift 2 ;;
         --threads=*)  THREADS="${1#--threads=}"; shift ;;
-        --n-gen)      N_GEN="$2"; shift 2 ;;
-        --n-gen=*)    N_GEN="${1#--n-gen=}"; shift ;;
+        --n-tokens)   N_TOKENS="$2"; shift 2 ;;
+        --n-tokens=*) N_TOKENS="${1#--n-tokens=}"; shift ;;
         --llama-cpp)  LLAMA_CPP="$2"; LLAMA_BENCH="${LLAMA_CPP}/build/bin/llama-bench"; LLAMA_QUANTIZE="${LLAMA_CPP}/build/bin/llama-quantize"; CONVERT_SCRIPT="${LLAMA_CPP}/convert_hf_to_gguf.py"; shift 2 ;;
         --llama-cpp=*) LLAMA_CPP="${1#--llama-cpp=}"; LLAMA_BENCH="${LLAMA_CPP}/build/bin/llama-bench"; LLAMA_QUANTIZE="${LLAMA_CPP}/build/bin/llama-quantize"; CONVERT_SCRIPT="${LLAMA_CPP}/convert_hf_to_gguf.py"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--tests <list>] [--threads <n>] [--n-gen <n>] [--llama-cpp <path>] [--dry-run]"
+            echo "Usage: $0 [--tests <list>] [--threads <n>] [--n-tokens <n>] [--llama-cpp <path>] [--dry-run]"
             echo ""
             echo "Options:"
             echo "  --tests <list>       Comma-separated formats to benchmark (default: all)"
             echo "                       Names: f32, q8, q4, all"
             echo "  --threads <n>        Number of CPU threads (default: all cores)"
-            echo "  --n-gen <n>          Number of tokens to generate (default: 128)"
+            echo "  --n-tokens <n>       Number of tokens for decode/prefill (default: 128)"
             echo "  --llama-cpp <path>   Path to llama.cpp directory (default: \$LLAMA_CPP or /home/amir/llama.cpp)"
             echo "  --dry-run            Show plan without running benchmarks"
             exit 0 ;;
@@ -164,8 +167,8 @@ quantize_gguf() {
     "${LLAMA_QUANTIZE}" "${input}" "${output}" "${qtype}" >/dev/null 2>&1
 }
 
-# Run llama-bench for CPU decode (ngl=0).
-run_llama_bench() {
+# Run llama-bench for CPU decode: -p 0 -n N (ngl=0).
+run_llama_bench_decode() {
     local gguf="$1"
     if $DRY_RUN; then
         echo "—"
@@ -176,13 +179,30 @@ run_llama_bench() {
         thread_args=(-t "${THREADS}")
     fi
     local json
-    json=$("${LLAMA_BENCH}" -m "${gguf}" -p 0 -n "${N_GEN}" -r "${LLAMA_BENCH_REPS}" \
+    json=$("${LLAMA_BENCH}" -m "${gguf}" -p 0 -n "${N_TOKENS}" -r "${LLAMA_BENCH_REPS}" \
         -ngl 0 "${thread_args[@]}" -o jsonl 2>/dev/null)
     echo "${json}" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(round(d["avg_ts"], 1))'
 }
 
-# Run infernum bench_cpu.
-run_infernum_bench() {
+# Run llama-bench for CPU prefill: -p N -n 0 (ngl=0).
+run_llama_bench_prefill() {
+    local gguf="$1"
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+    local thread_args=()
+    if [[ -n "${THREADS}" ]]; then
+        thread_args=(-t "${THREADS}")
+    fi
+    local json
+    json=$("${LLAMA_BENCH}" -m "${gguf}" -p "${N_TOKENS}" -n 0 -r "${LLAMA_BENCH_REPS}" \
+        -ngl 0 "${thread_args[@]}" -o jsonl 2>/dev/null)
+    echo "${json}" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(round(d["avg_ts"], 1))'
+}
+
+# Run infernum bench_cpu (eager decode).
+run_infernum_decode() {
     local model_path="$1"
     if $DRY_RUN; then
         echo "—"
@@ -194,7 +214,43 @@ run_infernum_bench() {
     fi
     local output toks
     output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
-        "${model_path}" "${N_GEN}" "${thread_args[@]}" 2>/dev/null || true)
+        "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
+    toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
+    echo "${toks:-ERR}"
+}
+
+# Run infernum bench_cpu --graph (graph prefill).
+run_infernum_prefill() {
+    local model_path="$1"
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+    local thread_args=()
+    if [[ -n "${THREADS}" ]]; then
+        thread_args=(-j "${THREADS}")
+    fi
+    local output toks
+    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
+        --graph "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
+    toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
+    echo "${toks:-ERR}"
+}
+
+# Run infernum bench_cpu --graph-decode (graph decode).
+run_infernum_graph_decode() {
+    local model_path="$1"
+    if $DRY_RUN; then
+        echo "—"
+        return
+    fi
+    local thread_args=()
+    if [[ -n "${THREADS}" ]]; then
+        thread_args=(-j "${THREADS}")
+    fi
+    local output toks
+    output=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
+        --graph-decode "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
     toks=$(echo "${output}" | grep -oP '[\d.]+(?= tok/s)' | tail -1)
     echo "${toks:-ERR}"
 }
@@ -277,8 +333,15 @@ fi
 
 # ── Run benchmarks ────────────────────────────────────────────────────────────
 
-declare -A results_llama
-declare -A results_infernum
+# Decode results
+declare -A decode_llama
+declare -A decode_eager
+declare -A decode_graph
+
+# Prefill results
+declare -A prefill_llama
+declare -A prefill_eager
+declare -A prefill_graph
 
 all_benchmarks=("GGUF F32" "GGUF Q8_0" "GGUF Q4_0")
 
@@ -294,7 +357,7 @@ fi
 
 effective_threads="${THREADS:-$(nproc)}"
 log ""
-log "Running ${total} benchmark(s) (${MODEL_NAME}, ${N_GEN} tokens, ${effective_threads} threads)..."
+log "Running ${total} benchmark(s) (${MODEL_NAME}, ${N_TOKENS} tokens, ${effective_threads} threads)..."
 log "─────────────────────────────────────────────"
 
 step=0
@@ -302,22 +365,43 @@ for bench in "${benchmarks[@]}"; do
     step=$((step + 1))
     case "$bench" in
         "GGUF F32")
-            log "[${step}/${total}] GGUF F32 — llama.cpp"
-            results_llama["GGUF F32"]=$(run_llama_bench "${GGUF_F32}")
-            log "[${step}/${total}] GGUF F32 — infernum"
-            results_infernum["GGUF F32"]=$(run_infernum_bench "${GGUF_F32}")
+            log "[${step}/${total}] GGUF F32 — llama.cpp decode"
+            decode_llama["GGUF F32"]=$(run_llama_bench_decode "${GGUF_F32}")
+            log "[${step}/${total}] GGUF F32 — llama.cpp prefill"
+            prefill_llama["GGUF F32"]=$(run_llama_bench_prefill "${GGUF_F32}")
+            log "[${step}/${total}] GGUF F32 — infernum decode (eager)"
+            decode_eager["GGUF F32"]=$(run_infernum_decode "${GGUF_F32}")
+            log "[${step}/${total}] GGUF F32 — infernum decode (graph)"
+            decode_graph["GGUF F32"]=$(run_infernum_graph_decode "${BASE_MODEL_DIR}")
+            log "[${step}/${total}] GGUF F32 — infernum prefill (graph)"
+            prefill_graph["GGUF F32"]=$(run_infernum_prefill "${BASE_MODEL_DIR}")
+            prefill_eager["GGUF F32"]="—"
             ;;
         "GGUF Q8_0")
-            log "[${step}/${total}] GGUF Q8_0 — llama.cpp"
-            results_llama["GGUF Q8_0"]=$(run_llama_bench "${GGUF_Q8}")
-            log "[${step}/${total}] GGUF Q8_0 — infernum"
-            results_infernum["GGUF Q8_0"]=$(run_infernum_bench "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — llama.cpp decode"
+            decode_llama["GGUF Q8_0"]=$(run_llama_bench_decode "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — llama.cpp prefill"
+            prefill_llama["GGUF Q8_0"]=$(run_llama_bench_prefill "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — infernum decode (eager)"
+            decode_eager["GGUF Q8_0"]=$(run_infernum_decode "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — infernum decode (graph)"
+            decode_graph["GGUF Q8_0"]=$(run_infernum_graph_decode "${GGUF_Q8}")
+            log "[${step}/${total}] GGUF Q8_0 — infernum prefill (graph)"
+            prefill_graph["GGUF Q8_0"]=$(run_infernum_prefill "${GGUF_Q8}")
+            prefill_eager["GGUF Q8_0"]="—"
             ;;
         "GGUF Q4_0")
-            log "[${step}/${total}] GGUF Q4_0 — llama.cpp"
-            results_llama["GGUF Q4_0"]=$(run_llama_bench "${GGUF_Q4}")
-            log "[${step}/${total}] GGUF Q4_0 — infernum"
-            results_infernum["GGUF Q4_0"]=$(run_infernum_bench "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — llama.cpp decode"
+            decode_llama["GGUF Q4_0"]=$(run_llama_bench_decode "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — llama.cpp prefill"
+            prefill_llama["GGUF Q4_0"]=$(run_llama_bench_prefill "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — infernum decode (eager)"
+            decode_eager["GGUF Q4_0"]=$(run_infernum_decode "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — infernum decode (graph)"
+            decode_graph["GGUF Q4_0"]=$(run_infernum_graph_decode "${GGUF_Q4}")
+            log "[${step}/${total}] GGUF Q4_0 — infernum prefill (graph)"
+            prefill_graph["GGUF Q4_0"]=$(run_infernum_prefill "${GGUF_Q4}")
+            prefill_eager["GGUF Q4_0"]="—"
             ;;
     esac
 done
@@ -326,9 +410,9 @@ log ""
 log "Done. Results:"
 log ""
 
-# ── Output table ──────────────────────────────────────────────────────────────
+# ── Output tables ─────────────────────────────────────────────────────────────
 
-compute_gap() {
+compute_ratio() {
     local llama="$1"
     local infernum="$2"
     if [[ "${llama}" == "—" || "${infernum}" == "—" || "${llama}" == "ERR" || "${infernum}" == "ERR" ]]; then
@@ -340,8 +424,11 @@ l, i = float('${llama}'), float('${infernum}')
 if l == 0 or i == 0:
     print('—')
 else:
-    ratio = l / i
-    print(f'{ratio:.1f}x')
+    ratio = i / l
+    if ratio >= 1:
+        print(f'{ratio:.2f}x')
+    else:
+        print(f'{ratio:.2f}x')
 "
 }
 
@@ -351,29 +438,60 @@ if [[ -z "${cpu_name}" || "${cpu_name}" == "unknown" ]]; then
 fi
 infernum_commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 llama_commit="unknown"
-# Get llama.cpp version from git
 if [[ -d "${LLAMA_CPP}/.git" ]]; then
     llama_commit=$(git -C "${LLAMA_CPP}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 fi
 
 echo ""
-echo "## Infernum vs llama.cpp — ${MODEL_NAME} CPU decode throughput"
+echo "## Infernum vs llama.cpp — ${MODEL_NAME} CPU throughput"
 echo ""
 echo "- **CPU:** ${cpu_name} (${effective_threads} threads)"
-echo "- **Tokens generated:** ${N_GEN} (8-token prompt, greedy)"
+echo "- **Tokens:** ${N_TOKENS}"
 echo "- **infernum:** commit \`${infernum_commit}\`"
-echo "- **llama.cpp:** commit \`${llama_commit}\` (\`-ngl 0\`, ${LLAMA_BENCH_REPS} reps)"
+echo "- **llama.cpp:** commit \`${llama_commit}\`" '(`-ngl 0`,' "${LLAMA_BENCH_REPS} reps)"
 echo "- **Date:** $(date +%Y-%m-%d)"
+
+# Decode table
 echo ""
-echo "| Format | llama.cpp (tok/s) | infernum (tok/s) | Gap (llama.cpp ÷ infernum) |"
-echo "| ------ | ----------------: | ---------------: | -------------------------: |"
+echo "### Decode throughput (tok/s)"
+echo ""
+echo "Autoregressive generation: each step processes 1 token, appending to KV cache."
+echo ""
+echo "| Format | llama.cpp | eager | graph | ratio |"
+echo "| ------ | --------: | ----: | ----: | ----: |"
+
+best_of() {
+    local a="$1" b="$2"
+    if [[ "${a}" == "—" || "${a}" == "ERR" ]]; then echo "${b}"; return; fi
+    if [[ "${b}" == "—" || "${b}" == "ERR" ]]; then echo "${a}"; return; fi
+    python3 -c "print(max(float('${a}'), float('${b}')))"
+}
 
 for bench in "${benchmarks[@]}"; do
-    l="${results_llama[$bench]}"
-    i="${results_infernum[$bench]}"
-    gap=$(compute_gap "${l}" "${i}")
+    l="${decode_llama[$bench]}"
+    e="${decode_eager[$bench]}"
+    g="${decode_graph[$bench]}"
+    best=$(best_of "${e}" "${g}")
+    r=$(compute_ratio "${l}" "${best}")
+    printf "| %-14s | %9s | %5s | %5s | %5s |\n" "${bench}" "${l}" "${e}" "${g}" "${r}"
+done
 
-    printf "| %-14s | %17s | %16s | %26s |\n" "${bench}" "${l}" "${i}" "${gap}"
+# Prefill table
+echo ""
+echo "### Prefill throughput (tok/s)"
+echo ""
+echo "Prompt processing: all tokens processed in a single forward pass."
+echo ""
+echo "| Format | llama.cpp | eager | graph | ratio |"
+echo "| ------ | --------: | ----: | ----: | ----: |"
+
+for bench in "${benchmarks[@]}"; do
+    l="${prefill_llama[$bench]}"
+    e="${prefill_eager[$bench]}"
+    g="${prefill_graph[$bench]}"
+    r=$(compute_ratio "${l}" "${g}")
+    printf "| %-14s | %9s | %5s | %5s | %5s |
+" "${bench}" "${l}" "${e}" "${g}" "${r}"
 done
 
 echo ""

@@ -14,11 +14,12 @@
     clippy::module_name_repetitions
 )]
 
+use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 
 use cudarc::driver::sys::{
-    self, CUgraph, CUgraphExec, CUgraphExecUpdateResult, CUgraphExecUpdateResultInfo,
+    self, CUevent, CUgraph, CUgraphExec, CUgraphExecUpdateResult, CUgraphExecUpdateResultInfo,
     CUstreamCaptureMode,
 };
 use cudarc::driver::{CudaDevice, CudaSlice};
@@ -197,6 +198,166 @@ impl Drop for CudaGraph {
             let lib = unsafe { sys::lib() };
             unsafe { lib.cuGraphExecDestroy(exec) };
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PinnedBuffer
+// ---------------------------------------------------------------------------
+
+/// A pinned (page-locked) host buffer holding a single `u32`.
+///
+/// Pinned memory enables async DMA from the GPU without the OS being able to
+/// page it out mid-transfer. Allocated with `cuMemHostAlloc` using the
+/// `CU_MEMHOSTALLOC_PORTABLE` flag so it is accessible from any CUDA context.
+///
+/// # Safety
+///
+/// The raw pointer `ptr` is valid for the lifetime of this struct. Safe to
+/// share across threads because CUDA pinned memory is accessible from the host
+/// on any thread once the preceding event has fired.
+pub struct PinnedBuffer {
+    ptr: *mut u32,
+    device: Arc<CudaDevice>,
+}
+
+// SAFETY: The pointer is pinned host memory, not aliased, and only read after
+// a `CudaEvent::synchronize()` ensures the DMA has completed.
+unsafe impl Send for PinnedBuffer {}
+unsafe impl Sync for PinnedBuffer {}
+
+impl PinnedBuffer {
+    /// Allocate a single `u32` pinned host buffer.
+    ///
+    /// # Errors
+    /// Returns an error if `cuMemHostAlloc` fails.
+    pub fn new(device: &Arc<CudaDevice>) -> Result<Self> {
+        let lib = unsafe { sys::lib() };
+        let mut ptr: *mut c_void = ptr::null_mut();
+        // CU_MEMHOSTALLOC_PORTABLE = 1: accessible from any CUDA context.
+        check(
+            unsafe { lib.cuMemHostAlloc(&raw mut ptr, std::mem::size_of::<u32>(), 1) },
+            "cuMemHostAlloc",
+        )?;
+        Ok(Self {
+            ptr: ptr.cast::<u32>(),
+            device: Arc::clone(device),
+        })
+    }
+
+    /// Queue an async device-to-host copy from `src_device_ptr` into this
+    /// buffer on the device's stream. Stream-ordered: the copy executes after
+    /// any prior work on the same stream.
+    ///
+    /// # Errors
+    /// Returns an error if `cuMemcpyDtoHAsync_v2` fails.
+    pub fn async_copy_from_device(&self, src_device_ptr: u64) -> Result<()> {
+        let lib = unsafe { sys::lib() };
+        let stream = *self.device.cu_stream();
+        check(
+            unsafe {
+                lib.cuMemcpyDtoHAsync_v2(
+                    self.ptr.cast::<c_void>(),
+                    src_device_ptr,
+                    std::mem::size_of::<u32>(),
+                    stream,
+                )
+            },
+            "cuMemcpyDtoHAsync_v2",
+        )
+    }
+
+    /// Read the buffered value.
+    ///
+    /// # Safety callers responsibility
+    /// Only safe to call after the associated `CudaEvent` has been
+    /// synchronized, guaranteeing the async DMA has completed.
+    #[must_use]
+    pub fn read(&self) -> u32 {
+        // SAFETY: ptr is valid pinned memory, caller ensures DMA is done.
+        unsafe { *self.ptr }
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        // Best-effort: ignore errors at drop time.
+        let _ = self.device.synchronize();
+        let lib = unsafe { sys::lib() };
+        unsafe { lib.cuMemFreeHost(self.ptr.cast::<c_void>()) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CudaEvent
+// ---------------------------------------------------------------------------
+
+/// A CUDA event used as a lightweight synchronization fence.
+///
+/// Created with `CU_EVENT_DISABLE_TIMING` so there is no overhead recording
+/// timing data. Used to wait only until a specific DMA has completed rather
+/// than flushing the entire device with `device.synchronize()`.
+pub struct CudaEvent {
+    event: CUevent,
+    device: Arc<CudaDevice>,
+}
+
+impl CudaEvent {
+    /// Create a new no-timing CUDA event.
+    ///
+    /// # Errors
+    /// Returns an error if `cuEventCreate` fails.
+    pub fn new(device: &Arc<CudaDevice>) -> Result<Self> {
+        let lib = unsafe { sys::lib() };
+        let mut event: CUevent = ptr::null_mut();
+        // CU_EVENT_DISABLE_TIMING = 2
+        check(
+            unsafe { lib.cuEventCreate(&raw mut event, 2) },
+            "cuEventCreate",
+        )?;
+        Ok(Self {
+            event,
+            device: Arc::clone(device),
+        })
+    }
+
+    /// Record the event on the device's stream.
+    ///
+    /// After this call, `synchronize()` will block until all work enqueued
+    /// before this record point on the stream has completed.
+    ///
+    /// # Errors
+    /// Returns an error if `cuEventRecord` fails.
+    pub fn record(&self) -> Result<()> {
+        let lib = unsafe { sys::lib() };
+        let stream = *self.device.cu_stream();
+        check(
+            unsafe { lib.cuEventRecord(self.event, stream) },
+            "cuEventRecord",
+        )
+    }
+
+    /// Block until this event has fired (i.e., until the DMA recorded before
+    /// this event has completed on the GPU).
+    ///
+    /// Much cheaper than `device.synchronize()` — only waits for the specific
+    /// stream work up to the record point, not all GPU activity.
+    ///
+    /// # Errors
+    /// Returns an error if `cuEventSynchronize` fails.
+    pub fn synchronize(&self) -> Result<()> {
+        let lib = unsafe { sys::lib() };
+        check(
+            unsafe { lib.cuEventSynchronize(self.event) },
+            "cuEventSynchronize",
+        )
+    }
+}
+
+impl Drop for CudaEvent {
+    fn drop(&mut self) {
+        let lib = unsafe { sys::lib() };
+        unsafe { lib.cuEventDestroy_v2(self.event) };
     }
 }
 

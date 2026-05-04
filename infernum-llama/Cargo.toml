@@ -3,8 +3,13 @@ name = "infernum-llama"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enable CPU-backend weight loading utilities (load_graph_weights_safetensors).
+cpu = ["dep:infernum-cpu"]
+
 [dependencies]
 infernum = { path = "../infernum" }
+infernum-cpu = { path = "../infernum-cpu", optional = true }
 half = { version = "2.4", features = ["num-traits", "bytemuck"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -14,6 +14,7 @@ pub mod dtype;
 pub mod error;
 pub mod fusion;
 pub mod gguf_meta;
+pub mod graph;
 pub mod logits;
 pub mod model;
 pub mod rope;
@@ -49,3 +50,10 @@ pub use tokenizer::Tokenizer;
 pub use weights::{QuantizationConfig, WeightLoader};
 
 pub use chat_template::{ChatMessage, ChatTemplate, RawTemplate};
+pub use graph::{
+    plan, BufferSlot, ExecutionPlan, Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps,
+    GraphCastOps, GraphEmbedOps, GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphNode,
+    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
+    GraphRopeOps, GraphSiluOps, GraphSwigluOps, GraphTensorOps, NodeId, OpNode, OutputRef,
+    WeightId, WeightMeta, WeightRef,
+};

@@ -1,0 +1,426 @@
+llama-bench;GOMP_barrier 300030
+llama-bench;[ld-linux-x86-64.so.2] 700070
+llama-bench;[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[unknown];[unknown] 100010
+llama-bench;[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[libc.so.6] 42904290
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown] 1100110
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 1200120
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[libc.so.6];ggml_backend_sched_synchronize 100010
+llama-bench;[libc.so.6];llama_context::decode 200020
+llama-bench;[libc.so.6];random_r 100010
+llama-bench;[libgomp.so.1.0.0] 78707870
+llama-bench;[unknown];GOMP_barrier 600060
+llama-bench;[unknown];GOMP_barrier@plt 200020
+llama-bench;[unknown];[[vdso]];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[ld-linux-x86-64.so.2] 200020
+llama-bench;[unknown];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2] 100010
+llama-bench;[unknown];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libc.so.6] 10001000
+llama-bench;[unknown];[libc.so.6];[libc.so.6] 100010
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];[libgomp.so.1.0.0] 3596859650
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown] 6500650
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown] 500050
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown] 600060
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown];[unknown] 700070
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 3500350
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 1900190
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libgomp.so.1.0.0];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[libm.so.6] 1200120
+llama-bench;[unknown];[unknown];GOMP_parallel 100010
+llama-bench;[unknown];[unknown];LLM_TN_IMPL::str[abi:cxx11] 100010
+llama-bench;[unknown];[unknown];[ld-linux-x86-64.so.2] 500050
+llama-bench;[unknown];[unknown];[ld-linux-x86-64.so.2];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];[libc.so.6] 4900490
+llama-bench;[unknown];[unknown];[libc.so.6];[unknown];[unknown];[unknown] 300030
+llama-bench;[unknown];[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];[libstdc++.so.6.0.30] 200020
+llama-bench;[unknown];[unknown];[unknown];GOMP_single_start 100010
+llama-bench;[unknown];[unknown];[unknown];[libc.so.6] 100010
+llama-bench;[unknown];[unknown];[unknown];[libgomp.so.1.0.0] 11301130
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[libc.so.6];[unknown];[unknown];[unknown] 400040
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];cfree 400040
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];llama_vocab::~llama_vocab 1700170
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_rehash 900090
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];std::_Hashtable<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int>, std::allocator<std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int> >, std::__detail::_Select1st, std::equal_to<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, llama_vocab::impl::pair_hash, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_before_node 700070
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];std::_Hashtable<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int>, std::allocator<std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int> >, std::__detail::_Select1st, std::equal_to<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, llama_vocab::impl::pair_hash, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_rehash 700070
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];std::__detail::_Map_base<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true>, true>::operator[] 1600160
+llama-bench;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];llama_kv_cache::prepare 100010
+llama-bench;[unknown];[unknown];[unknown];[unknown];llama_kv_cache::clear 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_backend_cpu_get_extra_buffer_types 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_barrier 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_compute_forward_get_rows 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_compute_forward_glu 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_compute_forward_rms_norm 200020
+llama-bench;[unknown];[unknown];[unknown];ggml_compute_forward_rms_norm@plt 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_compute_forward_set_rows@plt 200020
+llama-bench;[unknown];[unknown];[unknown];ggml_compute_forward_soft_max@plt 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute._omp_fn.0 700070
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0 6600660
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;[libc.so.6] 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;[libm.so.6] 1600160
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;dequantize_row_q8_0 200020
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_add_non_quantized 1900190
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_get_rows 200020
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_mul 2800280
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_rms_norm 14201420
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_soft_max 27702770
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_soft_max;ggml_vec_soft_max_f32 8700870
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_is_contiguous_rows 200020
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;ggml_nrows@plt 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;sincosf@plt 100010
+llama-bench;[unknown];[unknown];[unknown];ggml_graph_compute_thread.isra.0;void ggml_compute_forward_rope_flt<float> 2900290
+llama-bench;[unknown];[unknown];[unknown];ggml_is_empty@plt 100010
+llama-bench;[unknown];[unknown];_IO_fread 400040
+llama-bench;[unknown];[unknown];__vdso_clock_gettime 100010
+llama-bench;[unknown];[unknown];bool gguf_reader::read<unsigned int> 100010
+llama-bench;[unknown];[unknown];bool gguf_reader::read<unsigned long> 200020
+llama-bench;[unknown];[unknown];fstatat64;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];fstatat64;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];[unknown];ggml_backend_reg_get_proc_address 100010
+llama-bench;[unknown];[unknown];ggml_gallocr_reserve_n_impl 200020
+llama-bench;[unknown];[unknown];gguf_free 300030
+llama-bench;[unknown];[unknown];gguf_reader::read 100010
+llama-bench;[unknown];[unknown];llama_batch_allocr::clear 100010
+llama-bench;[unknown];[unknown];llama_context::decode;llama_batch_allocr::init 100010
+llama-bench;[unknown];[unknown];llama_context::decode;void std::vector<int, std::allocator<int> >::_M_realloc_insert<int const&> 100010
+llama-bench;[unknown];[unknown];llama_context::graph_compute 100010
+llama-bench;[unknown];[unknown];llama_kv_cache_context::~llama_kv_cache_context 100010
+llama-bench;[unknown];[unknown];llama_vocab::~llama_vocab 400040
+llama-bench;[unknown];[unknown];memcpy@plt 100010
+llama-bench;[unknown];[unknown];replace_all 400040
+llama-bench;[unknown];[unknown];std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_rehash 400040
+llama-bench;[unknown];[unknown];std::_Hashtable<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int>, std::allocator<std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int> >, std::__detail::_Select1st, std::equal_to<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, llama_vocab::impl::pair_hash, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_before_node 600060
+llama-bench;[unknown];[unknown];std::_Hashtable<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int>, std::allocator<std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int> >, std::__detail::_Select1st, std::equal_to<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, llama_vocab::impl::pair_hash, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_rehash 900090
+llama-bench;[unknown];[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_append 400040
+llama-bench;[unknown];[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::find 200020
+llama-bench;[unknown];[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::operator= 100010
+llama-bench;[unknown];[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::reserve 100010
+llama-bench;[unknown];[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::resize 100010
+llama-bench;[unknown];[unknown];std::__cxx11::collate<char>::do_transform;[libc.so.6] 100010
+llama-bench;[unknown];[unknown];std::ostream::sentry::sentry 100010
+llama-bench;[unknown];[unknown];std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::~vector 200020
+llama-bench;[unknown];[unknown];void std::vector<unsigned int, std::allocator<unsigned int> >::_M_realloc_insert<unsigned int> 100010
+llama-bench;[unknown];__isoc99_sscanf;[libc.so.6] 1900190
+llama-bench;[unknown];__isoc99_sscanf;_IO_sputbackc 100010
+llama-bench;[unknown];brk;[unknown];[unknown] 100010
+llama-bench;[unknown];brk;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];expm1f32 100010
+llama-bench;[unknown];format[abi:cxx11] 100010
+llama-bench;[unknown];getdents64;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];getdents64;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];getdents64;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];ggml::cpu::repack::extra_buffer_type::get_tensor_traits 8000800
+llama-bench;[unknown];ggml_aligned_free 100010
+llama-bench;[unknown];ggml_backend_cpu_buffer_type_alloc_buffer;ggml::cpu::repack::extra_buffer_type::get_tensor_traits 1800180
+llama-bench;[unknown];ggml_backend_cpu_buffer_type_alloc_buffer;ggml_backend_cpu_repack_buffer_type 100010
+llama-bench;[unknown];ggml_backend_cpu_get_extra_buffer_types 1500150
+llama-bench;[unknown];ggml_backend_cpu_graph_compute 200020
+llama-bench;[unknown];ggml_backend_sched_split_graph 200020
+llama-bench;[unknown];ggml_barrier 700070
+llama-bench;[unknown];ggml_barrier@plt 300030
+llama-bench;[unknown];ggml_can_repeat 1500150
+llama-bench;[unknown];ggml_compute_forward_add 200020
+llama-bench;[unknown];ggml_compute_forward_add_non_quantized 500050
+llama-bench;[unknown];ggml_compute_forward_cont 600060
+llama-bench;[unknown];ggml_compute_forward_cont@plt 200020
+llama-bench;[unknown];ggml_compute_forward_dup 100010
+llama-bench;[unknown];ggml_compute_forward_dup_bytes 600060
+llama-bench;[unknown];ggml_compute_forward_glu 1000100
+llama-bench;[unknown];ggml_compute_forward_glu;ggml_vec_swiglu_f32 6100610
+llama-bench;[unknown];ggml_compute_forward_mul 200020
+llama-bench;[unknown];ggml_compute_forward_mul_mat 11701170
+llama-bench;[unknown];ggml_compute_forward_mul_mat;llamafile_sgemm 700070
+llama-bench;[unknown];ggml_compute_forward_rms_norm 300030
+llama-bench;[unknown];ggml_compute_forward_rms_norm;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];ggml_compute_forward_rms_norm@plt 100010
+llama-bench;[unknown];ggml_compute_forward_rope 300030
+llama-bench;[unknown];ggml_compute_forward_set_rows 500050
+llama-bench;[unknown];ggml_compute_forward_set_rows@plt 200020
+llama-bench;[unknown];ggml_compute_forward_soft_max@plt 200020
+llama-bench;[unknown];ggml_cpu_extra_compute_forward 2100210
+llama-bench;[unknown];ggml_cpu_extra_compute_forward@plt 200020
+llama-bench;[unknown];ggml_cpu_extra_work_size 100010
+llama-bench;[unknown];ggml_cpu_init 1000100
+llama-bench;[unknown];ggml_cpu_init;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];ggml_free 100010
+llama-bench;[unknown];ggml_gallocr_allocate_node 300030
+llama-bench;[unknown];ggml_gallocr_reserve_n_impl 100010
+llama-bench;[unknown];ggml_gallocr_reserve_n_impl;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];ggml_get_glu_op 600060
+llama-bench;[unknown];ggml_get_glu_op@plt 200020
+llama-bench;[unknown];ggml_graph_compute._omp_fn.0 800080
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0 42004200
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;[libm.so.6] 8800880
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_are_same_shape 200020
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_are_same_shape@plt 100010
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_add 100010
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_add_non_quantized 1300130
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_dup 200020
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_get_rows 300030
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_mul 1800180
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_rms_norm 500050
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_compute_forward_soft_max 900090
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_is_contiguous_rows 100010
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_is_contiguous_rows@plt 100010
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;ggml_nrows@plt 100010
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;log2 1600160
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;powf@plt 300030
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;sincosf@plt 600060
+llama-bench;[unknown];ggml_graph_compute_thread.isra.0;void ggml_compute_forward_rope_flt<float> 21002100
+llama-bench;[unknown];ggml_is_contiguous 100010
+llama-bench;[unknown];ggml_is_contiguous@plt 400040
+llama-bench;[unknown];ggml_is_contiguous_0 200020
+llama-bench;[unknown];ggml_is_contiguous_1 100010
+llama-bench;[unknown];ggml_is_contiguous_1@plt 100010
+llama-bench;[unknown];ggml_is_empty 2700270
+llama-bench;[unknown];ggml_is_empty@plt 400040
+llama-bench;[unknown];ggml_is_numa 800080
+llama-bench;[unknown];ggml_is_numa@plt 700070
+llama-bench;[unknown];ggml_nelements 600060
+llama-bench;[unknown];ggml_nelements@plt 300030
+llama-bench;[unknown];ggml_new_tensor_impl.constprop.0 200020
+llama-bench;[unknown];ggml_permute 100010
+llama-bench;[unknown];ggml_rope_yarn_corr_dims 1000100
+llama-bench;[unknown];ggml_type_size 900090
+llama-bench;[unknown];ggml_type_size@plt 600060
+llama-bench;[unknown];gguf_get_arr_str 200020
+llama-bench;[unknown];gguf_get_n_kv 100010
+llama-bench;[unknown];gguf_get_n_tensors 100010
+llama-bench;[unknown];gguf_get_n_tensors@plt 100010
+llama-bench;[unknown];gguf_init_from_file;[libc.so.6] 200020
+llama-bench;[unknown];gguf_init_from_file_impl 100010
+llama-bench;[unknown];llama_batch_allocr::clear 300030
+llama-bench;[unknown];llama_hparams::n_head_kv 100010
+llama-bench;[unknown];llama_kv_cache::apply_ubatch 200020
+llama-bench;[unknown];llama_kv_cache::prepare 200020
+llama-bench;[unknown];llama_kv_cache::~llama_kv_cache;[unknown];llama_kv_cache::get_has_shift 200020
+llama-bench;[unknown];llama_kv_cache_context::set_input_k_idxs 100010
+llama-bench;[unknown];llama_model::load_hparams;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];llama_model::load_vocab;[libc.so.6] 1500150
+llama-bench;[unknown];llama_model::load_vocab;llama_vocab::impl::load 5500550
+llama-bench;[unknown];llama_model::load_vocab;llama_vocab::impl::load;[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];llama_model::load_vocab;llama_vocab::impl::load;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];llama_model::load_vocab;llama_vocab::impl::load;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];llama_model::load_vocab;operator new 300030
+llama-bench;[unknown];llama_model::load_vocab;std::_Hash_bytes 1400140
+llama-bench;[unknown];llama_model::load_vocab;std::_Hashtable<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int>, std::allocator<std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int> >, std::__detail::_Select1st, std::equal_to<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, llama_vocab::impl::pair_hash, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_befor 100010
+llama-bench;[unknown];llama_model::load_vocab;std::_Hashtable<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int>, std::allocator<std::pair<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const, int> >, std::__detail::_Select1st, std::equal_to<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, llama_vocab::impl::pair_hash, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_before_node 900090
+llama-bench;[unknown];llama_model::load_vocab;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string<std::allocator<char> > 100010
+llama-bench;[unknown];llama_model::load_vocab;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::compare 2900290
+llama-bench;[unknown];llama_model::load_vocab;std::__detail::_Map_base<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true>, true>::operator[] 1100110
+llama-bench;[unknown];llama_model::load_vocab;strlen@plt 1400140
+llama-bench;[unknown];llama_vocab::impl::token_to_piece 600060
+llama-bench;[unknown];llamafile_sgemm 100010
+llama-bench;[unknown];llamafile_sgemm@plt 200020
+llama-bench;[unknown];llseek 100010
+llama-bench;[unknown];logf@plt 100010
+llama-bench;[unknown];malloc@plt 100010
+llama-bench;[unknown];memcpy@plt 100010
+llama-bench;[unknown];openat64;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];operator delete 200020
+llama-bench;[unknown];read 100010
+llama-bench;[unknown];read;[unknown];[unknown] 100010
+llama-bench;[unknown];read;[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 1700170
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 43204320
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 49604960
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 1900190
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 5900590
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 2300230
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 13301330
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 7800780
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 24402440
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 3300330
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 8300830
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 1700170
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 5000500
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 9000900
+llama-bench;[unknown];read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 4800480
+llama-bench;[unknown];readlink;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];std::_Hash_bytes 1700170
+llama-bench;[unknown];std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, unsigned char>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, unsigned char> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::find 400040
+llama-bench;[unknown];std::_Rb_tree<llm_tensor, llm_tensor, std::_Identity<llm_tensor>, std::less<llm_tensor>, std::allocator<llm_tensor> >::_M_erase 100010
+llama-bench;[unknown];std::_Rb_tree<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, llm_chat_template>, std::_Select1st<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, llm_chat_template> >, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, llm_chat_template> > >::_M_get_insert_unique_pos 100010
+llama-bench;[unknown];std::_Rb_tree_insert_and_rebalance 200020
+llama-bench;[unknown];std::_Sp_counted_ptr_inplace<llama_ubatch::data_t, std::allocator<llama_ubatch::data_t>, (__gnu_cxx::_Lock_policy)2>::~_Sp_counted_ptr_inplace;[unknown];std::vector<int, std::allocator<int> >::_M_default_append 100010
+llama-bench;[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_assign 100010
+llama-bench;[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string<std::allocator<char> > 100010
+llama-bench;[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::find 100010
+llama-bench;[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::push_back 100010
+llama-bench;[unknown];std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::reserve 600060
+llama-bench;[unknown];std::__cxx11::collate<char>::do_transform 100010
+llama-bench;[unknown];std::__cxx11::messages<char>::messages 100010
+llama-bench;[unknown];std::__detail::_Map_base<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true>, true>::operator[] 100010
+llama-bench;[unknown];std::filesystem::__cxx11::path::_M_append 100010
+llama-bench;[unknown];std::ostream::sentry::sentry 100010
+llama-bench;[unknown];std::set<llm_tensor, std::less<llm_tensor>, std::allocator<llm_tensor> >::set 200020
+llama-bench;[unknown];tanhf32 200020
+llama-bench;[unknown];unicode_cpt_flags_from_cpt 300030
+llama-bench;[unknown];unicode_cpt_flags_from_cpt;[unknown];[unknown];[unknown] 300030
+llama-bench;[unknown];unicode_cpt_flags_from_cpt;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];unicode_cpt_flags_from_cpt;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;[unknown];unicode_cpt_from_utf8 800080
+llama-bench;[unknown];unicode_cpt_to_utf8[abi:cxx11] 500050
+llama-bench;[unknown];unicode_cpts_from_utf8 500050
+llama-bench;[unknown];unicode_utf8_to_byte 600060
+llama-bench;[unknown];virtual thunk to std::__cxx11::basic_stringstream<char, std::char_traits<char>, std::allocator<char> >::~basic_stringstream;[unknown];std::basic_ostream<char, std::char_traits<char> >& std::__ostream_insert<char, std::char_traits<char> > 500050
+llama-bench;[unknown];virtual thunk to std::basic_ostream<char, std::char_traits<char> >::~basic_ostream;[unknown];std::uncaught_exception 100010
+llama-bench;[unknown];void ggml_compute_forward_rope_flt<float> 100010
+llama-bench;[unknown];void ggml_compute_forward_rope_flt<float>;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;[unknown];void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_construct<char const*> 300030
+llama-bench;[unknown];void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_construct<char*> 600060
+llama-bench;[unknown];void std::vector<llama_kv_cells, std::allocator<llama_kv_cells> >::_M_realloc_insert<llama_kv_cells> 100010
+llama-bench;_IO_default_xsputn 200020
+llama-bench;_IO_fread 3600360
+llama-bench;_IO_sgetn 200020
+llama-bench;__dynamic_cast 100010
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 8900890
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 3200320
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 1700170
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 700070
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 5400540
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 1300130
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;__munmap;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 4300430
+llama-bench;_exit;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;_init 100010
+llama-bench;bool gguf_read_emplace_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > 400040
+llama-bench;bool gguf_read_emplace_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >;[unknown];[unknown];[unknown] 200020
+llama-bench;bool gguf_read_emplace_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;bool gguf_read_emplace_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;bool gguf_read_emplace_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;bool gguf_read_emplace_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;cfree 200020
+llama-bench;ggml_backend_cpu_get_extra_buffer_types 300030
+llama-bench;ggml_barrier@plt 200020
+llama-bench;ggml_blck_size 2600260
+llama-bench;ggml_blck_size@plt 2500250
+llama-bench;ggml_compute_forward_dup_bytes 1000100
+llama-bench;ggml_compute_forward_glu 400040
+llama-bench;ggml_compute_forward_mul_mat 214321430
+llama-bench;ggml_compute_forward_mul_mat;llamafile_sgemm 1100110
+llama-bench;ggml_compute_forward_set_rows 4700470
+llama-bench;ggml_compute_forward_set_rows;ggml_cpu_fp32_to_fp16 16901690
+llama-bench;ggml_cpu_extra_work_size 400040
+llama-bench;ggml_cpu_extra_work_size@plt 100010
+llama-bench;ggml_cpu_fp32_to_fp16 90209020
+llama-bench;ggml_cpu_fp32_to_fp16;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;ggml_graph_overhead_custom 100010
+llama-bench;ggml_graph_plan 1100110
+llama-bench;ggml_is_contiguous@plt 1000100
+llama-bench;ggml_is_contiguous_0 4100410
+llama-bench;ggml_is_contiguous_0@plt 200020
+llama-bench;ggml_is_empty 1900190
+llama-bench;ggml_is_empty@plt 100010
+llama-bench;ggml_nbytes 100010
+llama-bench;ggml_nrows@plt 200020
+llama-bench;ggml_rope_ext 100010
+llama-bench;ggml_row_size 8000800
+llama-bench;ggml_row_size@plt 800080
+llama-bench;ggml_type_size 3200320
+llama-bench;ggml_type_size@plt 2900290
+llama-bench;ggml_vec_dot_f16 426842680
+llama-bench;ggml_vec_dot_f16;[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;ggml_vec_dot_f16;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;ggml_vec_dot_q8_0_q8_0 6387738710
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;ggml_vec_dot_q8_0_q8_0;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;gguf_data_to_str 100010
+llama-bench;gguf_find_key 100010
+llama-bench;gguf_kv_to_str[abi:cxx11] 800080
+llama-bench;gguf_reader::read 100010
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6] 600060
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown] 1400140
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 400040
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 700070
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 300030
+llama-bench;llama_context::llama_context;llama_model::create_memory;[libc.so.6];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;llama_context::llama_context;llama_model::create_memory;ggml_new_tensor@plt 100010
+llama-bench;llama_kv_cache::get_k 100010
+llama-bench;llama_model::load_tensors 100010
+llama-bench;llama_vocab::impl::get_type 100010
+llama-bench;llama_vocab::impl::token_to_piece 600060
+llama-bench;llama_vocab::impl::token_to_piece_for_cache[abi:cxx11] 200020
+llama-bench;llamafile_sgemm;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 200020
+llama-bench;llamafile_sgemm@plt 500050
+llama-bench;malloc 1400140
+llama-bench;memchr@plt 200020
+llama-bench;memcmp@plt 1600160
+llama-bench;memcpy@plt 2000200
+llama-bench;quantize_row_q8_0 64506450
+llama-bench;read;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;replace_all 400040
+llama-bench;std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, unsigned char>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, unsigned char> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::find 4900490
+llama-bench;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_append 500050
+llama-bench;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_replace_aux 200020
+llama-bench;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::compare 1200120
+llama-bench;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::find 300030
+llama-bench;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::push_back 500050
+llama-bench;std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::resize 100010
+llama-bench;std::__detail::_Prime_rehash_policy::_M_next_bkt 100010
+llama-bench;std::basic_ostream<char, std::char_traits<char> >& std::__ostream_insert<char, std::char_traits<char> > 2900290
+llama-bench;std::basic_streambuf<char, std::char_traits<char> >::xsputn 1400140
+llama-bench;std::filesystem::__cxx11::path::_M_append 200020
+llama-bench;std::ostream::sentry::sentry 100010
+llama-bench;std::vector<llama_vocab::token_data, std::allocator<llama_vocab::token_data> >::_M_default_append;[unknown];[unknown];[unknown] 200020
+llama-bench;std::vector<llama_vocab::token_data, std::allocator<llama_vocab::token_data> >::_M_default_append;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;std::vector<llama_vocab::token_data, std::allocator<llama_vocab::token_data> >::_M_default_append;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;std::vector<llama_vocab::token_data, std::allocator<llama_vocab::token_data> >::_M_default_append;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;std::vector<llama_vocab::token_data, std::allocator<llama_vocab::token_data> >::_M_default_append;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;std::vector<llama_vocab::token_data, std::allocator<llama_vocab::token_data> >::_M_default_append;[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown];[unknown] 100010
+llama-bench;std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::operator= 200020
+llama-bench;unicode_cpts_from_utf8 100010
+llama-bench;void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_construct<char*> 100010

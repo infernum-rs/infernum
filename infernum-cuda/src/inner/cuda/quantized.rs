@@ -10,6 +10,8 @@
     clippy::module_name_repetitions
 )]
 
+use std::sync::OnceLock;
+
 use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::cuda::CudaContext;
@@ -81,6 +83,9 @@ pub struct QuantizedTensor {
     /// Per-channel (per-row) scale factors on GPU, shape [N] as f32.
     /// Used by compressed-tensors FP8 models. When set, `weight_scale` is ignored.
     d_channel_scales: Option<CudaSlice<f32>>,
+    /// Cached dequantized F16 weight buffer for prefill (lazily populated on first use).
+    /// Contains the full N×K weight matrix dequantized to F16 (2 bytes per element).
+    dequant_f16_cache: OnceLock<CudaSlice<u8>>,
 }
 
 impl QuantizedTensor {
@@ -150,6 +155,7 @@ impl QuantizedTensor {
             weight_scale: 1.0,
             d_weight_scale: None,
             d_channel_scales: None,
+            dequant_f16_cache: OnceLock::new(),
         })
     }
 
@@ -180,6 +186,7 @@ impl QuantizedTensor {
             weight_scale: 1.0,
             d_weight_scale: None,
             d_channel_scales: None,
+            dequant_f16_cache: OnceLock::new(),
         }
     }
 
@@ -243,6 +250,13 @@ impl QuantizedTensor {
     #[must_use]
     pub fn d_channel_scales(&self) -> Option<&CudaSlice<f32>> {
         self.d_channel_scales.as_ref()
+    }
+
+    /// Get or lazily create the cached F16 dequantized weight buffer.
+    /// Returns `None` for FP8 (which doesn't use dequant+cuBLAS).
+    #[must_use]
+    pub fn dequant_f16(&self) -> &OnceLock<CudaSlice<u8>> {
+        &self.dequant_f16_cache
     }
 
     /// Total number of logical elements
@@ -393,6 +407,7 @@ impl QuantizedTensor {
             weight_scale: 1.0,
             d_weight_scale: None,
             d_channel_scales: None,
+            dequant_f16_cache: OnceLock::new(),
         })
     }
 

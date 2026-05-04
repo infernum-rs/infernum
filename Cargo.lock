@@ -901,6 +901,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror 1.0.69",
  "tokenizers",
 ]
@@ -1001,6 +1002,7 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
+ "infernum-cpu",
  "serde",
  "serde_json",
 ]

@@ -33,6 +33,8 @@ impl Backend for CudaBackend {
     fn logits_from_tensor(tensor: CudaTensor) -> CudaLogits {
         CudaLogits::new(tensor)
     }
+
+    const QUANTIZED_COMPUTE_DTYPE: DType = DType::BF16;
 }
 
 // ---- Tensor factory ----
@@ -313,21 +315,29 @@ impl TensorOps for CudaBackend {
         use infernum::tensor::Tensor;
 
         assert!(!parts.is_empty(), "concat_rows: empty input");
-        let cols = parts[0].shape().last().copied().unwrap_or(0);
+        let ref_shape = parts[0].shape();
         let dtype = parts[0].dtype();
         let elem = dtype.size_in_bytes();
+        // Stride = product of all dims except the first (handles 2D, 3D, etc.)
+        let stride: usize = ref_shape.iter().skip(1).product();
         let total_rows: usize = parts.iter().map(|p| p.shape()[0]).sum();
         let ctx = parts[0].context();
 
-        let mut output = unsafe { CudaTensor::uninit(ctx, &[total_rows, cols], dtype)? };
+        // Build output shape: same as input but with dim-0 = total_rows
+        let mut out_shape = ref_shape.to_vec();
+        out_shape[0] = total_rows;
+
+        let mut output = unsafe { CudaTensor::uninit(ctx, &out_shape, dtype)? };
         let out_slice = output.cuda_slice_mut();
         let mut offset = 0;
         for part in parts {
-            let row_bytes = part.shape()[0] * cols * elem;
-            let src = part.cuda_slice().slice(..row_bytes);
-            let mut dst = out_slice.slice_mut(offset..offset + row_bytes);
-            ctx.device().dtod_copy(&src, &mut dst)?;
-            offset += row_bytes;
+            let part_bytes = part.shape()[0] * stride * elem;
+            if part_bytes > 0 {
+                let src = part.cuda_slice().slice(..part_bytes);
+                let mut dst = out_slice.slice_mut(offset..offset + part_bytes);
+                ctx.device().dtod_copy(&src, &mut dst)?;
+            }
+            offset += part_bytes;
         }
         Ok(output)
     }

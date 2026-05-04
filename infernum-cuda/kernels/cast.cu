@@ -44,3 +44,14 @@ extern "C" __global__ void cast_bf16_to_f32(
         output[idx] = __bfloat162float(input[idx]);
     }
 }
+
+extern "C" __global__ void cast_bf16_to_f16(
+    __half* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __float2half(__bfloat162float(input[idx]));
+    }
+}

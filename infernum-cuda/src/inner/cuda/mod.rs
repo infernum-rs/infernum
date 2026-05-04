@@ -17,7 +17,7 @@ mod tensor;
 
 pub use buffer_pool::{BufferPool, PooledSlice};
 pub use context::CudaContext;
-pub use graph::CudaGraph;
+pub use graph::{CudaEvent, CudaGraph, PinnedBuffer};
 pub use kv_cache::KvCache;
 #[cfg(feature = "nccl")]
 pub use nccl::{NcclCommunicator, NcclId};

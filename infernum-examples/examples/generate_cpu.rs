@@ -75,6 +75,11 @@ struct Cli {
     /// Maximum KV cache sequence length (default: min(model max, 4096))
     #[arg(long)]
     max_seq_len: Option<usize>,
+
+    /// Use graph executor instead of eager execution (Llama family only).
+    /// Runs full-sequence prefill at each step (no KV cache, O(n²) compute).
+    #[arg(long)]
+    graph: bool,
 }
 
 /// Abstraction over tokenizer backends so we can use either one.
@@ -227,10 +232,354 @@ fn detect_gguf_arch(path: &str) -> Result<String> {
     Ok(arch)
 }
 
+// ---------------------------------------------------------------------------
+// Graph-based generation
+// ---------------------------------------------------------------------------
+
+use serde::Deserialize;
+
+use infernum::backend::MatmulOps;
+use infernum::dtype::DType;
+use infernum::graph::{plan, Arena, WeightId, WeightStore};
+use infernum_cpu::executor::execute;
+use infernum_cpu::{CpuLinearWeight, CpuTensor};
+use infernum_llama::{build_prefill_graph, LlamaConfig};
+
+/// Peek at just the `model_type` field from config.json.
+#[derive(Deserialize)]
+struct ModelTypeProbe {
+    #[serde(default = "default_model_type")]
+    model_type: String,
+}
+
+fn default_model_type() -> String {
+    "llama".to_string()
+}
+
+fn detect_model_type(model_path: &str) -> Result<String> {
+    let config_path = Path::new(model_path).join("config.json");
+    let data = std::fs::read_to_string(&config_path).map_err(|e| {
+        infernum::Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read {}: {e}", config_path.display()),
+        ))
+    })?;
+    let probe: ModelTypeProbe = serde_json::from_str(&data).map_err(|e| {
+        infernum::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse config.json: {e}"),
+        ))
+    })?;
+    Ok(probe.model_type)
+}
+
+/// Map SafeTensors weight names to GGUF names.
+fn safetensors_to_gguf_name(name: &str) -> String {
+    //    Global weights
+    match name {
+        "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
+        "model.norm.weight" => return "output_norm.weight".to_string(),
+        "lm_head.weight" => return "output.weight".to_string(),
+        _ => {}
+    }
+
+    // Per-layer: model.layers.N.<suffix> → blk.N.<gguf_suffix>
+    if let Some(rest) = name.strip_prefix("model.layers.") {
+        if let Some(dot) = rest.find('.') {
+            let layer_num = &rest[..dot];
+            let suffix = &rest[dot + 1..];
+            let gguf_suffix = match suffix {
+                "input_layernorm.weight" => "attn_norm.weight",
+                "post_attention_layernorm.weight" => "ffn_norm.weight",
+                "self_attn.q_proj.weight" => "attn_q.weight",
+                "self_attn.k_proj.weight" => "attn_k.weight",
+                "self_attn.v_proj.weight" => "attn_v.weight",
+                "self_attn.o_proj.weight" => "attn_output.weight",
+                "mlp.gate_proj.weight" => "ffn_gate.weight",
+                "mlp.up_proj.weight" => "ffn_up.weight",
+                "mlp.down_proj.weight" => "ffn_down.weight",
+                other => other,
+            };
+            return format!("blk.{layer_num}.{gguf_suffix}");
+        }
+    }
+
+    name.to_string()
+}
+
+/// Whether a GGUF weight name needs Q/K unpermuting.
+fn needs_unpermute(name: &str) -> bool {
+    name.ends_with(".attn_q.weight") || name.ends_with(".attn_k.weight")
+}
+
+/// Load graph weights from SafeTensors into the `WeightStore`.
+fn load_graph_weights_safetensors(
+    graph: &infernum::graph::Graph<CpuBackend>,
+    model_dir: &str,
+    weights: &mut WeightStore<CpuTensor, CpuLinearWeight>,
+) -> Result<()> {
+    use infernum::weights::WeightLoader;
+
+    let loader = infernum_cpu::CpuSafeTensorsLoader::new(Path::new(model_dir))?;
+
+    for i in 0..graph.tensor_weight_count() {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let tensor = loader.load_tensor(&meta.name, DType::F32)?;
+        weights.push_tensor_weight(tensor);
+    }
+
+    for i in 0..graph.linear_weight_count() {
+        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        if loader.contains(&meta.name) {
+            let linear = loader.load_linear(&meta.name, DType::F32, None)?;
+            weights.push_linear_weight(linear);
+        } else if meta.name == "lm_head.weight" {
+            let linear = loader.load_linear("model.embed_tokens.weight", DType::F32, None)?;
+            weights.push_linear_weight(linear);
+        } else {
+            return Err(infernum::Error::WeightNotFound(meta.name.clone()));
+        }
+    }
+
+    Ok(())
+}
+
+/// Load graph weights from GGUF in native format (quantized or dense).
+fn load_graph_weights_gguf(
+    graph: &infernum::graph::Graph<CpuBackend>,
+    config: &LlamaConfig,
+    gguf_path: &str,
+    weights: &mut WeightStore<CpuTensor, CpuLinearWeight>,
+) -> Result<()> {
+    use infernum::weights::format::{host_transpose_2d, host_unpermute_f32, FormatLoader};
+    use infernum::weights::host::HostLinearWeight;
+
+    let loader = infernum::weights::gguf::GgufLoader::from_file(gguf_path)?;
+
+    for i in 0..graph.tensor_weight_count() {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let gguf_name = safetensors_to_gguf_name(&meta.name);
+        let host = loader.load_f32(&gguf_name)?;
+        weights.push_tensor_weight(CpuTensor::from_f32(&host.shape, host.as_f32_slice()));
+    }
+
+    for i in 0..graph.linear_weight_count() {
+        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let gguf_name = safetensors_to_gguf_name(&meta.name);
+
+        let actual_name = if loader.contains(&gguf_name) {
+            gguf_name.clone()
+        } else if meta.name == "lm_head.weight" {
+            "token_embd.weight".to_string()
+        } else {
+            return Err(infernum::Error::WeightNotFound(gguf_name));
+        };
+
+        let dtype = FormatLoader::get_dtype(&loader, &actual_name)?;
+
+        let host_linear = if dtype.is_quantized() {
+            if needs_unpermute(&gguf_name) {
+                let n_head = if gguf_name.contains("attn_q") {
+                    config.num_attention_heads
+                } else {
+                    config
+                        .num_key_value_heads
+                        .unwrap_or(config.num_attention_heads)
+                };
+                HostLinearWeight::Quantized(FormatLoader::load_quantized_unpermute(
+                    &loader,
+                    &actual_name,
+                    n_head,
+                )?)
+            } else {
+                HostLinearWeight::Quantized(FormatLoader::load_quantized(&loader, &actual_name)?)
+            }
+        } else {
+            let host = loader.load_f32(&actual_name)?;
+            let host = if needs_unpermute(&gguf_name) {
+                let n_head = if gguf_name.contains("attn_q") {
+                    config.num_attention_heads
+                } else {
+                    config
+                        .num_key_value_heads
+                        .unwrap_or(config.num_attention_heads)
+                };
+                host_unpermute_f32(&host, n_head)?
+            } else {
+                host
+            };
+            HostLinearWeight::Dense(host_transpose_2d(&host)?)
+        };
+
+        let linear = CpuBackend::upload_host_linear(&(), &host_linear)?;
+        weights.push_linear_weight(linear);
+    }
+
+    Ok(())
+}
+
+/// Graph-based text generation (greedy, no KV cache).
+///
+/// Each step runs a full prefill graph over the entire sequence so far,
+/// argmaxes the last position, and appends the new token. This is O(n²)
+/// but functionally correct and demonstrates the graph executor end-to-end.
+#[allow(clippy::cast_possible_truncation)]
+fn run_graph_generation(model_path: &str, tokenizer: &Tokenizer, cli: &Cli) -> Result<()> {
+    let is_gguf = model_path.ends_with(".gguf");
+
+    let config: LlamaConfig = if is_gguf {
+        let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+        LlamaConfig::from_gguf_metadata(gguf.metadata())?
+    } else {
+        let config_path = Path::new(model_path).join("config.json");
+        let data = std::fs::read_to_string(&config_path).map_err(|e| {
+            infernum::Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to read {}: {e}", config_path.display()),
+            ))
+        })?;
+        serde_json::from_str(&data).map_err(|e| {
+            infernum::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse config.json: {e}"),
+            ))
+        })?
+    };
+
+    let head_dim = config.head_dim();
+    let half_dim = head_dim / 2;
+
+    // Load weights once (use a dummy seq_len=1 graph to discover weight metadata)
+    let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+    let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+    eprint!("Loading weights...");
+    if is_gguf {
+        load_graph_weights_gguf(&dummy_graph, &config, model_path, &mut weights)?;
+    } else {
+        load_graph_weights_safetensors(&dummy_graph, model_path, &mut weights)?;
+    }
+    eprintln!(" done.");
+    eprintln!(
+        "Model: {} layers, {} hidden, vocab {}",
+        config.num_hidden_layers, config.hidden_size, config.vocab_size,
+    );
+    eprintln!("Generation: greedy (graph, no KV cache)");
+
+    // Tokenize prompt
+    let mut token_ids = tokenizer.encode(&cli.prompt, true)?;
+    let prompt_len = token_ids.len();
+    let eos = tokenizer.eos_token_id();
+
+    print!("{}", cli.prompt);
+    io::stdout().flush()?;
+
+    let start = Instant::now();
+
+    for _ in 0..cli.max_tokens {
+        let seq_len = token_ids.len();
+
+        // Build graph for current sequence length
+        let (mut graph, _) = build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32);
+        infernum::graph::optimizer::optimize(&mut graph);
+        let exec_plan = plan(&graph);
+
+        // Build inputs
+        let input_ids = CpuTensor::from_u32(&[seq_len], &token_ids);
+        let (cos_data, sin_data) =
+            infernum::rope::precompute_rope_data(seq_len, head_dim, config.rope_theta);
+        let cos_cache = CpuTensor::from_f32(&[seq_len, half_dim], &cos_data);
+        let sin_cache = CpuTensor::from_f32(&[seq_len, half_dim], &sin_data);
+        let inputs = vec![input_ids, cos_cache, sin_cache];
+
+        // Execute graph
+        let mut arena = Arena::new(exec_plan.arena_size);
+        let outputs = execute(
+            &exec_plan,
+            graph.nodes(),
+            &mut arena,
+            &weights,
+            &inputs,
+            graph.output_ids(),
+            None,
+        )?;
+
+        // Argmax the last position's logits
+        let logits = &outputs[0];
+        let logits_data = logits.as_f32_slice();
+        let vocab_size = config.vocab_size;
+        let last_row = &logits_data[(seq_len - 1) * vocab_size..seq_len * vocab_size];
+        let next_token = last_row
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+
+        if next_token == eos {
+            break;
+        }
+
+        token_ids.push(next_token);
+
+        let text = tokenizer.decode_token(next_token)?;
+        print!("{text}");
+        io::stdout().flush()?;
+    }
+
+    let elapsed = start.elapsed();
+    let generated = token_ids.len() - prompt_len;
+
+    println!();
+    println!(
+        "Generated {} tokens in {:.2}s ({:.1} tokens/sec)",
+        generated,
+        elapsed.as_secs_f64(),
+        generated as f64 / elapsed.as_secs_f64(),
+    );
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let is_gguf = cli.model.ends_with(".gguf");
+
+    if cli.graph {
+        // Graph mode — only supports Llama family
+        let arch = if is_gguf {
+            let a = detect_gguf_arch(&cli.model)?;
+            println!(
+                "Loading model from: {} (CPU, GGUF, arch={a}, graph)",
+                cli.model
+            );
+            a
+        } else {
+            let model_type = detect_model_type(&cli.model).unwrap_or_default();
+            println!(
+                "Loading model from: {} (CPU, SafeTensors, {model_type}, graph)",
+                cli.model
+            );
+            model_type
+        };
+
+        match arch.as_str() {
+            "llama" | "mistral" => {}
+            other => {
+                eprintln!("Graph mode only supports Llama/Mistral, got: {other}");
+                std::process::exit(1);
+            }
+        }
+
+        let tokenizer: Tokenizer = if is_gguf {
+            let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
+            Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?)
+        } else {
+            Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?)
+        };
+
+        return run_graph_generation(&cli.model, &tokenizer, &cli);
+    }
 
     if is_gguf {
         let arch = detect_gguf_arch(&cli.model)?;

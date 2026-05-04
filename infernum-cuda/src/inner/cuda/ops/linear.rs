@@ -1,4 +1,4 @@
-use crate::cuda::ops::{cast_f32_to_bf16, cast_f32_to_f16, cast_to_f32, matmul, quantized_matmul};
+use crate::cuda::ops::{cast_f32_to_bf16, cast_f32_to_f16, matmul, quantized_matmul};
 use crate::cuda::{CudaTensor, QuantizedTensor};
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
@@ -6,6 +6,7 @@ use infernum::Result;
 
 /// A linear layer weight that is either a dense matrix (pre-transposed for
 /// standard matmul) or a quantized tensor (dequantized on-the-fly in the kernel).
+#[allow(clippy::large_enum_variant)]
 pub enum LinearWeight {
     /// Pre-transposed dense weight: shape `(in_features, out_features)`.
     Dense(CudaTensor),
@@ -28,17 +29,17 @@ pub fn linear(input: &CudaTensor, weight: &LinearWeight) -> Result<CudaTensor> {
         LinearWeight::Dense(w) => matmul(input, w),
         LinearWeight::Quantized(w) => {
             let dtype = input.dtype();
-            let input_f32 = if dtype == DType::F32 {
-                input.slice_view(0, input.shape())
+            let output = quantized_matmul(input, w)?;
+            if output.dtype() == dtype {
+                // GEMV path already returned the correct dtype (e.g. BF16)
+                Ok(output)
             } else {
-                cast_to_f32(input)?
-            };
-            let output_f32 = quantized_matmul(&input_f32, w)?;
-            match dtype {
-                DType::F32 => Ok(output_f32),
-                DType::BF16 => cast_f32_to_bf16(&output_f32),
-                DType::F16 => cast_f32_to_f16(&output_f32),
-                other => panic!("Quantized matmul not supported for dtype {other}"),
+                match dtype {
+                    DType::F32 => Ok(output),
+                    DType::BF16 => cast_f32_to_bf16(&output),
+                    DType::F16 => cast_f32_to_f16(&output),
+                    other => panic!("Quantized matmul not supported for dtype {other}"),
+                }
             }
         }
     }
