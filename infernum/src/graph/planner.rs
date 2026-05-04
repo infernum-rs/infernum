@@ -1039,8 +1039,8 @@ mod tests {
         let cache = PlanCache::new();
         let g1 = mini_graph();
         let g2 = mini_graph();
-        cache.get_or_compile(&g1);
-        cache.get_or_compile(&g2);
+        let _ = cache.get_or_compile(&g1);
+        let _ = cache.get_or_compile(&g2);
         // Both graphs have identical topology, so only one entry should exist.
         assert_eq!(cache.len(), 1);
     }
@@ -1061,8 +1061,8 @@ mod tests {
         let proj = g2.add_linear(normed, lw);
         g2.set_output(proj.0);
 
-        cache.get_or_compile(&g1);
-        cache.get_or_compile(&g2);
+        let _ = cache.get_or_compile(&g1);
+        let _ = cache.get_or_compile(&g2);
         // Different topologies → two separate cache entries.
         assert_eq!(cache.len(), 2);
     }
