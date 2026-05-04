@@ -18,7 +18,7 @@ pub use arena::Arena;
 pub use builder::Graph;
 pub use builder_traits::{
     GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps, GraphGegluOps,
-    GraphIndirectDecodeOps, GraphMatmulExtOps, GraphMatmulOps, GraphNormOps,
+    GraphIndirectDecodeOps, GraphMatmulExtOps, GraphMatmulOps, GraphMoeOps, GraphNormOps,
     GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps, GraphRopeOps,
     GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
 };

@@ -6,11 +6,12 @@
 
 use std::collections::HashMap;
 
-use infernum::backend::{AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps};
+use infernum::backend::{ArithOps, AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps};
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, BiasAddOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeOp,
     FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp,
-    RepeatKvOp, RmsNormOp, RmsNormQkOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, RepeatKvOp, RmsNormOp, RmsNormQkOp, RopeOp,
+    ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -871,6 +872,116 @@ pub fn execute(
                 let data = input.as_f32_slice();
                 let out: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
                 let result = CpuTensor::from_f32_vec(&node.output_shapes[0], out);
+                write_tensor(arena, plan, node_id, 0, &result);
+            }
+
+            // --- MoE softmax dispatch (Mixtral, Qwen3-MoE) ---
+            "moe_dispatch_softmax" => {
+                use infernum::backend::MoeOps as _;
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<MoeDispatchSoftmaxOp>()
+                    .unwrap();
+                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let gate_t = weights.tensor_weight(op.gate);
+                let num_experts = op.experts.len();
+                let num_experts_per_tok = op.num_experts_per_tok;
+                let norm_topk = op.norm_topk;
+                // Snapshot expert weight IDs so we can pass them to the closure.
+                let expert_ids: Vec<_> = op.experts.iter().cloned().collect();
+                let result = crate::CpuBackend::moe_forward_softmax(
+                    &input,
+                    gate_t,
+                    num_experts,
+                    num_experts_per_tok,
+                    norm_topk,
+                    |expert_idx, expert_input| {
+                        let eids = &expert_ids[expert_idx];
+                        let gate_w = weights.linear_weight(eids.gate_proj);
+                        let up_w = weights.linear_weight(eids.up_proj);
+                        let down_w = weights.linear_weight(eids.down_proj);
+                        let gate_out = crate::CpuBackend::linear(expert_input, gate_w)?;
+                        let up_out = crate::CpuBackend::linear(expert_input, up_w)?;
+                        // Fused SiLU-Mul: gate_act[i] = silu(gate[i]) * up[i]
+                        let gate_data = gate_out.as_f32_slice();
+                        let up_data = up_out.as_f32_slice();
+                        let mut fused = vec![0.0f32; gate_data.len()];
+                        simd::vec_silu_mul(gate_data, up_data, &mut fused);
+                        let shape = gate_out.shape().to_vec();
+                        let activated =
+                            CpuTensor::from_f32_vec(&shape, fused);
+                        crate::CpuBackend::linear(&activated, down_w)
+                    },
+                )?;
+                write_tensor(arena, plan, node_id, 0, &result);
+            }
+
+            // --- MoE sigmoid dispatch with bias correction (DeepSeek) ---
+            "moe_dispatch_sigmoid" => {
+                use infernum::backend::MoeSigmoidOps as _;
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<MoeDispatchSigmoidOp>()
+                    .unwrap();
+                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let gate_t = weights.tensor_weight(op.gate);
+                let bias_data: Vec<f32> = if let Some(bias_id) = op.bias {
+                    weights.tensor_weight(bias_id).as_f32_slice().to_vec()
+                } else {
+                    vec![0.0f32; op.experts.len()]
+                };
+                let num_experts = op.experts.len();
+                let num_experts_per_tok = op.num_experts_per_tok;
+                let n_group = op.n_group;
+                let topk_group = op.topk_group;
+                let routed_scaling_factor = op.routed_scaling_factor;
+                let expert_ids: Vec<_> = op.experts.iter().cloned().collect();
+                let shared_ids = op.shared_expert.clone();
+                let mut result = crate::CpuBackend::moe_forward_sigmoid(
+                    &input,
+                    gate_t,
+                    &bias_data,
+                    num_experts,
+                    num_experts_per_tok,
+                    n_group,
+                    topk_group,
+                    false, // norm_topk_prob: DeepSeek normalises inside the kernel
+                    routed_scaling_factor,
+                    |expert_idx, expert_input| {
+                        let eids = &expert_ids[expert_idx];
+                        let gate_w = weights.linear_weight(eids.gate_proj);
+                        let up_w = weights.linear_weight(eids.up_proj);
+                        let down_w = weights.linear_weight(eids.down_proj);
+                        let gate_out = crate::CpuBackend::linear(expert_input, gate_w)?;
+                        let up_out = crate::CpuBackend::linear(expert_input, up_w)?;
+                        let gate_data = gate_out.as_f32_slice();
+                        let up_data = up_out.as_f32_slice();
+                        let mut fused = vec![0.0f32; gate_data.len()];
+                        simd::vec_silu_mul(gate_data, up_data, &mut fused);
+                        let shape = gate_out.shape().to_vec();
+                        let activated =
+                            CpuTensor::from_f32_vec(&shape, fused);
+                        crate::CpuBackend::linear(&activated, down_w)
+                    },
+                )?;
+                // Add shared expert output if present.
+                if let Some(sids) = shared_ids {
+                    let sg = weights.linear_weight(sids.gate_proj);
+                    let su = weights.linear_weight(sids.up_proj);
+                    let sd = weights.linear_weight(sids.down_proj);
+                    let sgate = crate::CpuBackend::linear(&input, sg)?;
+                    let sup_out = crate::CpuBackend::linear(&input, su)?;
+                    let sg_data = sgate.as_f32_slice();
+                    let su_data = sup_out.as_f32_slice();
+                    let mut sfused = vec![0.0f32; sg_data.len()];
+                    simd::vec_silu_mul(sg_data, su_data, &mut sfused);
+                    let sshape = sgate.shape().to_vec();
+                    let sact = CpuTensor::from_f32_vec(&sshape, sfused);
+                    let shared_out = crate::CpuBackend::linear(&sact, sd)?;
+                    crate::CpuBackend::add_inplace(&mut result, &shared_out)?;
+                }
                 write_tensor(arena, plan, node_id, 0, &result);
             }
 

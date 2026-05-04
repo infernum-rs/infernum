@@ -1022,6 +1022,9 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
+ "infernum-cpu",
+ "infernum-cuda",
+ "infernum-runtime",
  "serde",
  "serde_json",
 ]

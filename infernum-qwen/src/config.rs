@@ -237,6 +237,24 @@ impl QwenConfig {
         self.is_moe() && (layer_idx + 1).is_multiple_of(self.decoder_sparse_step)
     }
 
+    /// Returns `true` if this model uses per-head QK RMSNorm (Qwen3 / Qwen3-MoE).
+    ///
+    /// Qwen3 models always set an explicit `head_dim` in their config. Qwen2
+    /// models do not. This is the canonical static signal for QK-norm presence.
+    #[must_use]
+    pub fn has_qk_norm(&self) -> bool {
+        self.explicit_head_dim.is_some()
+    }
+
+    /// Returns `true` if this model uses Q/K/V projection biases (Qwen2 / Qwen2.5).
+    ///
+    /// Qwen2 models carry per-head biases on Q, K, and V projections; Qwen3
+    /// dropped these. Absence of `explicit_head_dim` is the static signal.
+    #[must_use]
+    pub fn has_qkv_bias(&self) -> bool {
+        self.explicit_head_dim.is_none()
+    }
+
     /// Build a `QwenConfig` from GGUF metadata key-value pairs.
     ///
     /// GGUF metadata uses keys like `qwen2.embedding_length`, `qwen2.block_count`, etc.

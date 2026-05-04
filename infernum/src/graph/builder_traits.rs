@@ -16,8 +16,9 @@ use super::builtin_ops::{
     AddInplaceOp, AddOp, AddRmsNormOp, AppendPagedBatchedOp, AppendPagedOp, BiasAddOp,
     CastFromF32Op, CastToF32Op, ConcatInnerDimOp, ConcatSeqOp, EmbeddingGatherOp, ExtractLastRowOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp, LinearOp,
-    LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp, MulOp,
-    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
+    LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp,
+    MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, MoeExpertIds, MulOp, PagedAttentionDecodeOp,
+    RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
     RopeInterleavedOp as RopeIntOp, RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp,
     Transpose2dOp,
 };
@@ -950,6 +951,106 @@ impl<B: Backend + MatmulOps> GraphIndirectDecodeOps for Graph<B> {
     fn add_argmax_last(&mut self, logits: OutputRef) -> OutputRef {
         use super::builtin_ops::ArgmaxLastOp;
         let node_id = self.add_node(Box::new(ArgmaxLastOp), &[logits]);
+        (node_id, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MoeOps — softmax and sigmoid MoE dispatch
+// ---------------------------------------------------------------------------
+
+/// Graph builder methods for Mixture-of-Experts dispatch.
+///
+/// Both methods register the gate projection and all per-expert MLP weights,
+/// then add a single `MoeDispatch*` node that the executor handles by calling
+/// the backend's `moe_forward_*` closure-based dispatch.
+pub trait GraphMoeOps {
+    /// Softmax MoE routing (Mixtral, Qwen3-MoE).
+    ///
+    /// `input` must have shape `[seq_len, hidden_size]`.  Returns the
+    /// weighted combination of expert outputs, same shape.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` — Hidden states before the MoE layer.
+    /// * `gate` — Gate projection weight ID (shape `[num_experts, hidden_size]`).
+    /// * `experts` — Per-expert MLP weight IDs.
+    /// * `num_experts_per_tok` — Number of experts activated per token.
+    /// * `norm_topk_prob` — Whether to renormalise top-k router probabilities.
+    fn add_moe_dispatch_softmax(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        experts: Vec<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        norm_topk: bool,
+    ) -> OutputRef;
+
+    /// Sigmoid MoE routing with bias correction and grouped top-k (DeepSeek).
+    ///
+    /// `input` must have shape `[seq_len, hidden_size]`.  Returns the
+    /// weighted combination of expert outputs, same shape.
+    #[allow(clippy::too_many_arguments)]
+    fn add_moe_dispatch_sigmoid(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        bias: Option<WeightId>,
+        experts: Vec<MoeExpertIds>,
+        shared_expert: Option<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        n_group: usize,
+        topk_group: usize,
+        routed_scaling_factor: f32,
+    ) -> OutputRef;
+}
+
+impl<B: Backend + MatmulOps> GraphMoeOps for Graph<B> {
+    fn add_moe_dispatch_softmax(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        experts: Vec<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        norm_topk: bool,
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(MoeDispatchSoftmaxOp {
+                gate,
+                experts,
+                num_experts_per_tok,
+                norm_topk,
+            }),
+            &[input],
+        );
+        (node_id, 0)
+    }
+
+    fn add_moe_dispatch_sigmoid(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        bias: Option<WeightId>,
+        experts: Vec<MoeExpertIds>,
+        shared_expert: Option<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        n_group: usize,
+        topk_group: usize,
+        routed_scaling_factor: f32,
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(MoeDispatchSigmoidOp {
+                gate,
+                bias,
+                experts,
+                shared_expert,
+                num_experts_per_tok,
+                n_group,
+                topk_group,
+                routed_scaling_factor,
+            }),
+            &[input],
+        );
         (node_id, 0)
     }
 }
