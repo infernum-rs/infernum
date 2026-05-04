@@ -444,17 +444,17 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
 
 /// IDs for the additional weight tensors registered by [`build_indirect_decode_graph`].
 ///
-/// These cover the pre-allocated KV cache buffers and RoPE tables that are
+/// These cover the pre-allocated `KV` cache buffers and `RoPE` tables that are
 /// treated as graph weights (stable GPU addresses) rather than inputs.
 pub struct IndirectDecodeExtraIds {
-    /// Number of tensor weights belonging to the model (embed_tokens, norms, etc.).
-    /// Tensor weight IDs in the range `[model_tensor_weight_count, ∞)` are RoPE
-    /// caches and KV buffers that the caller must allocate on the GPU — they are
+    /// Number of tensor weights belonging to the model (`embed_tokens`, norms, etc.).
+    /// Tensor weight IDs in the range `[model_tensor_weight_count, ∞)` are `RoPE`
+    /// caches and `KV` buffers that the caller must allocate on the GPU — they are
     /// not stored in the model checkpoint files.
     pub model_tensor_weight_count: usize,
-    /// Weight ID of the cosine RoPE cache `[max_seq_len, head_dim/2]`.
+    /// Weight ID of the cosine `RoPE` cache `[max_seq_len, head_dim/2]`.
     pub cos_cache: WeightId,
-    /// Weight ID of the sine RoPE cache `[max_seq_len, head_dim/2]`.
+    /// Weight ID of the sine `RoPE` cache `[max_seq_len, head_dim/2]`.
     pub sin_cache: WeightId,
     /// Per-layer K cache weight IDs, shape `[max_seq_len, num_kv_heads, head_dim]`.
     pub k_caches: Vec<WeightId>,
@@ -468,7 +468,7 @@ pub struct IndirectDecodeExtraIds {
 ///
 /// - Takes **zero** graph inputs — the token ID and sequence position are
 ///   provided out-of-band via a `SeqPosition` GPU pointer.
-/// - Registers the pre-allocated KV cache buffers and full RoPE tables as
+/// - Registers the pre-allocated `KV` cache buffers and full `RoPE` tables as
 ///   **tensor weights** (stable GPU addresses), so the graph captures the same
 ///   device pointers across all decode steps.
 /// - Uses indirect op variants (`embedding_gather_indirect`, `rope_indirect`,
@@ -482,19 +482,20 @@ pub struct IndirectDecodeExtraIds {
 ///
 /// * `config` — Model configuration.
 /// * `max_seq_len` — Maximum total sequence length (prompt + generated). Determines
-///   the pre-allocated KV cache size.
-/// * `weight_dtype` — Data type for model weights and KV cache buffers.
+///   the pre-allocated `KV` cache size.
+/// * `weight_dtype` — Data type for model weights and `KV` cache buffers.
 ///
 /// # Returns
 ///
 /// A tuple of `(graph, model_weight_ids, extra_ids)` where `extra_ids` contains
-/// the weight IDs for the RoPE tables and KV cache buffers that the caller must
+/// the weight IDs for the `RoPE` tables and `KV` cache buffers that the caller must
 /// populate in the `WeightStore` before execution.
 ///
 /// # Panics
 ///
-/// Panics if the config describes an MoE model (`num_local_experts > 1`).
+/// Panics if the config describes an `MoE` model (`num_local_experts > 1`).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
     config: &LlamaConfig,
     max_seq_len: usize,
@@ -517,6 +518,7 @@ pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
     let half_dim = head_dim / 2;
     let eps = config.rms_norm_eps;
     let num_layers = config.num_hidden_layers;
+    #[allow(clippy::cast_precision_loss)]
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
     // -- Register model weights (same ordering as prefill graph for weight reuse) --

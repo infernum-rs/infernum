@@ -1953,7 +1953,7 @@ pub struct RopeIndirectOp {
     pub cos_cache: WeightId,
     /// Weight ID of the full sine cache `[max_seq_len, head_dim/2]`.
     pub sin_cache: WeightId,
-    /// If `true`, use interleaved RoPE (DeepSeek style); otherwise standard.
+    /// If `true`, use interleaved `RoPE` (`DeepSeek` style); otherwise standard.
     pub interleaved: bool,
     /// Attention head dimension.
     pub head_dim: usize,

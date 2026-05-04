@@ -746,7 +746,7 @@ pub trait GraphIndirectDecodeOps {
         dtype: DType,
     ) -> OutputRef;
 
-    /// Apply RoPE reading the position from a stable GPU pointer.
+    /// Apply `RoPE` reading the position from a stable GPU pointer.
     ///
     /// Takes one graph input (the Q or K tensor). The full cos/sin caches are
     /// registered as tensor weights (`cos_cache`, `sin_cache`). The current

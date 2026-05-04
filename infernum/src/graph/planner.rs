@@ -401,6 +401,7 @@ impl PlanCache {
     /// # Panics
     /// Panics if the internal mutex is poisoned (which only happens if another
     /// thread panicked while holding it).
+    #[must_use]
     pub fn get_or_compile<B: Backend + MatmulOps>(&self, graph: &Graph<B>) -> ExecutionPlan {
         let hash = topology_hash(graph);
         // Compile outside the lock to avoid holding it during planning.
