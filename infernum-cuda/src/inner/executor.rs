@@ -421,7 +421,7 @@ pub fn execute(
 
 /// Execute an indirect decode graph on the CUDA backend.
 ///
-/// Identical to [`execute`] for standard ops (matmul, norm, RoPE, etc.), but
+/// Identical to [`execute`] for standard ops (matmul, norm, `RoPE`, etc.), but
 /// handles the four CUDA-graph-compatible indirect op names by calling the
 /// corresponding indirect kernel wrappers instead of their standard counterparts:
 ///
@@ -437,7 +437,7 @@ pub fn execute(
 ///
 /// # Errors
 /// Returns an error if any kernel launch fails.
-#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+#[allow(clippy::too_many_lines, clippy::missing_panics_doc, clippy::too_many_arguments)]
 pub fn execute_indirect(
     plan: &ExecutionPlan,
     nodes: &[GraphNode<CudaBackend>],
@@ -601,6 +601,7 @@ pub fn execute_indirect(
                     node.inputs.iter().map(|&inp| read(&buffers, inp)).collect();
                 let outputs = node.op.execute(&node_inputs, weights, ctx)?;
                 for (i, out) in outputs.into_iter().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
                     store(&mut buffers, node_id, i as u32, out);
                 }
             }

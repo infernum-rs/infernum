@@ -6,8 +6,8 @@
 //! `cuGraphExecUpdate_v2` overhead once the graph topology is fixed.
 //!
 //! The engine owns:
-//! - A single [`CudaGraph`] instance (`cudaGraphExec_t` under the hood).
-//! - The pre-computed RoPE cos/sin cache (stable GPU address, registered as a
+//! - A single [`CudaGraph`] instance (wraps a `cudaGraphExec_t`).
+//! - The pre-computed `RoPE` cos/sin cache (stable GPU address, registered as a
 //!   tensor weight).
 //! - A [`KvCache`] with pre-allocated `[max_seq_len, …]` buffers per layer.
 //! - A [`SeqPosition`] holding the current step position on the GPU.
@@ -75,7 +75,7 @@ impl CudaDecodeEngine {
     ///
     /// * `ctx` — CUDA context (device 0 or whichever device the weights live on).
     /// * `graph` — Indirect decode graph built by `build_indirect_decode_graph`.
-    /// * `weights` — Fully populated [`WeightStore`] (model weights, RoPE caches,
+    /// * `weights` — Fully populated [`WeightStore`] (model weights, `RoPE` caches,
     ///   KV cache tensors registered at construction time).
     /// * `kv_cache` — Pre-allocated KV cache with `max_seq_len` capacity.
     /// * `seq_pos` — GPU-resident sequence position counter (device pointer).
