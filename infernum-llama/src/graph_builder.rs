@@ -567,31 +567,35 @@ pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
         graph.add_embedding_gather_indirect(model_weights.embed_tokens, hidden, weight_dtype);
 
     // -- Transformer layers --
-    for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
-        // 1. Pre-attention RMS norm
-        let normed = graph.add_rms_norm(h, lw.input_layernorm, eps);
+    let layers: Vec<_> = model_weights.layers.iter().enumerate().collect();
+    let num_layers = layers.len();
 
-        // 2. Q/K/V projections (fused triple)
+    // Pre-compute normed for layer 0: no preceding residual add, so plain rms_norm.
+    let mut normed = graph.add_rms_norm(h, layers[0].1.input_layernorm, eps);
+
+    for &(layer_idx, lw) in &layers {
+        // 1. Q/K/V projections (fused triple) — `normed` carried from previous iteration
+        //    (or pre-computed above for layer 0).
         let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
 
-        // 3. Reshape to 3D: [1, num_heads, head_dim]
+        // 2. Reshape to 3D: [1, num_heads, head_dim]
         let q_3d = graph.add_reshape(q, &[1, num_heads, head_dim]);
         let k_3d = graph.add_reshape(k, &[1, num_kv_heads, head_dim]);
         let v_3d = graph.add_reshape(v, &[1, num_kv_heads, head_dim]);
 
-        // 4. Indirect RoPE (position read from SeqPosition at execution time)
+        // 3. Indirect RoPE (position read from SeqPosition at execution time)
         let q_rope =
             graph.add_rope_indirect(q_3d, cos_cache, sin_cache, false, head_dim, num_heads);
         let k_rope =
             graph.add_rope_indirect(k_3d, cos_cache, sin_cache, false, head_dim, num_kv_heads);
 
-        // 5. Indirect KV append (write offset read from SeqPosition at execution time)
+        // 4. Indirect KV append (write offset read from SeqPosition at execution time)
         let _k_append =
             graph.add_append_kv_indirect(k_rope, layer_idx, true, num_kv_heads, head_dim);
         let _v_append =
             graph.add_append_kv_indirect(v_3d, layer_idx, false, num_kv_heads, head_dim);
 
-        // 6. Indirect decode attention: K/V buffers and total_len are read from the
+        // 5. Indirect decode attention: K/V buffers and total_len are read from the
         //    executor's out-of-band KvCache (indexed by layer_idx).
         let attn_out = graph.add_fused_attention_decode_indirect(
             q_rope,
@@ -604,22 +608,31 @@ pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
             config.effective_sliding_window(layer_idx),
         );
 
-        // 7. Reshape back to 2D and output projection
+        // 6. Reshape back to 2D and output projection
         let attn_flat = graph.add_reshape(attn_out, &[1, hidden]);
         let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
 
-        // 8. Residual add + post-attention RMS norm
-        let h_updated = graph.add_add(h, attn_proj);
-        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm, eps);
+        // 7. Fused: residual add(h, attn_proj) + rms_norm(post_attention_layernorm)
+        let (h_updated, normed_post) =
+            graph.add_add_rmsnorm(h, attn_proj, lw.post_attention_layernorm, eps);
 
-        // 9. FFN: SiLU + Mul MLP
+        // 8. FFN: SiLU + Mul MLP
         let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
         let gate_activated = graph.add_silu(gate);
         let activated = graph.add_mul(gate_activated, up);
         let down = graph.add_linear(activated, lw.down_proj);
 
-        // 10. Residual add
-        h = graph.add_add_inplace(h_updated, down);
+        // 9. Fused: residual add(h_updated, down) + rms_norm(next layer's input_layernorm),
+        //    or plain add on the last layer (no next norm to fuse).
+        if layer_idx + 1 < num_layers {
+            let next_lw = layers[layer_idx + 1].1;
+            let (h_new, normed_next) =
+                graph.add_add_rmsnorm(h_updated, down, next_lw.input_layernorm, eps);
+            h = h_new;
+            normed = normed_next;
+        } else {
+            h = graph.add_add_inplace(h_updated, down);
+        }
     }
 
     // -- Final norm --
