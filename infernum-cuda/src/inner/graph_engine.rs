@@ -26,7 +26,9 @@ use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightStore
 use infernum::Result;
 
 use crate::cuda::ops::LinearWeight;
-use crate::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache, SeqPosition};
+use crate::cuda::{
+    CudaContext, CudaEvent, CudaGraph, CudaTensor, KvCache, PinnedBuffer, SeqPosition,
+};
 use crate::CudaBackend;
 
 // ---------------------------------------------------------------------------
@@ -55,8 +57,14 @@ pub struct CudaDecodeEngine {
     output_node: NodeId,
     /// The token tensor (`[1]` U32) from the last captured execute. Its GPU
     /// address is stable (pool-backed). On the fast path the CUDA graph writes
-    /// fresh values into it each step; we read 4 bytes with `to_vec::<u32>()`.
+    /// fresh values into it each step; we read 4 bytes from the pinned buffer.
     saved_token: Option<CudaTensor>,
+    /// Pinned host buffer for async D→H token readback (1 u32).
+    pinned_token: PinnedBuffer,
+    /// CUDA event recorded after each async DtoH copy. On the next step,
+    /// `event.synchronize()` waits only for that copy — much cheaper than
+    /// `ctx.synchronize()` which flushes all GPU work on all streams.
+    completion_event: CudaEvent,
 }
 
 impl CudaDecodeEngine {
@@ -113,6 +121,8 @@ impl CudaDecodeEngine {
             .expect("indirect decode graph must have at least one output");
 
         let cuda_graph = CudaGraph::new(ctx.device())?;
+        let pinned_token = PinnedBuffer::new(ctx.device())?;
+        let completion_event = CudaEvent::new(ctx.device())?;
 
         Ok(Self {
             ctx,
@@ -126,6 +136,8 @@ impl CudaDecodeEngine {
             stabilized: false,
             output_node,
             saved_token: None,
+            pinned_token,
+            completion_event,
         })
     }
 
@@ -149,17 +161,29 @@ impl CudaDecodeEngine {
             .htod_copy_into(vec![next_token], self.cuda_graph.token_input_mut())?;
 
         if self.stabilized {
-            // Fast path: graph is stable — replay with a single launch.
-            // The token tensor's GPU address is stable (pool-backed) and the
-            // CUDA graph writes fresh values into it each step. Read 4 bytes.
-            self.cuda_graph.launch()?;
-            self.ctx.synchronize()?;
-            let token_tensor = self
+            // Fast path: graph is stable — replay with a single launch, then
+            // use a targeted event sync instead of a full device sync.
+            //
+            // Stream ordering guarantees:
+            //   cuGraphLaunch  (async, writes token to saved_token GPU buffer)
+            //   cuMemcpyDtoHAsync  (async, copies token → pinned_token, after graph)
+            //   cuEventRecord  (marks completion fence)
+            //   cuEventSynchronize  (wait only until the DtoH copy is done)
+            //
+            // This is substantially cheaper than ctx.synchronize() which waits
+            // for ALL work on ALL CUDA streams (cuBLAS internal streams, etc.).
+            let token_device_ptr = self
                 .saved_token
                 .as_ref()
-                .expect("saved_token must be set before stabilization");
-            let result = token_tensor.to_vec::<u32>()?;
-            Ok(result[0])
+                .expect("saved_token must be set before stabilization")
+                .device_ptr();
+
+            self.cuda_graph.launch()?;
+            self.pinned_token.async_copy_from_device(token_device_ptr)?;
+            self.completion_event.record()?;
+            self.completion_event.synchronize()?;
+
+            Ok(self.pinned_token.read())
         } else {
             // Stabilization path: run execute_indirect within a CUDA graph
             // capture so the pool allocates all required buffers. The resulting
