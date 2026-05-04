@@ -2119,3 +2119,51 @@ impl<B: Backend + MatmulOps> OpNode<B> for FusedAttentionDecodeIndirectOp {
         self
     }
 }
+
+// ---------------------------------------------------------------------------
+// ArgmaxLastOp
+// ---------------------------------------------------------------------------
+
+/// Argmax over the last dimension of a 2D tensor, returning a `[1]` U32 tensor.
+///
+/// During decode the input is logits of shape `[1, vocab_size]`. The output is
+/// the token index on the GPU — no device→host transfer is needed until the
+/// caller explicitly reads the 4-byte result. This allows the op to be captured
+/// inside a CUDA graph and replayed without a D→H sync on every step.
+///
+/// Must be dispatched by the CUDA indirect executor via `argmax_last_gpu`; the
+/// generic `execute()` implementation panics.
+#[derive(Debug, Clone)]
+pub struct ArgmaxLastOp;
+
+impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
+    fn name(&self) -> &'static str {
+        "argmax_last"
+    }
+    fn num_inputs(&self) -> usize {
+        1
+    }
+    fn num_outputs(&self) -> usize {
+        1
+    }
+    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![vec![1]]
+    }
+    fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
+        vec![DType::U32]
+    }
+    fn execute(
+        &self,
+        _inputs: &[&B::Tensor],
+        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        _device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        panic!(
+            "ArgmaxLastOp must be dispatched by the CUDA executor via argmax_last_gpu; \
+             it cannot be executed through the generic OpNode::execute path"
+        )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}

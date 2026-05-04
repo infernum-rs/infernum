@@ -628,8 +628,13 @@ pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
     // -- LM head --
     let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
 
-    // -- Output: only logits (KV buffers are updated in-place) --
-    graph.set_output(logits.0);
+    // -- Argmax: keep token selection on-device so the CUDA graph replays the
+    //    full decode step without a D→H sync on every step. The caller reads
+    //    one u32 (4 bytes) instead of the full logits tensor. --
+    let token = graph.add_argmax_last(logits);
+
+    // -- Output: U32 token tensor [1] --
+    graph.set_output(token.0);
 
     let extra = IndirectDecodeExtraIds {
         model_tensor_weight_count,

@@ -1117,30 +1117,77 @@ fn bench_cuda_graph_engine(
     // -- Build CudaDecodeEngine --
     let mut engine = CudaDecodeEngine::new(ctx.clone(), graph, weights, kv_cache, seq_pos)?;
 
-    // -- Phase 2: Timed decode via CudaDecodeEngine --
+    // -- Phase 2: Timed decode via CudaDecodeEngine (with per-step miss tracking) --
     ctx.synchronize()?;
+
+    // Per-step pool miss deltas: miss_deltas[i] = new misses incurred on step i.
+    let mut miss_deltas: Vec<u64> = Vec::with_capacity(n_gen);
+    let mut stabilized_at: Option<usize> = None;
+
     let start = Instant::now();
 
-    for _step in 0..n_gen {
-        let logits = engine.step(last_token)?;
+    for step in 0..n_gen {
+        let misses_before = ctx.buffer_pool().map_or(0, |p| p.misses());
+
+        last_token = engine.step(last_token)?;
         engine.advance()?;
-        last_token = argmax_last_scalar(&logits)?;
+
+        let misses_after = ctx.buffer_pool().map_or(0, |p| p.misses());
+        let delta = misses_after.saturating_sub(misses_before);
+        miss_deltas.push(delta);
+
+        if stabilized_at.is_none() && engine.is_stabilized() {
+            stabilized_at = Some(step + 1); // first step that ran as a pure replay
+        }
     }
 
     ctx.synchronize()?;
     let elapsed = start.elapsed();
     let tok_s = n_gen as f64 / elapsed.as_secs_f64();
 
+    // -- Pool miss report --
+    let total_misses: u64 = miss_deltas.iter().sum();
+    let warmup_steps = stabilized_at.unwrap_or(n_gen);
+    let stable_steps = n_gen.saturating_sub(warmup_steps);
+
+    eprintln!("Pool miss profile ({n_gen} steps):");
     eprintln!(
-        "Graph stabilized after: {} steps",
-        if engine.is_stabilized() {
-            "~few"
-        } else {
-            "never"
-        },
+        "  Stabilized at step: {}",
+        stabilized_at
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "never (within this run)".to_string())
     );
+    eprintln!("  Total misses: {total_misses}  ({warmup_steps} warmup steps, {stable_steps} stable steps)");
+
+    // Print a compact per-step miss table for the warmup phase (up to 80 steps).
+    let display_steps = warmup_steps.min(80);
+    if display_steps > 0 {
+        eprintln!("  Per-step misses (warmup, first {display_steps} steps):");
+        for (i, &d) in miss_deltas.iter().take(display_steps).enumerate() {
+            if d > 0 {
+                eprintln!(
+                    "    step {:3}: {} miss{}",
+                    i,
+                    d,
+                    if d == 1 { "" } else { "es" }
+                );
+            }
+        }
+    }
+
+    // Throughput split: warmup vs stable.
+    if stable_steps > 0 {
+        // Rough per-step time assuming uniform cost (conservative — warmup is slower).
+        let step_ns = elapsed.as_nanos() / n_gen as u128;
+        let stable_ns = step_ns * stable_steps as u128;
+        let stable_tok_s = stable_steps as f64 / (stable_ns as f64 / 1e9);
+        eprintln!(
+            "  Estimated stabilized throughput: {stable_tok_s:.1} tok/s (over {stable_steps} stable steps)"
+        );
+    }
+
     println!(
-        "{n_gen} tokens in {:.2}s = {:.1} tok/s",
+        "{n_gen} tokens in {:.2}s = {:.1} tok/s (end-to-end)",
         elapsed.as_secs_f64(),
         tok_s,
     );

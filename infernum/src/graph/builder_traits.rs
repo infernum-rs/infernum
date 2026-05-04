@@ -796,6 +796,13 @@ pub trait GraphIndirectDecodeOps {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> OutputRef;
+
+    /// Add a device-side argmax over the last dimension of a 2D logits tensor.
+    ///
+    /// Input: `[1, vocab_size]` logits (F32).  Output: `[1]` U32 token index.
+    /// The result stays on the GPU — the caller reads it with a 4-byte D→H copy,
+    /// which is far cheaper than transferring the full logits tensor.
+    fn add_argmax_last(&mut self, logits: OutputRef) -> OutputRef;
 }
 
 impl<B: Backend + MatmulOps> GraphIndirectDecodeOps for Graph<B> {
@@ -886,6 +893,12 @@ impl<B: Backend + MatmulOps> GraphIndirectDecodeOps for Graph<B> {
             }),
             &[q],
         );
+        (node_id, 0)
+    }
+
+    fn add_argmax_last(&mut self, logits: OutputRef) -> OutputRef {
+        use super::builtin_ops::ArgmaxLastOp;
+        let node_id = self.add_node(Box::new(ArgmaxLastOp), &[logits]);
         (node_id, 0)
     }
 }

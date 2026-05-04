@@ -51,12 +51,12 @@ pub struct CudaDecodeEngine {
     last_miss_count: u64,
     /// `true` once the graph no longer changes between steps.
     stabilized: bool,
-    /// Index of the graph output node (logits).
+    /// Index of the graph output node (U32 token tensor `[1]`).
     output_node: NodeId,
-    /// The logits tensor from the last captured execute. Its GPU address is
-    /// stable (pool-backed), so the same tensor can be returned each step after
-    /// stabilization — the CUDA graph will have written fresh values into it.
-    saved_logits: Option<CudaTensor>,
+    /// The token tensor (`[1]` U32) from the last captured execute. Its GPU
+    /// address is stable (pool-backed). On the fast path the CUDA graph writes
+    /// fresh values into it each step; we read 4 bytes with `to_vec::<u32>()`.
+    saved_token: Option<CudaTensor>,
 }
 
 impl CudaDecodeEngine {
@@ -125,15 +125,16 @@ impl CudaDecodeEngine {
             last_miss_count: 0,
             stabilized: false,
             output_node,
-            saved_logits: None,
+            saved_token: None,
         })
     }
 
     /// Write the next token ID to the GPU buffer and run one decode step.
     ///
-    /// Returns the logits tensor for the predicted next token. Caller must
-    /// call `kv_cache.advance(1)` **after** reading the logits — it is a
-    /// host-side pointer update that cannot be captured inside the graph.
+    /// Returns the predicted next token as a `u32`. The argmax is computed
+    /// on-device inside the CUDA graph; only 4 bytes are copied host-side.
+    /// Caller must call [`CudaDecodeEngine::advance`] **after** this — the KV
+    /// cache host-side pointer update cannot be captured inside the graph.
     ///
     /// The first calls re-capture the graph (cheap once the pool is warm); once
     /// the pool has stabilized, only `launch()` is called.
@@ -141,7 +142,7 @@ impl CudaDecodeEngine {
     /// # Errors
     ///
     /// Returns an error if any kernel launch or CUDA API call fails.
-    pub fn step(&mut self, next_token: u32) -> Result<CudaTensor> {
+    pub fn step(&mut self, next_token: u32) -> Result<u32> {
         // Write the token ID to the stable GPU buffer that embedding_gather_indirect reads.
         self.ctx
             .device()
@@ -149,21 +150,21 @@ impl CudaDecodeEngine {
 
         if self.stabilized {
             // Fast path: graph is stable — replay with a single launch.
-            // The logits tensor's GPU address is stable (pool-backed) and the
-            // CUDA graph will have written fresh values into it. Return the
-            // same CudaTensor handle — the caller sees the updated data after
-            // synchronize() below.
+            // The token tensor's GPU address is stable (pool-backed) and the
+            // CUDA graph writes fresh values into it each step. Read 4 bytes.
             self.cuda_graph.launch()?;
             self.ctx.synchronize()?;
-            Ok(self
-                .saved_logits
-                .clone()
-                .expect("saved_logits must be set before stabilization"))
+            let token_tensor = self
+                .saved_token
+                .as_ref()
+                .expect("saved_token must be set before stabilization");
+            let result = token_tensor.to_vec::<u32>()?;
+            Ok(result[0])
         } else {
             // Stabilization path: run execute_indirect within a CUDA graph
             // capture so the pool allocates all required buffers. The resulting
-            // logits tensor has a stable pool-backed GPU address — save it so
-            // the fast path can return it without re-executing.
+            // token tensor has a stable pool-backed GPU address — save it so
+            // the fast path can read it without re-executing.
             self.cuda_graph.begin_capture()?;
 
             let mut outputs = super::executor::execute_indirect(
@@ -181,9 +182,10 @@ impl CudaDecodeEngine {
             self.cuda_graph.launch()?;
             self.ctx.synchronize()?;
 
-            let logits = outputs.pop().unwrap();
-            // Save logits for the fast path (stable pool-backed GPU address).
-            self.saved_logits = Some(logits.clone());
+            let token_tensor = outputs.pop().unwrap();
+            let result = token_tensor.to_vec::<u32>()?;
+            // Save the token tensor for the fast path (stable pool-backed GPU address).
+            self.saved_token = Some(token_tensor);
 
             // Track pool misses to detect stabilization.
             if let Some(pool) = self.ctx.buffer_pool() {
@@ -197,7 +199,7 @@ impl CudaDecodeEngine {
                 self.stabilized = self.cuda_graph.is_instantiated();
             }
 
-            Ok(logits)
+            Ok(result[0])
         }
     }
 

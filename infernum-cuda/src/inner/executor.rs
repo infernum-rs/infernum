@@ -13,11 +13,11 @@ use infernum::backend::{
     RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::graph::builtin_ops::{
-    AddRmsNormOp, AppendKvIndirectOp, BiasAddOp, CastFromF32Op, EmbeddingGatherIndirectOp,
-    EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp, FusedAttentionDecodeOp,
-    FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, RepeatKvOp,
-    ReshapeOp, RmsNormOp, RopeBatchedOp, RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp,
-    SliceViewOp, SplitInnerDimOp,
+    AddRmsNormOp, AppendKvIndirectOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
+    EmbeddingGatherIndirectOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp,
+    FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
+    LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp, RopeIndirectOp, RopeInterleavedOp,
+    RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -559,6 +559,14 @@ pub fn execute_indirect(
                 let input = read(&buffers, node.inputs[0]).clone();
                 let w = weights.linear_weight(op.weight);
                 let result = <CudaBackend as MatmulOps>::linear(&input, w)?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Device-side argmax (avoids D→H sync inside the graph) ---
+            "argmax_last" => {
+                let _op = node.op.as_any().downcast_ref::<ArgmaxLastOp>().unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let result = ops::argmax_last_tensor(&input)?;
                 store(&mut buffers, node_id, 0, result);
             }
 
