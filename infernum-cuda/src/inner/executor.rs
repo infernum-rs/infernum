@@ -5,7 +5,7 @@
 //! in a `Vec<Vec<Option<CudaTensor>>>` indexed by `(NodeId, output_index)`.
 //!
 //! Unlike the CPU executor which uses a flat byte arena, the GPU executor
-//! stores tensors as individual `CudaTensor` values. The `BufferPool`
+//! stores tensors as individual [`CudaTensor`] values. The [`BufferPool`]
 //! provides allocation reuse automatically.
 
 use infernum::backend::{

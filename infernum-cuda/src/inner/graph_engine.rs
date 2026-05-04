@@ -6,19 +6,19 @@
 //! `cuGraphExecUpdate_v2` overhead once the graph topology is fixed.
 //!
 //! The engine owns:
-//! - A single `CudaGraph` instance (`cudaGraphExec_t` under the hood).
+//! - A single [`CudaGraph`] instance (`cudaGraphExec_t` under the hood).
 //! - The pre-computed RoPE cos/sin cache (stable GPU address, registered as a
 //!   tensor weight).
-//! - A `KvCache` with pre-allocated `[max_seq_len, …]` buffers per layer.
-//! - A `SeqPosition` holding the current step position on the GPU.
-//! - The compiled `ExecutionPlan` (topological schedule).
+//! - A [`KvCache`] with pre-allocated `[max_seq_len, …]` buffers per layer.
+//! - A [`SeqPosition`] holding the current step position on the GPU.
+//! - The compiled [`ExecutionPlan`] (topological schedule).
 //!
 //! ## Stabilization
 //!
 //! On first use the buffer pool has not yet allocated the right sizes, so each
 //! call to `execute_indirect` may miss the pool and allocate new buffers. The
 //! pool miss count is tracked via [`BufferPool::misses`]. After the count stops
-//! growing (i.e., the pool has enough buffers cached), the `CudaGraph`'s
+//! growing (i.e., the pool has enough buffers cached), the [`CudaGraph`]'s
 //! `cuGraphExec_t` is fully stable and `begin_capture`/`end_capture` are no
 //! longer needed each step — `launch()` alone suffices.
 
@@ -53,15 +53,15 @@ pub struct CudaDecodeEngine {
     last_miss_count: u64,
     /// `true` once the graph no longer changes between steps.
     stabilized: bool,
-    /// Index of the graph output node (U32 token tensor `[1]`).
+    /// Index of the graph output node (`U32` token tensor `[1]`).
     output_node: NodeId,
-    /// The token tensor (`[1]` U32) from the last captured execute. Its GPU
+    /// The token tensor (`[1]` `U32`) from the last captured execute. Its GPU
     /// address is stable (pool-backed). On the fast path the CUDA graph writes
     /// fresh values into it each step; we read 4 bytes from the pinned buffer.
     saved_token: Option<CudaTensor>,
-    /// Pinned host buffer for async D→H token readback (1 u32).
+    /// Pinned host buffer for async D→H token readback (1 `u32`).
     pinned_token: PinnedBuffer,
-    /// CUDA event recorded after each async DtoH copy. On the next step,
+    /// CUDA event recorded after each async `DtoH` copy. On the next step,
     /// `event.synchronize()` waits only for that copy — much cheaper than
     /// `ctx.synchronize()` which flushes all GPU work on all streams.
     completion_event: CudaEvent,
@@ -69,20 +69,24 @@ pub struct CudaDecodeEngine {
 
 impl CudaDecodeEngine {
     /// Build a CUDA-graph decode engine from an already-compiled indirect
-    /// decode graph and a freshly-populated `WeightStore`.
+    /// decode graph and a freshly-populated [`WeightStore`].
     ///
     /// # Parameters
     ///
     /// * `ctx` — CUDA context (device 0 or whichever device the weights live on).
     /// * `graph` — Indirect decode graph built by `build_indirect_decode_graph`.
-    /// * `weights` — Fully populated `WeightStore` (model weights, RoPE caches,
+    /// * `weights` — Fully populated [`WeightStore`] (model weights, RoPE caches,
     ///   KV cache tensors registered at construction time).
     /// * `kv_cache` — Pre-allocated KV cache with `max_seq_len` capacity.
     /// * `seq_pos` — GPU-resident sequence position counter (device pointer).
     ///
+    /// # Panics
+    ///
+    /// Panics if the indirect decode graph has no output nodes.
+    ///
     /// # Errors
     ///
-    /// Returns an error if graph planning or `CudaGraph` allocation fails.
+    /// Returns an error if graph planning or [`CudaGraph`] allocation fails.
     pub fn new(
         ctx: CudaContext,
         graph: Graph<CudaBackend>,
@@ -150,6 +154,11 @@ impl CudaDecodeEngine {
     ///
     /// The first calls re-capture the graph (cheap once the pool is warm); once
     /// the pool has stabilized, only `launch()` is called.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stable fast-path token tensor has not been saved yet
+    /// (internal invariant violation; indicates a bug in stabilization logic).
     ///
     /// # Errors
     ///
@@ -240,16 +249,19 @@ impl CudaDecodeEngine {
     }
 
     /// Return a shared reference to the KV cache (e.g., for reading `current_len`).
+    #[must_use]
     pub fn kv_cache(&self) -> &KvCache {
         &self.kv_cache
     }
 
     /// Return a shared reference to the sequence position counter.
+    #[must_use]
     pub fn seq_pos(&self) -> &SeqPosition {
         &self.seq_pos
     }
 
     /// Return whether the CUDA graph has stabilized (pool misses stopped growing).
+    #[must_use]
     pub fn is_stabilized(&self) -> bool {
         self.stabilized
     }
