@@ -16,8 +16,8 @@ use infernum::graph::builtin_ops::{
     AddRmsNormOp, AppendKvIndirectOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
     EmbeddingGatherIndirectOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
-    LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp, RopeIndirectOp, RopeInterleavedOp,
-    RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    LmHeadOp, LogitSoftcapOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
+    RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -402,6 +402,38 @@ pub fn execute(
                 let op = node.op.as_any().downcast_ref::<CastFromF32Op>().unwrap();
                 let input = read(&buffers, node.inputs[0]);
                 let result = <CudaBackend as CastOps>::cast_from_f32(input, op.target)?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Per-head QK RMSNorm (Qwen3, Gemma 3) ---
+            "rms_norm_qk" => {
+                let op = node.op.as_any().downcast_ref::<RmsNormQkOp>().unwrap();
+                let q = read(&buffers, node.inputs[0]);
+                let k = read(&buffers, node.inputs[1]);
+                let q_w = weights.tensor_weight(op.q_weight);
+                let k_w = weights.tensor_weight(op.k_weight);
+                // The CUDA rms_norm kernel treats the outermost dims as a batch,
+                // so [seq, num_heads, head_dim] works directly — each row of
+                // head_dim is normalised independently.
+                let q_normed = <CudaBackend as NormOps>::rms_norm(q, q_w, op.eps)?;
+                let k_normed = <CudaBackend as NormOps>::rms_norm(k, k_w, op.eps)?;
+                store(&mut buffers, node_id, 0, q_normed);
+                store(&mut buffers, node_id, 1, k_normed);
+            }
+
+            // --- Logit soft-cap: tanh(x / cap) * cap (Gemma 2 final logit) ---
+            "logit_softcap" => {
+                // TODO: dedicated CUDA tanh kernel for better throughput.
+                // For now: download → CPU loop → upload. Logits are small
+                // ([1, vocab_size]) so this is not on the hot path.
+                let op = node.op.as_any().downcast_ref::<LogitSoftcapOp>().unwrap();
+                let input = read(&buffers, node.inputs[0]);
+                let ctx = input.context().clone();
+                let cap = op.cap;
+                let host: Vec<f32> = input.to_vec::<f32>()?;
+                let softcapped: Vec<f32> = host.iter().map(|&x| (x / cap).tanh() * cap).collect();
+                let result =
+                    CudaTensor::from_slice::<f32>(&ctx, &node.output_shapes[0], &softcapped)?;
                 store(&mut buffers, node_id, 0, result);
             }
 

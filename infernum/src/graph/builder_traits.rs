@@ -16,8 +16,8 @@ use super::builtin_ops::{
     AddInplaceOp, AddOp, AddRmsNormOp, AppendPagedBatchedOp, AppendPagedOp, BiasAddOp,
     CastFromF32Op, CastToF32Op, ConcatInnerDimOp, ConcatSeqOp, EmbeddingGatherOp, ExtractLastRowOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp, LinearOp,
-    LinearPairOp, LinearTripleOp, LmHeadOp, MatmulBf16F32Op, MatmulOp, MulOp,
-    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp,
+    LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp, MulOp,
+    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
     RopeInterleavedOp as RopeIntOp, RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp,
     Transpose2dOp,
 };
@@ -74,6 +74,19 @@ pub trait GraphNormOps {
         weight: WeightId,
         eps: f32,
     ) -> (OutputRef, OutputRef);
+
+    /// Per-head RMSNorm on Q and K before RoPE (Qwen3, Gemma 3).
+    ///
+    /// `q` and `k` must have shape `[seq, num_heads, head_dim]`.
+    /// Returns `(q_normed, k_normed)` with the same shapes as `q` and `k`.
+    fn add_qk_norm(
+        &mut self,
+        q: OutputRef,
+        k: OutputRef,
+        q_weight: WeightId,
+        k_weight: WeightId,
+        eps: f32,
+    ) -> (OutputRef, OutputRef);
 }
 
 impl<B: Backend + MatmulOps + NormOps> GraphNormOps for Graph<B> {
@@ -91,6 +104,44 @@ impl<B: Backend + MatmulOps + NormOps> GraphNormOps for Graph<B> {
     ) -> (OutputRef, OutputRef) {
         let node_id = self.add_node(Box::new(AddRmsNormOp { weight, eps }), &[residual, delta]);
         ((node_id, 0), (node_id, 1))
+    }
+
+    fn add_qk_norm(
+        &mut self,
+        q: OutputRef,
+        k: OutputRef,
+        q_weight: WeightId,
+        k_weight: WeightId,
+        eps: f32,
+    ) -> (OutputRef, OutputRef) {
+        let node_id = self.add_node(
+            Box::new(RmsNormQkOp {
+                q_weight,
+                k_weight,
+                eps,
+            }),
+            &[q, k],
+        );
+        ((node_id, 0), (node_id, 1))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SoftcapOps
+// ---------------------------------------------------------------------------
+
+/// Graph builder methods for logit soft-capping.
+pub trait GraphSoftcapOps {
+    /// Element-wise logit soft-cap: `tanh(x / cap) * cap`.
+    ///
+    /// Output shape = input shape, same dtype (`F32`).
+    fn add_logit_softcap(&mut self, input: OutputRef, cap: f32) -> OutputRef;
+}
+
+impl<B: Backend + MatmulOps> GraphSoftcapOps for Graph<B> {
+    fn add_logit_softcap(&mut self, input: OutputRef, cap: f32) -> OutputRef {
+        let node_id = self.add_node(Box::new(LogitSoftcapOp { cap }), &[input]);
+        (node_id, 0)
     }
 }
 

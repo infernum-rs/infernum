@@ -2167,3 +2167,120 @@ impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
         self
     }
 }
+
+// ---------------------------------------------------------------------------
+// RmsNormQkOp
+// ---------------------------------------------------------------------------
+
+/// Per-head RMSNorm applied to Q and K tensors before RoPE.
+///
+/// Used by Qwen3 and Gemma 3 models which apply an independent RMSNorm to
+/// each attention head in Q and K before the rotary embedding is applied.
+/// The op takes two inputs (Q, K) and returns two outputs (Q_normed, K_normed)
+/// with identical shapes to their respective inputs.
+///
+/// Shape contract:
+/// - `inputs[0]` = Q: `[seq, num_q_heads, head_dim]`
+/// - `inputs[1]` = K: `[seq, num_kv_heads, head_dim]`
+/// - `outputs[0]` = Q_normed: `[seq, num_q_heads, head_dim]`
+/// - `outputs[1]` = K_normed: `[seq, num_kv_heads, head_dim]`
+#[derive(Debug, Clone)]
+pub struct RmsNormQkOp {
+    /// Weight ID for the per-head Q normalization weight (shape `[head_dim]`).
+    pub q_weight: WeightId,
+    /// Weight ID for the per-head K normalization weight (shape `[head_dim]`).
+    pub k_weight: WeightId,
+    /// Epsilon for numerical stability.
+    pub eps: f32,
+}
+
+impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormQkOp {
+    fn name(&self) -> &'static str {
+        "rms_norm_qk"
+    }
+    fn num_inputs(&self) -> usize {
+        2
+    }
+    fn num_outputs(&self) -> usize {
+        2
+    }
+    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        // Q and K shapes are preserved element-wise.
+        vec![input_shapes[0].to_vec(), input_shapes[1].to_vec()]
+    }
+    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+        vec![input_dtypes[0], input_dtypes[1]]
+    }
+    fn execute(
+        &self,
+        inputs: &[&B::Tensor],
+        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        let q_w = weights.tensor_weight(self.q_weight);
+        let k_w = weights.tensor_weight(self.k_weight);
+        // Apply rms_norm independently to Q and K; the backend treats the
+        // leading dimensions as a batch (each head is one row).
+        let q_normed = B::rms_norm(inputs[0], q_w, self.eps)?;
+        let k_normed = B::rms_norm(inputs[1], k_w, self.eps)?;
+        // Silence unused `device` lint — the trait requires the parameter even
+        // though the default dispatch delegates to `B::rms_norm` which
+        // accepts tensors directly.
+        let _ = device;
+        Ok(vec![q_normed, k_normed])
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LogitSoftcapOp
+// ---------------------------------------------------------------------------
+
+/// Element-wise logit soft-cap: `tanh(x / cap) * cap`.
+///
+/// Used by Gemma 2 as a final logit soft-capping step after the LM head
+/// projection to bound the logit magnitude. The `cap` hyper-parameter is
+/// typically `30.0` for Gemma 2 models.
+///
+/// Shape contract:
+/// - `inputs[0]`: any shape `[...]` with dtype `F32`.
+/// - `outputs[0]`: same shape and dtype as `inputs[0]`.
+#[derive(Debug, Clone)]
+pub struct LogitSoftcapOp {
+    /// Soft-capping value (must be positive).
+    pub cap: f32,
+}
+
+impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
+    fn name(&self) -> &'static str {
+        "logit_softcap"
+    }
+    fn num_inputs(&self) -> usize {
+        1
+    }
+    fn num_outputs(&self) -> usize {
+        1
+    }
+    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![input_shapes[0].to_vec()]
+    }
+    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+        vec![input_dtypes[0]]
+    }
+    fn execute(
+        &self,
+        _inputs: &[&B::Tensor],
+        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        _device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        panic!(
+            "LogitSoftcapOp must be dispatched by the executor; \
+             the generic OpNode::execute path is not supported"
+        )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}

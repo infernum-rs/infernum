@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use infernum::backend::{AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps};
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, BiasAddOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeOp,
-    FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, RepeatKvOp,
-    RmsNormOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp,
+    RepeatKvOp, RmsNormOp, RmsNormQkOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -823,6 +823,54 @@ pub fn execute(
                 let op = node.op.as_any().downcast_ref::<SliceViewOp>().unwrap();
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let result = input.slice_view(op.offset, &op.shape);
+                write_tensor(arena, plan, node_id, 0, &result);
+            }
+
+            // --- Per-head QK RMSNorm (Qwen3, Gemma 3) ---
+            "rms_norm_qk" => {
+                let op = node.op.as_any().downcast_ref::<RmsNormQkOp>().unwrap();
+                // Process Q: iterate each head row [head_dim] independently.
+                let q_in = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let k_in = read_tensor(arena, plan, nodes, node.inputs[1]);
+                let q_w = weights.tensor_weight(op.q_weight);
+                let k_w = weights.tensor_weight(op.k_weight);
+                let q_weight_data = q_w.as_f32_slice();
+                let k_weight_data = k_w.as_f32_slice();
+                let head_dim = q_weight_data.len(); // weight shape is [head_dim]
+                                                    // Q: [seq * num_q_heads, head_dim]
+                let q_elems: usize = node.output_shapes[0].iter().product();
+                let mut q_out_data = vec![0.0f32; q_elems];
+                crate::ops::norm::rms_norm_slices(
+                    q_in.as_f32_slice(),
+                    q_weight_data,
+                    op.eps,
+                    &mut q_out_data,
+                    head_dim,
+                );
+                let q_result = CpuTensor::from_f32_vec(&node.output_shapes[0], q_out_data);
+                write_tensor(arena, plan, node_id, 0, &q_result);
+                // K: [seq * num_kv_heads, head_dim]
+                let k_elems: usize = node.output_shapes[1].iter().product();
+                let mut k_out_data = vec![0.0f32; k_elems];
+                crate::ops::norm::rms_norm_slices(
+                    k_in.as_f32_slice(),
+                    k_weight_data,
+                    op.eps,
+                    &mut k_out_data,
+                    head_dim,
+                );
+                let k_result = CpuTensor::from_f32_vec(&node.output_shapes[1], k_out_data);
+                write_tensor(arena, plan, node_id, 1, &k_result);
+            }
+
+            // --- Logit soft-cap: tanh(x / cap) * cap (Gemma 2 final logit) ---
+            "logit_softcap" => {
+                let op = node.op.as_any().downcast_ref::<LogitSoftcapOp>().unwrap();
+                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let cap = op.cap;
+                let data = input.as_f32_slice();
+                let out: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
+                let result = CpuTensor::from_f32_vec(&node.output_shapes[0], out);
                 write_tensor(arena, plan, node_id, 0, &result);
             }
 

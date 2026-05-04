@@ -20,7 +20,7 @@ pub use builder_traits::{
     GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps, GraphGegluOps,
     GraphIndirectDecodeOps, GraphMatmulExtOps, GraphMatmulOps, GraphNormOps,
     GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps, GraphRopeOps,
-    GraphSiluOps, GraphSwigluOps, GraphTensorOps,
+    GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
 };
 pub use builtin_ops::MoeExpertIds;
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
