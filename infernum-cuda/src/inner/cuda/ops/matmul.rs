@@ -1,9 +1,7 @@
-//! Matrix multiplication using cuBLAS and custom WMMA GEMV kernels.
+//! Matrix multiplication using cuBLAS
 //!
-//! For M > 1 (prefill), all variants use `cublasGemmEx`.
-//! For M = 1 (decode), BF16 and F32 dispatch to custom WMMA GEMV kernels
-//! (`gemv_bf16` / `gemv_f32`) that exploit tensor cores even for M=1 by
-//! replicating the input vector across WMMA_N virtual columns.
+//! All matmul variants use `cublasGemmEx` with explicit data type selection,
+//! dispatched at runtime based on the tensor's `DType`.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -15,92 +13,12 @@
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use cudarc::cublas::{result, sys};
-use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
-use cudarc::nvrtc::Ptx;
+use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 use crate::cuda::CudaTensor;
 use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::Result;
-
-// PTX for the WMMA GEMV kernels (BF16 and F32), compiled from gemv_bf16.cu.
-const GEMV_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/gemv_bf16.ptx"));
-const GEMV_MODULE: &str = "gemv_bf16";
-
-/// Launch a WMMA GEMV kernel for the M=1 decode path.
-///
-/// `weight`: shape `(N, K)` row-major (Dense pre-transposed convention).
-/// `input`:  shape `(1, K)` or `(K,)`.
-/// Output:   shape `(1, N)`, same dtype as input.
-///
-/// Dispatches to `gemv_bf16` for BF16 or `gemv_f32` for F32.
-/// Falls back to `None` for other dtypes (caller uses cuBLAS).
-fn gemv_wmma(
-    input: &CudaTensor,
-    weight: &CudaTensor,
-    n: usize,
-    k: usize,
-) -> Option<Result<CudaTensor>> {
-    let dtype = input.dtype();
-    let kernel_name = match dtype {
-        DType::BF16 => "gemv_bf16",
-        DType::F32 => "gemv_f32",
-        _ => return None,
-    };
-
-    let device = input.context().device();
-
-    if !device.has_func(GEMV_MODULE, kernel_name) {
-        device
-            .load_ptx(
-                Ptx::from_src(GEMV_PTX),
-                GEMV_MODULE,
-                &["gemv_bf16", "gemv_f32"],
-            )
-            .expect("failed to load gemv_bf16 PTX");
-    }
-
-    let func = device.get_func(GEMV_MODULE, kernel_name).unwrap();
-
-    // Block: (COLS_PER_CTA=32, K_SPLITS=16) — 512 threads total.
-    // cudarc LaunchConfig uses flat thread count; pass the 2D dims via cfg.
-    const COLS_PER_CTA: u32 = 32;
-    const K_SPLITS: u32 = 16;
-
-    let grid = ((n as u32).div_ceil(COLS_PER_CTA), 1, 1);
-    let block = (COLS_PER_CTA, K_SPLITS, 1);
-
-    let mut output = match unsafe { CudaTensor::uninit(input.context(), &[1, n], dtype) } {
-        Ok(t) => t,
-        Err(e) => return Some(Err(e)),
-    };
-
-    let cfg = LaunchConfig {
-        grid_dim: grid,
-        block_dim: block,
-        shared_mem_bytes: 0,
-    };
-
-    // Pass CudaSlice/CudaView references so cudarc routes the launch to the
-    // device's current stream (required for CUDA graph capture compatibility).
-    let result = unsafe {
-        func.launch(
-            cfg,
-            (
-                &weight.cuda_slice(),
-                &input.cuda_slice(),
-                output.cuda_slice_mut(),
-                n as i32,
-                k as i32,
-            ),
-        )
-    };
-
-    match result {
-        Ok(()) => Some(Ok(output)),
-        Err(e) => Some(Err(e.into())),
-    }
-}
 
 /// Map `DType` to the cuBLAS data type enum.
 fn cublas_data_type(dtype: DType) -> sys::cudaDataType_t {
@@ -161,14 +79,6 @@ fn matmul_2d(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
         "Inner dimensions must match: {} vs {}",
         k, b_shape[0]
     );
-
-    // M=1 decode fast path: use WMMA GEMV kernels (tensor-core path) for
-    // BF16 and F32. Falls back to cuBLAS for F16 or other dtypes.
-    if m == 1 {
-        if let Some(result) = gemv_wmma(a, b, n, k) {
-            return result;
-        }
-    }
 
     let c_shape = [m, n];
     let mut c = unsafe { CudaTensor::uninit(a.context(), &c_shape, dtype)? };
