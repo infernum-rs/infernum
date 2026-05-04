@@ -1880,3 +1880,242 @@ impl<B: Backend + MatmulOps> OpNode<B> for LmHeadOp {
         self
     }
 }
+
+// ---------------------------------------------------------------------------
+// EmbeddingGatherIndirectOp
+// ---------------------------------------------------------------------------
+
+/// Embedding table lookup reading the token ID from a stable GPU `u32` pointer.
+///
+/// The token ID is not a graph input — it is stored in a `SeqPosition`-like
+/// GPU buffer and passed to the executor out-of-band. This makes the op
+/// capturable by a CUDA graph (fixed device address, varying value).
+///
+/// Output shape: `[1, embed_dim]`.
+#[derive(Debug)]
+pub struct EmbeddingGatherIndirectOp {
+    /// Weight ID of the embedding table.
+    pub table: WeightId,
+    /// Embedding dimension (hidden size).
+    pub embed_dim: usize,
+    /// Output data type.
+    pub dtype: DType,
+}
+
+impl<B: Backend + MatmulOps> OpNode<B> for EmbeddingGatherIndirectOp {
+    fn name(&self) -> &'static str {
+        "embedding_gather_indirect"
+    }
+    fn num_inputs(&self) -> usize {
+        0
+    }
+    fn num_outputs(&self) -> usize {
+        1
+    }
+    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![vec![1, self.embed_dim]]
+    }
+    fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
+        vec![self.dtype]
+    }
+    fn execute(
+        &self,
+        _inputs: &[&B::Tensor],
+        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        _device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        panic!(
+            "EmbeddingGatherIndirectOp must be executed by the CUDA indirect executor; \
+             it reads the token ID from a stable GPU device pointer (SeqPosition)"
+        )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RopeIndirectOp
+// ---------------------------------------------------------------------------
+
+/// Rotary positional embedding reading the current position from a stable GPU
+/// `u32` pointer (`SeqPosition`).
+///
+/// Takes one graph input (the Q or K tensor, shape `[1, heads, head_dim]`).
+/// The full cos/sin cache (`[max_seq_len, head_dim/2]`) are stored as
+/// tensor weights identified by `cos_cache` and `sin_cache`. The position is
+/// read at execution time from the `SeqPosition` passed to the executor.
+///
+/// Output shape: same as input.
+#[derive(Debug)]
+pub struct RopeIndirectOp {
+    /// Weight ID of the full cosine cache `[max_seq_len, head_dim/2]`.
+    pub cos_cache: WeightId,
+    /// Weight ID of the full sine cache `[max_seq_len, head_dim/2]`.
+    pub sin_cache: WeightId,
+    /// If `true`, use interleaved RoPE (DeepSeek style); otherwise standard.
+    pub interleaved: bool,
+    /// Attention head dimension.
+    pub head_dim: usize,
+    /// Number of attention heads.
+    pub num_heads: usize,
+}
+
+impl<B: Backend + MatmulOps> OpNode<B> for RopeIndirectOp {
+    fn name(&self) -> &'static str {
+        "rope_indirect"
+    }
+    fn num_inputs(&self) -> usize {
+        1
+    }
+    fn num_outputs(&self) -> usize {
+        1
+    }
+    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![input_shapes[0].to_vec()]
+    }
+    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+        vec![input_dtypes[0]]
+    }
+    fn execute(
+        &self,
+        _inputs: &[&B::Tensor],
+        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        _device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        panic!(
+            "RopeIndirectOp must be executed by the CUDA indirect executor; \
+             it reads the sequence position from a stable GPU device pointer (SeqPosition)"
+        )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AppendKvIndirectOp
+// ---------------------------------------------------------------------------
+
+/// Append a new K or V token into the pre-allocated KV cache buffer.
+///
+/// Takes one graph input (new K or V, shape `[1, kv_heads, head_dim]`).
+/// The target KV buffer and write offset are both addressed via `SeqPosition`
+/// and the pre-allocated `KvCache` passed to the executor. This is a
+/// side-effect op (no output tensor).
+///
+/// The `layer_idx` determines which layer buffer to write into; `is_key`
+/// selects K vs V.
+#[derive(Debug)]
+pub struct AppendKvIndirectOp {
+    /// Transformer layer index.
+    pub layer_idx: usize,
+    /// `true` = append to K cache; `false` = append to V cache.
+    ///
+    /// In practice the executor handles both K and V together for the same
+    /// `layer_idx`, but having separate ops keeps the graph DAG explicit.
+    pub is_key: bool,
+    /// Number of KV heads.
+    pub num_kv_heads: usize,
+    /// Attention head dimension.
+    pub head_dim: usize,
+}
+
+impl<B: Backend + MatmulOps> OpNode<B> for AppendKvIndirectOp {
+    fn name(&self) -> &'static str {
+        "append_kv_indirect"
+    }
+    fn num_inputs(&self) -> usize {
+        1
+    }
+    fn num_outputs(&self) -> usize {
+        0
+    }
+    fn is_side_effect(&self) -> bool {
+        true
+    }
+    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![]
+    }
+    fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
+        vec![]
+    }
+    fn execute(
+        &self,
+        _inputs: &[&B::Tensor],
+        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        _device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        panic!(
+            "AppendKvIndirectOp must be executed by the CUDA indirect executor; \
+             it writes into pre-allocated GPU KV cache buffers via SeqPosition"
+        )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FusedAttentionDecodeIndirectOp
+// ---------------------------------------------------------------------------
+
+/// Fused decode attention reading K/V buffers and total sequence length from
+/// the executor's out-of-band `KvCache` (indexed by `layer_idx`).
+///
+/// Takes one graph input: Q `[1, num_heads, head_dim]`. The full K and V cache
+/// buffers are fetched from `kv_cache.full_buffers(layer_idx)` at execution
+/// time — their GPU addresses are stable across all decode steps, making this
+/// op safe to use inside a CUDA graph capture. The actual sequence length is
+/// read from the `KvCache`'s internal `SeqPosition` device pointer.
+///
+/// Output shape: `[1, num_heads, head_dim]`.
+#[derive(Debug)]
+pub struct FusedAttentionDecodeIndirectOp {
+    /// Layer index used to look up K/V buffers from `kv_cache.full_buffers(layer_idx)`.
+    pub layer_idx: usize,
+    /// Number of query heads.
+    pub num_heads: usize,
+    /// Number of key/value heads (may differ from `num_heads` for GQA).
+    pub num_kv_heads: usize,
+    /// Attention head dimension.
+    pub head_dim: usize,
+    /// Attention scale (`1/sqrt(head_dim)` if standard).
+    pub scale: f32,
+    /// Optional `logit_softcapping` value (Gemma-style).
+    pub softcap: Option<f32>,
+    /// Optional sliding window size (Mistral/Qwen-style).
+    pub sliding_window: Option<usize>,
+}
+
+impl<B: Backend + MatmulOps> OpNode<B> for FusedAttentionDecodeIndirectOp {
+    fn name(&self) -> &'static str {
+        "fused_attention_decode_indirect"
+    }
+    fn num_inputs(&self) -> usize {
+        1 // Q only; K/V fetched from kv_cache.full_buffers(layer_idx) by executor
+    }
+    fn num_outputs(&self) -> usize {
+        1
+    }
+    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![vec![1, self.num_heads, self.head_dim]]
+    }
+    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+        vec![input_dtypes[0]]
+    }
+    fn execute(
+        &self,
+        _inputs: &[&B::Tensor],
+        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        _device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        panic!(
+            "FusedAttentionDecodeIndirectOp must be executed by the CUDA indirect executor; \
+             it reads the total sequence length from a stable GPU device pointer (SeqPosition)"
+        )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}

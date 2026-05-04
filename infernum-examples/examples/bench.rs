@@ -40,12 +40,14 @@ use infernum_cuda::cuda::ops::{
     embedding_gather_from_device, fused_attention_decode_indirect, linear, rms_norm, swiglu,
     LinearWeight,
 };
-use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache};
+use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache, SeqPosition};
 use infernum_cuda::executor;
-use infernum_cuda::CudaBackend;
+use infernum_cuda::{CudaBackend, CudaDecodeEngine};
 use infernum_deepseek::DeepSeekModel;
 use infernum_gemma::GemmaModel;
-use infernum_llama::{build_decode_graph, build_prefill_graph, LlamaConfig, LlamaModel};
+use infernum_llama::{
+    build_decode_graph, build_indirect_decode_graph, build_prefill_graph, LlamaConfig, LlamaModel,
+};
 use infernum_qwen::QwenModel;
 use infernum_runtime::Engine;
 
@@ -70,6 +72,10 @@ struct Cli {
     /// Use CUDA graph capture/replay for decode (Llama SafeTensors dense only)
     #[arg(long)]
     cuda_graphs: bool,
+
+    /// Use the architecture-correct CUDA graph engine (indirect ops, no bypass)
+    #[arg(long)]
+    cuda_graph_engine: bool,
 
     /// Weight dtype for graph mode (f32 or bf16)
     #[arg(long, default_value = "bf16")]
@@ -704,8 +710,14 @@ fn bench_cuda_graphs_decode(
         infernum::rope::precompute_rope_data(max_pos, head_dim, config.rope_theta);
 
     // KV cache sized for the full generation window.
-    let mut kv_cache =
-        KvCache::new(ctx, num_layers, max_pos, num_kv_heads, head_dim, weight_dtype)?;
+    let mut kv_cache = KvCache::new(
+        ctx,
+        num_layers,
+        max_pos,
+        num_kv_heads,
+        head_dim,
+        weight_dtype,
+    )?;
     kv_cache.set_graph_max_seq_len(max_pos);
     let graph_max_seq_len = max_pos;
 
@@ -786,14 +798,20 @@ fn bench_cuda_graphs_decode(
             weights.tensor_weight(model_weight_ids.final_norm),
             eps,
         )?;
-        let logits = linear(&final_normed, weights.linear_weight(model_weight_ids.lm_head))?;
+        let logits = linear(
+            &final_normed,
+            weights.linear_weight(model_weight_ids.lm_head),
+        )?;
         last_token = argmax_last_scalar(&logits)?;
 
         // Advance position counters after all layers have appended for this step.
         kv_cache.advance(1)?;
     }
     ctx.synchronize()?;
-    eprintln!("Warm-up done. kv_cache.current_len() = {}", kv_cache.current_len());
+    eprintln!(
+        "Warm-up done. kv_cache.current_len() = {}",
+        kv_cache.current_len()
+    );
 
     // --- Phase 2: Timed decode — CUDA graph capture + replay ---
     ctx.synchronize()?;
@@ -871,7 +889,10 @@ fn bench_cuda_graphs_decode(
             weights.tensor_weight(model_weight_ids.final_norm),
             eps,
         )?;
-        let logits = linear(&final_normed, weights.linear_weight(model_weight_ids.lm_head))?;
+        let logits = linear(
+            &final_normed,
+            weights.linear_weight(model_weight_ids.lm_head),
+        )?;
 
         // End capture and instantiate (or update in-place via cuGraphExecUpdate_v2).
         cuda_graph.end_capture()?;
@@ -900,11 +921,238 @@ fn bench_cuda_graphs_decode(
     Ok(())
 }
 
+/// Benchmark decode throughput using the architecture-correct `CudaDecodeEngine`.
+///
+/// Unlike `bench_cuda_graphs_decode` (the bypass), this path uses the computation
+/// graph IR and `execute_indirect` — the same path that will become the production
+/// inference path. Specifically:
+///
+/// - Builds a graph via `build_indirect_decode_graph` (no `kv_len` parameter).
+/// - Populates a `WeightStore` with model weights, RoPE cos/sin caches, and
+///   per-layer KV cache buffer handles.
+/// - Runs `CudaDecodeEngine` which re-captures until the buffer pool stabilizes,
+///   then replays with bare `launch()` calls.
+///
+/// Supports dense SafeTensors (F32, BF16) Llama-family models only.
+///
+/// # Errors
+/// Returns an error if weight loading or any CUDA kernel launch fails.
+#[allow(clippy::too_many_lines)]
+fn bench_cuda_graph_engine(
+    ctx: &CudaContext,
+    model_path: &str,
+    n_gen: usize,
+    weight_dtype: DType,
+) -> infernum::Result<()> {
+    use infernum_cuda::cuda::ops::{apply_rope, fused_attention_decode, precompute_rope_cache};
+
+    assert!(
+        !model_path.ends_with(".gguf"),
+        "--cuda-graph-engine only supports SafeTensors directories"
+    );
+
+    // -- Load config --
+    let config_path = Path::new(model_path).join("config.json");
+    let config_data = std::fs::read_to_string(&config_path).map_err(|e| {
+        infernum::Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read {}: {e}", config_path.display()),
+        ))
+    })?;
+    let config: LlamaConfig = serde_json::from_str(&config_data).map_err(|e| {
+        infernum::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse config.json: {e}"),
+        ))
+    })?;
+
+    let num_layers = config.num_hidden_layers;
+    let hidden_size = config.hidden_size;
+    let head_dim = config.head_dim();
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads();
+    let eps = config.rms_norm_eps;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let half_dim = head_dim / 2;
+    let prompt_len: usize = 8;
+    let max_seq_len = prompt_len + n_gen;
+
+    eprintln!(
+        "Model: {} layers, {} hidden (CudaDecodeEngine, n_gen={n_gen})",
+        num_layers, hidden_size,
+    );
+
+    // -- Build indirect decode graph --
+    let (graph, model_weight_ids, _extra_ids) =
+        build_indirect_decode_graph::<CudaBackend>(&config, max_seq_len, weight_dtype);
+
+    // -- Populate WeightStore --
+    // Phase A: model weights (from SafeTensors files).
+    // Use a temporary 1-token prefill graph to load weights — it has the same
+    // model weight names and ordering as the indirect graph but no RoPE/KV extras,
+    // so load_graph_weights won't try to look up "rope.cos_cache" on disk.
+    let mut weights = WeightStore::<CudaTensor, LinearWeight>::new();
+    eprintln!("Loading weights...");
+    {
+        let (tmp_graph, _) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype);
+        load_graph_weights(ctx, &tmp_graph, model_path, &mut weights)?;
+    }
+
+    // Phase B: RoPE cos/sin caches (precomputed on GPU) — pushed in the
+    // same order as the indirect graph registered them (immediately after model weights).
+    let (cos_cache_tensor, sin_cache_tensor) =
+        precompute_rope_cache(ctx, max_seq_len, head_dim, config.rope_theta)?;
+    weights.push_tensor_weight(cos_cache_tensor.clone());
+    weights.push_tensor_weight(sin_cache_tensor.clone());
+
+    // Phase C: KV cache buffers (pre-allocated on GPU).
+    // Push one K and one V buffer per layer (interleaved per the graph's registration order).
+    let mut kv_cache = KvCache::new(
+        ctx,
+        num_layers,
+        max_seq_len,
+        num_kv_heads,
+        head_dim,
+        weight_dtype,
+    )?;
+    kv_cache.set_graph_max_seq_len(max_seq_len);
+
+    for layer_idx in 0..num_layers {
+        let (k_buf, v_buf) = kv_cache.full_buffers(layer_idx);
+        weights.push_tensor_weight(k_buf.clone());
+        weights.push_tensor_weight(v_buf.clone());
+    }
+
+    // -- Sequence position counter (GPU-resident pointer) --
+    let mut seq_pos = SeqPosition::new(ctx.device())?;
+    seq_pos.set(prompt_len, ctx.device())?;
+
+    // -- Phase 1: Eager warmup (prompt ingestion, not timed) --
+    eprintln!("Warm-up: decoding {prompt_len} prompt tokens (eager)...");
+    let (all_cos_host, all_sin_host) =
+        infernum::rope::precompute_rope_data(max_seq_len, head_dim, config.rope_theta);
+
+    let mut last_token = 0u32;
+    for pos in 0..prompt_len {
+        let token = (pos % 256) as u32;
+        let mut hidden = infernum_cuda::cuda::ops::embedding_gather(
+            ctx,
+            weights.tensor_weight(model_weight_ids.embed_tokens),
+            &[token],
+        )?;
+
+        for layer_idx in 0..num_layers {
+            let ids = &model_weight_ids.layers[layer_idx];
+
+            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm), eps)?;
+            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj))?;
+            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj))?;
+            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj))?;
+
+            let q = q_flat.reshape(&[1, num_heads, head_dim]);
+            let k = k_flat.reshape(&[1, num_kv_heads, head_dim]);
+            let v = v_flat.reshape(&[1, num_kv_heads, head_dim]);
+
+            let offset = pos * half_dim;
+            let cos_slice = CudaTensor::from_slice(
+                ctx,
+                &[1, half_dim],
+                &all_cos_host[offset..offset + half_dim],
+            )?;
+            let sin_slice = CudaTensor::from_slice(
+                ctx,
+                &[1, half_dim],
+                &all_sin_host[offset..offset + half_dim],
+            )?;
+            let q_rot = apply_rope(&q, &cos_slice, &sin_slice, 0)?;
+            let k_rot = apply_rope(&k, &cos_slice, &sin_slice, 0)?;
+
+            kv_cache.append(layer_idx, &k_rot, &v)?;
+
+            let total = kv_cache.current_len() + 1;
+            let (k_full, v_full) = kv_cache.get_up_to(layer_idx, total);
+            let attn = fused_attention_decode(
+                &q_rot,
+                &k_full,
+                &v_full,
+                Some(scale),
+                None,
+                config.effective_sliding_window(layer_idx),
+            )?;
+            let attn_flat = attn.reshape(&[1, hidden_size]);
+            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj))?;
+            add_inplace(&mut hidden, &attn_proj)?;
+
+            let ffn_normed = rms_norm(
+                &hidden,
+                weights.tensor_weight(ids.post_attention_layernorm),
+                eps,
+            )?;
+            let gate = linear(&ffn_normed, weights.linear_weight(ids.gate_proj))?;
+            let up = linear(&ffn_normed, weights.linear_weight(ids.up_proj))?;
+            let activated = swiglu(&gate, &up)?;
+            let ffn_out = linear(&activated, weights.linear_weight(ids.down_proj))?;
+            add_inplace(&mut hidden, &ffn_out)?;
+        }
+
+        let final_normed = rms_norm(
+            &hidden,
+            weights.tensor_weight(model_weight_ids.final_norm),
+            eps,
+        )?;
+        let logits = linear(
+            &final_normed,
+            weights.linear_weight(model_weight_ids.lm_head),
+        )?;
+        last_token = argmax_last_scalar(&logits)?;
+
+        kv_cache.advance(1)?;
+    }
+    ctx.synchronize()?;
+    eprintln!(
+        "Warm-up done. kv_cache.current_len() = {}",
+        kv_cache.current_len()
+    );
+
+    // -- Build CudaDecodeEngine --
+    let mut engine = CudaDecodeEngine::new(ctx.clone(), graph, weights, kv_cache, seq_pos)?;
+
+    // -- Phase 2: Timed decode via CudaDecodeEngine --
+    ctx.synchronize()?;
+    let start = Instant::now();
+
+    for _step in 0..n_gen {
+        let logits = engine.step(last_token)?;
+        engine.advance()?;
+        last_token = argmax_last_scalar(&logits)?;
+    }
+
+    ctx.synchronize()?;
+    let elapsed = start.elapsed();
+    let tok_s = n_gen as f64 / elapsed.as_secs_f64();
+
+    eprintln!(
+        "Graph stabilized after: {} steps",
+        if engine.is_stabilized() {
+            "~few"
+        } else {
+            "never"
+        },
+    );
+    println!(
+        "{n_gen} tokens in {:.2}s = {:.1} tok/s",
+        elapsed.as_secs_f64(),
+        tok_s,
+    );
+
+    Ok(())
+}
+
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
     let ctx = CudaContext::new(0)?;
 
-    if cli.graph || cli.graph_decode || cli.cuda_graphs {
+    if cli.graph || cli.graph_decode || cli.cuda_graphs || cli.cuda_graph_engine {
         let weight_dtype = match cli.dtype.as_str() {
             "f32" => DType::F32,
             "bf16" => DType::BF16,
@@ -918,6 +1166,10 @@ fn main() -> infernum::Result<()> {
 
         if cli.cuda_graphs && is_gguf {
             eprintln!("ERROR: --cuda-graphs does not support GGUF files");
+            std::process::exit(1);
+        }
+        if cli.cuda_graph_engine && is_gguf {
+            eprintln!("ERROR: --cuda-graph-engine does not support GGUF files");
             std::process::exit(1);
         }
 
@@ -934,7 +1186,7 @@ fn main() -> infernum::Result<()> {
                 "llama" | "mistral" => {}
                 other => {
                     eprintln!(
-                        "ERROR: --graph/--graph-decode/--cuda-graphs mode only supports Llama/Mistral, got: {other}"
+                        "ERROR: --graph/--graph-decode/--cuda-graphs/--cuda-graph-engine mode only supports Llama/Mistral, got: {other}"
                     );
                     std::process::exit(1);
                 }
@@ -943,7 +1195,9 @@ fn main() -> infernum::Result<()> {
         };
 
         let format_name = if is_gguf { "GGUF" } else { "SafeTensors" };
-        let mode = if cli.cuda_graphs {
+        let mode = if cli.cuda_graph_engine {
+            "cuda-graph-engine"
+        } else if cli.cuda_graphs {
             "cuda-graphs"
         } else if cli.graph_decode {
             "graph-decode"
@@ -955,7 +1209,9 @@ fn main() -> infernum::Result<()> {
             cli.model,
         );
 
-        let result = if cli.cuda_graphs {
+        let result = if cli.cuda_graph_engine {
+            bench_cuda_graph_engine(&ctx, &cli.model, cli.n_gen, weight_dtype)
+        } else if cli.cuda_graphs {
             bench_cuda_graphs_decode(&ctx, &cli.model, cli.n_gen, weight_dtype)
         } else if cli.graph_decode {
             bench_graph_decode(&ctx, &cli.model, cli.n_gen, weight_dtype)

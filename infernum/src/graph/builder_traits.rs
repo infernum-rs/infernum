@@ -719,6 +719,178 @@ impl<B: Backend + MatmulOps + TensorOps> GraphTensorOps for Graph<B> {
 }
 
 // ---------------------------------------------------------------------------
+// Indirect decode ops (CUDA graph capture compatible)
+// ---------------------------------------------------------------------------
+
+/// Graph builder methods for CUDA-graph-compatible indirect decode operations.
+///
+/// Each op reads dynamically-changing values (token ID, sequence position)
+/// from stable GPU device pointers (`SeqPosition`) rather than baking them
+/// into the graph as literal constants. This allows the same captured
+/// `cudaGraphExec_t` to be replayed across all decode steps with only the
+/// values at those addresses changing between replays.
+///
+/// The ops are implemented only in the CUDA executor — calling
+/// `OpNode::execute` on them panics. The KV cache buffers and cos/sin tables
+/// are registered as tensor weights so their GPU addresses are stable.
+pub trait GraphIndirectDecodeOps {
+    /// Embedding table lookup that reads the token ID from a stable GPU pointer.
+    ///
+    /// Takes zero graph inputs — the token ID is provided out-of-band via the
+    /// `SeqPosition` passed to the CUDA executor. The embedding table is
+    /// referenced by `table` (a tensor weight). Output shape: `[1, embed_dim]`.
+    fn add_embedding_gather_indirect(
+        &mut self,
+        table: WeightId,
+        embed_dim: usize,
+        dtype: DType,
+    ) -> OutputRef;
+
+    /// Apply RoPE reading the position from a stable GPU pointer.
+    ///
+    /// Takes one graph input (the Q or K tensor). The full cos/sin caches are
+    /// registered as tensor weights (`cos_cache`, `sin_cache`). The current
+    /// sequence position is read from the `SeqPosition` passed to the executor.
+    /// Output shape = input shape.
+    fn add_rope_indirect(
+        &mut self,
+        input: OutputRef,
+        cos_cache: WeightId,
+        sin_cache: WeightId,
+        interleaved: bool,
+        head_dim: usize,
+        num_heads: usize,
+    ) -> OutputRef;
+
+    /// Append a new K or V token into a pre-allocated KV cache buffer.
+    ///
+    /// Takes one graph input (new K or V, shape `[1, kv_heads, head_dim]`).
+    /// The write offset is derived from the `SeqPosition` pointer passed to the
+    /// executor. This is a side-effect op (returns a dummy `OutputRef` — callers
+    /// should not use the output as a graph input).
+    fn add_append_kv_indirect(
+        &mut self,
+        input: OutputRef,
+        layer_idx: usize,
+        is_key: bool,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> OutputRef;
+
+    /// Fused decode attention whose K/V caches and total sequence length are
+    /// read from the executor's out-of-band `KvCache` (indexed by `layer_idx`).
+    ///
+    /// Takes one graph input: Q `[1, num_heads, head_dim]`. The K and V cache
+    /// full buffers are fetched from `kv_cache.full_buffers(layer_idx)` at
+    /// execution time — their GPU addresses are stable across all decode steps.
+    /// Output shape: `[1, num_heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_fused_attention_decode_indirect(
+        &mut self,
+        q: OutputRef,
+        layer_idx: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> OutputRef;
+}
+
+impl<B: Backend + MatmulOps> GraphIndirectDecodeOps for Graph<B> {
+    fn add_embedding_gather_indirect(
+        &mut self,
+        table: WeightId,
+        embed_dim: usize,
+        dtype: DType,
+    ) -> OutputRef {
+        use super::builtin_ops::EmbeddingGatherIndirectOp;
+        let node_id = self.add_node(
+            Box::new(EmbeddingGatherIndirectOp {
+                table,
+                embed_dim,
+                dtype,
+            }),
+            &[],
+        );
+        (node_id, 0)
+    }
+
+    fn add_rope_indirect(
+        &mut self,
+        input: OutputRef,
+        cos_cache: WeightId,
+        sin_cache: WeightId,
+        interleaved: bool,
+        head_dim: usize,
+        num_heads: usize,
+    ) -> OutputRef {
+        use super::builtin_ops::RopeIndirectOp;
+        let node_id = self.add_node(
+            Box::new(RopeIndirectOp {
+                cos_cache,
+                sin_cache,
+                interleaved,
+                head_dim,
+                num_heads,
+            }),
+            &[input],
+        );
+        (node_id, 0)
+    }
+
+    fn add_append_kv_indirect(
+        &mut self,
+        input: OutputRef,
+        layer_idx: usize,
+        is_key: bool,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> OutputRef {
+        use super::builtin_ops::AppendKvIndirectOp;
+        let node_id = self.add_node(
+            Box::new(AppendKvIndirectOp {
+                layer_idx,
+                is_key,
+                num_kv_heads,
+                head_dim,
+            }),
+            &[input],
+        );
+        (node_id, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_fused_attention_decode_indirect(
+        &mut self,
+        q: OutputRef,
+        layer_idx: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> OutputRef {
+        use super::builtin_ops::FusedAttentionDecodeIndirectOp;
+        let node_id = self.add_node(
+            Box::new(FusedAttentionDecodeIndirectOp {
+                layer_idx,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                softcap,
+                sliding_window,
+            }),
+            &[q],
+        );
+        (node_id, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LM Head — always available (unconditional on Graph<B>)
 // ---------------------------------------------------------------------------
 

@@ -13,9 +13,10 @@ use infernum::backend::{
     RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::graph::builtin_ops::{
-    AddRmsNormOp, BiasAddOp, CastFromF32Op, EmbeddingGatherOp, ExtractLastRowOp,
-    FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
-    LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp, RopeInterleavedOp, RopeOp, ScaleOp,
+    AddRmsNormOp, AppendKvIndirectOp, BiasAddOp, CastFromF32Op, EmbeddingGatherIndirectOp,
+    EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp, FusedAttentionDecodeOp,
+    FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, RepeatKvOp,
+    ReshapeOp, RmsNormOp, RopeBatchedOp, RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp,
     SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
@@ -24,7 +25,7 @@ use infernum::{ExecutionPlan, NodeId, Result};
 
 use crate::cuda::ops;
 use crate::cuda::ops::LinearWeight;
-use crate::cuda::CudaTensor;
+use crate::cuda::{CudaTensor, KvCache, SeqPosition};
 use crate::CudaBackend;
 
 /// Read a tensor from the node buffer by `OutputRef`.
@@ -410,6 +411,194 @@ pub fn execute(
     }
 
     // Collect output tensors.
+    let outputs = output_nodes
+        .iter()
+        .map(|&id| take(&mut buffers, id, 0))
+        .collect();
+
+    Ok(outputs)
+}
+
+/// Execute an indirect decode graph on the CUDA backend.
+///
+/// Identical to [`execute`] for standard ops (matmul, norm, RoPE, etc.), but
+/// handles the four CUDA-graph-compatible indirect op names by calling the
+/// corresponding indirect kernel wrappers instead of their standard counterparts:
+///
+/// - `"embedding_gather_indirect"` → reads token ID from `seq_pos.device()`
+/// - `"rope_indirect"` → reads position from `seq_pos.device()`
+/// - `"append_kv_indirect"` → writes into `kv_cache` at the current position
+/// - `"fused_attention_decode_indirect"` → reads total length from `kv_cache.current_total_len()`
+///
+/// The `kv_cache` full-capacity buffers are injected as the `inputs` slice at
+/// positions corresponding to the `input` graph nodes (one K buffer and one V
+/// buffer per layer, in layer order). Their stable GPU addresses mean the
+/// captured `cudaGraphExec_t` can be replayed without re-capture.
+///
+/// # Errors
+/// Returns an error if any kernel launch fails.
+#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+pub fn execute_indirect(
+    plan: &ExecutionPlan,
+    nodes: &[GraphNode<CudaBackend>],
+    weights: &WeightStore<CudaTensor, LinearWeight>,
+    inputs: &[CudaTensor],
+    output_nodes: &[NodeId],
+    ctx: &crate::cuda::CudaContext,
+    seq_pos: &SeqPosition,
+    kv_cache: &mut KvCache,
+) -> Result<Vec<CudaTensor>> {
+    use crate::cuda::ops::{
+        apply_rope_indirect, apply_rope_interleaved_indirect, embedding_gather_from_device,
+        fused_attention_decode_indirect,
+    };
+
+    let mut buffers: Vec<Vec<Option<CudaTensor>>> = nodes
+        .iter()
+        .map(|node| {
+            let num_outputs = node.output_shapes.len().max(1);
+            vec![None; num_outputs]
+        })
+        .collect();
+    let mut input_idx: usize = 0;
+    // Per-layer scratch for K/V appends.  The topo sort may schedule K-append
+    // and V-append for the same layer in either order.  Whichever arrives first
+    // stores its tensor here; when both are present, `append_indirect` is called.
+    let num_layers = kv_cache.num_layers();
+    let mut pending_k: Vec<Option<CudaTensor>> = vec![None; num_layers];
+    let mut pending_v: Vec<Option<CudaTensor>> = vec![None; num_layers];
+
+    for &node_id in &plan.schedule {
+        let node = &nodes[node_id.index() as usize];
+        let op_name = node.op.name();
+
+        match op_name {
+            // --- Indirect embedding: reads token ID from SeqPosition device pointer ---
+            "embedding_gather_indirect" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<EmbeddingGatherIndirectOp>()
+                    .unwrap();
+                let table = weights.tensor_weight(op.table);
+                let ctx = table.context();
+                let result = embedding_gather_from_device(ctx, table, seq_pos.device(), 1)?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Indirect RoPE: reads position from SeqPosition device pointer ---
+            "rope_indirect" => {
+                let op = node.op.as_any().downcast_ref::<RopeIndirectOp>().unwrap();
+                let input = read(&buffers, node.inputs[0]);
+                let cos_cache = weights.tensor_weight(op.cos_cache);
+                let sin_cache = weights.tensor_weight(op.sin_cache);
+                let result = if op.interleaved {
+                    apply_rope_interleaved_indirect(input, cos_cache, sin_cache, seq_pos)?
+                } else {
+                    apply_rope_indirect(input, cos_cache, sin_cache, seq_pos)?
+                };
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Indirect KV append: writes to KvCache at position from SeqPosition ---
+            "append_kv_indirect" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<AppendKvIndirectOp>()
+                    .unwrap();
+                let new_tensor = read(&buffers, node.inputs[0]).clone();
+                store(&mut buffers, node_id, 0, new_tensor.clone());
+                // K and V appends for a layer may be scheduled in either order by
+                // the topological sort.  Stash whichever arrives first; call
+                // `append_indirect` once both are present.
+                let layer = op.layer_idx;
+                if op.is_key {
+                    pending_k[layer] = Some(new_tensor);
+                } else {
+                    pending_v[layer] = Some(new_tensor);
+                }
+                if let (Some(k_ten), Some(v_ten)) =
+                    (pending_k[layer].as_ref(), pending_v[layer].as_ref())
+                {
+                    kv_cache.append_indirect(layer, k_ten, v_ten)?;
+                    pending_k[layer] = None;
+                    pending_v[layer] = None;
+                }
+            }
+
+            // --- Indirect attention: K/V and total_len from out-of-band KvCache ---
+            "fused_attention_decode_indirect" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<FusedAttentionDecodeIndirectOp>()
+                    .unwrap();
+                let q = read(&buffers, node.inputs[0]).clone();
+                // K/V full buffers have stable GPU addresses — fetched from the KvCache
+                // by layer_idx (not from the graph input buffer table).
+                let (k_full, v_full) = kv_cache.full_buffers(op.layer_idx);
+                let total_len = kv_cache.current_total_len();
+                let max_seq_len = kv_cache.max_seq_len();
+                let result = fused_attention_decode_indirect(
+                    &q,
+                    k_full,
+                    v_full,
+                    total_len,
+                    max_seq_len,
+                    Some(op.scale),
+                    op.softcap,
+                    op.sliding_window,
+                )?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- LM head (panics in OpNode::execute, needs explicit dispatch) ---
+            "lm_head" => {
+                let op = node.op.as_any().downcast_ref::<LmHeadOp>().unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let w = weights.linear_weight(op.weight);
+                let result = <CudaBackend as MatmulOps>::linear(&input, w)?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Zero-copy view ops (cannot use OpNode::execute) ---
+            "reshape" => {
+                let op = node.op.as_any().downcast_ref::<ReshapeOp>().unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let result = input.reshape(&op.shape);
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            "slice_view" => {
+                let op = node.op.as_any().downcast_ref::<SliceViewOp>().unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let result = input.slice_view(op.offset, &op.shape);
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Standard input injection ---
+            "input" => {
+                let tensor = inputs[input_idx].clone();
+                input_idx += 1;
+                store(&mut buffers, node_id, 0, tensor);
+            }
+
+            // --- All other ops: fall through to standard dispatch ---
+            _ => {
+                // Re-use the standard execute logic for this node by calling
+                // OpNode::execute directly (no special handling needed for
+                // non-indirect ops in a CUDA graph context).
+                let node_inputs: Vec<&CudaTensor> =
+                    node.inputs.iter().map(|&inp| read(&buffers, inp)).collect();
+                let outputs = node.op.execute(&node_inputs, weights, ctx)?;
+                for (i, out) in outputs.into_iter().enumerate() {
+                    store(&mut buffers, node_id, i as u32, out);
+                }
+            }
+        }
+    }
+
     let outputs = output_nodes
         .iter()
         .map(|&id| take(&mut buffers, id, 0))
