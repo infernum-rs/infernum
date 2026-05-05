@@ -9,8 +9,7 @@ use std::path::Path;
 use infernum::graph::{Graph, WeightStore};
 use infernum::{DType, Result};
 use infernum_cuda::{
-    load_graph_weights_cuda, CudaBackend, CudaContext, CudaGraphEngineConfig, CudaTensor,
-    LinearWeight,
+    load_graph_weights_cuda, CudaContext, CudaGraphEngineConfig, CudaTensor, LinearWeight,
 };
 
 use crate::config::QwenConfig;
@@ -88,7 +87,7 @@ pub type QwenCudaGraphEngine = infernum_cuda::CudaGraphEngine<QwenConfig>;
 
 /// Extension trait providing Qwen-specific CUDA constructors.
 pub trait QwenCudaGraphEngineExt: Sized {
-    /// Load a Qwen-family model from a SafeTensors directory onto a CUDA device.
+    /// Load a Qwen-family model from a `SafeTensors` directory onto a CUDA device.
     ///
     /// # Errors
     ///
