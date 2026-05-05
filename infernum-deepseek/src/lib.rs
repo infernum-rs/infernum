@@ -8,9 +8,13 @@ mod model;
 
 #[cfg(feature = "cpu")]
 pub mod graph_builder;
+#[cfg(feature = "cpu")]
+pub mod graph_engine;
 
 pub use chat_templates::DeepSeekTemplate;
 pub use config::DeepSeekConfig;
 #[cfg(feature = "cpu")]
 pub use graph_builder::load_graph_weights_safetensors;
+#[cfg(feature = "cpu")]
+pub use graph_engine::DeepSeekGraphEngine;
 pub use model::{split_kv_b_proj_dense, DeepSeekModel, DeepSeekOps};

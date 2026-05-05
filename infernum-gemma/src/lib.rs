@@ -10,6 +10,8 @@
 mod chat_templates;
 mod config;
 pub mod graph_builder;
+#[cfg(feature = "cpu")]
+pub mod graph_engine;
 mod model;
 
 pub use chat_templates::GemmaTemplate;
@@ -20,6 +22,8 @@ pub use graph_builder::{
 };
 #[cfg(feature = "cpu")]
 pub use graph_builder::{load_graph_weights_gguf, load_graph_weights_safetensors};
+#[cfg(feature = "cpu")]
+pub use graph_engine::GemmaGraphEngine;
 pub use model::GemmaModel;
 
 /// Type alias for Gemma 2 models (`model_type: "gemma2"`)
