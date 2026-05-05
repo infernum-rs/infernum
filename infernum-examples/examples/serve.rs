@@ -123,11 +123,11 @@ async fn main() -> Result<()> {
 
     let entry = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
-            let model = LlamaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = LlamaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
-            let model = QwenCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = QwenCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "deepseek_v3" => {
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
             ));
         }
         "gemma2" | "gemma3_text" => {
-            let model = GemmaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = GemmaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         other => {

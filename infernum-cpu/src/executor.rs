@@ -415,6 +415,26 @@ pub fn execute(
                 }
             }
 
+            "geglu" => {
+                // GeGLU: gelu(gate) * up, where gelu uses the tanh approximation.
+                let gate = read_tensor(arena, plan, nodes, node.inputs[0]);
+                let up = read_tensor(arena, plan, nodes, node.inputs[1]);
+                let gate_data = gate.as_f32_slice();
+                let up_data = up.as_f32_slice();
+                let n = gate_data.len();
+                let mut out = vec![0.0f32; n];
+                // tanh-approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+                const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2 / π)
+                for i in 0..n {
+                    let x = gate_data[i];
+                    let inner = SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x);
+                    let gelu = 0.5 * x * (1.0 + inner.tanh());
+                    out[i] = gelu * up_data[i];
+                }
+                let result = CpuTensor::from_f32(&node.output_shapes[0], &out);
+                write_tensor(arena, plan, node_id, 0, &result);
+            }
+
             "silu" => {
                 let input = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let data = input.as_f32_slice();
