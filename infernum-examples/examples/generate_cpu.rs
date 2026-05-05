@@ -18,7 +18,6 @@ use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cpu::CpuBackend;
 use infernum_gemma::{GemmaGraphEngine, GemmaGraphEngineExt as _};
 use infernum_llama::{LlamaGraphEngine, LlamaGraphEngineExt as _};
-use infernum_qwen::{QwenGraphEngine, QwenGraphEngineExt as _};
 use infernum_runtime::{Engine, Runtime};
 
 /// CPU text generation with LLMs (SafeTensors + GGUF)

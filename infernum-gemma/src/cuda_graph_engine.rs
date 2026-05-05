@@ -9,8 +9,7 @@ use std::path::Path;
 use infernum::graph::{Graph, WeightStore};
 use infernum::{DType, Result};
 use infernum_cuda::{
-    load_graph_weights_cuda, CudaBackend, CudaContext, CudaGraphEngineConfig, CudaTensor,
-    LinearWeight,
+    load_graph_weights_cuda, CudaContext, CudaGraphEngineConfig, CudaTensor, LinearWeight,
 };
 
 use crate::config::GemmaConfig;

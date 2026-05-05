@@ -9,8 +9,7 @@ use std::path::Path;
 use infernum::graph::{Graph, WeightStore};
 use infernum::{DType, Result};
 use infernum_cuda::{
-    load_graph_weights_cuda, CudaBackend, CudaContext, CudaGraphEngineConfig, CudaTensor,
-    LinearWeight,
+    load_graph_weights_cuda, CudaContext, CudaGraphEngineConfig, CudaTensor, LinearWeight,
 };
 
 use crate::config::LlamaConfig;
@@ -89,7 +88,7 @@ pub type LlamaCudaGraphEngine = infernum_cuda::CudaGraphEngine<LlamaConfig>;
 
 /// Extension trait providing Llama-specific CUDA constructors.
 pub trait LlamaCudaGraphEngineExt: Sized {
-    /// Load a Llama-family model from a SafeTensors directory onto a CUDA device.
+    /// Load a Llama-family model from a `SafeTensors` directory onto a CUDA device.
     ///
     /// # Errors
     ///
