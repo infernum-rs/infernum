@@ -409,6 +409,8 @@ fn bench_graph(
             &weights,
             &inputs,
             graph.output_ids(),
+            None,
+            0,
         )?;
         ctx.synchronize()?;
         assert_eq!(outputs[0].shape()[0], n_tokens);
@@ -428,6 +430,8 @@ fn bench_graph(
             &weights,
             &inputs,
             graph.output_ids(),
+            None,
+            0,
         )?;
         ctx.synchronize()?;
         let elapsed = start.elapsed();
@@ -582,6 +586,8 @@ fn bench_graph_decode(
             weights,
             &inputs,
             graph.output_ids(),
+            None,
+            0,
         )?;
 
         // Outputs: [logits, k_0, k_1, ..., k_{n-1}, v_0, v_1, ..., v_{n-1}]
@@ -1299,12 +1305,12 @@ fn main() -> infernum::Result<()> {
                     "GGUF loading is not yet supported by the CUDA graph engine.".to_string(),
                 ));
             }
-            let model = LlamaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = LlamaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "bf16", cli.n_gen)
         }
         "qwen" => {
-            let model = QwenCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = QwenCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "bf16", cli.n_gen)
         }
@@ -1314,7 +1320,7 @@ fn main() -> infernum::Result<()> {
             ));
         }
         "gemma" => {
-            let model = GemmaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = GemmaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
             bench_with_info(model, nl, hs, "bf16", cli.n_gen)
         }

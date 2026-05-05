@@ -548,7 +548,7 @@ where
 /// Map a SafeTensors weight name (HuggingFace convention) to its GGUF key.
 ///
 /// Gemma 2 / Gemma 3 use `blk.N.*` block prefixes with the following suffixes:
-/// - `attn_norm` / `post_attn_norm` / `ffn_norm` / `post_ffw_norm` for the 4 norms
+/// - `attn_norm` / `post_attention_norm` / `ffn_norm` / `post_ffw_norm` for the 4 norms
 /// - `attn_q` / `attn_k` / `attn_v` / `attn_output` for attention projections
 /// - `ffn_gate` / `ffn_up` / `ffn_down` for GeGLU projections
 /// - Optional `attn_q_norm` / `attn_k_norm` for Gemma 3 per-head QK-norm
@@ -566,7 +566,7 @@ fn safetensors_to_gguf_name(name: &str) -> String {
         let suffix = &rest[dot + 1..];
         let gguf_suffix = match suffix {
             "input_layernorm.weight" => "attn_norm.weight",
-            "post_attention_layernorm.weight" => "post_attn_norm.weight",
+            "post_attention_layernorm.weight" => "post_attention_norm.weight",
             "pre_feedforward_layernorm.weight" => "ffn_norm.weight",
             "post_feedforward_layernorm.weight" => "post_ffw_norm.weight",
             "self_attn.q_proj.weight" => "attn_q.weight",
