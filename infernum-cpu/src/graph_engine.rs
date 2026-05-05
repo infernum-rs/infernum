@@ -548,49 +548,76 @@ impl<C: GraphEngineConfig> infernum::Model for GraphEngine<C> {
         _start_pos: usize,
     ) -> infernum::Result<<CpuBackend as infernum::backend::Backend>::Logits> {
         use infernum::Backend as _;
+        // The prefill graph only outputs logits — it does not produce KV cache
+        // tensors. To correctly populate the KV cache for subsequent decode
+        // steps, we process prompt tokens sequentially through the decode graph
+        // (the same path as forward_batch_decode). This is O(n²) in prompt
+        // length but is functionally correct with the existing graph structure.
         let config = &self.config;
-        let seq_len = input_ids.len();
         let head_dim = config.head_dim();
         let half_dim = head_dim / 2;
         let num_layers = config.num_hidden_layers();
         let vocab_size = config.vocab_size();
-
-        let mut graph = config.build_prefill_graph(seq_len);
-        optimizer::optimize(&mut graph);
-        let ep = plan(&graph);
+        let seq_len = input_ids.len();
 
         let (cos_data, sin_data) = precompute_rope_data(seq_len, head_dim, config.rope_theta());
-        let input_ids_t = CpuTensor::from_u32(&[seq_len], input_ids);
-        let cos_t = CpuTensor::from_f32(&[seq_len, half_dim], &cos_data);
-        let sin_t = CpuTensor::from_f32(&[seq_len, half_dim], &sin_data);
-        let inputs = vec![input_ids_t, cos_t, sin_t];
 
-        let mut arena = Arena::new(ep.arena_size);
-        let output_nodes = graph.output_ids().to_vec();
-        let outputs = execute(
-            &ep,
-            graph.nodes(),
-            &mut arena,
-            &self.weights,
-            &inputs,
-            &output_nodes,
-            None,
-        )?;
+        let mut last_logits: Option<<CpuBackend as infernum::backend::Backend>::Logits> = None;
 
-        // Store updated K/V (outputs[1..1+L] = K per layer, outputs[1+L..1+2L] = V per layer).
-        {
-            let mut store = kv_cache.inner.lock().expect("GraphKvCache mutex poisoned");
-            store.update_from_outputs(&outputs, num_layers);
+        for (pos, &token) in input_ids.iter().enumerate() {
+            let kv_len = kv_cache.seq_len();
+
+            let mut graph = config.build_decode_graph(kv_len);
+            optimizer::optimize(&mut graph);
+            let ep = plan(&graph);
+
+            let cos_row = &cos_data[pos * half_dim..(pos + 1) * half_dim];
+            let sin_row = &sin_data[pos * half_dim..(pos + 1) * half_dim];
+
+            let input_id_t = CpuTensor::from_u32(&[1], &[token]);
+            let cos_t = CpuTensor::from_f32(&[1, half_dim], cos_row);
+            let sin_t = CpuTensor::from_f32(&[1, half_dim], sin_row);
+
+            let mut inputs = vec![input_id_t, cos_t, sin_t];
+            {
+                // When kv_len == 0, get_layer returns empty [0, num_kv_heads, head_dim] tensors,
+                // which is exactly what the decode graph expects for an empty cache.
+                let store = kv_cache.inner.lock().expect("GraphKvCache mutex poisoned");
+                for layer in 0..num_layers {
+                    let (k, v) = store.get_layer(layer, kv_len);
+                    inputs.push(k);
+                    inputs.push(v);
+                }
+            }
+
+            let mut arena = Arena::new(ep.arena_size.max(self.decode.plan.arena_size));
+            let output_nodes = graph.output_ids().to_vec();
+            let outputs = execute(
+                &ep,
+                graph.nodes(),
+                &mut arena,
+                &self.weights,
+                &inputs,
+                &output_nodes,
+                None,
+            )?;
+
+            {
+                let mut store = kv_cache.inner.lock().expect("GraphKvCache mutex poisoned");
+                store.update_from_outputs(&outputs, num_layers);
+            }
+            kv_cache
+                .committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let logits_vec = outputs[0].to_f32_vec();
+            let logit_tensor = CpuTensor::from_f32(&[1, vocab_size], &logits_vec[..vocab_size]);
+            last_logits = Some(CpuBackend::logits_from_tensor(logit_tensor));
         }
-        kv_cache
-            .committed
-            .store(seq_len, std::sync::atomic::Ordering::Relaxed);
 
-        // Return last-position logits (shape [1, vocab_size]).
-        let logits_vec = outputs[0].to_f32_vec();
-        let last_row = logits_vec[(seq_len - 1) * vocab_size..seq_len * vocab_size].to_vec();
-        let last_tensor = CpuTensor::from_f32(&[1, vocab_size], &last_row);
-        Ok(CpuBackend::logits_from_tensor(last_tensor))
+        last_logits.ok_or_else(|| {
+            infernum::Error::InvalidShape("forward_prefill called with empty input_ids".into())
+        })
     }
 
     /// Batched decode. Only `batch_size=1` is supported on the graph CPU path.
