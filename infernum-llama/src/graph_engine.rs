@@ -101,7 +101,7 @@ fn find_kv_cache_node_ids(
         .enumerate()
         .filter(|(_, n)| n.op.name() == "input")
         .skip(3) // skip token_id, cos, sin
-        .map(|(i, _)| NodeId::from_index(i as u32))
+        .map(|(i, _)| NodeId::from_index(u32::try_from(i).expect("node index fits in u32")))
         .collect();
     assert_eq!(
         input_ids.len(),
@@ -113,7 +113,7 @@ fn find_kv_cache_node_ids(
         .iter()
         .enumerate()
         .filter(|(_, n)| n.op.name() == "concat_seq")
-        .map(|(i, _)| NodeId::from_index(i as u32))
+        .map(|(i, _)| NodeId::from_index(u32::try_from(i).expect("node index fits in u32")))
         .collect();
     assert_eq!(
         concat_ids.len(),
@@ -160,9 +160,14 @@ pub struct LlamaGraphEngine {
 ///
 /// Compiles the decode graph once at `kv_len=0`, runs the optimizer and
 /// memory planner, discovers KV cache node IDs, and pre-computes the full
-/// RoPE table up to `max_position_embeddings`.  Stored in `LlamaGraphEngine`
+/// RoPE table up to `max_position_embeddings`. Stored in [`LlamaGraphEngine`]
 /// so that `generate()` pays zero setup cost per call.
-fn build_decode_cache(config: &LlamaConfig) -> Result<DecodeCache> {
+///
+/// # Panics
+///
+/// Panics if the compiled decode graph does not contain the expected number of
+/// KV cache input nodes or `concat_seq` nodes (indicates a graph-builder bug).
+fn build_decode_cache(config: &LlamaConfig) -> DecodeCache {
     let head_dim = config.head_dim();
     let half_dim = head_dim / 2;
     let num_layers = config.num_hidden_layers;
@@ -177,7 +182,7 @@ fn build_decode_cache(config: &LlamaConfig) -> Result<DecodeCache> {
     let max_pos = config.max_position_embeddings;
     let (cos, sin) = precompute_rope_data(max_pos, head_dim, config.rope_theta);
 
-    Ok(DecodeCache {
+    DecodeCache {
         graph,
         plan: ep,
         logits_id,
@@ -186,7 +191,7 @@ fn build_decode_cache(config: &LlamaConfig) -> Result<DecodeCache> {
         cos,
         sin,
         half_dim,
-    })
+    }
 }
 
 impl LlamaGraphEngine {
@@ -215,7 +220,7 @@ impl LlamaGraphEngine {
         let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
         let weights = load_graph_weights_safetensors(&dummy_graph, model_dir, &config)?;
 
-        let decode = build_decode_cache(&config)?;
+        let decode = build_decode_cache(&config);
         Ok(Self {
             config,
             weights,
@@ -246,7 +251,7 @@ impl LlamaGraphEngine {
         let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
         let weights = load_graph_weights_gguf(&dummy_graph, &config, gguf_path)?;
 
-        let decode = build_decode_cache(&config)?;
+        let decode = build_decode_cache(&config);
         Ok(Self {
             config,
             weights,
@@ -378,13 +383,18 @@ impl LlamaGraphEngine {
     }
 }
 
+/// Returns the index of the maximum element in `slice` as a `u32`.
+/// Returns 0 if `slice` is empty.
+///
+/// # Panics
+///
+/// Panics if the number of elements exceeds `u32::MAX` (unreachable in practice).
 fn argmax(slice: &[f32]) -> u32 {
     slice
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+        .map_or(0, |(i, _)| u32::try_from(i).expect("index fits in u32"))
 }
 
 // ---------------------------------------------------------------------------

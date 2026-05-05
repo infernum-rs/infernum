@@ -707,13 +707,17 @@ pub fn load_graph_weights_safetensors(
     let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
 
     for i in 0..tensor_count {
-        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits in u32"),
+        ));
         let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
         store.push_tensor_weight(tensor);
     }
 
     for i in 0..linear_count {
-        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits in u32"),
+        ));
         // Handle tied embeddings: some models (e.g. SmolLM2) do not store
         // `lm_head.weight` separately — it is shared with `embed_tokens`.
         let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {
@@ -828,7 +832,9 @@ pub fn load_graph_weights_gguf(
 
     // ── Tensor weights (embeddings, layernorms) — always loaded as F32 ───────
     for i in 0..tensor_count {
-        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits in u32"),
+        ));
         let gguf_name = safetensors_to_gguf_name(&meta.name);
         let host = loader.load_f32(&gguf_name)?;
         store.push_tensor_weight(CpuTensor::from_f32(&host.shape, host.as_f32_slice()));
@@ -836,7 +842,9 @@ pub fn load_graph_weights_gguf(
 
     // ── Linear weights — loaded in native format (quantized or dense) ─────────
     for i in 0..linear_count {
-        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits in u32"),
+        ));
         let gguf_name = safetensors_to_gguf_name(&meta.name);
 
         // Resolve the actual GGUF name, falling back to tied embeddings.
