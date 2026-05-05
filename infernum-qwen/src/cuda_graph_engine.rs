@@ -26,7 +26,7 @@ impl CudaGraphEngineConfig for QwenConfig {
     }
 
     fn num_kv_heads(&self) -> usize {
-        self.num_key_value_heads
+        self.num_kv_heads()
     }
 
     fn head_dim(&self) -> usize {
@@ -101,7 +101,7 @@ impl QwenCudaGraphEngineExt for QwenCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
         let config_text = std::fs::read_to_string(model_dir.join("config.json"))?;
         let config: QwenConfig = serde_json::from_str(&config_text)
-            .map_err(|e| infernum::Error::InvalidConfig(e.to_string()))?;
+            .map_err(|e| infernum::Error::Other(e.to_string()))?;
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
     }
 }

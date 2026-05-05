@@ -49,16 +49,12 @@ impl CudaGraphEngineConfig for GemmaConfig {
         self.eos_token_id
     }
 
-    fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
-        let (graph, _) =
-            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16);
-        graph
+    fn build_prefill_graph_cuda(&self, _seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+        build_prefill_graph::<infernum_cuda::CudaBackend>(self, DType::BF16)
     }
 
     fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<infernum_cuda::CudaBackend> {
-        let (graph, _) =
-            build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16);
-        graph
+        build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16)
     }
 
     fn load_weights_cuda_safetensors(
@@ -100,7 +96,7 @@ pub trait GemmaCudaGraphEngineExt: Sized {
 impl GemmaCudaGraphEngineExt for GemmaCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
         let config_text = std::fs::read_to_string(model_dir.join("config.json"))?;
-        let config = GemmaConfig::from_str(&config_text)?;
+        let config = GemmaConfig::from_str(&config_text);
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
     }
 }

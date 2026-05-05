@@ -78,7 +78,8 @@ fn store(
 #[allow(
     clippy::too_many_lines,
     clippy::missing_panics_doc,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::similar_names
 )]
 pub fn execute(
     plan: &ExecutionPlan,
@@ -86,7 +87,7 @@ pub fn execute(
     weights: &WeightStore<CudaTensor, LinearWeight>,
     inputs: &[CudaTensor],
     output_nodes: &[NodeId],
-    mla_kv_cache: Option<&mut Vec<Vec<CudaTensor>>>,
+    mut mla_kv_cache: Option<&mut Vec<Vec<CudaTensor>>>,
     mla_seq_pos: usize,
 ) -> Result<Vec<CudaTensor>> {
     let mut buffers: Vec<Vec<Option<CudaTensor>>> = nodes

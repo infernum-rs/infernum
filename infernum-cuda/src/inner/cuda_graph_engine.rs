@@ -14,9 +14,9 @@
 //! # Limitations
 //!
 //! - Only `batch_size = 1` is supported in decode; block tables are ignored.
-//! - MoE models (Qwen3-MoE, Mixtral) require the CUDA MoE dispatch arms to be
+//! - `MoE` models (Qwen3-MoE, Mixtral) require the CUDA `MoE` dispatch arms to be
 //!   present in the executor (added in Step 6).
-//! - DeepSeek (MLA) is not supported via this generic path; it remains a separate
+//! - `DeepSeek` (MLA) is not supported via this generic path; it remains a separate
 //!   implementation.
 //! - Graphs are rebuilt for each decode step (no indirect / CUDA graph capture).
 //!   A future optimization can adopt the `CudaDecodeEngine` approach.
@@ -31,6 +31,7 @@ use infernum::{DType, ModelConfig, Result};
 use super::executor::execute;
 use crate::cuda::ops::LinearWeight;
 use crate::cuda::{CudaContext, CudaTensor};
+use crate::cuda_logits::CudaLogits;
 use crate::weights::{CudaWeightLoader, SafeTensorsLoader};
 use crate::CudaBackend;
 
@@ -43,8 +44,7 @@ use crate::CudaBackend;
 /// Model crates implement this for their `*Config` type. It provides:
 /// - Scalar config getters (matching [`infernum_cpu::GraphEngineConfig`]).
 /// - Methods to build `Graph<CudaBackend>` for prefill and decode.
-/// - A method to load weights from a SafeTensors directory into a CUDA
-///   [`WeightStore`].
+/// - A method to load weights from a `SafeTensors` directory into a CUDA///   [`WeightStore`].
 pub trait CudaGraphEngineConfig: Send + Sync + 'static {
     fn num_hidden_layers(&self) -> usize;
     fn num_kv_heads(&self) -> usize;
@@ -60,7 +60,7 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
     /// Build a decode-mode graph for a KV cache of the given length.
     fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<CudaBackend>;
 
-    /// Load all model weights from a SafeTensors directory into CUDA memory.
+    /// Load all model weights from a `SafeTensors` directory into CUDA memory.
     ///
     /// The `dummy_graph` (a prefill graph built with a small `seq_len`) is
     /// used to enumerate weight metadata (names, shapes, dtypes). The weights
@@ -81,7 +81,7 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
 // Generic CUDA weight loader helper
 // ---------------------------------------------------------------------------
 
-/// Load all graph weights from a SafeTensors directory into CUDA memory.
+/// Load all graph weights from a `SafeTensors` directory into CUDA memory.
 ///
 /// Iterates the graph's weight metadata (tensor weights and linear weights),
 /// loads each from disk via a [`CudaWeightLoader`], and returns a populated
@@ -89,7 +89,11 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
 ///
 /// The `lm_head_fallback` parameter, when `true`, silently falls back to
 /// loading `model.embed_tokens.weight` when `lm_head.weight` is absent
-/// (tied-embedding models such as SmolLM2).
+/// (tied-embedding models such as `SmolLM2`).
+///
+/// # Panics
+///
+/// Panics if the number of weights in the graph exceeds `u32::MAX`.
 ///
 /// # Errors
 ///
@@ -141,6 +145,7 @@ pub fn load_graph_weights_cuda(
 // RoPE precomputation (mirrors infernum-cpu/src/graph_engine.rs)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::cast_precision_loss)]
 fn precompute_rope_row(pos: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
     let half_dim = head_dim / 2;
     let mut cos_row = Vec::with_capacity(half_dim);
@@ -238,12 +243,12 @@ pub struct CudaGraphEngine<C: CudaGraphEngineConfig> {
     config: C,
     ctx: CudaContext,
     weights: Arc<WeightStore<CudaTensor, LinearWeight>>,
-    /// Cached `head_dim / 2` for RoPE slice arithmetic.
+    /// Cached `head_dim / 2` for `RoPE` slice arithmetic.
     half_dim: usize,
 }
 
 impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
-    /// Load a model from a SafeTensors directory.
+    /// Load a model from a `SafeTensors` directory.
     ///
     /// # Errors
     ///
@@ -419,7 +424,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             .into_iter()
             .next()
             .expect("prefill graph has no output");
-        Ok(CudaBackend::logits_from_tensor(logits_tensor))
+        Ok(CudaLogits::new(logits_tensor))
     }
 
     /// Single-sequence prefill with KV cache.
@@ -455,7 +460,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         let logits_f32 = outputs[0].to_vec::<f32>()?;
         let last_row = &logits_f32[(seq_len - 1) * vocab_size..seq_len * vocab_size];
         let last_t = CudaTensor::from_slice(&self.ctx, &[1, vocab_size], last_row)?;
-        Ok(CudaBackend::logits_from_tensor(last_t))
+        Ok(CudaLogits::new(last_t))
     }
 
     /// Batched decode. Only `batch_size = 1` is supported.
@@ -505,6 +510,6 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         let logits_vec = outputs[0].to_vec::<f32>()?;
         let logit_t =
             CudaTensor::from_slice(&self.ctx, &[1, vocab_size], &logits_vec[..vocab_size])?;
-        Ok(CudaBackend::logits_from_tensor(logit_t))
+        Ok(CudaLogits::new(logit_t))
     }
 }

@@ -2,8 +2,8 @@
 
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, KvCacheOps,
-    MatmulExtOps, MatmulOps, MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps,
-    PagedKvCacheOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
+    MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
+    RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::{DType, Result};
@@ -624,7 +624,12 @@ impl infernum::backend::MlaAttentionOps for CudaBackend {
     ///
     /// # Errors
     /// Returns an error if any CUDA kernel fails.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::cast_precision_loss
+    )]
     fn mla_attention(
         hidden: &CudaTensor,
         q_a_proj: &LinearWeight,
