@@ -1009,6 +1009,7 @@ dependencies = [
  "half",
  "infernum",
  "infernum-cpu",
+ "infernum-cuda",
  "serde",
  "serde_json",
 ]

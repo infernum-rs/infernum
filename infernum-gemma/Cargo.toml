@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 cpu = ["dep:infernum-cpu"]
-cuda = ["dep:infernum-cuda", "dep:infernum-runtime"]
+cuda = ["dep:infernum-cuda", "infernum-cuda/cuda", "dep:infernum-runtime"]
 nccl = ["cuda", "infernum-cuda/nccl"]
 integration = ["cuda"]
 

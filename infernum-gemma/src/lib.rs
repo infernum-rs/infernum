@@ -9,6 +9,8 @@
 
 mod chat_templates;
 mod config;
+#[cfg(feature = "cuda")]
+pub mod cuda_graph_engine;
 pub mod graph_builder;
 #[cfg(feature = "cpu")]
 pub mod graph_engine;
@@ -16,6 +18,8 @@ mod model;
 
 pub use chat_templates::GemmaTemplate;
 pub use config::GemmaConfig;
+#[cfg(feature = "cuda")]
+pub use cuda_graph_engine::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt};
 pub use graph_builder::{
     build_decode_graph, build_prefill_graph, GemmaGraphOps, LayerWeightIds, ModelWeightIds,
     QkNormIds,

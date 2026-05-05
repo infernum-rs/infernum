@@ -6,6 +6,8 @@
 
 mod chat_templates;
 mod config;
+#[cfg(feature = "cuda")]
+pub mod cuda_graph_engine;
 pub mod graph_builder;
 #[cfg(feature = "cpu")]
 pub mod graph_engine;
@@ -13,6 +15,8 @@ mod model;
 
 pub use chat_templates::{Llama3Template, MistralTemplate};
 pub use config::{LlamaConfig, QuantizationConfig};
+#[cfg(feature = "cuda")]
+pub use cuda_graph_engine::{LlamaCudaGraphEngine, LlamaCudaGraphEngineExt};
 pub use graph_builder::{
     build_decode_graph, build_indirect_decode_graph, build_prefill_graph, IndirectDecodeExtraIds,
     LayerWeightIds, LlamaGraphOps, ModelWeightIds,

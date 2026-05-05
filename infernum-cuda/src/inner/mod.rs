@@ -1,5 +1,6 @@
 mod backend_impl;
 pub mod cuda;
+pub mod cuda_graph_engine;
 pub mod cuda_logits;
 pub mod cuda_runtime_state;
 mod error;
@@ -9,6 +10,9 @@ pub mod model;
 pub mod weights;
 
 pub use backend_impl::CudaBackend;
+pub use cuda_graph_engine::{
+    load_graph_weights_cuda, CudaGraphEngine, CudaGraphEngineConfig, CudaGraphKvCache,
+};
 pub use cuda_logits::CudaLogits;
 pub use cuda_runtime_state::CudaRuntimeState;
 pub use graph_engine::CudaDecodeEngine;
