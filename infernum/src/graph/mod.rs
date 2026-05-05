@@ -18,11 +18,11 @@ pub use arena::Arena;
 pub use builder::Graph;
 pub use builder_traits::{
     GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps, GraphGegluOps,
-    GraphIndirectDecodeOps, GraphMatmulExtOps, GraphMatmulOps, GraphMoeOps, GraphNormOps,
-    GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps, GraphRopeOps,
-    GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
+    GraphIndirectDecodeOps, GraphMatmulExtOps, GraphMatmulOps, GraphMlaAttentionOps, GraphMoeOps,
+    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
+    GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
 };
-pub use builtin_ops::MoeExpertIds;
+pub use builtin_ops::{MlaAttentionOp, MoeExpertIds};
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use op_node::{OpNode, OutputRef};
 pub use planner::{plan, BufferSlot, ExecutionPlan, PlanCache};

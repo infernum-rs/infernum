@@ -6,6 +6,9 @@ mod chat_templates;
 mod config;
 mod model;
 
+#[cfg(feature = "cpu")]
+pub mod graph_builder;
+
 pub use chat_templates::DeepSeekTemplate;
 pub use config::DeepSeekConfig;
 pub use model::{split_kv_b_proj_dense, DeepSeekModel, DeepSeekOps};

@@ -2284,3 +2284,98 @@ impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
         self
     }
 }
+
+// ---------------------------------------------------------------------------
+// MlaAttentionOp
+// ---------------------------------------------------------------------------
+
+/// Multi-head Latent Attention (MLA) as used by DeepSeek V3 / R1.
+///
+/// This is an **opaque** op that encapsulates the entire MLA forward pass:
+/// Q LoRA compression + RMSNorm + expansion, joint KV projection + RMSNorm,
+/// KV decompression, interleaved RoPE, Q absorption, fused attention (with
+/// optional two-pass LSE combining for multi-chunk prefill), V absorption,
+/// and the output projection.
+///
+/// The KV cache stores the compressed latent `(c_kv, k_rope)` — this is a
+/// special case that the generic graph IR does not generalize over, making
+/// opacity the right design choice.
+///
+/// Shape contract:
+/// - `inputs[0]`: `[seq_len, hidden_size]` hidden states.
+/// - `outputs[0]`: `[seq_len, hidden_size]` attention output.
+///
+/// All weight tensors are fetched from the `WeightStore` via the stored IDs.
+/// The executor handles KV cache access and the full MLA algorithm.
+#[derive(Debug)]
+pub struct MlaAttentionOp {
+    // --- Attention projection weights ---
+    /// Q compression linear: `(hidden_size, q_lora_rank)`.
+    pub q_a_proj: WeightId,
+    /// Q compression RMSNorm weight: `(q_lora_rank,)`.
+    pub q_a_layernorm: WeightId,
+    /// Q expansion linear: `(q_lora_rank, num_heads * qk_head_dim)`.
+    pub q_b_proj: WeightId,
+    /// Joint KV compression linear: `(hidden_size, kv_lora_rank + qk_rope_head_dim)`.
+    pub kv_a_proj_with_mqa: WeightId,
+    /// KV compression RMSNorm weight: `(kv_lora_rank,)`.
+    pub kv_a_layernorm: WeightId,
+    /// K-nope decompression matrix (dense): `(kv_lora_rank, num_heads * qk_nope_head_dim)`.
+    pub kv_b_proj_k: WeightId,
+    /// V decompression matrix (dense, batched): `(num_heads, kv_lora_rank, v_head_dim)`.
+    pub kv_b_proj_v: WeightId,
+    /// K-transposed for Q absorption (batched): `(num_heads, qk_nope_head_dim, kv_lora_rank)`.
+    pub kv_b_proj_k_t: WeightId,
+    /// Output projection linear: `(num_heads * v_head_dim, hidden_size)`.
+    pub o_proj: WeightId,
+    // --- Dimension parameters (inlined to avoid config dep in graph IR) ---
+    /// Number of attention heads on this device (post-TP sharding).
+    pub num_heads: usize,
+    /// Non-RoPE portion of Q/K head dim.
+    pub qk_nope_head_dim: usize,
+    /// RoPE portion of Q/K head dim.
+    pub qk_rope_head_dim: usize,
+    /// Value head dim.
+    pub v_head_dim: usize,
+    /// KV compression rank.
+    pub kv_lora_rank: usize,
+    /// RMSNorm epsilon.
+    pub rms_norm_eps: f32,
+    /// Attention scale factor (pre-computed, includes YaRN mscale if applicable).
+    pub attn_scale: f32,
+    /// Layer index (for KV cache slot selection).
+    pub layer_idx: usize,
+}
+
+impl<B: Backend + MatmulOps> OpNode<B> for MlaAttentionOp {
+    fn name(&self) -> &'static str {
+        "mla_attention"
+    }
+    fn num_inputs(&self) -> usize {
+        1
+    }
+    fn num_outputs(&self) -> usize {
+        1
+    }
+    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        // Output hidden states have the same shape as input hidden states.
+        vec![input_shapes[0].to_vec()]
+    }
+    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+        vec![input_dtypes[0]]
+    }
+    fn execute(
+        &self,
+        _inputs: &[&B::Tensor],
+        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
+        _device: &B::DeviceHandle,
+    ) -> Result<Vec<B::Tensor>> {
+        panic!(
+            "MlaAttentionOp requires KV cache + runtime state access; \
+             must be dispatched by the executor"
+        )
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}

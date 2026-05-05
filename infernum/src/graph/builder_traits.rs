@@ -17,9 +17,10 @@ use super::builtin_ops::{
     CastFromF32Op, CastToF32Op, ConcatInnerDimOp, ConcatSeqOp, EmbeddingGatherOp, ExtractLastRowOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp, LinearOp,
     LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp,
-    MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, MoeExpertIds, MulOp, PagedAttentionDecodeOp,
-    RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp, RopeInterleavedOp as RopeIntOp,
-    RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp, Transpose2dOp,
+    MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, MoeExpertIds, MulOp,
+    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
+    RopeInterleavedOp as RopeIntOp, RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp,
+    Transpose2dOp,
 };
 use super::node::WeightId;
 use super::op_node::OutputRef;
@@ -1049,6 +1050,89 @@ impl<B: Backend + MatmulOps> GraphMoeOps for Graph<B> {
                 routed_scaling_factor,
             }),
             &[input],
+        );
+        (node_id, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlaAttentionOps
+// ---------------------------------------------------------------------------
+
+/// Graph builder method for the MLA attention block (DeepSeek V3/R1).
+pub trait GraphMlaAttentionOps {
+    /// Add an opaque MLA attention node.
+    ///
+    /// `hidden` is the input tensor `[seq_len, hidden_size]`. The node
+    /// encapsulates all MLA projections, interleaved RoPE, fused attention,
+    /// and the output projection. The executor handles KV cache access.
+    #[allow(clippy::too_many_arguments)]
+    fn add_mla_attention(
+        &mut self,
+        hidden: OutputRef,
+        q_a_proj: WeightId,
+        q_a_layernorm: WeightId,
+        q_b_proj: WeightId,
+        kv_a_proj_with_mqa: WeightId,
+        kv_a_layernorm: WeightId,
+        kv_b_proj_k: WeightId,
+        kv_b_proj_v: WeightId,
+        kv_b_proj_k_t: WeightId,
+        o_proj: WeightId,
+        num_heads: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        v_head_dim: usize,
+        kv_lora_rank: usize,
+        rms_norm_eps: f32,
+        attn_scale: f32,
+        layer_idx: usize,
+    ) -> OutputRef;
+}
+
+impl<B: Backend + MatmulOps> GraphMlaAttentionOps for Graph<B> {
+    fn add_mla_attention(
+        &mut self,
+        hidden: OutputRef,
+        q_a_proj: WeightId,
+        q_a_layernorm: WeightId,
+        q_b_proj: WeightId,
+        kv_a_proj_with_mqa: WeightId,
+        kv_a_layernorm: WeightId,
+        kv_b_proj_k: WeightId,
+        kv_b_proj_v: WeightId,
+        kv_b_proj_k_t: WeightId,
+        o_proj: WeightId,
+        num_heads: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        v_head_dim: usize,
+        kv_lora_rank: usize,
+        rms_norm_eps: f32,
+        attn_scale: f32,
+        layer_idx: usize,
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(MlaAttentionOp {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+                kv_a_proj_with_mqa,
+                kv_a_layernorm,
+                kv_b_proj_k,
+                kv_b_proj_v,
+                kv_b_proj_k_t,
+                o_proj,
+                num_heads,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                v_head_dim,
+                kv_lora_rank,
+                rms_norm_eps,
+                attn_scale,
+                layer_idx,
+            }),
+            &[hidden],
         );
         (node_id, 0)
     }
