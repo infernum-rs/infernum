@@ -255,7 +255,17 @@ pub fn execute(
                 let input = read(&buffers, node.inputs[0]);
                 let bias_w = weights.tensor_weight(op.bias);
                 let mut result = input.clone();
-                <CudaBackend as BiasOps>::bias_add_inplace(&mut result, bias_w)?;
+                // Cast bias to match input dtype when they differ (e.g. F32 bias
+                // loaded from a Qwen2.5 checkpoint applied to a BF16 activation).
+                // The CUDA kernel requires both operands to share the same dtype.
+                let bias_cast;
+                let bias_ref = if bias_w.dtype() == result.dtype() {
+                    bias_w
+                } else {
+                    bias_cast = ops::cast_from_f32(bias_w, result.dtype())?;
+                    &bias_cast
+                };
+                <CudaBackend as BiasOps>::bias_add_inplace(&mut result, bias_ref)?;
                 store(&mut buffers, node_id, 0, result);
             }
 
@@ -439,13 +449,16 @@ pub fn execute(
                     .unwrap();
                 let input = read(&buffers, node.inputs[0]).clone();
                 let gate_t = weights.tensor_weight(op.gate);
+                // The checkpoint stores gate as [num_experts, hidden]; moe_route
+                // computes `hidden @ gate` so it needs [hidden, num_experts].
+                let gate_t = ops::transpose_2d(gate_t)?;
                 let num_experts = op.experts.len();
                 let num_experts_per_tok = op.num_experts_per_tok;
                 let norm_topk = op.norm_topk;
                 let expert_ids = op.experts.clone();
                 let result = <CudaBackend as MoeOps>::moe_forward_softmax(
                     &input,
-                    gate_t,
+                    &gate_t,
                     num_experts,
                     num_experts_per_tok,
                     norm_topk,
@@ -472,6 +485,9 @@ pub fn execute(
                     .unwrap();
                 let input = read(&buffers, node.inputs[0]).clone();
                 let gate_t = weights.tensor_weight(op.gate);
+                // The checkpoint stores gate as [num_experts, hidden]; moe_route_sigmoid
+                // computes `hidden @ gate` so it needs [hidden, num_experts].
+                let gate_t = ops::transpose_2d(gate_t)?;
                 let bias_data: Vec<f32> = if let Some(bias_id) = op.bias {
                     weights.tensor_weight(bias_id).to_vec::<f32>()?
                 } else {
@@ -486,7 +502,7 @@ pub fn execute(
                 let shared_ids = op.shared_expert.clone();
                 let mut result = <CudaBackend as MoeSigmoidOps>::moe_forward_sigmoid(
                     &input,
-                    gate_t,
+                    &gate_t,
                     &bias_data,
                     num_experts,
                     num_experts_per_tok,
