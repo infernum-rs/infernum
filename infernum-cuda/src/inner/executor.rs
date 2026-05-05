@@ -9,15 +9,16 @@
 //! provides allocation reuse automatically.
 
 use infernum::backend::{
-    ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, NormOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, MoeOps,
+    MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, AppendKvIndirectOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
     EmbeddingGatherIndirectOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
-    LmHeadOp, LogitSoftcapOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
-    RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    LmHeadOp, LogitSoftcapOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, RepeatKvOp, ReshapeOp,
+    RmsNormOp, RmsNormQkOp, RopeBatchedOp, RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp,
+    SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -419,6 +420,95 @@ pub fn execute(
                 let k_normed = <CudaBackend as NormOps>::rms_norm(k, k_w, op.eps)?;
                 store(&mut buffers, node_id, 0, q_normed);
                 store(&mut buffers, node_id, 1, k_normed);
+            }
+
+            // --- MoE softmax dispatch (Mixtral, Qwen3-MoE) ---
+            "moe_dispatch_softmax" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<MoeDispatchSoftmaxOp>()
+                    .unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let gate_t = weights.tensor_weight(op.gate);
+                let num_experts = op.experts.len();
+                let num_experts_per_tok = op.num_experts_per_tok;
+                let norm_topk = op.norm_topk;
+                let expert_ids = op.experts.clone();
+                let result = <CudaBackend as MoeOps>::moe_forward_softmax(
+                    &input,
+                    gate_t,
+                    num_experts,
+                    num_experts_per_tok,
+                    norm_topk,
+                    |expert_idx, expert_input| {
+                        let eids = &expert_ids[expert_idx];
+                        let gate_w = weights.linear_weight(eids.gate_proj);
+                        let up_w = weights.linear_weight(eids.up_proj);
+                        let down_w = weights.linear_weight(eids.down_proj);
+                        let gate_out = <CudaBackend as MatmulOps>::linear(expert_input, gate_w)?;
+                        let up_out = <CudaBackend as MatmulOps>::linear(expert_input, up_w)?;
+                        let activated = <CudaBackend as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                        <CudaBackend as MatmulOps>::linear(&activated, down_w)
+                    },
+                )?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- MoE sigmoid dispatch with bias correction (DeepSeek) ---
+            "moe_dispatch_sigmoid" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<MoeDispatchSigmoidOp>()
+                    .unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let gate_t = weights.tensor_weight(op.gate);
+                let bias_data: Vec<f32> = if let Some(bias_id) = op.bias {
+                    weights.tensor_weight(bias_id).to_vec::<f32>()?
+                } else {
+                    vec![0.0f32; op.experts.len()]
+                };
+                let num_experts = op.experts.len();
+                let num_experts_per_tok = op.num_experts_per_tok;
+                let n_group = op.n_group;
+                let topk_group = op.topk_group;
+                let routed_scaling_factor = op.routed_scaling_factor;
+                let expert_ids = op.experts.clone();
+                let shared_ids = op.shared_expert.clone();
+                let mut result = <CudaBackend as MoeSigmoidOps>::moe_forward_sigmoid(
+                    &input,
+                    gate_t,
+                    &bias_data,
+                    num_experts,
+                    num_experts_per_tok,
+                    n_group,
+                    topk_group,
+                    false, // DeepSeek normalises inside the kernel
+                    routed_scaling_factor,
+                    |expert_idx, expert_input| {
+                        let eids = &expert_ids[expert_idx];
+                        let gate_w = weights.linear_weight(eids.gate_proj);
+                        let up_w = weights.linear_weight(eids.up_proj);
+                        let down_w = weights.linear_weight(eids.down_proj);
+                        let gate_out = <CudaBackend as MatmulOps>::linear(expert_input, gate_w)?;
+                        let up_out = <CudaBackend as MatmulOps>::linear(expert_input, up_w)?;
+                        let activated = <CudaBackend as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                        <CudaBackend as MatmulOps>::linear(&activated, down_w)
+                    },
+                )?;
+                // Add shared expert output if present.
+                if let Some(sids) = shared_ids {
+                    let sg = weights.linear_weight(sids.gate_proj);
+                    let su = weights.linear_weight(sids.up_proj);
+                    let sd = weights.linear_weight(sids.down_proj);
+                    let sgate = <CudaBackend as MatmulOps>::linear(&input, sg)?;
+                    let sup_out = <CudaBackend as MatmulOps>::linear(&input, su)?;
+                    let sact = <CudaBackend as SwigluOps>::swiglu(&sgate, &sup_out)?;
+                    let shared_out = <CudaBackend as MatmulOps>::linear(&sact, sd)?;
+                    <CudaBackend as ArithOps>::add_inplace(&mut result, &shared_out)?;
+                }
+                store(&mut buffers, node_id, 0, result);
             }
 
             // --- Logit soft-cap: tanh(x / cap) * cap (Gemma 2 final logit) ---
