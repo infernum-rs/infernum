@@ -270,13 +270,13 @@ fn main() -> Result<()> {
 
     match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
-            let model = LlamaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = LlamaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             let num_layers = model.config().num_hidden_layers;
             let hidden_size = model.config().hidden_size;
             run_generate(model, tokenizer, num_layers, hidden_size, &cli)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
-            let model = QwenCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = QwenCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             let num_layers = model.config().num_hidden_layers;
             let hidden_size = model.config().hidden_size;
             run_generate(model, tokenizer, num_layers, hidden_size, &cli)
@@ -285,7 +285,7 @@ fn main() -> Result<()> {
             "DeepSeek CUDA graph engine is not yet implemented.".to_string(),
         )),
         "gemma2" | "gemma3_text" => {
-            let model = GemmaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let model = GemmaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             let num_layers = model.config().num_hidden_layers;
             let hidden_size = model.config().hidden_size;
             run_generate(model, tokenizer, num_layers, hidden_size, &cli)

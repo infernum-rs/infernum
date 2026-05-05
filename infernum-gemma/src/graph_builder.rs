@@ -250,9 +250,19 @@ where
         + GraphGegluOps
         + GraphSoftcapOps,
 {
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+
     let q = graph.add_linear(h_normed, ids.q_proj);
     let k = graph.add_linear(h_normed, ids.k_proj);
     let v = graph.add_linear(h_normed, ids.v_proj);
+
+    // Reshape to 3D [seq_len, num_heads, head_dim] for QK-norm and RoPE.
+    // 0 is the dynamic seq_len placeholder in the prefill graph.
+    let q = graph.add_reshape(q, &[0, num_heads, head_dim]);
+    let k = graph.add_reshape(k, &[0, num_kv_heads, head_dim]);
+    let v = graph.add_reshape(v, &[0, num_kv_heads, head_dim]);
 
     // Optional QK-norm (Gemma 3)
     let (q, k) = if let Some(ref qkn) = ids.qk_norm {
@@ -270,7 +280,9 @@ where
     let attn_out =
         graph.add_fused_attention_prefill(q, k, v, 0, attn_scale, softcap, sliding_window);
 
-    graph.add_linear(attn_out, ids.o_proj)
+    // Reshape back to 2D [seq_len, num_heads * head_dim] before the output projection.
+    let attn_flat = graph.add_reshape(attn_out, &[0, num_heads * head_dim]);
+    graph.add_linear(attn_flat, ids.o_proj)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -296,9 +308,18 @@ where
         + GraphGegluOps
         + GraphSoftcapOps,
 {
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+
     let q = graph.add_linear(h_normed, ids.q_proj);
     let k = graph.add_linear(h_normed, ids.k_proj);
     let v = graph.add_linear(h_normed, ids.v_proj);
+
+    // Reshape to 3D [1, num_heads, head_dim] for QK-norm and RoPE.
+    let q = graph.add_reshape(q, &[1, num_heads, head_dim]);
+    let k = graph.add_reshape(k, &[1, num_kv_heads, head_dim]);
+    let v = graph.add_reshape(v, &[1, num_kv_heads, head_dim]);
 
     // Optional QK-norm (Gemma 3)
     let (q, k) = if let Some(ref qkn) = ids.qk_norm {
@@ -319,7 +340,9 @@ where
     let _ = layer_idx;
     let attn_out = graph.add_fused_attention_decode(q, full_k, full_v, softcap);
 
-    (graph.add_linear(attn_out, ids.o_proj), full_k, full_v)
+    // Reshape back to 2D [1, num_heads * head_dim] before the output projection.
+    let attn_flat = graph.add_reshape(attn_out, &[1, num_heads * head_dim]);
+    (graph.add_linear(attn_flat, ids.o_proj), full_k, full_v)
 }
 
 // ---------------------------------------------------------------------------
