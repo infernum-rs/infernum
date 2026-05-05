@@ -17,7 +17,7 @@ use std::time::Instant;
 use clap::Parser;
 use serde::Deserialize;
 
-use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
+use infernum::tokenizer::LlamaTokenizer;
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cuda::cuda::CudaContext;
@@ -85,38 +85,34 @@ struct Cli {
     max_seq_len: Option<usize>,
 }
 
-/// Abstraction over tokenizer backends so we can use either one.
+/// Abstraction over tokenizer backends (currently only HuggingFace; GGUF
+/// support is not implemented for the CUDA graph engines).
 enum Tokenizer {
     HuggingFace(LlamaTokenizer),
-    Gguf(GgufTokenizer),
 }
 
 impl infernum::Tokenizer for Tokenizer {
     fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         match self {
             Self::HuggingFace(t) => t.encode(text, add_bos),
-            Self::Gguf(t) => t.encode(text, add_bos),
         }
     }
 
     fn decode(&self, ids: &[u32]) -> Result<String> {
         match self {
             Self::HuggingFace(t) => t.decode(ids),
-            Self::Gguf(t) => t.decode(ids),
         }
     }
 
     fn decode_token(&self, id: u32) -> Result<String> {
         match self {
             Self::HuggingFace(t) => t.decode_token(id),
-            Self::Gguf(t) => t.decode_token(id),
         }
     }
 
     fn eos_token_id(&self) -> u32 {
         match self {
             Self::HuggingFace(t) => t.eos_token_id(),
-            Self::Gguf(t) => t.eos_token_id(),
         }
     }
 }
@@ -125,7 +121,6 @@ impl Tokenizer {
     fn vocab_size(&self) -> usize {
         match self {
             Self::HuggingFace(t) => t.vocab_size(),
-            Self::Gguf(t) => t.vocab_size(),
         }
     }
 }
