@@ -280,7 +280,9 @@ fn build_attention_decode<B>(
     h_normed: OutputRef,
     cos_input: OutputRef,
     sin_input: OutputRef,
-) -> OutputRef
+    k_cache_input: OutputRef,
+    v_cache_input: OutputRef,
+) -> (OutputRef, OutputRef, OutputRef)
 where
     B: GemmaGraphOps,
     Graph<B>: GraphMatmulOps
@@ -306,12 +308,16 @@ where
     let q = graph.add_rope(q, cos_input, sin_input, 0);
     let k = graph.add_rope(k, cos_input, sin_input, 0);
 
+    // Accumulate K/V history via concat_seq.
+    let full_k = graph.add_concat_seq(k_cache_input, k);
+    let full_v = graph.add_concat_seq(v_cache_input, v);
+
     let softcap = config.attn_logit_softcapping;
     // Sliding window is tracked via KV cache metadata at decode time; not passed here.
     let _ = layer_idx;
-    let attn_out = graph.add_fused_attention_decode(q, k, v, softcap);
+    let attn_out = graph.add_fused_attention_decode(q, full_k, full_v, softcap);
 
-    graph.add_linear(attn_out, ids.o_proj)
+    (graph.add_linear(attn_out, ids.o_proj), full_k, full_v)
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +408,19 @@ where
 }
 
 /// Build the Gemma single-token decode graph.
-pub fn build_decode_graph<B>(config: &GemmaConfig, weight_dtype: DType) -> Graph<B>
+///
+/// ## Inputs
+/// 0. `token_id` — shape `[1]`, U32
+/// 1. `cos_cache` — shape `[1, head_dim]`
+/// 2. `sin_cache` — shape `[1, head_dim]`
+/// 3..3+L: `k_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
+/// 3+L..3+2L: `v_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
+///
+/// ## Outputs
+/// 0. `logits` — shape `[1, vocab_size]`
+/// 1..1+L: `full_k_i` — updated K caches (shape `[kv_len+1, ...]`)
+/// 1+L..1+2L: `full_v_i` — updated V caches
+pub fn build_decode_graph<B>(config: &GemmaConfig, kv_len: usize, weight_dtype: DType) -> Graph<B>
 where
     B: GemmaGraphOps,
     Graph<B>: GraphMatmulOps
@@ -420,25 +438,49 @@ where
     let ids = register_weights(&mut graph, config, weight_dtype);
 
     let hidden = config.hidden_size;
+    let num_kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+    let num_layers = config.num_hidden_layers;
 
     // Inputs: single token ID + RoPE cos/sin
     let token_input = graph.add_input(&[1], DType::U32);
-    let cos_input = graph.add_input(&[1, config.head_dim], weight_dtype);
-    let sin_input = graph.add_input(&[1, config.head_dim], weight_dtype);
+    let cos_input = graph.add_input(&[1, head_dim], weight_dtype);
+    let sin_input = graph.add_input(&[1, head_dim], weight_dtype);
+
+    // KV cache input nodes: one K + one V per layer.
+    let mut k_cache_inputs = Vec::with_capacity(num_layers);
+    let mut v_cache_inputs = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
+        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
+    }
 
     // Embedding lookup + scale
     let embed_scale = (hidden as f32).sqrt();
     let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
     h = graph.add_scale(h, embed_scale);
 
+    let mut full_k_outputs = Vec::with_capacity(num_layers);
+    let mut full_v_outputs = Vec::with_capacity(num_layers);
+
     for (layer_idx, layer_ids) in ids.layers.iter().enumerate() {
         // Pre-attention norm
         let normed = graph.add_rms_norm(h, layer_ids.input_layernorm, config.rms_norm_eps);
 
-        // Attention (decode: reads from KV cache, no sliding window in kernel)
-        let attn_out = build_attention_decode(
-            &mut graph, config, layer_idx, layer_ids, normed, cos_input, sin_input,
+        // Attention (decode with KV cache accumulation)
+        let (attn_out, full_k, full_v) = build_attention_decode(
+            &mut graph,
+            config,
+            layer_idx,
+            layer_ids,
+            normed,
+            cos_input,
+            sin_input,
+            k_cache_inputs[layer_idx],
+            v_cache_inputs[layer_idx],
         );
+        full_k_outputs.push(full_k);
+        full_v_outputs.push(full_v);
 
         // Post-attention norm then residual
         let post_attn_normed = graph.add_rms_norm(
@@ -478,8 +520,186 @@ where
         logits
     };
 
+    // Output 0: logits; outputs 1..1+L: full_k; outputs 1+L..1+2L: full_v.
     graph.set_output(logits.0);
+    for fk in &full_k_outputs {
+        graph.set_output(fk.0);
+    }
+    for fv in &full_v_outputs {
+        graph.set_output(fv.0);
+    }
+
     graph
+}
+
+// ---------------------------------------------------------------------------
+// GGUF name mapping
+// ---------------------------------------------------------------------------
+
+/// Map a SafeTensors weight name (HuggingFace convention) to its GGUF key.
+///
+/// Gemma 2 / Gemma 3 use `blk.N.*` block prefixes with the following suffixes:
+/// - `attn_norm` / `post_attn_norm` / `ffn_norm` / `post_ffw_norm` for the 4 norms
+/// - `attn_q` / `attn_k` / `attn_v` / `attn_output` for attention projections
+/// - `ffn_gate` / `ffn_up` / `ffn_down` for GeGLU projections
+/// - Optional `attn_q_norm` / `attn_k_norm` for Gemma 3 per-head QK-norm
+#[cfg(feature = "cpu")]
+fn safetensors_to_gguf_name(name: &str) -> String {
+    match name {
+        "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
+        "model.norm.weight" => return "output_norm.weight".to_string(),
+        "lm_head.weight" => return "output.weight".to_string(),
+        _ => {}
+    }
+    if let Some(rest) = name.strip_prefix("model.layers.") {
+        let dot = rest.find('.').expect("malformed layer weight name");
+        let layer_idx = &rest[..dot];
+        let suffix = &rest[dot + 1..];
+        let gguf_suffix = match suffix {
+            "input_layernorm.weight" => "attn_norm.weight",
+            "post_attention_layernorm.weight" => "post_attn_norm.weight",
+            "pre_feedforward_layernorm.weight" => "ffn_norm.weight",
+            "post_feedforward_layernorm.weight" => "post_ffw_norm.weight",
+            "self_attn.q_proj.weight" => "attn_q.weight",
+            "self_attn.k_proj.weight" => "attn_k.weight",
+            "self_attn.v_proj.weight" => "attn_v.weight",
+            "self_attn.o_proj.weight" => "attn_output.weight",
+            // Gemma 3 per-head QK-norm
+            "self_attn.q_norm.weight" => "attn_q_norm.weight",
+            "self_attn.k_norm.weight" => "attn_k_norm.weight",
+            "mlp.gate_proj.weight" => "ffn_gate.weight",
+            "mlp.up_proj.weight" => "ffn_up.weight",
+            "mlp.down_proj.weight" => "ffn_down.weight",
+            other => panic!("Unknown Gemma layer suffix: {other}"),
+        };
+        return format!("blk.{layer_idx}.{gguf_suffix}");
+    }
+    panic!("Unknown Gemma weight name: {name}");
+}
+
+// ---------------------------------------------------------------------------
+// Weight loaders (CPU backend)
+// ---------------------------------------------------------------------------
+
+/// Load SafeTensors weights from `model_dir` into a CPU weight store,
+/// using the layout encoded in `graph`.
+///
+/// Tied embeddings: if `lm_head.weight` is absent, `model.embed_tokens.weight`
+/// is used as the fallback (Gemma models often tie them).
+#[cfg(feature = "cpu")]
+pub fn load_graph_weights_safetensors(
+    graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
+    model_dir: &std::path::Path,
+    _config: &GemmaConfig,
+) -> infernum::Result<
+    infernum::graph::WeightStore<
+        infernum_cpu::tensor::CpuTensor,
+        infernum_cpu::tensor::CpuLinearWeight,
+    >,
+> {
+    use infernum::graph::WeightId;
+    use infernum::WeightLoader as _;
+    use infernum_cpu::CpuSafeTensorsLoader;
+
+    let loader = CpuSafeTensorsLoader::new(model_dir)?;
+
+    let tensor_count = graph.tensor_weight_count();
+    let linear_count = graph.linear_weight_count();
+
+    let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
+
+    for i in 0..tensor_count {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
+        store.push_tensor_weight(tensor);
+    }
+
+    for i in 0..linear_count {
+        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        // Handle tied embeddings: if `lm_head.weight` is absent in the
+        // checkpoint, use `model.embed_tokens.weight` as a fallback.
+        let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {
+            "model.embed_tokens.weight"
+        } else {
+            &meta.name
+        };
+        let weight = loader.load_linear(name, meta.dtype, None)?;
+        store.push_linear_weight(weight);
+    }
+
+    Ok(store)
+}
+
+/// Load GGUF weights from a single `.gguf` file into a CPU weight store.
+///
+/// Uses the GGUF key-naming convention (e.g. `blk.0.attn_q.weight`).
+/// Name mapping from SafeTensors convention is handled by
+/// [`safetensors_to_gguf_name`].
+#[cfg(feature = "cpu")]
+pub fn load_graph_weights_gguf(
+    graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
+    gguf_path: &std::path::Path,
+    _config: &GemmaConfig,
+) -> infernum::Result<
+    infernum::graph::WeightStore<
+        infernum_cpu::tensor::CpuTensor,
+        infernum_cpu::tensor::CpuLinearWeight,
+    >,
+> {
+    use infernum::graph::WeightId;
+    use infernum::weights::format::{host_transpose_2d, FormatLoader};
+    use infernum::weights::host::HostLinearWeight;
+    use infernum_cpu::tensor::CpuTensor;
+    use infernum_cpu::CpuBackend;
+
+    let loader =
+        infernum::weights::gguf::GgufLoader::from_file(gguf_path.to_str().ok_or_else(|| {
+            infernum::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "GGUF path is not valid UTF-8",
+            ))
+        })?)?;
+
+    let tensor_count = graph.tensor_weight_count();
+    let linear_count = graph.linear_weight_count();
+    let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
+
+    // Tensor weights (embeddings, layernorms) — loaded as F32.
+    for i in 0..tensor_count {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let gguf_name = safetensors_to_gguf_name(&meta.name);
+        let host = loader.load_f32(&gguf_name)?;
+        store.push_tensor_weight(CpuTensor::from_f32(&host.shape, host.as_f32_slice()));
+    }
+
+    // Linear weights — loaded in native format (quantized or dense).
+    for i in 0..linear_count {
+        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let gguf_name = safetensors_to_gguf_name(&meta.name);
+
+        // Resolve actual name with tied-embedding fallback.
+        let actual_name = if loader.contains(&gguf_name) {
+            gguf_name.clone()
+        } else if meta.name == "lm_head.weight" {
+            "token_embd.weight".to_string()
+        } else {
+            return Err(infernum::Error::WeightNotFound(gguf_name));
+        };
+
+        let dtype = FormatLoader::get_dtype(&loader, &actual_name)?;
+        let host_linear = if dtype.is_quantized() {
+            // Preserve native quantization for fast kernels at inference time.
+            HostLinearWeight::Quantized(FormatLoader::load_quantized(&loader, &actual_name)?)
+        } else {
+            // Dense path: load as F32, then transpose for matmul convention.
+            let host = loader.load_f32(&actual_name)?;
+            HostLinearWeight::Dense(host_transpose_2d(&host)?)
+        };
+        let linear = CpuBackend::upload_host_linear(&(), &host_linear)?;
+        store.push_linear_weight(linear);
+    }
+
+    Ok(store)
 }
 
 // ---------------------------------------------------------------------------
@@ -818,15 +1038,17 @@ mod tests {
     #[test]
     fn test_build_decode_graph_gemma2() {
         let config = gemma2_config();
-        let graph: Graph<TestBackend> = build_decode_graph(&config, DType::F32);
-        assert_eq!(graph.output_ids().len(), 1);
+        let graph: Graph<TestBackend> = build_decode_graph(&config, 0, DType::F32);
+        // Output 0: logits; outputs 1..1+L: full_k; outputs 1+L..1+2L: full_v.
+        assert_eq!(graph.output_ids().len(), 1 + 2 * config.num_hidden_layers);
     }
 
     #[test]
     fn test_build_decode_graph_gemma3() {
         let config = gemma3_config();
-        let graph: Graph<TestBackend> = build_decode_graph(&config, DType::F32);
-        assert_eq!(graph.output_ids().len(), 1);
+        let graph: Graph<TestBackend> = build_decode_graph(&config, 0, DType::F32);
+        // Output 0: logits; outputs 1..1+L: full_k; outputs 1+L..1+2L: full_v.
+        assert_eq!(graph.output_ids().len(), 1 + 2 * config.num_hidden_layers);
     }
 
     #[test]

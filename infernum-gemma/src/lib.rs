@@ -18,6 +18,8 @@ pub use graph_builder::{
     build_decode_graph, build_prefill_graph, GemmaGraphOps, LayerWeightIds, ModelWeightIds,
     QkNormIds,
 };
+#[cfg(feature = "cpu")]
+pub use graph_builder::{load_graph_weights_gguf, load_graph_weights_safetensors};
 pub use model::GemmaModel;
 
 /// Type alias for Gemma 2 models (`model_type: "gemma2"`)

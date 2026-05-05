@@ -506,6 +506,55 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Weight loaders (CPU backend)
+// ---------------------------------------------------------------------------
+
+/// Load SafeTensors weights from `model_dir` into a CPU weight store,
+/// using the weight layout encoded in `graph`.
+#[cfg(feature = "cpu")]
+pub fn load_graph_weights_safetensors(
+    graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
+    model_dir: &std::path::Path,
+    _config: &DeepSeekConfig,
+) -> infernum::Result<
+    infernum::graph::WeightStore<
+        infernum_cpu::tensor::CpuTensor,
+        infernum_cpu::tensor::CpuLinearWeight,
+    >,
+> {
+    use infernum::graph::WeightId;
+    use infernum::WeightLoader as _;
+    use infernum_cpu::CpuSafeTensorsLoader;
+
+    let loader = CpuSafeTensorsLoader::new(model_dir)?;
+
+    let tensor_count = graph.tensor_weight_count();
+    let linear_count = graph.linear_weight_count();
+
+    let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
+
+    for i in 0..tensor_count {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
+        store.push_tensor_weight(tensor);
+    }
+
+    for i in 0..linear_count {
+        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        // Handle tied embeddings (DeepSeek-V3 ties lm_head to embed_tokens).
+        let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {
+            "model.embed_tokens.weight"
+        } else {
+            &meta.name
+        };
+        let weight = loader.load_linear(name, meta.dtype, None)?;
+        store.push_linear_weight(weight);
+    }
+
+    Ok(store)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
