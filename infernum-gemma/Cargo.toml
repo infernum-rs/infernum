@@ -3,8 +3,17 @@ name = "infernum-gemma"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+cpu = ["dep:infernum-cpu"]
+cuda = ["dep:infernum-cuda", "dep:infernum-runtime"]
+nccl = ["cuda", "infernum-cuda/nccl"]
+integration = ["cuda"]
+
 [dependencies]
 infernum = { path = "../infernum" }
+infernum-cpu = { path = "../infernum-cpu", optional = true }
+infernum-cuda = { path = "../infernum-cuda", optional = true }
+infernum-runtime = { path = "../infernum-runtime", optional = true }
 half = { version = "2.4", features = ["num-traits", "bytemuck"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

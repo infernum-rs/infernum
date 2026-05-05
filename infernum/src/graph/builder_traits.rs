@@ -18,9 +18,8 @@ use super::builtin_ops::{
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp, LinearOp,
     LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp,
     MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, MoeExpertIds, MulOp, PagedAttentionDecodeOp,
-    RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
-    RopeInterleavedOp as RopeIntOp, RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp,
-    Transpose2dOp,
+    RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp, RopeInterleavedOp as RopeIntOp,
+    RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp, Transpose2dOp,
 };
 use super::node::WeightId;
 use super::op_node::OutputRef;

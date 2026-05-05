@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use infernum::backend::{ArithOps, AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps};
+use infernum::backend::{
+    ArithOps, AttentionOps, EmbedOps, MatmulExtOps, MatmulOps, RopeOps, TensorOps,
+};
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, BiasAddOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeOp,
     FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp,
@@ -909,8 +911,7 @@ pub fn execute(
                         let mut fused = vec![0.0f32; gate_data.len()];
                         simd::vec_silu_mul(gate_data, up_data, &mut fused);
                         let shape = gate_out.shape().to_vec();
-                        let activated =
-                            CpuTensor::from_f32_vec(&shape, fused);
+                        let activated = CpuTensor::from_f32_vec(&shape, fused);
                         crate::CpuBackend::linear(&activated, down_w)
                     },
                 )?;
@@ -961,8 +962,7 @@ pub fn execute(
                         let mut fused = vec![0.0f32; gate_data.len()];
                         simd::vec_silu_mul(gate_data, up_data, &mut fused);
                         let shape = gate_out.shape().to_vec();
-                        let activated =
-                            CpuTensor::from_f32_vec(&shape, fused);
+                        let activated = CpuTensor::from_f32_vec(&shape, fused);
                         crate::CpuBackend::linear(&activated, down_w)
                     },
                 )?;
