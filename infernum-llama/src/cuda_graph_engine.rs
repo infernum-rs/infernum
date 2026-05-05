@@ -1,0 +1,106 @@
+//! CUDA graph-mode inference engine for the Llama model family.
+//!
+//! Provides [`LlamaCudaGraphEngine`] (a type alias for
+//! [`infernum_cuda::CudaGraphEngine<LlamaConfig>`]) by implementing
+//! [`infernum_cuda::CudaGraphEngineConfig`] for [`LlamaConfig`].
+
+use std::path::Path;
+
+use infernum::graph::{Graph, WeightStore};
+use infernum::{DType, Result};
+use infernum_cuda::{
+    load_graph_weights_cuda, CudaBackend, CudaContext, CudaGraphEngineConfig, CudaTensor,
+    LinearWeight,
+};
+
+use crate::config::LlamaConfig;
+use crate::graph_builder::{build_decode_graph, build_prefill_graph};
+
+// ---------------------------------------------------------------------------
+// CudaGraphEngineConfig impl
+// ---------------------------------------------------------------------------
+
+impl CudaGraphEngineConfig for LlamaConfig {
+    fn num_hidden_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        LlamaConfig::num_kv_heads(self)
+    }
+
+    fn head_dim(&self) -> usize {
+        LlamaConfig::head_dim(self)
+    }
+
+    fn max_position_embeddings(&self) -> usize {
+        self.max_position_embeddings
+    }
+
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+        let (graph, _) =
+            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16);
+        graph
+    }
+
+    fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+        let (graph, _) =
+            build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16);
+        graph
+    }
+
+    fn load_weights_cuda_safetensors(
+        &self,
+        dummy_graph: &Graph<infernum_cuda::CudaBackend>,
+        ctx: &CudaContext,
+        model_dir: &Path,
+    ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
+        // SmolLM2 and some other Llama-family models use tied embeddings:
+        // `lm_head.weight` is absent and shares `model.embed_tokens.weight`.
+        load_graph_weights_cuda(
+            dummy_graph,
+            ctx,
+            model_dir,
+            /* lm_head_fallback */ true,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type alias + convenience constructors
+// ---------------------------------------------------------------------------
+
+/// CUDA graph-mode engine for Llama-family models.
+///
+/// A type alias for [`infernum_cuda::CudaGraphEngine<LlamaConfig>`].
+pub type LlamaCudaGraphEngine = infernum_cuda::CudaGraphEngine<LlamaConfig>;
+
+/// Extension trait providing Llama-specific CUDA constructors.
+pub trait LlamaCudaGraphEngineExt: Sized {
+    /// Load a Llama-family model from a SafeTensors directory onto a CUDA device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory is missing, weights cannot be loaded,
+    /// or `config.json` cannot be parsed.
+    fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self>;
+}
+
+impl LlamaCudaGraphEngineExt for LlamaCudaGraphEngine {
+    fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
+        let config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
+    }
+}

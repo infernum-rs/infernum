@@ -21,11 +21,9 @@ use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::CudaBackend;
-use infernum_deepseek::DeepSeekModel;
-use infernum_gemma::GemmaModel;
-use infernum_llama::LlamaModel;
-use infernum_qwen::QwenModel;
+use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _};
+use infernum_llama::{LlamaCudaGraphEngine, LlamaCudaGraphEngineExt as _};
+use infernum_qwen::{QwenCudaGraphEngine, QwenCudaGraphEngineExt as _};
 use infernum_runtime::{Engine, Runtime};
 
 /// Text generation with Llama and Qwen models
@@ -260,45 +258,40 @@ fn main() -> Result<()> {
     println!("CUDA context initialized");
 
     if is_gguf {
-        // GGUF is Llama-family only
-        let model = LlamaModel::<CudaBackend>::from_gguf(&ctx, &cli.model)?;
-        let gguf_loader = infernum_cuda::GgufLoader::from_file(&cli.model)?;
-        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(gguf_loader.metadata())?);
-        let num_layers = model.config().num_hidden_layers;
-        let hidden_size = model.config().hidden_size;
-        run_generate(model, tokenizer, num_layers, hidden_size, &cli)
-    } else {
-        let model_type = detect_model_type(&cli.model)?;
-        let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
+        return Err(infernum::Error::UnsupportedModel(
+            "GGUF loading is not yet supported by the CUDA graph engine. \
+             Use a SafeTensors model directory instead."
+                .to_string(),
+        ));
+    }
 
-        match model_type.as_str() {
-            "llama" | "mistral" | "mixtral" => {
-                let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-                let num_layers = model.config().num_hidden_layers;
-                let hidden_size = model.config().hidden_size;
-                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
-            }
-            "qwen2" | "qwen3" | "qwen3_moe" => {
-                let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-                let num_layers = model.config().num_hidden_layers;
-                let hidden_size = model.config().hidden_size;
-                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
-            }
-            "deepseek_v3" => {
-                let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-                let num_layers = model.config().num_hidden_layers;
-                let hidden_size = model.config().hidden_size;
-                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
-            }
-            "gemma2" | "gemma3_text" => {
-                let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-                let num_layers = model.config().num_hidden_layers;
-                let hidden_size = model.config().hidden_size;
-                run_generate(model, tokenizer, num_layers, hidden_size, &cli)
-            }
-            other => Err(infernum::Error::UnsupportedModel(format!(
-                "Unsupported model_type: \"{other}\". Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, deepseek_v3, gemma2, gemma3_text"
-            ))),
+    let model_type = detect_model_type(&cli.model)?;
+    let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
+
+    match model_type.as_str() {
+        "llama" | "mistral" | "mixtral" => {
+            let model = LlamaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let num_layers = model.config().num_hidden_layers;
+            let hidden_size = model.config().hidden_size;
+            run_generate(model, tokenizer, num_layers, hidden_size, &cli)
         }
+        "qwen2" | "qwen3" | "qwen3_moe" => {
+            let model = QwenCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let num_layers = model.config().num_hidden_layers;
+            let hidden_size = model.config().hidden_size;
+            run_generate(model, tokenizer, num_layers, hidden_size, &cli)
+        }
+        "deepseek_v3" => Err(infernum::Error::UnsupportedModel(
+            "DeepSeek CUDA graph engine is not yet implemented.".to_string(),
+        )),
+        "gemma2" | "gemma3_text" => {
+            let model = GemmaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
+            let num_layers = model.config().num_hidden_layers;
+            let hidden_size = model.config().hidden_size;
+            run_generate(model, tokenizer, num_layers, hidden_size, &cli)
+        }
+        other => Err(infernum::Error::UnsupportedModel(format!(
+            "Unsupported model_type: \"{other}\". Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
+        ))),
     }
 }

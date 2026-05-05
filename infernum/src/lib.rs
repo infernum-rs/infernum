@@ -29,9 +29,9 @@ pub mod weights;
 
 pub use backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, Comm, DecodeBufferOps, DecodeTensors,
-    EmbedOps, GegluOps, KvCacheOps, MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, MultiDeviceOps,
-    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, RopeOps, SafeTensorsLoaderOps,
-    SwigluOps, TensorDataOps, TensorFactory, TensorOps,
+    EmbedOps, GegluOps, KvCacheOps, MatmulExtOps, MatmulOps, MlaAttentionOps, MoeOps,
+    MoeSigmoidOps, MultiDeviceOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps,
+    RopeOps, SafeTensorsLoaderOps, SwigluOps, TensorDataOps, TensorFactory, TensorOps,
 };
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};
@@ -54,6 +54,6 @@ pub use graph::{
     plan, BufferSlot, ExecutionPlan, Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps,
     GraphCastOps, GraphEmbedOps, GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphNode,
     GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
-    GraphRopeOps, GraphSiluOps, GraphSwigluOps, GraphTensorOps, NodeId, OpNode, OutputRef,
-    WeightId, WeightMeta, WeightRef,
+    GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps, NodeId, OpNode,
+    OutputRef, WeightId, WeightMeta, WeightRef,
 };

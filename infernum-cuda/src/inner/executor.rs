@@ -9,15 +9,17 @@
 //! provides allocation reuse automatically.
 
 use infernum::backend::{
-    ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, NormOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
+    MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps, SwigluOps,
+    TensorOps,
 };
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, AppendKvIndirectOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
     EmbeddingGatherIndirectOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
-    LmHeadOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp, RopeIndirectOp, RopeInterleavedOp,
-    RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    LmHeadOp, LogitSoftcapOp, MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp,
+    RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp, RopeIndirectOp,
+    RopeInterleavedOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -73,13 +75,20 @@ fn store(
 /// # Errors
 ///
 /// Returns an error if any op kernel fails.
-#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    clippy::too_many_arguments,
+    clippy::similar_names
+)]
 pub fn execute(
     plan: &ExecutionPlan,
     nodes: &[GraphNode<CudaBackend>],
     weights: &WeightStore<CudaTensor, LinearWeight>,
     inputs: &[CudaTensor],
     output_nodes: &[NodeId],
+    mut mla_kv_cache: Option<&mut Vec<Vec<CudaTensor>>>,
+    mla_seq_pos: usize,
 ) -> Result<Vec<CudaTensor>> {
     let mut buffers: Vec<Vec<Option<CudaTensor>>> = nodes
         .iter()
@@ -402,6 +411,178 @@ pub fn execute(
                 let op = node.op.as_any().downcast_ref::<CastFromF32Op>().unwrap();
                 let input = read(&buffers, node.inputs[0]);
                 let result = <CudaBackend as CastOps>::cast_from_f32(input, op.target)?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Per-head QK RMSNorm (Qwen3, Gemma 3) ---
+            "rms_norm_qk" => {
+                let op = node.op.as_any().downcast_ref::<RmsNormQkOp>().unwrap();
+                let q = read(&buffers, node.inputs[0]);
+                let k = read(&buffers, node.inputs[1]);
+                let q_w = weights.tensor_weight(op.q_weight);
+                let k_w = weights.tensor_weight(op.k_weight);
+                // The CUDA rms_norm kernel treats the outermost dims as a batch,
+                // so [seq, num_heads, head_dim] works directly — each row of
+                // head_dim is normalised independently.
+                let q_normed = <CudaBackend as NormOps>::rms_norm(q, q_w, op.eps)?;
+                let k_normed = <CudaBackend as NormOps>::rms_norm(k, k_w, op.eps)?;
+                store(&mut buffers, node_id, 0, q_normed);
+                store(&mut buffers, node_id, 1, k_normed);
+            }
+
+            // --- MoE softmax dispatch (Mixtral, Qwen3-MoE) ---
+            "moe_dispatch_softmax" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<MoeDispatchSoftmaxOp>()
+                    .unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let gate_t = weights.tensor_weight(op.gate);
+                let num_experts = op.experts.len();
+                let num_experts_per_tok = op.num_experts_per_tok;
+                let norm_topk = op.norm_topk;
+                let expert_ids = op.experts.clone();
+                let result = <CudaBackend as MoeOps>::moe_forward_softmax(
+                    &input,
+                    gate_t,
+                    num_experts,
+                    num_experts_per_tok,
+                    norm_topk,
+                    |expert_idx, expert_input| {
+                        let eids = &expert_ids[expert_idx];
+                        let gate_w = weights.linear_weight(eids.gate_proj);
+                        let up_w = weights.linear_weight(eids.up_proj);
+                        let down_w = weights.linear_weight(eids.down_proj);
+                        let gate_out = <CudaBackend as MatmulOps>::linear(expert_input, gate_w)?;
+                        let up_out = <CudaBackend as MatmulOps>::linear(expert_input, up_w)?;
+                        let activated = <CudaBackend as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                        <CudaBackend as MatmulOps>::linear(&activated, down_w)
+                    },
+                )?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- MoE sigmoid dispatch with bias correction (DeepSeek) ---
+            "moe_dispatch_sigmoid" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<MoeDispatchSigmoidOp>()
+                    .unwrap();
+                let input = read(&buffers, node.inputs[0]).clone();
+                let gate_t = weights.tensor_weight(op.gate);
+                let bias_data: Vec<f32> = if let Some(bias_id) = op.bias {
+                    weights.tensor_weight(bias_id).to_vec::<f32>()?
+                } else {
+                    vec![0.0f32; op.experts.len()]
+                };
+                let num_experts = op.experts.len();
+                let num_experts_per_tok = op.num_experts_per_tok;
+                let n_group = op.n_group;
+                let topk_group = op.topk_group;
+                let routed_scaling_factor = op.routed_scaling_factor;
+                let expert_ids = op.experts.clone();
+                let shared_ids = op.shared_expert.clone();
+                let mut result = <CudaBackend as MoeSigmoidOps>::moe_forward_sigmoid(
+                    &input,
+                    gate_t,
+                    &bias_data,
+                    num_experts,
+                    num_experts_per_tok,
+                    n_group,
+                    topk_group,
+                    false, // DeepSeek normalises inside the kernel
+                    routed_scaling_factor,
+                    |expert_idx, expert_input| {
+                        let eids = &expert_ids[expert_idx];
+                        let gate_w = weights.linear_weight(eids.gate_proj);
+                        let up_w = weights.linear_weight(eids.up_proj);
+                        let down_w = weights.linear_weight(eids.down_proj);
+                        let gate_out = <CudaBackend as MatmulOps>::linear(expert_input, gate_w)?;
+                        let up_out = <CudaBackend as MatmulOps>::linear(expert_input, up_w)?;
+                        let activated = <CudaBackend as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                        <CudaBackend as MatmulOps>::linear(&activated, down_w)
+                    },
+                )?;
+                // Add shared expert output if present.
+                if let Some(sids) = shared_ids {
+                    let sg = weights.linear_weight(sids.gate_proj);
+                    let su = weights.linear_weight(sids.up_proj);
+                    let sd = weights.linear_weight(sids.down_proj);
+                    let sgate = <CudaBackend as MatmulOps>::linear(&input, sg)?;
+                    let sup_out = <CudaBackend as MatmulOps>::linear(&input, su)?;
+                    let sact = <CudaBackend as SwigluOps>::swiglu(&sgate, &sup_out)?;
+                    let shared_out = <CudaBackend as MatmulOps>::linear(&sact, sd)?;
+                    <CudaBackend as ArithOps>::add_inplace(&mut result, &shared_out)?;
+                }
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Logit soft-cap: tanh(x / cap) * cap (Gemma 2 final logit) ---
+            "logit_softcap" => {
+                // TODO: dedicated CUDA tanh kernel for better throughput.
+                // For now: download → CPU loop → upload. Logits are small
+                // ([1, vocab_size]) so this is not on the hot path.
+                let op = node.op.as_any().downcast_ref::<LogitSoftcapOp>().unwrap();
+                let input = read(&buffers, node.inputs[0]);
+                let ctx = input.context().clone();
+                let cap = op.cap;
+                let host: Vec<f32> = input.to_vec::<f32>()?;
+                let softcapped: Vec<f32> = host.iter().map(|&x| (x / cap).tanh() * cap).collect();
+                let result =
+                    CudaTensor::from_slice::<f32>(&ctx, &node.output_shapes[0], &softcapped)?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- MLA Attention (DeepSeek V3/R1) ---
+            "mla_attention" => {
+                let op = node.op.as_any().downcast_ref::<MlaAttentionOp>().unwrap();
+                let hidden = read(&buffers, node.inputs[0]).clone();
+                let q_a_proj = weights.linear_weight(op.q_a_proj);
+                let q_a_layernorm = weights.tensor_weight(op.q_a_layernorm);
+                let q_b_proj = weights.linear_weight(op.q_b_proj);
+                let kv_a_proj_with_mqa = weights.linear_weight(op.kv_a_proj_with_mqa);
+                let kv_a_layernorm = weights.tensor_weight(op.kv_a_layernorm);
+                let kv_b_proj_k = weights.linear_weight(op.kv_b_proj_k);
+                let kv_b_proj_v = weights.linear_weight(op.kv_b_proj_v);
+                let kv_b_proj_k_t = weights.linear_weight(op.kv_b_proj_k_t);
+                let o_proj = weights.linear_weight(op.o_proj);
+                let layer_kv = mla_kv_cache
+                    .as_deref_mut()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "CUDA executor: mla_attention op requires mla_kv_cache to be provided"
+                        )
+                    })
+                    .get_mut(op.layer_idx)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "CUDA executor: mla_kv_cache has no entry for layer {}",
+                            op.layer_idx
+                        )
+                    });
+                let result = <CudaBackend as MlaAttentionOps>::mla_attention(
+                    &hidden,
+                    q_a_proj,
+                    q_a_layernorm,
+                    q_b_proj,
+                    kv_a_proj_with_mqa,
+                    kv_a_layernorm,
+                    kv_b_proj_k,
+                    kv_b_proj_v,
+                    kv_b_proj_k_t,
+                    o_proj,
+                    layer_kv,
+                    mla_seq_pos,
+                    op.num_heads,
+                    op.qk_nope_head_dim,
+                    op.qk_rope_head_dim,
+                    op.v_head_dim,
+                    op.kv_lora_rank,
+                    op.rms_norm_eps,
+                    op.attn_scale,
+                )?;
                 store(&mut buffers, node_id, 0, result);
             }
 

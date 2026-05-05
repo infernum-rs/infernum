@@ -666,7 +666,7 @@ pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
 // CPU weight loading (feature-gated)
 // ---------------------------------------------------------------------------
 
-/// Load model weights from a SafeTensors directory into a `WeightStore` for
+/// Load model weights from a `SafeTensors` directory into a `WeightStore` for
 /// graph execution on the CPU backend.
 ///
 /// The caller must have already built a graph (via [`build_prefill_graph`] or
@@ -684,6 +684,10 @@ pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
 /// Returns an error if the directory contains no `.safetensors` files, if a
 /// required weight is missing, or if a weight cannot be converted to the
 /// target dtype.
+///
+/// # Panics
+///
+/// Panics if the number of registered weights exceeds `u32::MAX`.
 #[cfg(feature = "cpu")]
 pub fn load_graph_weights_safetensors(
     graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
@@ -708,7 +712,7 @@ pub fn load_graph_weights_safetensors(
 
     for i in 0..tensor_count {
         let meta = graph.tensor_weight_meta(WeightId::from_index(
-            u32::try_from(i).expect("weight index fits in u32"),
+            u32::try_from(i).expect("weight count exceeds u32"),
         ));
         let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
         store.push_tensor_weight(tensor);
@@ -716,7 +720,7 @@ pub fn load_graph_weights_safetensors(
 
     for i in 0..linear_count {
         let meta = graph.linear_weight_meta(WeightId::from_index(
-            u32::try_from(i).expect("weight index fits in u32"),
+            u32::try_from(i).expect("weight count exceeds u32"),
         ));
         // Handle tied embeddings: some models (e.g. SmolLM2) do not store
         // `lm_head.weight` separately — it is shared with `embed_tokens`.
@@ -783,7 +787,7 @@ fn needs_unpermute(gguf_name: &str) -> bool {
 /// Load model weights from a GGUF file into a [`WeightStore`] for graph
 /// execution on the CPU backend.
 ///
-/// Weights are loaded in their native quantization format (Q8_0, Q4_0, F32,
+/// Weights are loaded in their native quantization format (`Q8_0`, `Q4_0`, F32,
 /// etc.) using the same quantized kernels as the eager path. Dequantization
 /// happens lazily inside each matmul kernel, so no extra memory is needed for
 /// a full-precision copy of the weights.
@@ -800,7 +804,11 @@ fn needs_unpermute(gguf_name: &str) -> bool {
 ///
 /// Returns an error if the GGUF file cannot be opened, a required tensor is
 /// missing, or a weight cannot be uploaded to the CPU backend (e.g. unsupported
-/// quantization type such as Q6_K).
+/// quantization type such as `Q6_K`).
+///
+/// # Panics
+///
+/// Panics if the number of registered weights exceeds `u32::MAX`.
 #[cfg(feature = "cpu")]
 pub fn load_graph_weights_gguf(
     graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
@@ -833,7 +841,7 @@ pub fn load_graph_weights_gguf(
     // ── Tensor weights (embeddings, layernorms) — always loaded as F32 ───────
     for i in 0..tensor_count {
         let meta = graph.tensor_weight_meta(WeightId::from_index(
-            u32::try_from(i).expect("weight index fits in u32"),
+            u32::try_from(i).expect("weight count exceeds u32"),
         ));
         let gguf_name = safetensors_to_gguf_name(&meta.name);
         let host = loader.load_f32(&gguf_name)?;
@@ -843,7 +851,7 @@ pub fn load_graph_weights_gguf(
     // ── Linear weights — loaded in native format (quantized or dense) ─────────
     for i in 0..linear_count {
         let meta = graph.linear_weight_meta(WeightId::from_index(
-            u32::try_from(i).expect("weight index fits in u32"),
+            u32::try_from(i).expect("weight count exceeds u32"),
         ));
         let gguf_name = safetensors_to_gguf_name(&meta.name);
 

@@ -9,15 +9,21 @@
 
 mod chat_templates;
 mod config;
-mod model;
+#[cfg(feature = "cuda")]
+pub mod cuda_graph_engine;
+pub mod graph_builder;
+#[cfg(feature = "cpu")]
+pub mod graph_engine;
 
 pub use chat_templates::GemmaTemplate;
-
 pub use config::GemmaConfig;
-pub use model::GemmaModel;
-
-/// Type alias for Gemma 2 models (`model_type: "gemma2"`)
-pub type Gemma2Model<B> = GemmaModel<B>;
-
-/// Type alias for Gemma 3 text models (`model_type: "gemma3_text"`)
-pub type Gemma3Model<B> = GemmaModel<B>;
+#[cfg(feature = "cuda")]
+pub use cuda_graph_engine::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt};
+pub use graph_builder::{
+    build_decode_graph, build_prefill_graph, GemmaGraphOps, LayerWeightIds, ModelWeightIds,
+    QkNormIds,
+};
+#[cfg(feature = "cpu")]
+pub use graph_builder::{load_graph_weights_gguf, load_graph_weights_safetensors};
+#[cfg(feature = "cpu")]
+pub use graph_engine::{GemmaGraphEngine, GemmaGraphEngineExt};

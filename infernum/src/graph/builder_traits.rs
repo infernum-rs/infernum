@@ -7,7 +7,8 @@
 
 use crate::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
-    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
+    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
 
@@ -16,8 +17,9 @@ use super::builtin_ops::{
     AddInplaceOp, AddOp, AddRmsNormOp, AppendPagedBatchedOp, AppendPagedOp, BiasAddOp,
     CastFromF32Op, CastToF32Op, ConcatInnerDimOp, ConcatSeqOp, EmbeddingGatherOp, ExtractLastRowOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp, LinearOp,
-    LinearPairOp, LinearTripleOp, LmHeadOp, MatmulBf16F32Op, MatmulOp, MulOp,
-    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RopeBatchedOp,
+    LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp,
+    MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, MoeExpertIds, MulOp,
+    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
     RopeInterleavedOp as RopeIntOp, RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp,
     Transpose2dOp,
 };
@@ -74,6 +76,19 @@ pub trait GraphNormOps {
         weight: WeightId,
         eps: f32,
     ) -> (OutputRef, OutputRef);
+
+    /// Per-head `RMSNorm` on `Q` and `K` before `RoPE` (`Qwen3`, `Gemma3`).
+    ///
+    /// `q` and `k` must have shape `[seq, num_heads, head_dim]`.
+    /// Returns `(q_normed, k_normed)` with the same shapes as `q` and `k`.
+    fn add_qk_norm(
+        &mut self,
+        q: OutputRef,
+        k: OutputRef,
+        q_weight: WeightId,
+        k_weight: WeightId,
+        eps: f32,
+    ) -> (OutputRef, OutputRef);
 }
 
 impl<B: Backend + MatmulOps + NormOps> GraphNormOps for Graph<B> {
@@ -91,6 +106,44 @@ impl<B: Backend + MatmulOps + NormOps> GraphNormOps for Graph<B> {
     ) -> (OutputRef, OutputRef) {
         let node_id = self.add_node(Box::new(AddRmsNormOp { weight, eps }), &[residual, delta]);
         ((node_id, 0), (node_id, 1))
+    }
+
+    fn add_qk_norm(
+        &mut self,
+        q: OutputRef,
+        k: OutputRef,
+        q_weight: WeightId,
+        k_weight: WeightId,
+        eps: f32,
+    ) -> (OutputRef, OutputRef) {
+        let node_id = self.add_node(
+            Box::new(RmsNormQkOp {
+                q_weight,
+                k_weight,
+                eps,
+            }),
+            &[q, k],
+        );
+        ((node_id, 0), (node_id, 1))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SoftcapOps
+// ---------------------------------------------------------------------------
+
+/// Graph builder methods for logit soft-capping.
+pub trait GraphSoftcapOps {
+    /// Element-wise logit soft-cap: `tanh(x / cap) * cap`.
+    ///
+    /// Output shape = input shape, same dtype (`F32`).
+    fn add_logit_softcap(&mut self, input: OutputRef, cap: f32) -> OutputRef;
+}
+
+impl<B: Backend + MatmulOps> GraphSoftcapOps for Graph<B> {
+    fn add_logit_softcap(&mut self, input: OutputRef, cap: f32) -> OutputRef {
+        let node_id = self.add_node(Box::new(LogitSoftcapOp { cap }), &[input]);
+        (node_id, 0)
     }
 }
 
@@ -899,6 +952,191 @@ impl<B: Backend + MatmulOps> GraphIndirectDecodeOps for Graph<B> {
     fn add_argmax_last(&mut self, logits: OutputRef) -> OutputRef {
         use super::builtin_ops::ArgmaxLastOp;
         let node_id = self.add_node(Box::new(ArgmaxLastOp), &[logits]);
+        (node_id, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MoeOps — softmax and sigmoid MoE dispatch
+// ---------------------------------------------------------------------------
+
+/// Graph builder methods for Mixture-of-Experts dispatch.
+///
+/// Both methods register the gate projection and all per-expert MLP weights,
+/// then add a single `MoeDispatch*` node that the executor handles by calling
+/// the backend's `moe_forward_*` closure-based dispatch.
+pub trait GraphMoeOps {
+    /// Softmax `MoE` routing (`Mixtral`, `Qwen3-MoE`).
+    ///
+    /// `input` must have shape `[seq_len, hidden_size]`.  Returns the
+    /// weighted combination of expert outputs, same shape.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` — hidden states before the `MoE` layer.
+    /// * `gate` — Gate projection weight ID (shape `[num_experts, hidden_size]`).
+    /// * `experts` — Per-expert MLP weight IDs.
+    /// * `num_experts_per_tok` — Number of experts activated per token.
+    /// * `norm_topk_prob` — Whether to renormalise top-k router probabilities.
+    fn add_moe_dispatch_softmax(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        experts: Vec<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        norm_topk: bool,
+    ) -> OutputRef;
+
+    /// Sigmoid `MoE` routing with bias correction and grouped top-k (`DeepSeek`).
+    ///
+    /// `input` must have shape `[seq_len, hidden_size]`.  Returns the
+    /// weighted combination of expert outputs, same shape.
+    #[allow(clippy::too_many_arguments)]
+    fn add_moe_dispatch_sigmoid(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        bias: Option<WeightId>,
+        experts: Vec<MoeExpertIds>,
+        shared_expert: Option<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        n_group: usize,
+        topk_group: usize,
+        routed_scaling_factor: f32,
+    ) -> OutputRef;
+}
+
+impl<B: Backend + MatmulOps + MoeOps + MoeSigmoidOps> GraphMoeOps for Graph<B> {
+    fn add_moe_dispatch_softmax(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        experts: Vec<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        norm_topk: bool,
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(MoeDispatchSoftmaxOp {
+                gate,
+                experts,
+                num_experts_per_tok,
+                norm_topk,
+            }),
+            &[input],
+        );
+        (node_id, 0)
+    }
+
+    fn add_moe_dispatch_sigmoid(
+        &mut self,
+        input: OutputRef,
+        gate: WeightId,
+        bias: Option<WeightId>,
+        experts: Vec<MoeExpertIds>,
+        shared_expert: Option<MoeExpertIds>,
+        num_experts_per_tok: usize,
+        n_group: usize,
+        topk_group: usize,
+        routed_scaling_factor: f32,
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(MoeDispatchSigmoidOp {
+                gate,
+                bias,
+                experts,
+                shared_expert,
+                num_experts_per_tok,
+                n_group,
+                topk_group,
+                routed_scaling_factor,
+            }),
+            &[input],
+        );
+        (node_id, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlaAttentionOps
+// ---------------------------------------------------------------------------
+
+/// Graph builder method for the MLA attention block (`DeepSeek` V3/R1).
+pub trait GraphMlaAttentionOps {
+    /// Add an opaque MLA attention node.
+    ///
+    /// `hidden` is the input tensor `[seq_len, hidden_size]`. The node
+    /// encapsulates all MLA projections, interleaved `RoPE`, fused attention,
+    /// and the output projection. The executor handles KV cache access.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::similar_names)]
+    fn add_mla_attention(
+        &mut self,
+        hidden: OutputRef,
+        q_a_proj: WeightId,
+        q_a_layernorm: WeightId,
+        q_b_proj: WeightId,
+        kv_a_proj_with_mqa: WeightId,
+        kv_a_layernorm: WeightId,
+        kv_b_proj_k: WeightId,
+        kv_b_proj_v: WeightId,
+        kv_b_proj_k_t: WeightId,
+        o_proj: WeightId,
+        num_heads: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        v_head_dim: usize,
+        kv_lora_rank: usize,
+        rms_norm_eps: f32,
+        attn_scale: f32,
+        layer_idx: usize,
+    ) -> OutputRef;
+}
+
+impl<B: Backend + MatmulOps + MlaAttentionOps> GraphMlaAttentionOps for Graph<B> {
+    #[allow(clippy::similar_names)]
+    fn add_mla_attention(
+        &mut self,
+        hidden: OutputRef,
+        q_a_proj: WeightId,
+        q_a_layernorm: WeightId,
+        q_b_proj: WeightId,
+        kv_a_proj_with_mqa: WeightId,
+        kv_a_layernorm: WeightId,
+        kv_b_proj_k: WeightId,
+        kv_b_proj_v: WeightId,
+        kv_b_proj_k_t: WeightId,
+        o_proj: WeightId,
+        num_heads: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        v_head_dim: usize,
+        kv_lora_rank: usize,
+        rms_norm_eps: f32,
+        attn_scale: f32,
+        layer_idx: usize,
+    ) -> OutputRef {
+        let node_id = self.add_node(
+            Box::new(MlaAttentionOp {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+                kv_a_proj_with_mqa,
+                kv_a_layernorm,
+                kv_b_proj_k,
+                kv_b_proj_v,
+                kv_b_proj_k_t,
+                o_proj,
+                num_heads,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                v_head_dim,
+                kv_lora_rank,
+                rms_norm_eps,
+                attn_scale,
+                layer_idx,
+            }),
+            &[hidden],
+        );
         (node_id, 0)
     }
 }

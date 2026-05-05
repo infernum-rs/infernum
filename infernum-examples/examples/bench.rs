@@ -43,12 +43,12 @@ use infernum_cuda::cuda::ops::{
 use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache, SeqPosition};
 use infernum_cuda::executor;
 use infernum_cuda::{CudaBackend, CudaDecodeEngine};
-use infernum_deepseek::DeepSeekModel;
-use infernum_gemma::GemmaModel;
+use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _};
 use infernum_llama::{
-    build_decode_graph, build_indirect_decode_graph, build_prefill_graph, LlamaConfig, LlamaModel,
+    build_decode_graph, build_indirect_decode_graph, build_prefill_graph, LlamaConfig,
+    LlamaCudaGraphEngine, LlamaCudaGraphEngineExt as _,
 };
-use infernum_qwen::QwenModel;
+use infernum_qwen::{QwenCudaGraphEngine, QwenCudaGraphEngineExt as _};
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
@@ -1294,32 +1294,29 @@ fn main() -> infernum::Result<()> {
 
     let result = match family {
         "llama" => {
-            let model = if is_gguf {
-                LlamaModel::<CudaBackend>::from_gguf(&ctx, &cli.model)?
-            } else {
-                LlamaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?
-            };
-            let dtype = format!("{}", model.dtype());
+            if is_gguf {
+                return Err(infernum::Error::UnsupportedModel(
+                    "GGUF loading is not yet supported by the CUDA graph engine.".to_string(),
+                ));
+            }
+            let model = LlamaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
+            bench_with_info(model, nl, hs, "bf16", cli.n_gen)
         }
         "qwen" => {
-            let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-            let dtype = format!("{}", model.dtype());
+            let model = QwenCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
+            bench_with_info(model, nl, hs, "bf16", cli.n_gen)
         }
         "deepseek" => {
-            let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-            let dtype = format!("{}", model.dtype());
-            let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
+            return Err(infernum::Error::UnsupportedModel(
+                "DeepSeek CUDA graph engine is not yet implemented.".to_string(),
+            ));
         }
         "gemma" => {
-            let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-            let dtype = format!("{}", model.dtype());
+            let model = GemmaCudaGraphEngine::from_pretrained(ctx, &cli.model)?;
             let (nl, hs) = (model.config().num_hidden_layers, model.config().hidden_size);
-            bench_with_info(model, nl, hs, &dtype, cli.n_gen)
+            bench_with_info(model, nl, hs, "bf16", cli.n_gen)
         }
         other => panic!("Unsupported family: {other}"),
     };

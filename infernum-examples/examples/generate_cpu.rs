@@ -16,9 +16,9 @@ use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_cpu::CpuBackend;
-use infernum_gemma::GemmaModel;
-use infernum_llama::LlamaModel;
-use infernum_qwen::QwenModel;
+use infernum_gemma::{GemmaGraphEngine, GemmaGraphEngineExt as _};
+use infernum_llama::{LlamaGraphEngine, LlamaGraphEngineExt as _};
+use infernum_qwen::{QwenGraphEngine, QwenGraphEngineExt as _};
 use infernum_runtime::{Engine, Runtime};
 
 /// CPU text generation with LLMs (SafeTensors + GGUF)
@@ -590,26 +590,27 @@ fn main() -> Result<()> {
 
         match arch.as_str() {
             "llama" => {
-                let model = LlamaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
+                let model = LlamaGraphEngine::from_gguf(Path::new(&cli.model))?;
                 run_model(model, tokenizer, &cli)
             }
             "qwen2" => {
-                let model = QwenModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
-                run_model(model, tokenizer, &cli)
+                return Err(infernum::Error::UnsupportedModel(
+                    "Qwen GGUF loading is not yet supported by the CPU graph engine.".to_string(),
+                ));
             }
             "gemma2" | "gemma3" => {
-                let model = GemmaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?;
+                let model = GemmaGraphEngine::from_gguf(Path::new(&cli.model))?;
                 run_model(model, tokenizer, &cli)
             }
             _ => {
                 eprintln!("Unsupported GGUF architecture: {arch}");
-                eprintln!("Supported: llama, qwen2, gemma2, gemma3");
+                eprintln!("Supported: llama, gemma2, gemma3");
                 std::process::exit(1);
             }
         }
     } else {
         println!("Loading model from: {} (CPU, SafeTensors)", cli.model);
-        let model = LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?;
+        let model = LlamaGraphEngine::from_pretrained(Path::new(&cli.model))?;
         let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
         run_model(model, tokenizer, &cli)
     }

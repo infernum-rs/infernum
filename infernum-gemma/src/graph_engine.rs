@@ -1,17 +1,17 @@
-//! CPU graph-mode inference engine for the Llama model family.
+//! CPU graph-mode inference engine for the Gemma model family.
 //!
-//! Provides [`LlamaGraphEngine`] (a type alias for
-//! [`infernum_cpu::GraphEngine<LlamaConfig>`]) by implementing
-//! [`infernum_cpu::GraphEngineConfig`] for [`LlamaConfig`].
+//! Provides [`GemmaGraphEngine`] (a type alias for
+//! [`infernum_cpu::GraphEngine<GemmaConfig>`]) by implementing
+//! [`infernum_cpu::GraphEngineConfig`] for [`GemmaConfig`].
 //!
 //! # Example
 //!
 //! ```no_run
 //! use std::path::Path;
-//! use infernum_llama::graph_engine::{LlamaGraphEngine, LlamaGraphEngineExt as _};
+//! use infernum_gemma::graph_engine::{GemmaGraphEngine, GemmaGraphEngineExt as _};
 //!
-//! let engine = LlamaGraphEngine::from_pretrained(Path::new("/path/to/model")).unwrap();
-//! let tokens = engine.generate(&[1, 1234, 567], 128, 2).unwrap();
+//! let engine = GemmaGraphEngine::from_pretrained(Path::new("/path/to/model")).unwrap();
+//! let tokens = engine.generate(&[2, 1234, 567], 128, 1).unwrap();
 //! println!("{tokens:?}");
 //! ```
 
@@ -23,7 +23,7 @@ use infernum_cpu::graph_engine::GraphEngineConfig;
 use infernum_cpu::tensor::{CpuLinearWeight, CpuTensor};
 use infernum_cpu::CpuBackend;
 
-use crate::config::LlamaConfig;
+use crate::config::GemmaConfig;
 use crate::graph_builder::{
     build_decode_graph, build_prefill_graph, load_graph_weights_gguf,
     load_graph_weights_safetensors,
@@ -33,17 +33,17 @@ use crate::graph_builder::{
 // GraphEngineConfig impl
 // ---------------------------------------------------------------------------
 
-impl GraphEngineConfig for LlamaConfig {
+impl GraphEngineConfig for GemmaConfig {
     fn num_hidden_layers(&self) -> usize {
         self.num_hidden_layers
     }
 
     fn num_kv_heads(&self) -> usize {
-        LlamaConfig::num_kv_heads(self)
+        self.num_key_value_heads
     }
 
     fn head_dim(&self) -> usize {
-        LlamaConfig::head_dim(self)
+        self.head_dim
     }
 
     fn max_position_embeddings(&self) -> usize {
@@ -62,14 +62,14 @@ impl GraphEngineConfig for LlamaConfig {
         self.eos_token_id
     }
 
-    fn build_prefill_graph(&self, seq_len: usize) -> Graph<CpuBackend> {
-        let (graph, _) = build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32);
-        graph
+    /// Gemma's `build_prefill_graph` has no `seq_len` parameter — it always
+    /// produces a dynamic-shape graph. The `seq_len` argument is ignored.
+    fn build_prefill_graph(&self, _seq_len: usize) -> Graph<CpuBackend> {
+        build_prefill_graph::<CpuBackend>(self, DType::F32)
     }
 
     fn build_decode_graph(&self, kv_len: usize) -> Graph<CpuBackend> {
-        let (graph, _) = build_decode_graph::<CpuBackend>(self, kv_len, DType::F32);
-        graph
+        build_decode_graph::<CpuBackend>(self, kv_len, DType::F32)
     }
 
     fn load_weights_safetensors(
@@ -85,8 +85,8 @@ impl GraphEngineConfig for LlamaConfig {
         dummy_graph: &Graph<CpuBackend>,
         gguf_path: &Path,
     ) -> Option<Result<WeightStore<CpuTensor, CpuLinearWeight>>> {
-        // Signature: load_graph_weights_gguf(graph, config, gguf_path)
-        Some(load_graph_weights_gguf(dummy_graph, self, gguf_path))
+        // Signature: load_graph_weights_gguf(graph, gguf_path, config)
+        Some(load_graph_weights_gguf(dummy_graph, gguf_path, self))
     }
 }
 
@@ -94,37 +94,38 @@ impl GraphEngineConfig for LlamaConfig {
 // Type alias + convenience constructors
 // ---------------------------------------------------------------------------
 
-/// CPU graph-mode engine for Llama-family models.
+/// CPU graph-mode engine for Gemma-family models (Gemma 2 and Gemma 3 text).
 ///
-/// A type alias for [`infernum_cpu::GraphEngine<LlamaConfig>`].
+/// A type alias for [`infernum_cpu::GraphEngine<GemmaConfig>`].
 /// See [`infernum_cpu::GraphEngine`] for the full API.
-pub type LlamaGraphEngine = infernum_cpu::GraphEngine<LlamaConfig>;
+pub type GemmaGraphEngine = infernum_cpu::GraphEngine<GemmaConfig>;
 
-/// Extension trait providing Llama-specific constructors on [`LlamaGraphEngine`].
-pub trait LlamaGraphEngineExt: Sized {
-    /// Load a Llama-family model from a `SafeTensors` directory.
+/// Extension trait providing Gemma-specific constructors on [`GemmaGraphEngine`].
+pub trait GemmaGraphEngineExt: Sized {
+    /// Load a Gemma-family model from a `SafeTensors` directory.
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory is missing, weights cannot be loaded,
-    /// or `config.json` cannot be parsed.
+    /// Returns an error if the directory is missing or weights cannot be loaded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.json` is missing or cannot be parsed
+    /// (delegated to [`GemmaConfig::from_json`]).
     fn from_pretrained(model_dir: &Path) -> Result<Self>;
 
-    /// Load a Llama-family model from a GGUF file.
-    ///
-    /// Weights are stored in their native quantization format (`Q8_0`, `Q4_0`,
-    /// F32, etc.) and dequantized lazily inside each matmul kernel.
+    /// Load a Gemma-family model from a GGUF file.
     ///
     /// # Errors
     ///
     /// Returns an error if the GGUF file cannot be opened, cannot be parsed,
-    /// or contains unsupported quantization types (e.g. `Q6_K`).
+    /// or contains unsupported quantization types.
     fn from_gguf(gguf_path: &Path) -> Result<Self>;
 }
 
-impl LlamaGraphEngineExt for LlamaGraphEngine {
+impl GemmaGraphEngineExt for GemmaGraphEngine {
     fn from_pretrained(model_dir: &Path) -> Result<Self> {
-        let config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        let config = GemmaConfig::from_json(&model_dir.join("config.json"));
         infernum_cpu::GraphEngine::from_config_and_dir(config, model_dir)
     }
 
@@ -137,11 +138,7 @@ impl LlamaGraphEngineExt for LlamaGraphEngine {
                 ))
             })?,
         )?;
-        let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+        let config = GemmaConfig::from_gguf_metadata(loader.metadata())?;
         infernum_cpu::GraphEngine::from_gguf_with_config(config, gguf_path)
     }
 }
-
-// Re-export `GraphKvCache` so existing users of
-// `infernum_llama::graph_engine::GraphKvCache` continue to work.
-pub use infernum_cpu::GraphKvCache;
