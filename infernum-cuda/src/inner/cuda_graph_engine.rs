@@ -29,7 +29,7 @@ use infernum::graph::{optimizer, plan, Graph, WeightId, WeightStore};
 use infernum::{DType, ModelConfig, Result};
 
 use super::executor::execute;
-use crate::cuda::ops::LinearWeight;
+use crate::cuda::ops::{cast_to_f32, LinearWeight};
 use crate::cuda::{CudaContext, CudaTensor};
 use crate::cuda_logits::CudaLogits;
 use crate::weights::{CudaWeightLoader, SafeTensorsLoader};
@@ -424,13 +424,18 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             .into_iter()
             .next()
             .expect("prefill graph has no output");
-        Ok(CudaLogits::new(logits_tensor))
+        let logits_f32 = cast_to_f32(&logits_tensor)?;
+        Ok(CudaLogits::new(logits_f32))
     }
 
     /// Single-sequence prefill with KV cache.
     ///
-    /// Runs the prefill graph, stores K/V outputs per layer into `kv_cache`,
-    /// and returns the logits for the last token position.
+    /// Iterates through `input_ids` one token at a time using the decode graph
+    /// (which outputs `[logits, k_layer0, v_layer0, ...]`), storing K/V outputs
+    /// into `kv_cache` after each step. Returns the logits for the last token.
+    ///
+    /// The prefill graph cannot be used here because it only outputs logits —
+    /// it does not return per-layer K/V tensors needed to populate the cache.
     fn forward_prefill(
         &self,
         input_ids: &[u32],
@@ -439,28 +444,28 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         _block_table: &BlockTable,
         _start_pos: usize,
     ) -> Result<<CudaBackend as infernum::backend::Backend>::Logits> {
-        let seq_len = input_ids.len();
-        let vocab_size = self.config.vocab_size();
         let num_layers = self.config.num_hidden_layers();
+        let mut last_outputs: Option<Vec<CudaTensor>> = None;
 
-        let outputs = self.run_prefill_graph(input_ids)?;
-
-        {
-            let mut store = kv_cache
-                .inner
-                .lock()
-                .expect("CudaGraphKvCache mutex poisoned");
-            store.update_from_outputs(&outputs, num_layers);
+        for &token in input_ids {
+            let outputs = self.run_decode_graph(token, kv_cache)?;
+            {
+                let mut store = kv_cache
+                    .inner
+                    .lock()
+                    .expect("CudaGraphKvCache mutex poisoned");
+                store.update_from_outputs(&outputs, num_layers);
+            }
+            kv_cache
+                .committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            last_outputs = Some(outputs);
         }
-        kv_cache
-            .committed
-            .store(seq_len, std::sync::atomic::Ordering::Relaxed);
 
-        // outputs[0] has shape [seq_len, vocab_size]; extract last row.
-        let logits_f32 = outputs[0].to_vec::<f32>()?;
-        let last_row = &logits_f32[(seq_len - 1) * vocab_size..seq_len * vocab_size];
-        let last_t = CudaTensor::from_slice(&self.ctx, &[1, vocab_size], last_row)?;
-        Ok(CudaLogits::new(last_t))
+        let outputs = last_outputs.expect("input_ids must not be empty");
+        // outputs[0] has shape [1, vocab_size]; cast to F32 and return.
+        let logits_f32 = cast_to_f32(&outputs[0])?;
+        Ok(CudaLogits::new(logits_f32))
     }
 
     /// Batched decode. Only `batch_size = 1` is supported.
