@@ -29,12 +29,12 @@ use infernum::Tensor;
 use infernum::{GenerateOptions, NodeId};
 use infernum_cpu::executor::{execute, KvCacheStore};
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
-use infernum_gemma::GemmaModel;
+use infernum_gemma::{GemmaGraphEngine, GemmaGraphEngineExt as _};
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaGraphEngine,
-    LlamaGraphEngineExt as _, LlamaModel,
+    LlamaGraphEngineExt as _,
 };
-use infernum_qwen::QwenModel;
+use infernum_qwen::{QwenGraphEngine, QwenGraphEngineExt as _};
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
@@ -724,46 +724,44 @@ fn main() -> infernum::Result<()> {
     match family {
         "llama" => {
             let model = if is_gguf {
-                LlamaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?
+                LlamaGraphEngine::from_gguf(Path::new(&cli.model))?
             } else {
-                LlamaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?
+                LlamaGraphEngine::from_pretrained(Path::new(&cli.model))?
             };
             let cfg = model.config();
             eprintln!(
-                "Model: {} layers, {} hidden, dtype={}",
+                "Model: {} layers, {} hidden",
                 cfg.num_hidden_layers,
                 cfg.hidden_size,
-                model.dtype(),
             );
             bench_model(model, cli.n_gen)
         }
         "qwen" => {
-            let model = if is_gguf {
-                QwenModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?
-            } else {
-                QwenModel::<CpuBackend>::from_pretrained(&(), &cli.model)?
-            };
+            if is_gguf {
+                return Err(infernum::Error::UnsupportedModel(
+                    "Qwen GGUF loading is not yet supported by the CPU graph engine.".to_string(),
+                ));
+            }
+            let model = QwenGraphEngine::from_pretrained(Path::new(&cli.model))?;
             let cfg = model.config();
             eprintln!(
-                "Model: {} layers, {} hidden, dtype={}",
+                "Model: {} layers, {} hidden",
                 cfg.num_hidden_layers,
                 cfg.hidden_size,
-                model.dtype(),
             );
             bench_model(model, cli.n_gen)
         }
         "gemma" => {
             let model = if is_gguf {
-                GemmaModel::<CpuBackend>::from_gguf(&(), Path::new(&cli.model))?
+                GemmaGraphEngine::from_gguf(Path::new(&cli.model))?
             } else {
-                GemmaModel::<CpuBackend>::from_pretrained(&(), &cli.model)?
+                GemmaGraphEngine::from_pretrained(Path::new(&cli.model))?
             };
             let cfg = model.config();
             eprintln!(
-                "Model: {} layers, {} hidden, dtype={}",
+                "Model: {} layers, {} hidden",
                 cfg.num_hidden_layers,
                 cfg.hidden_size,
-                model.dtype(),
             );
             bench_model(model, cli.n_gen)
         }

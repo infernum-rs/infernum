@@ -10,7 +10,6 @@ pub mod cuda_graph_engine;
 pub mod graph_builder;
 #[cfg(feature = "cpu")]
 pub mod graph_engine;
-mod model;
 
 pub use chat_templates::ChatMLTemplate;
 pub use config::QwenConfig;
@@ -24,4 +23,3 @@ pub use graph_builder::{
 };
 #[cfg(feature = "cpu")]
 pub use graph_engine::{QwenGraphEngine, QwenGraphEngineExt};
-pub use model::{QwenModel, QwenOps};
