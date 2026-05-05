@@ -11,7 +11,10 @@
 //! - **Dense MLP** (SwiGLU) for the first `first_k_dense_replace` layers.
 //! - **Shared expert** alongside routed experts in MoE layers.
 
-use infernum::backend::{ArithOps, Backend, EmbedOps, MatmulOps, NormOps, SwigluOps, TensorOps};
+use infernum::backend::{
+    ArithOps, Backend, EmbedOps, MatmulOps, MlaAttentionOps, MoeSigmoidOps, NormOps, SwigluOps,
+    TensorOps,
+};
 use infernum::dtype::DType;
 use infernum::graph::{
     Graph, GraphArithOps, GraphEmbedOps, GraphMatmulOps, GraphMlaAttentionOps, GraphMoeOps,
@@ -86,12 +89,32 @@ pub struct DeepSeekWeightIds {
 
 /// Combined trait bound for backends that can execute the DeepSeek graph.
 pub trait DeepSeekGraphOps:
-    Backend + MatmulOps + NormOps + EmbedOps + TensorOps + ArithOps + SwigluOps + Send + 'static
+    Backend
+    + MatmulOps
+    + NormOps
+    + EmbedOps
+    + TensorOps
+    + ArithOps
+    + SwigluOps
+    + MlaAttentionOps
+    + MoeSigmoidOps
+    + Send
+    + 'static
 {
 }
 
 impl<B> DeepSeekGraphOps for B where
-    B: Backend + MatmulOps + NormOps + EmbedOps + TensorOps + ArithOps + SwigluOps + Send + 'static
+    B: Backend
+        + MatmulOps
+        + NormOps
+        + EmbedOps
+        + TensorOps
+        + ArithOps
+        + SwigluOps
+        + MlaAttentionOps
+        + MoeSigmoidOps
+        + Send
+        + 'static
 {
 }
 
@@ -757,6 +780,69 @@ mod tests {
 
     impl infernum::backend::SwigluOps for TestBackend {
         fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl infernum::backend::MoeOps for TestBackend {
+        fn moe_forward_softmax<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _norm_topk_prob: bool,
+            _expert_fn: F,
+        ) -> infernum::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> infernum::Result<DummyTensor>,
+        {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl infernum::backend::MoeSigmoidOps for TestBackend {
+        fn moe_forward_sigmoid<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _e_score_correction_bias: &[f32],
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _n_group: usize,
+            _topk_group: usize,
+            _norm_topk_prob: bool,
+            _routed_scaling_factor: f32,
+            _expert_fn: F,
+        ) -> infernum::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> infernum::Result<DummyTensor>,
+        {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl infernum::backend::MlaAttentionOps for TestBackend {
+        #[allow(clippy::too_many_arguments)]
+        fn mla_attention(
+            _hidden: &DummyTensor,
+            _q_a_proj: &DummyTensor,
+            _q_a_layernorm: &DummyTensor,
+            _q_b_proj: &DummyTensor,
+            _kv_a_proj_with_mqa: &DummyTensor,
+            _kv_a_layernorm: &DummyTensor,
+            _kv_b_proj_k: &DummyTensor,
+            _kv_b_proj_v: &DummyTensor,
+            _kv_b_proj_k_t: &DummyTensor,
+            _o_proj: &DummyTensor,
+            _kv_cache: &mut Vec<DummyTensor>,
+            _pos: usize,
+            _num_heads: usize,
+            _qk_nope_head_dim: usize,
+            _qk_rope_head_dim: usize,
+            _v_head_dim: usize,
+            _kv_lora_rank: usize,
+            _rms_norm_eps: f32,
+            _attn_scale: f32,
+        ) -> infernum::Result<DummyTensor> {
             Ok(DummyTensor)
         }
     }

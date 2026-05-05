@@ -7,7 +7,8 @@
 
 use crate::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
-    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
+    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
 
@@ -1005,7 +1006,7 @@ pub trait GraphMoeOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps> GraphMoeOps for Graph<B> {
+impl<B: Backend + MatmulOps + MoeOps + MoeSigmoidOps> GraphMoeOps for Graph<B> {
     fn add_moe_dispatch_softmax(
         &mut self,
         input: OutputRef,
@@ -1090,7 +1091,7 @@ pub trait GraphMlaAttentionOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps> GraphMlaAttentionOps for Graph<B> {
+impl<B: Backend + MatmulOps + MlaAttentionOps> GraphMlaAttentionOps for Graph<B> {
     fn add_mla_attention(
         &mut self,
         hidden: OutputRef,

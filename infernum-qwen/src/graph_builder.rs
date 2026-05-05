@@ -11,8 +11,8 @@
 //! - SafeTensors weight loading on the CPU backend
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, EmbedOps, MatmulOps, NormOps, RopeOps, SwigluOps,
-    TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, EmbedOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps,
+    RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
@@ -113,6 +113,8 @@ pub trait QwenGraphOps:
     + RopeOps
     + AttentionOps
     + SwigluOps
+    + MoeOps
+    + MoeSigmoidOps
 {
 }
 
@@ -127,6 +129,8 @@ impl<B> QwenGraphOps for B where
         + RopeOps
         + AttentionOps
         + SwigluOps
+        + MoeOps
+        + MoeSigmoidOps
 {
 }
 
@@ -1161,6 +1165,42 @@ mod tests {
     impl infernum::backend::BiasOps for TestBackend {
         fn bias_add_inplace(_input: &mut DummyTensor, _bias: &DummyTensor) -> infernum::Result<()> {
             Ok(())
+        }
+    }
+
+    impl infernum::backend::MoeOps for TestBackend {
+        fn moe_forward_softmax<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _norm_topk_prob: bool,
+            _expert_fn: F,
+        ) -> infernum::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> infernum::Result<DummyTensor>,
+        {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl infernum::backend::MoeSigmoidOps for TestBackend {
+        fn moe_forward_sigmoid<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _e_score_correction_bias: &[f32],
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _n_group: usize,
+            _topk_group: usize,
+            _norm_topk_prob: bool,
+            _routed_scaling_factor: f32,
+            _expert_fn: F,
+        ) -> infernum::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> infernum::Result<DummyTensor>,
+        {
+            Ok(DummyTensor)
         }
     }
 
