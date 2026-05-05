@@ -1,15 +1,15 @@
-//! Graph builder for the DeepSeek model family (DeepSeek V3, R1).
+//! Graph builder for the `DeepSeek` model family (`DeepSeek` V3, R1).
 //!
 //! Constructs a computation graph ([`Graph<B>`]) representing the full
-//! DeepSeek forward pass. Key architectural features:
+//! `DeepSeek` forward pass. Key architectural features:
 //!
 //! - **MLA attention**: treated as a single opaque [`MlaAttentionOp`] node
-//!   that encapsulates Q LoRA compression, KV joint projection, interleaved
-//!   RoPE, absorbed attention, and output projection.
-//! - **Sigmoid MoE routing**: layers at or above `first_k_dense_replace` use
+//!   that encapsulates Q `LoRA` compression, KV joint projection, interleaved
+//!   `RoPE`, absorbed attention, and output projection.
+//! - **Sigmoid `MoE` routing**: layers at or above `first_k_dense_replace` use
 //!   `add_moe_dispatch_sigmoid` with bias correction and grouped top-k.
-//! - **Dense MLP** (SwiGLU) for the first `first_k_dense_replace` layers.
-//! - **Shared expert** alongside routed experts in MoE layers.
+//! - **Dense MLP** (`SwiGLU`) for the first `first_k_dense_replace` layers.
+//! - **Shared expert** alongside routed experts in `MoE` layers.
 
 use infernum::backend::{
     ArithOps, Backend, EmbedOps, MatmulOps, MlaAttentionOps, MoeSigmoidOps, NormOps, SwigluOps,
@@ -41,7 +41,7 @@ pub struct MlaWeightIds {
     pub o_proj: WeightId,
 }
 
-/// Weight IDs for a dense SwiGLU MLP block.
+/// Weight IDs for a dense `SwiGLU` MLP block.
 #[derive(Debug, Clone)]
 pub struct DenseMlpIds {
     pub gate_proj: WeightId,
@@ -49,7 +49,7 @@ pub struct DenseMlpIds {
     pub down_proj: WeightId,
 }
 
-/// Weight IDs for a MoE FFN block (sigmoid routing).
+/// Weight IDs for a `MoE` FFN block (sigmoid routing).
 #[derive(Debug, Clone)]
 pub struct SigmoidMoeIds {
     pub gate: WeightId,
@@ -58,7 +58,7 @@ pub struct SigmoidMoeIds {
     pub shared_expert: DenseMlpIds,
 }
 
-/// FFN weight IDs — either dense MLP or sigmoid MoE.
+/// FFN weight IDs — either dense MLP or sigmoid `MoE`.
 #[derive(Debug, Clone)]
 pub enum FfnIds {
     Dense(DenseMlpIds),
@@ -74,7 +74,7 @@ pub struct LayerWeightIds {
     pub ffn: FfnIds,
 }
 
-/// Weight IDs for the full DeepSeek model.
+/// Weight IDs for the full `DeepSeek` model.
 #[derive(Debug, Clone)]
 pub struct DeepSeekWeightIds {
     pub embed_tokens: WeightId,
@@ -87,7 +87,7 @@ pub struct DeepSeekWeightIds {
 // Graph builder trait bound alias
 // ---------------------------------------------------------------------------
 
-/// Combined trait bound for backends that can execute the DeepSeek graph.
+/// Combined trait bound for backends that can execute the `DeepSeek` graph.
 pub trait DeepSeekGraphOps:
     Backend
     + MatmulOps
@@ -122,6 +122,7 @@ impl<B> DeepSeekGraphOps for B where
 // Weight registration
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::similar_names)]
 fn register_all_weights<B: Backend + MatmulOps>(
     graph: &mut Graph<B>,
     config: &DeepSeekConfig,
@@ -145,7 +146,7 @@ fn register_all_weights<B: Backend + MatmulOps>(
         let pfx = format!("model.layers.{i}");
 
         let input_layernorm = graph.register_tensor_weight(
-            &format!("{pfx}.input_layernorm.weight"),
+            format!("{pfx}.input_layernorm.weight"),
             &[hidden],
             weight_dtype,
         );
@@ -164,7 +165,7 @@ fn register_all_weights<B: Backend + MatmulOps>(
         );
 
         let post_attention_layernorm = graph.register_tensor_weight(
-            &format!("{pfx}.post_attention_layernorm.weight"),
+            format!("{pfx}.post_attention_layernorm.weight"),
             &[hidden],
             weight_dtype,
         );
@@ -181,17 +182,17 @@ fn register_all_weights<B: Backend + MatmulOps>(
             let intermediate = config.intermediate_size;
             FfnIds::Dense(DenseMlpIds {
                 gate_proj: graph.register_linear_weight(
-                    &format!("{pfx}.mlp.gate_proj.weight"),
+                    format!("{pfx}.mlp.gate_proj.weight"),
                     &[intermediate, hidden],
                     weight_dtype,
                 ),
                 up_proj: graph.register_linear_weight(
-                    &format!("{pfx}.mlp.up_proj.weight"),
+                    format!("{pfx}.mlp.up_proj.weight"),
                     &[intermediate, hidden],
                     weight_dtype,
                 ),
                 down_proj: graph.register_linear_weight(
-                    &format!("{pfx}.mlp.down_proj.weight"),
+                    format!("{pfx}.mlp.down_proj.weight"),
                     &[hidden, intermediate],
                     weight_dtype,
                 ),
@@ -221,7 +222,7 @@ fn register_all_weights<B: Backend + MatmulOps>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn register_mla_weights<B: Backend + MatmulOps>(
     graph: &mut Graph<B>,
     pfx: &str,
@@ -243,48 +244,48 @@ fn register_mla_weights<B: Backend + MatmulOps>(
     let kv_a_out = kv_lora + qk_rope;
 
     let q_a_proj = graph.register_linear_weight(
-        &format!("{pfx}.q_a_proj.weight"),
+        format!("{pfx}.q_a_proj.weight"),
         &[q_lora_rank, hidden],
         weight_dtype,
     );
     let q_a_layernorm = graph.register_tensor_weight(
-        &format!("{pfx}.q_a_layernorm.weight"),
+        format!("{pfx}.q_a_layernorm.weight"),
         &[q_lora_rank],
         weight_dtype,
     );
     let q_b_proj = graph.register_linear_weight(
-        &format!("{pfx}.q_b_proj.weight"),
+        format!("{pfx}.q_b_proj.weight"),
         &[q_full_dim, q_lora_rank],
         weight_dtype,
     );
     let kv_a_proj_with_mqa = graph.register_linear_weight(
-        &format!("{pfx}.kv_a_proj_with_mqa.weight"),
+        format!("{pfx}.kv_a_proj_with_mqa.weight"),
         &[kv_a_out, hidden],
         weight_dtype,
     );
     let kv_a_layernorm = graph.register_tensor_weight(
-        &format!("{pfx}.kv_a_layernorm.weight"),
+        format!("{pfx}.kv_a_layernorm.weight"),
         &[kv_lora],
         weight_dtype,
     );
     let kv_b_proj_k = graph.register_linear_weight(
-        &format!("{pfx}.kv_b_proj_k.weight"),
+        format!("{pfx}.kv_b_proj_k.weight"),
         &[num_heads * qk_nope, kv_lora],
         weight_dtype,
     );
     let kv_b_proj_v = graph.register_linear_weight(
-        &format!("{pfx}.kv_b_proj_v.weight"),
+        format!("{pfx}.kv_b_proj_v.weight"),
         &[num_heads * v_head, kv_lora],
         weight_dtype,
     );
     // Pre-transposed K absorb matrix (kv_lora × num_heads * qk_nope)
     let kv_b_proj_k_t = graph.register_linear_weight(
-        &format!("{pfx}.kv_b_proj_k_t.weight"),
+        format!("{pfx}.kv_b_proj_k_t.weight"),
         &[kv_lora, num_heads * qk_nope],
         weight_dtype,
     );
     let o_proj = graph.register_linear_weight(
-        &format!("{pfx}.o_proj.weight"),
+        format!("{pfx}.o_proj.weight"),
         &[hidden, num_heads * v_head],
         weight_dtype,
     );
@@ -314,12 +315,12 @@ fn register_moe_weights<B: Backend + MatmulOps>(
     let shared_intermediate = config.shared_expert_intermediate_size();
 
     let gate = graph.register_tensor_weight(
-        &format!("{pfx}.mlp.gate.weight"),
+        format!("{pfx}.mlp.gate.weight"),
         &[num_experts, hidden],
         weight_dtype,
     );
     let bias = Some(graph.register_tensor_weight(
-        &format!("{pfx}.mlp.gate.e_score_correction_bias"),
+        format!("{pfx}.mlp.gate.e_score_correction_bias"),
         &[num_experts],
         weight_dtype,
     ));
@@ -329,17 +330,17 @@ fn register_moe_weights<B: Backend + MatmulOps>(
             let ep = format!("{pfx}.mlp.experts.{e}");
             MoeExpertIds {
                 gate_proj: graph.register_linear_weight(
-                    &format!("{ep}.gate_proj.weight"),
+                    format!("{ep}.gate_proj.weight"),
                     &[expert_intermediate, hidden],
                     weight_dtype,
                 ),
                 up_proj: graph.register_linear_weight(
-                    &format!("{ep}.up_proj.weight"),
+                    format!("{ep}.up_proj.weight"),
                     &[expert_intermediate, hidden],
                     weight_dtype,
                 ),
                 down_proj: graph.register_linear_weight(
-                    &format!("{ep}.down_proj.weight"),
+                    format!("{ep}.down_proj.weight"),
                     &[hidden, expert_intermediate],
                     weight_dtype,
                 ),
@@ -350,17 +351,17 @@ fn register_moe_weights<B: Backend + MatmulOps>(
     let sp = format!("{pfx}.mlp.shared_experts");
     let shared_expert = DenseMlpIds {
         gate_proj: graph.register_linear_weight(
-            &format!("{sp}.gate_proj.weight"),
+            format!("{sp}.gate_proj.weight"),
             &[shared_intermediate, hidden],
             weight_dtype,
         ),
         up_proj: graph.register_linear_weight(
-            &format!("{sp}.up_proj.weight"),
+            format!("{sp}.up_proj.weight"),
             &[shared_intermediate, hidden],
             weight_dtype,
         ),
         down_proj: graph.register_linear_weight(
-            &format!("{sp}.down_proj.weight"),
+            format!("{sp}.down_proj.weight"),
             &[hidden, shared_intermediate],
             weight_dtype,
         ),
@@ -378,7 +379,8 @@ fn register_moe_weights<B: Backend + MatmulOps>(
 // Graph construction
 // ---------------------------------------------------------------------------
 
-/// Build the prefill (multi-token) forward-pass graph for a DeepSeek model.
+/// Build the prefill (multi-token) forward-pass graph for a `DeepSeek` model.
+#[must_use]
 pub fn build_prefill_graph<B>(config: &DeepSeekConfig, weight_dtype: DType) -> Graph<B>
 where
     B: DeepSeekGraphOps,
@@ -405,7 +407,8 @@ where
     graph
 }
 
-/// Build the decode (single-token) forward-pass graph for a DeepSeek model.
+/// Build the decode (single-token) forward-pass graph for a `DeepSeek` model.
+#[must_use]
 pub fn build_decode_graph<B>(config: &DeepSeekConfig, weight_dtype: DType) -> Graph<B>
 where
     B: DeepSeekGraphOps,
@@ -532,8 +535,17 @@ where
 // Weight loaders (CPU backend)
 // ---------------------------------------------------------------------------
 
-/// Load SafeTensors weights from `model_dir` into a CPU weight store,
+/// Load `SafeTensors` weights from `model_dir` into a CPU weight store,
 /// using the weight layout encoded in `graph`.
+///
+/// # Errors
+///
+/// Returns an error if any weight file cannot be opened or if a named
+/// tensor is not found in the checkpoint.
+///
+/// # Panics
+///
+/// Panics if the number of registered weights exceeds `u32::MAX`.
 #[cfg(feature = "cpu")]
 pub fn load_graph_weights_safetensors(
     graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
@@ -557,13 +569,17 @@ pub fn load_graph_weights_safetensors(
     let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
 
     for i in 0..tensor_count {
-        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight count exceeds u32"),
+        ));
         let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
         store.push_tensor_weight(tensor);
     }
 
     for i in 0..linear_count {
-        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight count exceeds u32"),
+        ));
         // Handle tied embeddings (DeepSeek-V3 ties lm_head to embed_tokens).
         let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {
             "model.embed_tokens.weight"

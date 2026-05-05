@@ -99,7 +99,8 @@ impl<B> GemmaGraphOps for B where
 
 /// Register all Gemma model weights into the graph and return their IDs.
 ///
-/// Names match the SafeTensors convention used by the HuggingFace checkpoints.
+/// Names match the `SafeTensors` convention used by the HuggingFace checkpoints.
+#[allow(clippy::too_many_lines)]
 pub fn register_weights<B: Backend + MatmulOps>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
@@ -119,43 +120,43 @@ pub fn register_weights<B: Backend + MatmulOps>(
         let pfx = format!("model.layers.{i}");
 
         let input_layernorm = graph.register_tensor_weight(
-            &format!("{pfx}.input_layernorm.weight"),
+            format!("{pfx}.input_layernorm.weight"),
             &[hidden],
             weight_dtype,
         );
         let post_attention_layernorm = graph.register_tensor_weight(
-            &format!("{pfx}.post_attention_layernorm.weight"),
+            format!("{pfx}.post_attention_layernorm.weight"),
             &[hidden],
             weight_dtype,
         );
         let pre_feedforward_layernorm = graph.register_tensor_weight(
-            &format!("{pfx}.pre_feedforward_layernorm.weight"),
+            format!("{pfx}.pre_feedforward_layernorm.weight"),
             &[hidden],
             weight_dtype,
         );
         let post_feedforward_layernorm = graph.register_tensor_weight(
-            &format!("{pfx}.post_feedforward_layernorm.weight"),
+            format!("{pfx}.post_feedforward_layernorm.weight"),
             &[hidden],
             weight_dtype,
         );
 
         let q_proj = graph.register_linear_weight(
-            &format!("{pfx}.self_attn.q_proj.weight"),
+            format!("{pfx}.self_attn.q_proj.weight"),
             &[config.num_attention_heads * head_dim, hidden],
             weight_dtype,
         );
         let k_proj = graph.register_linear_weight(
-            &format!("{pfx}.self_attn.k_proj.weight"),
+            format!("{pfx}.self_attn.k_proj.weight"),
             &[config.num_key_value_heads * head_dim, hidden],
             weight_dtype,
         );
         let v_proj = graph.register_linear_weight(
-            &format!("{pfx}.self_attn.v_proj.weight"),
+            format!("{pfx}.self_attn.v_proj.weight"),
             &[config.num_key_value_heads * head_dim, hidden],
             weight_dtype,
         );
         let o_proj = graph.register_linear_weight(
-            &format!("{pfx}.self_attn.o_proj.weight"),
+            format!("{pfx}.self_attn.o_proj.weight"),
             &[hidden, config.num_attention_heads * head_dim],
             weight_dtype,
         );
@@ -163,12 +164,12 @@ pub fn register_weights<B: Backend + MatmulOps>(
         let qk_norm = if config.has_qk_norm {
             Some(QkNormIds {
                 q_norm: graph.register_tensor_weight(
-                    &format!("{pfx}.self_attn.q_norm.weight"),
+                    format!("{pfx}.self_attn.q_norm.weight"),
                     &[head_dim],
                     weight_dtype,
                 ),
                 k_norm: graph.register_tensor_weight(
-                    &format!("{pfx}.self_attn.k_norm.weight"),
+                    format!("{pfx}.self_attn.k_norm.weight"),
                     &[head_dim],
                     weight_dtype,
                 ),
@@ -178,17 +179,17 @@ pub fn register_weights<B: Backend + MatmulOps>(
         };
 
         let gate_proj = graph.register_linear_weight(
-            &format!("{pfx}.mlp.gate_proj.weight"),
+            format!("{pfx}.mlp.gate_proj.weight"),
             &[config.intermediate_size, hidden],
             weight_dtype,
         );
         let up_proj = graph.register_linear_weight(
-            &format!("{pfx}.mlp.up_proj.weight"),
+            format!("{pfx}.mlp.up_proj.weight"),
             &[config.intermediate_size, hidden],
             weight_dtype,
         );
         let down_proj = graph.register_linear_weight(
-            &format!("{pfx}.mlp.down_proj.weight"),
+            format!("{pfx}.mlp.down_proj.weight"),
             &[hidden, config.intermediate_size],
             weight_dtype,
         );
@@ -272,6 +273,7 @@ where
     graph.add_linear(attn_out, ids.o_proj)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_attention_decode<B>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
@@ -326,7 +328,8 @@ where
 
 /// Build the Gemma prefill graph.
 ///
-/// The graph has two inputs: token IDs and a RoPE cache tensor.
+/// The graph has two inputs: token IDs and a `RoPE` cache tensor.
+#[must_use]
 pub fn build_prefill_graph<B>(config: &GemmaConfig, weight_dtype: DType) -> Graph<B>
 where
     B: GemmaGraphOps,
@@ -352,6 +355,7 @@ where
     let sin_input = graph.add_input(&[0, config.head_dim], weight_dtype);
 
     // Embedding lookup + scale by sqrt(hidden_size)
+    #[allow(clippy::cast_precision_loss)]
     let embed_scale = (hidden as f32).sqrt();
     let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
     h = graph.add_scale(h, embed_scale);
@@ -413,13 +417,17 @@ where
 /// 0. `token_id` — shape `[1]`, U32
 /// 1. `cos_cache` — shape `[1, head_dim]`
 /// 2. `sin_cache` — shape `[1, head_dim]`
-/// 3..3+L: `k_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
-/// 3+L..3+2L: `v_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
+/// 3. `k_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
+///    (indices `3..3+L`)
+/// 4. `v_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
+///    (indices `3+L..3+2L`)
 ///
 /// ## Outputs
 /// 0. `logits` — shape `[1, vocab_size]`
-/// 1..1+L: `full_k_i` — updated K caches (shape `[kv_len+1, ...]`)
-/// 1+L..1+2L: `full_v_i` — updated V caches
+/// 1. `full_k_i` — updated K caches (shape `[kv_len+1, ...]`, indices `1..1+L`)
+/// 2. `full_v_i` — updated V caches (indices `1+L..1+2L`)
+#[must_use]
+#[allow(clippy::similar_names)]
 pub fn build_decode_graph<B>(config: &GemmaConfig, kv_len: usize, weight_dtype: DType) -> Graph<B>
 where
     B: GemmaGraphOps,
@@ -456,6 +464,7 @@ where
     }
 
     // Embedding lookup + scale
+    #[allow(clippy::cast_precision_loss)]
     let embed_scale = (hidden as f32).sqrt();
     let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
     h = graph.add_scale(h, embed_scale);
@@ -586,6 +595,16 @@ fn safetensors_to_gguf_name(name: &str) -> String {
 ///
 /// Tied embeddings: if `lm_head.weight` is absent, `model.embed_tokens.weight`
 /// is used as the fallback (Gemma models often tie them).
+///
+/// # Errors
+///
+/// Returns an error if the directory contains no `.safetensors` files, a
+/// required weight is missing, or a weight cannot be converted to the target
+/// dtype.
+///
+/// # Panics
+///
+/// Panics if the number of weights exceeds `u32::MAX` (practically impossible).
 #[cfg(feature = "cpu")]
 pub fn load_graph_weights_safetensors(
     graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
@@ -609,13 +628,17 @@ pub fn load_graph_weights_safetensors(
     let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
 
     for i in 0..tensor_count {
-        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
         let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
         store.push_tensor_weight(tensor);
     }
 
     for i in 0..linear_count {
-        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
         // Handle tied embeddings: if `lm_head.weight` is absent in the
         // checkpoint, use `model.embed_tokens.weight` as a fallback.
         let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {
@@ -635,6 +658,15 @@ pub fn load_graph_weights_safetensors(
 /// Uses the GGUF key-naming convention (e.g. `blk.0.attn_q.weight`).
 /// Name mapping from SafeTensors convention is handled by
 /// [`safetensors_to_gguf_name`].
+///
+/// # Errors
+///
+/// Returns an error if the GGUF file cannot be opened, a required weight is
+/// missing, or a weight cannot be converted to the target dtype.
+///
+/// # Panics
+///
+/// Panics if the number of weights exceeds `u32::MAX` (practically impossible).
 #[cfg(feature = "cpu")]
 pub fn load_graph_weights_gguf(
     graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
@@ -666,7 +698,9 @@ pub fn load_graph_weights_gguf(
 
     // Tensor weights (embeddings, layernorms) — loaded as F32.
     for i in 0..tensor_count {
-        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
         let gguf_name = safetensors_to_gguf_name(&meta.name);
         let host = loader.load_f32(&gguf_name)?;
         store.push_tensor_weight(CpuTensor::from_f32(&host.shape, host.as_f32_slice()));
@@ -674,7 +708,9 @@ pub fn load_graph_weights_gguf(
 
     // Linear weights — loaded in native format (quantized or dense).
     for i in 0..linear_count {
-        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
         let gguf_name = safetensors_to_gguf_name(&meta.name);
 
         // Resolve actual name with tied-embedding fallback.

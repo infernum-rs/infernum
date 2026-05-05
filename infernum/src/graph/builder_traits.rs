@@ -77,7 +77,7 @@ pub trait GraphNormOps {
         eps: f32,
     ) -> (OutputRef, OutputRef);
 
-    /// Per-head RMSNorm on Q and K before RoPE (Qwen3, Gemma 3).
+    /// Per-head `RMSNorm` on `Q` and `K` before `RoPE` (`Qwen3`, `Gemma3`).
     ///
     /// `q` and `k` must have shape `[seq, num_heads, head_dim]`.
     /// Returns `(q_normed, k_normed)` with the same shapes as `q` and `k`.
@@ -966,14 +966,14 @@ impl<B: Backend + MatmulOps> GraphIndirectDecodeOps for Graph<B> {
 /// then add a single `MoeDispatch*` node that the executor handles by calling
 /// the backend's `moe_forward_*` closure-based dispatch.
 pub trait GraphMoeOps {
-    /// Softmax MoE routing (Mixtral, Qwen3-MoE).
+    /// Softmax `MoE` routing (`Mixtral`, `Qwen3-MoE`).
     ///
     /// `input` must have shape `[seq_len, hidden_size]`.  Returns the
     /// weighted combination of expert outputs, same shape.
     ///
     /// # Arguments
     ///
-    /// * `input` — Hidden states before the MoE layer.
+    /// * `input` — hidden states before the `MoE` layer.
     /// * `gate` — Gate projection weight ID (shape `[num_experts, hidden_size]`).
     /// * `experts` — Per-expert MLP weight IDs.
     /// * `num_experts_per_tok` — Number of experts activated per token.
@@ -987,7 +987,7 @@ pub trait GraphMoeOps {
         norm_topk: bool,
     ) -> OutputRef;
 
-    /// Sigmoid MoE routing with bias correction and grouped top-k (DeepSeek).
+    /// Sigmoid `MoE` routing with bias correction and grouped top-k (`DeepSeek`).
     ///
     /// `input` must have shape `[seq_len, hidden_size]`.  Returns the
     /// weighted combination of expert outputs, same shape.
@@ -1060,14 +1060,15 @@ impl<B: Backend + MatmulOps + MoeOps + MoeSigmoidOps> GraphMoeOps for Graph<B> {
 // MlaAttentionOps
 // ---------------------------------------------------------------------------
 
-/// Graph builder method for the MLA attention block (DeepSeek V3/R1).
+/// Graph builder method for the MLA attention block (`DeepSeek` V3/R1).
 pub trait GraphMlaAttentionOps {
     /// Add an opaque MLA attention node.
     ///
     /// `hidden` is the input tensor `[seq_len, hidden_size]`. The node
-    /// encapsulates all MLA projections, interleaved RoPE, fused attention,
+    /// encapsulates all MLA projections, interleaved `RoPE`, fused attention,
     /// and the output projection. The executor handles KV cache access.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::similar_names)]
     fn add_mla_attention(
         &mut self,
         hidden: OutputRef,
@@ -1092,6 +1093,7 @@ pub trait GraphMlaAttentionOps {
 }
 
 impl<B: Backend + MatmulOps + MlaAttentionOps> GraphMlaAttentionOps for Graph<B> {
+    #[allow(clippy::similar_names)]
     fn add_mla_attention(
         &mut self,
         hidden: OutputRef,

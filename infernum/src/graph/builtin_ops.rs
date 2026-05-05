@@ -2172,18 +2172,18 @@ impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
 // RmsNormQkOp
 // ---------------------------------------------------------------------------
 
-/// Per-head RMSNorm applied to Q and K tensors before RoPE.
+/// Per-head `RMSNorm` applied to `Q` and `K` tensors before `RoPE`.
 ///
-/// Used by Qwen3 and Gemma 3 models which apply an independent RMSNorm to
+/// Used by `Qwen3` and `Gemma3` models which apply an independent `RMSNorm` to
 /// each attention head in Q and K before the rotary embedding is applied.
-/// The op takes two inputs (Q, K) and returns two outputs (Q_normed, K_normed)
+/// The op takes two inputs (`Q`, `K`) and returns two outputs (`Q_normed`, `K_normed`)
 /// with identical shapes to their respective inputs.
 ///
 /// Shape contract:
 /// - `inputs[0]` = Q: `[seq, num_q_heads, head_dim]`
 /// - `inputs[1]` = K: `[seq, num_kv_heads, head_dim]`
-/// - `outputs[0]` = Q_normed: `[seq, num_q_heads, head_dim]`
-/// - `outputs[1]` = K_normed: `[seq, num_kv_heads, head_dim]`
+/// - `outputs[0]` = `Q_normed`: `[seq, num_q_heads, head_dim]`
+/// - `outputs[1]` = `K_normed`: `[seq, num_kv_heads, head_dim]`
 #[derive(Debug, Clone)]
 pub struct RmsNormQkOp {
     /// Weight ID for the per-head Q normalization weight (shape `[head_dim]`).
@@ -2289,11 +2289,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
 // MlaAttentionOp
 // ---------------------------------------------------------------------------
 
-/// Multi-head Latent Attention (MLA) as used by DeepSeek V3 / R1.
+/// Multi-head Latent Attention (MLA) as used by `DeepSeek` V3 / R1.
 ///
 /// This is an **opaque** op that encapsulates the entire MLA forward pass:
-/// Q LoRA compression + RMSNorm + expansion, joint KV projection + RMSNorm,
-/// KV decompression, interleaved RoPE, Q absorption, fused attention (with
+/// `Q` `LoRA` compression + `RMSNorm` + expansion, joint `KV` projection + `RMSNorm`,
+/// `KV` decompression, interleaved `RoPE`, `Q` absorption, fused attention (with
 /// optional two-pass LSE combining for multi-chunk prefill), V absorption,
 /// and the output projection.
 ///
@@ -2312,13 +2312,13 @@ pub struct MlaAttentionOp {
     // --- Attention projection weights ---
     /// Q compression linear: `(hidden_size, q_lora_rank)`.
     pub q_a_proj: WeightId,
-    /// Q compression RMSNorm weight: `(q_lora_rank,)`.
+    /// Q compression `RMSNorm` weight: `(q_lora_rank,)`.
     pub q_a_layernorm: WeightId,
     /// Q expansion linear: `(q_lora_rank, num_heads * qk_head_dim)`.
     pub q_b_proj: WeightId,
     /// Joint KV compression linear: `(hidden_size, kv_lora_rank + qk_rope_head_dim)`.
     pub kv_a_proj_with_mqa: WeightId,
-    /// KV compression RMSNorm weight: `(kv_lora_rank,)`.
+    /// KV compression `RMSNorm` weight: `(kv_lora_rank,)`.
     pub kv_a_layernorm: WeightId,
     /// K-nope decompression matrix (dense): `(kv_lora_rank, num_heads * qk_nope_head_dim)`.
     pub kv_b_proj_k: WeightId,
@@ -2333,15 +2333,15 @@ pub struct MlaAttentionOp {
     pub num_heads: usize,
     /// Non-RoPE portion of Q/K head dim.
     pub qk_nope_head_dim: usize,
-    /// RoPE portion of Q/K head dim.
+    /// `RoPE` portion of Q/K head dim.
     pub qk_rope_head_dim: usize,
     /// Value head dim.
     pub v_head_dim: usize,
     /// KV compression rank.
     pub kv_lora_rank: usize,
-    /// RMSNorm epsilon.
+    /// `RMSNorm` epsilon.
     pub rms_norm_eps: f32,
-    /// Attention scale factor (pre-computed, includes YaRN mscale if applicable).
+    /// Attention scale factor (pre-computed, includes `YaRN` mscale if applicable).
     pub attn_scale: f32,
     /// Layer index (for KV cache slot selection).
     pub layer_idx: usize,

@@ -59,7 +59,7 @@ fn find_kv_cache_node_ids(
         .enumerate()
         .filter(|(_, n)| n.op.name() == "input")
         .skip(3) // skip token_id, cos, sin
-        .map(|(i, _)| NodeId::from_index(i as u32))
+        .map(|(i, _)| NodeId::from_index(u32::try_from(i).expect("node index fits u32")))
         .collect();
     assert_eq!(
         input_ids.len(),
@@ -71,7 +71,7 @@ fn find_kv_cache_node_ids(
         .iter()
         .enumerate()
         .filter(|(_, n)| n.op.name() == "concat_seq")
-        .map(|(i, _)| NodeId::from_index(i as u32))
+        .map(|(i, _)| NodeId::from_index(u32::try_from(i).expect("node index fits u32")))
         .collect();
     assert_eq!(
         concat_ids.len(),
@@ -98,7 +98,7 @@ struct DecodeCache {
     half_dim: usize,
 }
 
-fn build_decode_cache(config: &GemmaConfig) -> Result<DecodeCache>
+fn build_decode_cache(config: &GemmaConfig) -> DecodeCache
 where
     CpuBackend: GemmaGraphOps,
 {
@@ -115,7 +115,7 @@ where
     let max_pos = config.max_position_embeddings;
     let (cos, sin) = precompute_rope_data(max_pos, head_dim, config.rope_theta);
 
-    Ok(DecodeCache {
+    DecodeCache {
         graph,
         plan: ep,
         logits_id,
@@ -124,7 +124,7 @@ where
         cos,
         sin,
         half_dim,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ impl GemmaGraphEngine {
         let dummy_graph: Graph<CpuBackend> = build_prefill_graph(&config, DType::F32);
         let weights = load_graph_weights_safetensors(&dummy_graph, model_dir, &config)?;
 
-        let decode = build_decode_cache(&config)?;
+        let decode = build_decode_cache(&config);
         Ok(Self {
             config,
             weights,
@@ -188,7 +188,7 @@ impl GemmaGraphEngine {
         let dummy_graph: Graph<CpuBackend> = build_prefill_graph(&config, DType::F32);
         let weights = load_graph_weights_gguf(&dummy_graph, gguf_path, &config)?;
 
-        let decode = build_decode_cache(&config)?;
+        let decode = build_decode_cache(&config);
         Ok(Self {
             config,
             weights,
@@ -205,6 +205,9 @@ impl GemmaGraphEngine {
     ///
     /// # Errors
     /// Returns an error if any graph execution step fails.
+    ///
+    /// # Panics
+    /// Panics if `prompt_ids` is empty.
     pub fn generate(
         &self,
         prompt_ids: &[u32],
@@ -316,6 +319,5 @@ fn argmax(slice: &[f32]) -> u32 {
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+        .map_or(0, |(i, _)| u32::try_from(i).expect("vocab index fits u32"))
 }

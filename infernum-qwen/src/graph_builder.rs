@@ -5,10 +5,10 @@
 //!
 //! - **Qwen2/2.5** — dense, Q/K/V biases, tied embeddings
 //! - **Qwen3/3.5** — dense, per-head QK-norm, explicit `head_dim`
-//! - **Qwen3-MoE** — softmax MoE routing with shared expert, `decoder_sparse_step`
+//! - **Qwen3-MoE** — softmax `MoE` routing with shared expert, `decoder_sparse_step`
 //! - Per-layer sliding window attention (SWA) via `effective_sliding_window`
 //! - Prefill and single-token decode graphs
-//! - SafeTensors weight loading on the CPU backend
+//! - `SafeTensors` weight loading on the CPU backend
 
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, EmbedOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps,
@@ -57,7 +57,7 @@ pub struct DenseLayerWeightIds {
     pub down_proj: WeightId,
 }
 
-/// Weight IDs for a single MoE layer (Qwen3-MoE).
+/// Weight IDs for a single `MoE` layer (`Qwen3-MoE`).
 pub struct MoeLayerWeightIds {
     pub input_layernorm: WeightId,
     pub q_proj: WeightId,
@@ -77,7 +77,7 @@ pub struct MoeLayerWeightIds {
     pub shared_down: Option<WeightId>,
 }
 
-/// Per-layer weight IDs — either dense or MoE.
+/// Per-layer weight IDs — either dense or `MoE`.
 pub enum LayerWeightIds {
     Dense(DenseLayerWeightIds),
     Moe(MoeLayerWeightIds),
@@ -138,7 +138,7 @@ impl<B> QwenGraphOps for B where
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Whether this layer uses MoE based on `decoder_sparse_step`.
+/// Whether this layer uses `MoE` based on `decoder_sparse_step`.
 fn is_moe_layer(config: &QwenConfig, layer_idx: usize) -> bool {
     config.is_moe() && config.is_moe_layer(layer_idx)
 }
@@ -151,6 +151,7 @@ fn is_moe_layer(config: &QwenConfig, layer_idx: usize) -> bool {
 ///
 /// Registration order must be identical across prefill and decode graphs so
 /// that the same [`WeightStore`] can be shared between them.
+#[allow(clippy::too_many_lines)]
 fn register_weights<B: Backend + MatmulOps>(
     graph: &mut Graph<B>,
     config: &QwenConfig,
@@ -380,7 +381,7 @@ fn register_weights<B: Backend + MatmulOps>(
 
 /// Build the attention block for a single layer into the graph.
 ///
-/// Handles Q/K/V projection, optional biases, optional QK-norm, RoPE,
+/// Handles Q/K/V projection, optional biases, optional QK-norm, `RoPE`,
 /// and fused attention (decode or prefill depending on the caller).
 /// Returns the output of the attention projection `[seq_len, hidden]`.
 #[allow(clippy::too_many_arguments)]
@@ -391,8 +392,8 @@ fn build_attention_prefill<B: QwenGraphOps>(
     lw_k: WeightId,
     lw_v: WeightId,
     lw_o: WeightId,
-    qkv_bias: &Option<QkvBiasIds>,
-    qk_norm: &Option<QkNormIds>,
+    qkv_bias: Option<&QkvBiasIds>,
+    qk_norm: Option<&QkNormIds>,
     eps: f32,
     seq_len: usize,
     num_heads: usize,
@@ -451,8 +452,8 @@ fn build_attention_decode<B: QwenGraphOps>(
     lw_k: WeightId,
     lw_v: WeightId,
     lw_o: WeightId,
-    qkv_bias: &Option<QkvBiasIds>,
-    qk_norm: &Option<QkNormIds>,
+    qkv_bias: Option<&QkvBiasIds>,
+    qk_norm: Option<&QkNormIds>,
     eps: f32,
     num_heads: usize,
     num_kv_heads: usize,
@@ -508,8 +509,8 @@ fn build_attention_decode<B: QwenGraphOps>(
 ///
 /// The graph takes three inputs:
 /// 1. `input_ids` — token IDs, shape `[seq_len]`
-/// 2. `cos_cache` — RoPE cosine cache, shape `[seq_len, head_dim / 2]`
-/// 3. `sin_cache` — RoPE sine cache, shape `[seq_len, head_dim / 2]`
+/// 2. `cos_cache` — `RoPE` cosine cache, shape `[seq_len, head_dim / 2]`
+/// 3. `sin_cache` — `RoPE` sine cache, shape `[seq_len, head_dim / 2]`
 ///
 /// And produces `logits` of shape `[seq_len, vocab_size]`.
 ///
@@ -557,8 +558,8 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
                     d.q_proj,
                     d.k_proj,
                     d.v_proj,
-                    &d.qkv_bias,
-                    &d.qk_norm,
+                    d.qkv_bias.as_ref(),
+                    d.qk_norm.as_ref(),
                     d.o_proj,
                     d.post_attention_layernorm,
                 ),
@@ -567,8 +568,8 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
                     m.q_proj,
                     m.k_proj,
                     m.v_proj,
-                    &m.qkv_bias,
-                    &m.qk_norm,
+                    m.qkv_bias.as_ref(),
+                    m.qk_norm.as_ref(),
                     m.o_proj,
                     m.post_attention_layernorm,
                 ),
@@ -675,15 +676,17 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
 ///
 /// Inputs (in order):
 /// 1. `input_id` — single token ID, shape `[1]`
-/// 2. `cos` — RoPE cosine for the current position, shape `[1, head_dim / 2]`
-/// 3. `sin` — RoPE sine for the current position, shape `[1, head_dim / 2]`
-/// 4..3+L: `k_cache_i` shape `[kv_len, num_kv_heads, head_dim]` for each layer
-/// 4+L..3+2L: `v_cache_i` shape `[kv_len, num_kv_heads, head_dim]` for each layer
+/// 2. `cos` — `RoPE` cosine for the current position, shape `[1, head_dim / 2]`
+/// 3. `sin` — `RoPE` sine for the current position, shape `[1, head_dim / 2]`
+/// 4. `k_cache_i` shape `[kv_len, num_kv_heads, head_dim]` for each layer
+///    (indices `4..3+L`)
+/// 5. `v_cache_i` shape `[kv_len, num_kv_heads, head_dim]` for each layer
+///    (indices `4+L..3+2L`)
 ///
 /// Outputs (in order):
 /// 1. `logits` shape `[1, vocab_size]`
-/// 2..1+L: `full_k_i` shape `[kv_len+1, num_kv_heads, head_dim]`
-/// 2+L..1+2L: `full_v_i` shape `[kv_len+1, num_kv_heads, head_dim]`
+/// 2. `full_k_i` shape `[kv_len+1, num_kv_heads, head_dim]` (indices `2..1+L`)
+/// 3. `full_v_i` shape `[kv_len+1, num_kv_heads, head_dim]` (indices `2+L..1+2L`)
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn build_decode_graph<B: QwenGraphOps>(
@@ -731,8 +734,8 @@ pub fn build_decode_graph<B: QwenGraphOps>(
                     d.q_proj,
                     d.k_proj,
                     d.v_proj,
-                    &d.qkv_bias,
-                    &d.qk_norm,
+                    d.qkv_bias.as_ref(),
+                    d.qk_norm.as_ref(),
                     d.o_proj,
                     d.post_attention_layernorm,
                 ),
@@ -741,8 +744,8 @@ pub fn build_decode_graph<B: QwenGraphOps>(
                     m.q_proj,
                     m.k_proj,
                     m.v_proj,
-                    &m.qkv_bias,
-                    &m.qk_norm,
+                    m.qkv_bias.as_ref(),
+                    m.qk_norm.as_ref(),
                     m.o_proj,
                     m.post_attention_layernorm,
                 ),
@@ -835,7 +838,7 @@ pub fn build_decode_graph<B: QwenGraphOps>(
 // CPU weight loading (feature-gated)
 // ---------------------------------------------------------------------------
 
-/// Load model weights from a SafeTensors directory into a `WeightStore` for
+/// Load model weights from a `SafeTensors` directory into a `WeightStore` for
 /// graph execution on the CPU backend.
 ///
 /// Handles tied embeddings (Qwen2.5-0.5B style: `lm_head.weight` absent,
@@ -846,6 +849,10 @@ pub fn build_decode_graph<B: QwenGraphOps>(
 /// Returns an error if the directory contains no `.safetensors` files, a
 /// required weight is missing, or a weight cannot be converted to the target
 /// dtype.
+///
+/// # Panics
+///
+/// Panics if the number of weights exceeds `u32::MAX` (practically impossible).
 #[cfg(feature = "cpu")]
 pub fn load_graph_weights_safetensors(
     graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
@@ -869,13 +876,17 @@ pub fn load_graph_weights_safetensors(
     let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
 
     for i in 0..tensor_count {
-        let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
         let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
         store.push_tensor_weight(tensor);
     }
 
     for i in 0..linear_count {
-        let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
         // Handle tied embeddings: if `lm_head.weight` is absent in the
         // checkpoint, use `model.embed_tokens.weight` as a fallback.
         let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {

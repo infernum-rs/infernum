@@ -101,7 +101,7 @@ fn find_kv_cache_node_ids(
         .enumerate()
         .filter(|(_, n)| n.op.name() == "input")
         .skip(3) // skip token_id, cos, sin
-        .map(|(i, _)| NodeId::from_index(i as u32))
+        .map(|(i, _)| NodeId::from_index(u32::try_from(i).expect("node count exceeds u32")))
         .collect();
     assert_eq!(
         input_ids.len(),
@@ -113,7 +113,7 @@ fn find_kv_cache_node_ids(
         .iter()
         .enumerate()
         .filter(|(_, n)| n.op.name() == "concat_seq")
-        .map(|(i, _)| NodeId::from_index(i as u32))
+        .map(|(i, _)| NodeId::from_index(u32::try_from(i).expect("node count exceeds u32")))
         .collect();
     assert_eq!(
         concat_ids.len(),
@@ -139,7 +139,7 @@ struct DecodeCache {
     logits_id: NodeId,
     cache_input_ids: Vec<NodeId>,
     concat_ids: Vec<NodeId>,
-    /// Pre-computed RoPE tables up to `max_position_embeddings`.
+    /// Pre-computed `RoPE` tables up to `max_position_embeddings`.
     cos: Vec<f32>,
     sin: Vec<f32>,
     half_dim: usize,
@@ -160,9 +160,9 @@ pub struct LlamaGraphEngine {
 ///
 /// Compiles the decode graph once at `kv_len=0`, runs the optimizer and
 /// memory planner, discovers KV cache node IDs, and pre-computes the full
-/// RoPE table up to `max_position_embeddings`.  Stored in `LlamaGraphEngine`
+/// `RoPE` table up to `max_position_embeddings`.  Stored in `LlamaGraphEngine`
 /// so that `generate()` pays zero setup cost per call.
-fn build_decode_cache(config: &LlamaConfig) -> Result<DecodeCache> {
+fn build_decode_cache(config: &LlamaConfig) -> DecodeCache {
     let head_dim = config.head_dim();
     let half_dim = head_dim / 2;
     let num_layers = config.num_hidden_layers;
@@ -177,7 +177,7 @@ fn build_decode_cache(config: &LlamaConfig) -> Result<DecodeCache> {
     let max_pos = config.max_position_embeddings;
     let (cos, sin) = precompute_rope_data(max_pos, head_dim, config.rope_theta);
 
-    Ok(DecodeCache {
+    DecodeCache {
         graph,
         plan: ep,
         logits_id,
@@ -186,11 +186,11 @@ fn build_decode_cache(config: &LlamaConfig) -> Result<DecodeCache> {
         cos,
         sin,
         half_dim,
-    })
+    }
 }
 
 impl LlamaGraphEngine {
-    /// Load a Llama-family model from a SafeTensors directory.
+    /// Load a Llama-family model from a `SafeTensors` directory.
     ///
     /// # Errors
     /// Returns an error if the directory is missing, weights cannot be loaded,
@@ -215,7 +215,7 @@ impl LlamaGraphEngine {
         let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
         let weights = load_graph_weights_safetensors(&dummy_graph, model_dir, &config)?;
 
-        let decode = build_decode_cache(&config)?;
+        let decode = build_decode_cache(&config);
         Ok(Self {
             config,
             weights,
@@ -225,12 +225,12 @@ impl LlamaGraphEngine {
 
     /// Load a Llama-family model from a GGUF file.
     ///
-    /// Weights are stored in their native quantization format (Q8_0, Q4_0,
+    /// Weights are stored in their native quantization format (`Q8_0`, `Q4_0`,
     /// F32, etc.) and dequantized lazily inside each matmul kernel.
     ///
     /// # Errors
     /// Returns an error if the GGUF file cannot be opened, cannot be parsed,
-    /// or contains unsupported quantization types (e.g. Q6_K).
+    /// or contains unsupported quantization types (e.g. `Q6_K`).
     pub fn from_gguf(gguf_path: &Path) -> Result<Self> {
         let loader = infernum::weights::gguf::GgufLoader::from_file(
             gguf_path.to_str().ok_or_else(|| {
@@ -246,7 +246,7 @@ impl LlamaGraphEngine {
         let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
         let weights = load_graph_weights_gguf(&dummy_graph, &config, gguf_path)?;
 
-        let decode = build_decode_cache(&config)?;
+        let decode = build_decode_cache(&config);
         Ok(Self {
             config,
             weights,
@@ -265,6 +265,11 @@ impl LlamaGraphEngine {
     ///
     /// # Errors
     /// Returns an error if any graph execution step fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `token_ids` is empty during autoregressive decode (should not
+    /// occur when `prompt_ids` is non-empty).
     pub fn generate(
         &self,
         prompt_ids: &[u32],
@@ -383,8 +388,9 @@ fn argmax(slice: &[f32]) -> u32 {
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+        .map_or(0, |(i, _)| {
+            u32::try_from(i).expect("vocab size exceeds u32")
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +549,7 @@ impl infernum::Model for LlamaGraphEngine {
         Ok(infernum_cpu::CpuBackend::logits_from_tensor(last_tensor))
     }
 
-    /// Batched decode.  Only batch_size=1 is supported on the graph CPU path.
+    /// Batched decode.  Only `batch_size=1` is supported on the graph CPU path.
     ///
     /// The block table inputs are ignored — the graph engine tracks sequence
     /// length via the K/V cache length.

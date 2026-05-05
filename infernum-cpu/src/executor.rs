@@ -891,7 +891,7 @@ pub fn execute(
                 let num_experts_per_tok = op.num_experts_per_tok;
                 let norm_topk = op.norm_topk;
                 // Snapshot expert weight IDs so we can pass them to the closure.
-                let expert_ids: Vec<_> = op.experts.iter().cloned().collect();
+                let expert_ids = op.experts.clone();
                 let result = crate::CpuBackend::moe_forward_softmax(
                     &input,
                     gate_t,
@@ -938,7 +938,7 @@ pub fn execute(
                 let n_group = op.n_group;
                 let topk_group = op.topk_group;
                 let routed_scaling_factor = op.routed_scaling_factor;
-                let expert_ids: Vec<_> = op.experts.iter().cloned().collect();
+                let expert_ids = op.experts.clone();
                 let shared_ids = op.shared_expert.clone();
                 let mut result = crate::CpuBackend::moe_forward_sigmoid(
                     &input,
@@ -973,10 +973,10 @@ pub fn execute(
                     let sd = weights.linear_weight(sids.down_proj);
                     let sgate = crate::CpuBackend::linear(&input, sg)?;
                     let sup_out = crate::CpuBackend::linear(&input, su)?;
-                    let sg_data = sgate.as_f32_slice();
-                    let su_data = sup_out.as_f32_slice();
-                    let mut sfused = vec![0.0f32; sg_data.len()];
-                    simd::vec_silu_mul(sg_data, su_data, &mut sfused);
+                    let shared_gate_data = sgate.as_f32_slice();
+                    let shared_up_data = sup_out.as_f32_slice();
+                    let mut sfused = vec![0.0f32; shared_gate_data.len()];
+                    simd::vec_silu_mul(shared_gate_data, shared_up_data, &mut sfused);
                     let sshape = sgate.shape().to_vec();
                     let sact = CpuTensor::from_f32_vec(&sshape, sfused);
                     let shared_out = crate::CpuBackend::linear(&sact, sd)?;
