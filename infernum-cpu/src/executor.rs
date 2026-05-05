@@ -417,14 +417,14 @@ pub fn execute(
 
             "geglu" => {
                 // GeGLU: gelu(gate) * up, where gelu uses the tanh approximation.
+                // tanh-approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+                const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2 / π)
                 let gate = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let up = read_tensor(arena, plan, nodes, node.inputs[1]);
                 let gate_data = gate.as_f32_slice();
                 let up_data = up.as_f32_slice();
                 let n = gate_data.len();
                 let mut out = vec![0.0f32; n];
-                // tanh-approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-                const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2 / π)
                 for i in 0..n {
                     let x = gate_data[i];
                     let inner = SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x);
