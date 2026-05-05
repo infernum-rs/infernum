@@ -66,12 +66,14 @@ impl CudaGraphEngineConfig for QwenConfig {
         ctx: &CudaContext,
         model_dir: &Path,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
-        // Qwen models do not use tied embeddings; lm_head.weight is always present.
+        // Some Qwen models (Qwen2.5, Qwen3-MoE) use tied embeddings and do not
+        // have a separate lm_head.weight; enable the fallback so the loader
+        // reuses model.embed_tokens.weight in that case.
         load_graph_weights_cuda(
             dummy_graph,
             ctx,
             model_dir,
-            /* lm_head_fallback */ false,
+            /* lm_head_fallback */ true,
         )
     }
 }
