@@ -31,7 +31,9 @@ use infernum::{ChatTemplate, Result};
 use infernum_cuda::cuda::CudaContext;
 use infernum_deepseek::DeepSeekTemplate;
 use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _, GemmaTemplate};
-use infernum_llama::{Llama3Template, LlamaCudaGraphEngine, LlamaCudaGraphEngineExt as _, MistralTemplate};
+use infernum_llama::{
+    Llama3Template, LlamaCudaGraphEngine, LlamaCudaGraphEngineExt as _, MistralTemplate,
+};
 use infernum_qwen::{ChatMLTemplate, QwenCudaGraphEngine, QwenCudaGraphEngineExt as _};
 use infernum_serve::{BatchConfig, ModelEntry, Server};
 

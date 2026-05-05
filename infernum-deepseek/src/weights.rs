@@ -78,8 +78,7 @@ pub fn split_kv_b_proj_dense<B: TensorFactory + TensorDataOps>(
         for row in 0..kv_lora_rank {
             for col in 0..qk_nope_dim {
                 let src_offset = (row * k_cols + h * qk_nope_dim + col) * elem;
-                let dst_offset =
-                    (h * qk_nope_dim * kv_lora_rank + col * kv_lora_rank + row) * elem;
+                let dst_offset = (h * qk_nope_dim * kv_lora_rank + col * kv_lora_rank + row) * elem;
                 k_t_data[dst_offset..dst_offset + elem]
                     .copy_from_slice(&k_data[src_offset..src_offset + elem]);
             }

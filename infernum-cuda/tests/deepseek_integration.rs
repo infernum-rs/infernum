@@ -18,8 +18,8 @@ use test_helpers::{download_model, greedy_options};
 /// Load a model and generate text with greedy decoding.
 fn generate_greedy(model_dir: &PathBuf, prompt: &str, max_tokens: usize) -> String {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let model = DeepSeekCudaGraphEngine::from_pretrained(ctx, model_dir)
-        .expect("Failed to load model");
+    let model =
+        DeepSeekCudaGraphEngine::from_pretrained(ctx, model_dir).expect("Failed to load model");
     let tokenizer = LlamaTokenizer::from_pretrained(model_dir).expect("Failed to load tokenizer");
 
     let runtime = Runtime::new(model, tokenizer).expect("Failed to create runtime");

@@ -731,8 +731,7 @@ fn main() -> infernum::Result<()> {
             let cfg = model.config();
             eprintln!(
                 "Model: {} layers, {} hidden",
-                cfg.num_hidden_layers,
-                cfg.hidden_size,
+                cfg.num_hidden_layers, cfg.hidden_size,
             );
             bench_model(model, cli.n_gen)
         }
@@ -746,8 +745,7 @@ fn main() -> infernum::Result<()> {
             let cfg = model.config();
             eprintln!(
                 "Model: {} layers, {} hidden",
-                cfg.num_hidden_layers,
-                cfg.hidden_size,
+                cfg.num_hidden_layers, cfg.hidden_size,
             );
             bench_model(model, cli.n_gen)
         }
@@ -760,8 +758,7 @@ fn main() -> infernum::Result<()> {
             let cfg = model.config();
             eprintln!(
                 "Model: {} layers, {} hidden",
-                cfg.num_hidden_layers,
-                cfg.hidden_size,
+                cfg.num_hidden_layers, cfg.hidden_size,
             );
             bench_model(model, cli.n_gen)
         }

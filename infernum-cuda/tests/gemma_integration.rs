@@ -53,8 +53,8 @@ mod gemma2_tiny_random {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir)
-            .expect("Failed to load model");
+        let model =
+            GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -96,8 +96,8 @@ mod gemma3_text_tiny_random {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir)
-            .expect("Failed to load model");
+        let model =
+            GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -146,8 +146,8 @@ mod gemma2_2b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir)
-            .expect("Failed to load model");
+        let model =
+            GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -190,8 +190,8 @@ mod gemma3_1b {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir)
-            .expect("Failed to load model");
+        let model =
+            GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir).expect("Failed to load model");
         let tokenizer =
             LlamaTokenizer::from_pretrained(&model_dir).expect("Failed to load tokenizer");
 
@@ -226,8 +226,8 @@ mod gemma2_tiny_safetensors {
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
-        let model = GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir)
-            .expect("Failed to load model");
+        let model =
+            GemmaCudaGraphEngine::from_pretrained(ctx, &model_dir).expect("Failed to load model");
 
         // Gemma BOS=2, "Hello"=4521 (SentencePiece)
         let input_ids = vec![2_u32, 4521];
