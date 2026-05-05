@@ -294,7 +294,15 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let inputs = vec![input_ids_t, cos_t, sin_t];
 
         let output_nodes = graph.output_ids().to_vec();
-        execute(&ep, graph.nodes(), &self.weights, &inputs, &output_nodes)
+        execute(
+            &ep,
+            graph.nodes(),
+            &self.weights,
+            &inputs,
+            &output_nodes,
+            None,
+            0,
+        )
     }
 
     fn build_empty_kv_inputs(&self) -> Result<Vec<CudaTensor>> {
@@ -363,7 +371,15 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         }
 
         let output_nodes = graph.output_ids().to_vec();
-        execute(&ep, graph.nodes(), &self.weights, &inputs, &output_nodes)
+        execute(
+            &ep,
+            graph.nodes(),
+            &self.weights,
+            &inputs,
+            &output_nodes,
+            None,
+            0,
+        )
     }
 }
 

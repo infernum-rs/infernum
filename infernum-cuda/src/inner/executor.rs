@@ -9,16 +9,17 @@
 //! provides allocation reuse automatically.
 
 use infernum::backend::{
-    ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, MoeOps,
-    MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
+    MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps, SwigluOps,
+    TensorOps,
 };
 use infernum::graph::builtin_ops::{
     AddRmsNormOp, AppendKvIndirectOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
     EmbeddingGatherIndirectOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
-    LmHeadOp, LogitSoftcapOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, RepeatKvOp, ReshapeOp,
-    RmsNormOp, RmsNormQkOp, RopeBatchedOp, RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp,
-    SliceViewOp, SplitInnerDimOp,
+    LmHeadOp, LogitSoftcapOp, MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp,
+    RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp, RopeIndirectOp,
+    RopeInterleavedOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -74,13 +75,19 @@ fn store(
 /// # Errors
 ///
 /// Returns an error if any op kernel fails.
-#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    clippy::too_many_arguments
+)]
 pub fn execute(
     plan: &ExecutionPlan,
     nodes: &[GraphNode<CudaBackend>],
     weights: &WeightStore<CudaTensor, LinearWeight>,
     inputs: &[CudaTensor],
     output_nodes: &[NodeId],
+    mla_kv_cache: Option<&mut Vec<Vec<CudaTensor>>>,
+    mla_seq_pos: usize,
 ) -> Result<Vec<CudaTensor>> {
     let mut buffers: Vec<Vec<Option<CudaTensor>>> = nodes
         .iter()
@@ -524,6 +531,57 @@ pub fn execute(
                 let softcapped: Vec<f32> = host.iter().map(|&x| (x / cap).tanh() * cap).collect();
                 let result =
                     CudaTensor::from_slice::<f32>(&ctx, &node.output_shapes[0], &softcapped)?;
+                store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- MLA Attention (DeepSeek V3/R1) ---
+            "mla_attention" => {
+                let op = node.op.as_any().downcast_ref::<MlaAttentionOp>().unwrap();
+                let hidden = read(&buffers, node.inputs[0]).clone();
+                let q_a_proj = weights.linear_weight(op.q_a_proj);
+                let q_a_layernorm = weights.tensor_weight(op.q_a_layernorm);
+                let q_b_proj = weights.linear_weight(op.q_b_proj);
+                let kv_a_proj_with_mqa = weights.linear_weight(op.kv_a_proj_with_mqa);
+                let kv_a_layernorm = weights.tensor_weight(op.kv_a_layernorm);
+                let kv_b_proj_k = weights.linear_weight(op.kv_b_proj_k);
+                let kv_b_proj_v = weights.linear_weight(op.kv_b_proj_v);
+                let kv_b_proj_k_t = weights.linear_weight(op.kv_b_proj_k_t);
+                let o_proj = weights.linear_weight(op.o_proj);
+                let layer_kv = mla_kv_cache
+                    .as_deref_mut()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "CUDA executor: mla_attention op requires mla_kv_cache to be provided"
+                        )
+                    })
+                    .get_mut(op.layer_idx)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "CUDA executor: mla_kv_cache has no entry for layer {}",
+                            op.layer_idx
+                        )
+                    });
+                let result = <CudaBackend as MlaAttentionOps>::mla_attention(
+                    &hidden,
+                    q_a_proj,
+                    q_a_layernorm,
+                    q_b_proj,
+                    kv_a_proj_with_mqa,
+                    kv_a_layernorm,
+                    kv_b_proj_k,
+                    kv_b_proj_v,
+                    kv_b_proj_k_t,
+                    o_proj,
+                    layer_kv,
+                    mla_seq_pos,
+                    op.num_heads,
+                    op.qk_nope_head_dim,
+                    op.qk_rope_head_dim,
+                    op.v_head_dim,
+                    op.kv_lora_rank,
+                    op.rms_norm_eps,
+                    op.attn_scale,
+                )?;
                 store(&mut buffers, node_id, 0, result);
             }
 
