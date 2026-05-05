@@ -9,6 +9,7 @@ mod test_helpers;
 use std::path::PathBuf;
 
 use infernum::tokenizer::LlamaTokenizer;
+use infernum::Model;
 use infernum_cuda::cuda::CudaContext;
 use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _};
 use infernum_runtime::Runtime;
