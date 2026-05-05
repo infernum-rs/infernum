@@ -19,5 +19,5 @@ pub use graph_builder::{
     MoeLayerWeightIds, QkNormIds, QkvBiasIds, QwenGraphOps,
 };
 #[cfg(feature = "cpu")]
-pub use graph_engine::QwenGraphEngine;
+pub use graph_engine::{QwenGraphEngine, QwenGraphEngineExt};
 pub use model::{QwenModel, QwenOps};

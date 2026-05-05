@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum_cpu::CpuBackend;
-use infernum_qwen::{QwenGraphEngine, QwenModel};
+use infernum_qwen::{QwenGraphEngine, QwenGraphEngineExt as _, QwenModel};
 
 use test_helpers::{download_model, download_model_files, greedy_options};
 

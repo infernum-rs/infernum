@@ -20,7 +20,7 @@ pub use graph_builder::{
 #[cfg(feature = "cpu")]
 pub use graph_builder::{load_graph_weights_gguf, load_graph_weights_safetensors};
 #[cfg(feature = "cpu")]
-pub use graph_engine::{GraphKvCache, LlamaGraphEngine};
+pub use graph_engine::{GraphKvCache, LlamaGraphEngine, LlamaGraphEngineExt};
 pub use model::LlamaModel;
 
 /// Mistral model (architecturally identical to Llama).

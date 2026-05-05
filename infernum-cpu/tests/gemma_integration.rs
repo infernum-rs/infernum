@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use infernum::tokenizer::GgufTokenizer;
 use infernum_cpu::CpuBackend;
-use infernum_gemma::{GemmaGraphEngine, GemmaModel};
+use infernum_gemma::{GemmaGraphEngine, GemmaGraphEngineExt as _, GemmaModel};
 
 use test_helpers::{download_model_files, greedy_options};
 

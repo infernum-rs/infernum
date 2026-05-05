@@ -309,7 +309,7 @@ mod smollm2_360m_q4 {
 /// autoregressive decode loop produces correct output and no out-of-vocab tokens.
 mod smollm2_360m_graph_engine {
     use infernum::tokenizer::LlamaTokenizer;
-    use infernum_llama::LlamaGraphEngine;
+    use infernum_llama::{LlamaGraphEngine, LlamaGraphEngineExt as _};
 
     use super::*;
 
@@ -389,7 +389,7 @@ mod smollm2_360m_graph_engine {
 /// above, so no additional downloads are required when both modules run.
 mod smollm2_360m_graph_engine_gguf {
     use infernum::tokenizer::LlamaTokenizer;
-    use infernum_llama::LlamaGraphEngine;
+    use infernum_llama::{LlamaGraphEngine, LlamaGraphEngineExt as _};
 
     use super::*;
 

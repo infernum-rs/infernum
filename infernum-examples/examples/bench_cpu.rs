@@ -31,7 +31,8 @@ use infernum_cpu::executor::{execute, KvCacheStore};
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
 use infernum_gemma::GemmaModel;
 use infernum_llama::{
-    build_decode_graph, build_prefill_graph, LlamaConfig, LlamaGraphEngine, LlamaModel,
+    build_decode_graph, build_prefill_graph, LlamaConfig, LlamaGraphEngine,
+    LlamaGraphEngineExt as _, LlamaModel,
 };
 use infernum_qwen::QwenModel;
 use infernum_runtime::Engine;

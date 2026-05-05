@@ -15,6 +15,7 @@
 )]
 
 pub mod executor;
+pub mod graph_engine;
 pub mod logits;
 pub mod ops;
 pub mod simd;
@@ -24,6 +25,7 @@ pub mod weights;
 
 use infernum::backend::Backend;
 
+pub use graph_engine::{GraphEngine, GraphEngineConfig, GraphKvCache};
 pub use logits::CpuLogits;
 pub use ops::attention::{CpuKvCache, CpuPagedKvCache};
 pub use tensor::{decode_f16_scales, with_scratch, CpuLinearWeight, CpuQuantizedWeight, CpuTensor};

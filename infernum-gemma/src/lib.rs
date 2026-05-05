@@ -23,7 +23,7 @@ pub use graph_builder::{
 #[cfg(feature = "cpu")]
 pub use graph_builder::{load_graph_weights_gguf, load_graph_weights_safetensors};
 #[cfg(feature = "cpu")]
-pub use graph_engine::GemmaGraphEngine;
+pub use graph_engine::{GemmaGraphEngine, GemmaGraphEngineExt};
 pub use model::GemmaModel;
 
 /// Type alias for Gemma 2 models (`model_type: "gemma2"`)
