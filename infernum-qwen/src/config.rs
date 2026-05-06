@@ -88,7 +88,7 @@ pub struct QwenConfig {
     /// End of sequence token ID (first value when the config specifies an array)
     #[serde(
         default = "default_eos_token_id",
-        deserialize_with = "deserialize_single_or_first"
+        deserialize_with = "infernum::deserialize_u32_or_first"
     )]
     pub eos_token_id: u32,
 
@@ -144,28 +144,6 @@ pub struct QwenConfig {
     /// this index use full causal attention. When absent, all layers use SWA.
     #[serde(default)]
     pub max_window_layers: Option<usize>,
-}
-
-/// Deserialize a field that may be a single `u32` or an array of `u32`.
-/// When an array is provided, the first element is used.
-fn deserialize_single_or_first<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SingleOrVec {
-        Single(u32),
-        Vec(Vec<u32>),
-    }
-
-    match SingleOrVec::deserialize(deserializer)? {
-        SingleOrVec::Single(v) => Ok(v),
-        SingleOrVec::Vec(v) => v
-            .first()
-            .copied()
-            .ok_or_else(|| serde::de::Error::custom("eos_token_id array is empty")),
-    }
 }
 
 fn default_max_position_embeddings() -> usize {
@@ -266,6 +244,7 @@ impl QwenConfig {
     pub fn from_gguf_metadata(
         metadata: &std::collections::HashMap<String, infernum::GgufValue>,
     ) -> Result<Self> {
+        use infernum::gguf_meta::{get_f32, get_usize};
         use infernum::GgufValue;
 
         // Detect architecture prefix (qwen2 or qwen3)
@@ -274,24 +253,8 @@ impl QwenConfig {
             .and_then(GgufValue::as_str)
             .unwrap_or("qwen2");
 
-        let get_usize = |key: &str| -> Result<usize> {
-            metadata
-                .get(key)
-                .and_then(GgufValue::as_usize)
-                .ok_or_else(|| {
-                    infernum::Error::InvalidShape(format!("Missing GGUF metadata: {key}"))
-                })
-        };
-
-        let get_f32 = |key: &str, default: f32| -> f32 {
-            metadata
-                .get(key)
-                .and_then(GgufValue::as_f32)
-                .unwrap_or(default)
-        };
-
-        let hidden_size = get_usize(&format!("{arch}.embedding_length"))?;
-        let num_attention_heads = get_usize(&format!("{arch}.attention.head_count"))?;
+        let hidden_size = get_usize(metadata, &format!("{arch}.embedding_length"))?;
+        let num_attention_heads = get_usize(metadata, &format!("{arch}.attention.head_count"))?;
 
         let num_key_value_heads = metadata
             .get(&format!("{arch}.attention.head_count_kv"))
@@ -308,18 +271,23 @@ impl QwenConfig {
             .filter(|&w| w > 0);
 
         Ok(Self {
-            vocab_size: get_usize(&format!("{arch}.vocab_size"))
-                .or_else(|_| get_usize("tokenizer.ggml.tokens_count"))
+            vocab_size: get_usize(metadata, &format!("{arch}.vocab_size"))
+                .or_else(|_| get_usize(metadata, "tokenizer.ggml.tokens_count"))
                 .unwrap_or(151_936),
             hidden_size,
-            intermediate_size: get_usize(&format!("{arch}.feed_forward_length"))?,
-            num_hidden_layers: get_usize(&format!("{arch}.block_count"))?,
+            intermediate_size: get_usize(metadata, &format!("{arch}.feed_forward_length"))?,
+            num_hidden_layers: get_usize(metadata, &format!("{arch}.block_count"))?,
             num_attention_heads,
             num_key_value_heads,
             explicit_head_dim,
-            max_position_embeddings: get_usize(&format!("{arch}.context_length")).unwrap_or(2048),
-            rms_norm_eps: get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-6),
-            rope_theta: get_f32(&format!("{arch}.rope.freq_base"), 10000.0),
+            max_position_embeddings: get_usize(metadata, &format!("{arch}.context_length"))
+                .unwrap_or(2048),
+            rms_norm_eps: get_f32(
+                metadata,
+                &format!("{arch}.attention.layer_norm_rms_epsilon"),
+                1e-6,
+            ),
+            rope_theta: get_f32(metadata, &format!("{arch}.rope.freq_base"), 10000.0),
             tie_word_embeddings: metadata
                 .get(&format!("{arch}.tie_word_embeddings"))
                 .and_then(GgufValue::as_bool)

@@ -91,7 +91,6 @@ impl GraphEngineConfig for LlamaConfig {
         dummy_graph: &Graph<CpuBackend>,
         gguf_path: &Path,
     ) -> Option<Result<WeightStore<CpuTensor, CpuLinearWeight>>> {
-        // Signature: load_graph_weights_gguf(graph, config, gguf_path)
         Some(load_graph_weights_gguf(dummy_graph, self, gguf_path))
     }
 }

@@ -20,6 +20,7 @@ pub mod model;
 pub mod rope;
 pub mod runtime_state;
 pub mod sampling;
+pub mod serde_helpers;
 pub mod shard;
 pub mod sharded;
 pub mod tensor;
@@ -57,3 +58,4 @@ pub use graph::{
     GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps, NodeId, OpNode,
     OutputRef, WeightId, WeightMeta, WeightRef,
 };
+pub use serde_helpers::deserialize_u32_or_first;

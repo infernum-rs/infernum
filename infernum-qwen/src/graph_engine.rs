@@ -94,6 +94,12 @@ impl GraphEngineConfig for QwenConfig {
 pub type QwenGraphEngine = infernum_cpu::GraphEngine<QwenConfig>;
 
 /// Extension trait providing Qwen-specific constructors on [`QwenGraphEngine`].
+///
+/// GGUF loading is not yet supported for Qwen models. Adding it would require
+/// a `safetensors_to_gguf_name` mapping for the Qwen weight-naming convention
+/// (e.g. `model.layers.0.self_attn.q_proj.weight` → `blk.0.attn_q.weight`),
+/// along with handling for Qwen2 Q/K/V biases and optional Qwen3 QK-norm
+/// weights that have no direct GGUF analogue in existing converters.
 pub trait QwenGraphEngineExt: Sized {
     /// Load a Qwen-family model from a `SafeTensors` directory.
     ///

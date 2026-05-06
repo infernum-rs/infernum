@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use infernum::graph::{Graph, WeightStore};
+use infernum::weights::QuantizationConfig;
 use infernum::{DType, Result};
 use infernum_cuda::{
     load_graph_weights_cuda, CudaContext, CudaGraphEngineConfig, CudaTensor, LinearWeight,
@@ -48,6 +49,10 @@ impl CudaGraphEngineConfig for GemmaConfig {
 
     fn head_dim(&self) -> usize {
         self.head_dim
+    }
+
+    fn quantization_config(&self) -> Option<&QuantizationConfig> {
+        self.quantization_config.as_ref()
     }
 
     fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {

@@ -85,8 +85,7 @@ impl GraphEngineConfig for GemmaConfig {
         dummy_graph: &Graph<CpuBackend>,
         gguf_path: &Path,
     ) -> Option<Result<WeightStore<CpuTensor, CpuLinearWeight>>> {
-        // Signature: load_graph_weights_gguf(graph, gguf_path, config)
-        Some(load_graph_weights_gguf(dummy_graph, gguf_path, self))
+        Some(load_graph_weights_gguf(dummy_graph, self, gguf_path))
     }
 }
 

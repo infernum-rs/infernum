@@ -5,11 +5,12 @@
 //! from token IDs to logits, enabling ahead-of-time memory planning
 //! and execution scheduling.
 //!
-//! Currently supports:
-//! - Dense models only (no `MoE`)
-//! - Prefill pass only (no decode graph yet)
+//! Supports:
+//! - Dense and `MoE` models (Llama, Mistral, Mixtral)
+//! - Prefill, single-token decode, paged-KV decode, and CUDA-graph-compatible
+//!   indirect decode graphs
+//! - Per-layer sliding window attention via mask (`effective_sliding_window`)
 //! - Single-GPU only (no tensor parallelism / `AllReduce`)
-//! - Full causal attention (no sliding window)
 
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, PagedAttentionOps,

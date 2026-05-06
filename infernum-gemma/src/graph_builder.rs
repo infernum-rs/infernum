@@ -103,7 +103,7 @@ impl<B> GemmaGraphOps for B where
 ///
 /// Names match the `SafeTensors` convention used by the HuggingFace checkpoints.
 #[allow(clippy::too_many_lines)]
-pub fn register_weights<B: Backend + MatmulOps>(
+fn register_weights<B: Backend + MatmulOps>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
     weight_dtype: DType,
@@ -379,14 +379,14 @@ where
     // Inputs: token IDs + RoPE cos/sin cache.
     // cos/sin have shape [seq_len, head_dim / 2] — the RoPE op uses only the
     // first half of each head dimension, matching the Llama/Qwen convention.
-    let token_input = graph.add_input(&[seq_len], DType::U32);
+    let input_ids = graph.add_input(&[seq_len], DType::U32);
     let cos_input = graph.add_input(&[seq_len, config.head_dim / 2], weight_dtype);
     let sin_input = graph.add_input(&[seq_len, config.head_dim / 2], weight_dtype);
 
     // Embedding lookup + scale by sqrt(hidden_size)
     #[allow(clippy::cast_precision_loss)]
     let embed_scale = (hidden as f32).sqrt();
-    let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
+    let mut h = graph.add_embedding_gather(ids.embed_tokens, input_ids);
     h = graph.add_scale(h, embed_scale);
 
     for (layer_idx, layer_ids) in ids.layers.iter().enumerate() {
@@ -480,7 +480,7 @@ where
     let num_layers = config.num_hidden_layers;
 
     // Inputs: single token ID + RoPE cos/sin
-    let token_input = graph.add_input(&[1], DType::U32);
+    let input_id = graph.add_input(&[1], DType::U32);
     // cos/sin: [1, head_dim / 2] — RoPE uses only the first half of each head dimension.
     let cos_input = graph.add_input(&[1, head_dim / 2], weight_dtype);
     let sin_input = graph.add_input(&[1, head_dim / 2], weight_dtype);
@@ -496,7 +496,7 @@ where
     // Embedding lookup + scale
     #[allow(clippy::cast_precision_loss)]
     let embed_scale = (hidden as f32).sqrt();
-    let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
+    let mut h = graph.add_embedding_gather(ids.embed_tokens, input_id);
     h = graph.add_scale(h, embed_scale);
 
     let mut full_k_outputs = Vec::with_capacity(num_layers);
@@ -619,7 +619,7 @@ where
     let head_dim = config.head_dim;
 
     // --- Inputs ---
-    let token_input = graph.add_input(&[batch_size], DType::U32);
+    let input_ids = graph.add_input(&[batch_size], DType::U32);
     let cos_input = graph.add_input(&[batch_size, head_dim / 2], weight_dtype);
     let sin_input = graph.add_input(&[batch_size, head_dim / 2], weight_dtype);
     let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
@@ -629,7 +629,7 @@ where
     // --- Embedding lookup + scale ---
     #[allow(clippy::cast_precision_loss)]
     let embed_scale = (hidden as f32).sqrt();
-    let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
+    let mut h = graph.add_embedding_gather(ids.embed_tokens, input_ids);
     h = graph.add_scale(h, embed_scale);
 
     for (layer_idx, layer_ids) in ids.layers.iter().enumerate() {
@@ -822,8 +822,8 @@ pub fn load_graph_weights_safetensors(
 #[cfg(feature = "cpu")]
 pub fn load_graph_weights_gguf(
     graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
-    gguf_path: &std::path::Path,
     _config: &GemmaConfig,
+    gguf_path: &std::path::Path,
 ) -> infernum::Result<
     infernum::graph::WeightStore<
         infernum_cpu::tensor::CpuTensor,

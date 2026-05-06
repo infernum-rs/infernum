@@ -541,6 +541,56 @@ fn build_attention_decode<B: QwenGraphOps>(
 }
 
 // ---------------------------------------------------------------------------
+// FFN sub-graph helpers
+// ---------------------------------------------------------------------------
+
+/// Build the dense SwiGLU FFN block into the graph.
+///
+/// Returns the FFN output before the residual add.
+fn build_dense_ffn<B: QwenGraphOps>(
+    graph: &mut Graph<B>,
+    normed_post: OutputRef,
+    d: &DenseLayerWeightIds,
+) -> OutputRef {
+    let (gate, up) = graph.add_linear_pair(normed_post, d.gate_proj, d.up_proj);
+    let gate_activated = graph.add_silu(gate);
+    let activated = graph.add_mul(gate_activated, up);
+    graph.add_linear(activated, d.down_proj)
+}
+
+/// Build the `MoE` FFN block (routed experts + optional shared expert) into the graph.
+///
+/// Returns the combined FFN output before the residual add.
+fn build_moe_ffn<B: QwenGraphOps>(
+    graph: &mut Graph<B>,
+    normed_post: OutputRef,
+    m: &MoeLayerWeightIds,
+    num_experts_per_tok: usize,
+    norm_topk: bool,
+) -> OutputRef {
+    let moe_out = graph.add_moe_dispatch_softmax(
+        normed_post,
+        m.moe_gate,
+        m.experts.clone(),
+        num_experts_per_tok,
+        norm_topk,
+    );
+    // The Qwen3-MoE shared expert output is added to the routed expert output
+    // before the residual.  The executor's `moe_dispatch_softmax` arm handles
+    // only the routed experts, so we model the shared expert as a separate
+    // dense MLP.
+    if let (Some(sg), Some(su), Some(sd)) = (m.shared_gate, m.shared_up, m.shared_down) {
+        let (sgate, sup) = graph.add_linear_pair(normed_post, sg, su);
+        let sgate_act = graph.add_silu(sgate);
+        let sact = graph.add_mul(sgate_act, sup);
+        let sdown = graph.add_linear(sact, sd);
+        graph.add_add(moe_out, sdown)
+    } else {
+        moe_out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Prefill graph
 // ---------------------------------------------------------------------------
 
@@ -629,35 +679,12 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
         // 4. FFN or MoE
         h = match lw {
             LayerWeightIds::Dense(d) => {
-                let (gate, up) = graph.add_linear_pair(normed_post, d.gate_proj, d.up_proj);
-                let gate_activated = graph.add_silu(gate);
-                let activated = graph.add_mul(gate_activated, up);
-                let down = graph.add_linear(activated, d.down_proj);
+                let down = build_dense_ffn(&mut graph, normed_post, d);
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(m) => {
-                let moe_out = graph.add_moe_dispatch_softmax(
-                    normed_post,
-                    m.moe_gate,
-                    m.experts.clone(),
-                    num_experts_per_tok,
-                    norm_topk,
-                );
-                // The Qwen3-MoE shared expert output is added to the routed
-                // expert output before the residual.  The executor's
-                // `moe_dispatch_softmax` arm handles only the routed experts,
-                // so we model the shared expert as a separate dense MLP.
-                let ffn_out = if let (Some(sg), Some(su), Some(sd)) =
-                    (m.shared_gate, m.shared_up, m.shared_down)
-                {
-                    let (sgate, sup) = graph.add_linear_pair(normed_post, sg, su);
-                    let sgate_act = graph.add_silu(sgate);
-                    let sact = graph.add_mul(sgate_act, sup);
-                    let sdown = graph.add_linear(sact, sd);
-                    graph.add_add(moe_out, sdown)
-                } else {
-                    moe_out
-                };
+                let ffn_out =
+                    build_moe_ffn(&mut graph, normed_post, m, num_experts_per_tok, norm_topk);
                 graph.add_add_inplace(h_updated, ffn_out)
             }
         };
@@ -774,31 +801,12 @@ pub fn build_decode_graph<B: QwenGraphOps>(
 
         h = match lw {
             LayerWeightIds::Dense(d) => {
-                let (gate, up) = graph.add_linear_pair(normed_post, d.gate_proj, d.up_proj);
-                let gate_activated = graph.add_silu(gate);
-                let activated = graph.add_mul(gate_activated, up);
-                let down = graph.add_linear(activated, d.down_proj);
+                let down = build_dense_ffn(&mut graph, normed_post, d);
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(m) => {
-                let moe_out = graph.add_moe_dispatch_softmax(
-                    normed_post,
-                    m.moe_gate,
-                    m.experts.clone(),
-                    num_experts_per_tok,
-                    norm_topk,
-                );
-                let ffn_out = if let (Some(sg), Some(su), Some(sd)) =
-                    (m.shared_gate, m.shared_up, m.shared_down)
-                {
-                    let (sgate, sup) = graph.add_linear_pair(normed_post, sg, su);
-                    let sgate_act = graph.add_silu(sgate);
-                    let sact = graph.add_mul(sgate_act, sup);
-                    let sdown = graph.add_linear(sact, sd);
-                    graph.add_add(moe_out, sdown)
-                } else {
-                    moe_out
-                };
+                let ffn_out =
+                    build_moe_ffn(&mut graph, normed_post, m, num_experts_per_tok, norm_topk);
                 graph.add_add_inplace(h_updated, ffn_out)
             }
         };
@@ -874,7 +882,7 @@ where
     let model_weights = register_weights(&mut graph, config, weight_dtype);
 
     // -- Graph inputs --
-    let input_ids = graph.add_input(&[1], DType::U32);
+    let input_ids = graph.add_input(&[batch_size], DType::U32);
     let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
     let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
     let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
@@ -964,31 +972,12 @@ where
         // 11. FFN or MoE
         h = match lw {
             LayerWeightIds::Dense(d) => {
-                let (gate, up) = graph.add_linear_pair(normed_post, d.gate_proj, d.up_proj);
-                let gate_activated = graph.add_silu(gate);
-                let activated = graph.add_mul(gate_activated, up);
-                let down = graph.add_linear(activated, d.down_proj);
+                let down = build_dense_ffn(&mut graph, normed_post, d);
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(m) => {
-                let moe_out = graph.add_moe_dispatch_softmax(
-                    normed_post,
-                    m.moe_gate,
-                    m.experts.clone(),
-                    num_experts_per_tok,
-                    norm_topk,
-                );
-                let ffn_out = if let (Some(sg), Some(su), Some(sd)) =
-                    (m.shared_gate, m.shared_up, m.shared_down)
-                {
-                    let (sgate, sup) = graph.add_linear_pair(normed_post, sg, su);
-                    let sgate_act = graph.add_silu(sgate);
-                    let sact = graph.add_mul(sgate_act, sup);
-                    let sdown = graph.add_linear(sact, sd);
-                    graph.add_add(moe_out, sdown)
-                } else {
-                    moe_out
-                };
+                let ffn_out =
+                    build_moe_ffn(&mut graph, normed_post, m, num_experts_per_tok, norm_topk);
                 graph.add_add_inplace(h_updated, ffn_out)
             }
         };
@@ -1353,6 +1342,72 @@ mod tests {
         }
     }
 
+    impl infernum::backend::PagedKvCacheOps for TestBackend {
+        fn allocate_paged_kv_cache(
+            _device: &(),
+            _num_layers: usize,
+            _block_config: &infernum::block_allocator::BlockConfig,
+            _num_kv_heads: usize,
+            _head_dim: usize,
+            _cache_dtype: infernum::dtype::DType,
+        ) -> infernum::Result<()> {
+            Ok(())
+        }
+        fn append_paged(
+            _cache: &mut (),
+            _layer_idx: usize,
+            _block_table: &infernum::block_allocator::BlockTable,
+            _k: &DummyTensor,
+            _v: &DummyTensor,
+            _start_pos: usize,
+        ) -> infernum::Result<()> {
+            Ok(())
+        }
+        fn get_pools(_cache: &(), _layer_idx: usize) -> (&DummyTensor, &DummyTensor) {
+            unimplemented!()
+        }
+        fn block_size(_cache: &()) -> usize {
+            16
+        }
+        fn append_paged_batched(
+            _cache: &mut (),
+            _layer_idx: usize,
+            _k: &DummyTensor,
+            _v: &DummyTensor,
+            _block_tables: &DummyTensor,
+            _positions: &DummyTensor,
+            _batch_size: usize,
+            _max_blocks_per_seq: usize,
+        ) -> infernum::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl infernum::backend::PagedAttentionOps for TestBackend {
+        fn paged_attention_decode(
+            _q: &DummyTensor,
+            _k_pool: &DummyTensor,
+            _v_pool: &DummyTensor,
+            _block_tables: &DummyTensor,
+            _seq_lens: &DummyTensor,
+            _block_size: usize,
+            _max_blocks_per_seq: usize,
+            _max_seq_len: usize,
+            _scale: Option<f32>,
+            _softcap: Option<f32>,
+            _sliding_window: Option<usize>,
+        ) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn gather_paged_kv(
+            _paged_kv: &(),
+            _layer_idx: usize,
+            _block_table: &infernum::block_allocator::BlockTable,
+        ) -> infernum::Result<(DummyTensor, DummyTensor)> {
+            Ok((DummyTensor, DummyTensor))
+        }
+    }
+
     fn dense_config() -> QwenConfig {
         serde_json::from_str(
             r#"{
@@ -1486,5 +1541,38 @@ mod tests {
         let (graph, _): (Graph<TestBackend>, _) = build_decode_graph(&config, 10, DType::F32);
         // Outputs: logits + K per layer + V per layer = 1 + 2 + 2 = 5.
         assert_eq!(graph.output_ids().len(), 5);
+    }
+
+    #[test]
+    fn test_build_paged_decode_graph_output_shape_batch_1() {
+        let config = dense_config();
+        let graph: Graph<TestBackend> = build_paged_decode_graph(&config, 1, 16, 8, DType::F32);
+        // Paged decode: only logits (no K/V outputs — KV is a side-effect via append).
+        assert_eq!(graph.output_ids().len(), 1);
+        let logits_shape = graph.output_shape(graph.output_ids()[0], 0);
+        assert_eq!(
+            logits_shape[0], 1,
+            "logits leading dim should equal batch_size"
+        );
+    }
+
+    #[test]
+    fn test_build_paged_decode_graph_output_shape_batch_4() {
+        // Regression test: input_ids was hard-coded to shape [1] instead of
+        // [batch_size].  Because EmbeddingGatherOp propagates the input's
+        // leading dimension to every downstream op, the logits output would
+        // also have leading dimension 1 instead of 4 — detectable without
+        // executing the graph.
+        let config = dense_config();
+        let batch_size = 4;
+        let graph: Graph<TestBackend> =
+            build_paged_decode_graph(&config, batch_size, 16, 8, DType::F32);
+        assert_eq!(graph.output_ids().len(), 1);
+        let logits_shape = graph.output_shape(graph.output_ids()[0], 0);
+        assert_eq!(
+            logits_shape[0], batch_size,
+            "logits leading dim should equal batch_size ({batch_size}), got {}",
+            logits_shape[0]
+        );
     }
 }
