@@ -935,16 +935,8 @@ pub fn execute_indirect(
 
             // --- All other ops: fall through to standard dispatch ---
             _ => {
-                // Re-use the standard execute logic for this node by calling
-                // OpNode::execute directly (no special handling needed for
-                // non-indirect ops in a CUDA graph context).
-                let node_inputs: Vec<&CudaTensor> =
-                    node.inputs.iter().map(|&inp| read(&buffers, inp)).collect();
-                let outputs = node.op.execute(&node_inputs, weights, ctx)?;
-                for (i, out) in outputs.into_iter().enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    store(&mut buffers, node_id, i as u32, out);
-                }
+                // TODO(Step 5): rebuild with ExecuteContext-based dispatch.
+                unimplemented!("Step 5: executor rebuilt with ExecuteContext")
             }
         }
     }

@@ -16,8 +16,9 @@ use crate::dtype::DType;
 use crate::tensor::Tensor as TensorTrait;
 use crate::Result;
 
-use super::node::WeightId;
-use super::op_node::OpNode;
+use super::execute_context::ExecuteContext;
+use super::node::{NodeId, WeightId};
+use super::op_node::{OpNode, OutputRef};
 use super::weight_store::WeightStore;
 
 // ---------------------------------------------------------------------------
@@ -69,11 +70,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for InputOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("InputOp is handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -116,14 +117,11 @@ impl<B: Backend + MatmulOps + EmbedOps> OpNode<B> for EmbeddingGatherOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let table = weights.tensor_weight(self.table);
-        let seq_len = inputs[0].shape()[0];
-        let result = B::embedding_gather_tensor(table, inputs[0], seq_len)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -164,13 +162,11 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w = weights.tensor_weight(self.weight);
-        let result = B::rms_norm(inputs[0], w, self.eps)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -211,13 +207,11 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for AddRmsNormOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w = weights.tensor_weight(self.weight);
-        let (updated, normed) = B::add_rmsnorm(inputs[0], inputs[1], w, self.eps)?;
-        Ok(vec![updated, normed])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -260,13 +254,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w = weights.linear_weight(self.weight);
-        let result = B::linear(inputs[0], w)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -315,14 +307,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearPairOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w1 = weights.linear_weight(self.w1);
-        let w2 = weights.linear_weight(self.w2);
-        let (r1, r2) = B::linear_pair(inputs[0], w1, w2)?;
-        Ok(vec![r1, r2])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -378,15 +367,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w1 = weights.linear_weight(self.w1);
-        let w2 = weights.linear_weight(self.w2);
-        let w3 = weights.linear_weight(self.w3);
-        let (r1, r2, r3) = B::linear_triple(inputs[0], w1, w2, w3)?;
-        Ok(vec![r1, r2, r3])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -421,12 +406,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::matmul(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -462,12 +446,11 @@ impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::matmul_bf16_f32(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -502,12 +485,11 @@ impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::swiglu(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -542,12 +524,11 @@ impl<B: Backend + MatmulOps + GegluOps> OpNode<B> for GegluOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::geglu(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -583,14 +564,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "SiluOp should be fused into SwigluOp by the optimizer; 
-             direct execution is not supported"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -623,12 +601,11 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::add(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -665,12 +642,11 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::add(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -703,12 +679,11 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for MulOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::mul(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -748,14 +723,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for ScaleOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "ScaleOp requires in-place mutation (scale_inplace); 
-             handled specially by the executor"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -795,14 +767,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for BiasAddOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "BiasAddOp requires in-place mutation (bias_add_inplace); 
-             handled specially by the executor"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -840,12 +809,11 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::apply_rope(inputs[0], inputs[1], inputs[2], self.offset)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -884,13 +852,11 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeBatchedOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result =
-            B::apply_rope_batched(inputs[0], inputs[1], inputs[2], inputs[3], self.batch_size)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -929,12 +895,11 @@ impl<B: Backend + MatmulOps + RopeInterleavedOps> OpNode<B> for RopeInterleavedO
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::apply_rope_interleaved(inputs[0], inputs[1], inputs[2], self.offset)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -979,20 +944,11 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionPrefillO
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::fused_attention_prefill(
-            inputs[0],
-            inputs[1],
-            inputs[2],
-            self.offset,
-            self.scale,
-            self.softcap,
-            self.sliding_window,
-        )?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1031,13 +987,11 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionDecodeOp
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result =
-            B::fused_attention_decode(inputs[0], inputs[1], inputs[2], None, self.softcap, None)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1094,11 +1048,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("PagedAttentionDecodeOp requires KV cache access; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1140,11 +1094,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("AppendPagedOp requires KV cache access; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn is_side_effect(&self) -> bool {
         true
@@ -1194,11 +1148,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("AppendPagedBatchedOp requires KV cache access; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn is_side_effect(&self) -> bool {
         true
@@ -1250,11 +1204,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for GatherPagedKvOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("GatherPagedKvOp requires KV cache access; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1293,11 +1247,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for ReshapeOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("ReshapeOp is a zero-copy view; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1338,11 +1292,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("SliceViewOp is a zero-copy view; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1377,12 +1331,11 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for Transpose2dOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::transpose_2d(inputs[0])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1427,14 +1380,11 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let total = inputs[0].shape().last().copied().unwrap();
-        let right_size = total - self.left_size;
-        let (left, right) = B::split_inner_dim(inputs[0], self.left_size, right_size)?;
-        Ok(vec![left, right])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1472,12 +1422,11 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for ConcatInnerDimOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::concat_inner_dim(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1516,11 +1465,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for ConcatSeqOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("ConcatSeqOp requires backend-specific concat; handled by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1560,12 +1509,11 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for RepeatKvOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::repeat_kv(inputs[0], self.num_repeats)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1604,11 +1552,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("ExtractLastRowOp is a zero-copy view; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1641,12 +1589,11 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastToF32Op {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::cast_to_f32(inputs[0])?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1682,12 +1629,11 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastFromF32Op {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::cast_from_f32(inputs[0], self.target)?;
-        Ok(vec![result])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1733,14 +1679,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSoftmaxOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "MoeDispatchSoftmaxOp requires closure-based expert dispatch; 
-             handled by the executor"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1795,14 +1738,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSigmoidOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "MoeDispatchSigmoidOp requires closure-based expert dispatch; \
-             handled by the executor"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1838,11 +1778,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for AllReduceSumOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("AllReduceSumOp requires communicator access; handled by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1886,11 +1826,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for LmHeadOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("LmHeadOp requires dtype-dependent dispatch; handled by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1936,14 +1876,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for EmbeddingGatherIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "EmbeddingGatherIndirectOp must be executed by the CUDA indirect executor; \
-             it reads the token ID from a stable GPU device pointer (SeqPosition)"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1995,14 +1932,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for RopeIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "RopeIndirectOp must be executed by the CUDA indirect executor; \
-             it reads the sequence position from a stable GPU device pointer (SeqPosition)"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2058,14 +1992,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendKvIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "AppendKvIndirectOp must be executed by the CUDA indirect executor; \
-             it writes into pre-allocated GPU KV cache buffers via SeqPosition"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2122,14 +2053,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for FusedAttentionDecodeIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "FusedAttentionDecodeIndirectOp must be executed by the CUDA indirect executor; \
-             it reads the total sequence length from a stable GPU device pointer (SeqPosition)"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2170,14 +2098,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "ArgmaxLastOp must be dispatched by the CUDA executor via argmax_last_gpu; \
-             it cannot be executed through the generic OpNode::execute path"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2229,21 +2154,11 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormQkOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let q_w = weights.tensor_weight(self.q_weight);
-        let k_w = weights.tensor_weight(self.k_weight);
-        // Apply rms_norm independently to Q and K; the backend treats the
-        // leading dimensions as a batch (each head is one row).
-        let q_normed = B::rms_norm(inputs[0], q_w, self.eps)?;
-        let k_normed = B::rms_norm(inputs[1], k_w, self.eps)?;
-        // Silence unused `device` lint — the trait requires the parameter even
-        // though the default dispatch delegates to `B::rms_norm` which
-        // accepts tensors directly.
-        let _ = device;
-        Ok(vec![q_normed, k_normed])
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2287,14 +2202,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "LogitSoftcapOp must be dispatched by the executor; \
-             the generic OpNode::execute path is not supported"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2382,14 +2294,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for MlaAttentionOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "MlaAttentionOp requires KV cache + runtime state access; \
-             must be dispatched by the executor"
-        )
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("Step 5/7: body migrated later")
     }
     fn as_any(&self) -> &dyn Any {
         self

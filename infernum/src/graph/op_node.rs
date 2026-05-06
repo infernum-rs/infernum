@@ -11,6 +11,7 @@ use crate::backend::{Backend, MatmulOps};
 use crate::dtype::DType;
 use crate::Result;
 
+use super::execute_context::ExecuteContext;
 use super::node::NodeId;
 use super::weight_store::WeightStore;
 
@@ -38,16 +39,16 @@ pub trait OpNode<B: Backend + MatmulOps>: Send + Sync + std::fmt::Debug {
     /// Infer output dtypes from the given input dtypes.
     fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType>;
 
-    /// Execute the operation on concrete tensors.
+    /// Execute the operation, reading inputs and writing outputs via `ctx`.
     ///
     /// # Errors
     /// Returns an error if the underlying backend operation fails.
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>>;
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()>;
 
     /// Whether this operation has side effects (e.g., KV cache writes).
     ///

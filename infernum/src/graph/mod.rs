@@ -714,11 +714,11 @@ mod tests {
 
         fn execute(
             &self,
-            _inputs: &[&DummyTensor],
-            _weights: &crate::graph::WeightStore<DummyTensor, DummyTensor>,
-            _device: &(),
-        ) -> crate::Result<Vec<DummyTensor>> {
-            Ok(vec![DummyTensor])
+            _ctx: &mut ExecuteContext<'_, B>,
+            _node_id: NodeId,
+            _inputs: &[OutputRef],
+        ) -> Result<()> {
+            unimplemented!("Step 5/7: body migrated later")
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
