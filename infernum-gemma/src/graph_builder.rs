@@ -212,11 +212,13 @@ pub fn register_weights<B: Backend + MatmulOps>(
 
     let final_norm = graph.register_tensor_weight("model.norm.weight", &[hidden], weight_dtype);
 
-    let lm_head = if config.tie_word_embeddings {
-        embed_tokens
-    } else {
-        graph.register_linear_weight("lm_head.weight", &[config.vocab_size, hidden], weight_dtype)
-    };
+    // When tie_word_embeddings is true the checkpoint has no separate lm_head.weight;
+    // the embedding table is reused.  We still register a *linear* weight (not a
+    // tensor-weight alias) so that the executor's linear_weight() call indexes the
+    // correct store.  Both the SafeTensors and GGUF loaders already fall back to
+    // model.embed_tokens.weight / token_embd.weight when lm_head.weight is absent.
+    let lm_head =
+        graph.register_linear_weight("lm_head.weight", &[config.vocab_size, hidden], weight_dtype);
 
     ModelWeightIds {
         embed_tokens,
@@ -372,10 +374,12 @@ where
 
     let hidden = config.hidden_size;
 
-    // Inputs: token IDs + RoPE cos/sin cache
+    // Inputs: token IDs + RoPE cos/sin cache.
+    // cos/sin have shape [seq_len, head_dim / 2] — the RoPE op uses only the
+    // first half of each head dimension, matching the Llama/Qwen convention.
     let token_input = graph.add_input(&[0], DType::U32);
-    let cos_input = graph.add_input(&[0, config.head_dim], weight_dtype);
-    let sin_input = graph.add_input(&[0, config.head_dim], weight_dtype);
+    let cos_input = graph.add_input(&[0, config.head_dim / 2], weight_dtype);
+    let sin_input = graph.add_input(&[0, config.head_dim / 2], weight_dtype);
 
     // Embedding lookup + scale by sqrt(hidden_size)
     #[allow(clippy::cast_precision_loss)]
@@ -475,8 +479,9 @@ where
 
     // Inputs: single token ID + RoPE cos/sin
     let token_input = graph.add_input(&[1], DType::U32);
-    let cos_input = graph.add_input(&[1, head_dim], weight_dtype);
-    let sin_input = graph.add_input(&[1, head_dim], weight_dtype);
+    // cos/sin: [1, head_dim / 2] — RoPE uses only the first half of each head dimension.
+    let cos_input = graph.add_input(&[1, head_dim / 2], weight_dtype);
+    let sin_input = graph.add_input(&[1, head_dim / 2], weight_dtype);
 
     // KV cache input nodes: one K + one V per layer.
     let mut k_cache_inputs = Vec::with_capacity(num_layers);

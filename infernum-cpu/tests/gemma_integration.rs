@@ -47,7 +47,6 @@ mod gemma2_2b_q8 {
     }
 
     #[test]
-    #[ignore = "CPU GemmaGraphEngine produces degenerate output; quality bug needs separate investigation"]
     fn capital_of_france() {
         let path = gguf_path();
         let engine = GemmaGraphEngine::from_gguf(&path).expect("Failed to load GGUF");
@@ -95,7 +94,6 @@ mod gemma2_2b_graph_engine {
 
     /// Graph-mode generation produces "Paris" for the standard prompt.
     #[test]
-    #[ignore = "CPU GemmaGraphEngine produces degenerate output; quality bug needs separate investigation"]
     fn capital_of_france() {
         let path = gguf_path();
         let engine = GemmaGraphEngine::from_gguf(&path).expect("Failed to load GemmaGraphEngine");

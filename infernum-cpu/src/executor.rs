@@ -1257,4 +1257,132 @@ mod tests {
             assert!(!v.is_infinite(), "Inf at logit index {i}");
         }
     }
+
+    /// Verify that the Gemma decode graph produces different logits across
+    /// autoregressive steps when KV cache accumulates correctly.
+    ///
+    /// Uses a tiny Gemma 2 config with synthetic weights. Runs 3 decode steps
+    /// and asserts that logits differ between steps, proving the model sees a
+    /// growing context rather than a static (stuck) state.
+    #[test]
+    fn gemma_decode_graph_kv_accumulates() {
+        use crate::graph_engine::find_kv_cache_node_ids;
+        use infernum::graph::optimizer;
+        use infernum::graph::WeightId;
+        use infernum::rope::precompute_rope_data;
+        use infernum_gemma::{build_decode_graph, GemmaConfig};
+
+        // Tiny Gemma 2 config — small enough to run without a GPU.
+        let config = GemmaConfig::from_str(
+            r#"{
+                "model_type": "gemma2",
+                "vocab_size": 64,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "query_pre_attn_scalar": 16.0,
+                "attn_logit_softcapping": null,
+                "final_logit_softcapping": null,
+                "sliding_window": null,
+                "tie_word_embeddings": true,
+                "bos_token_id": 2,
+                "eos_token_id": 1
+            }"#,
+        );
+
+        let head_dim = config.head_dim;
+        let half_dim = head_dim / 2;
+        let num_layers = config.num_hidden_layers;
+
+        let mut graph = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+        optimizer::optimize(&mut graph);
+        let exec_plan = plan(&graph);
+        let mut arena = Arena::new(exec_plan.arena_size);
+
+        // Build synthetic weights.
+        let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+        for i in 0..graph.tensor_weight_count() {
+            let meta = graph.tensor_weight_meta(WeightId::from_index(i as u32));
+            let size: usize = meta.shape.iter().product();
+            // Use non-uniform values to avoid degenerate outputs.
+            let data: Vec<f32> = (0..size)
+                .map(|j| ((j as f32 * 0.07 + 0.3) % 1.5) - 0.5)
+                .collect();
+            weights.push_tensor_weight(CpuTensor::from_f32(&meta.shape, &data));
+        }
+        for i in 0..graph.linear_weight_count() {
+            let meta = graph.linear_weight_meta(WeightId::from_index(i as u32));
+            let (n, k) = (meta.shape[0], meta.shape[1]);
+            let size = k * n;
+            let data: Vec<f32> = (0..size)
+                .map(|j| ((j as f32 * 0.03 + 0.1) % 0.8) - 0.4)
+                .collect();
+            weights.push_linear_weight(CpuLinearWeight::new_dense(CpuTensor::from_f32(
+                &[k, n],
+                &data,
+            )));
+        }
+
+        // Set up KV cache store via find_kv_cache_node_ids.
+        let (cache_input_ids, concat_ids) = find_kv_cache_node_ids(graph.nodes(), num_layers);
+        let mut kv_cache = KvCacheStore::new(
+            num_layers,
+            config.num_key_value_heads,
+            head_dim,
+            64,
+            cache_input_ids,
+            concat_ids,
+        );
+
+        let (cos_table, sin_table) = precompute_rope_data(64, head_dim, config.rope_theta);
+        let logits_id = graph.output_ids()[0];
+
+        let mut prev_logits: Option<Vec<f32>> = None;
+        for pos in 0..3 {
+            let cos_start = pos * half_dim;
+            let inputs = vec![
+                CpuTensor::from_u32(&[1], &[(pos as u32 + 5) % 64]),
+                CpuTensor::from_f32(&[1, half_dim], &cos_table[cos_start..cos_start + half_dim]),
+                CpuTensor::from_f32(&[1, half_dim], &sin_table[cos_start..cos_start + half_dim]),
+            ];
+
+            let outputs = execute(
+                &exec_plan,
+                graph.nodes(),
+                &mut arena,
+                &weights,
+                &inputs,
+                &[logits_id],
+                Some(&mut kv_cache),
+            )
+            .unwrap();
+
+            let logits = outputs[0].as_f32_slice().to_vec();
+            assert_eq!(logits.len(), config.vocab_size, "logit count at step {pos}");
+            for (i, &v) in logits.iter().enumerate() {
+                assert!(!v.is_nan(), "NaN at logit[{i}] in step {pos}");
+                assert!(!v.is_infinite(), "Inf at logit[{i}] in step {pos}");
+            }
+
+            if let Some(prev) = &prev_logits {
+                // Logits must change when the model sees a new token in context.
+                let same = prev
+                    .iter()
+                    .zip(logits.iter())
+                    .all(|(a, b)| (a - b).abs() < 1e-6);
+                assert!(
+                    !same,
+                    "Logits at step {pos} are identical to step {}: \
+                     KV cache is not accumulating correctly",
+                    pos - 1
+                );
+            }
+            prev_logits = Some(logits);
+        }
+    }
 }

@@ -174,7 +174,7 @@ impl KvStore {
 /// - Input nodes 0–2: `token_id`, `cos`, `sin`
 /// - Input nodes 3..: one `[0, kv_heads, head_dim]` K input and one V input per layer
 /// - `concat_seq` nodes: one K and one V concat per layer
-fn find_kv_cache_node_ids(
+pub(crate) fn find_kv_cache_node_ids(
     nodes: &[infernum::graph::GraphNode<CpuBackend>],
     num_layers: usize,
 ) -> (Vec<NodeId>, Vec<NodeId>) {
@@ -406,12 +406,20 @@ impl<C: GraphEngineConfig> GraphEngine<C> {
         }
         token_ids.push(first_token);
 
+        let debug = std::env::var("INFERNUM_DEBUG_KV").is_ok();
+
         // Autoregressive decode.
         for step in 0..max_new_tokens.saturating_sub(1) {
             let pos = prompt_ids.len() + step;
             let last_token = *token_ids.last().unwrap();
             let outputs = run_step(pos, last_token, &mut kv_cache, &mut arena)?;
             let next_token = argmax(outputs[0].as_f32_slice());
+            if debug {
+                eprintln!(
+                    "[DEBUG] step={step} pos={pos} token={last_token} -> next={next_token} kv_len={}",
+                    kv_cache.len()
+                );
+            }
             if next_token == eos_token_id {
                 break;
             }
