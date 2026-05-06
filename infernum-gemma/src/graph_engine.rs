@@ -62,10 +62,8 @@ impl GraphEngineConfig for GemmaConfig {
         self.eos_token_id
     }
 
-    /// Gemma's `build_prefill_graph` has no `seq_len` parameter — it always
-    /// produces a dynamic-shape graph. The `seq_len` argument is ignored.
-    fn build_prefill_graph(&self, _seq_len: usize) -> Graph<CpuBackend> {
-        build_prefill_graph::<CpuBackend>(self, DType::F32)
+    fn build_prefill_graph(&self, seq_len: usize) -> Graph<CpuBackend> {
+        build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32)
     }
 
     fn build_decode_graph(&self, kv_len: usize) -> Graph<CpuBackend> {

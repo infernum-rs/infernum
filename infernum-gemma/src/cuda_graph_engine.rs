@@ -48,8 +48,8 @@ impl CudaGraphEngineConfig for GemmaConfig {
         self.eos_token_id
     }
 
-    fn build_prefill_graph_cuda(&self, _seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
-        build_prefill_graph::<infernum_cuda::CudaBackend>(self, DType::BF16)
+    fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+        build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16)
     }
 
     fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<infernum_cuda::CudaBackend> {
@@ -62,12 +62,14 @@ impl CudaGraphEngineConfig for GemmaConfig {
         ctx: &CudaContext,
         model_dir: &Path,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
-        // Gemma models do not use tied embeddings; lm_head.weight is always present.
+        // Gemma checkpoints use tied embeddings; lm_head.weight is absent and
+        // the SafeTensors loader must fall back to model.embed_tokens.weight.
         load_graph_weights_cuda(
             dummy_graph,
             ctx,
             model_dir,
-            /* lm_head_fallback */ false,
+            /* lm_head_fallback */ true,
+            /* quant_config */ None,
         )
     }
 }

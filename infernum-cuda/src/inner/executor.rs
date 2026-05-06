@@ -23,7 +23,7 @@ use infernum::graph::builtin_ops::{
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
-use infernum::{ExecutionPlan, NodeId, Result};
+use infernum::{DType, ExecutionPlan, NodeId, Result};
 
 use crate::cuda::ops;
 use crate::cuda::ops::LinearWeight;
@@ -120,7 +120,11 @@ pub fn execute(
                     .unwrap();
                 let token_ids = read(&buffers, node.inputs[0]);
                 let table_w = weights.tensor_weight(op.table);
-                let seq_len = node.output_shapes[0][0];
+                // Use the runtime input length, not the statically declared
+                // output shape. Graphs that use 0 as a dynamic seq_len
+                // placeholder (e.g. Gemma's prefill graph) would produce
+                // seq_len=0 here, causing CUDA_ERROR_INVALID_VALUE on launch.
+                let seq_len = token_ids.shape()[0];
                 let result = <CudaBackend as EmbedOps>::embedding_gather_tensor(
                     table_w, token_ids, seq_len,
                 )?;
@@ -589,16 +593,27 @@ pub fn execute(
             // --- Logit soft-cap: tanh(x / cap) * cap (Gemma 2 final logit) ---
             "logit_softcap" => {
                 // TODO: dedicated CUDA tanh kernel for better throughput.
-                // For now: download → CPU loop → upload. Logits are small
-                // ([1, vocab_size]) so this is not on the hot path.
+                // For now: cast to F32 → download → CPU loop → upload. Logits
+                // are small ([seq_len, vocab_size]) so this is not on the hot path.
                 let op = node.op.as_any().downcast_ref::<LogitSoftcapOp>().unwrap();
                 let input = read(&buffers, node.inputs[0]);
                 let ctx = input.context().clone();
+                // Use the runtime shape from the input, not the statically declared
+                // output shape — graphs with dynamic seq_len (0 placeholder) would
+                // produce the wrong shape here.
+                let shape = input.shape().to_vec();
+                // Cast to F32 if needed (input may be BF16/F16 for BF16 models).
+                let f32_input;
+                let input_f32 = if input.dtype() == DType::F32 {
+                    input
+                } else {
+                    f32_input = ops::cast_to_f32(input)?;
+                    &f32_input
+                };
                 let cap = op.cap;
-                let host: Vec<f32> = input.to_vec::<f32>()?;
+                let host: Vec<f32> = input_f32.to_vec::<f32>()?;
                 let softcapped: Vec<f32> = host.iter().map(|&x| (x / cap).tanh() * cap).collect();
-                let result =
-                    CudaTensor::from_slice::<f32>(&ctx, &node.output_shapes[0], &softcapped)?;
+                let result = CudaTensor::from_slice::<f32>(&ctx, &shape, &softcapped)?;
                 store(&mut buffers, node_id, 0, result);
             }
 

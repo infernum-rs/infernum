@@ -235,6 +235,7 @@ pub fn register_weights<B: Backend + MatmulOps>(
 fn build_attention_prefill<B>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
+    seq_len: usize,
     layer_idx: usize,
     ids: &LayerWeightIds,
     h_normed: OutputRef,
@@ -261,10 +262,9 @@ where
     let v = graph.add_linear(h_normed, ids.v_proj);
 
     // Reshape to 3D [seq_len, num_heads, head_dim] for QK-norm and RoPE.
-    // 0 is the dynamic seq_len placeholder in the prefill graph.
-    let q = graph.add_reshape(q, &[0, num_heads, head_dim]);
-    let k = graph.add_reshape(k, &[0, num_kv_heads, head_dim]);
-    let v = graph.add_reshape(v, &[0, num_kv_heads, head_dim]);
+    let q = graph.add_reshape(q, &[seq_len, num_heads, head_dim]);
+    let k = graph.add_reshape(k, &[seq_len, num_kv_heads, head_dim]);
+    let v = graph.add_reshape(v, &[seq_len, num_kv_heads, head_dim]);
 
     // Optional QK-norm (Gemma 3)
     let (q, k) = if let Some(ref qkn) = ids.qk_norm {
@@ -283,7 +283,7 @@ where
         graph.add_fused_attention_prefill(q, k, v, 0, attn_scale, softcap, sliding_window);
 
     // Reshape back to 2D [seq_len, num_heads * head_dim] before the output projection.
-    let attn_flat = graph.add_reshape(attn_out, &[0, num_heads * head_dim]);
+    let attn_flat = graph.add_reshape(attn_out, &[seq_len, num_heads * head_dim]);
     graph.add_linear(attn_flat, ids.o_proj)
 }
 
@@ -355,7 +355,7 @@ where
 ///
 /// The graph has two inputs: token IDs and a `RoPE` cache tensor.
 #[must_use]
-pub fn build_prefill_graph<B>(config: &GemmaConfig, weight_dtype: DType) -> Graph<B>
+pub fn build_prefill_graph<B>(config: &GemmaConfig, seq_len: usize, weight_dtype: DType) -> Graph<B>
 where
     B: GemmaGraphOps,
     Graph<B>: GraphMatmulOps
@@ -377,9 +377,9 @@ where
     // Inputs: token IDs + RoPE cos/sin cache.
     // cos/sin have shape [seq_len, head_dim / 2] — the RoPE op uses only the
     // first half of each head dimension, matching the Llama/Qwen convention.
-    let token_input = graph.add_input(&[0], DType::U32);
-    let cos_input = graph.add_input(&[0, config.head_dim / 2], weight_dtype);
-    let sin_input = graph.add_input(&[0, config.head_dim / 2], weight_dtype);
+    let token_input = graph.add_input(&[seq_len], DType::U32);
+    let cos_input = graph.add_input(&[seq_len, config.head_dim / 2], weight_dtype);
+    let sin_input = graph.add_input(&[seq_len, config.head_dim / 2], weight_dtype);
 
     // Embedding lookup + scale by sqrt(hidden_size)
     #[allow(clippy::cast_precision_loss)]
@@ -393,7 +393,7 @@ where
 
         // Attention
         let attn_out = build_attention_prefill(
-            &mut graph, config, layer_idx, layer_ids, normed, cos_input, sin_input,
+            &mut graph, config, seq_len, layer_idx, layer_ids, normed, cos_input, sin_input,
         );
 
         // Post-attention norm then residual
@@ -1088,14 +1088,14 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_gemma2() {
         let config = gemma2_config();
-        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32);
+        let graph: Graph<TestBackend> = build_prefill_graph(&config, 4, DType::F32);
         assert_eq!(graph.output_ids().len(), 1);
     }
 
     #[test]
     fn test_build_prefill_graph_gemma3() {
         let config = gemma3_config();
-        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32);
+        let graph: Graph<TestBackend> = build_prefill_graph(&config, 4, DType::F32);
         assert_eq!(graph.output_ids().len(), 1);
     }
 

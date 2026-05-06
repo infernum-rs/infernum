@@ -247,7 +247,10 @@ pub fn execute(
                     .unwrap();
                 let token_ids = read_tensor(arena, plan, nodes, node.inputs[0]);
                 let table_w = weights.tensor_weight(op.table);
-                let seq_len = node.output_shapes[0][0];
+                // Use the runtime input length, not the statically declared
+                // output shape. Dynamic-shape graphs use 0 as a placeholder
+                // which would silently produce an empty embedding tensor.
+                let seq_len = token_ids.shape()[0];
                 let result = <CpuBackend as EmbedOps>::embedding_gather_tensor(
                     table_w, &token_ids, seq_len,
                 )?;
