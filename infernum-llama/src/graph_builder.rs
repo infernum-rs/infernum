@@ -847,41 +847,9 @@ pub fn load_graph_weights_safetensors(
         infernum_cpu::tensor::CpuLinearWeight,
     >,
 > {
-    use infernum::graph::WeightId;
-    use infernum::WeightLoader as _;
-    use infernum_cpu::CpuSafeTensorsLoader;
-
-    let loader = CpuSafeTensorsLoader::new(model_dir)?;
-
-    let tensor_count = graph.tensor_weight_count();
-    let linear_count = graph.linear_weight_count();
-
-    let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
-
-    for i in 0..tensor_count {
-        let meta = graph.tensor_weight_meta(WeightId::from_index(
-            u32::try_from(i).expect("weight count exceeds u32"),
-        ));
-        let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
-        store.push_tensor_weight(tensor);
-    }
-
-    for i in 0..linear_count {
-        let meta = graph.linear_weight_meta(WeightId::from_index(
-            u32::try_from(i).expect("weight count exceeds u32"),
-        ));
-        // Handle tied embeddings: some models (e.g. SmolLM2) do not store
-        // `lm_head.weight` separately — it is shared with `embed_tokens`.
-        let name = if meta.name == "lm_head.weight" && !loader.contains("lm_head.weight") {
-            "model.embed_tokens.weight"
-        } else {
-            &meta.name
-        };
-        let weight = loader.load_linear(name, meta.dtype, None)?;
-        store.push_linear_weight(weight);
-    }
-
-    Ok(store)
+    // Some Llama-family models (e.g. SmolLM2) tie `lm_head.weight` to
+    // `embed_tokens.weight`; enable the fallback.
+    infernum_cpu::load_cpu_safetensors_weights(graph, model_dir, true)
 }
 
 // ---------------------------------------------------------------------------

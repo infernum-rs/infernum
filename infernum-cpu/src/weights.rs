@@ -256,6 +256,65 @@ impl SafeTensorsLoaderOps for CpuBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared graph weight loader
+// ---------------------------------------------------------------------------
+
+/// Load `SafeTensors` weights for a CPU graph into a [`infernum::graph::WeightStore`].
+///
+/// Iterates over all tensor and linear weight slots registered in `graph` and
+/// loads them from the `SafeTensors` files in `model_dir`.  When
+/// `lm_head_fallback` is `true` and `lm_head.weight` is absent from the
+/// checkpoint (tied-embedding models), `model.embed_tokens.weight` is used
+/// as a fallback.
+///
+/// # Errors
+///
+/// Returns an error if any weight cannot be found or loaded.
+pub fn load_cpu_safetensors_weights(
+    graph: &infernum::graph::Graph<CpuBackend>,
+    model_dir: &Path,
+    lm_head_fallback: bool,
+) -> infernum::Result<
+    infernum::graph::WeightStore<crate::tensor::CpuTensor, crate::tensor::CpuLinearWeight>,
+> {
+    use infernum::graph::WeightId;
+    use infernum::WeightLoader as _;
+
+    let loader = CpuSafeTensorsLoader::new(model_dir)?;
+
+    let tensor_count = graph.tensor_weight_count();
+    let linear_count = graph.linear_weight_count();
+
+    let mut store = infernum::graph::WeightStore::with_capacity(tensor_count, linear_count);
+
+    for i in 0..tensor_count {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
+        let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
+        store.push_tensor_weight(tensor);
+    }
+
+    for i in 0..linear_count {
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight index fits u32"),
+        ));
+        let name = if lm_head_fallback
+            && meta.name == "lm_head.weight"
+            && !loader.contains("lm_head.weight")
+        {
+            "model.embed_tokens.weight"
+        } else {
+            &meta.name
+        };
+        let weight = loader.load_linear(name, meta.dtype, None)?;
+        store.push_linear_weight(weight);
+    }
+
+    Ok(store)
+}
+
 /// Convert an FP8 E4M3 byte to f32.
 fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     let sign = (bits >> 7) & 1;

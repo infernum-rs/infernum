@@ -29,7 +29,7 @@ pub use graph_engine::{GraphEngine, GraphEngineConfig, GraphKvCache};
 pub use logits::CpuLogits;
 pub use ops::attention::{CpuKvCache, CpuPagedKvCache};
 pub use tensor::{decode_f16_scales, with_scratch, CpuLinearWeight, CpuQuantizedWeight, CpuTensor};
-pub use weights::CpuSafeTensorsLoader;
+pub use weights::{load_cpu_safetensors_weights, CpuSafeTensorsLoader};
 
 /// Marker type for the CPU backend.
 ///
