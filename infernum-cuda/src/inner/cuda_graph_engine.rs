@@ -27,7 +27,7 @@ use std::sync::Arc;
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::graph::{optimizer, plan, Graph, WeightId, WeightStore};
 use infernum::weights::QuantizationConfig;
-use infernum::{DType, ModelConfig, Result};
+use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
@@ -190,36 +190,6 @@ pub fn load_graph_weights_cuda(
     }
 
     Ok(store)
-}
-
-// ---------------------------------------------------------------------------
-// RoPE precomputation (mirrors infernum-cpu/src/graph_engine.rs)
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::cast_precision_loss)]
-fn precompute_rope_row(pos: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
-    let half_dim = head_dim / 2;
-    let mut cos_row = Vec::with_capacity(half_dim);
-    let mut sin_row = Vec::with_capacity(half_dim);
-    for i in 0..half_dim {
-        let freq = 1.0_f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
-        let angle = pos as f32 * freq;
-        cos_row.push(angle.cos());
-        sin_row.push(angle.sin());
-    }
-    (cos_row, sin_row)
-}
-
-fn precompute_rope_data(max_pos: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
-    let half_dim = head_dim / 2;
-    let mut cos_data = Vec::with_capacity(max_pos * half_dim);
-    let mut sin_data = Vec::with_capacity(max_pos * half_dim);
-    for pos in 0..max_pos {
-        let (c, s) = precompute_rope_row(pos, head_dim, theta);
-        cos_data.extend(c);
-        sin_data.extend(s);
-    }
-    (cos_data, sin_data)
 }
 
 // ---------------------------------------------------------------------------

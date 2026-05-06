@@ -39,7 +39,7 @@ pub use error::{path_to_utf8, Error, Result};
 pub use gguf_meta::GgufValue;
 pub use logits::Logits;
 pub use model::{Model, ModelConfig};
-pub use rope::RopeScaling;
+pub use rope::{precompute_rope_data, precompute_rope_row, RopeScaling};
 pub use runtime_state::{BatchConfig, RuntimeStateInit};
 pub use sampling::{GenerateOptions, SamplingParams};
 pub use shard::{shard_strategy_for_weight, GpuConfig, ShardConfig, ShardStrategy};
