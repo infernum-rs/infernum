@@ -410,6 +410,7 @@ fn bench_graph(
             &inputs,
             graph.output_ids(),
             None,
+            None,
             0,
         )?;
         ctx.synchronize()?;
@@ -430,6 +431,7 @@ fn bench_graph(
             &weights,
             &inputs,
             graph.output_ids(),
+            None,
             None,
             0,
         )?;
@@ -586,6 +588,7 @@ fn bench_graph_decode(
             weights,
             &inputs,
             graph.output_ids(),
+            None,
             None,
             0,
         )?;
