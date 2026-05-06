@@ -83,6 +83,48 @@ pub enum LayerWeightIds {
     Moe(MoeLayerWeightIds),
 }
 
+/// Attention weight IDs shared by both dense and `MoE` layers.
+pub struct AttnIds<'a> {
+    pub input_layernorm: WeightId,
+    pub q_proj: WeightId,
+    pub k_proj: WeightId,
+    pub v_proj: WeightId,
+    pub qkv_bias: Option<&'a QkvBiasIds>,
+    pub qk_norm: Option<&'a QkNormIds>,
+    pub o_proj: WeightId,
+    pub post_attention_layernorm: WeightId,
+}
+
+impl LayerWeightIds {
+    /// Return the attention weight IDs regardless of whether the layer is
+    /// dense or `MoE`.  Both variants carry identical attention fields.
+    #[must_use]
+    pub fn attn_ids(&self) -> AttnIds<'_> {
+        match self {
+            LayerWeightIds::Dense(d) => AttnIds {
+                input_layernorm: d.input_layernorm,
+                q_proj: d.q_proj,
+                k_proj: d.k_proj,
+                v_proj: d.v_proj,
+                qkv_bias: d.qkv_bias.as_ref(),
+                qk_norm: d.qk_norm.as_ref(),
+                o_proj: d.o_proj,
+                post_attention_layernorm: d.post_attention_layernorm,
+            },
+            LayerWeightIds::Moe(m) => AttnIds {
+                input_layernorm: m.input_layernorm,
+                q_proj: m.q_proj,
+                k_proj: m.k_proj,
+                v_proj: m.v_proj,
+                qkv_bias: m.qkv_bias.as_ref(),
+                qk_norm: m.qk_norm.as_ref(),
+                o_proj: m.o_proj,
+                post_attention_layernorm: m.post_attention_layernorm,
+            },
+        }
+    }
+}
+
 /// All weight IDs for the full Qwen model.
 pub struct ModelWeightIds {
     /// Embedding table (tensor weight).
@@ -549,29 +591,16 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
     for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
         let sliding_window = config.effective_sliding_window(layer_idx);
 
-        let (input_layernorm, q_proj, k_proj, v_proj, qkv_bias, qk_norm, o_proj, post_attn_norm) =
-            match lw {
-                LayerWeightIds::Dense(d) => (
-                    d.input_layernorm,
-                    d.q_proj,
-                    d.k_proj,
-                    d.v_proj,
-                    d.qkv_bias.as_ref(),
-                    d.qk_norm.as_ref(),
-                    d.o_proj,
-                    d.post_attention_layernorm,
-                ),
-                LayerWeightIds::Moe(m) => (
-                    m.input_layernorm,
-                    m.q_proj,
-                    m.k_proj,
-                    m.v_proj,
-                    m.qkv_bias.as_ref(),
-                    m.qk_norm.as_ref(),
-                    m.o_proj,
-                    m.post_attention_layernorm,
-                ),
-            };
+        let AttnIds {
+            input_layernorm,
+            q_proj,
+            k_proj,
+            v_proj,
+            qkv_bias,
+            qk_norm,
+            o_proj,
+            post_attention_layernorm: post_attn_norm,
+        } = lw.attn_ids();
 
         // 1. Pre-attention norm
         let normed = graph.add_rms_norm(h, input_layernorm, eps);
@@ -724,29 +753,16 @@ pub fn build_decode_graph<B: QwenGraphOps>(
     let mut v_outputs = Vec::with_capacity(num_layers);
 
     for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
-        let (input_layernorm, q_proj, k_proj, v_proj, qkv_bias, qk_norm, o_proj, post_attn_norm) =
-            match lw {
-                LayerWeightIds::Dense(d) => (
-                    d.input_layernorm,
-                    d.q_proj,
-                    d.k_proj,
-                    d.v_proj,
-                    d.qkv_bias.as_ref(),
-                    d.qk_norm.as_ref(),
-                    d.o_proj,
-                    d.post_attention_layernorm,
-                ),
-                LayerWeightIds::Moe(m) => (
-                    m.input_layernorm,
-                    m.q_proj,
-                    m.k_proj,
-                    m.v_proj,
-                    m.qkv_bias.as_ref(),
-                    m.qk_norm.as_ref(),
-                    m.o_proj,
-                    m.post_attention_layernorm,
-                ),
-            };
+        let AttnIds {
+            input_layernorm,
+            q_proj,
+            k_proj,
+            v_proj,
+            qkv_bias,
+            qk_norm,
+            o_proj,
+            post_attention_layernorm: post_attn_norm,
+        } = lw.attn_ids();
 
         let normed = graph.add_rms_norm(h, input_layernorm, eps);
 
@@ -898,29 +914,16 @@ where
     for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
         let sliding_window = config.effective_sliding_window(layer_idx);
 
-        let (input_layernorm, q_proj, k_proj, v_proj, qkv_bias, qk_norm, o_proj, post_attn_norm) =
-            match lw {
-                LayerWeightIds::Dense(d) => (
-                    d.input_layernorm,
-                    d.q_proj,
-                    d.k_proj,
-                    d.v_proj,
-                    d.qkv_bias.as_ref(),
-                    d.qk_norm.as_ref(),
-                    d.o_proj,
-                    d.post_attention_layernorm,
-                ),
-                LayerWeightIds::Moe(m) => (
-                    m.input_layernorm,
-                    m.q_proj,
-                    m.k_proj,
-                    m.v_proj,
-                    m.qkv_bias.as_ref(),
-                    m.qk_norm.as_ref(),
-                    m.o_proj,
-                    m.post_attention_layernorm,
-                ),
-            };
+        let AttnIds {
+            input_layernorm,
+            q_proj,
+            k_proj,
+            v_proj,
+            qkv_bias,
+            qk_norm,
+            o_proj,
+            post_attention_layernorm: post_attn_norm,
+        } = lw.attn_ids();
 
         // 1. Pre-attention norm
         let normed = graph.add_rms_norm(h, input_layernorm, eps);
