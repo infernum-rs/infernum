@@ -12,13 +12,13 @@
 
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, EmbedOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps,
-    RopeOps, SwigluOps, TensorOps,
+    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
     Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphEmbedOps, GraphMatmulOps,
-    GraphMoeOps, GraphNormOps, GraphRopeOps, GraphSiluOps, GraphTensorOps, MoeExpertIds, OutputRef,
-    WeightId,
+    GraphMoeOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps,
+    GraphSiluOps, GraphTensorOps, MoeExpertIds, OutputRef, WeightId,
 };
 
 use crate::config::QwenConfig;
@@ -832,6 +832,211 @@ pub fn build_decode_graph<B: QwenGraphOps>(
     }
 
     (graph, model_weights)
+}
+
+// ---------------------------------------------------------------------------
+// Paged decode graph
+// ---------------------------------------------------------------------------
+
+/// Build a computation graph for batched paged-KV-cache decode for Qwen.
+///
+/// Mirrors [`build_decode_graph`] but uses paged KV cache ops instead of
+/// `concat_seq`. Supports dense layers, `MoE` layers, Q/K/V biases (`Qwen2`),
+/// per-head QK-norm (`Qwen3`), and per-layer sliding window attention.
+///
+/// # Inputs (in order)
+///
+/// 0. `input_ids`    — U32, shape `[batch_size]`
+/// 1. `cos_input`    — F32, shape `[batch_size, head_dim / 2]`
+/// 2. `sin_input`    — F32, shape `[batch_size, head_dim / 2]`
+/// 3. `block_tables` — U32, shape `[batch_size, max_blocks_per_seq]`
+/// 4. `positions`    — U32, shape `[batch_size]`
+/// 5. `seq_lens`     — U32, shape `[batch_size]`
+///
+/// # Panics
+///
+/// Panics if `batch_size == 0`.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
+pub fn build_paged_decode_graph<B>(
+    config: &QwenConfig,
+    batch_size: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    weight_dtype: DType,
+) -> Graph<B>
+where
+    B: QwenGraphOps + PagedKvCacheOps + PagedAttentionOps,
+    Graph<B>: GraphPagedKvCacheOps + GraphPagedAttentionOps,
+{
+    assert!(batch_size > 0, "batch_size must be > 0");
+
+    let mut graph = Graph::<B>::new();
+
+    let hidden = config.hidden_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads();
+    let head_dim = config.head_dim();
+    let vocab_size = config.vocab_size;
+    let eps = config.rms_norm_eps;
+    let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
+    let norm_topk = config.norm_topk_prob;
+
+    let model_weights = register_weights(&mut graph, config, weight_dtype);
+
+    // -- Graph inputs --
+    let input_ids = graph.add_input(&[batch_size], DType::U32);
+    let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
+    let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
+    let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
+    let positions = graph.add_input(&[batch_size], DType::U32);
+    let seq_lens = graph.add_input(&[batch_size], DType::U32);
+
+    // -- Embedding --
+    let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_ids);
+
+    for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
+        let sliding_window = config.effective_sliding_window(layer_idx);
+
+        let (input_layernorm, q_proj, k_proj, v_proj, qkv_bias, qk_norm, o_proj, post_attn_norm) =
+            match lw {
+                LayerWeightIds::Dense(d) => (
+                    d.input_layernorm,
+                    d.q_proj,
+                    d.k_proj,
+                    d.v_proj,
+                    d.qkv_bias.as_ref(),
+                    d.qk_norm.as_ref(),
+                    d.o_proj,
+                    d.post_attention_layernorm,
+                ),
+                LayerWeightIds::Moe(m) => (
+                    m.input_layernorm,
+                    m.q_proj,
+                    m.k_proj,
+                    m.v_proj,
+                    m.qkv_bias.as_ref(),
+                    m.qk_norm.as_ref(),
+                    m.o_proj,
+                    m.post_attention_layernorm,
+                ),
+            };
+
+        // 1. Pre-attention norm
+        let normed = graph.add_rms_norm(h, input_layernorm, eps);
+
+        // 2. Q/K/V projections
+        let (q, k, v) = graph.add_linear_triple(normed, q_proj, k_proj, v_proj);
+
+        // 3. Optional Q/K/V biases (Qwen2)
+        let (q, k, v) = if let Some(bias) = qkv_bias {
+            (
+                graph.add_bias_add(q, bias.q_bias),
+                graph.add_bias_add(k, bias.k_bias),
+                graph.add_bias_add(v, bias.v_bias),
+            )
+        } else {
+            (q, k, v)
+        };
+
+        // 4. Reshape to 3D
+        let q_3d = graph.add_reshape(q, &[batch_size, num_heads, head_dim]);
+        let k_3d = graph.add_reshape(k, &[batch_size, num_kv_heads, head_dim]);
+        let v_3d = graph.add_reshape(v, &[batch_size, num_kv_heads, head_dim]);
+
+        // 5. Optional per-head QK RMSNorm (Qwen3)
+        let (q_3d, k_3d) = if let Some(norms) = qk_norm {
+            graph.add_qk_norm(q_3d, k_3d, norms.q_norm, norms.k_norm, eps)
+        } else {
+            (q_3d, k_3d)
+        };
+
+        // 6. RoPE
+        let q_rope = graph.add_rope(q_3d, cos_input, sin_input, 0);
+        let k_rope = graph.add_rope(k_3d, cos_input, sin_input, 0);
+
+        // 7. Append K/V to paged cache (side-effect)
+        let append =
+            graph.add_append_paged_batched(k_rope, v_3d, block_tables, positions, layer_idx);
+
+        // 8. Paged attention decode
+        //    `append` is listed as a dummy input to force the planner to
+        //    schedule the append before this attention node.
+        let attn_out = graph.add_paged_attention_decode(
+            q_rope,
+            block_tables,
+            seq_lens,
+            positions,
+            append,
+            layer_idx,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            sliding_window,
+            None, // no attention logit softcap
+        );
+
+        // 9. Reshape and output projection
+        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads * head_dim]);
+        let attn_proj = graph.add_linear(attn_flat, o_proj);
+
+        // 10. Residual + post-attention norm
+        let h_updated = graph.add_add(h, attn_proj);
+        let normed_post = graph.add_rms_norm(h_updated, post_attn_norm, eps);
+
+        // 11. FFN or MoE
+        h = match lw {
+            LayerWeightIds::Dense(d) => {
+                let (gate, up) = graph.add_linear_pair(normed_post, d.gate_proj, d.up_proj);
+                let gate_activated = graph.add_silu(gate);
+                let activated = graph.add_mul(gate_activated, up);
+                let down = graph.add_linear(activated, d.down_proj);
+                graph.add_add_inplace(h_updated, down)
+            }
+            LayerWeightIds::Moe(m) => {
+                let moe_out = graph.add_moe_dispatch_softmax(
+                    normed_post,
+                    m.moe_gate,
+                    m.experts.clone(),
+                    num_experts_per_tok,
+                    norm_topk,
+                );
+                let ffn_out = if let (Some(sg), Some(su), Some(sd)) =
+                    (m.shared_gate, m.shared_up, m.shared_down)
+                {
+                    let (sgate, sup) = graph.add_linear_pair(normed_post, sg, su);
+                    let sgate_act = graph.add_silu(sgate);
+                    let sact = graph.add_mul(sgate_act, sup);
+                    let sdown = graph.add_linear(sact, sd);
+                    graph.add_add(moe_out, sdown)
+                } else {
+                    moe_out
+                };
+                graph.add_add_inplace(h_updated, ffn_out)
+            }
+        };
+    }
+
+    // -- Final norm + LM head --
+    let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
+
+    let logits = if let Some(lm_head) = model_weights.lm_head {
+        graph.add_lm_head(normed_final, lm_head, weight_dtype)
+    } else {
+        let lm_w =
+            graph.register_linear_weight("lm_head.weight", &[vocab_size, hidden], weight_dtype);
+        graph.add_lm_head(normed_final, lm_w, weight_dtype)
+    };
+
+    // -- Output: only logits --
+    graph.set_output(logits.0);
+
+    graph
 }
 
 // ---------------------------------------------------------------------------

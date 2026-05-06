@@ -1067,6 +1067,8 @@ pub struct PagedAttentionDecodeOp {
     pub block_size: usize,
     /// Optional sliding window size.
     pub sliding_window: Option<usize>,
+    /// Optional attention logit soft-cap (`tanh(x / cap) * cap`). Used by Gemma 2.
+    pub softcap: Option<f32>,
 }
 
 impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
@@ -1074,7 +1076,12 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
         "paged_attention_decode"
     }
     fn num_inputs(&self) -> usize {
-        4
+        // inputs[0]: q
+        // inputs[1]: block_tables
+        // inputs[2]: seq_lens
+        // inputs[3]: positions
+        // inputs[4]: append_ref (dummy — creates ordering edge; not used at runtime)
+        5
     }
     fn num_outputs(&self) -> usize {
         1
@@ -1121,14 +1128,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedOp {
     fn num_inputs(&self) -> usize {
         2
     }
+    /// One dummy output so `(node_id, 0)` is a valid [`OutputRef`] scheduling handle.
     fn num_outputs(&self) -> usize {
-        0
+        1
     }
     fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
-        vec![]
+        vec![vec![]] // dummy; never read by executor
     }
     fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
-        vec![]
+        vec![DType::U32] // dummy; never used
     }
     fn execute(
         &self,
@@ -1167,14 +1175,22 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
     fn num_inputs(&self) -> usize {
         4
     }
+    /// One dummy output declared so that `(node_id, 0)` is a valid [`OutputRef`].
+    ///
+    /// The scheduling trick in [`GraphPagedKvCacheOps::add_append_paged_batched`]
+    /// returns `(node_id, 0)` which is passed as a dependency input to the
+    /// subsequent `paged_attention_decode` node. Graph construction calls
+    /// `output_shape(node_id, 0)` on that ref, so we must declare at least one
+    /// output shape or it panics. The executor's buffer initialiser already
+    /// allocates a slot via `.max(1)`, so this declaration aligns with that.
     fn num_outputs(&self) -> usize {
-        0
+        1
     }
     fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
-        vec![]
+        vec![vec![]] // dummy scalar-shape marker; never read by the executor
     }
     fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
-        vec![]
+        vec![DType::U32] // dummy; never used
     }
     fn execute(
         &self,

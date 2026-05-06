@@ -548,6 +548,12 @@ impl<B: Backend + MatmulOps + AttentionOps> GraphAttentionOps for Graph<B> {
 pub trait GraphPagedAttentionOps {
     /// Paged attention decode. Q shape is `(batch, num_heads, head_dim)`.
     /// Output shape = Q shape.
+    ///
+    /// `append_ref` is the `OutputRef` returned by the corresponding
+    /// `add_append_paged_batched` call for the same layer. It is passed as a
+    /// dummy input so the planner creates an explicit ordering edge from the
+    /// append side-effect node to this node, guaranteeing the K/V write
+    /// completes before the attention read.
     #[allow(clippy::too_many_arguments)]
     fn add_paged_attention_decode(
         &mut self,
@@ -555,12 +561,14 @@ pub trait GraphPagedAttentionOps {
         block_tables: OutputRef,
         seq_lens: OutputRef,
         positions: OutputRef,
+        append_ref: OutputRef,
         layer_idx: usize,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         block_size: usize,
         sliding_window: Option<usize>,
+        softcap: Option<f32>,
     ) -> OutputRef;
 }
 
@@ -571,12 +579,14 @@ impl<B: Backend + MatmulOps + PagedAttentionOps> GraphPagedAttentionOps for Grap
         block_tables: OutputRef,
         seq_lens: OutputRef,
         positions: OutputRef,
+        append_ref: OutputRef,
         layer_idx: usize,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         block_size: usize,
         sliding_window: Option<usize>,
+        softcap: Option<f32>,
     ) -> OutputRef {
         let node_id = self.add_node(
             Box::new(PagedAttentionDecodeOp {
@@ -586,8 +596,11 @@ impl<B: Backend + MatmulOps + PagedAttentionOps> GraphPagedAttentionOps for Grap
                 head_dim,
                 block_size,
                 sliding_window,
+                softcap,
             }),
-            &[q, block_tables, seq_lens, positions],
+            // append_ref is listed as input[4] to force topological ordering:
+            // append must execute before this attention node.
+            &[q, block_tables, seq_lens, positions, append_ref],
         );
         (node_id, 0)
     }

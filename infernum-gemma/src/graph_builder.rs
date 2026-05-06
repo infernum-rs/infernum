@@ -8,12 +8,14 @@
 //!   dual-theta RoPE (handled via per-layer rope_theta_for_layer)
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, EmbedOps, GegluOps, MatmulOps, NormOps, RopeOps, TensorOps,
+    ArithOps, AttentionOps, Backend, EmbedOps, GegluOps, MatmulOps, NormOps, PagedAttentionOps,
+    PagedKvCacheOps, RopeOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
     Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphGegluOps, GraphMatmulOps,
-    GraphNormOps, GraphRopeOps, GraphSoftcapOps, GraphTensorOps, OutputRef, WeightId,
+    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSoftcapOps,
+    GraphTensorOps, OutputRef, WeightId,
 };
 
 use crate::config::GemmaConfig;
@@ -566,6 +568,161 @@ where
     for fv in &full_v_outputs {
         graph.set_output(fv.0);
     }
+
+    graph
+}
+
+/// Build the Gemma paged-KV decode graph.
+///
+/// Replaces `concat_seq` + `fused_attention_decode` with the paged KV cache
+/// path (`append_paged_batched` + `paged_attention_decode`), enabling true
+/// paged memory management without per-step K/V tensor outputs.
+///
+/// **Graph inputs (6):**
+/// - 0: `input_ids` — U32, `[batch_size]`
+/// - 1: `cos_input` — weight_dtype, `[batch_size, head_dim / 2]`
+/// - 2: `sin_input` — weight_dtype, `[batch_size, head_dim / 2]`
+/// - 3: `block_tables` — U32, `[batch_size, max_blocks_per_seq]`
+/// - 4: `positions` — U32, `[batch_size]` — write index for K/V append
+/// - 5: `seq_lens` — U32, `[batch_size]` — K/V lengths for attention lookup
+///
+/// **Graph output:** logits only — no K/V outputs.
+#[must_use]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
+pub fn build_paged_decode_graph<B>(
+    config: &GemmaConfig,
+    batch_size: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    weight_dtype: DType,
+) -> Graph<B>
+where
+    B: GemmaGraphOps + PagedAttentionOps + PagedKvCacheOps,
+    Graph<B>: GraphMatmulOps
+        + GraphNormOps
+        + GraphEmbedOps
+        + GraphRopeOps
+        + GraphTensorOps
+        + GraphAttentionOps
+        + GraphArithOps
+        + GraphGegluOps
+        + GraphSoftcapOps
+        + GraphPagedAttentionOps
+        + GraphPagedKvCacheOps,
+{
+    let mut graph = Graph::<B>::new();
+
+    let ids = register_weights(&mut graph, config, weight_dtype);
+
+    let hidden = config.hidden_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+
+    // --- Inputs ---
+    let token_input = graph.add_input(&[batch_size], DType::U32);
+    let cos_input = graph.add_input(&[batch_size, head_dim / 2], weight_dtype);
+    let sin_input = graph.add_input(&[batch_size, head_dim / 2], weight_dtype);
+    let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
+    let positions = graph.add_input(&[batch_size], DType::U32);
+    let seq_lens = graph.add_input(&[batch_size], DType::U32);
+
+    // --- Embedding lookup + scale ---
+    #[allow(clippy::cast_precision_loss)]
+    let embed_scale = (hidden as f32).sqrt();
+    let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
+    h = graph.add_scale(h, embed_scale);
+
+    for (layer_idx, layer_ids) in ids.layers.iter().enumerate() {
+        // 1. Pre-attention norm
+        let normed = graph.add_rms_norm(h, layer_ids.input_layernorm, config.rms_norm_eps);
+
+        // 2. QKV projections
+        let q = graph.add_linear(normed, layer_ids.q_proj);
+        let k = graph.add_linear(normed, layer_ids.k_proj);
+        let v = graph.add_linear(normed, layer_ids.v_proj);
+
+        // 3. Reshape to 3D [batch_size, num_heads, head_dim]
+        let q = graph.add_reshape(q, &[batch_size, num_heads, head_dim]);
+        let k = graph.add_reshape(k, &[batch_size, num_kv_heads, head_dim]);
+        let v = graph.add_reshape(v, &[batch_size, num_kv_heads, head_dim]);
+
+        // 4. Optional QK-norm (Gemma 3)
+        let (q, k) = if let Some(ref qkn) = layer_ids.qk_norm {
+            graph.add_qk_norm(q, k, qkn.q_norm, qkn.k_norm, config.rms_norm_eps)
+        } else {
+            (q, k)
+        };
+
+        // 5. RoPE
+        let q = graph.add_rope(q, cos_input, sin_input, 0);
+        let k = graph.add_rope(k, cos_input, sin_input, 0);
+
+        // 6. Paged KV append (side-effect, no output consumed by graph)
+        let append = graph.add_append_paged_batched(k, v, block_tables, positions, layer_idx);
+
+        // 7. Paged attention decode
+        //    `append` is listed as a dummy input to force the planner to
+        //    schedule the append before this attention node.
+        let sliding_window = config.effective_sliding_window(layer_idx);
+        let attn_out = graph.add_paged_attention_decode(
+            q,
+            block_tables,
+            seq_lens,
+            positions,
+            append,
+            layer_idx,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            sliding_window,
+            config.attn_logit_softcapping, // Gemma 2 attention soft-cap; None for Gemma 3
+        );
+
+        // 8. Reshape back to 2D and output projection
+        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads * head_dim]);
+        let attn_proj = graph.add_linear(attn_flat, layer_ids.o_proj);
+
+        // 9. Post-attention norm then residual
+        let post_attn_normed = graph.add_rms_norm(
+            attn_proj,
+            layer_ids.post_attention_layernorm,
+            config.rms_norm_eps,
+        );
+        h = graph.add_add(h, post_attn_normed);
+
+        // 10. Pre-FFN norm
+        let normed_ffn =
+            graph.add_rms_norm(h, layer_ids.pre_feedforward_layernorm, config.rms_norm_eps);
+
+        // 11. GeGLU FFN
+        let gate = graph.add_linear(normed_ffn, layer_ids.gate_proj);
+        let up = graph.add_linear(normed_ffn, layer_ids.up_proj);
+        let activated = graph.add_geglu(gate, up);
+        let down = graph.add_linear(activated, layer_ids.down_proj);
+
+        // 12. Post-FFN norm then residual
+        let post_ffn_normed = graph.add_rms_norm(
+            down,
+            layer_ids.post_feedforward_layernorm,
+            config.rms_norm_eps,
+        );
+        h = graph.add_add(h, post_ffn_normed);
+    }
+
+    // --- Final norm and LM head ---
+    let normed = graph.add_rms_norm(h, ids.final_norm, config.rms_norm_eps);
+    let logits = graph.add_lm_head(normed, ids.lm_head, weight_dtype);
+
+    // Optional final logit soft-capping (Gemma 2)
+    let logits = if let Some(cap) = config.final_logit_softcapping {
+        graph.add_logit_softcap(logits, cap)
+    } else {
+        logits
+    };
+
+    graph.set_output(logits.0);
 
     graph
 }

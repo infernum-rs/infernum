@@ -14,12 +14,12 @@ use infernum::backend::{
     TensorOps,
 };
 use infernum::graph::builtin_ops::{
-    AddRmsNormOp, AppendKvIndirectOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
+    AddRmsNormOp, AppendKvIndirectOp, AppendPagedBatchedOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
     EmbeddingGatherIndirectOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp,
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
     LmHeadOp, LogitSoftcapOp, MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp,
-    RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp, RopeIndirectOp,
-    RopeInterleavedOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
+    RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -88,8 +88,11 @@ pub fn execute(
     inputs: &[CudaTensor],
     output_nodes: &[NodeId],
     mut mla_kv_cache: Option<&mut Vec<Vec<CudaTensor>>>,
+    paged_kv_cache: Option<&mut crate::cuda::PagedKvCache>,
     mla_seq_pos: usize,
 ) -> Result<Vec<CudaTensor>> {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    let mut paged_kv_cache = paged_kv_cache;
     let mut buffers: Vec<Vec<Option<CudaTensor>>> = nodes
         .iter()
         .map(|node| {
@@ -615,6 +618,77 @@ pub fn execute(
                 let softcapped: Vec<f32> = host.iter().map(|&x| (x / cap).tanh() * cap).collect();
                 let result = CudaTensor::from_slice::<f32>(&ctx, &shape, &softcapped)?;
                 store(&mut buffers, node_id, 0, result);
+            }
+
+            // --- Paged KV cache: batched append (side-effect, no output) ---
+            "append_paged_batched" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<AppendPagedBatchedOp>()
+                    .unwrap();
+                let k = read(&buffers, node.inputs[0]).clone();
+                let v = read(&buffers, node.inputs[1]).clone();
+                let block_tables = read(&buffers, node.inputs[2]).clone();
+                let positions = read(&buffers, node.inputs[3]).clone();
+                let batch_size = k.shape()[0];
+                let max_blocks_per_seq = block_tables.shape()[1];
+                let paged = paged_kv_cache
+                    .as_deref_mut()
+                    .expect("paged KV cache required for append_paged_batched");
+                paged.append_paged_batched_tensor(
+                    op.layer_idx,
+                    &k,
+                    &v,
+                    &block_tables,
+                    &positions,
+                    batch_size,
+                    max_blocks_per_seq,
+                )?;
+                // Side-effect op: no output tensor to store.
+                // We store a dummy unit-value so the buffer slot is non-None
+                // (the op has 0 declared outputs but add_node gives it 1 slot
+                // via `.max(1)` in the buffer initialiser).
+            }
+
+            // --- Paged attention decode ---
+            "paged_attention_decode" => {
+                let op = node
+                    .op
+                    .as_any()
+                    .downcast_ref::<PagedAttentionDecodeOp>()
+                    .unwrap();
+                let q = read(&buffers, node.inputs[0]).clone();
+                let block_tables = read(&buffers, node.inputs[1]);
+                let seq_lens = read(&buffers, node.inputs[2]);
+                let paged = paged_kv_cache
+                    .as_deref_mut()
+                    .expect("paged KV cache required for paged_attention_decode");
+                let (k_pool, v_pool) = paged.get_pools(op.layer_idx);
+                let block_size = paged.block_size();
+                let max_blocks_per_seq = block_tables.shape()[1];
+                let seq_lens_vec = seq_lens.to_vec::<u32>()?;
+                let max_seq_len = seq_lens_vec
+                    .iter()
+                    .copied()
+                    .map(|x| x as usize)
+                    .max()
+                    .unwrap_or(1);
+                let attn_out = ops::paged_attention_decode_from_tensor(
+                    q.context(),
+                    &q,
+                    k_pool,
+                    v_pool,
+                    block_tables,
+                    seq_lens,
+                    block_size,
+                    max_blocks_per_seq,
+                    max_seq_len,
+                    None, // scale: auto (1/sqrt(head_dim))
+                    op.softcap,
+                    op.sliding_window,
+                )?;
+                store(&mut buffers, node_id, 0, attn_out);
             }
 
             // --- MLA Attention (DeepSeek V3/R1) ---

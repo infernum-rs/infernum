@@ -14,7 +14,7 @@ use infernum_cuda::{
 };
 
 use crate::config::QwenConfig;
-use crate::graph_builder::{build_decode_graph, build_prefill_graph};
+use crate::graph_builder::{build_decode_graph, build_paged_decode_graph, build_prefill_graph};
 
 // ---------------------------------------------------------------------------
 // CudaGraphEngineConfig impl
@@ -63,6 +63,21 @@ impl CudaGraphEngineConfig for QwenConfig {
         let (graph, _) =
             build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16);
         graph
+    }
+
+    fn build_paged_decode_graph_cuda(
+        &self,
+        batch_size: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Graph<infernum_cuda::CudaBackend> {
+        build_paged_decode_graph::<infernum_cuda::CudaBackend>(
+            self,
+            batch_size,
+            block_size,
+            max_blocks_per_seq,
+            DType::BF16,
+        )
     }
 
     fn load_weights_cuda_safetensors(

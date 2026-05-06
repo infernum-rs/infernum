@@ -12,12 +12,14 @@
 //! - Full causal attention (no sliding window)
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, PagedAttentionOps,
+    PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
     Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphIndirectDecodeOps, GraphMatmulOps,
-    GraphNormOps, GraphRopeOps, GraphSiluOps, GraphTensorOps, WeightId,
+    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSiluOps,
+    GraphTensorOps, WeightId,
 };
 
 use crate::config::LlamaConfig;
@@ -436,6 +438,152 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
     }
 
     (graph, model_weights)
+}
+
+// ---------------------------------------------------------------------------
+// Paged decode graph construction
+// ---------------------------------------------------------------------------
+
+/// Build a computation graph for batched paged-KV-cache decode.
+///
+/// Unlike [`build_decode_graph`], this graph:
+/// - Accepts a batch of tokens (one per sequence) rather than a single token.
+/// - Uses [`GraphPagedKvCacheOps::add_append_paged_batched`] to write new K/V
+///   into the paged pool (side-effect, no tensor output).
+/// - Uses [`GraphPagedAttentionOps::add_paged_attention_decode`] to look up K/V
+///   from the paged pool and compute attention.
+/// - Produces **only** `logits` — no per-layer K/V outputs.
+///
+/// # Inputs (in order)
+///
+/// 0. `input_ids` — U32, shape `[batch_size]`
+/// 1. `cos_input`  — F32, shape `[batch_size, head_dim / 2]`
+/// 2. `sin_input`  — F32, shape `[batch_size, head_dim / 2]`
+/// 3. `block_tables` — U32, shape `[batch_size, max_blocks_per_seq]`
+/// 4. `positions`  — U32, shape `[batch_size]` (write index for append)
+/// 5. `seq_lens`   — U32, shape `[batch_size]` (= positions + 1, for attention)
+///
+/// # Panics
+///
+/// Panics if the config describes an `MoE` model.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_paged_decode_graph<B>(
+    config: &LlamaConfig,
+    batch_size: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    weight_dtype: DType,
+) -> Graph<B>
+where
+    B: LlamaGraphOps + PagedKvCacheOps + PagedAttentionOps,
+    Graph<B>: GraphPagedKvCacheOps + GraphPagedAttentionOps,
+{
+    assert!(
+        !config.is_moe(),
+        "build_paged_decode_graph does not support MoE models"
+    );
+
+    let mut graph = Graph::<B>::new();
+
+    let hidden = config.hidden_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads();
+    let head_dim = config.head_dim();
+    let kv_dim = num_kv_heads * head_dim;
+    let intermediate = config.intermediate_size;
+    let vocab_size = config.vocab_size;
+    let eps = config.rms_norm_eps;
+
+    // -- Register weights (same order as build_decode_graph / build_prefill_graph) --
+    let model_weights = register_weights(
+        &mut graph,
+        config,
+        hidden,
+        kv_dim,
+        intermediate,
+        vocab_size,
+        weight_dtype,
+    );
+
+    // -- Graph inputs --
+    let input_ids = graph.add_input(&[batch_size], DType::U32);
+    let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
+    let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
+    let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
+    let positions = graph.add_input(&[batch_size], DType::U32);
+    let seq_lens = graph.add_input(&[batch_size], DType::U32);
+
+    // -- Embedding --
+    let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_ids);
+
+    // -- Transformer layers --
+    for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
+        // 1. Pre-attention RMS norm
+        let normed = graph.add_rms_norm(h, lw.input_layernorm, eps);
+
+        // 2. Q/K/V projections
+        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
+
+        // 3. Reshape to 3D: [batch_size, num_heads, head_dim]
+        let q_3d = graph.add_reshape(q, &[batch_size, num_heads, head_dim]);
+        let k_3d = graph.add_reshape(k, &[batch_size, num_kv_heads, head_dim]);
+        let v_3d = graph.add_reshape(v, &[batch_size, num_kv_heads, head_dim]);
+
+        // 4. RoPE — offset = 0; cos/sin inputs carry per-token position data.
+        let q_rope = graph.add_rope(q_3d, cos_input, sin_input, 0);
+        let k_rope = graph.add_rope(k_3d, cos_input, sin_input, 0);
+
+        // 5. Append K/V to paged cache (side-effect, no output tensor used).
+        let append =
+            graph.add_append_paged_batched(k_rope, v_3d, block_tables, positions, layer_idx);
+
+        // 6. Paged attention decode: reads K/V from paged pool.
+        //    `append` is listed as a dummy input to force the planner to
+        //    schedule the append before this attention node.
+        let attn_out = graph.add_paged_attention_decode(
+            q_rope,
+            block_tables,
+            seq_lens,
+            positions,
+            append,
+            layer_idx,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            config.effective_sliding_window(layer_idx),
+            None, // no attention logit softcap
+        );
+
+        // 7. Reshape back to 2D and output projection
+        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads * head_dim]);
+        let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
+
+        // 8. Residual add + post-attention RMS norm
+        let h_updated = graph.add_add(h, attn_proj);
+        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm, eps);
+
+        // 9. FFN: SiLU + Mul MLP
+        let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
+        let gate_activated = graph.add_silu(gate);
+        let activated = graph.add_mul(gate_activated, up);
+        let down = graph.add_linear(activated, lw.down_proj);
+
+        // 10. Residual add
+        h = graph.add_add_inplace(h_updated, down);
+    }
+
+    // -- Final norm --
+    let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
+
+    // -- LM head --
+    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
+
+    // -- Output: only logits (no K/V outputs — cache lives in PagedKvCache) --
+    graph.set_output(logits.0);
+
+    graph
 }
 
 // ---------------------------------------------------------------------------

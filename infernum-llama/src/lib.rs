@@ -13,8 +13,8 @@ pub use config::{LlamaConfig, QuantizationConfig};
 #[cfg(feature = "cuda")]
 pub use cuda_graph_engine::{LlamaCudaGraphEngine, LlamaCudaGraphEngineExt};
 pub use graph_builder::{
-    build_decode_graph, build_indirect_decode_graph, build_prefill_graph, IndirectDecodeExtraIds,
-    LayerWeightIds, LlamaGraphOps, ModelWeightIds,
+    build_decode_graph, build_indirect_decode_graph, build_paged_decode_graph, build_prefill_graph,
+    IndirectDecodeExtraIds, LayerWeightIds, LlamaGraphOps, ModelWeightIds,
 };
 #[cfg(feature = "cpu")]
 pub use graph_builder::{load_graph_weights_gguf, load_graph_weights_safetensors};
