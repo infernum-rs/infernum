@@ -577,10 +577,11 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
 
         for i in 0..batch_size {
             let token = token_data[i];
-            let kv_len = positions_data[i] as usize;
+            let kv_len = usize::try_from(positions_data[i]).expect("position must be non-negative");
             // First block ID is the stable per-sequence key.
             let seq_key = if max_blocks_per_seq > 0 {
-                block_table_data[i * max_blocks_per_seq] as usize
+                usize::try_from(block_table_data[i * max_blocks_per_seq])
+                    .expect("block ID must be non-negative")
             } else {
                 i
             };
