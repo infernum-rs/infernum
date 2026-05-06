@@ -13,8 +13,8 @@
 //! - Single-GPU only (no tensor parallelism / `AllReduce`)
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, EmbedOps, MatmulOps, NormOps, PagedAttentionOps,
-    PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, ContextBackend, EmbedOps, MatmulOps, NormOps,
+    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
@@ -72,13 +72,23 @@ pub struct ModelWeightIds {
 /// This is the subset of [`LlamaOps`](crate::model::LlamaOps) needed for
 /// the prefill graph — excludes paged KV cache, `MoE`, and cast ops.
 pub trait LlamaGraphOps:
-    Backend + MatmulOps + NormOps + ArithOps + EmbedOps + TensorOps + RopeOps + AttentionOps + SwigluOps
+    Backend
+    + MatmulOps
+    + ContextBackend
+    + NormOps
+    + ArithOps
+    + EmbedOps
+    + TensorOps
+    + RopeOps
+    + AttentionOps
+    + SwigluOps
 {
 }
 
 impl<B> LlamaGraphOps for B where
     B: Backend
         + MatmulOps
+        + ContextBackend
         + NormOps
         + ArithOps
         + EmbedOps
@@ -97,7 +107,7 @@ impl<B> LlamaGraphOps for B where
 ///
 /// Weight names match the `SafeTensors` naming convention used by
 /// [`LlamaModel::load_weights`](crate::LlamaModel).
-fn register_weights<B: Backend + MatmulOps>(
+fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &LlamaConfig,
     hidden: usize,
@@ -997,6 +1007,7 @@ mod tests {
 
     impl infernum::backend::Backend for TestBackend {
         type Tensor = DummyTensor;
+        type ExecutorState = ();
         type DeviceHandle = ();
         type PagedKvCache = ();
         type KvCache = ();
@@ -1195,6 +1206,27 @@ mod tests {
     impl infernum::backend::SwigluOps for TestBackend {
         fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> infernum::Result<DummyTensor> {
             Ok(DummyTensor)
+        }
+    }
+
+    impl infernum::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: infernum::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: infernum::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
         }
     }
 

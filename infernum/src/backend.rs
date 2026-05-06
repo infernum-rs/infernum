@@ -821,3 +821,36 @@ pub trait MultiDeviceOps: Backend {
         comm_id: Self::CommId,
     ) -> Result<Self::Comm>;
 }
+
+/// Backend-specific tensor I/O for the executor context.
+///
+/// Implements read/write/next_input through the [`ExecuteContext`] for each
+/// backend. The generic [`OpNode::execute`](crate::graph::OpNode::execute)
+/// bodies call these static methods so that context interaction is
+/// backend-dispatched without requiring inherent impls on the foreign
+/// `ExecuteContext` type (which would violate Rust's orphan rules).
+///
+/// [`ExecuteContext`]: crate::graph::execute_context::ExecuteContext
+pub trait ContextBackend: Backend + MatmulOps + Sized {
+    /// Read a tensor produced by a prior node in the graph.
+    ///
+    /// Checks backend-specific caches (e.g., KV overrides on CPU) before
+    /// falling back to the primary storage (arena on CPU, tensor map on CUDA).
+    fn ctx_read(
+        ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,
+        output_ref: crate::graph::OutputRef,
+    ) -> Self::Tensor;
+
+    /// Write an op's output tensor into the context.
+    fn ctx_write(
+        ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        node_id: crate::graph::NodeId,
+        idx: u32,
+        tensor: Self::Tensor,
+    );
+
+    /// Consume the next graph input tensor, advancing the input cursor.
+    fn ctx_next_input(
+        ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+    ) -> Self::Tensor;
+}

@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use crate::backend::{Backend, MatmulOps};
+use crate::backend::{Backend, ContextBackend, MatmulOps};
 use crate::dtype::DType;
 
 use super::builder::Graph;
@@ -54,7 +54,7 @@ impl ExecutionPlan {
 /// # Panics
 /// Panics if the graph contains cycles (should never happen for well-formed graphs).
 #[must_use]
-pub fn plan<B: Backend + MatmulOps>(graph: &Graph<B>) -> ExecutionPlan {
+pub fn plan<B: Backend + MatmulOps + ContextBackend>(graph: &Graph<B>) -> ExecutionPlan {
     let full_schedule = topological_sort(graph);
     let schedule = eliminate_dead_nodes(graph, full_schedule);
     let last_use = compute_last_use(graph, &schedule);
@@ -69,7 +69,7 @@ pub fn plan<B: Backend + MatmulOps>(graph: &Graph<B>) -> ExecutionPlan {
 /// Remove nodes from the schedule that have no consumers and are not graph
 /// outputs or side-effect ops. This eliminates orphaned nodes left behind
 /// by fusion passes (e.g., Silu nodes orphaned by Swiglu fusion).
-fn eliminate_dead_nodes<B: Backend + MatmulOps>(
+fn eliminate_dead_nodes<B: Backend + MatmulOps + ContextBackend>(
     graph: &Graph<B>,
     schedule: Vec<NodeId>,
 ) -> Vec<NodeId> {
@@ -120,7 +120,7 @@ const fn dtype_size_bytes(dtype: DType) -> usize {
 /// the `NodeId` part gives the predecessor.
 #[allow(clippy::cast_possible_truncation)] // graph will never have 2^32 nodes
 #[allow(clippy::needless_range_loop)]
-fn topological_sort<B: Backend + MatmulOps>(graph: &Graph<B>) -> Vec<NodeId> {
+fn topological_sort<B: Backend + MatmulOps + ContextBackend>(graph: &Graph<B>) -> Vec<NodeId> {
     let n = graph.nodes.len();
     if n == 0 {
         return Vec::new();
@@ -181,7 +181,7 @@ fn topological_sort<B: Backend + MatmulOps>(graph: &Graph<B>) -> Vec<NodeId> {
 ///
 /// Returns a flat vector indexed by a key derived from `(node_index, output_index)`.
 /// We use a `Vec<Vec<usize>>` where outer = node index, inner = output index.
-fn compute_last_use<B: Backend + MatmulOps>(
+fn compute_last_use<B: Backend + MatmulOps + ContextBackend>(
     graph: &Graph<B>,
     schedule: &[NodeId],
 ) -> Vec<Vec<usize>> {
@@ -241,7 +241,7 @@ fn buffer_size(shape: &[usize], dtype: DType) -> usize {
 /// Each node may produce multiple outputs, each needing its own buffer slot.
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::needless_range_loop)]
-fn assign_offsets<B: Backend + MatmulOps>(
+fn assign_offsets<B: Backend + MatmulOps + ContextBackend>(
     graph: &Graph<B>,
     schedule: &[NodeId],
     last_use: &[Vec<usize>],
@@ -402,7 +402,10 @@ impl PlanCache {
     /// Panics if the internal mutex is poisoned (which only happens if another
     /// thread panicked while holding it).
     #[must_use]
-    pub fn get_or_compile<B: Backend + MatmulOps>(&self, graph: &Graph<B>) -> ExecutionPlan {
+    pub fn get_or_compile<B: Backend + MatmulOps + ContextBackend>(
+        &self,
+        graph: &Graph<B>,
+    ) -> ExecutionPlan {
         let hash = topology_hash(graph);
         // Compile outside the lock to avoid holding it during planning.
         let candidate = plan(graph);
@@ -431,7 +434,7 @@ impl PlanCache {
 }
 
 /// Compute a topology hash for a graph from its node count and op-name sequence.
-fn topology_hash<B: Backend + MatmulOps>(graph: &Graph<B>) -> u64 {
+fn topology_hash<B: Backend + MatmulOps + ContextBackend>(graph: &Graph<B>) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -722,6 +725,27 @@ mod tests {
             _max_blocks_per_seq: usize,
         ) -> crate::Result<()> {
             Ok(())
+        }
+    }
+
+    impl crate::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: crate::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: crate::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
         }
     }
 

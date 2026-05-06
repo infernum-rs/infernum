@@ -15,6 +15,7 @@ use infernum::graph::builtin_ops::{
     MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, RepeatKvOp, RmsNormOp, RmsNormQkOp, RopeOp,
     ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
+use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
 use infernum::{DType, ExecutionPlan, NodeId, Result};
@@ -45,6 +46,10 @@ pub struct KvCacheStore {
     /// Node IDs of the `ConcatSeq` nodes that append to KV caches, in order:
     /// `[k_concat_0, v_concat_0, k_concat_1, v_concat_1, ...]`
     concat_node_ids: Vec<NodeId>,
+    /// Tensor overrides: nodes whose output lives outside the arena (e.g.,
+    /// KV caches in the persistent `KvCacheStore`). Populated by
+    /// `try_append_kv` and read by downstream attention ops.
+    overrides: HashMap<NodeId, CpuTensor>,
 }
 
 impl KvCacheStore {
@@ -79,6 +84,7 @@ impl KvCacheStore {
             head_dim,
             cache_input_node_ids,
             concat_node_ids,
+            overrides: HashMap::new(),
         }
     }
 
@@ -134,6 +140,49 @@ impl KvCacheStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+impl KvCacheAccess<CpuBackend> for KvCacheStore {
+    fn is_cache_input(&self, node_id: NodeId) -> bool {
+        self.cache_input_node_ids.contains(&node_id)
+    }
+
+    fn read_cache(&self, node_id: NodeId) -> Option<&CpuTensor> {
+        self.overrides.get(&node_id)
+    }
+
+    fn write_cache(&mut self, node_id: NodeId, tensor: CpuTensor) {
+        self.overrides.insert(node_id, tensor);
+    }
+
+    fn cache_concat_info(&self, node_id: NodeId) -> Option<(usize, bool)> {
+        self.concat_node_ids
+            .iter()
+            .position(|&id| id == node_id)
+            .map(|pos| {
+                let layer = pos / 2;
+                let is_key = pos % 2 == 0;
+                (layer, is_key)
+            })
+    }
+
+    fn try_append_kv(&mut self, node_id: NodeId, new_row: &CpuTensor) -> Option<CpuTensor> {
+        let (layer, is_key) = self.cache_concat_info(node_id)?;
+        self.append(layer, is_key, new_row.as_f32_slice());
+        let row_elems = self.num_kv_heads * self.head_dim;
+        let new_len = if is_key {
+            self.k_caches[layer].len() / row_elems
+        } else {
+            self.v_caches[layer].len() / row_elems
+        };
+        let full_cache = self.get_cache(layer, is_key, new_len);
+        self.overrides.insert(node_id, full_cache.clone());
+        Some(full_cache)
+    }
+
+    fn finalize_step(&mut self) {
+        self.len += 1;
     }
 }
 

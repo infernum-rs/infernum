@@ -13,7 +13,6 @@ use crate::Result;
 
 use super::execute_context::ExecuteContext;
 use super::node::NodeId;
-use super::weight_store::WeightStore;
 
 /// Reference to a specific output of a graph node: `(node, output_index)`.
 pub type OutputRef = (NodeId, u32);

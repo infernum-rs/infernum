@@ -8,8 +8,8 @@
 //!   dual-theta RoPE (handled via per-layer rope_theta_for_layer)
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, EmbedOps, GegluOps, MatmulOps, NormOps, PagedAttentionOps,
-    PagedKvCacheOps, RopeOps, TensorOps,
+    ArithOps, AttentionOps, Backend, ContextBackend, EmbedOps, GegluOps, MatmulOps, NormOps,
+    PagedAttentionOps, PagedKvCacheOps, RopeOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
@@ -78,13 +78,23 @@ pub struct ModelWeightIds {
 
 /// Backend trait bounds required by the Gemma graph builder.
 pub trait GemmaGraphOps:
-    Backend + MatmulOps + NormOps + ArithOps + EmbedOps + TensorOps + RopeOps + AttentionOps + GegluOps
+    Backend
+    + MatmulOps
+    + ContextBackend
+    + NormOps
+    + ArithOps
+    + EmbedOps
+    + TensorOps
+    + RopeOps
+    + AttentionOps
+    + GegluOps
 {
 }
 
 impl<B> GemmaGraphOps for B where
     B: Backend
         + MatmulOps
+        + ContextBackend
         + NormOps
         + ArithOps
         + EmbedOps
@@ -103,7 +113,7 @@ impl<B> GemmaGraphOps for B where
 ///
 /// Names match the `SafeTensors` convention used by the HuggingFace checkpoints.
 #[allow(clippy::too_many_lines)]
-fn register_weights<B: Backend + MatmulOps>(
+fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
     weight_dtype: DType,
@@ -874,6 +884,7 @@ mod tests {
 
     impl infernum::backend::Backend for TestBackend {
         type Tensor = DummyTensor;
+        type ExecutorState = ();
         type DeviceHandle = ();
         type PagedKvCache = ();
         type KvCache = ();
@@ -1072,6 +1083,27 @@ mod tests {
     impl infernum::backend::GegluOps for TestBackend {
         fn geglu(_gate: &DummyTensor, _up: &DummyTensor) -> infernum::Result<DummyTensor> {
             Ok(DummyTensor)
+        }
+    }
+
+    impl infernum::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: infernum::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: infernum::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
         }
     }
 

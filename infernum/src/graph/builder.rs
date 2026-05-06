@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use smallvec::SmallVec;
 
-use crate::backend::{Backend, MatmulOps};
+use crate::backend::{Backend, ContextBackend, MatmulOps};
 use crate::dtype::DType;
 
 use super::builtin_ops::InputOp;
@@ -15,8 +15,8 @@ use super::op_node::{OpNode, OutputRef};
 ///
 /// Nodes represent operations; edges (stored as `OutputRef` lists in each
 /// `GraphNode`) represent data dependencies. Weights are registered
-/// separately and referenced by `WeightId`.
-pub struct Graph<B: Backend + MatmulOps> {
+/// separately and referenced by `WeightId`.\
+pub struct Graph<B: Backend + MatmulOps + ContextBackend> {
     /// All nodes in topological (insertion) order.
     pub(crate) nodes: Vec<GraphNode<B>>,
     /// Nodes marked as graph outputs.
@@ -28,7 +28,7 @@ pub struct Graph<B: Backend + MatmulOps> {
     _backend: PhantomData<B>,
 }
 
-impl<B: Backend + MatmulOps> Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend> Graph<B> {
     /// Create an empty computation graph.
     #[must_use]
     pub fn new() -> Self {
@@ -213,7 +213,7 @@ impl<B: Backend + MatmulOps> Graph<B> {
     }
 }
 
-impl<B: Backend + MatmulOps> Default for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend> Default for Graph<B> {
     fn default() -> Self {
         Self::new()
     }

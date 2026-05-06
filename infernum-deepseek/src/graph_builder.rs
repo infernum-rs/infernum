@@ -12,8 +12,8 @@
 //! - **Shared expert** alongside routed experts in `MoE` layers.
 
 use infernum::backend::{
-    ArithOps, Backend, EmbedOps, MatmulOps, MlaAttentionOps, MoeSigmoidOps, NormOps, SwigluOps,
-    TensorOps,
+    ArithOps, Backend, ContextBackend, EmbedOps, MatmulOps, MlaAttentionOps, MoeSigmoidOps,
+    NormOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
@@ -123,7 +123,7 @@ impl<B> DeepSeekGraphOps for B where
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::similar_names)]
-fn register_all_weights<B: Backend + MatmulOps>(
+fn register_all_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &DeepSeekConfig,
     weight_dtype: DType,
@@ -223,7 +223,7 @@ fn register_all_weights<B: Backend + MatmulOps>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
-fn register_mla_weights<B: Backend + MatmulOps>(
+fn register_mla_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     pfx: &str,
     config: &DeepSeekConfig,
@@ -303,7 +303,7 @@ fn register_mla_weights<B: Backend + MatmulOps>(
     }
 }
 
-fn register_moe_weights<B: Backend + MatmulOps>(
+fn register_moe_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &DeepSeekConfig,
     pfx: &str,

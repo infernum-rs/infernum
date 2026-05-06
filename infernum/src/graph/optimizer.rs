@@ -8,20 +8,25 @@
 //! - `Silu(a) → Mul(silu_out, b)` → `Swiglu(a, b)` (when Silu has single consumer)
 //! - `Add(a, b) → RmsNorm(sum)` → `AddRmsNorm(a, b)` (when Add has single consumer)
 
-use crate::backend::{ArithOps, Backend, MatmulOps, NormOps, SwigluOps};
+use crate::backend::{ArithOps, Backend, ContextBackend, MatmulOps, NormOps, SwigluOps};
 
 use super::builder::Graph;
 use super::builtin_ops::{AddRmsNormOp, RmsNormOp, SwigluOp};
 use super::node::NodeId;
 
 /// Apply all fusion rules to the graph in-place.
-pub fn optimize<B: Backend + MatmulOps + ArithOps + NormOps + SwigluOps>(graph: &mut Graph<B>) {
+pub fn optimize<B: Backend + MatmulOps + ArithOps + NormOps + SwigluOps + ContextBackend>(
+    graph: &mut Graph<B>,
+) {
     fuse_swiglu(graph);
     fuse_add_rmsnorm(graph);
 }
 
 /// Count how many nodes use any output of `target` as an input.
-fn consumer_count<B: Backend + MatmulOps>(graph: &Graph<B>, target: NodeId) -> usize {
+fn consumer_count<B: Backend + MatmulOps + ContextBackend>(
+    graph: &Graph<B>,
+    target: NodeId,
+) -> usize {
     graph
         .nodes
         .iter()
@@ -34,7 +39,9 @@ fn consumer_count<B: Backend + MatmulOps>(graph: &Graph<B>, target: NodeId) -> u
 /// Preconditions for fusion:
 /// - The `Mul` node has exactly two inputs, one of which is a `Silu` output.
 /// - The `Silu` node has exactly one consumer (this `Mul`).
-fn fuse_swiglu<B: Backend + MatmulOps + ArithOps + SwigluOps>(graph: &mut Graph<B>) {
+fn fuse_swiglu<B: Backend + MatmulOps + ArithOps + SwigluOps + ContextBackend>(
+    graph: &mut Graph<B>,
+) {
     let n = graph.nodes.len();
     for i in 0..n {
         if graph.nodes[i].op.name() != "mul" {
@@ -92,7 +99,9 @@ fn fuse_swiglu<B: Backend + MatmulOps + ArithOps + SwigluOps>(graph: &mut Graph<
 /// - The `RmsNorm`'s sole input is an `Add`/`AddInplace` output.
 /// - The `Add` output has exactly one node-consumer (the `RmsNorm`).
 #[allow(clippy::cast_possible_truncation)] // graph will never have 2^32 nodes
-fn fuse_add_rmsnorm<B: Backend + MatmulOps + ArithOps + NormOps>(graph: &mut Graph<B>) {
+fn fuse_add_rmsnorm<B: Backend + MatmulOps + ArithOps + NormOps + ContextBackend>(
+    graph: &mut Graph<B>,
+) {
     let n = graph.nodes.len();
     for i in 0..n {
         if graph.nodes[i].op.name() != "rms_norm" {
@@ -234,6 +243,7 @@ mod tests {
         type DeviceHandle = ();
         type PagedKvCache = ();
         type KvCache = ();
+        type ExecutorState = ();
         type RuntimeState = DummyRuntimeState;
         type Logits = DummyLogits;
         type Comm = ();
@@ -316,6 +326,27 @@ mod tests {
     impl crate::backend::SwigluOps for TestBackend {
         fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> crate::Result<DummyTensor> {
             Ok(DummyTensor)
+        }
+    }
+
+    impl crate::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: crate::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: crate::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
         }
     }
 

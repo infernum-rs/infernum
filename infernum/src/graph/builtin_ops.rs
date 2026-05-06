@@ -9,8 +9,8 @@
 use std::any::Any;
 
 use crate::backend::{
-    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, NormOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, GegluOps,
+    MatmulExtOps, MatmulOps, NormOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
 use crate::tensor::Tensor as TensorTrait;
@@ -19,7 +19,6 @@ use crate::Result;
 use super::execute_context::ExecuteContext;
 use super::node::{NodeId, WeightId};
 use super::op_node::{OpNode, OutputRef};
-use super::weight_store::WeightStore;
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -52,7 +51,7 @@ pub struct InputOp {
     pub dtype: DType,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for InputOp {
+impl<B: ContextBackend> OpNode<B> for InputOp {
     fn name(&self) -> &'static str {
         "input"
     }
@@ -70,11 +69,20 @@ impl<B: Backend + MatmulOps> OpNode<B> for InputOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        if ctx
+            .kv_cache
+            .as_ref()
+            .is_some_and(|kv| kv.is_cache_input(node_id))
+        {
+            return Ok(());
+        }
+        let tensor = B::ctx_next_input(ctx);
+        B::ctx_write(ctx, node_id, 0, tensor);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -99,7 +107,7 @@ pub struct EmbeddingGatherOp {
     pub dtype: DType,
 }
 
-impl<B: Backend + MatmulOps + EmbedOps> OpNode<B> for EmbeddingGatherOp {
+impl<B: ContextBackend + EmbedOps> OpNode<B> for EmbeddingGatherOp {
     fn name(&self) -> &'static str {
         "embedding_gather"
     }
@@ -117,11 +125,16 @@ impl<B: Backend + MatmulOps + EmbedOps> OpNode<B> for EmbeddingGatherOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let token_ids = B::ctx_read(ctx, inputs[0]);
+        let table_w = ctx.weights.tensor_weight(self.table).clone();
+        let seq_len = token_ids.shape()[0];
+        let result = <B as EmbedOps>::embedding_gather_tensor(&table_w, &token_ids, seq_len)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -144,7 +157,7 @@ pub struct RmsNormOp {
     pub eps: f32,
 }
 
-impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormOp {
+impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormOp {
     fn name(&self) -> &'static str {
         "rms_norm"
     }
@@ -162,11 +175,15 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let weight = ctx.weights.tensor_weight(self.weight).clone();
+        let result = <B as NormOps>::rms_norm(&input, &weight, self.eps)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -189,7 +206,7 @@ pub struct AddRmsNormOp {
     pub eps: f32,
 }
 
-impl<B: Backend + MatmulOps + NormOps> OpNode<B> for AddRmsNormOp {
+impl<B: ContextBackend + NormOps> OpNode<B> for AddRmsNormOp {
     fn name(&self) -> &'static str {
         "add_rms_norm"
     }
@@ -207,11 +224,17 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for AddRmsNormOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let residual = B::ctx_read(ctx, inputs[0]);
+        let delta = B::ctx_read(ctx, inputs[1]);
+        let weight = ctx.weights.tensor_weight(self.weight).clone();
+        let (updated, normed) = <B as NormOps>::add_rmsnorm(&residual, &delta, &weight, self.eps)?;
+        B::ctx_write(ctx, node_id, 0, updated);
+        B::ctx_write(ctx, node_id, 1, normed);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -234,7 +257,7 @@ pub struct LinearOp {
     pub out_features: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LinearOp {
+impl<B: ContextBackend> OpNode<B> for LinearOp {
     fn name(&self) -> &'static str {
         "linear"
     }
@@ -254,11 +277,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let weight = ctx.weights.linear_weight(self.weight);
+        let result = <B as MatmulOps>::linear(&input, weight)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -285,7 +312,7 @@ pub struct LinearPairOp {
     pub out2: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LinearPairOp {
+impl<B: ContextBackend> OpNode<B> for LinearPairOp {
     fn name(&self) -> &'static str {
         "linear_pair"
     }
@@ -307,11 +334,17 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearPairOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let lw1 = ctx.weights.linear_weight(self.w1);
+        let lw2 = ctx.weights.linear_weight(self.w2);
+        let (out1, out2) = <B as MatmulOps>::linear_pair(&input, lw1, lw2)?;
+        B::ctx_write(ctx, node_id, 0, out1);
+        B::ctx_write(ctx, node_id, 1, out2);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -343,7 +376,7 @@ pub struct LinearTripleOp {
     pub out3: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
+impl<B: ContextBackend> OpNode<B> for LinearTripleOp {
     fn name(&self) -> &'static str {
         "linear_triple"
     }
@@ -367,11 +400,19 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let lw1 = ctx.weights.linear_weight(self.w1);
+        let lw2 = ctx.weights.linear_weight(self.w2);
+        let lw3 = ctx.weights.linear_weight(self.w3);
+        let (out1, out2, out3) = <B as MatmulOps>::linear_triple(&input, lw1, lw2, lw3)?;
+        B::ctx_write(ctx, node_id, 0, out1);
+        B::ctx_write(ctx, node_id, 1, out2);
+        B::ctx_write(ctx, node_id, 2, out3);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -388,7 +429,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
 #[derive(Debug)]
 pub struct MatmulOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
+impl<B: ContextBackend> OpNode<B> for MatmulOp {
     fn name(&self) -> &'static str {
         "matmul"
     }
@@ -406,11 +447,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as MatmulOps>::matmul(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -428,7 +473,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
 #[derive(Debug)]
 pub struct MatmulBf16F32Op;
 
-impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
+impl<B: ContextBackend + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
     fn name(&self) -> &'static str {
         "matmul_bf16_f32"
     }
@@ -446,11 +491,15 @@ impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as MatmulExtOps>::matmul_bf16_f32(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -467,7 +516,7 @@ impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
 #[derive(Debug)]
 pub struct SwigluOp;
 
-impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
+impl<B: ContextBackend + SwigluOps> OpNode<B> for SwigluOp {
     fn name(&self) -> &'static str {
         "swiglu"
     }
@@ -485,11 +534,15 @@ impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let gate = B::ctx_read(ctx, inputs[0]);
+        let up = B::ctx_read(ctx, inputs[1]);
+        let result = <B as SwigluOps>::swiglu(&gate, &up)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -506,7 +559,7 @@ impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
 #[derive(Debug)]
 pub struct GegluOp;
 
-impl<B: Backend + MatmulOps + GegluOps> OpNode<B> for GegluOp {
+impl<B: ContextBackend + GegluOps> OpNode<B> for GegluOp {
     fn name(&self) -> &'static str {
         "geglu"
     }
@@ -524,11 +577,15 @@ impl<B: Backend + MatmulOps + GegluOps> OpNode<B> for GegluOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let gate = B::ctx_read(ctx, inputs[0]);
+        let up = B::ctx_read(ctx, inputs[1]);
+        let result = <B as GegluOps>::geglu(&gate, &up)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -568,7 +625,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!("SiluOp should be fused into SwigluOp by the graph optimiser")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -583,7 +640,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
 #[derive(Debug)]
 pub struct AddOp;
 
-impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for AddOp {
     fn name(&self) -> &'static str {
         "add"
     }
@@ -601,11 +658,15 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as ArithOps>::add(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -624,7 +685,7 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
 #[derive(Debug)]
 pub struct AddInplaceOp;
 
-impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for AddInplaceOp {
     fn name(&self) -> &'static str {
         "add_inplace"
     }
@@ -642,11 +703,15 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as ArithOps>::add(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -661,7 +726,7 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
 #[derive(Debug)]
 pub struct MulOp;
 
-impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for MulOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for MulOp {
     fn name(&self) -> &'static str {
         "mul"
     }
@@ -679,11 +744,15 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for MulOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as ArithOps>::mul(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -705,7 +774,7 @@ pub struct ScaleOp {
     pub factor: f32,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for ScaleOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for ScaleOp {
     fn name(&self) -> &'static str {
         "scale"
     }
@@ -723,11 +792,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for ScaleOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let mut result = B::ctx_read(ctx, inputs[0]);
+        <B as ArithOps>::scale_inplace(&mut result, self.factor)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -749,7 +821,7 @@ pub struct BiasAddOp {
     pub bias: WeightId,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for BiasAddOp {
+impl<B: ContextBackend + BiasOps> OpNode<B> for BiasAddOp {
     fn name(&self) -> &'static str {
         "bias_add"
     }
@@ -767,11 +839,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for BiasAddOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let mut result = B::ctx_read(ctx, inputs[0]);
+        let bias = ctx.weights.tensor_weight(self.bias).clone();
+        <B as BiasOps>::bias_add_inplace(&mut result, &bias)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -791,7 +867,7 @@ pub struct RopeOp {
     pub offset: usize,
 }
 
-impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeOp {
+impl<B: ContextBackend + RopeOps> OpNode<B> for RopeOp {
     fn name(&self) -> &'static str {
         "rope"
     }
@@ -809,11 +885,16 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cos = B::ctx_read(ctx, inputs[1]);
+        let sin = B::ctx_read(ctx, inputs[2]);
+        let result = <B as RopeOps>::apply_rope(&input, &cos, &sin, self.offset)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -834,7 +915,7 @@ pub struct RopeBatchedOp {
     pub batch_size: usize,
 }
 
-impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeBatchedOp {
+impl<B: ContextBackend + RopeOps> OpNode<B> for RopeBatchedOp {
     fn name(&self) -> &'static str {
         "rope_batched"
     }
@@ -852,11 +933,18 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeBatchedOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cos = B::ctx_read(ctx, inputs[1]);
+        let sin = B::ctx_read(ctx, inputs[2]);
+        let positions = B::ctx_read(ctx, inputs[3]);
+        let result =
+            <B as RopeOps>::apply_rope_batched(&input, &cos, &sin, &positions, self.batch_size)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -877,7 +965,7 @@ pub struct RopeInterleavedOp {
     pub offset: usize,
 }
 
-impl<B: Backend + MatmulOps + RopeInterleavedOps> OpNode<B> for RopeInterleavedOp {
+impl<B: ContextBackend + RopeInterleavedOps> OpNode<B> for RopeInterleavedOp {
     fn name(&self) -> &'static str {
         "rope_interleaved"
     }
@@ -895,11 +983,17 @@ impl<B: Backend + MatmulOps + RopeInterleavedOps> OpNode<B> for RopeInterleavedO
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cos = B::ctx_read(ctx, inputs[1]);
+        let sin = B::ctx_read(ctx, inputs[2]);
+        let result =
+            <B as RopeInterleavedOps>::apply_rope_interleaved(&input, &cos, &sin, self.offset)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -926,7 +1020,7 @@ pub struct FusedAttentionPrefillOp {
     pub sliding_window: Option<usize>,
 }
 
-impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionPrefillOp {
+impl<B: ContextBackend + AttentionOps> OpNode<B> for FusedAttentionPrefillOp {
     fn name(&self) -> &'static str {
         "fused_attention_prefill"
     }
@@ -944,11 +1038,24 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionPrefillO
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let q = B::ctx_read(ctx, inputs[0]);
+        let k = B::ctx_read(ctx, inputs[1]);
+        let v = B::ctx_read(ctx, inputs[2]);
+        let result = <B as AttentionOps>::fused_attention_prefill(
+            &q,
+            &k,
+            &v,
+            self.offset,
+            self.scale,
+            self.softcap,
+            self.sliding_window,
+        )?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -969,7 +1076,7 @@ pub struct FusedAttentionDecodeOp {
     pub softcap: Option<f32>,
 }
 
-impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionDecodeOp {
+impl<B: ContextBackend + AttentionOps> OpNode<B> for FusedAttentionDecodeOp {
     fn name(&self) -> &'static str {
         "fused_attention_decode"
     }
@@ -987,11 +1094,17 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionDecodeOp
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let q = B::ctx_read(ctx, inputs[0]);
+        let k = B::ctx_read(ctx, inputs[1]);
+        let v = B::ctx_read(ctx, inputs[2]);
+        let result =
+            <B as AttentionOps>::fused_attention_decode(&q, &k, &v, None, self.softcap, None)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1052,7 +1165,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!("PagedAttentionDecodeOp requires paged KV cache — handled by executor")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1098,7 +1211,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!("AppendPagedOp requires paged KV cache write access — handled by executor")
     }
     fn is_side_effect(&self) -> bool {
         true
@@ -1152,7 +1265,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "AppendPagedBatchedOp requires paged KV cache write access — handled by executor"
+        )
     }
     fn is_side_effect(&self) -> bool {
         true
@@ -1208,7 +1323,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for GatherPagedKvOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!("GatherPagedKvOp requires paged KV cache read access — handled by executor")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1229,7 +1344,7 @@ pub struct ReshapeOp {
     pub shape: Vec<usize>,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for ReshapeOp {
+impl<B: ContextBackend> OpNode<B> for ReshapeOp {
     fn name(&self) -> &'static str {
         "reshape"
     }
@@ -1247,11 +1362,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for ReshapeOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = input.reshape(&self.shape);
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1274,7 +1392,7 @@ pub struct SliceViewOp {
     pub shape: Vec<usize>,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
+impl<B: ContextBackend> OpNode<B> for SliceViewOp {
     fn name(&self) -> &'static str {
         "slice_view"
     }
@@ -1292,11 +1410,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = input.slice_view(self.offset, &self.shape);
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1313,7 +1434,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
 #[derive(Debug)]
 pub struct Transpose2dOp;
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for Transpose2dOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for Transpose2dOp {
     fn name(&self) -> &'static str {
         "transpose_2d"
     }
@@ -1331,11 +1452,14 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for Transpose2dOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as TensorOps>::transpose_2d(&input)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1356,7 +1480,7 @@ pub struct SplitInnerDimOp {
     pub left_size: usize,
 }
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for SplitInnerDimOp {
     fn name(&self) -> &'static str {
         "split_inner_dim"
     }
@@ -1380,11 +1504,17 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let total = *input.shape().last().unwrap();
+        let right_size = total - self.left_size;
+        let (left, right) = <B as TensorOps>::split_inner_dim(&input, self.left_size, right_size)?;
+        B::ctx_write(ctx, node_id, 0, left);
+        B::ctx_write(ctx, node_id, 1, right);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1402,7 +1532,7 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
 #[derive(Debug)]
 pub struct ConcatInnerDimOp;
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for ConcatInnerDimOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for ConcatInnerDimOp {
     fn name(&self) -> &'static str {
         "concat_inner_dim"
     }
@@ -1422,11 +1552,15 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for ConcatInnerDimOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as TensorOps>::concat_inner_dim(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1469,7 +1603,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for ConcatSeqOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!("ConcatSeqOp requires KV cache sequence concat — handled by executor")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1490,7 +1624,7 @@ pub struct RepeatKvOp {
     pub num_repeats: usize,
 }
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for RepeatKvOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for RepeatKvOp {
     fn name(&self) -> &'static str {
         "repeat_kv"
     }
@@ -1509,11 +1643,14 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for RepeatKvOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as TensorOps>::repeat_kv(&input, self.num_repeats)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1534,7 +1671,7 @@ pub struct ExtractLastRowOp {
     pub seq_len: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
+impl<B: ContextBackend> OpNode<B> for ExtractLastRowOp {
     fn name(&self) -> &'static str {
         "extract_last_row"
     }
@@ -1552,11 +1689,17 @@ impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cols = input.shape()[1];
+        let offset = (self.seq_len - 1) * cols;
+        let out_shape = vec![1, cols];
+        let result = input.slice_view(offset, &out_shape);
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1571,7 +1714,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
 #[derive(Debug)]
 pub struct CastToF32Op;
 
-impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastToF32Op {
+impl<B: ContextBackend + CastOps> OpNode<B> for CastToF32Op {
     fn name(&self) -> &'static str {
         "cast_to_f32"
     }
@@ -1589,11 +1732,14 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastToF32Op {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as CastOps>::cast_to_f32(&input)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1611,7 +1757,7 @@ pub struct CastFromF32Op {
     pub target: DType,
 }
 
-impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastFromF32Op {
+impl<B: ContextBackend + CastOps> OpNode<B> for CastFromF32Op {
     fn name(&self) -> &'static str {
         "cast_from_f32"
     }
@@ -1629,11 +1775,14 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastFromF32Op {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as CastOps>::cast_from_f32(&input, self.target)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1683,7 +1832,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSoftmaxOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        panic!("MoeDispatchSoftmaxOp requires closure-based expert dispatch — handled by executor")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1742,7 +1891,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSigmoidOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        panic!("MoeDispatchSigmoidOp requires closure-based expert dispatch — handled by executor")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1782,7 +1931,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for AllReduceSumOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "AllReduceSumOp requires multi-device NCCL communicator — handled by executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1808,7 +1959,7 @@ pub struct LmHeadOp {
     pub vocab_size: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LmHeadOp {
+impl<B: ContextBackend> OpNode<B> for LmHeadOp {
     fn name(&self) -> &'static str {
         "lm_head"
     }
@@ -1826,11 +1977,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for LmHeadOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let weight = ctx.weights.linear_weight(self.weight);
+        let result = <B as MatmulOps>::linear(&input, weight)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1880,7 +2035,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for EmbeddingGatherIndirectOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "EmbeddingGatherIndirectOp requires SeqPosition GPU pointer — handled by CUDA graph executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1936,7 +2093,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for RopeIndirectOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "RopeIndirectOp requires SeqPosition GPU pointer — handled by CUDA graph executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1996,7 +2155,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendKvIndirectOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "AppendKvIndirectOp requires KV cache device buffer access — handled by CUDA graph executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2057,7 +2218,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for FusedAttentionDecodeIndirectOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "FusedAttentionDecodeIndirectOp requires stable KV cache device buffers — handled by CUDA graph executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2102,7 +2265,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "ArgmaxLastOp must use argmax_last_gpu kernel — handled by CUDA graph executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2135,7 +2300,7 @@ pub struct RmsNormQkOp {
     pub eps: f32,
 }
 
-impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormQkOp {
+impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormQkOp {
     fn name(&self) -> &'static str {
         "rms_norm_qk"
     }
@@ -2154,11 +2319,19 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormQkOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        let q = B::ctx_read(ctx, inputs[0]);
+        let k = B::ctx_read(ctx, inputs[1]);
+        let q_weight = ctx.weights.tensor_weight(self.q_weight).clone();
+        let k_weight = ctx.weights.tensor_weight(self.k_weight).clone();
+        let q_normed = <B as NormOps>::rms_norm(&q, &q_weight, self.eps)?;
+        let k_normed = <B as NormOps>::rms_norm(&k, &k_weight, self.eps)?;
+        B::ctx_write(ctx, node_id, 0, q_normed);
+        B::ctx_write(ctx, node_id, 1, k_normed);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2206,7 +2379,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "LogitSoftcapOp requires backend-specific softcap kernel — handled by executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2298,7 +2473,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for MlaAttentionOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("Step 5/7: body migrated later")
+        unimplemented!(
+            "MlaAttentionOp is a composite op requiring MLA-specific KV cache logic — handled by executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self

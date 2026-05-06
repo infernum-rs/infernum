@@ -450,6 +450,27 @@ mod tests {
         }
     }
 
+    impl crate::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: crate::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: crate::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Builder traits tests
     // -----------------------------------------------------------------------
@@ -714,11 +735,11 @@ mod tests {
 
         fn execute(
             &self,
-            _ctx: &mut ExecuteContext<'_, B>,
+            _ctx: &mut ExecuteContext<'_, TestBackend>,
             _node_id: NodeId,
             _inputs: &[OutputRef],
-        ) -> Result<()> {
-            unimplemented!("Step 5/7: body migrated later")
+        ) -> crate::Result<()> {
+            Ok(()) // no-op test implementation
         }
 
         fn as_any(&self) -> &dyn std::any::Any {

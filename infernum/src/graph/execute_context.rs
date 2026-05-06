@@ -32,6 +32,19 @@ pub trait KvCacheAccess<B: Backend> {
 
     /// Store a tensor into the cache for `node_id`.
     fn write_cache(&mut self, node_id: NodeId, tensor: B::Tensor);
+
+    /// Returns `(layer_index, is_key)` if `node_id` is a KV-cache `ConcatSeq`
+    /// node, or `None` if it is a regular concat.
+    fn cache_concat_info(&self, node_id: NodeId) -> Option<(usize, bool)>;
+
+    /// If `node_id` is a KV concat node, appends `new_row` to the persistent
+    /// cache and returns the full updated cache tensor. Returns `None` if this
+    /// is not a KV concat node.
+    fn try_append_kv(&mut self, node_id: NodeId, new_row: &B::Tensor) -> Option<B::Tensor>;
+
+    /// Called after all ops in one decode step have executed, to advance
+    /// internal sequence-length counters.
+    fn finalize_step(&mut self);
 }
 
 /// Context passed to each op's [`super::op_node::OpNode::execute`] method.
@@ -73,12 +86,13 @@ pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
 impl<'a, B: Backend + MatmulOps> ExecuteContext<'a, B> {
     /// Read a tensor produced by a prior node in the graph.
     ///
+    /// Returns an owned tensor (cloned from the backend's storage).
     /// Implemented concretely for each backend in the backend crates.
     ///
     /// # Panics
     ///
     /// Panics with a backend-specific message if the tensor is not found.
-    pub fn read_tensor(&self, _output_ref: OutputRef) -> &B::Tensor {
+    pub fn read_tensor(&self, _output_ref: OutputRef) -> B::Tensor {
         unimplemented!(
             "ExecuteContext::read_tensor — implement in the backend crate (infernum-cpu / infernum-cuda)"
         )
@@ -99,12 +113,13 @@ impl<'a, B: Backend + MatmulOps> ExecuteContext<'a, B> {
 
     /// Consume the next graph input tensor, advancing the input cursor.
     ///
-    /// Implemented concretely for each backend in the backend crates.
+    /// Returns an owned tensor. Implemented concretely for each backend in the
+    /// backend crates.
     ///
     /// # Panics
     ///
     /// Panics if all input tensors have already been consumed.
-    pub fn next_input(&mut self) -> &B::Tensor {
+    pub fn next_input(&mut self) -> B::Tensor {
         unimplemented!(
             "ExecuteContext::next_input — implement in the backend crate (infernum-cpu / infernum-cuda)"
         )
