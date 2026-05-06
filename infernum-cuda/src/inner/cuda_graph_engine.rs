@@ -13,7 +13,6 @@
 //!
 //! # Limitations
 //!
-//! - Only `batch_size = 1` is supported in decode; block tables are ignored.
 //! - `MoE` models (Qwen3-MoE, Mixtral) require the CUDA `MoE` dispatch arms to be
 //!   present in the executor (added in Step 6).
 //! - `DeepSeek` (MLA) is not supported via this generic path; it remains a separate
@@ -26,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::graph::{optimizer, plan, Graph, WeightId, WeightStore};
+use infernum::weights::QuantizationConfig;
 use infernum::{DType, ModelConfig, Result};
 
 use super::executor::execute;
@@ -53,6 +53,17 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
     fn rope_theta(&self) -> f32;
     fn vocab_size(&self) -> usize;
     fn eos_token_id(&self) -> u32;
+
+    /// Optional quantization config for GPTQ/AWQ/FP8 models.
+    ///
+    /// When `Some`, `load_graph_weights_cuda` passes this to `load_linear`
+    /// so that quantized weight variants (`qweight`/`qzeros`/`scales` for
+    /// GPTQ, or raw FP8 tensors with scales) are loaded correctly.
+    ///
+    /// Default implementation returns `None` (dense/unquantized models).
+    fn quantization_config(&self) -> Option<&QuantizationConfig> {
+        None
+    }
 
     /// Build a prefill-mode graph for the given sequence length.
     fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<CudaBackend>;
@@ -91,6 +102,12 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
 /// loading `model.embed_tokens.weight` when `lm_head.weight` is absent
 /// (tied-embedding models such as `SmolLM2`).
 ///
+/// The `quant_config` parameter, when `Some`, is forwarded to `load_linear`
+/// for each linear weight. This enables GPTQ and AWQ quantized loading (via
+/// `qweight`/`qzeros`/`scales`) and FP8 compressed-tensors loading. When
+/// `None`, the loader falls back to detecting quantization from the file's
+/// dtype (e.g. raw FP8 tensors stored as `F8E4M3`).
+///
 /// # Panics
 ///
 /// Panics if the number of weights in the graph exceeds `u32::MAX`.
@@ -103,6 +120,7 @@ pub fn load_graph_weights_cuda(
     ctx: &CudaContext,
     model_dir: &Path,
     lm_head_fallback: bool,
+    quant_config: Option<&QuantizationConfig>,
 ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
     use infernum::WeightLoader as _;
 
@@ -134,7 +152,31 @@ pub fn load_graph_weights_cuda(
         } else {
             &meta.name
         };
-        let weight = loader.load_linear(name, meta.dtype, None)?;
+        // Only pass quant_config when the weight is actually quantized.
+        // GPTQ/AWQ checkpoints may contain unquantized tensors (e.g.
+        // `model.embed_tokens.weight`) alongside quantized projections; we
+        // detect this by probing for the `<prefix>.qweight` sibling that GPTQ
+        // format always produces.  For FP8 (compressed-tensors) we check the
+        // on-disk dtype.
+        let effective_quant = quant_config.and_then(|qc| {
+            let is_quantized = match qc.quant_method.as_str() {
+                "gptq" | "awq" => {
+                    let prefix = name.strip_suffix(".weight").unwrap_or(name);
+                    loader.contains(&format!("{prefix}.qweight"))
+                }
+                _ => {
+                    // compressed-tensors / fp8: weight exists as a quantized
+                    // dtype on disk — let load_linear detect it via file_dtype.
+                    false
+                }
+            };
+            if is_quantized {
+                Some(qc)
+            } else {
+                None
+            }
+        });
+        let weight = loader.load_linear(name, meta.dtype, effective_quant)?;
         store.push_linear_weight(weight);
     }
 
@@ -175,23 +217,22 @@ fn precompute_rope_data(max_pos: usize, head_dim: usize, theta: f32) -> (Vec<f32
 // KV cache
 // ---------------------------------------------------------------------------
 
-/// Per-layer KV tensors on the GPU for the graph-mode decode path.
+/// Per-sequence, per-layer KV tensors on the GPU for the graph-mode decode path.
 ///
-/// Wraps CUDA tensors in a `Mutex` so they can be shared across the `Model`
-/// trait boundary. The mutex is never contended (single worker thread).
-pub struct CudaGraphKvCache {
-    inner: Mutex<KvStore>,
-    committed: std::sync::atomic::AtomicUsize,
-}
-
-struct KvStore {
+/// Stores the K/V history for one sequence as dense CUDA tensors.
+/// Shape after `n` tokens: `[n, num_kv_heads, head_dim]`.
+struct SeqKvStore {
+    /// Per-layer accumulated K/V tensors. `None` until the first decode step.
     layers: Vec<(Option<CudaTensor>, Option<CudaTensor>)>,
+    /// Number of tokens whose K/V has been committed to `layers`.
+    committed: usize,
 }
 
-impl KvStore {
+impl SeqKvStore {
     fn new(num_layers: usize) -> Self {
         Self {
             layers: vec![(None, None); num_layers],
+            committed: 0,
         }
     }
 
@@ -202,27 +243,49 @@ impl KvStore {
 
     /// Update K/V from graph outputs.
     ///
-    /// Output layout (from both prefill and decode graphs):
-    /// `[logits, k_layer0, v_layer0, k_layer1, v_layer1, ...]`
+    /// Output layout (from all graph builders):
+    /// `[logits, k_layer0, k_layer1, ..., k_layer{L-1}, v_layer0, v_layer1, ..., v_layer{L-1}]`
     fn update_from_outputs(&mut self, outputs: &[CudaTensor], num_layers: usize) {
         for layer in 0..num_layers {
-            let k = outputs[1 + layer * 2].clone();
-            let v = outputs[1 + layer * 2 + 1].clone();
+            let k = outputs[1 + layer].clone();
+            let v = outputs[1 + num_layers + layer].clone();
             self.layers[layer] = (Some(k), Some(v));
         }
+        self.committed += 1;
     }
+}
+
+/// Multi-sequence KV cache for the graph-mode decode path.
+///
+/// Keyed by the first block ID of each sequence (stable per-sequence identifier
+/// provided by the block allocator). Each sequence maintains its own dense K/V
+/// accumulator, enabling inflight batching without a paged KV layout.
+///
+/// Wraps a `Mutex` so it can be shared across the `Model` trait boundary.
+/// The mutex is never contended (single worker thread).
+pub struct CudaGraphKvCache {
+    inner: Mutex<std::collections::HashMap<usize, SeqKvStore>>,
+    num_layers: usize,
 }
 
 impl CudaGraphKvCache {
     fn new(num_layers: usize) -> Self {
         Self {
-            inner: Mutex::new(KvStore::new(num_layers)),
-            committed: std::sync::atomic::AtomicUsize::new(0),
+            inner: Mutex::new(std::collections::HashMap::new()),
+            num_layers,
         }
     }
 
-    fn seq_len(&self) -> usize {
-        self.committed.load(std::sync::atomic::Ordering::Relaxed)
+    /// Get or insert a per-sequence store for `seq_key`.
+    fn with_seq<F, R>(&self, seq_key: usize, f: F) -> R
+    where
+        F: FnOnce(&mut SeqKvStore) -> R,
+    {
+        let mut map = self.inner.lock().expect("CudaGraphKvCache mutex poisoned");
+        let entry = map
+            .entry(seq_key)
+            .or_insert_with(|| SeqKvStore::new(self.num_layers));
+        f(entry)
     }
 }
 
@@ -333,8 +396,16 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         Ok(inputs)
     }
 
-    fn run_decode_graph(&self, token: u32, kv_cache: &CudaGraphKvCache) -> Result<Vec<CudaTensor>> {
-        let kv_len = kv_cache.seq_len();
+    /// Run one decode step for a single sequence.
+    ///
+    /// `kv_len` is the number of tokens already in the sequence's KV store,
+    /// and `seq_store` provides the current accumulated K/V tensors per layer.
+    fn run_decode_graph(
+        &self,
+        token: u32,
+        kv_len: usize,
+        seq_store: &SeqKvStore,
+    ) -> Result<Vec<CudaTensor>> {
         let head_dim = self.config.head_dim();
         let half_dim = self.half_dim;
         let num_layers = self.config.num_hidden_layers();
@@ -353,12 +424,8 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let mut inputs = vec![input_id_t, cos_t, sin_t];
 
         if kv_len > 0 {
-            let store = kv_cache
-                .inner
-                .lock()
-                .expect("CudaGraphKvCache mutex poisoned");
             for layer in 0..num_layers {
-                if let Some((k, v)) = store.get_layer(layer) {
+                if let Some((k, v)) = seq_store.get_layer(layer) {
                     inputs.push(k.clone());
                     inputs.push(v.clone());
                 } else {
@@ -444,24 +511,22 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         input_ids: &[u32],
         kv_cache: &mut CudaGraphKvCache,
         _runtime_state: &mut <CudaBackend as infernum::backend::Backend>::RuntimeState,
-        _block_table: &BlockTable,
+        block_table: &BlockTable,
         _start_pos: usize,
     ) -> Result<<CudaBackend as infernum::backend::Backend>::Logits> {
         let num_layers = self.config.num_hidden_layers();
+        // Use the first block ID as the stable per-sequence key. Block 0 is
+        // always assigned before prefill and never changes for this sequence.
+        let seq_key = block_table.blocks().first().copied().unwrap_or(0);
         let mut last_outputs: Option<Vec<CudaTensor>> = None;
 
         for &token in input_ids {
-            let outputs = self.run_decode_graph(token, kv_cache)?;
-            {
-                let mut store = kv_cache
-                    .inner
-                    .lock()
-                    .expect("CudaGraphKvCache mutex poisoned");
-                store.update_from_outputs(&outputs, num_layers);
-            }
-            kv_cache
-                .committed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let outputs = kv_cache.with_seq(seq_key, |seq_store| -> Result<Vec<CudaTensor>> {
+                let kv_len = seq_store.committed;
+                let outs = self.run_decode_graph(token, kv_len, seq_store)?;
+                seq_store.update_from_outputs(&outs, num_layers);
+                Ok(outs)
+            })?;
             last_outputs = Some(outputs);
         }
 
@@ -471,53 +536,74 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         Ok(CudaLogits::new(logits_f32))
     }
 
-    /// Batched decode. Only `batch_size = 1` is supported.
+    /// Batched decode with per-sequence KV cache.
     ///
-    /// Block tables are ignored — the graph engine tracks sequence length via
-    /// the committed token count in the KV cache.
+    /// Runs one decode step per sequence independently, using the first block
+    /// ID from each row of `block_tables` as the stable per-sequence key into
+    /// the KV cache. Each sequence's K/V history is updated after its step.
+    /// Logits are concatenated row-wise before returning.
     #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
         token_ids: &CudaTensor,
         kv_cache: &mut CudaGraphKvCache,
         _runtime_state: &mut <CudaBackend as infernum::backend::Backend>::RuntimeState,
-        _block_tables: &CudaTensor,
+        block_tables: &CudaTensor,
         _seq_lens: &CudaTensor,
-        _positions: &CudaTensor,
+        positions: &CudaTensor,
         batch_size: usize,
-        _max_blocks_per_seq: usize,
+        max_blocks_per_seq: usize,
         _max_seq_len: usize,
     ) -> Result<<CudaBackend as infernum::backend::Backend>::Logits> {
-        if batch_size != 1 {
-            return Err(infernum::Error::InvalidShape(format!(
-                "CudaGraphEngine only supports batch_size=1 in decode, got {batch_size}"
-            )));
-        }
-
-        let vocab_size = self.config.vocab_size();
         let num_layers = self.config.num_hidden_layers();
 
-        // Extract the single token from the device tensor.
+        // Bring per-sequence data to the host for the graph-engine loop.
         let token_data = token_ids.to_vec::<u32>()?;
-        let token = token_data[0];
+        // positions[i] is the number of tokens already committed for sequence i.
+        // DType::I32 tensors hold raw i32 bytes; reinterpret after downloading.
+        let positions_bytes = positions.to_raw_bytes()?;
+        let positions_data: Vec<i32> = positions_bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        // block_tables is a flat (batch_size * max_blocks_per_seq) i32 tensor.
+        let block_table_bytes = block_tables.to_raw_bytes()?;
+        let block_table_data: Vec<i32> = block_table_bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
 
-        let outputs = self.run_decode_graph(token, kv_cache)?;
+        let mut all_logits: Vec<CudaTensor> = Vec::with_capacity(batch_size);
 
-        {
-            let mut store = kv_cache
-                .inner
-                .lock()
-                .expect("CudaGraphKvCache mutex poisoned");
-            store.update_from_outputs(&outputs, num_layers);
+        for i in 0..batch_size {
+            let token = token_data[i];
+            let kv_len = positions_data[i] as usize;
+            // First block ID is the stable per-sequence key.
+            let seq_key = if max_blocks_per_seq > 0 {
+                block_table_data[i * max_blocks_per_seq] as usize
+            } else {
+                i
+            };
+
+            let logits_t = kv_cache.with_seq(seq_key, |seq_store| -> Result<CudaTensor> {
+                // Sync committed count from the block table position so that
+                // sequences re-entering the batch after being descheduled
+                // are handled correctly.
+                seq_store.committed = kv_len;
+                let outs = self.run_decode_graph(token, kv_len, seq_store)?;
+                seq_store.update_from_outputs(&outs, num_layers);
+                // outs[0] has shape [1, vocab_size] in BF16.
+                Ok(outs
+                    .into_iter()
+                    .next()
+                    .expect("no outputs from decode graph"))
+            })?;
+            all_logits.push(logits_t);
         }
-        kv_cache
-            .committed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // outputs[0] has shape [1, vocab_size].
-        let logits_vec = outputs[0].to_vec::<f32>()?;
-        let logit_t =
-            CudaTensor::from_slice(&self.ctx, &[1, vocab_size], &logits_vec[..vocab_size])?;
-        Ok(CudaLogits::new(logit_t))
+        // Concatenate logits row-wise: [batch_size, vocab_size] in BF16.
+        let logits_bf16 = <CudaBackend as infernum::backend::TensorOps>::concat_rows(&all_logits)?;
+        let logits_f32 = cast_to_f32(&logits_bf16)?;
+        Ok(CudaLogits::new(logits_f32))
     }
 }

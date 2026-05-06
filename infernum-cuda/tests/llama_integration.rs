@@ -152,7 +152,6 @@ mod llama_fp8 {
     }
 
     #[test]
-    #[ignore = "FP8 compressed-tensors weight loading not yet supported by CudaGraphEngine"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(
@@ -162,7 +161,6 @@ mod llama_fp8 {
     }
 
     #[test]
-    #[ignore = "FP8 compressed-tensors weight loading not yet supported by CudaGraphEngine"]
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();
@@ -197,7 +195,6 @@ mod llama_gptq {
     }
 
     #[test]
-    #[ignore = "GPTQ INT4 weight loading not yet supported by CudaGraphEngine; requires porting the GPTQ dequantization path from the old eager model loader"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(
@@ -207,7 +204,6 @@ mod llama_gptq {
     }
 
     #[test]
-    #[ignore = "GPTQ INT4 weight loading not yet supported by CudaGraphEngine; requires porting the GPTQ dequantization path from the old eager model loader"]
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();

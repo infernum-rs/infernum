@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use infernum::graph::{Graph, WeightStore};
+use infernum::weights::QuantizationConfig;
 use infernum::{DType, Result};
 use infernum_cuda::{
     load_graph_weights_cuda, CudaContext, CudaGraphEngineConfig, CudaTensor, LinearWeight,
@@ -48,6 +49,10 @@ impl CudaGraphEngineConfig for LlamaConfig {
         self.eos_token_id
     }
 
+    fn quantization_config(&self) -> Option<&QuantizationConfig> {
+        self.quantization_config.as_ref()
+    }
+
     fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
         let (graph, _) =
             build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16);
@@ -73,6 +78,7 @@ impl CudaGraphEngineConfig for LlamaConfig {
             ctx,
             model_dir,
             /* lm_head_fallback */ true,
+            self.quantization_config.as_ref(),
         )
     }
 }
