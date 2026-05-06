@@ -544,7 +544,7 @@ fn build_attention_decode<B: QwenGraphOps>(
 // FFN sub-graph helpers
 // ---------------------------------------------------------------------------
 
-/// Build the dense SwiGLU FFN block into the graph.
+/// Build the dense `SwiGLU` FFN block into the graph.
 ///
 /// Returns the FFN output before the residual add.
 fn build_dense_ffn<B: QwenGraphOps>(
