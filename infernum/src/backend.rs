@@ -82,6 +82,17 @@ pub trait Backend: 'static {
     /// contents.
     type RuntimeState: RuntimeStateInit;
 
+    /// Per-execution state threaded through `ExecuteContext`.
+    ///
+    /// For `CpuBackend` this is the flat byte `Arena` that holds all
+    /// intermediate activations. For `CudaBackend` (where tensors are
+    /// heap-allocated and tracked in a `HashMap`) this is `()`.
+    ///
+    /// Ops receive `&mut B::ExecutorState` through `ExecuteContext` so they
+    /// can read/write their tensor outputs without knowing the concrete
+    /// storage strategy.
+    type ExecutorState: Send + 'static;
+
     /// Backend-specific logits type returned by forward passes.
     /// Must implement the `Logits` trait so the engine can sample from it.
     type Logits: Logits;

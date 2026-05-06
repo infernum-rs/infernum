@@ -520,6 +520,7 @@ mod tests {
         type PagedKvCache = ();
         type KvCache = ();
         type RuntimeState = DummyRuntimeState;
+        type ExecutorState = ();
         type Logits = DummyLogits;
         type Comm = ();
 

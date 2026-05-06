@@ -43,6 +43,7 @@ impl Backend for CpuBackend {
     type PagedKvCache = CpuPagedKvCache;
     type KvCache = CpuKvCache;
     type RuntimeState = ();
+    type ExecutorState = infernum::graph::Arena;
     type Logits = CpuLogits;
     type Comm = ();
 
