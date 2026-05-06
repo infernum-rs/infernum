@@ -8,7 +8,6 @@
 )]
 
 use serde::Deserialize;
-use std::path::Path;
 
 /// Re-exported from `infernum` core — the same struct is used by
 /// `WeightLoader<B>` for generic weight loading.
@@ -134,18 +133,6 @@ impl GemmaConfig {
             )));
         }
         Ok(Self::from_str(&text))
-    }
-
-    /// Parse a `config.json` file into a `GemmaConfig`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the file cannot be read or parsed, or if the `model_type` is
-    /// not `gemma2` or `gemma3_text`.
-    pub fn from_json(path: &Path) -> Self {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
-        Self::from_str(&text)
     }
 
     /// Parse a JSON string into a `GemmaConfig`.

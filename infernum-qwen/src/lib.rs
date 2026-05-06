@@ -15,8 +15,6 @@ pub use chat_templates::ChatMLTemplate;
 pub use config::QwenConfig;
 #[cfg(feature = "cuda")]
 pub use cuda_graph_engine::{QwenCudaGraphEngine, QwenCudaGraphEngineExt};
-#[cfg(feature = "cpu")]
-pub use graph_builder::load_graph_weights_safetensors;
 pub use graph_builder::{
     build_decode_graph, build_paged_decode_graph, build_prefill_graph, DenseLayerWeightIds,
     LayerWeightIds, ModelWeightIds, MoeLayerWeightIds, QkNormIds, QkvBiasIds, QwenGraphOps,

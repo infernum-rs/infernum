@@ -24,9 +24,7 @@ use infernum_cpu::tensor::{CpuLinearWeight, CpuTensor};
 use infernum_cpu::CpuBackend;
 
 use crate::config::QwenConfig;
-use crate::graph_builder::{
-    build_decode_graph, build_prefill_graph, load_graph_weights_safetensors,
-};
+use crate::graph_builder::{build_decode_graph, build_prefill_graph};
 
 // ---------------------------------------------------------------------------
 // GraphEngineConfig impl
@@ -78,7 +76,7 @@ impl GraphEngineConfig for QwenConfig {
         dummy_graph: &Graph<CpuBackend>,
         model_dir: &Path,
     ) -> Result<WeightStore<CpuTensor, CpuLinearWeight>> {
-        load_graph_weights_safetensors(dummy_graph, model_dir, self)
+        infernum_cpu::load_cpu_safetensors_weights(dummy_graph, model_dir, true)
     }
     // No GGUF support for Qwen (no load_graph_weights_gguf in graph_builder.rs).
 }

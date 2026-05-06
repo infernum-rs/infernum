@@ -15,8 +15,6 @@ pub mod graph_builder;
 
 pub use chat_templates::DeepSeekTemplate;
 pub use config::DeepSeekConfig;
-#[cfg(feature = "cpu")]
-pub use graph_builder::load_graph_weights_safetensors;
 // #[cfg(feature = "cpu")]
 // pub use graph_engine::DeepSeekGraphEngine;
 pub use weights::split_kv_b_proj_dense;

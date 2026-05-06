@@ -532,36 +532,6 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Weight loaders (CPU backend)
-// ---------------------------------------------------------------------------
-
-/// Load `SafeTensors` weights from `model_dir` into a CPU weight store,
-/// using the weight layout encoded in `graph`.
-///
-/// # Errors
-///
-/// Returns an error if any weight file cannot be opened or if a named
-/// tensor is not found in the checkpoint.
-///
-/// # Panics
-///
-/// Panics if the number of registered weights exceeds `u32::MAX`.
-#[cfg(feature = "cpu")]
-pub fn load_graph_weights_safetensors(
-    graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
-    model_dir: &std::path::Path,
-    _config: &DeepSeekConfig,
-) -> infernum::Result<
-    infernum::graph::WeightStore<
-        infernum_cpu::tensor::CpuTensor,
-        infernum_cpu::tensor::CpuLinearWeight,
-    >,
-> {
-    // DeepSeek-V3 ties `lm_head.weight` to `embed_tokens.weight`.
-    infernum_cpu::load_cpu_safetensors_weights(graph, model_dir, true)
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -775,36 +775,6 @@ fn safetensors_to_gguf_name(name: &str) -> String {
 // Weight loaders (CPU backend)
 // ---------------------------------------------------------------------------
 
-/// Load SafeTensors weights from `model_dir` into a CPU weight store,
-/// using the layout encoded in `graph`.
-///
-/// Tied embeddings: if `lm_head.weight` is absent, `model.embed_tokens.weight`
-/// is used as the fallback (Gemma models often tie them).
-///
-/// # Errors
-///
-/// Returns an error if the directory contains no `.safetensors` files, a
-/// required weight is missing, or a weight cannot be converted to the target
-/// dtype.
-///
-/// # Panics
-///
-/// Panics if the number of weights exceeds `u32::MAX` (practically impossible).
-#[cfg(feature = "cpu")]
-pub fn load_graph_weights_safetensors(
-    graph: &infernum::graph::Graph<infernum_cpu::CpuBackend>,
-    model_dir: &std::path::Path,
-    _config: &GemmaConfig,
-) -> infernum::Result<
-    infernum::graph::WeightStore<
-        infernum_cpu::tensor::CpuTensor,
-        infernum_cpu::tensor::CpuLinearWeight,
-    >,
-> {
-    // Gemma models tie `lm_head.weight` to `embed_tokens.weight`.
-    infernum_cpu::load_cpu_safetensors_weights(graph, model_dir, true)
-}
-
 /// Load GGUF weights from a single `.gguf` file into a CPU weight store.
 ///
 /// Uses the GGUF key-naming convention (e.g. `blk.0.attn_q.weight`).
@@ -897,67 +867,10 @@ pub fn load_graph_weights_gguf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infernum::DType;
+    use infernum::graph::test_helpers::{DummyLogits, DummyRuntimeState, DummyTensor};
 
     /// Minimal no-op backend for graph construction tests.
     struct TestBackend;
-
-    #[derive(Clone)]
-    struct DummyTensor;
-
-    impl infernum::tensor::Tensor for DummyTensor {
-        fn shape(&self) -> &[usize] {
-            &[]
-        }
-        fn dtype(&self) -> DType {
-            DType::F32
-        }
-        fn reshape(&self, _shape: &[usize]) -> Self {
-            Self
-        }
-        fn slice_view(&self, _offset: usize, _shape: &[usize]) -> Self {
-            Self
-        }
-    }
-
-    struct DummyLogits;
-
-    impl infernum::logits::Logits for DummyLogits {
-        fn vocab_size(&self) -> usize {
-            0
-        }
-        fn batch_size(&self) -> usize {
-            0
-        }
-        fn argmax(&self, _batch_index: usize) -> infernum::Result<u32> {
-            Ok(0)
-        }
-        fn sample_top_p(
-            &self,
-            _batch_index: usize,
-            _temperature: f32,
-            _top_p: f32,
-            _rng_seed: u64,
-            _repetition_penalty: f32,
-            _recent_tokens: &[u32],
-        ) -> infernum::Result<u32> {
-            Ok(0)
-        }
-    }
-
-    struct DummyRuntimeState;
-
-    impl infernum::runtime_state::RuntimeStateInit for DummyRuntimeState {
-        fn new(
-            _batch_config: &infernum::runtime_state::BatchConfig,
-            _block_config: &infernum::block_allocator::BlockConfig,
-        ) -> infernum::Result<Self> {
-            Ok(Self)
-        }
-        fn new_placeholder() -> Self {
-            Self
-        }
-    }
 
     impl infernum::backend::Backend for TestBackend {
         type Tensor = DummyTensor;

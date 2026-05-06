@@ -24,10 +24,7 @@ use infernum_cpu::tensor::{CpuLinearWeight, CpuTensor};
 use infernum_cpu::CpuBackend;
 
 use crate::config::GemmaConfig;
-use crate::graph_builder::{
-    build_decode_graph, build_prefill_graph, load_graph_weights_gguf,
-    load_graph_weights_safetensors,
-};
+use crate::graph_builder::{build_decode_graph, build_prefill_graph, load_graph_weights_gguf};
 
 // ---------------------------------------------------------------------------
 // GraphEngineConfig impl
@@ -77,7 +74,7 @@ impl GraphEngineConfig for GemmaConfig {
         dummy_graph: &Graph<CpuBackend>,
         model_dir: &Path,
     ) -> Result<WeightStore<CpuTensor, CpuLinearWeight>> {
-        load_graph_weights_safetensors(dummy_graph, model_dir, self)
+        infernum_cpu::load_cpu_safetensors_weights(dummy_graph, model_dir, true)
     }
 
     fn load_weights_gguf(

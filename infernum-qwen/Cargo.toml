@@ -17,3 +17,6 @@ infernum-runtime = { path = "../infernum-runtime", optional = true }
 half = { version = "2.4", features = ["num-traits", "bytemuck"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[dev-dependencies]
+infernum = { path = "../infernum", features = ["test-helpers"] }

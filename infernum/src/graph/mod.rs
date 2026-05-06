@@ -28,6 +28,9 @@ pub use op_node::{OpNode, OutputRef};
 pub use planner::{plan, BufferSlot, ExecutionPlan, PlanCache};
 pub use weight_store::WeightStore;
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers;
+
 #[cfg(test)]
 mod tests {
     use super::*;

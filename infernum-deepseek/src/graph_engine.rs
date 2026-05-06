@@ -31,9 +31,7 @@ use infernum_cpu::tensor::{CpuLinearWeight, CpuTensor};
 use infernum_cpu::CpuBackend;
 
 use crate::config::DeepSeekConfig;
-use crate::graph_builder::{
-    build_decode_graph, build_prefill_graph, load_graph_weights_safetensors, DeepSeekGraphOps,
-};
+use crate::graph_builder::{build_decode_graph, build_prefill_graph, DeepSeekGraphOps};
 
 // ---------------------------------------------------------------------------
 // DecodeCache
@@ -89,7 +87,7 @@ impl DeepSeekGraphEngine {
 
         // Build a dummy 1-token prefill graph to discover weight metadata.
         let dummy_graph: Graph<CpuBackend> = build_prefill_graph(&config, DType::F32);
-        let weights = load_graph_weights_safetensors(&dummy_graph, model_dir, &config)?;
+        let weights = infernum_cpu::load_cpu_safetensors_weights(&dummy_graph, model_dir, true)?;
 
         let decode = build_decode_cache(&config)?;
         Ok(Self {
