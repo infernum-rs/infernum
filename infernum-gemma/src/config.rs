@@ -134,6 +134,28 @@ where
 }
 
 impl GemmaConfig {
+    /// Parse a `config.json` file into a `GemmaConfig`, returning an error on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, the JSON is malformed, or
+    /// the `model_type` is not `gemma2` or `gemma3_text`.
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> infernum::Result<Self> {
+        let text = std::fs::read_to_string(path.as_ref())?;
+        // Validate model_type before the panicking from_str path.
+        let model_type: serde_json::Value = serde_json::from_str(&text)?;
+        let mt = model_type
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if mt != "gemma2" && mt != "gemma3_text" {
+            return Err(infernum::Error::UnsupportedModel(format!(
+                "Unsupported model_type: `{mt}`. Expected `gemma2` or `gemma3_text`"
+            )));
+        }
+        Ok(Self::from_str(&text))
+    }
+
     /// Parse a `config.json` file into a `GemmaConfig`.
     ///
     /// # Panics

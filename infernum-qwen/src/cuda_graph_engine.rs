@@ -121,9 +121,7 @@ pub trait QwenCudaGraphEngineExt: Sized {
 
 impl QwenCudaGraphEngineExt for QwenCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
-        let config_text = std::fs::read_to_string(model_dir.join("config.json"))?;
-        let config: QwenConfig = serde_json::from_str(&config_text)
-            .map_err(|e| infernum::Error::Other(e.to_string()))?;
+        let config = QwenConfig::from_file(model_dir.join("config.json"))?;
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
     }
 }

@@ -111,8 +111,7 @@ pub trait GemmaCudaGraphEngineExt: Sized {
 
 impl GemmaCudaGraphEngineExt for GemmaCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
-        let config_text = std::fs::read_to_string(model_dir.join("config.json"))?;
-        let config = GemmaConfig::from_str(&config_text);
+        let config = GemmaConfig::from_file(model_dir.join("config.json"))?;
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
     }
 }

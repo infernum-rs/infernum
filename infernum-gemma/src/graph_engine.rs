@@ -106,10 +106,10 @@ pub trait GemmaGraphEngineExt: Sized {
     ///
     /// Returns an error if the directory is missing or weights cannot be loaded.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `config.json` is missing or cannot be parsed
-    /// (delegated to [`GemmaConfig::from_json`]).
+    /// Returns an error if `config.json` is missing, cannot be parsed, or
+    /// contains an unsupported `model_type`.
     fn from_pretrained(model_dir: &Path) -> Result<Self>;
 
     /// Load a Gemma-family model from a GGUF file.
@@ -123,7 +123,7 @@ pub trait GemmaGraphEngineExt: Sized {
 
 impl GemmaGraphEngineExt for GemmaGraphEngine {
     fn from_pretrained(model_dir: &Path) -> Result<Self> {
-        let config = GemmaConfig::from_json(&model_dir.join("config.json"));
+        let config = GemmaConfig::from_file(model_dir.join("config.json"))?;
         infernum_cpu::GraphEngine::from_config_and_dir(config, model_dir)
     }
 
