@@ -82,7 +82,6 @@ mod qwen3_0_6b {
     }
 
     #[test]
-    #[ignore = "Qwen3 QK-norm causes a cudarc panic in CudaGraphEngine; needs investigation"]
     fn capital_of_france() {
         let output = generate_greedy(&model_dir(), "The capital of France is", 30);
         assert!(
@@ -92,7 +91,6 @@ mod qwen3_0_6b {
     }
 
     #[test]
-    #[ignore = "Qwen3 QK-norm causes a cudarc panic in CudaGraphEngine; needs investigation"]
     fn no_nan_in_output() {
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
         let model_dir = model_dir();

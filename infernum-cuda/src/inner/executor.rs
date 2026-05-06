@@ -466,8 +466,27 @@ pub fn execute(
                 // The CUDA rms_norm kernel treats the outermost dims as a batch,
                 // so [seq, num_heads, head_dim] works directly — each row of
                 // head_dim is normalised independently.
-                let q_normed = <CudaBackend as NormOps>::rms_norm(q, q_w, op.eps)?;
-                let k_normed = <CudaBackend as NormOps>::rms_norm(k, k_w, op.eps)?;
+                //
+                // QK-norm weights are registered as F32 (checkpoint dtype), but
+                // the activation `q`/`k` may be BF16. The rmsnorm_bf16 kernel
+                // requires all tensors to share the same dtype, so cast if needed
+                // (mirrors the dtype-cast pattern used in the `bias_add` arm).
+                let q_w_cast;
+                let q_w_ref = if q_w.dtype() == q.dtype() {
+                    q_w
+                } else {
+                    q_w_cast = ops::cast_from_f32(q_w, q.dtype())?;
+                    &q_w_cast
+                };
+                let k_w_cast;
+                let k_w_ref = if k_w.dtype() == k.dtype() {
+                    k_w
+                } else {
+                    k_w_cast = ops::cast_from_f32(k_w, k.dtype())?;
+                    &k_w_cast
+                };
+                let q_normed = <CudaBackend as NormOps>::rms_norm(q, q_w_ref, op.eps)?;
+                let k_normed = <CudaBackend as NormOps>::rms_norm(k, k_w_ref, op.eps)?;
                 store(&mut buffers, node_id, 0, q_normed);
                 store(&mut buffers, node_id, 1, k_normed);
             }
