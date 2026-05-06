@@ -33,10 +33,32 @@ use crate::graph_builder::{
 // GraphEngineConfig impl
 // ---------------------------------------------------------------------------
 
+/// Generate trivial forwarding getters that map directly to struct fields.
+///
+/// Methods that require special handling (e.g. `num_kv_heads` and `head_dim`
+/// on `LlamaConfig`, which shadow inherent methods) are left as explicit impls.
+macro_rules! impl_common_config_getters {
+    () => {
+        fn num_hidden_layers(&self) -> usize {
+            self.num_hidden_layers
+        }
+        fn max_position_embeddings(&self) -> usize {
+            self.max_position_embeddings
+        }
+        fn rope_theta(&self) -> f32 {
+            self.rope_theta
+        }
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+        fn eos_token_id(&self) -> u32 {
+            self.eos_token_id
+        }
+    };
+}
+
 impl GraphEngineConfig for LlamaConfig {
-    fn num_hidden_layers(&self) -> usize {
-        self.num_hidden_layers
-    }
+    impl_common_config_getters!();
 
     fn num_kv_heads(&self) -> usize {
         LlamaConfig::num_kv_heads(self)
@@ -44,22 +66,6 @@ impl GraphEngineConfig for LlamaConfig {
 
     fn head_dim(&self) -> usize {
         LlamaConfig::head_dim(self)
-    }
-
-    fn max_position_embeddings(&self) -> usize {
-        self.max_position_embeddings
-    }
-
-    fn rope_theta(&self) -> f32 {
-        self.rope_theta
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.vocab_size
-    }
-
-    fn eos_token_id(&self) -> u32 {
-        self.eos_token_id
     }
 
     fn build_prefill_graph(&self, seq_len: usize) -> Graph<CpuBackend> {

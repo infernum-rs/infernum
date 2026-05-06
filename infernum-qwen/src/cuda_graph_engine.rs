@@ -20,33 +20,35 @@ use crate::graph_builder::{build_decode_graph, build_paged_decode_graph, build_p
 // CudaGraphEngineConfig impl
 // ---------------------------------------------------------------------------
 
+macro_rules! impl_common_config_getters {
+    () => {
+        fn num_hidden_layers(&self) -> usize {
+            self.num_hidden_layers
+        }
+        fn max_position_embeddings(&self) -> usize {
+            self.max_position_embeddings
+        }
+        fn rope_theta(&self) -> f32 {
+            self.rope_theta
+        }
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+        fn eos_token_id(&self) -> u32 {
+            self.eos_token_id
+        }
+    };
+}
+
 impl CudaGraphEngineConfig for QwenConfig {
-    fn num_hidden_layers(&self) -> usize {
-        self.num_hidden_layers
-    }
+    impl_common_config_getters!();
 
     fn num_kv_heads(&self) -> usize {
-        self.num_kv_heads()
+        QwenConfig::num_kv_heads(self)
     }
 
     fn head_dim(&self) -> usize {
         QwenConfig::head_dim(self)
-    }
-
-    fn max_position_embeddings(&self) -> usize {
-        self.max_position_embeddings
-    }
-
-    fn rope_theta(&self) -> f32 {
-        self.rope_theta
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.vocab_size
-    }
-
-    fn eos_token_id(&self) -> u32 {
-        self.eos_token_id
     }
 
     fn quantization_config(&self) -> Option<&QuantizationConfig> {
