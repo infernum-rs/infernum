@@ -8,7 +8,6 @@
 )]
 
 use serde::Deserialize;
-use std::path::Path;
 
 /// Re-exported from `infernum` core — the same struct is used by
 /// `WeightLoader<B>` for generic weight loading.
@@ -87,7 +86,7 @@ struct RawConfig {
     bos_token_id: u32,
     #[serde(
         default = "default_eos",
-        deserialize_with = "deserialize_single_or_first"
+        deserialize_with = "infernum::deserialize_u32_or_first"
     )]
     eos_token_id: u32,
     #[serde(default)]
@@ -113,37 +112,27 @@ fn default_eos() -> u32 {
     1
 }
 
-fn deserialize_single_or_first<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SingleOrVec {
-        Single(u32),
-        Vec(Vec<u32>),
-    }
-
-    match SingleOrVec::deserialize(deserializer)? {
-        SingleOrVec::Single(v) => Ok(v),
-        SingleOrVec::Vec(v) => v
-            .first()
-            .copied()
-            .ok_or_else(|| serde::de::Error::custom("eos_token_id array is empty")),
-    }
-}
-
 impl GemmaConfig {
-    /// Parse a `config.json` file into a `GemmaConfig`.
+    /// Parse a `config.json` file into a `GemmaConfig`, returning an error on failure.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the file cannot be read or parsed, or if the `model_type` is
-    /// not `gemma2` or `gemma3_text`.
-    pub fn from_json(path: &Path) -> Self {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
-        Self::from_str(&text)
+    /// Returns an error if the file cannot be read, the JSON is malformed, or
+    /// the `model_type` is not `gemma2` or `gemma3_text`.
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> infernum::Result<Self> {
+        let text = std::fs::read_to_string(path.as_ref())?;
+        // Validate model_type before the panicking from_str path.
+        let model_type: serde_json::Value = serde_json::from_str(&text)?;
+        let mt = model_type
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if mt != "gemma2" && mt != "gemma3_text" {
+            return Err(infernum::Error::UnsupportedModel(format!(
+                "Unsupported model_type: `{mt}`. Expected `gemma2` or `gemma3_text`"
+            )));
+        }
+        Ok(Self::from_str(&text))
     }
 
     /// Parse a JSON string into a `GemmaConfig`.
@@ -218,28 +207,13 @@ impl GemmaConfig {
     pub fn from_gguf_metadata(
         metadata: &std::collections::HashMap<String, infernum::GgufValue>,
     ) -> infernum::Result<Self> {
+        use infernum::gguf_meta::{get_f32, get_usize};
         use infernum::GgufValue;
 
         let arch = metadata
             .get("general.architecture")
             .and_then(GgufValue::as_str)
             .unwrap_or("gemma2");
-
-        let get_usize = |key: &str| -> infernum::Result<usize> {
-            metadata
-                .get(key)
-                .and_then(GgufValue::as_usize)
-                .ok_or_else(|| {
-                    infernum::Error::InvalidShape(format!("Missing GGUF metadata: {key}"))
-                })
-        };
-
-        let get_f32 = |key: &str, default: f32| -> f32 {
-            metadata
-                .get(key)
-                .and_then(GgufValue::as_f32)
-                .unwrap_or(default)
-        };
 
         let is_gemma3 = arch == "gemma3";
         let model_type = if is_gemma3 {
@@ -248,9 +222,9 @@ impl GemmaConfig {
             "gemma2".to_string()
         };
 
-        let hidden_size = get_usize(&format!("{arch}.embedding_length"))?;
-        let num_hidden_layers = get_usize(&format!("{arch}.block_count"))?;
-        let num_attention_heads = get_usize(&format!("{arch}.attention.head_count"))?;
+        let hidden_size = get_usize(metadata, &format!("{arch}.embedding_length"))?;
+        let num_hidden_layers = get_usize(metadata, &format!("{arch}.block_count"))?;
+        let num_attention_heads = get_usize(metadata, &format!("{arch}.attention.head_count"))?;
         let num_key_value_heads = metadata
             .get(&format!("{arch}.attention.head_count_kv"))
             .and_then(GgufValue::as_usize)
@@ -294,17 +268,22 @@ impl GemmaConfig {
 
         Ok(Self {
             model_type,
-            vocab_size: get_usize(&format!("{arch}.vocab_size"))
-                .or_else(|_| get_usize("tokenizer.ggml.tokens_count"))
+            vocab_size: get_usize(metadata, &format!("{arch}.vocab_size"))
+                .or_else(|_| get_usize(metadata, "tokenizer.ggml.tokens_count"))
                 .unwrap_or(256_000),
             hidden_size,
-            intermediate_size: get_usize(&format!("{arch}.feed_forward_length"))?,
+            intermediate_size: get_usize(metadata, &format!("{arch}.feed_forward_length"))?,
             num_hidden_layers,
             num_attention_heads,
             num_key_value_heads,
             head_dim,
-            rms_norm_eps: get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-6),
-            max_position_embeddings: get_usize(&format!("{arch}.context_length")).unwrap_or(8192),
+            rms_norm_eps: get_f32(
+                metadata,
+                &format!("{arch}.attention.layer_norm_rms_epsilon"),
+                1e-6,
+            ),
+            max_position_embeddings: get_usize(metadata, &format!("{arch}.context_length"))
+                .unwrap_or(8192),
             tie_word_embeddings: true, // Gemma always ties
             query_pre_attn_scalar,
             sliding_window,
@@ -312,7 +291,7 @@ impl GemmaConfig {
             sliding_window_pattern,
             attn_logit_softcapping,
             final_logit_softcapping,
-            rope_theta: get_f32(&format!("{arch}.rope.freq_base"), 10000.0),
+            rope_theta: get_f32(metadata, &format!("{arch}.rope.freq_base"), 10000.0),
             rope_local_base_freq: None, // Not stored in GGUF; dual-theta from Gemma 3 JSON only
             has_qk_norm: is_gemma3,
             #[allow(clippy::cast_possible_truncation)]

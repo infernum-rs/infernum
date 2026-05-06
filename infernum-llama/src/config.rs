@@ -63,7 +63,7 @@ pub struct LlamaConfig {
     /// End of sequence token ID (first value when the config specifies an array)
     #[serde(
         default = "default_eos_token_id",
-        deserialize_with = "deserialize_single_or_first"
+        deserialize_with = "infernum::deserialize_u32_or_first"
     )]
     pub eos_token_id: u32,
 
@@ -92,28 +92,6 @@ pub struct LlamaConfig {
     /// this index use full causal attention. When absent, all layers use SWA.
     #[serde(default)]
     pub max_window_layers: Option<usize>,
-}
-
-/// Deserialize a field that may be a single `u32` or an array of `u32`.
-/// When an array is provided, the first element is used.
-fn deserialize_single_or_first<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SingleOrVec {
-        Single(u32),
-        Vec(Vec<u32>),
-    }
-
-    match SingleOrVec::deserialize(deserializer)? {
-        SingleOrVec::Single(v) => Ok(v),
-        SingleOrVec::Vec(v) => v
-            .first()
-            .copied()
-            .ok_or_else(|| serde::de::Error::custom("eos_token_id array is empty")),
-    }
 }
 
 fn default_model_type() -> String {
@@ -202,23 +180,8 @@ impl LlamaConfig {
     pub fn from_gguf_metadata(
         metadata: &std::collections::HashMap<String, infernum::GgufValue>,
     ) -> Result<Self> {
+        use infernum::gguf_meta::{get_f32, get_usize};
         use infernum::GgufValue;
-
-        let get_usize = |key: &str| -> Result<usize> {
-            metadata
-                .get(key)
-                .and_then(GgufValue::as_usize)
-                .ok_or_else(|| {
-                    infernum::Error::InvalidShape(format!("Missing GGUF metadata: {key}"))
-                })
-        };
-
-        let get_f32 = |key: &str, default: f32| -> f32 {
-            metadata
-                .get(key)
-                .and_then(GgufValue::as_f32)
-                .unwrap_or(default)
-        };
 
         // GGUF stores model architecture in `general.architecture` (e.g. "llama", "mistral")
         let model_type = metadata
@@ -227,8 +190,8 @@ impl LlamaConfig {
             .unwrap_or("llama")
             .to_string();
 
-        let hidden_size = get_usize("llama.embedding_length")?;
-        let num_attention_heads = get_usize("llama.attention.head_count")?;
+        let hidden_size = get_usize(metadata, "llama.embedding_length")?;
+        let num_attention_heads = get_usize(metadata, "llama.attention.head_count")?;
 
         let num_key_value_heads = metadata
             .get("llama.attention.head_count_kv")
@@ -236,17 +199,17 @@ impl LlamaConfig {
 
         let config = Self {
             model_type,
-            vocab_size: get_usize("llama.vocab_size")
-                .or_else(|_| get_usize("tokenizer.ggml.tokens_count"))
+            vocab_size: get_usize(metadata, "llama.vocab_size")
+                .or_else(|_| get_usize(metadata, "tokenizer.ggml.tokens_count"))
                 .unwrap_or(32000),
             hidden_size,
-            intermediate_size: get_usize("llama.feed_forward_length")?,
-            num_hidden_layers: get_usize("llama.block_count")?,
+            intermediate_size: get_usize(metadata, "llama.feed_forward_length")?,
+            num_hidden_layers: get_usize(metadata, "llama.block_count")?,
             num_attention_heads,
             num_key_value_heads,
-            max_position_embeddings: get_usize("llama.context_length").unwrap_or(2048),
-            rms_norm_eps: get_f32("llama.attention.layer_norm_rms_epsilon", 1e-5),
-            rope_theta: get_f32("llama.rope.freq_base", 10000.0),
+            max_position_embeddings: get_usize(metadata, "llama.context_length").unwrap_or(2048),
+            rms_norm_eps: get_f32(metadata, "llama.attention.layer_norm_rms_epsilon", 1e-5),
+            rope_theta: get_f32(metadata, "llama.rope.freq_base", 10000.0),
             tie_word_embeddings: metadata
                 .get("llama.tie_word_embeddings")
                 .and_then(GgufValue::as_bool)

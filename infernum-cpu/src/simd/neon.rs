@@ -80,6 +80,31 @@ unsafe fn vec_add_inplace_inner(a: &mut [f32], b: &[f32]) {
     }
 }
 
+/// Scaled accumulate: `out[i] += scale * src[i]` (AXPY).
+pub fn vec_axpy(out: &mut [f32], scale: f32, src: &[f32]) {
+    unsafe { vec_axpy_inner(out, scale, src) }
+}
+
+unsafe fn vec_axpy_inner(out: &mut [f32], scale: f32, src: &[f32]) {
+    use std::arch::aarch64::{vdupq_n_f32, vfmaq_f32};
+
+    let n = out.len();
+    let chunks = n / 4;
+    let remainder = n % 4;
+    let vs = vdupq_n_f32(scale);
+
+    for i in 0..chunks {
+        let vo = vld1q_f32(out.as_ptr().add(i * 4));
+        let vsrc = vld1q_f32(src.as_ptr().add(i * 4));
+        vst1q_f32(out.as_mut_ptr().add(i * 4), vfmaq_f32(vo, vs, vsrc));
+    }
+
+    let tail = chunks * 4;
+    for i in 0..remainder {
+        out[tail + i] += scale * src[tail + i];
+    }
+}
+
 pub fn vec_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
     unsafe {
         vec_mul_inner(a, b, out);

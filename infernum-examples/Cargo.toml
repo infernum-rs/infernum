@@ -7,9 +7,9 @@ build = "build.rs"
 
 [features]
 default = []
-cpu = ["dep:infernum-cpu"]
-cuda = ["dep:cudarc", "infernum-cuda", "infernum-cuda/cuda", "infernum-serve/cuda"]
-nccl = ["cuda", "infernum-cuda/nccl"]
+cpu = ["dep:infernum-cpu", "infernum-llama/cpu", "infernum-gemma/cpu", "infernum-qwen/cpu"]
+cuda = ["dep:cudarc", "infernum-cuda", "infernum-cuda/cuda", "infernum-serve/cuda", "infernum-llama/cuda", "infernum-gemma/cuda", "infernum-qwen/cuda", "infernum-deepseek/cuda"]
+nccl = ["cuda", "infernum-cuda/nccl", "infernum-llama/nccl", "infernum-gemma/nccl", "infernum-qwen/nccl"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
@@ -30,14 +30,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 [[example]]
 name = "generate"
 required-features = ["cuda"]
-
-[[example]]
-name = "generate_parallel"
-required-features = ["nccl"]
-
-[[example]]
-name = "verify_parallel"
-required-features = ["nccl"]
 
 [[example]]
 name = "bench"

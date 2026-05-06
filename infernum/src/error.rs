@@ -67,6 +67,26 @@ pub enum Error {
 }
 
 // ---------------------------------------------------------------------------
+// Path utilities
+// ---------------------------------------------------------------------------
+
+/// Convert a [`std::path::Path`] to a `&str`, returning [`Error::Io`] if the
+/// path contains non-UTF-8 bytes.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] when the
+/// path is not valid UTF-8.
+pub fn path_to_utf8(path: &std::path::Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not valid UTF-8",
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Optional From impls for cudarc error types (enabled by `cuda-errors` feature)
 // ---------------------------------------------------------------------------
 

@@ -50,16 +50,29 @@ mod cuda {
         }
     }
 
+    /// Returns the minimum compute architecture for a given kernel.
+    ///
+    /// Kernels using WMMA (tensor core) intrinsics need at least `sm_75` (Turing).
+    /// Everything else targets `sm_70` (Volta) for broader compatibility.
+    fn compute_arch_for(stem: &str) -> &'static str {
+        if stem.starts_with("mmq") {
+            "compute_75" // WMMA int8 tensor cores (Turing+)
+        } else {
+            "compute_70" // Default (Volta+)
+        }
+    }
+
     fn compile_cu(ptx_dir: &Path, cu_path: &Path) {
         let stem = cu_path.file_stem().unwrap().to_str().unwrap();
         let ptx_path = ptx_dir.join(format!("{stem}.ptx"));
+        let arch = compute_arch_for(stem);
 
         println!("cargo:rerun-if-changed={}", cu_path.display());
 
         let status = Command::new("nvcc")
             .args([
                 "--ptx",
-                "-arch=compute_70",
+                &format!("-arch={arch}"),
                 "-o",
                 ptx_path.to_str().unwrap(),
                 cu_path.to_str().unwrap(),

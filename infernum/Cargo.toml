@@ -14,6 +14,8 @@ nccl-errors = ["cuda-errors", "cudarc/nccl"]
 force-fuse = []
 # Disable fused kernels even in release builds
 no-fuse = []
+# Expose graph::test_helpers for downstream test suites (model crates)
+test-helpers = []
 
 [dependencies]
 # CUDA error types (optional — only for From impls, no GPU code)
@@ -40,6 +42,7 @@ infernum-macros = { path = "../infernum-macros" }
 half = { version = "2.4", features = ["num-traits", "bytemuck"] }
 num-traits = "0.2"
 bytemuck = { version = "1.14", features = ["derive"] }
+smallvec = "1"
 
 # File format parsers (CPU-only, no GPU deps)
 memmap2 = "0.9"

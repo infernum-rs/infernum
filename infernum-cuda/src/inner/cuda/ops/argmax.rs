@@ -106,6 +106,26 @@ fn ensure_kernel_loaded(ctx: &CudaContext) -> Result<()> {
 
 const MODULE_NAME: &str = "argmax";
 
+/// Compute argmax over the last dimension of a 2D tensor, returning a GPU
+/// tensor of U32 indices with shape `[num_rows]`.
+///
+/// This is the device-side counterpart of [`argmax_last`] — the result stays
+/// on the GPU, avoiding a D→H transfer. Used by the CUDA graph executor so
+/// that the argmax runs inside the capture without forcing a sync.
+///
+/// # Errors
+/// Returns an error if the kernel launch fails.
+pub fn argmax_last_tensor(input: &CudaTensor) -> Result<CudaTensor> {
+    let shape = input.shape();
+    assert!(
+        shape.len() == 2,
+        "argmax_last_tensor expects a 2D tensor, got shape {shape:?}"
+    );
+    let num_rows = shape[0];
+    let row_size = shape[1];
+    argmax_last_gpu(input.context(), input, num_rows, row_size)
+}
+
 /// Compute argmax over the last dimension, returning a GPU tensor of u32 indices.
 fn argmax_last_gpu(
     ctx: &CudaContext,

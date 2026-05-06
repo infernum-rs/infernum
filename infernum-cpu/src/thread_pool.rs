@@ -1,75 +1,76 @@
-//! Lightweight spin-wait thread pool for latency-critical GEMV.
+//! Lightweight spin-wait thread pool for latency-critical GEMM/GEMV.
 //!
-//! Workers spin on an atomic flag instead of sleeping through futex,
-//! eliminating kernel round-trips and keeping the memory prefetch pipeline warm.
+//! Workers spin on a shared generation counter instead of per-worker status
+//! flags.  This keeps the spinning read-shared (no cache-line bouncing while
+//! idle) and reduces per-dispatch overhead to two shared atomics.
 //!
 //! # Design
 //!
 //! - Fixed number of worker threads, spawned once at creation.
-//! - Each worker has its own `WorkerSlot` containing an atomic task pointer
-//!   and status flag.
-//! - `dispatch()` writes task descriptors and sets each worker's flag to `Ready`.
-//!   Workers spin until they see `Ready`, execute, then set `Done`.
-//! - The calling thread also executes one chunk (slot 0), so N threads =
+//! - A shared `DispatchState` holds the task descriptor and a generation counter.
+//! - `dispatch()` writes the task, bumps the generation (Release), then runs
+//!   task 0.  Workers spin on the generation (Acquire), execute if their
+//!   `worker_id < num_tasks`, and atomically increment a completion counter.
+//! - The calling thread also executes one chunk (task 0), so N threads =
 //!   1 caller + (N-1) workers.
 //! - Workers spin with `hint::spin_loop()` for ~1µs latency vs ~5-10µs for futex.
 
-use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-/// Status values for worker slots.
-const IDLE: u8 = 0;
-const READY: u8 = 1;
-const DONE: u8 = 2;
-const SHUTDOWN: u8 = 3;
-
-/// Per-worker communication slot (cache-line padded).
+/// Shared dispatch state, written by the main thread before bumping the
+/// generation counter, read by workers after observing the new generation.
 ///
-/// The task is transmitted as a type-erased function call: a trampoline
-/// function pointer plus a data pointer. The trampoline casts the data
-/// pointer back to `&F` and calls `F(task_id, num_tasks)`.
+/// All fields live on one cache line so that the single `generation` Acquire
+/// load also pulls in the task descriptor.
 #[repr(align(64))]
-struct WorkerSlot {
-    /// Status flag: IDLE → READY (main sets) → DONE (worker sets).
-    status: AtomicU8,
+struct DispatchState {
+    /// Monotonically increasing generation counter.  Main bumps this (Release)
+    /// to signal new work; workers spin on it (Acquire).
+    generation: AtomicU64,
+    /// Number of participating threads (including the caller).  Workers with
+    /// `worker_id >= num_tasks` skip this round.
+    num_tasks: std::sync::atomic::AtomicUsize,
     /// Trampoline function pointer: `fn(*const (), usize, usize)`.
     trampoline: AtomicPtr<()>,
     /// Pointer to the task closure (type-erased `&F`).
     data: AtomicPtr<()>,
-    /// This worker's task index.
-    task_id: std::sync::atomic::AtomicUsize,
-    /// Total number of tasks in this dispatch.
-    num_tasks: std::sync::atomic::AtomicUsize,
 }
 
-impl WorkerSlot {
-    fn new() -> Self {
-        Self {
-            status: AtomicU8::new(IDLE),
-            trampoline: AtomicPtr::new(std::ptr::null_mut()),
-            data: AtomicPtr::new(std::ptr::null_mut()),
-            task_id: std::sync::atomic::AtomicUsize::new(0),
-            num_tasks: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
+/// Per-dispatch completion counter, on its own cache line to avoid
+/// false-sharing with `DispatchState` (which workers read-share while
+/// spinning).
+#[repr(align(64))]
+struct CompletionState {
+    /// Workers atomically increment this after finishing.  Main spins
+    /// until it reaches `num_tasks - 1`.
+    completed: std::sync::atomic::AtomicUsize,
 }
 
-/// A fixed-size spin-wait thread pool.
+/// A fixed-size spin-wait thread pool using barrier-based synchronisation.
 ///
-/// Workers spin on atomic flags rather than sleeping via futex/condvar.
-/// This trades CPU usage for latency — workers burn cycles when idle,
-/// but wake up in ~1µs instead of ~5-10µs.
+/// Workers spin on a shared generation counter rather than per-worker status
+/// flags.  This keeps the spinning read-shared (no cache-line bouncing while
+/// idle) and reduces the per-dispatch overhead to two atomic operations:
+/// one `fetch_add` on `generation` (main) and one `fetch_add` on `completed`
+/// (each worker).
 ///
 /// When physical core topology is detected, each worker is pinned to a
 /// distinct physical core to avoid HT siblings competing for execution
 /// resources. The caller thread (task 0) is also pinned during dispatch.
 pub struct SpinPool {
-    slots: Arc<Vec<WorkerSlot>>,
+    state: Arc<DispatchState>,
+    completion: Arc<CompletionState>,
     workers: Vec<std::thread::JoinHandle<()>>,
     num_threads: usize,
     /// CPU ID to pin the caller thread to during dispatch (core 0).
     /// `None` if topology detection failed.
     caller_core: Option<usize>,
+    /// Ensures only one dispatch is active at a time, preventing concurrent
+    /// callers from corrupting shared state (e.g., during parallel tests).
+    dispatch_lock: std::sync::Mutex<()>,
+    /// Set to true to tell workers to exit.
+    shutdown: Arc<AtomicU8>,
 }
 
 impl SpinPool {
@@ -84,11 +85,16 @@ impl SpinPool {
     pub fn new(num_threads: usize) -> Self {
         assert!(num_threads > 0, "SpinPool needs at least 1 thread");
 
-        let mut slots = Vec::with_capacity(num_threads);
-        for _ in 0..num_threads {
-            slots.push(WorkerSlot::new());
-        }
-        let slots = Arc::new(slots);
+        let state = Arc::new(DispatchState {
+            generation: AtomicU64::new(0),
+            num_tasks: std::sync::atomic::AtomicUsize::new(0),
+            trampoline: AtomicPtr::new(std::ptr::null_mut()),
+            data: AtomicPtr::new(std::ptr::null_mut()),
+        });
+        let completion = Arc::new(CompletionState {
+            completed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let shutdown = Arc::new(AtomicU8::new(0));
 
         let physical_cores = detect_physical_cores();
         let caller_core = physical_cores.as_ref().and_then(|c| c.first().copied());
@@ -96,7 +102,9 @@ impl SpinPool {
         let mut workers = Vec::with_capacity(num_threads - 1);
 
         for worker_id in 1..num_threads {
-            let slots_clone = Arc::clone(&slots);
+            let st = Arc::clone(&state);
+            let comp = Arc::clone(&completion);
+            let shut = Arc::clone(&shutdown);
             let pin_core = physical_cores
                 .as_ref()
                 .and_then(|cores| cores.get(worker_id).copied());
@@ -106,17 +114,20 @@ impl SpinPool {
                     if let Some(core_id) = pin_core {
                         pin_to_core(core_id);
                     }
-                    worker_loop(&slots_clone[worker_id]);
+                    worker_loop(worker_id, &st, &comp, &shut);
                 })
                 .expect("failed to spawn spin-pool worker");
             workers.push(handle);
         }
 
         Self {
-            slots,
+            state,
+            completion,
             workers,
             num_threads,
             caller_core,
+            dispatch_lock: std::sync::Mutex::new(()),
+            shutdown,
         }
     }
 
@@ -161,12 +172,17 @@ impl SpinPool {
             return;
         }
 
+        // Serialize multi-task dispatches to prevent concurrent callers from
+        // corrupting shared state. Single-task fast path above is lock-free.
+        let _guard = self
+            .dispatch_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let tramp: fn(*const (), usize, usize) = trampoline::<F>;
         let data_ptr = (&raw const task_fn).cast::<()>();
 
         // Pin caller thread to its physical core (once per thread).
-        // This prevents the OS from scheduling it on an HT sibling
-        // of a pinned worker.
         if let Some(core_id) = self.caller_core {
             thread_local! {
                 static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -179,78 +195,100 @@ impl SpinPool {
             });
         }
 
-        for worker_id in 1..num_tasks {
-            self.slots[worker_id]
-                .trampoline
-                .store(tramp as *mut (), Ordering::Relaxed);
-            self.slots[worker_id]
-                .data
-                .store(data_ptr.cast_mut(), Ordering::Relaxed);
-            self.slots[worker_id]
-                .task_id
-                .store(worker_id, Ordering::Relaxed);
-            self.slots[worker_id]
-                .num_tasks
-                .store(num_tasks, Ordering::Relaxed);
-            // Release fence: makes all preceding stores visible to the worker.
-            self.slots[worker_id].status.store(READY, Ordering::Release);
-        }
+        // Publish task descriptor, then bump generation to release workers.
+        self.state
+            .trampoline
+            .store(tramp as *mut (), Ordering::Relaxed);
+        self.state
+            .data
+            .store(data_ptr.cast_mut(), Ordering::Relaxed);
+        self.state.num_tasks.store(num_tasks, Ordering::Relaxed);
+        self.completion.completed.store(0, Ordering::Relaxed);
+        // Release: ensures all stores above are visible before workers read them.
+        self.state.generation.fetch_add(1, Ordering::Release);
 
         // Execute task 0 on the calling thread.
         task_fn(0, num_tasks);
 
         // Wait for all workers to complete.
-        for worker_id in 1..num_tasks {
-            while self.slots[worker_id].status.load(Ordering::Acquire) != DONE {
-                std::hint::spin_loop();
-            }
-            // Reset to IDLE for next dispatch.
-            self.slots[worker_id].status.store(IDLE, Ordering::Release);
+        let expected = num_tasks - 1;
+        while self.completion.completed.load(Ordering::Acquire) != expected {
+            std::hint::spin_loop();
         }
     }
 }
 
 impl Drop for SpinPool {
     fn drop(&mut self) {
-        // Signal all workers to shut down.
-        for slot in self.slots.iter().skip(1) {
-            slot.status.store(SHUTDOWN, Ordering::Release);
-        }
-        // Join is handled by JoinHandle drop, but we drain explicitly to catch panics.
+        // Signal shutdown and bump generation so workers see it.
+        self.shutdown.store(1, Ordering::Relaxed);
+        self.state.generation.fetch_add(1, Ordering::Release);
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
     }
 }
 
-/// Worker spin loop: wait for READY, execute task, set DONE.
-fn worker_loop(slot: &WorkerSlot) {
+/// Worker spin loop: wait for generation change, execute if participating.
+fn worker_loop(
+    worker_id: usize,
+    state: &DispatchState,
+    completion: &CompletionState,
+    shutdown: &AtomicU8,
+) {
+    let mut last_gen = 0u64;
+
     loop {
-        // Spin until we see READY or SHUTDOWN.
+        // Spin until we see a new generation.
         loop {
-            let status = slot.status.load(Ordering::Acquire);
-            if status == READY {
+            let gen = state.generation.load(Ordering::Acquire);
+            if gen != last_gen {
+                last_gen = gen;
                 break;
-            }
-            if status == SHUTDOWN {
-                return;
             }
             std::hint::spin_loop();
         }
 
-        // The Acquire on status ensures we see the trampoline/data stores.
-        let tramp_ptr = slot.trampoline.load(Ordering::Relaxed);
-        let data_ptr = slot.data.load(Ordering::Relaxed);
-        let task_id = slot.task_id.load(Ordering::Relaxed);
-        let num_tasks = slot.num_tasks.load(Ordering::Relaxed);
+        // Check for shutdown.
+        if shutdown.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+
+        // Check if this worker participates in the current dispatch.
+        let num_tasks = state.num_tasks.load(Ordering::Relaxed);
+        if worker_id >= num_tasks {
+            // Not participating — go back to spinning on generation.
+            continue;
+        }
+
+        // Save the generation we woke up for before executing the task.
+        // This is used after the task completes to guard against stale signals.
+        let my_gen = last_gen;
+
+        // The Acquire on generation ensures we see the trampoline/data stores.
+        let tramp_ptr = state.trampoline.load(Ordering::Relaxed);
+        let data_ptr = state.data.load(Ordering::Relaxed);
 
         // SAFETY: tramp_ptr is a valid fn(*const (), usize, usize),
         // data_ptr points to the caller's stack-local closure reference.
         let tramp: fn(*const (), usize, usize) = unsafe { std::mem::transmute(tramp_ptr) };
-        tramp(data_ptr.cast_const(), task_id, num_tasks);
+        tramp(data_ptr.cast_const(), worker_id, num_tasks);
 
-        // Signal completion.
-        slot.status.store(DONE, Ordering::Release);
+        // Only signal completion if the dispatch we participated in is still
+        // current.  Under heavy preemption a worker can be descheduled between
+        // executing the task and reaching this point.  If the main thread has
+        // already timed out waiting (impossible with our blocking wait) *or* if
+        // a new dispatch has been issued (generation changed), the old worker's
+        // fetch_add would corrupt the new round's counter, causing the main
+        // thread to exit its spin loop one completion short and return while a
+        // worker from the new round is still writing.  The generation check
+        // makes such stale workers silently discard their signal — the main
+        // thread already exited correctly (it saw `num_tasks - 1` from the real
+        // workers), and the new round's counter remains uncorrupted.
+        let current_gen = state.generation.load(Ordering::Acquire);
+        if current_gen == my_gen {
+            completion.completed.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -390,6 +428,41 @@ mod tests {
             });
             // 0 + 1 + 2 + 3 = 6
             assert_eq!(sum.load(Ordering::Relaxed), 6);
+        }
+    }
+
+    /// Stress test for the generation-keyed completion race.
+    ///
+    /// Without the generation check in `worker_loop`, a worker preempted
+    /// between "execute task" and "fetch_add(1)" can fire its stale
+    /// increment into the *next* dispatch's counter, causing the main thread
+    /// to exit the spin loop one completion short. That manifests here as a
+    /// sum that doesn't equal the expected value — proving a worker was still
+    /// running when `dispatch` returned.
+    ///
+    /// Run with many threads and many iterations to stress the timing window.
+    #[test]
+    fn test_repeated_dispatch_race_stress() {
+        let num_threads = (std::thread::available_parallelism().map_or(4, std::num::NonZero::get))
+            .min(16)
+            .max(2);
+        let pool = SpinPool::new(num_threads);
+        let expected: u64 = (0..num_threads as u64).sum(); // 0+1+…+(N-1)
+
+        for iteration in 0..500 {
+            let sum = AtomicU64::new(0);
+            pool.dispatch(num_threads, |task_id, _| {
+                // Simulate a tiny amount of work so tasks finish at slightly
+                // different times, increasing the probability of catching a
+                // worker that is slow to signal completion.
+                std::hint::spin_loop();
+                sum.fetch_add(task_id as u64, Ordering::Relaxed);
+            });
+            let got = sum.load(Ordering::Relaxed);
+            assert_eq!(
+                got, expected,
+                "iteration {iteration}: sum={got} expected={expected} (race detected)"
+            );
         }
     }
 

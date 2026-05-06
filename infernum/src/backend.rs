@@ -98,6 +98,12 @@ pub trait Backend: 'static {
     /// Used by generic `Model` impls to return backend-specific logits
     /// from forward passes without knowing the concrete type.
     fn logits_from_tensor(tensor: Self::Tensor) -> Self::Logits;
+
+    /// Computation dtype used when the model's embedding weights are
+    /// quantized (and thus don't imply a native dtype). CUDA backends
+    /// return `BF16` for faster Tensor Core ops; CPU backends return
+    /// `F32` since they only support f32 tensors.
+    const QUANTIZED_COMPUTE_DTYPE: crate::dtype::DType = crate::dtype::DType::F32;
 }
 
 // ---- Op traits ----
@@ -701,6 +707,59 @@ pub trait MoeSigmoidOps: Backend {
     ) -> Result<Self::Tensor>
     where
         F: Fn(usize, &Self::Tensor) -> Result<Self::Tensor>;
+}
+
+/// Multi-head Latent Attention (MLA) as used by DeepSeek V3 / R1.
+///
+/// A backend that implements this trait can execute a graph containing an
+/// [`crate::graph::MlaAttentionOp`] node. The trait captures the full MLA
+/// forward pass: Q LoRA compression + RMSNorm + expansion, joint KV
+/// projection + RMSNorm + decompression, interleaved RoPE, fused attention,
+/// and the output projection. The KV cache is accumulated across decode steps
+/// entirely inside this method; the graph engine does not manage it externally.
+///
+/// The flat (non-paged) KV cache is stored as a `Vec` of per-layer compressed
+/// latent tensors `(c_kv, k_rope)`. The backend grows the cache in-place on
+/// each call by appending the new position's entry.
+pub trait MlaAttentionOps: Backend + MatmulOps {
+    /// Run the full MLA forward pass for one layer and one decode step.
+    ///
+    /// # Arguments
+    /// - `hidden`: input hidden states `[1, hidden_size]`.
+    /// - `q_a_proj`, `q_a_layernorm`, `q_b_proj`: Q LoRA weights.
+    /// - `kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj_k`, `kv_b_proj_v`,
+    ///   `kv_b_proj_k_t`: KV projection weights.
+    /// - `o_proj`: output projection weight.
+    /// - `kv_cache`: mutable flat KV cache for this layer (appended to each call).
+    /// - `pos`: current sequence position (used for RoPE offset).
+    /// - Dimension params as stored in `MlaAttentionOp`.
+    ///
+    /// Returns the attention output `[1, hidden_size]`.
+    ///
+    /// # Errors
+    /// Returns an error if any matmul or norm fails.
+    #[allow(clippy::too_many_arguments)]
+    fn mla_attention(
+        hidden: &Self::Tensor,
+        q_a_proj: &<Self as MatmulOps>::LinearWeight,
+        q_a_layernorm: &Self::Tensor,
+        q_b_proj: &<Self as MatmulOps>::LinearWeight,
+        kv_a_proj_with_mqa: &<Self as MatmulOps>::LinearWeight,
+        kv_a_layernorm: &Self::Tensor,
+        kv_b_proj_k: &<Self as MatmulOps>::LinearWeight,
+        kv_b_proj_v: &<Self as MatmulOps>::LinearWeight,
+        kv_b_proj_k_t: &<Self as MatmulOps>::LinearWeight,
+        o_proj: &<Self as MatmulOps>::LinearWeight,
+        kv_cache: &mut Vec<Self::Tensor>,
+        pos: usize,
+        num_heads: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        v_head_dim: usize,
+        kv_lora_rank: usize,
+        rms_norm_eps: f32,
+        attn_scale: f32,
+    ) -> Result<Self::Tensor>;
 }
 
 // ---- Extended matmul ----

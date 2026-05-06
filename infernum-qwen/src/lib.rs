@@ -5,8 +5,19 @@
 
 mod chat_templates;
 mod config;
-mod model;
+#[cfg(feature = "cuda")]
+pub mod cuda_graph_engine;
+pub mod graph_builder;
+#[cfg(feature = "cpu")]
+pub mod graph_engine;
 
 pub use chat_templates::ChatMLTemplate;
 pub use config::QwenConfig;
-pub use model::{QwenModel, QwenOps};
+#[cfg(feature = "cuda")]
+pub use cuda_graph_engine::{QwenCudaGraphEngine, QwenCudaGraphEngineExt};
+pub use graph_builder::{
+    build_decode_graph, build_paged_decode_graph, build_prefill_graph, DenseLayerWeightIds,
+    LayerWeightIds, ModelWeightIds, MoeLayerWeightIds, QkNormIds, QkvBiasIds, QwenGraphOps,
+};
+#[cfg(feature = "cpu")]
+pub use graph_engine::{QwenGraphEngine, QwenGraphEngineExt};

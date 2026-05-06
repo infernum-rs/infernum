@@ -901,6 +901,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror 1.0.69",
  "tokenizers",
 ]
@@ -961,6 +962,9 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
+ "infernum-cpu",
+ "infernum-cuda",
+ "infernum-runtime",
  "serde",
  "serde_json",
 ]
@@ -991,6 +995,9 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
+ "infernum-cpu",
+ "infernum-cuda",
+ "infernum-runtime",
  "serde",
  "serde_json",
 ]
@@ -1001,6 +1008,8 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
+ "infernum-cpu",
+ "infernum-cuda",
  "serde",
  "serde_json",
 ]
@@ -1020,6 +1029,9 @@ version = "0.1.0"
 dependencies = [
  "half",
  "infernum",
+ "infernum-cpu",
+ "infernum-cuda",
+ "infernum-runtime",
  "serde",
  "serde_json",
 ]

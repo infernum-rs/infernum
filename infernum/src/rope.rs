@@ -32,6 +32,25 @@ pub fn precompute_rope_data(
     (cos_data, sin_data)
 }
 
+/// Precompute RoPE cos/sin for a single token position.
+///
+/// Returns `(cos_row, sin_row)` each of length `head_dim / 2`.
+/// This is the per-position equivalent of [`precompute_rope_data`], useful
+/// for paged-decode paths where positions are known one at a time.
+#[must_use]
+pub fn precompute_rope_row(pos: usize, head_dim: usize, base: f32) -> (Vec<f32>, Vec<f32>) {
+    let half_dim = head_dim / 2;
+    let mut cos_row = Vec::with_capacity(half_dim);
+    let mut sin_row = Vec::with_capacity(half_dim);
+    for i in 0..half_dim {
+        let freq = 1.0_f32 / base.powf(2.0 * i as f32 / head_dim as f32);
+        let angle = pos as f32 * freq;
+        cos_row.push(angle.cos());
+        sin_row.push(angle.sin());
+    }
+    (cos_row, sin_row)
+}
+
 /// RoPE scaling configuration (from `config.json` `rope_scaling` field).
 #[derive(Debug, Clone)]
 pub struct RopeScaling {

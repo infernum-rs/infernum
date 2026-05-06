@@ -29,11 +29,12 @@ use serde::Deserialize;
 use infernum::tokenizer::LlamaTokenizer;
 use infernum::{ChatTemplate, Result};
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::CudaBackend;
-use infernum_deepseek::{DeepSeekModel, DeepSeekTemplate};
-use infernum_gemma::{GemmaModel, GemmaTemplate};
-use infernum_llama::{Llama3Template, LlamaModel, MistralTemplate};
-use infernum_qwen::{ChatMLTemplate, QwenModel};
+use infernum_deepseek::DeepSeekTemplate;
+use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _, GemmaTemplate};
+use infernum_llama::{
+    Llama3Template, LlamaCudaGraphEngine, LlamaCudaGraphEngineExt as _, MistralTemplate,
+};
+use infernum_qwen::{ChatMLTemplate, QwenCudaGraphEngine, QwenCudaGraphEngineExt as _};
 use infernum_serve::{BatchConfig, ModelEntry, Server};
 
 /// Serve a model via the `OpenAI`-compatible Chat Completions API
@@ -122,19 +123,20 @@ async fn main() -> Result<()> {
 
     let entry = match model_type.as_str() {
         "llama" | "mistral" | "mixtral" => {
-            let model = LlamaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
+            let model = LlamaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "qwen2" | "qwen3" | "qwen3_moe" => {
-            let model = QwenModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
+            let model = QwenCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         "deepseek_v3" => {
-            let model = DeepSeekModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
-            ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
+            return Err(infernum::Error::UnsupportedModel(
+                "DeepSeek CUDA graph engine is not yet implemented.".to_string(),
+            ));
         }
         "gemma2" | "gemma3_text" => {
-            let model = GemmaModel::<CudaBackend>::from_pretrained(&ctx, &cli.model)?;
+            let model = GemmaCudaGraphEngine::from_pretrained(ctx, Path::new(&cli.model))?;
             ModelEntry::with_config(&cli.name, model, tokenizer, template, batch_config)
         }
         other => {

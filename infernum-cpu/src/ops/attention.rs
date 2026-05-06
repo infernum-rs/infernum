@@ -285,8 +285,108 @@ impl PagedKvCacheOps for CpuBackend {
 
 // ---- Attention ----
 
+/// Process a single (seq_pos, head) attention unit: Q·K^T, mask, softmax, V weighted sum.
+///
+/// Writes directly into `output` at the correct offset. Each (s, h) pair
+/// accesses a disjoint region so this is safe to call from multiple threads.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::many_single_char_names,
+    clippy::large_stack_arrays
+)]
+fn attention_head_unit(
+    output: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    s: usize,
+    h: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    gqa_ratio: usize,
+    offset: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
+) {
+    const MAX_STACK_KV: usize = 2048;
+
+    let kv_h = h / gqa_ratio;
+    let q_off = (s * num_heads + h) * head_dim;
+    let q_vec = &q[q_off..q_off + head_dim];
+
+    // Compute attention scores using SIMD dot products.
+    // Use stack array to avoid heap allocation (called ~245K times per iteration).
+    let mut stack_scores = [0.0f32; MAX_STACK_KV];
+    let mut heap_scores;
+    let scores: &mut [f32] = if kv_len <= MAX_STACK_KV {
+        &mut stack_scores[..kv_len]
+    } else {
+        heap_scores = vec![0.0f32; kv_len];
+        &mut heap_scores
+    };
+
+    for kv_pos in 0..kv_len {
+        let k_off = (kv_pos * num_kv_heads + kv_h) * head_dim;
+        let k_vec = &k[k_off..k_off + head_dim];
+        let mut dot = crate::simd::dot_f32(q_vec, k_vec) * scale;
+
+        if let Some(cap) = softcap {
+            dot = cap * (dot / cap).tanh();
+        }
+
+        scores[kv_pos] = dot;
+    }
+
+    // Causal mask + sliding window
+    let query_pos = offset + s;
+    for kv_pos in (query_pos + 1)..kv_len {
+        scores[kv_pos] = f32::NEG_INFINITY;
+    }
+    if let Some(window) = sliding_window {
+        if query_pos >= window {
+            let cutoff = query_pos - window + 1;
+            for score in &mut scores[..cutoff] {
+                *score = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    // Softmax
+    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for score in scores.iter_mut() {
+        *score = (*score - max_score).exp();
+        sum += *score;
+    }
+    if sum > 0.0 {
+        let inv_sum = 1.0 / sum;
+        for score in scores.iter_mut() {
+            *score *= inv_sum;
+        }
+    }
+
+    // Weighted sum of V using SIMD fused-multiply-add.
+    let o_off = (s * num_heads + h) * head_dim;
+    let o_slice = &mut output[o_off..o_off + head_dim];
+    for kv_pos in 0..kv_len {
+        let w = scores[kv_pos];
+        if w > 0.0 {
+            let v_off = (kv_pos * num_kv_heads + kv_h) * head_dim;
+            let v_vec = &v[v_off..v_off + head_dim];
+            crate::simd::vec_fmadd(o_slice, v_vec, w);
+        }
+    }
+}
+
 /// Causal attention: Q @ K^T * scale, mask, softmax, @ V.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+///
+/// Parallelized across the `(seq_pos, head)` dimension — each unit writes
+/// to a disjoint region of the output, so no synchronization is needed.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 fn causal_attention(
     q: &[f32],
     k: &[f32],
@@ -302,71 +402,72 @@ fn causal_attention(
     sliding_window: Option<usize>,
 ) -> Vec<f32> {
     let gqa_ratio = num_heads / num_kv_heads;
-    let mut output = vec![0.0f32; seq_len * num_heads * head_dim];
+    let total_units = seq_len * num_heads;
+    let mut output = vec![0.0f32; total_units * head_dim];
 
-    for s in 0..seq_len {
-        for h in 0..num_heads {
-            let kv_h = h / gqa_ratio;
-            let q_offset = (s * num_heads + h) * head_dim;
-            let q_vec = &q[q_offset..q_offset + head_dim];
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
 
-            // Compute attention scores
-            let mut scores = Vec::with_capacity(kv_len);
-            for kv_pos in 0..kv_len {
-                let k_offset = (kv_pos * num_kv_heads + kv_h) * head_dim;
-                let k_vec = &k[k_offset..k_offset + head_dim];
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    dot += q_vec[d] * k_vec[d];
-                }
-                dot *= scale;
-
-                // Apply soft-capping
-                if let Some(cap) = softcap {
-                    dot = cap * (dot / cap).tanh();
-                }
-
-                scores.push(dot);
-            }
-
-            // Apply causal mask and sliding window
-            let query_pos = offset + s;
-            for kv_pos in 0..kv_len {
-                if kv_pos > query_pos {
-                    scores[kv_pos] = f32::NEG_INFINITY;
-                }
-                if let Some(window) = sliding_window {
-                    if query_pos >= window && kv_pos < query_pos - window + 1 {
-                        scores[kv_pos] = f32::NEG_INFINITY;
-                    }
-                }
-            }
-
-            // Softmax
-            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for score in &mut scores {
-                *score = (*score - max_score).exp();
-                sum += *score;
-            }
-            if sum > 0.0 {
-                for score in &mut scores {
-                    *score /= sum;
-                }
-            }
-
-            // Weighted sum of V
-            let o_offset = (s * num_heads + h) * head_dim;
-            for kv_pos in 0..kv_len {
-                if scores[kv_pos] > 0.0 {
-                    let v_offset = (kv_pos * num_kv_heads + kv_h) * head_dim;
-                    for d in 0..head_dim {
-                        output[o_offset + d] += scores[kv_pos] * v[v_offset + d];
-                    }
-                }
+    // For very small workloads (decode with few heads), skip dispatch overhead.
+    if total_units <= num_threads {
+        for s in 0..seq_len {
+            for h in 0..num_heads {
+                attention_head_unit(
+                    &mut output,
+                    q,
+                    k,
+                    v,
+                    s,
+                    h,
+                    kv_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gqa_ratio,
+                    offset,
+                    scale,
+                    softcap,
+                    sliding_window,
+                );
             }
         }
+        return output;
     }
+
+    let chunk_size = total_units.div_ceil(num_threads);
+    let num_tasks = total_units.div_ceil(chunk_size);
+    let out_addr = output.as_mut_ptr() as usize;
+
+    pool.dispatch(num_tasks, |task_id, _| {
+        let unit_start = task_id * chunk_size;
+        let unit_end = (unit_start + chunk_size).min(total_units);
+
+        // Safety: each task writes to disjoint (s, h) output slots.
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, total_units * head_dim) };
+
+        for unit in unit_start..unit_end {
+            let s = unit / num_heads;
+            let h = unit % num_heads;
+            attention_head_unit(
+                out_slice,
+                q,
+                k,
+                v,
+                s,
+                h,
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                gqa_ratio,
+                offset,
+                scale,
+                softcap,
+                sliding_window,
+            );
+        }
+    });
 
     output
 }

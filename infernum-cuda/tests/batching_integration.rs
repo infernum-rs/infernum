@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use infernum::tokenizer::LlamaTokenizer;
 use infernum_cuda::cuda::CudaContext;
-use infernum_cuda::CudaBackend;
-use infernum_llama::LlamaModel;
+
+use infernum_llama::{LlamaCudaGraphEngine, LlamaCudaGraphEngineExt as _};
 use infernum_runtime::{BatchConfig, Engine, FinishReason, GenerationEvent};
 
 use test_helpers::{download_model, greedy_options};
@@ -62,8 +62,7 @@ fn collect_tokens(rx: mpsc::Receiver<GenerationEvent>) -> (Vec<u32>, FinishReaso
 fn single_request() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model: LlamaModel<CudaBackend> =
-        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     let engine = Engine::with_config(model, batch_config()).expect("engine");
@@ -86,8 +85,7 @@ fn single_request() {
 fn concurrent_identical_requests() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model: LlamaModel<CudaBackend> =
-        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -131,8 +129,7 @@ fn concurrent_identical_requests() {
 fn concurrent_different_prompts() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model: LlamaModel<CudaBackend> =
-        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -179,8 +176,7 @@ fn concurrent_different_prompts() {
 fn staggered_arrival() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model: LlamaModel<CudaBackend> =
-        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -221,8 +217,7 @@ fn staggered_arrival() {
 fn early_cancellation() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model: LlamaModel<CudaBackend> =
-        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
     let engine = Engine::with_config(model, batch_config()).expect("engine");
 
@@ -271,8 +266,7 @@ fn early_cancellation() {
 fn memory_pressure() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model: LlamaModel<CudaBackend> =
-        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     // Very small block pool — enough for about 2 short sequences
@@ -311,8 +305,7 @@ fn memory_pressure() {
 fn sequential_engine_regression() {
     let dir = model_dir();
     let ctx = CudaContext::new(0).expect("CUDA context");
-    let model: LlamaModel<CudaBackend> =
-        LlamaModel::from_pretrained(&ctx, &dir).expect("load model");
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx, &dir).expect("load model");
     let tokenizer = LlamaTokenizer::from_pretrained(&dir).expect("load tokenizer");
 
     let engine = Engine::new(model).expect("engine");

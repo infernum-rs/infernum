@@ -147,16 +147,20 @@ impl CudaTensor {
         let numel: usize = shape.iter().product();
         let elem_size = dtype.size_in_bytes();
         let byte_size = numel * elem_size;
+        // cuMemAlloc with size 0 has undefined behaviour, so allocate at
+        // least 1 byte.  The shape is still recorded as-is (e.g. [0, H, D]),
+        // so downstream ops that branch on shape[0]==0 behave correctly.
+        let alloc_size = byte_size.max(1);
 
         let buffer = if let Some(pool) = ctx.buffer_pool() {
-            if let Some(slice) = pool.acquire::<u8>(byte_size, byte_size) {
-                PoolableBuffer::pooled(slice, pool.clone(), byte_size)
+            if let Some(slice) = pool.acquire::<u8>(alloc_size, alloc_size) {
+                PoolableBuffer::pooled(slice, pool.clone(), alloc_size)
             } else {
-                let data = ctx.device().alloc::<u8>(byte_size)?;
-                PoolableBuffer::pooled(data, pool.clone(), byte_size)
+                let data = ctx.device().alloc::<u8>(alloc_size)?;
+                PoolableBuffer::pooled(data, pool.clone(), alloc_size)
             }
         } else {
-            let data = ctx.device().alloc::<u8>(byte_size)?;
+            let data = ctx.device().alloc::<u8>(alloc_size)?;
             PoolableBuffer::unpooled(data)
         };
 
@@ -177,9 +181,9 @@ impl CudaTensor {
     /// # Errors
     /// Returns an error if GPU memory allocation fails
     pub fn zeros(ctx: &CudaContext, shape: &[usize], dtype: DType) -> Result<Self> {
-        if ctx.buffer_pool().is_some() {
-            let mut t = unsafe { Self::uninit(ctx, shape, dtype)? };
-            let byte_count = t.size_in_bytes();
+        let mut t = unsafe { Self::uninit(ctx, shape, dtype)? };
+        let byte_count = t.size_in_bytes();
+        if byte_count > 0 {
             let ptr = *t.cuda_slice_mut().device_ptr_mut();
             let result = unsafe { cudarc::driver::sys::lib().cuMemsetD8_v2(ptr, 0, byte_count) };
             assert_eq!(
@@ -187,19 +191,8 @@ impl CudaTensor {
                 cudarc::driver::sys::CUresult::CUDA_SUCCESS,
                 "cuMemsetD8 failed"
             );
-            Ok(t)
-        } else {
-            let numel: usize = shape.iter().product();
-            let byte_size = numel * dtype.size_in_bytes();
-            let data = ctx.device().alloc_zeros::<u8>(byte_size)?;
-            Ok(Self {
-                data: Arc::new(PoolableBuffer::unpooled(data)),
-                offset_bytes: 0,
-                shape: shape.to_vec(),
-                dtype,
-                ctx: ctx.clone(),
-            })
         }
+        Ok(t)
     }
 
     /// Copy tensor data back to the host as typed elements.

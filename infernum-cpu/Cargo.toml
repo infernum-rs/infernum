@@ -46,8 +46,8 @@ libc = "0.2"
 
 [dev-dependencies]
 approx = "0.5"
-infernum-gemma = { path = "../infernum-gemma" }
-infernum-llama = { path = "../infernum-llama" }
-infernum-qwen = { path = "../infernum-qwen" }
 infernum-runtime = { path = "../infernum-runtime" }
+infernum-gemma = { path = "../infernum-gemma", features = ["cpu"] }
+infernum-llama = { path = "../infernum-llama", features = ["cpu"] }
+infernum-qwen = { path = "../infernum-qwen", features = ["cpu"] }
 ureq = { version = "3", features = ["json"] }

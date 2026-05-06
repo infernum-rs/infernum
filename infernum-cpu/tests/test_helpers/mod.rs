@@ -68,6 +68,7 @@ pub fn download_model_files(repo_id: &str, files: &[&str]) -> PathBuf {
 }
 
 /// Greedy generation options (deterministic, no sampling).
+#[allow(dead_code)]
 pub fn greedy_options(max_tokens: usize) -> GenerateOptions {
     GenerateOptions {
         max_new_tokens: max_tokens,

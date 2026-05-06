@@ -73,3 +73,32 @@ impl GgufValue {
         }
     }
 }
+
+/// Extract a required `usize` value from GGUF metadata by key.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidShape`] if the key is absent or the value
+/// cannot be interpreted as a `usize`.
+pub fn get_usize<S: ::std::hash::BuildHasher>(
+    metadata: &std::collections::HashMap<String, GgufValue, S>,
+    key: &str,
+) -> crate::Result<usize> {
+    metadata
+        .get(key)
+        .and_then(GgufValue::as_usize)
+        .ok_or_else(|| crate::Error::InvalidShape(format!("Missing GGUF metadata: {key}")))
+}
+
+/// Extract an optional `f32` value from GGUF metadata, returning `default` if absent.
+#[must_use]
+pub fn get_f32<S: ::std::hash::BuildHasher>(
+    metadata: &std::collections::HashMap<String, GgufValue, S>,
+    key: &str,
+    default: f32,
+) -> f32 {
+    metadata
+        .get(key)
+        .and_then(GgufValue::as_f32)
+        .unwrap_or(default)
+}

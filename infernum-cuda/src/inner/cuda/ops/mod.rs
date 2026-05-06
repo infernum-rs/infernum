@@ -29,7 +29,7 @@ mod transpose;
 
 pub use add::{add, add_inplace};
 pub use add_rmsnorm::add_rmsnorm;
-pub use argmax::{argmax_last, argmax_last_scalar};
+pub use argmax::{argmax_last, argmax_last_scalar, argmax_last_tensor};
 pub use attention::{attention, attention_kv};
 pub use bias_add::{bias_add, bias_add_inplace};
 pub use cast::{cast_bf16_to_f32, cast_f32_to_bf16, cast_f32_to_f16, cast_from_f32, cast_to_f32};
