@@ -316,15 +316,18 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let head_dim = self.config.head_dim();
         let mut inputs = Vec::with_capacity(2 * num_layers);
         for _ in 0..num_layers {
+            // Must match the model's activation dtype (BF16). An F32 empty
+            // tensor concatenated with a BF16 K/V update causes an OOB panic
+            // because concat_rows uses dtype byte-width for slice arithmetic.
             inputs.push(CudaTensor::zeros(
                 &self.ctx,
                 &[0, num_kv_heads, head_dim],
-                DType::F32,
+                DType::BF16,
             )?);
             inputs.push(CudaTensor::zeros(
                 &self.ctx,
                 &[0, num_kv_heads, head_dim],
-                DType::F32,
+                DType::BF16,
             )?);
         }
         Ok(inputs)
@@ -362,12 +365,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                     inputs.push(CudaTensor::zeros(
                         &self.ctx,
                         &[0, num_kv_heads, head_dim],
-                        DType::F32,
+                        DType::BF16,
                     )?);
                     inputs.push(CudaTensor::zeros(
                         &self.ctx,
                         &[0, num_kv_heads, head_dim],
-                        DType::F32,
+                        DType::BF16,
                     )?);
                 }
             }

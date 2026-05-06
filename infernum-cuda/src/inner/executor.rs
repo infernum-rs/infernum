@@ -275,8 +275,25 @@ pub fn execute(
                 let input = read(&buffers, node.inputs[0]);
                 let cos_cache = read(&buffers, node.inputs[1]);
                 let sin_cache = read(&buffers, node.inputs[2]);
+                // The rope kernel dispatches on input.dtype() and expects cos/sin
+                // to share that dtype. Precomputed caches are always F32, so cast
+                // them when the activation dtype differs (e.g. BF16 models).
+                let cos_cast;
+                let cos_ref = if cos_cache.dtype() == input.dtype() {
+                    cos_cache
+                } else {
+                    cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
+                    &cos_cast
+                };
+                let sin_cast;
+                let sin_ref = if sin_cache.dtype() == input.dtype() {
+                    sin_cache
+                } else {
+                    sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
+                    &sin_cast
+                };
                 let result =
-                    <CudaBackend as RopeOps>::apply_rope(input, cos_cache, sin_cache, op.offset)?;
+                    <CudaBackend as RopeOps>::apply_rope(input, cos_ref, sin_ref, op.offset)?;
                 store(&mut buffers, node_id, 0, result);
             }
 
@@ -286,10 +303,25 @@ pub fn execute(
                 let cos_cache = read(&buffers, node.inputs[1]);
                 let sin_cache = read(&buffers, node.inputs[2]);
                 let positions = read(&buffers, node.inputs[3]);
+                // Cast cos/sin to match activation dtype (same reason as "rope" arm).
+                let cos_cast;
+                let cos_ref = if cos_cache.dtype() == input.dtype() {
+                    cos_cache
+                } else {
+                    cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
+                    &cos_cast
+                };
+                let sin_cast;
+                let sin_ref = if sin_cache.dtype() == input.dtype() {
+                    sin_cache
+                } else {
+                    sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
+                    &sin_cast
+                };
                 let result = <CudaBackend as RopeOps>::apply_rope_batched(
                     input,
-                    cos_cache,
-                    sin_cache,
+                    cos_ref,
+                    sin_ref,
                     positions,
                     op.batch_size,
                 )?;
