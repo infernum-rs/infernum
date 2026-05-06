@@ -129,14 +129,8 @@ impl LlamaGraphEngineExt for LlamaGraphEngine {
     }
 
     fn from_gguf(gguf_path: &Path) -> Result<Self> {
-        let loader = infernum::weights::gguf::GgufLoader::from_file(
-            gguf_path.to_str().ok_or_else(|| {
-                infernum::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "GGUF path is not valid UTF-8",
-                ))
-            })?,
-        )?;
+        let loader =
+            infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
         let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
         infernum_cpu::GraphEngine::from_gguf_with_config(config, gguf_path)
     }

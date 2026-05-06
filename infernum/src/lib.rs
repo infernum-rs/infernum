@@ -35,7 +35,7 @@ pub use backend::{
 };
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};
-pub use error::{Error, Result};
+pub use error::{path_to_utf8, Error, Result};
 pub use gguf_meta::GgufValue;
 pub use logits::Logits;
 pub use model::{Model, ModelConfig};

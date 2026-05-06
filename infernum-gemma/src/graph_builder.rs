@@ -294,7 +294,7 @@ where
 fn build_attention_decode<B>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
-    layer_idx: usize,
+    _layer_idx: usize,
     ids: &LayerWeightIds,
     h_normed: OutputRef,
     cos_input: OutputRef,
@@ -342,7 +342,6 @@ where
 
     let softcap = config.attn_logit_softcapping;
     // Sliding window is tracked via KV cache metadata at decode time; not passed here.
-    let _ = layer_idx;
     let attn_out = graph.add_fused_attention_decode(q, full_k, full_v, softcap);
 
     // Reshape back to 2D [1, num_heads * head_dim] before the output projection.
