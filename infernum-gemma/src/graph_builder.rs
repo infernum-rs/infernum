@@ -232,6 +232,7 @@ pub fn register_weights<B: Backend + MatmulOps>(
 // Attention helper
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn build_attention_prefill<B>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
