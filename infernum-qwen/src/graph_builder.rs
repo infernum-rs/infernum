@@ -134,9 +134,10 @@ pub struct ModelWeightIds {
     /// Final RMS norm weight (tensor weight).
     pub final_norm: WeightId,
     /// LM head projection (linear weight).
-    /// `None` when `tie_word_embeddings` is true — the embedding table is
-    /// reused at inference time.
-    pub lm_head: Option<WeightId>,
+    ///
+    /// Always registered, even when `tie_word_embeddings` is true.  The
+    /// weight loader supplies the embedding table as a fallback in that case.
+    pub lm_head: WeightId,
 }
 
 // ---------------------------------------------------------------------------
@@ -401,13 +402,11 @@ fn register_weights<B: Backend + MatmulOps>(
 
     let final_norm = graph.register_tensor_weight("model.norm.weight", &[hidden], weight_dtype);
 
-    // Tied embeddings: if `tie_word_embeddings` the embedding table is reused;
-    // no separate lm_head weight is stored in the checkpoint.
-    let lm_head = if config.tie_word_embeddings {
-        None
-    } else {
-        Some(graph.register_linear_weight("lm_head.weight", &[vocab_size, hidden], weight_dtype))
-    };
+    // Always register lm_head.weight as a linear weight.  For tied-embedding
+    // models (tie_word_embeddings=true) the weight loader falls back to
+    // model.embed_tokens.weight at load time; no special-casing is needed here.
+    let lm_head =
+        graph.register_linear_weight("lm_head.weight", &[vocab_size, hidden], weight_dtype);
 
     ModelWeightIds {
         embed_tokens,
@@ -568,11 +567,9 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
 
     let mut graph = Graph::<B>::new();
 
-    let hidden = config.hidden_size;
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_kv_heads();
     let head_dim = config.head_dim();
-    let vocab_size = config.vocab_size;
     let eps = config.rms_norm_eps;
     let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
     let norm_topk = config.norm_topk_prob;
@@ -670,21 +667,7 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
     let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
 
     // -- LM head --
-    // Tied embeddings: `embed_tokens` (tensor weight) is used directly.
-    // Non-tied: separate `lm_head` linear weight.
-    let logits = if let Some(lm_head) = model_weights.lm_head {
-        graph.add_lm_head(normed_final, lm_head, weight_dtype)
-    } else {
-        // Tied: matmul with embed_tokens (shape [vocab, hidden]) transposed.
-        // We use add_lm_head_tied which broadcasts the embedding table.
-        // Since the builder only has add_lm_head (linear), we register a
-        // synthetic linear weight that reuses the embed_tokens slot.
-        // For simplicity, re-register lm_head.weight as tied (the SafeTensors
-        // loader will fall back to embed_tokens if lm_head is absent).
-        let lm_w =
-            graph.register_linear_weight("lm_head.weight", &[vocab_size, hidden], weight_dtype);
-        graph.add_lm_head(normed_final, lm_w, weight_dtype)
-    };
+    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
 
     graph.set_output(logits.0);
 
@@ -722,11 +705,9 @@ pub fn build_decode_graph<B: QwenGraphOps>(
 ) -> (Graph<B>, ModelWeightIds) {
     let mut graph = Graph::<B>::new();
 
-    let hidden = config.hidden_size;
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_kv_heads();
     let head_dim = config.head_dim();
-    let vocab_size = config.vocab_size;
     let eps = config.rms_norm_eps;
     let num_layers = config.num_hidden_layers;
     let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
@@ -826,13 +807,7 @@ pub fn build_decode_graph<B: QwenGraphOps>(
     // -- Final norm + LM head --
     let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
 
-    let logits = if let Some(lm_head) = model_weights.lm_head {
-        graph.add_lm_head(normed_final, lm_head, weight_dtype)
-    } else {
-        let lm_w =
-            graph.register_linear_weight("lm_head.weight", &[vocab_size, hidden], weight_dtype);
-        graph.add_lm_head(normed_final, lm_w, weight_dtype)
-    };
+    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
 
     // -- Outputs: logits, then K caches, then V caches --
     graph.set_output(logits.0);
@@ -889,11 +864,9 @@ where
 
     let mut graph = Graph::<B>::new();
 
-    let hidden = config.hidden_size;
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_kv_heads();
     let head_dim = config.head_dim();
-    let vocab_size = config.vocab_size;
     let eps = config.rms_norm_eps;
     let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
     let norm_topk = config.norm_topk_prob;
@@ -901,7 +874,7 @@ where
     let model_weights = register_weights(&mut graph, config, weight_dtype);
 
     // -- Graph inputs --
-    let input_ids = graph.add_input(&[batch_size], DType::U32);
+    let input_ids = graph.add_input(&[1], DType::U32);
     let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
     let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
     let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
@@ -1024,13 +997,7 @@ where
     // -- Final norm + LM head --
     let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
 
-    let logits = if let Some(lm_head) = model_weights.lm_head {
-        graph.add_lm_head(normed_final, lm_head, weight_dtype)
-    } else {
-        let lm_w =
-            graph.register_linear_weight("lm_head.weight", &[vocab_size, hidden], weight_dtype);
-        graph.add_lm_head(normed_final, lm_w, weight_dtype)
-    };
+    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
 
     // -- Output: only logits --
     graph.set_output(logits.0);
@@ -1468,20 +1435,24 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_dense() {
         let config = dense_config();
-        let (_graph, weights): (Graph<TestBackend>, _) =
-            build_prefill_graph(&config, 4, DType::F32);
-        // Verify we get a non-empty weight store.
+        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32);
         assert!(weights.layers.len() == 2);
-        assert!(weights.lm_head.is_some());
+        // Non-tied: lm_head.weight is a distinct linear weight in the store.
+        assert_eq!(
+            graph.linear_weight_meta(weights.lm_head).name,
+            "lm_head.weight"
+        );
     }
 
     #[test]
     fn test_build_prefill_graph_tied_embeddings() {
         let config = dense_config_tied();
-        let (_graph, weights): (Graph<TestBackend>, _) =
-            build_prefill_graph(&config, 4, DType::F32);
-        // Tied: lm_head slot from register_weights is None.
-        assert!(weights.lm_head.is_none());
+        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32);
+        // Tied: lm_head is still registered; the loader supplies embed_tokens at runtime.
+        assert_eq!(
+            graph.linear_weight_meta(weights.lm_head).name,
+            "lm_head.weight"
+        );
     }
 
     #[test]
