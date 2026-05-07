@@ -15,8 +15,8 @@ pub use cuda_graph_engine::{LlamaCudaGraphEngine, LlamaCudaGraphEngineExt};
 #[cfg(feature = "cpu")]
 pub use graph_builder::load_graph_weights_gguf;
 pub use graph_builder::{
-    build_decode_graph, build_indirect_decode_graph, build_paged_decode_graph, build_prefill_graph,
-    IndirectDecodeExtraIds, LayerWeightIds, LlamaGraphOps, ModelWeightIds,
+    build_decode_graph, build_paged_decode_graph, build_prefill_graph, LayerWeightIds,
+    LlamaGraphOps, ModelWeightIds,
 };
 #[cfg(feature = "cpu")]
 pub use graph_engine::{GraphKvCache, LlamaGraphEngine, LlamaGraphEngineExt};

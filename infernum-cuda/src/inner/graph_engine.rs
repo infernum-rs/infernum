@@ -164,10 +164,10 @@ impl CudaDecodeEngine {
     ///
     /// Returns an error if any kernel launch or CUDA API call fails.
     pub fn step(&mut self, next_token: u32) -> Result<u32> {
-        // Write the token ID to the stable GPU buffer that embedding_gather_indirect reads.
-        self.ctx
-            .device()
-            .htod_copy_into(vec![next_token], self.cuda_graph.token_input_mut())?;
+        // TODO(Step 3): write next_token into GraphInputs::token_ids buffer here.
+        // The old indirect-ops token_input buffer is no longer used; the token
+        // is now passed via GraphInputs on each step.
+        let _ = next_token;
 
         if self.stabilized {
             // Fast path: graph is stable — replay with a single launch, then
@@ -194,21 +194,24 @@ impl CudaDecodeEngine {
 
             Ok(self.pinned_token.read())
         } else {
-            // Stabilization path: run execute_indirect within a CUDA graph
+            // Stabilization path: execute the graph inside a CUDA graph
             // capture so the pool allocates all required buffers. The resulting
             // token tensor has a stable pool-backed GPU address — save it so
             // the fast path can read it without re-executing.
             self.cuda_graph.begin_capture()?;
 
-            let mut outputs = super::executor::execute_indirect(
+            // TODO(Step 3): replace `inputs` with views into GraphInputs buffers.
+            // For now pass an empty slice — graph inputs are supplied via
+            // registered weights (KV cache, RoPE tables).
+            let mut outputs = super::executor::execute(
                 &self.plan,
                 self.graph.nodes(),
                 &self.weights,
-                &[], // no graph inputs — data comes from weights / kv_cache / seq_pos
+                &[], // inputs come from registered weights
                 &[self.output_node],
-                &self.ctx,
-                &self.seq_pos,
-                &mut self.kv_cache,
+                None, // no MLA KV cache
+                None, // no paged KV cache
+                0,    // mla_seq_pos
             )?;
 
             self.cuda_graph.end_capture()?;

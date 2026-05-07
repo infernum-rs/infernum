@@ -1164,6 +1164,12 @@ mod tests {
         }
     }
 
+    impl infernum::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     fn gemma2_config() -> GemmaConfig {
         GemmaConfig::from_str(
             r#"{

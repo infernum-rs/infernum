@@ -9,8 +9,8 @@
 use std::any::Any;
 
 use crate::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, GegluOps,
-    MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps,
+    ArgmaxLastOps, ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps,
+    GegluOps, MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps,
     SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
@@ -2215,257 +2215,20 @@ impl<B: ContextBackend> OpNode<B> for LmHeadOp {
 }
 
 // ---------------------------------------------------------------------------
-// EmbeddingGatherIndirectOp
-// ---------------------------------------------------------------------------
-
-/// Embedding table lookup reading the token ID from a stable GPU `u32` pointer.
-///
-/// The token ID is not a graph input — it is stored in a `SeqPosition`-like
-/// GPU buffer and passed to the executor out-of-band. This makes the op
-/// capturable by a CUDA graph (fixed device address, varying value).
-///
-/// Output shape: `[1, embed_dim]`.
-#[derive(Debug)]
-pub struct EmbeddingGatherIndirectOp {
-    /// Weight ID of the embedding table.
-    pub table: WeightId,
-    /// Embedding dimension (hidden size).
-    pub embed_dim: usize,
-    /// Output data type.
-    pub dtype: DType,
-}
-
-impl<B: Backend + MatmulOps> OpNode<B> for EmbeddingGatherIndirectOp {
-    fn name(&self) -> &'static str {
-        "embedding_gather_indirect"
-    }
-    fn num_inputs(&self) -> usize {
-        0
-    }
-    fn num_outputs(&self) -> usize {
-        1
-    }
-    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
-        vec![vec![1, self.embed_dim]]
-    }
-    fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
-        vec![self.dtype]
-    }
-    fn execute(
-        &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
-    ) -> Result<()> {
-        unimplemented!(
-            "EmbeddingGatherIndirectOp requires SeqPosition GPU pointer — handled by CUDA graph executor"
-        )
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RopeIndirectOp
-// ---------------------------------------------------------------------------
-
-/// Rotary positional embedding reading the current position from a stable GPU
-/// `u32` pointer (`SeqPosition`).
-///
-/// Takes one graph input (the Q or K tensor, shape `[1, heads, head_dim]`).
-/// The full cos/sin cache (`[max_seq_len, head_dim/2]`) are stored as
-/// tensor weights identified by `cos_cache` and `sin_cache`. The position is
-/// read at execution time from the `SeqPosition` passed to the executor.
-///
-/// Output shape: same as input.
-#[derive(Debug)]
-pub struct RopeIndirectOp {
-    /// Weight ID of the full cosine cache `[max_seq_len, head_dim/2]`.
-    pub cos_cache: WeightId,
-    /// Weight ID of the full sine cache `[max_seq_len, head_dim/2]`.
-    pub sin_cache: WeightId,
-    /// If `true`, use interleaved `RoPE` (`DeepSeek` style); otherwise standard.
-    pub interleaved: bool,
-    /// Attention head dimension.
-    pub head_dim: usize,
-    /// Number of attention heads.
-    pub num_heads: usize,
-}
-
-impl<B: Backend + MatmulOps> OpNode<B> for RopeIndirectOp {
-    fn name(&self) -> &'static str {
-        "rope_indirect"
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn num_outputs(&self) -> usize {
-        1
-    }
-    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
-        vec![input_shapes[0].to_vec()]
-    }
-    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
-        vec![input_dtypes[0]]
-    }
-    fn execute(
-        &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
-    ) -> Result<()> {
-        unimplemented!(
-            "RopeIndirectOp requires SeqPosition GPU pointer — handled by CUDA graph executor"
-        )
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AppendKvIndirectOp
-// ---------------------------------------------------------------------------
-
-/// Append a new K or V token into the pre-allocated KV cache buffer.
-///
-/// Takes one graph input (new K or V, shape `[1, kv_heads, head_dim]`).
-/// The target KV buffer and write offset are both addressed via `SeqPosition`
-/// and the pre-allocated `KvCache` passed to the executor. This is a
-/// side-effect op (no output tensor).
-///
-/// The `layer_idx` determines which layer buffer to write into; `is_key`
-/// selects K vs V.
-#[derive(Debug)]
-pub struct AppendKvIndirectOp {
-    /// Transformer layer index.
-    pub layer_idx: usize,
-    /// `true` = append to K cache; `false` = append to V cache.
-    ///
-    /// In practice the executor handles both K and V together for the same
-    /// `layer_idx`, but having separate ops keeps the graph DAG explicit.
-    pub is_key: bool,
-    /// Number of KV heads.
-    pub num_kv_heads: usize,
-    /// Attention head dimension.
-    pub head_dim: usize,
-}
-
-impl<B: Backend + MatmulOps> OpNode<B> for AppendKvIndirectOp {
-    fn name(&self) -> &'static str {
-        "append_kv_indirect"
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn num_outputs(&self) -> usize {
-        0
-    }
-    fn is_side_effect(&self) -> bool {
-        true
-    }
-    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
-        vec![]
-    }
-    fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
-        vec![]
-    }
-    fn execute(
-        &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
-    ) -> Result<()> {
-        unimplemented!(
-            "AppendKvIndirectOp requires KV cache device buffer access — handled by CUDA graph executor"
-        )
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FusedAttentionDecodeIndirectOp
-// ---------------------------------------------------------------------------
-
-/// Fused decode attention reading K/V buffers and total sequence length from
-/// the executor's out-of-band `KvCache` (indexed by `layer_idx`).
-///
-/// Takes one graph input: Q `[1, num_heads, head_dim]`. The full K and V cache
-/// buffers are fetched from `kv_cache.full_buffers(layer_idx)` at execution
-/// time — their GPU addresses are stable across all decode steps, making this
-/// op safe to use inside a CUDA graph capture. The actual sequence length is
-/// read from the `KvCache`'s internal `SeqPosition` device pointer.
-///
-/// Output shape: `[1, num_heads, head_dim]`.
-#[derive(Debug)]
-pub struct FusedAttentionDecodeIndirectOp {
-    /// Layer index used to look up K/V buffers from `kv_cache.full_buffers(layer_idx)`.
-    pub layer_idx: usize,
-    /// Number of query heads.
-    pub num_heads: usize,
-    /// Number of key/value heads (may differ from `num_heads` for GQA).
-    pub num_kv_heads: usize,
-    /// Attention head dimension.
-    pub head_dim: usize,
-    /// Attention scale (`1/sqrt(head_dim)` if standard).
-    pub scale: f32,
-    /// Optional `logit_softcapping` value (Gemma-style).
-    pub softcap: Option<f32>,
-    /// Optional sliding window size (Mistral/Qwen-style).
-    pub sliding_window: Option<usize>,
-}
-
-impl<B: Backend + MatmulOps> OpNode<B> for FusedAttentionDecodeIndirectOp {
-    fn name(&self) -> &'static str {
-        "fused_attention_decode_indirect"
-    }
-    fn num_inputs(&self) -> usize {
-        1 // Q only; K/V fetched from kv_cache.full_buffers(layer_idx) by executor
-    }
-    fn num_outputs(&self) -> usize {
-        1
-    }
-    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
-        vec![vec![1, self.num_heads, self.head_dim]]
-    }
-    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
-        vec![input_dtypes[0]]
-    }
-    fn execute(
-        &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
-    ) -> Result<()> {
-        unimplemented!(
-            "FusedAttentionDecodeIndirectOp requires stable KV cache device buffers — handled by CUDA graph executor"
-        )
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ArgmaxLastOp
 // ---------------------------------------------------------------------------
 
-/// Argmax over the last dimension of a 2D tensor, returning a `[1]` U32 tensor.
+/// Argmax over the last dimension of a 2D tensor, returning a U32 tensor.
 ///
-/// During decode the input is logits of shape `[1, vocab_size]`. The output is
-/// the token index on the GPU — no device→host transfer is needed until the
-/// caller explicitly reads the 4-byte result. This allows the op to be captured
-/// inside a CUDA graph and replayed without a D→H sync on every step.
-///
-/// Must be dispatched by the CUDA indirect executor via `argmax_last_gpu`; the
-/// generic `execute()` implementation panics.
+/// During decode the input is logits of shape `[batch, vocab_size]`.  The
+/// output shape is `[batch]`.  The token index stays on-device — no
+/// device→host transfer is needed until the caller explicitly reads the result.
+/// On CUDA this allows the op to be captured inside a CUDA graph and replayed
+/// without a D→H sync on every step.
 #[derive(Debug, Clone)]
 pub struct ArgmaxLastOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
+impl<B: ContextBackend> OpNode<B> for ArgmaxLastOp {
     fn name(&self) -> &'static str {
         "argmax_last"
     }
@@ -2475,21 +2238,24 @@ impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
     fn num_outputs(&self) -> usize {
         1
     }
-    fn output_shapes(&self, _input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
-        vec![vec![1]]
+    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        // Output: [rows] — one argmax per row.
+        let rows = input_shapes[0].first().copied().unwrap_or(1);
+        vec![vec![rows]]
     }
     fn output_dtypes(&self, _input_dtypes: &[DType]) -> Vec<DType> {
         vec![DType::U32]
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!(
-            "ArgmaxLastOp must use argmax_last_gpu kernel — handled by CUDA graph executor"
-        )
+        let logits = B::ctx_read(ctx, inputs[0]);
+        let result = B::argmax_last_tensor(&logits)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self

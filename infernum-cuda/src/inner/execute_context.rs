@@ -5,6 +5,9 @@
 //! `B::ctx_write`, and `B::ctx_next_input` without violating Rust's orphan
 //! rules (which forbid inherent `impl` blocks on foreign types).
 
+use std::sync::Arc;
+
+use cudarc::driver::{CudaDevice, CudaSlice};
 use infernum::backend::{ContextBackend, MlaAttentionOps};
 use infernum::graph::builtin_ops::MlaAttentionOp;
 use infernum::graph::execute_context::{ExecuteContext, KvCacheAccess};
@@ -13,6 +16,68 @@ use infernum::Result;
 
 use crate::cuda::{ops, CudaTensor, PagedKvCache};
 use crate::CudaBackend;
+
+// ---------------------------------------------------------------------------
+// GraphInputs
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated GPU-side input buffers for CUDA graph capture decode steps.
+///
+/// Allocated once per decode engine instance with fixed device addresses.
+/// Between graph replays the engine writes new values via `htod_copy_into`.
+/// The CUDA graph records the fixed addresses — no re-capture needed when only
+/// the values change.
+///
+/// The 6 buffers map 1-to-1 to the 6 graph input nodes of the paged decode
+/// graph in this fixed order:
+///
+/// 0. `token_ids`   — `[batch_size]` U32
+/// 1. `cos`         — `[batch_size, half_dim]` F32
+/// 2. `sin`         — `[batch_size, half_dim]` F32
+/// 3. `block_table` — `[batch_size, max_blocks_per_seq]` U32
+/// 4. `positions`   — `[batch_size]` U32
+/// 5. `seq_lens`    — `[batch_size]` U32
+pub struct GraphInputs {
+    pub token_ids: CudaSlice<u32>,
+    pub cos: CudaSlice<f32>,
+    pub sin: CudaSlice<f32>,
+    pub block_table: CudaSlice<u32>,
+    pub positions: CudaSlice<u32>,
+    pub seq_lens: CudaSlice<u32>,
+    pub batch_size: usize,
+    pub half_dim: usize,
+    pub max_blocks_per_seq: usize,
+}
+
+impl GraphInputs {
+    /// Allocate all input buffers on the given device, zeroed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any device allocation fails.
+    pub fn new(
+        device: &Arc<CudaDevice>,
+        batch_size: usize,
+        half_dim: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            token_ids: device.alloc_zeros::<u32>(batch_size)?,
+            cos: device.alloc_zeros::<f32>(batch_size * half_dim)?,
+            sin: device.alloc_zeros::<f32>(batch_size * half_dim)?,
+            block_table: device.alloc_zeros::<u32>(batch_size * max_blocks_per_seq)?,
+            positions: device.alloc_zeros::<u32>(batch_size)?,
+            seq_lens: device.alloc_zeros::<u32>(batch_size)?,
+            batch_size,
+            half_dim,
+            max_blocks_per_seq,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CudaExecutorState
+// ---------------------------------------------------------------------------
 
 /// Backend-specific executor state for [`CudaBackend`].
 ///
@@ -31,6 +96,11 @@ pub struct CudaExecutorState {
     pub mla_kv_cache_ptr: *mut Vec<Vec<CudaTensor>>,
     /// Current sequence position for MLA attention.
     pub mla_seq_pos: usize,
+    /// Pre-allocated GPU-side input buffers for CUDA graph capture.
+    ///
+    /// `Some` during `CudaDecodeEngine::step()` (captured decode).
+    /// `None` during eager prefill/decode (inputs come from `input_tensors`).
+    pub graph_inputs: Option<GraphInputs>,
 }
 
 // SAFETY: `CudaExecutorState` is only constructed and used within a single
@@ -85,13 +155,61 @@ impl ContextBackend for CudaBackend {
 
     /// Consume the next graph input tensor, advancing the input cursor.
     ///
+    /// During CUDA graph capture (`state.graph_inputs = Some(…)`), returns a
+    /// non-owning [`CudaTensor`] view over the corresponding pre-allocated
+    /// [`GraphInputs`] buffer.  The device address is stable across replays,
+    /// allowing the captured graph to reference it without re-capture.
+    ///
+    /// During eager execution (`state.graph_inputs = None`), clones from the
+    /// `input_tensors` slice as before.
+    ///
     /// # Panics
     ///
-    /// Panics if all input tensors have already been consumed.
+    /// Panics if the input index is out of range.
     fn ctx_next_input(ctx: &mut ExecuteContext<'_, CudaBackend>) -> CudaTensor {
-        let tensor = ctx.input_tensors[*ctx.input_idx].clone();
+        let idx = *ctx.input_idx;
         *ctx.input_idx += 1;
-        tensor
+        if let Some(ref inputs) = ctx.state.graph_inputs {
+            // Build a non-owning CudaTensor view from the corresponding buffer.
+            // The CudaContext is borrowed from the device handle already in ctx.
+            let cuda_ctx: &crate::cuda::CudaContext = ctx.device;
+            return match idx {
+                0 => CudaTensor::from_cuda_slice_view(
+                    cuda_ctx,
+                    &[inputs.batch_size],
+                    &inputs.token_ids,
+                ),
+                1 => CudaTensor::from_cuda_slice_view(
+                    cuda_ctx,
+                    &[inputs.batch_size, inputs.half_dim],
+                    &inputs.cos,
+                ),
+                2 => CudaTensor::from_cuda_slice_view(
+                    cuda_ctx,
+                    &[inputs.batch_size, inputs.half_dim],
+                    &inputs.sin,
+                ),
+                3 => CudaTensor::from_cuda_slice_view(
+                    cuda_ctx,
+                    &[inputs.batch_size, inputs.max_blocks_per_seq],
+                    &inputs.block_table,
+                ),
+                4 => CudaTensor::from_cuda_slice_view(
+                    cuda_ctx,
+                    &[inputs.batch_size],
+                    &inputs.positions,
+                ),
+                5 => CudaTensor::from_cuda_slice_view(
+                    cuda_ctx,
+                    &[inputs.batch_size],
+                    &inputs.seq_lens,
+                ),
+                _ => panic!(
+                    "ctx_next_input: index {idx} out of range for GraphInputs (expected 0–5)"
+                ),
+            };
+        }
+        ctx.input_tensors[idx].clone()
     }
 
     // Weight names (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj_k, …) are

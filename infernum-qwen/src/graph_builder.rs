@@ -1370,6 +1370,12 @@ mod tests {
         }
     }
 
+    impl infernum::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     fn dense_config() -> QwenConfig {
         serde_json::from_str(
             r#"{

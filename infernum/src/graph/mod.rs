@@ -18,8 +18,8 @@ mod weight_store;
 pub use arena::Arena;
 pub use builder::Graph;
 pub use builder_traits::{
-    GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps, GraphGegluOps,
-    GraphIndirectDecodeOps, GraphMatmulExtOps, GraphMatmulOps, GraphMlaAttentionOps, GraphMoeOps,
+    GraphArgmaxOps, GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps,
+    GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphMlaAttentionOps, GraphMoeOps,
     GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
     GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
 };
@@ -519,6 +519,12 @@ mod tests {
             _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
         ) -> DummyTensor {
             DummyTensor
+        }
+    }
+
+    impl crate::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
         }
     }
 

@@ -560,6 +560,12 @@ mod tests {
         }
     }
 
+    impl crate::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     #[test]
     fn fuse_silu_mul_into_swiglu() {
         let mut graph = Graph::<TestBackend>::new();

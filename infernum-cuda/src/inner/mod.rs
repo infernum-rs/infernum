@@ -14,7 +14,7 @@ pub use backend_impl::CudaBackend;
 pub use cuda_graph_engine::*;
 pub use cuda_logits::CudaLogits;
 pub use cuda_runtime_state::CudaRuntimeState;
-pub use execute_context::CudaExecutorState;
+pub use execute_context::{CudaExecutorState, GraphInputs};
 pub use graph_engine::CudaDecodeEngine;
 
 pub use cuda::ops::LinearWeight;

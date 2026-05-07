@@ -18,9 +18,9 @@ use infernum::backend::{
 };
 use infernum::dtype::DType;
 use infernum::graph::{
-    Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphIndirectDecodeOps, GraphMatmulOps,
-    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSiluOps,
-    GraphTensorOps, WeightId,
+    Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphMatmulOps, GraphNormOps,
+    GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSiluOps, GraphTensorOps,
+    WeightId,
 };
 
 use crate::config::LlamaConfig;
@@ -597,231 +597,6 @@ where
     graph
 }
 
-// ---------------------------------------------------------------------------
-// Indirect decode graph construction (CUDA graph compatible)
-// ---------------------------------------------------------------------------
-
-/// IDs for the additional weight tensors registered by [`build_indirect_decode_graph`].
-///
-/// These cover the pre-allocated `KV` cache buffers and `RoPE` tables that are
-/// treated as graph weights (stable GPU addresses) rather than inputs.
-pub struct IndirectDecodeExtraIds {
-    /// Number of tensor weights belonging to the model (`embed_tokens`, norms, etc.).
-    /// Tensor weight IDs in the range `[model_tensor_weight_count, ∞)` are `RoPE`
-    /// caches and `KV` buffers that the caller must allocate on the GPU — they are
-    /// not stored in the model checkpoint files.
-    pub model_tensor_weight_count: usize,
-    /// Weight ID of the cosine `RoPE` cache `[max_seq_len, head_dim/2]`.
-    pub cos_cache: WeightId,
-    /// Weight ID of the sine `RoPE` cache `[max_seq_len, head_dim/2]`.
-    pub sin_cache: WeightId,
-    /// Per-layer K cache weight IDs, shape `[max_seq_len, num_kv_heads, head_dim]`.
-    pub k_caches: Vec<WeightId>,
-    /// Per-layer V cache weight IDs, shape `[max_seq_len, num_kv_heads, head_dim]`.
-    pub v_caches: Vec<WeightId>,
-}
-
-/// Build a computation graph for CUDA-graph-compatible single-token decode.
-///
-/// Unlike [`build_decode_graph`], this graph:
-///
-/// - Takes **zero** graph inputs — the token ID and sequence position are
-///   provided out-of-band via a `SeqPosition` GPU pointer.
-/// - Registers the pre-allocated `KV` cache buffers and full `RoPE` tables as
-///   **tensor weights** (stable GPU addresses), so the graph captures the same
-///   device pointers across all decode steps.
-/// - Uses indirect op variants (`embedding_gather_indirect`, `rope_indirect`,
-///   `append_kv_indirect`, `fused_attention_decode_indirect`) that read
-///   dynamically-changing values from stable device addresses at execution time.
-///
-/// This makes it possible to capture the entire forward pass into a single
-/// `cudaGraphExec_t` and replay it with `cuGraphExecUpdate_v2` each step.
-///
-/// # Arguments
-///
-/// * `config` — Model configuration.
-/// * `max_seq_len` — Maximum total sequence length (prompt + generated). Determines
-///   the pre-allocated `KV` cache size.
-/// * `weight_dtype` — Data type for model weights and `KV` cache buffers.
-///
-/// # Returns
-///
-/// A tuple of `(graph, model_weight_ids, extra_ids)` where `extra_ids` contains
-/// the weight IDs for the `RoPE` tables and `KV` cache buffers that the caller must
-/// populate in the `WeightStore` before execution.
-///
-/// # Panics
-///
-/// Panics if the config describes an `MoE` model (`num_local_experts > 1`).
-#[must_use]
-#[allow(clippy::too_many_lines)]
-pub fn build_indirect_decode_graph<B: LlamaGraphOps>(
-    config: &LlamaConfig,
-    max_seq_len: usize,
-    weight_dtype: DType,
-) -> (Graph<B>, ModelWeightIds, IndirectDecodeExtraIds) {
-    assert!(
-        !config.is_moe(),
-        "build_indirect_decode_graph does not support MoE models"
-    );
-
-    let mut graph = Graph::<B>::new();
-
-    let hidden = config.hidden_size;
-    let num_heads = config.num_attention_heads;
-    let num_kv_heads = config.num_kv_heads();
-    let head_dim = config.head_dim();
-    let kv_dim = num_kv_heads * head_dim;
-    let intermediate = config.intermediate_size;
-    let vocab_size = config.vocab_size;
-    let half_dim = head_dim / 2;
-    let eps = config.rms_norm_eps;
-    let num_layers = config.num_hidden_layers;
-    #[allow(clippy::cast_precision_loss)]
-    let scale = 1.0_f32 / (head_dim as f32).sqrt();
-
-    // -- Register model weights (same ordering as prefill graph for weight reuse) --
-    let model_weights = register_weights(
-        &mut graph,
-        config,
-        hidden,
-        kv_dim,
-        intermediate,
-        vocab_size,
-        weight_dtype,
-    );
-
-    // Snapshot the tensor weight count after model weights are registered.
-    // Weights registered after this point (RoPE caches, KV buffers) must be
-    // allocated by the caller — they are not stored in checkpoint files.
-    let model_tensor_weight_count = graph.tensor_weight_count();
-
-    // -- Register RoPE caches as tensor weights (stable GPU addresses) --
-    let cos_cache =
-        graph.register_tensor_weight("rope.cos_cache", &[max_seq_len, half_dim], DType::F32);
-    let sin_cache =
-        graph.register_tensor_weight("rope.sin_cache", &[max_seq_len, half_dim], DType::F32);
-
-    // -- Register per-layer KV cache buffers as tensor weights (stable GPU addresses) --
-    // The executor fetches these at execution time via kv_cache.full_buffers(layer_idx).
-    // They are recorded here so the caller can populate the WeightStore before execution,
-    // but they are NOT injected as graph inputs — the executor reads them out-of-band.
-    let mut k_caches = Vec::with_capacity(num_layers);
-    let mut v_caches = Vec::with_capacity(num_layers);
-    for i in 0..num_layers {
-        let k_id = graph.register_tensor_weight(
-            format!("kv_cache.layer{i}.k"),
-            &[max_seq_len, num_kv_heads, head_dim],
-            weight_dtype,
-        );
-        let v_id = graph.register_tensor_weight(
-            format!("kv_cache.layer{i}.v"),
-            &[max_seq_len, num_kv_heads, head_dim],
-            weight_dtype,
-        );
-        k_caches.push(k_id);
-        v_caches.push(v_id);
-    }
-
-    // -- Embedding (reads token ID from SeqPosition device pointer) --
-    let mut h =
-        graph.add_embedding_gather_indirect(model_weights.embed_tokens, hidden, weight_dtype);
-
-    // -- Transformer layers --
-    let layers: Vec<_> = model_weights.layers.iter().enumerate().collect();
-    let num_layers = layers.len();
-
-    // Pre-compute normed for layer 0: no preceding residual add, so plain rms_norm.
-    let mut normed = graph.add_rms_norm(h, layers[0].1.input_layernorm, eps);
-
-    for &(layer_idx, lw) in &layers {
-        // 1. Q/K/V projections (fused triple) — `normed` carried from previous iteration
-        //    (or pre-computed above for layer 0).
-        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
-
-        // 2. Reshape to 3D: [1, num_heads, head_dim]
-        let q_3d = graph.add_reshape(q, &[1, num_heads, head_dim]);
-        let k_3d = graph.add_reshape(k, &[1, num_kv_heads, head_dim]);
-        let v_3d = graph.add_reshape(v, &[1, num_kv_heads, head_dim]);
-
-        // 3. Indirect RoPE (position read from SeqPosition at execution time)
-        let q_rope =
-            graph.add_rope_indirect(q_3d, cos_cache, sin_cache, false, head_dim, num_heads);
-        let k_rope =
-            graph.add_rope_indirect(k_3d, cos_cache, sin_cache, false, head_dim, num_kv_heads);
-
-        // 4. Indirect KV append (write offset read from SeqPosition at execution time)
-        let _k_append =
-            graph.add_append_kv_indirect(k_rope, layer_idx, true, num_kv_heads, head_dim);
-        let _v_append =
-            graph.add_append_kv_indirect(v_3d, layer_idx, false, num_kv_heads, head_dim);
-
-        // 5. Indirect decode attention: K/V buffers and total_len are read from the
-        //    executor's out-of-band KvCache (indexed by layer_idx).
-        let attn_out = graph.add_fused_attention_decode_indirect(
-            q_rope,
-            layer_idx,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            scale,
-            None,
-            config.effective_sliding_window(layer_idx),
-        );
-
-        // 6. Reshape back to 2D and output projection
-        let attn_flat = graph.add_reshape(attn_out, &[1, hidden]);
-        let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
-
-        // 7. Fused: residual add(h, attn_proj) + rms_norm(post_attention_layernorm)
-        let (h_updated, normed_post) =
-            graph.add_add_rmsnorm(h, attn_proj, lw.post_attention_layernorm, eps);
-
-        // 8. FFN: SiLU + Mul MLP
-        let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
-        let gate_activated = graph.add_silu(gate);
-        let activated = graph.add_mul(gate_activated, up);
-        let down = graph.add_linear(activated, lw.down_proj);
-
-        // 9. Fused: residual add(h_updated, down) + rms_norm(next layer's input_layernorm),
-        //    or plain add on the last layer (no next norm to fuse).
-        if layer_idx + 1 < num_layers {
-            let next_lw = layers[layer_idx + 1].1;
-            let (h_new, normed_next) =
-                graph.add_add_rmsnorm(h_updated, down, next_lw.input_layernorm, eps);
-            h = h_new;
-            normed = normed_next;
-        } else {
-            h = graph.add_add_inplace(h_updated, down);
-        }
-    }
-
-    // -- Final norm --
-    let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
-
-    // -- LM head --
-    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
-
-    // -- Argmax: keep token selection on-device so the CUDA graph replays the
-    //    full decode step without a D→H sync on every step. The caller reads
-    //    one u32 (4 bytes) instead of the full logits tensor. --
-    let token = graph.add_argmax_last(logits);
-
-    // -- Output: U32 token tensor [1] --
-    graph.set_output(token.0);
-
-    let extra = IndirectDecodeExtraIds {
-        model_tensor_weight_count,
-        cos_cache,
-        sin_cache,
-        k_caches,
-        v_caches,
-    };
-
-    (graph, model_weights, extra)
-}
-
-// ---------------------------------------------------------------------------
 // GGUF weight loader helpers
 // ---------------------------------------------------------------------------
 
@@ -1278,6 +1053,12 @@ mod tests {
             _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
         ) -> DummyTensor {
             DummyTensor
+        }
+    }
+
+    impl infernum::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
         }
     }
 

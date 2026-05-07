@@ -12,7 +12,7 @@ pub mod nccl;
 pub mod ops;
 pub mod paged_kv_cache;
 mod quantized;
-pub mod seq_position;
+mod seq_position;
 mod tensor;
 
 pub use buffer_pool::{BufferPool, PooledSlice};

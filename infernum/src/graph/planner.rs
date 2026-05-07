@@ -800,6 +800,12 @@ mod tests {
         }
     }
 
+    impl crate::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test 1: Empty graph
     // -----------------------------------------------------------------------
