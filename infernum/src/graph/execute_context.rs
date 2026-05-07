@@ -10,6 +10,7 @@
 //! are running on CPU or CUDA.
 
 use crate::backend::{Backend, MatmulOps};
+use crate::DType;
 
 use super::node::{GraphNode, NodeId};
 use super::op_node::OutputRef;
@@ -84,6 +85,41 @@ pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
 }
 
 impl<B: Backend + MatmulOps> ExecuteContext<'_, B> {
+    /// Returns `(byte_offset, element_count, dtype)` for an input tensor
+    /// identified by its [`OutputRef`].
+    ///
+    /// Used by op `execute()` bodies to locate arena slots without importing
+    /// planner internals directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node output has no buffer slot assigned by the planner.
+    #[must_use]
+    pub fn input_slot(&self, output_ref: OutputRef) -> (usize, usize, DType) {
+        let (node_id, output_idx) = output_ref;
+        let node = &self.nodes[node_id.index() as usize];
+        let slot = self
+            .plan
+            .slot(node_id, output_idx)
+            .expect("input node output has no buffer slot");
+        let shape = &node.output_shapes[output_idx as usize];
+        let dtype = node.output_dtypes[output_idx as usize];
+        let num_elements: usize = shape.iter().product();
+        (slot.offset, num_elements, dtype)
+    }
+
+    /// Returns `(byte_offset, element_count)` for this node's output slot, or
+    /// `None` if the planner did not assign a slot (side-effect-only outputs).
+    #[must_use]
+    pub fn output_slot(&self, node_id: NodeId, idx: u32) -> Option<(usize, usize)> {
+        let node = &self.nodes[node_id.index() as usize];
+        self.plan.slot(node_id, idx).map(|slot| {
+            let shape = &node.output_shapes[idx as usize];
+            let num_elements: usize = shape.iter().product();
+            (slot.offset, num_elements)
+        })
+    }
+
     /// Read a tensor produced by a prior node in the graph.
     ///
     /// Returns an owned tensor (cloned from the backend's storage).
