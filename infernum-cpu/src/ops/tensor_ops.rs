@@ -175,13 +175,18 @@ impl TensorOps for CpuBackend {
 
     fn concat_rows(parts: &[CpuTensor]) -> Result<CpuTensor> {
         assert!(!parts.is_empty(), "concat_rows: empty parts");
-        let cols = parts[0].shape().last().copied().unwrap_or(0);
+        let ref_shape = parts[0].shape();
         let mut data = Vec::new();
         for part in parts {
             data.extend_from_slice(part.as_f32_slice());
         }
-        let rows = parts.len();
-        Ok(CpuTensor::from_f32_vec(&[rows, cols], data))
+        // Sum the leading dimension across all parts; keep trailing dims from
+        // the first part. This handles both 2D [rows, cols] and 3D
+        // [seq, heads, dim] tensors correctly.
+        let total_rows: usize = parts.iter().map(|p| p.shape()[0]).sum();
+        let mut out_shape = ref_shape.to_vec();
+        out_shape[0] = total_rows;
+        Ok(CpuTensor::from_f32_vec(&out_shape, data))
     }
 }
 

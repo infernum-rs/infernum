@@ -1210,7 +1210,7 @@ pub struct PagedAttentionDecodeOp {
     pub softcap: Option<f32>,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
+impl<B: ContextBackend> OpNode<B> for PagedAttentionDecodeOp {
     fn name(&self) -> &'static str {
         "paged_attention_decode"
     }
@@ -1237,9 +1237,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let q = ctx.read_tensor(inputs[0]);
-        let block_tables = ctx.read_tensor(inputs[1]);
-        let seq_lens = ctx.read_tensor(inputs[2]);
+        let q = B::ctx_read(ctx, inputs[0]);
+        let block_tables = B::ctx_read(ctx, inputs[1]);
+        let seq_lens = B::ctx_read(ctx, inputs[2]);
         let max_blocks_per_seq = block_tables.shape()[1];
         // max_seq_len is passed as 0 — the KvCacheAccess impl computes the
         // real value from the seq_lens tensor, which requires backend-specific
@@ -1259,7 +1259,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
                 self.softcap,
                 self.sliding_window,
             )?;
-        ctx.write_tensor(node_id, 0, attn_out);
+        B::ctx_write(ctx, node_id, 0, attn_out);
         Ok(())
     }
     fn as_any(&self) -> &dyn Any {
@@ -1330,7 +1330,7 @@ pub struct AppendPagedBatchedOp {
     pub layer_idx: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
+impl<B: ContextBackend> OpNode<B> for AppendPagedBatchedOp {
     fn name(&self) -> &'static str {
         "append_paged_batched"
     }
@@ -1360,10 +1360,10 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let k = ctx.read_tensor(inputs[0]);
-        let v = ctx.read_tensor(inputs[1]);
-        let block_tables = ctx.read_tensor(inputs[2]);
-        let positions = ctx.read_tensor(inputs[3]);
+        let k = B::ctx_read(ctx, inputs[0]);
+        let v = B::ctx_read(ctx, inputs[1]);
+        let block_tables = B::ctx_read(ctx, inputs[2]);
+        let positions = B::ctx_read(ctx, inputs[3]);
         let batch_size = k.shape()[0];
         let max_blocks_per_seq = block_tables.shape()[1];
         ctx.kv_cache
@@ -1382,7 +1382,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
         // The executor allocates a slot for every node output via `.max(1)`, and
         // the subsequent `paged_attention_decode` node takes a scheduling edge
         // on `(node_id, 0)` — the slot must be filled, but the value is ignored.
-        ctx.write_tensor(node_id, 0, k);
+        B::ctx_write(ctx, node_id, 0, k);
         Ok(())
     }
     fn is_side_effect(&self) -> bool {
