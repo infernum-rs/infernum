@@ -83,7 +83,7 @@ pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
     pub input_idx: &'a mut usize,
 }
 
-impl<'a, B: Backend + MatmulOps> ExecuteContext<'a, B> {
+impl<B: Backend + MatmulOps> ExecuteContext<'_, B> {
     /// Read a tensor produced by a prior node in the graph.
     ///
     /// Returns an owned tensor (cloned from the backend's storage).
@@ -92,6 +92,7 @@ impl<'a, B: Backend + MatmulOps> ExecuteContext<'a, B> {
     /// # Panics
     ///
     /// Panics with a backend-specific message if the tensor is not found.
+    #[must_use]
     pub fn read_tensor(&self, _output_ref: OutputRef) -> B::Tensor {
         unimplemented!(
             "ExecuteContext::read_tensor — implement in the backend crate (infernum-cpu / infernum-cuda)"

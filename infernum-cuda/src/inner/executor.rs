@@ -760,22 +760,25 @@ pub fn execute(
             _ => {
                 use crate::inner::execute_context::CudaExecutorState;
                 use infernum::graph::execute_context::ExecuteContext;
+                // Get the CUDA context from the first input tensor — every graph
+                // has at least one input, so this is always valid.
+                let device = inputs[0].context().clone();
                 let mut state = CudaExecutorState { buffers };
                 let mut input_idx_local = input_idx;
                 {
-                    let mut ctx = ExecuteContext {
+                    let mut exec_ctx = ExecuteContext {
                         state: &mut state,
                         plan,
                         nodes,
                         weights,
-                        device: &crate::cuda::CudaContext::current()?,
+                        device: &device,
                         kv_cache: None::<
                             &mut dyn infernum::graph::execute_context::KvCacheAccess<CudaBackend>,
                         >,
                         input_tensors: inputs,
                         input_idx: &mut input_idx_local,
                     };
-                    node.op.execute(&mut ctx, node_id, &node.inputs)?;
+                    node.op.execute(&mut exec_ctx, node_id, &node.inputs)?;
                 }
                 buffers = state.buffers;
                 input_idx = input_idx_local;
