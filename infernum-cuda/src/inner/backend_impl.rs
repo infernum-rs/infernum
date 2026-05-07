@@ -204,11 +204,28 @@ impl MatmulExtOps for CudaBackend {
 
 impl NormOps for CudaBackend {
     fn rms_norm(input: &CudaTensor, weight: &CudaTensor, eps: f32) -> Result<CudaTensor> {
-        ops::rms_norm(input, weight, eps)
+        // Some weights (e.g. Qwen3 per-head QK-norm) are stored as F32 in the
+        // checkpoint while activations are BF16.  The CUDA rmsnorm kernels
+        // require both tensors to share the same dtype, so cast when they differ.
+        let weight_cast;
+        let weight_ref = if weight.dtype() == input.dtype() {
+            weight
+        } else {
+            weight_cast = ops::cast_from_f32(weight, input.dtype())?;
+            &weight_cast
+        };
+        ops::rms_norm(input, weight_ref, eps)
     }
 
     fn rms_norm_inplace(input: &mut CudaTensor, weight: &CudaTensor, eps: f32) -> Result<()> {
-        ops::rms_norm_inplace(input, weight, eps)
+        let weight_cast;
+        let weight_ref = if weight.dtype() == input.dtype() {
+            weight
+        } else {
+            weight_cast = ops::cast_from_f32(weight, input.dtype())?;
+            &weight_cast
+        };
+        ops::rms_norm_inplace(input, weight_ref, eps)
     }
 
     fn add_rmsnorm(
@@ -217,7 +234,14 @@ impl NormOps for CudaBackend {
         weight: &CudaTensor,
         eps: f32,
     ) -> Result<(CudaTensor, CudaTensor)> {
-        ops::add_rmsnorm(residual, input, weight, eps)
+        let weight_cast;
+        let weight_ref = if weight.dtype() == input.dtype() {
+            weight
+        } else {
+            weight_cast = ops::cast_from_f32(weight, input.dtype())?;
+            &weight_cast
+        };
+        ops::add_rmsnorm(residual, input, weight_ref, eps)
     }
 }
 
