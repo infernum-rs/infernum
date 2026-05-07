@@ -127,7 +127,15 @@ pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
     /// Backend-specific executor state.
     ///
     /// For `CpuBackend` this is `&mut Arena` (the flat intermediate buffer).
-    /// For `CudaBackend` this is `&mut CudaExecutorState` (the tensor map).
+    ///
+    /// For `CudaBackend` this is `&mut CudaExecutorState`, which contains:
+    /// - `buffers`: per-node intermediate tensor storage.
+    /// - `graph_inputs`: `None` during eager prefill and batch-decode (inputs
+    ///   are cloned from `input_tensors`); `Some(GraphInputs)` during CUDA
+    ///   graph capture and replay, in which case
+    ///   [`ContextBackend::ctx_next_input`](crate::backend::ContextBackend::ctx_next_input)
+    ///   returns non-owning views over the pre-allocated stable GPU buffers so
+    ///   the captured graph can reference their fixed device addresses.
     pub state: &'a mut B::ExecutorState,
 
     /// The execution plan (schedule + buffer slots).

@@ -76,8 +76,9 @@ impl CudaGraph {
 
     /// GPU buffer holding the current token ID (immutable).
     ///
-    /// Pass this to `forward_next_token_device` — the model reads from
-    /// this fixed device address during both eager and captured execution.
+    /// The buffer holds a stable device address. Write the next token with
+    /// `device.htod_copy_into()` before each capture or replay step;
+    /// the captured graph reads from this fixed address without re-capture.
     #[must_use]
     pub fn token_input(&self) -> &CudaSlice<u32> {
         &self.token_input

@@ -40,13 +40,34 @@ use crate::CudaBackend;
 
 /// CUDA-graph-accelerated single-token decode engine.
 ///
-/// Call [`CudaDecodeEngine::step`] once per decode step. The first few steps
-/// re-capture the graph until the buffer pool stabilizes; subsequent steps
-/// replay the captured graph with a single `launch()` call.
+/// Owns all state needed for repeated single-token decode steps:
 ///
-/// Call [`CudaDecodeEngine::advance`] **after** each `step()`. The host-side
-/// block table and position counter cannot be updated inside the capture
-/// boundary.
+/// - [`GraphInputs`] — pre-allocated stable GPU-side input buffers (`token_ids`,
+///   `cos`, `sin`, `block_table`, `positions`, `seq_lens`).
+/// - [`PagedKvCache`] — paged KV cache for all transformer layers.
+/// - [`BlockAllocator`] / [`BlockTable`] — host-side paged memory management.
+/// - [`CudaGraph`] — the compiled CUDA graph executable.
+/// - [`ExecutionPlan`] — topological schedule (built once, reused every step).
+///
+/// # Step lifecycle
+///
+/// [`step`](CudaDecodeEngine::step) runs one decode step:
+///
+/// 1. Writes the current token ID, RoPE cos/sin, block table, positions, and
+///    seq-lens into the `GraphInputs` buffers via `htod_copy_into`.
+/// 2. **Stabilisation phase** (first few steps): wraps [`execute`] in
+///    [`begin_capture`](CudaGraph::begin_capture) /
+///    [`end_capture`](CudaGraph::end_capture) so the buffer pool can allocate
+///    its working set under capture. Re-captures until the pool miss count
+///    plateaus (pool stable), then sets `stabilized = true`.
+/// 3. **Fast path** (once stabilised): calls
+///    [`launch`](CudaGraph::launch) only — a single `cuGraphLaunch` with
+///    near-zero CPU overhead. The token result is read back asynchronously via
+///    [`PinnedBuffer`] + [`CudaEvent`].
+///
+/// [`advance`](CudaDecodeEngine::advance) **must** be called after each
+/// `step()`. It increments the host-side sequence position and advances the
+/// block table — operations that cannot occur inside a capture boundary.
 pub struct CudaDecodeEngine {
     ctx: CudaContext,
     cuda_graph: CudaGraph,
