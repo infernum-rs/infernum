@@ -209,6 +209,21 @@ impl KvCacheAccess<CudaBackend> for CudaPagedKvCacheAccess<'_> {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<CudaTensor> {
+        // The generic `PagedAttentionDecodeOp` passes `max_seq_len = 0` as a
+        // sentinel, expecting the backend to compute the real value.  The CUDA
+        // kernel uses `max_seq_len` to size its shared-memory allocation; a
+        // zero value causes under-allocation and corrupted attention output.
+        let max_seq_len = if max_seq_len == 0 {
+            let seq_lens_vec = seq_lens.to_vec::<u32>()?;
+            seq_lens_vec
+                .iter()
+                .copied()
+                .map(|x| x as usize)
+                .max()
+                .unwrap_or(1)
+        } else {
+            max_seq_len
+        };
         let (k_pool, v_pool) = self.0.get_pools(layer_idx);
         ops::paged_attention_decode_from_tensor(
             q.context(),
