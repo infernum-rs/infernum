@@ -151,5 +151,3 @@ pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
     /// Cursor into `input_tensors` — advanced by [`ContextBackend::ctx_next_input`](crate::backend::ContextBackend::ctx_next_input).
     pub input_idx: &'a mut usize,
 }
-
-
