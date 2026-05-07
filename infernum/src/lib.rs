@@ -29,10 +29,11 @@ pub mod transformer;
 pub mod weights;
 
 pub use backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, Comm, DecodeBufferOps, DecodeTensors,
-    EmbedOps, GegluOps, KvCacheOps, MatmulExtOps, MatmulOps, MlaAttentionOps, MoeOps,
-    MoeSigmoidOps, MultiDeviceOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeInterleavedOps,
-    RopeOps, SafeTensorsLoaderOps, SwigluOps, TensorDataOps, TensorFactory, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, Comm, ContextBackend, DecodeBufferOps,
+    DecodeTensors, EmbedOps, GegluOps, KvCacheOps, MatmulExtOps, MatmulOps, MlaAttentionOps,
+    MoeOps, MoeSigmoidOps, MultiDeviceOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
+    RopeInterleavedOps, RopeOps, SafeTensorsLoaderOps, SwigluOps, TensorDataOps, TensorFactory,
+    TensorOps,
 };
 pub use block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 pub use dtype::{DType, GPTQ_GROUP_SIZE, QUANTIZATION_BLOCK_SIZE};

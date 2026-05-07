@@ -11,6 +11,7 @@ mod fused_attention;
 mod geglu;
 mod gelu;
 mod linear;
+mod logit_softcap;
 mod matmul;
 mod mla_tensor_ops;
 mod moe_routing;
@@ -41,6 +42,7 @@ pub use fused_attention::{
 pub use geglu::geglu;
 pub use gelu::{gelu, gelu_inplace, gelu_mul};
 pub use linear::{linear, LinearWeight};
+pub use logit_softcap::logit_softcap;
 pub use matmul::{matmul, matmul_bf16_f32};
 pub use mla_tensor_ops::{broadcast_to_heads, concat_inner_dim, pad_inner_dim, split_inner_dim};
 pub use moe_routing::{moe_route_sigmoid_gpu, GpuRouting, GpuRoutingBuffers};

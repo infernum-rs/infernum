@@ -8,6 +8,7 @@ mod arena;
 mod builder;
 mod builder_traits;
 pub mod builtin_ops;
+pub mod execute_context;
 mod node;
 mod op_node;
 pub mod optimizer;
@@ -22,7 +23,8 @@ pub use builder_traits::{
     GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
     GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
 };
-pub use builtin_ops::{MlaAttentionOp, MoeExpertIds};
+pub use builtin_ops::{FusedRopePairOp, MlaAttentionOp, MoeExpertIds};
+pub use execute_context::{ExecuteContext, KvCacheAccess};
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use op_node::{OpNode, OutputRef};
 pub use planner::{plan, BufferSlot, ExecutionPlan, PlanCache};
@@ -105,6 +107,7 @@ mod tests {
         type PagedKvCache = ();
         type KvCache = ();
         type RuntimeState = DummyRuntimeState;
+        type ExecutorState = ();
         type Logits = DummyLogits;
         type Comm = ();
 
@@ -336,6 +339,12 @@ mod tests {
         fn scale_inplace(_a: &mut DummyTensor, _scale: f32) -> crate::Result<()> {
             Ok(())
         }
+        fn silu(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn logit_softcap(_input: &DummyTensor, _cap: f32) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
     }
 
     impl crate::backend::AttentionOps for TestBackend {
@@ -444,6 +453,72 @@ mod tests {
     impl crate::backend::SwigluOps for TestBackend {
         fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> crate::Result<DummyTensor> {
             Ok(DummyTensor)
+        }
+    }
+
+    impl crate::backend::MoeOps for TestBackend {
+        fn moe_forward_softmax<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _norm_topk_prob: bool,
+            _expert_fn: F,
+        ) -> crate::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> crate::Result<DummyTensor>,
+        {
+            unimplemented!()
+        }
+    }
+
+    impl crate::backend::MoeSigmoidOps for TestBackend {
+        fn moe_forward_sigmoid<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _e_score_correction_bias: &[f32],
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _n_group: usize,
+            _topk_group: usize,
+            _norm_topk_prob: bool,
+            _routed_scaling_factor: f32,
+            _expert_fn: F,
+        ) -> crate::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> crate::Result<DummyTensor>,
+        {
+            unimplemented!()
+        }
+    }
+
+    impl crate::backend::TensorDataOps for TestBackend {
+        fn to_f32_vec(_tensor: &DummyTensor) -> crate::Result<Vec<f32>> {
+            unimplemented!()
+        }
+        fn to_raw_bytes(_tensor: &DummyTensor) -> crate::Result<Vec<u8>> {
+            unimplemented!()
+        }
+    }
+
+    impl crate::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: crate::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: crate::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
         }
     }
 
@@ -711,11 +786,11 @@ mod tests {
 
         fn execute(
             &self,
-            _inputs: &[&DummyTensor],
-            _weights: &crate::graph::WeightStore<DummyTensor, DummyTensor>,
-            _device: &(),
-        ) -> crate::Result<Vec<DummyTensor>> {
-            Ok(vec![DummyTensor])
+            _ctx: &mut ExecuteContext<'_, TestBackend>,
+            _node_id: NodeId,
+            _inputs: &[OutputRef],
+        ) -> crate::Result<()> {
+            Ok(()) // no-op test implementation
         }
 
         fn as_any(&self) -> &dyn std::any::Any {

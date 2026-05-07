@@ -14,6 +14,7 @@
     clippy::module_name_repetitions
 )]
 
+pub mod execute_context;
 pub mod executor;
 pub mod graph_engine;
 pub mod logits;
@@ -43,6 +44,7 @@ impl Backend for CpuBackend {
     type PagedKvCache = CpuPagedKvCache;
     type KvCache = CpuKvCache;
     type RuntimeState = ();
+    type ExecutorState = infernum::graph::Arena;
     type Logits = CpuLogits;
     type Comm = ();
 

@@ -54,3 +54,7 @@ required-features = ["cpu"]
 [[example]]
 name = "bench_cpu"
 required-features = ["cpu"]
+
+[[example]]
+name = "custom_graph_op"
+required-features = ["cpu"]

@@ -9,16 +9,17 @@
 use std::any::Any;
 
 use crate::backend::{
-    ArithOps, AttentionOps, Backend, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps, NormOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, GegluOps,
+    MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps,
+    SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
 use crate::tensor::Tensor as TensorTrait;
 use crate::Result;
 
-use super::node::WeightId;
-use super::op_node::OpNode;
-use super::weight_store::WeightStore;
+use super::execute_context::ExecuteContext;
+use super::node::{NodeId, WeightId};
+use super::op_node::{OpNode, OutputRef};
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -51,7 +52,7 @@ pub struct InputOp {
     pub dtype: DType,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for InputOp {
+impl<B: ContextBackend> OpNode<B> for InputOp {
     fn name(&self) -> &'static str {
         "input"
     }
@@ -69,11 +70,20 @@ impl<B: Backend + MatmulOps> OpNode<B> for InputOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("InputOp is handled specially by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        if ctx
+            .kv_cache
+            .as_ref()
+            .is_some_and(|kv| kv.is_cache_input(node_id))
+        {
+            return Ok(());
+        }
+        let tensor = B::ctx_next_input(ctx);
+        B::ctx_write(ctx, node_id, 0, tensor);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -98,7 +108,7 @@ pub struct EmbeddingGatherOp {
     pub dtype: DType,
 }
 
-impl<B: Backend + MatmulOps + EmbedOps> OpNode<B> for EmbeddingGatherOp {
+impl<B: ContextBackend + EmbedOps> OpNode<B> for EmbeddingGatherOp {
     fn name(&self) -> &'static str {
         "embedding_gather"
     }
@@ -116,14 +126,16 @@ impl<B: Backend + MatmulOps + EmbedOps> OpNode<B> for EmbeddingGatherOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let table = weights.tensor_weight(self.table);
-        let seq_len = inputs[0].shape()[0];
-        let result = B::embedding_gather_tensor(table, inputs[0], seq_len)?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let token_ids = B::ctx_read(ctx, inputs[0]);
+        let table_w = ctx.weights.tensor_weight(self.table).clone();
+        let seq_len = token_ids.shape()[0];
+        let result = <B as EmbedOps>::embedding_gather_tensor(&table_w, &token_ids, seq_len)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -146,7 +158,7 @@ pub struct RmsNormOp {
     pub eps: f32,
 }
 
-impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormOp {
+impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormOp {
     fn name(&self) -> &'static str {
         "rms_norm"
     }
@@ -164,13 +176,15 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w = weights.tensor_weight(self.weight);
-        let result = B::rms_norm(inputs[0], w, self.eps)?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let weight = ctx.weights.tensor_weight(self.weight).clone();
+        let result = <B as NormOps>::rms_norm(&input, &weight, self.eps)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -193,7 +207,7 @@ pub struct AddRmsNormOp {
     pub eps: f32,
 }
 
-impl<B: Backend + MatmulOps + NormOps> OpNode<B> for AddRmsNormOp {
+impl<B: ContextBackend + NormOps> OpNode<B> for AddRmsNormOp {
     fn name(&self) -> &'static str {
         "add_rms_norm"
     }
@@ -211,13 +225,17 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for AddRmsNormOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w = weights.tensor_weight(self.weight);
-        let (updated, normed) = B::add_rmsnorm(inputs[0], inputs[1], w, self.eps)?;
-        Ok(vec![updated, normed])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let residual = B::ctx_read(ctx, inputs[0]);
+        let delta = B::ctx_read(ctx, inputs[1]);
+        let weight = ctx.weights.tensor_weight(self.weight).clone();
+        let (updated, normed) = <B as NormOps>::add_rmsnorm(&residual, &delta, &weight, self.eps)?;
+        B::ctx_write(ctx, node_id, 0, updated);
+        B::ctx_write(ctx, node_id, 1, normed);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -240,7 +258,7 @@ pub struct LinearOp {
     pub out_features: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LinearOp {
+impl<B: ContextBackend> OpNode<B> for LinearOp {
     fn name(&self) -> &'static str {
         "linear"
     }
@@ -260,13 +278,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w = weights.linear_weight(self.weight);
-        let result = B::linear(inputs[0], w)?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let weight = ctx.weights.linear_weight(self.weight);
+        let result = <B as MatmulOps>::linear(&input, weight)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -293,7 +313,7 @@ pub struct LinearPairOp {
     pub out2: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LinearPairOp {
+impl<B: ContextBackend> OpNode<B> for LinearPairOp {
     fn name(&self) -> &'static str {
         "linear_pair"
     }
@@ -315,14 +335,17 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearPairOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w1 = weights.linear_weight(self.w1);
-        let w2 = weights.linear_weight(self.w2);
-        let (r1, r2) = B::linear_pair(inputs[0], w1, w2)?;
-        Ok(vec![r1, r2])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let lw1 = ctx.weights.linear_weight(self.w1);
+        let lw2 = ctx.weights.linear_weight(self.w2);
+        let (out1, out2) = <B as MatmulOps>::linear_pair(&input, lw1, lw2)?;
+        B::ctx_write(ctx, node_id, 0, out1);
+        B::ctx_write(ctx, node_id, 1, out2);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -354,7 +377,7 @@ pub struct LinearTripleOp {
     pub out3: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
+impl<B: ContextBackend> OpNode<B> for LinearTripleOp {
     fn name(&self) -> &'static str {
         "linear_triple"
     }
@@ -378,15 +401,19 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let w1 = weights.linear_weight(self.w1);
-        let w2 = weights.linear_weight(self.w2);
-        let w3 = weights.linear_weight(self.w3);
-        let (r1, r2, r3) = B::linear_triple(inputs[0], w1, w2, w3)?;
-        Ok(vec![r1, r2, r3])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let lw1 = ctx.weights.linear_weight(self.w1);
+        let lw2 = ctx.weights.linear_weight(self.w2);
+        let lw3 = ctx.weights.linear_weight(self.w3);
+        let (out1, out2, out3) = <B as MatmulOps>::linear_triple(&input, lw1, lw2, lw3)?;
+        B::ctx_write(ctx, node_id, 0, out1);
+        B::ctx_write(ctx, node_id, 1, out2);
+        B::ctx_write(ctx, node_id, 2, out3);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -403,7 +430,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for LinearTripleOp {
 #[derive(Debug)]
 pub struct MatmulOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
+impl<B: ContextBackend> OpNode<B> for MatmulOp {
     fn name(&self) -> &'static str {
         "matmul"
     }
@@ -421,12 +448,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::matmul(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as MatmulOps>::matmul(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -444,7 +474,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for MatmulOp {
 #[derive(Debug)]
 pub struct MatmulBf16F32Op;
 
-impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
+impl<B: ContextBackend + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
     fn name(&self) -> &'static str {
         "matmul_bf16_f32"
     }
@@ -462,12 +492,15 @@ impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::matmul_bf16_f32(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as MatmulExtOps>::matmul_bf16_f32(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -484,7 +517,7 @@ impl<B: Backend + MatmulOps + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
 #[derive(Debug)]
 pub struct SwigluOp;
 
-impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
+impl<B: ContextBackend + SwigluOps> OpNode<B> for SwigluOp {
     fn name(&self) -> &'static str {
         "swiglu"
     }
@@ -502,12 +535,15 @@ impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::swiglu(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let gate = B::ctx_read(ctx, inputs[0]);
+        let up = B::ctx_read(ctx, inputs[1]);
+        let result = <B as SwigluOps>::swiglu(&gate, &up)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -524,7 +560,7 @@ impl<B: Backend + MatmulOps + SwigluOps> OpNode<B> for SwigluOp {
 #[derive(Debug)]
 pub struct GegluOp;
 
-impl<B: Backend + MatmulOps + GegluOps> OpNode<B> for GegluOp {
+impl<B: ContextBackend + GegluOps> OpNode<B> for GegluOp {
     fn name(&self) -> &'static str {
         "geglu"
     }
@@ -542,12 +578,15 @@ impl<B: Backend + MatmulOps + GegluOps> OpNode<B> for GegluOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::geglu(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let gate = B::ctx_read(ctx, inputs[0]);
+        let up = B::ctx_read(ctx, inputs[1]);
+        let result = <B as GegluOps>::geglu(&gate, &up)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -565,7 +604,7 @@ impl<B: Backend + MatmulOps + GegluOps> OpNode<B> for GegluOp {
 #[derive(Debug)]
 pub struct SiluOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
+impl<B: ContextBackend> OpNode<B> for SiluOp {
     fn name(&self) -> &'static str {
         "silu"
     }
@@ -583,14 +622,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "SiluOp should be fused into SwigluOp by the optimizer; 
-             direct execution is not supported"
-        )
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as ArithOps>::silu(&input)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -605,7 +644,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
 #[derive(Debug)]
 pub struct AddOp;
 
-impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for AddOp {
     fn name(&self) -> &'static str {
         "add"
     }
@@ -623,12 +662,15 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::add(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as ArithOps>::add(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -647,7 +689,7 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddOp {
 #[derive(Debug)]
 pub struct AddInplaceOp;
 
-impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for AddInplaceOp {
     fn name(&self) -> &'static str {
         "add_inplace"
     }
@@ -665,12 +707,15 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::add(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as ArithOps>::add(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -685,7 +730,7 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for AddInplaceOp {
 #[derive(Debug)]
 pub struct MulOp;
 
-impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for MulOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for MulOp {
     fn name(&self) -> &'static str {
         "mul"
     }
@@ -703,12 +748,15 @@ impl<B: Backend + MatmulOps + ArithOps> OpNode<B> for MulOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::mul(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as ArithOps>::mul(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -730,7 +778,7 @@ pub struct ScaleOp {
     pub factor: f32,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for ScaleOp {
+impl<B: ContextBackend + ArithOps> OpNode<B> for ScaleOp {
     fn name(&self) -> &'static str {
         "scale"
     }
@@ -748,14 +796,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for ScaleOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "ScaleOp requires in-place mutation (scale_inplace); 
-             handled specially by the executor"
-        )
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let mut result = B::ctx_read(ctx, inputs[0]);
+        <B as ArithOps>::scale_inplace(&mut result, self.factor)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -777,7 +825,7 @@ pub struct BiasAddOp {
     pub bias: WeightId,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for BiasAddOp {
+impl<B: ContextBackend + BiasOps + CastOps> OpNode<B> for BiasAddOp {
     fn name(&self) -> &'static str {
         "bias_add"
     }
@@ -795,14 +843,25 @@ impl<B: Backend + MatmulOps> OpNode<B> for BiasAddOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "BiasAddOp requires in-place mutation (bias_add_inplace); 
-             handled specially by the executor"
-        )
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let mut result = B::ctx_read(ctx, inputs[0]);
+        let bias_w = ctx.weights.tensor_weight(self.bias);
+        // Cast bias to match input dtype when they differ (e.g. F32 bias
+        // loaded from a Qwen2.5 checkpoint applied to a BF16 activation).
+        // The kernel requires both operands to share the same dtype.
+        let bias_cast;
+        let bias_ref = if bias_w.dtype() == result.dtype() {
+            bias_w
+        } else {
+            bias_cast = <B as CastOps>::cast_from_f32(bias_w, result.dtype())?;
+            &bias_cast
+        };
+        <B as BiasOps>::bias_add_inplace(&mut result, bias_ref)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -822,7 +881,7 @@ pub struct RopeOp {
     pub offset: usize,
 }
 
-impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeOp {
+impl<B: ContextBackend + RopeOps> OpNode<B> for RopeOp {
     fn name(&self) -> &'static str {
         "rope"
     }
@@ -840,12 +899,16 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::apply_rope(inputs[0], inputs[1], inputs[2], self.offset)?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cos = B::ctx_read(ctx, inputs[1]);
+        let sin = B::ctx_read(ctx, inputs[2]);
+        let result = <B as RopeOps>::apply_rope(&input, &cos, &sin, self.offset)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -866,7 +929,7 @@ pub struct RopeBatchedOp {
     pub batch_size: usize,
 }
 
-impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeBatchedOp {
+impl<B: ContextBackend + RopeOps> OpNode<B> for RopeBatchedOp {
     fn name(&self) -> &'static str {
         "rope_batched"
     }
@@ -884,13 +947,86 @@ impl<B: Backend + MatmulOps + RopeOps> OpNode<B> for RopeBatchedOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cos = B::ctx_read(ctx, inputs[1]);
+        let sin = B::ctx_read(ctx, inputs[2]);
+        let positions = B::ctx_read(ctx, inputs[3]);
         let result =
-            B::apply_rope_batched(inputs[0], inputs[1], inputs[2], inputs[3], self.batch_size)?;
-        Ok(vec![result])
+            <B as RopeOps>::apply_rope_batched(&input, &cos, &sin, &positions, self.batch_size)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FusedRopePairOp
+// ---------------------------------------------------------------------------
+
+/// Fused `RoPE` for Q and K tensors sharing the same cos/sin cache.
+///
+/// Created at optimize time by [`crate::graph::optimizer::fuse_rope_pairs`]
+/// when two consecutive [`RopeOp`] nodes share identical cos/sin inputs.
+/// Produces two outputs (RoPE-applied Q and K) in a single dispatch.
+///
+/// Shape contract:
+/// - `inputs[0]` — Q tensor `(seq, num_q_heads, head_dim)`
+/// - `inputs[1]` — K tensor `(seq, num_k_heads, head_dim)`
+/// - `inputs[2]` — cos cache (shared by both)
+/// - `inputs[3]` — sin cache (shared by both)
+/// - `outputs[0]` — RoPE-applied Q (same shape as input 0)
+/// - `outputs[1]` — RoPE-applied K (same shape as input 1)
+#[derive(Debug)]
+pub struct FusedRopePairOp {
+    /// Position offset for the Q rope (first operand).
+    pub offset_a: usize,
+    /// Position offset for the K rope (second operand).
+    pub offset_b: usize,
+}
+
+impl<B: ContextBackend + RopeOps> OpNode<B> for FusedRopePairOp {
+    fn name(&self) -> &'static str {
+        "fused_rope_pair"
+    }
+    fn num_inputs(&self) -> usize {
+        4
+    }
+    fn num_outputs(&self) -> usize {
+        2
+    }
+    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![input_shapes[0].to_vec(), input_shapes[1].to_vec()]
+    }
+    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+        vec![input_dtypes[0], input_dtypes[1]]
+    }
+    fn execute(
+        &self,
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input_a = B::ctx_read(ctx, inputs[0]);
+        let input_b = B::ctx_read(ctx, inputs[1]);
+        let cos = B::ctx_read(ctx, inputs[2]);
+        let sin = B::ctx_read(ctx, inputs[3]);
+        let (out_a, out_b) = <B as RopeOps>::apply_rope_pair(
+            &input_a,
+            &input_b,
+            &cos,
+            &sin,
+            self.offset_a,
+            self.offset_b,
+        )?;
+        B::ctx_write(ctx, node_id, 0, out_a);
+        B::ctx_write(ctx, node_id, 1, out_b);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -911,7 +1047,7 @@ pub struct RopeInterleavedOp {
     pub offset: usize,
 }
 
-impl<B: Backend + MatmulOps + RopeInterleavedOps> OpNode<B> for RopeInterleavedOp {
+impl<B: ContextBackend + RopeInterleavedOps> OpNode<B> for RopeInterleavedOp {
     fn name(&self) -> &'static str {
         "rope_interleaved"
     }
@@ -929,12 +1065,17 @@ impl<B: Backend + MatmulOps + RopeInterleavedOps> OpNode<B> for RopeInterleavedO
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::apply_rope_interleaved(inputs[0], inputs[1], inputs[2], self.offset)?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cos = B::ctx_read(ctx, inputs[1]);
+        let sin = B::ctx_read(ctx, inputs[2]);
+        let result =
+            <B as RopeInterleavedOps>::apply_rope_interleaved(&input, &cos, &sin, self.offset)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -961,7 +1102,7 @@ pub struct FusedAttentionPrefillOp {
     pub sliding_window: Option<usize>,
 }
 
-impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionPrefillOp {
+impl<B: ContextBackend + AttentionOps> OpNode<B> for FusedAttentionPrefillOp {
     fn name(&self) -> &'static str {
         "fused_attention_prefill"
     }
@@ -979,20 +1120,24 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionPrefillO
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::fused_attention_prefill(
-            inputs[0],
-            inputs[1],
-            inputs[2],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let q = B::ctx_read(ctx, inputs[0]);
+        let k = B::ctx_read(ctx, inputs[1]);
+        let v = B::ctx_read(ctx, inputs[2]);
+        let result = <B as AttentionOps>::fused_attention_prefill(
+            &q,
+            &k,
+            &v,
             self.offset,
             self.scale,
             self.softcap,
             self.sliding_window,
         )?;
-        Ok(vec![result])
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1013,7 +1158,7 @@ pub struct FusedAttentionDecodeOp {
     pub softcap: Option<f32>,
 }
 
-impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionDecodeOp {
+impl<B: ContextBackend + AttentionOps> OpNode<B> for FusedAttentionDecodeOp {
     fn name(&self) -> &'static str {
         "fused_attention_decode"
     }
@@ -1031,13 +1176,17 @@ impl<B: Backend + MatmulOps + AttentionOps> OpNode<B> for FusedAttentionDecodeOp
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let q = B::ctx_read(ctx, inputs[0]);
+        let k = B::ctx_read(ctx, inputs[1]);
+        let v = B::ctx_read(ctx, inputs[2]);
         let result =
-            B::fused_attention_decode(inputs[0], inputs[1], inputs[2], None, self.softcap, None)?;
-        Ok(vec![result])
+            <B as AttentionOps>::fused_attention_decode(&q, &k, &v, None, self.softcap, None)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1071,7 +1220,7 @@ pub struct PagedAttentionDecodeOp {
     pub softcap: Option<f32>,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
+impl<B: ContextBackend> OpNode<B> for PagedAttentionDecodeOp {
     fn name(&self) -> &'static str {
         "paged_attention_decode"
     }
@@ -1094,11 +1243,34 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("PagedAttentionDecodeOp requires KV cache access; handled specially by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let q = B::ctx_read(ctx, inputs[0]);
+        let block_tables = B::ctx_read(ctx, inputs[1]);
+        let seq_lens = B::ctx_read(ctx, inputs[2]);
+        let max_blocks_per_seq = block_tables.shape()[1];
+        // max_seq_len is passed as 0 — the KvCacheAccess impl computes the
+        // real value from the seq_lens tensor, which requires backend-specific
+        // host data access (e.g. CudaTensor::to_vec).
+        let attn_out = ctx
+            .kv_cache
+            .as_mut()
+            .expect("paged_attention_decode requires a paged KV cache")
+            .paged_attention_decode(
+                self.layer_idx,
+                &q,
+                &block_tables,
+                &seq_lens,
+                self.block_size,
+                max_blocks_per_seq,
+                0, // sentinel: backend impl computes from seq_lens
+                self.softcap,
+                self.sliding_window,
+            )?;
+        B::ctx_write(ctx, node_id, 0, attn_out);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1140,11 +1312,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("AppendPagedOp requires KV cache access; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("AppendPagedOp requires paged KV cache write access — handled by executor")
     }
     fn is_side_effect(&self) -> bool {
         true
@@ -1168,7 +1340,7 @@ pub struct AppendPagedBatchedOp {
     pub layer_idx: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
+impl<B: ContextBackend> OpNode<B> for AppendPagedBatchedOp {
     fn name(&self) -> &'static str {
         "append_paged_batched"
     }
@@ -1194,11 +1366,34 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("AppendPagedBatchedOp requires KV cache access; handled specially by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let k = B::ctx_read(ctx, inputs[0]);
+        let v = B::ctx_read(ctx, inputs[1]);
+        let block_tables = B::ctx_read(ctx, inputs[2]);
+        let positions = B::ctx_read(ctx, inputs[3]);
+        let batch_size = k.shape()[0];
+        let max_blocks_per_seq = block_tables.shape()[1];
+        ctx.kv_cache
+            .as_mut()
+            .expect("append_paged_batched requires a paged KV cache")
+            .append_paged_batched(
+                self.layer_idx,
+                &k,
+                &v,
+                &block_tables,
+                &positions,
+                batch_size,
+                max_blocks_per_seq,
+            )?;
+        // Side-effect op: write a dummy tensor to keep the buffer slot non-None.
+        // The executor allocates a slot for every node output via `.max(1)`, and
+        // the subsequent `paged_attention_decode` node takes a scheduling edge
+        // on `(node_id, 0)` — the slot must be filled, but the value is ignored.
+        B::ctx_write(ctx, node_id, 0, k);
+        Ok(())
     }
     fn is_side_effect(&self) -> bool {
         true
@@ -1250,11 +1445,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for GatherPagedKvOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("GatherPagedKvOp requires KV cache access; handled specially by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!("GatherPagedKvOp requires paged KV cache read access — handled by executor")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1275,7 +1470,7 @@ pub struct ReshapeOp {
     pub shape: Vec<usize>,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for ReshapeOp {
+impl<B: ContextBackend> OpNode<B> for ReshapeOp {
     fn name(&self) -> &'static str {
         "reshape"
     }
@@ -1293,11 +1488,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for ReshapeOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("ReshapeOp is a zero-copy view; handled specially by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = input.reshape(&self.shape);
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1320,7 +1518,7 @@ pub struct SliceViewOp {
     pub shape: Vec<usize>,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
+impl<B: ContextBackend> OpNode<B> for SliceViewOp {
     fn name(&self) -> &'static str {
         "slice_view"
     }
@@ -1338,11 +1536,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("SliceViewOp is a zero-copy view; handled specially by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = input.slice_view(self.offset, &self.shape);
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1359,7 +1560,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for SliceViewOp {
 #[derive(Debug)]
 pub struct Transpose2dOp;
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for Transpose2dOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for Transpose2dOp {
     fn name(&self) -> &'static str {
         "transpose_2d"
     }
@@ -1377,12 +1578,14 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for Transpose2dOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::transpose_2d(inputs[0])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as TensorOps>::transpose_2d(&input)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1403,7 +1606,7 @@ pub struct SplitInnerDimOp {
     pub left_size: usize,
 }
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for SplitInnerDimOp {
     fn name(&self) -> &'static str {
         "split_inner_dim"
     }
@@ -1427,14 +1630,17 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let total = inputs[0].shape().last().copied().unwrap();
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let total = *input.shape().last().unwrap();
         let right_size = total - self.left_size;
-        let (left, right) = B::split_inner_dim(inputs[0], self.left_size, right_size)?;
-        Ok(vec![left, right])
+        let (left, right) = <B as TensorOps>::split_inner_dim(&input, self.left_size, right_size)?;
+        B::ctx_write(ctx, node_id, 0, left);
+        B::ctx_write(ctx, node_id, 1, right);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1452,7 +1658,7 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for SplitInnerDimOp {
 #[derive(Debug)]
 pub struct ConcatInnerDimOp;
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for ConcatInnerDimOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for ConcatInnerDimOp {
     fn name(&self) -> &'static str {
         "concat_inner_dim"
     }
@@ -1472,12 +1678,15 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for ConcatInnerDimOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::concat_inner_dim(inputs[0], inputs[1])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as TensorOps>::concat_inner_dim(&a, &b)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1496,7 +1705,7 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for ConcatInnerDimOp {
 #[derive(Debug)]
 pub struct ConcatSeqOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for ConcatSeqOp {
+impl<B: ContextBackend> OpNode<B> for ConcatSeqOp {
     fn name(&self) -> &'static str {
         "concat_seq"
     }
@@ -1516,11 +1725,36 @@ impl<B: Backend + MatmulOps> OpNode<B> for ConcatSeqOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("ConcatSeqOp requires backend-specific concat; handled by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        // KV cache path: if this is a KV sequence concat, delegate to the
+        // cache's append logic and store the full updated cache tensor.
+        if ctx
+            .kv_cache
+            .as_ref()
+            .is_some_and(|kv| kv.cache_concat_info(node_id).is_some())
+        {
+            let new_row = B::ctx_read(ctx, inputs[1]);
+            // NOTE: do NOT call ctx_write here. The arena slot was allocated
+            // for the initial kv_len (typically 1 token), but the accumulated
+            // KV tensor grows each step. Writing it to the arena would overflow
+            // the slot and corrupt adjacent tensor data. try_append_kv already
+            // stores the full updated cache in the KvCache's overrides map,
+            // where downstream ctx_read calls will find it.
+            ctx.kv_cache
+                .as_mut()
+                .and_then(|kv| kv.try_append_kv(node_id, &new_row))
+                .expect("cache_concat_info returned Some but try_append_kv returned None");
+            return Ok(());
+        }
+        // Plain concat path.
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as TensorOps>::concat_rows(&[a, b])?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1541,7 +1775,7 @@ pub struct RepeatKvOp {
     pub num_repeats: usize,
 }
 
-impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for RepeatKvOp {
+impl<B: ContextBackend + TensorOps> OpNode<B> for RepeatKvOp {
     fn name(&self) -> &'static str {
         "repeat_kv"
     }
@@ -1560,12 +1794,14 @@ impl<B: Backend + MatmulOps + TensorOps> OpNode<B> for RepeatKvOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::repeat_kv(inputs[0], self.num_repeats)?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as TensorOps>::repeat_kv(&input, self.num_repeats)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1586,7 +1822,7 @@ pub struct ExtractLastRowOp {
     pub seq_len: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
+impl<B: ContextBackend> OpNode<B> for ExtractLastRowOp {
     fn name(&self) -> &'static str {
         "extract_last_row"
     }
@@ -1604,11 +1840,17 @@ impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("ExtractLastRowOp is a zero-copy view; handled specially by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let cols = input.shape()[1];
+        let offset = (self.seq_len - 1) * cols;
+        let out_shape = vec![1, cols];
+        let result = input.slice_view(offset, &out_shape);
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1623,7 +1865,7 @@ impl<B: Backend + MatmulOps> OpNode<B> for ExtractLastRowOp {
 #[derive(Debug)]
 pub struct CastToF32Op;
 
-impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastToF32Op {
+impl<B: ContextBackend + CastOps> OpNode<B> for CastToF32Op {
     fn name(&self) -> &'static str {
         "cast_to_f32"
     }
@@ -1641,12 +1883,14 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastToF32Op {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::cast_to_f32(inputs[0])?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as CastOps>::cast_to_f32(&input)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1664,7 +1908,7 @@ pub struct CastFromF32Op {
     pub target: DType,
 }
 
-impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastFromF32Op {
+impl<B: ContextBackend + CastOps> OpNode<B> for CastFromF32Op {
     fn name(&self) -> &'static str {
         "cast_from_f32"
     }
@@ -1682,12 +1926,14 @@ impl<B: Backend + MatmulOps + CastOps> OpNode<B> for CastFromF32Op {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let result = B::cast_from_f32(inputs[0], self.target)?;
-        Ok(vec![result])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as CastOps>::cast_from_f32(&input, self.target)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1715,7 +1961,7 @@ pub struct MoeDispatchSoftmaxOp {
     pub norm_topk: bool,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSoftmaxOp {
+impl<B: ContextBackend> OpNode<B> for MoeDispatchSoftmaxOp {
     fn name(&self) -> &'static str {
         "moe_dispatch_softmax"
     }
@@ -1733,14 +1979,36 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSoftmaxOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "MoeDispatchSoftmaxOp requires closure-based expert dispatch; 
-             handled by the executor"
-        )
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let hidden = B::ctx_read(ctx, inputs[0]);
+        let gate = ctx.weights.tensor_weight(self.gate);
+        let num_experts = self.experts.len();
+        let expert_ids = &self.experts;
+        // Extract weights reference before closure to avoid borrowing ctx mutably
+        // while the closure holds an immutable borrow. `&WeightStore` is Copy.
+        let weights = ctx.weights;
+        let result = <B as MoeOps>::moe_forward_softmax(
+            &hidden,
+            gate,
+            num_experts,
+            self.num_experts_per_tok,
+            self.norm_topk,
+            |expert_idx, expert_input| {
+                let eids = &expert_ids[expert_idx];
+                let gate_w = weights.linear_weight(eids.gate_proj);
+                let up_w = weights.linear_weight(eids.up_proj);
+                let down_w = weights.linear_weight(eids.down_proj);
+                let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
+                let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
+                let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                <B as MatmulOps>::linear(&activated, down_w)
+            },
+        )?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1777,7 +2045,7 @@ pub struct MoeDispatchSigmoidOp {
     pub routed_scaling_factor: f32,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSigmoidOp {
+impl<B: ContextBackend> OpNode<B> for MoeDispatchSigmoidOp {
     fn name(&self) -> &'static str {
         "moe_dispatch_sigmoid"
     }
@@ -1795,14 +2063,57 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSigmoidOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "MoeDispatchSigmoidOp requires closure-based expert dispatch; \
-             handled by the executor"
-        )
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let hidden = B::ctx_read(ctx, inputs[0]);
+        let gate = ctx.weights.tensor_weight(self.gate);
+        let bias_data: Vec<f32> = if let Some(bias_id) = self.bias {
+            B::to_f32_vec(ctx.weights.tensor_weight(bias_id))?
+        } else {
+            vec![0.0_f32; self.experts.len()]
+        };
+        let num_experts = self.experts.len();
+        let expert_ids = &self.experts;
+        let shared_ids = self.shared_expert.clone();
+        // Extract weights reference before closure to avoid borrowing ctx mutably
+        // while the closure holds an immutable borrow. `&WeightStore` is Copy.
+        let weights = ctx.weights;
+        let mut result = <B as MoeSigmoidOps>::moe_forward_sigmoid(
+            &hidden,
+            gate,
+            &bias_data,
+            num_experts,
+            self.num_experts_per_tok,
+            self.n_group,
+            self.topk_group,
+            false, // DeepSeek normalises inside the kernel
+            self.routed_scaling_factor,
+            |expert_idx, expert_input| {
+                let eids = &expert_ids[expert_idx];
+                let gate_w = weights.linear_weight(eids.gate_proj);
+                let up_w = weights.linear_weight(eids.up_proj);
+                let down_w = weights.linear_weight(eids.down_proj);
+                let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
+                let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
+                let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                <B as MatmulOps>::linear(&activated, down_w)
+            },
+        )?;
+        // Add shared expert output if present (DeepSeek shared expert).
+        if let Some(sids) = shared_ids {
+            let sg = weights.linear_weight(sids.gate_proj);
+            let su = weights.linear_weight(sids.up_proj);
+            let sd = weights.linear_weight(sids.down_proj);
+            let sgate = <B as MatmulOps>::linear(&hidden, sg)?;
+            let sup_out = <B as MatmulOps>::linear(&hidden, su)?;
+            let sact = <B as SwigluOps>::swiglu(&sgate, &sup_out)?;
+            let shared_out = <B as MatmulOps>::linear(&sact, sd)?;
+            <B as ArithOps>::add_inplace(&mut result, &shared_out)?;
+        }
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1838,11 +2149,13 @@ impl<B: Backend + MatmulOps> OpNode<B> for AllReduceSumOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("AllReduceSumOp requires communicator access; handled by the executor")
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!(
+            "AllReduceSumOp requires multi-device NCCL communicator — handled by executor"
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1868,7 +2181,7 @@ pub struct LmHeadOp {
     pub vocab_size: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LmHeadOp {
+impl<B: ContextBackend> OpNode<B> for LmHeadOp {
     fn name(&self) -> &'static str {
         "lm_head"
     }
@@ -1886,11 +2199,15 @@ impl<B: Backend + MatmulOps> OpNode<B> for LmHeadOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!("LmHeadOp requires dtype-dependent dispatch; handled by the executor")
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let weight = ctx.weights.linear_weight(self.weight);
+        let result = <B as MatmulOps>::linear(&input, weight)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1936,13 +2253,12 @@ impl<B: Backend + MatmulOps> OpNode<B> for EmbeddingGatherIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "EmbeddingGatherIndirectOp must be executed by the CUDA indirect executor; \
-             it reads the token ID from a stable GPU device pointer (SeqPosition)"
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!(
+            "EmbeddingGatherIndirectOp requires SeqPosition GPU pointer — handled by CUDA graph executor"
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -1995,13 +2311,12 @@ impl<B: Backend + MatmulOps> OpNode<B> for RopeIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "RopeIndirectOp must be executed by the CUDA indirect executor; \
-             it reads the sequence position from a stable GPU device pointer (SeqPosition)"
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!(
+            "RopeIndirectOp requires SeqPosition GPU pointer — handled by CUDA graph executor"
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -2058,13 +2373,12 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendKvIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "AppendKvIndirectOp must be executed by the CUDA indirect executor; \
-             it writes into pre-allocated GPU KV cache buffers via SeqPosition"
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!(
+            "AppendKvIndirectOp requires KV cache device buffer access — handled by CUDA graph executor"
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -2122,13 +2436,12 @@ impl<B: Backend + MatmulOps> OpNode<B> for FusedAttentionDecodeIndirectOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "FusedAttentionDecodeIndirectOp must be executed by the CUDA indirect executor; \
-             it reads the total sequence length from a stable GPU device pointer (SeqPosition)"
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!(
+            "FusedAttentionDecodeIndirectOp requires stable KV cache device buffers — handled by CUDA graph executor"
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -2170,13 +2483,12 @@ impl<B: Backend + MatmulOps> OpNode<B> for ArgmaxLastOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "ArgmaxLastOp must be dispatched by the CUDA executor via argmax_last_gpu; \
-             it cannot be executed through the generic OpNode::execute path"
+        _ctx: &mut ExecuteContext<'_, B>,
+        _node_id: NodeId,
+        _inputs: &[OutputRef],
+    ) -> Result<()> {
+        unimplemented!(
+            "ArgmaxLastOp must use argmax_last_gpu kernel — handled by CUDA graph executor"
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -2210,7 +2522,7 @@ pub struct RmsNormQkOp {
     pub eps: f32,
 }
 
-impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormQkOp {
+impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormQkOp {
     fn name(&self) -> &'static str {
         "rms_norm_qk"
     }
@@ -2229,21 +2541,19 @@ impl<B: Backend + MatmulOps + NormOps> OpNode<B> for RmsNormQkOp {
     }
     fn execute(
         &self,
-        inputs: &[&B::Tensor],
-        weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        let q_w = weights.tensor_weight(self.q_weight);
-        let k_w = weights.tensor_weight(self.k_weight);
-        // Apply rms_norm independently to Q and K; the backend treats the
-        // leading dimensions as a batch (each head is one row).
-        let q_normed = B::rms_norm(inputs[0], q_w, self.eps)?;
-        let k_normed = B::rms_norm(inputs[1], k_w, self.eps)?;
-        // Silence unused `device` lint — the trait requires the parameter even
-        // though the default dispatch delegates to `B::rms_norm` which
-        // accepts tensors directly.
-        let _ = device;
-        Ok(vec![q_normed, k_normed])
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let q = B::ctx_read(ctx, inputs[0]);
+        let k = B::ctx_read(ctx, inputs[1]);
+        let q_weight = ctx.weights.tensor_weight(self.q_weight).clone();
+        let k_weight = ctx.weights.tensor_weight(self.k_weight).clone();
+        let q_normed = <B as NormOps>::rms_norm(&q, &q_weight, self.eps)?;
+        let k_normed = <B as NormOps>::rms_norm(&k, &k_weight, self.eps)?;
+        B::ctx_write(ctx, node_id, 0, q_normed);
+        B::ctx_write(ctx, node_id, 1, k_normed);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2269,7 +2579,7 @@ pub struct LogitSoftcapOp {
     pub cap: f32,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
+impl<B: ContextBackend> OpNode<B> for LogitSoftcapOp {
     fn name(&self) -> &'static str {
         "logit_softcap"
     }
@@ -2287,14 +2597,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "LogitSoftcapOp must be dispatched by the executor; \
-             the generic OpNode::execute path is not supported"
-        )
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as ArithOps>::logit_softcap(&input, self.cap)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2363,7 +2673,7 @@ pub struct MlaAttentionOp {
     pub layer_idx: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for MlaAttentionOp {
+impl<B: crate::backend::ContextBackend + MatmulOps> OpNode<B> for MlaAttentionOp {
     fn name(&self) -> &'static str {
         "mla_attention"
     }
@@ -2382,14 +2692,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for MlaAttentionOp {
     }
     fn execute(
         &self,
-        _inputs: &[&B::Tensor],
-        _weights: &WeightStore<B::Tensor, <B as MatmulOps>::LinearWeight>,
-        _device: &B::DeviceHandle,
-    ) -> Result<Vec<B::Tensor>> {
-        panic!(
-            "MlaAttentionOp requires KV cache + runtime state access; \
-             must be dispatched by the executor"
-        )
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        B::ctx_execute_mla(self, ctx, node_id, inputs)
     }
     fn as_any(&self) -> &dyn Any {
         self

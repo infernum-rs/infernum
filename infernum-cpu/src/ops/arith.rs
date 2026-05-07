@@ -40,4 +40,16 @@ impl ArithOps for CpuBackend {
         simd::vec_scale(a_data, scale);
         Ok(())
     }
+
+    fn silu(input: &CpuTensor) -> Result<CpuTensor> {
+        let data = input.as_f32_slice();
+        let out: Vec<f32> = data.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+        Ok(CpuTensor::from_f32(input.shape(), &out))
+    }
+
+    fn logit_softcap(input: &CpuTensor, cap: f32) -> Result<CpuTensor> {
+        let data = input.as_f32_slice();
+        let out: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
+        Ok(CpuTensor::from_f32(input.shape(), &out))
+    }
 }

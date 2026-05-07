@@ -82,6 +82,17 @@ pub trait Backend: 'static {
     /// contents.
     type RuntimeState: RuntimeStateInit;
 
+    /// Per-execution state threaded through `ExecuteContext`.
+    ///
+    /// For `CpuBackend` this is the flat byte `Arena` that holds all
+    /// intermediate activations. For `CudaBackend` (where tensors are
+    /// heap-allocated and tracked in a `HashMap`) this is `()`.
+    ///
+    /// Ops receive `&mut B::ExecutorState` through `ExecuteContext` so they
+    /// can read/write their tensor outputs without knowing the concrete
+    /// storage strategy.
+    type ExecutorState: Send + 'static;
+
     /// Backend-specific logits type returned by forward passes.
     /// Must implement the `Logits` trait so the engine can sample from it.
     type Logits: Logits;
@@ -243,6 +254,12 @@ pub trait ArithOps: Backend {
 
     /// In-place scalar scaling: `a *= scale`.
     fn scale_inplace(a: &mut Self::Tensor, scale: f32) -> Result<()>;
+
+    /// Element-wise SiLU activation: `x * sigmoid(x)`.
+    fn silu(input: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Element-wise logit soft-cap: `tanh(x / cap) * cap`.
+    fn logit_softcap(input: &Self::Tensor, cap: f32) -> Result<Self::Tensor>;
 }
 
 /// Matrix multiplication and linear layers.
@@ -494,6 +511,24 @@ pub trait RopeOps: Backend {
         positions: &Self::Tensor,
         batch_size: usize,
     ) -> Result<Self::Tensor>;
+
+    /// Apply RoPE to two tensors (Q and K) sharing the same cos/sin cache.
+    ///
+    /// Backends that support a fused parallel dispatch (e.g. the CPU thread
+    /// pool) should override this method. The default implementation falls
+    /// back to two sequential [`apply_rope`](Self::apply_rope) calls.
+    fn apply_rope_pair(
+        input_a: &Self::Tensor,
+        input_b: &Self::Tensor,
+        cos_cache: &Self::Tensor,
+        sin_cache: &Self::Tensor,
+        offset_a: usize,
+        offset_b: usize,
+    ) -> Result<(Self::Tensor, Self::Tensor)> {
+        let a = Self::apply_rope(input_a, cos_cache, sin_cache, offset_a)?;
+        let b = Self::apply_rope(input_b, cos_cache, sin_cache, offset_b)?;
+        Ok((a, b))
+    }
 }
 
 /// Rotary positional embedding (interleaved layout, used by DeepSeek).
@@ -809,4 +844,69 @@ pub trait MultiDeviceOps: Backend {
         world_size: usize,
         comm_id: Self::CommId,
     ) -> Result<Self::Comm>;
+}
+
+/// Backend-specific tensor I/O for the executor context.
+///
+/// Implements read/write/next_input through the [`ExecuteContext`] for each
+/// backend. The generic [`OpNode::execute`](crate::graph::OpNode::execute)
+/// bodies call these static methods so that context interaction is
+/// backend-dispatched without requiring inherent impls on the foreign
+/// `ExecuteContext` type (which would violate Rust's orphan rules).
+///
+/// [`ExecuteContext`]: crate::graph::execute_context::ExecuteContext
+pub trait ContextBackend:
+    Backend
+    + ArithOps
+    + MatmulOps
+    + TensorOps
+    + TensorDataOps
+    + MoeOps
+    + MoeSigmoidOps
+    + SwigluOps
+    + Sized
+{
+    /// Read a tensor produced by a prior node in the graph.
+    ///
+    /// Checks backend-specific caches (e.g., KV overrides on CPU) before
+    /// falling back to the primary storage (arena on CPU, tensor map on CUDA).
+    fn ctx_read(
+        ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,
+        output_ref: crate::graph::OutputRef,
+    ) -> Self::Tensor;
+
+    /// Write an op's output tensor into the context.
+    fn ctx_write(
+        ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        node_id: crate::graph::NodeId,
+        idx: u32,
+        tensor: Self::Tensor,
+    );
+
+    /// Consume the next graph input tensor, advancing the input cursor.
+    fn ctx_next_input(
+        ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+    ) -> Self::Tensor;
+
+    /// Execute an [`MlaAttentionOp`] using backend-specific MLA KV cache state.
+    ///
+    /// The default implementation panics — only backends that support MLA
+    /// (currently only CUDA) override this.  Called by
+    /// [`MlaAttentionOp::execute`](crate::graph::builtin_ops::MlaAttentionOp).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the MLA attention kernel fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics on backends that do not implement MLA attention.
+    fn ctx_execute_mla(
+        _op: &crate::graph::builtin_ops::MlaAttentionOp,
+        _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        _node_id: crate::graph::NodeId,
+        _inputs: &[crate::graph::OutputRef],
+    ) -> crate::error::Result<()> {
+        unimplemented!("MlaAttentionOp is not supported on this backend")
+    }
 }

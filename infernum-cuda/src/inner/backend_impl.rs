@@ -6,7 +6,7 @@ use infernum::backend::{
     RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };
 use infernum::block_allocator::{BlockConfig, BlockTable};
-use infernum::{DType, Result};
+use infernum::{DType, Result, Tensor};
 
 use crate::cuda::ops;
 use crate::cuda::ops::LinearWeight;
@@ -23,6 +23,7 @@ impl Backend for CudaBackend {
     type PagedKvCache = crate::cuda::PagedKvCache;
     type KvCache = crate::cuda::KvCache;
     type RuntimeState = CudaRuntimeState;
+    type ExecutorState = crate::inner::execute_context::CudaExecutorState;
     type Logits = CudaLogits;
 
     #[cfg(feature = "nccl")]
@@ -99,6 +100,14 @@ impl ArithOps for CudaBackend {
 
     fn scale_inplace(a: &mut CudaTensor, scale: f32) -> Result<()> {
         ops::scale_inplace(a, scale)
+    }
+
+    fn silu(input: &CudaTensor) -> Result<CudaTensor> {
+        ops::silu(input)
+    }
+
+    fn logit_softcap(input: &CudaTensor, cap: f32) -> Result<CudaTensor> {
+        ops::logit_softcap(input, cap)
     }
 }
 
@@ -195,11 +204,28 @@ impl MatmulExtOps for CudaBackend {
 
 impl NormOps for CudaBackend {
     fn rms_norm(input: &CudaTensor, weight: &CudaTensor, eps: f32) -> Result<CudaTensor> {
-        ops::rms_norm(input, weight, eps)
+        // Some weights (e.g. Qwen3 per-head QK-norm) are stored as F32 in the
+        // checkpoint while activations are BF16.  The CUDA rmsnorm kernels
+        // require both tensors to share the same dtype, so cast when they differ.
+        let weight_cast;
+        let weight_ref = if weight.dtype() == input.dtype() {
+            weight
+        } else {
+            weight_cast = ops::cast_from_f32(weight, input.dtype())?;
+            &weight_cast
+        };
+        ops::rms_norm(input, weight_ref, eps)
     }
 
     fn rms_norm_inplace(input: &mut CudaTensor, weight: &CudaTensor, eps: f32) -> Result<()> {
-        ops::rms_norm_inplace(input, weight, eps)
+        let weight_cast;
+        let weight_ref = if weight.dtype() == input.dtype() {
+            weight
+        } else {
+            weight_cast = ops::cast_from_f32(weight, input.dtype())?;
+            &weight_cast
+        };
+        ops::rms_norm_inplace(input, weight_ref, eps)
     }
 
     fn add_rmsnorm(
@@ -208,7 +234,14 @@ impl NormOps for CudaBackend {
         weight: &CudaTensor,
         eps: f32,
     ) -> Result<(CudaTensor, CudaTensor)> {
-        ops::add_rmsnorm(residual, input, weight, eps)
+        let weight_cast;
+        let weight_ref = if weight.dtype() == input.dtype() {
+            weight
+        } else {
+            weight_cast = ops::cast_from_f32(weight, input.dtype())?;
+            &weight_cast
+        };
+        ops::add_rmsnorm(residual, input, weight_ref, eps)
     }
 }
 
@@ -352,7 +385,23 @@ impl RopeOps for CudaBackend {
         sin_cache: &CudaTensor,
         position_offset: usize,
     ) -> Result<CudaTensor> {
-        ops::apply_rope(input, cos_cache, sin_cache, position_offset)
+        // RoPE caches are stored as F32 but the activation tensor may be BF16
+        // or F16. Cast cos/sin to match the input dtype before dispatching.
+        let cos_cast;
+        let cos_ref = if cos_cache.dtype() == input.dtype() {
+            cos_cache
+        } else {
+            cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
+            &cos_cast
+        };
+        let sin_cast;
+        let sin_ref = if sin_cache.dtype() == input.dtype() {
+            sin_cache
+        } else {
+            sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
+            &sin_cast
+        };
+        ops::apply_rope(input, cos_ref, sin_ref, position_offset)
     }
 
     fn apply_rope_batched(
@@ -362,11 +411,24 @@ impl RopeOps for CudaBackend {
         positions: &CudaTensor,
         batch_size: usize,
     ) -> Result<CudaTensor> {
-        // The tensor holds i32 positions; apply_rope_batched_indirect
-        // reads them from the GPU via CudaSlice<i32>. Since I32 and i32
-        // are bit-identical and cudarc passes raw device pointers, we
-        // can pass the CudaView<u8> directly to the kernel.
-        ops::apply_rope_batched_from_tensor(input, cos_cache, sin_cache, positions, batch_size)
+        // RoPE caches are stored as F32 but the activation tensor may be BF16
+        // or F16. Cast cos/sin to match the input dtype before dispatching.
+        // The positions tensor holds i32 values and is passed as-is.
+        let cos_cast;
+        let cos_ref = if cos_cache.dtype() == input.dtype() {
+            cos_cache
+        } else {
+            cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
+            &cos_cast
+        };
+        let sin_cast;
+        let sin_ref = if sin_cache.dtype() == input.dtype() {
+            sin_cache
+        } else {
+            sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
+            &sin_cast
+        };
+        ops::apply_rope_batched_from_tensor(input, cos_ref, sin_ref, positions, batch_size)
     }
 }
 
@@ -572,9 +634,12 @@ impl MoeOps for CudaBackend {
     where
         F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
     {
+        // gate_weight is (num_experts, hidden_size) in checkpoint layout;
+        // moe_forward expects (hidden_size, num_experts) for hidden @ gate matmul.
+        let gate_t = crate::cuda::ops::transpose_2d(gate_weight)?;
         crate::cuda::moe::moe_forward(
             hidden,
-            gate_weight,
+            &gate_t,
             num_experts,
             num_experts_per_tok,
             norm_topk_prob,
@@ -599,9 +664,12 @@ impl MoeSigmoidOps for CudaBackend {
     where
         F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
     {
+        // gate_weight is (num_experts, hidden_size) in checkpoint layout;
+        // moe_forward_sigmoid expects (hidden_size, num_experts) for the routing matmul.
+        let gate_t = crate::cuda::ops::transpose_2d(gate_weight)?;
         crate::cuda::moe::moe_forward_sigmoid(
             hidden,
-            gate_weight,
+            &gate_t,
             e_score_correction_bias,
             num_experts,
             num_experts_per_tok,

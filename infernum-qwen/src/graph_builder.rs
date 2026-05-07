@@ -11,8 +11,8 @@
 //! - `SafeTensors` weight loading on the CPU backend
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, EmbedOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps,
-    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, MatmulOps, MoeOps,
+    MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
@@ -148,9 +148,11 @@ pub struct ModelWeightIds {
 pub trait QwenGraphOps:
     Backend
     + MatmulOps
+    + ContextBackend
     + NormOps
     + ArithOps
     + BiasOps
+    + CastOps
     + EmbedOps
     + TensorOps
     + RopeOps
@@ -164,9 +166,11 @@ pub trait QwenGraphOps:
 impl<B> QwenGraphOps for B where
     B: Backend
         + MatmulOps
+        + ContextBackend
         + NormOps
         + ArithOps
         + BiasOps
+        + CastOps
         + EmbedOps
         + TensorOps
         + RopeOps
@@ -195,7 +199,7 @@ fn is_moe_layer(config: &QwenConfig, layer_idx: usize) -> bool {
 /// Registration order must be identical across prefill and decode graphs so
 /// that the same [`WeightStore`] can be shared between them.
 #[allow(clippy::too_many_lines)]
-fn register_weights<B: Backend + MatmulOps>(
+fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &QwenConfig,
     weight_dtype: DType,
@@ -1008,6 +1012,7 @@ mod tests {
 
     impl infernum::backend::Backend for TestBackend {
         type Tensor = DummyTensor;
+        type ExecutorState = ();
         type DeviceHandle = ();
         type PagedKvCache = ();
         type KvCache = ();
@@ -1103,6 +1108,12 @@ mod tests {
         }
         fn scale_inplace(_a: &mut DummyTensor, _scale: f32) -> infernum::Result<()> {
             Ok(())
+        }
+        fn silu(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn logit_softcap(_input: &DummyTensor, _cap: f32) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
         }
     }
 
@@ -1215,6 +1226,18 @@ mod tests {
         }
     }
 
+    impl infernum::backend::CastOps for TestBackend {
+        fn cast_to_f32(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn cast_from_f32(
+            _input: &DummyTensor,
+            _target: infernum::dtype::DType,
+        ) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     impl infernum::backend::MoeOps for TestBackend {
         fn moe_forward_softmax<F>(
             _hidden: &DummyTensor,
@@ -1314,6 +1337,36 @@ mod tests {
             _block_table: &infernum::block_allocator::BlockTable,
         ) -> infernum::Result<(DummyTensor, DummyTensor)> {
             Ok((DummyTensor, DummyTensor))
+        }
+    }
+
+    impl infernum::backend::TensorDataOps for TestBackend {
+        fn to_f32_vec(_tensor: &DummyTensor) -> infernum::Result<Vec<f32>> {
+            unimplemented!()
+        }
+        fn to_raw_bytes(_tensor: &DummyTensor) -> infernum::Result<Vec<u8>> {
+            unimplemented!()
+        }
+    }
+
+    impl infernum::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: infernum::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: infernum::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
         }
     }
 

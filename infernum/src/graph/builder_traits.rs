@@ -6,9 +6,9 @@
 //! by the op's `output_shapes()` method.
 
 use crate::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
-    MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, GegluOps,
+    MatmulExtOps, MatmulOps, MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps,
+    PagedKvCacheOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
 
@@ -40,7 +40,7 @@ pub trait GraphEmbedOps {
     fn add_embedding_gather(&mut self, table: WeightId, token_ids: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + EmbedOps> GraphEmbedOps for Graph<B> {
+impl<B: Backend + MatmulOps + EmbedOps + ContextBackend> GraphEmbedOps for Graph<B> {
     fn add_embedding_gather(&mut self, table: WeightId, token_ids: OutputRef) -> OutputRef {
         let embed_dim = self.tensor_weight_meta(table).shape[1];
         let dtype = self.tensor_weight_meta(table).dtype;
@@ -91,7 +91,7 @@ pub trait GraphNormOps {
     ) -> (OutputRef, OutputRef);
 }
 
-impl<B: Backend + MatmulOps + NormOps> GraphNormOps for Graph<B> {
+impl<B: Backend + MatmulOps + NormOps + ContextBackend> GraphNormOps for Graph<B> {
     fn add_rms_norm(&mut self, input: OutputRef, weight: WeightId, eps: f32) -> OutputRef {
         let node_id = self.add_node(Box::new(RmsNormOp { weight, eps }), &[input]);
         (node_id, 0)
@@ -140,7 +140,7 @@ pub trait GraphSoftcapOps {
     fn add_logit_softcap(&mut self, input: OutputRef, cap: f32) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps> GraphSoftcapOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend> GraphSoftcapOps for Graph<B> {
     fn add_logit_softcap(&mut self, input: OutputRef, cap: f32) -> OutputRef {
         let node_id = self.add_node(Box::new(LogitSoftcapOp { cap }), &[input]);
         (node_id, 0)
@@ -184,7 +184,7 @@ pub trait GraphMatmulOps {
     fn add_matmul(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps> GraphMatmulOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend> GraphMatmulOps for Graph<B> {
     fn add_linear(&mut self, input: OutputRef, weight: WeightId) -> OutputRef {
         let out_features = self.linear_weight_meta(weight).shape[0];
         let node_id = self.add_node(
@@ -251,7 +251,7 @@ pub trait GraphMatmulExtOps {
     fn add_matmul_bf16_f32(&mut self, a: OutputRef, b: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + MatmulExtOps> GraphMatmulExtOps for Graph<B> {
+impl<B: Backend + MatmulOps + MatmulExtOps + ContextBackend> GraphMatmulExtOps for Graph<B> {
     fn add_matmul_bf16_f32(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
         let node_id = self.add_node(Box::new(MatmulBf16F32Op), &[a, b]);
         (node_id, 0)
@@ -277,7 +277,7 @@ pub trait GraphArithOps {
     fn add_scale(&mut self, input: OutputRef, factor: f32) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + ArithOps> GraphArithOps for Graph<B> {
+impl<B: Backend + MatmulOps + ArithOps + ContextBackend> GraphArithOps for Graph<B> {
     fn add_add(&mut self, a: OutputRef, b: OutputRef) -> OutputRef {
         let node_id = self.add_node(Box::new(AddOp), &[a, b]);
         (node_id, 0)
@@ -309,7 +309,7 @@ pub trait GraphBiasOps {
     fn add_bias_add(&mut self, input: OutputRef, bias: WeightId) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + BiasOps> GraphBiasOps for Graph<B> {
+impl<B: Backend + MatmulOps + BiasOps + CastOps + ContextBackend> GraphBiasOps for Graph<B> {
     fn add_bias_add(&mut self, input: OutputRef, bias: WeightId) -> OutputRef {
         let node_id = self.add_node(Box::new(BiasAddOp { bias }), &[input]);
         (node_id, 0)
@@ -326,7 +326,7 @@ pub trait GraphSwigluOps {
     fn add_swiglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + SwigluOps> GraphSwigluOps for Graph<B> {
+impl<B: Backend + MatmulOps + SwigluOps + ContextBackend> GraphSwigluOps for Graph<B> {
     fn add_swiglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef {
         let node_id = self.add_node(Box::new(SwigluOp), &[gate, up]);
         (node_id, 0)
@@ -343,7 +343,7 @@ pub trait GraphGegluOps {
     fn add_geglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + GegluOps> GraphGegluOps for Graph<B> {
+impl<B: Backend + MatmulOps + GegluOps + ContextBackend> GraphGegluOps for Graph<B> {
     fn add_geglu(&mut self, gate: OutputRef, up: OutputRef) -> OutputRef {
         let node_id = self.add_node(Box::new(GegluOp), &[gate, up]);
         (node_id, 0)
@@ -360,7 +360,7 @@ pub trait GraphSiluOps {
     fn add_silu(&mut self, input: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps> GraphSiluOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend> GraphSiluOps for Graph<B> {
     fn add_silu(&mut self, input: OutputRef) -> OutputRef {
         let node_id = self.add_node(Box::new(SiluOp), &[input]);
         (node_id, 0)
@@ -380,7 +380,7 @@ pub trait GraphCastOps {
     fn add_cast_from_f32(&mut self, input: OutputRef, target: DType) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + CastOps> GraphCastOps for Graph<B> {
+impl<B: Backend + MatmulOps + CastOps + ContextBackend> GraphCastOps for Graph<B> {
     fn add_cast_to_f32(&mut self, input: OutputRef) -> OutputRef {
         let node_id = self.add_node(Box::new(CastToF32Op), &[input]);
         (node_id, 0)
@@ -419,7 +419,7 @@ pub trait GraphRopeOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + RopeOps> GraphRopeOps for Graph<B> {
+impl<B: Backend + MatmulOps + RopeOps + ContextBackend> GraphRopeOps for Graph<B> {
     fn add_rope(
         &mut self,
         input: OutputRef,
@@ -463,7 +463,9 @@ pub trait GraphRopeInterleavedOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + RopeInterleavedOps> GraphRopeInterleavedOps for Graph<B> {
+impl<B: Backend + MatmulOps + RopeInterleavedOps + ContextBackend> GraphRopeInterleavedOps
+    for Graph<B>
+{
     fn add_rope_interleaved(
         &mut self,
         input: OutputRef,
@@ -505,7 +507,7 @@ pub trait GraphAttentionOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + AttentionOps> GraphAttentionOps for Graph<B> {
+impl<B: Backend + MatmulOps + AttentionOps + ContextBackend> GraphAttentionOps for Graph<B> {
     fn add_fused_attention_prefill(
         &mut self,
         q: OutputRef,
@@ -572,7 +574,9 @@ pub trait GraphPagedAttentionOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + PagedAttentionOps> GraphPagedAttentionOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend + PagedAttentionOps> GraphPagedAttentionOps
+    for Graph<B>
+{
     fn add_paged_attention_decode(
         &mut self,
         q: OutputRef,
@@ -649,7 +653,7 @@ pub trait GraphPagedKvCacheOps {
     ) -> (OutputRef, OutputRef);
 }
 
-impl<B: Backend + MatmulOps + PagedKvCacheOps> GraphPagedKvCacheOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend + PagedKvCacheOps> GraphPagedKvCacheOps for Graph<B> {
     fn add_append_paged(
         &mut self,
         k: OutputRef,
@@ -738,7 +742,7 @@ pub trait GraphTensorOps {
     fn add_transpose_2d(&mut self, input: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + TensorOps> GraphTensorOps for Graph<B> {
+impl<B: Backend + MatmulOps + TensorOps + ContextBackend> GraphTensorOps for Graph<B> {
     fn add_reshape(&mut self, input: OutputRef, shape: &[usize]) -> OutputRef {
         let node_id = self.add_node(
             Box::new(ReshapeOp {
@@ -871,7 +875,7 @@ pub trait GraphIndirectDecodeOps {
     fn add_argmax_last(&mut self, logits: OutputRef) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps> GraphIndirectDecodeOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend> GraphIndirectDecodeOps for Graph<B> {
     fn add_embedding_gather_indirect(
         &mut self,
         table: WeightId,
@@ -1019,7 +1023,7 @@ pub trait GraphMoeOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + MoeOps + MoeSigmoidOps> GraphMoeOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend + MoeOps + MoeSigmoidOps> GraphMoeOps for Graph<B> {
     fn add_moe_dispatch_softmax(
         &mut self,
         input: OutputRef,
@@ -1105,7 +1109,7 @@ pub trait GraphMlaAttentionOps {
     ) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + MlaAttentionOps> GraphMlaAttentionOps for Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend + MlaAttentionOps> GraphMlaAttentionOps for Graph<B> {
     #[allow(clippy::similar_names)]
     fn add_mla_attention(
         &mut self,
@@ -1158,7 +1162,7 @@ impl<B: Backend + MatmulOps + MlaAttentionOps> GraphMlaAttentionOps for Graph<B>
 // LM Head — always available (unconditional on Graph<B>)
 // ---------------------------------------------------------------------------
 
-impl<B: Backend + MatmulOps> Graph<B> {
+impl<B: Backend + MatmulOps + ContextBackend> Graph<B> {
     /// Add an LM head projection: `hidden → logits`.
     ///
     /// Output shape: `(seq_len, vocab_size)` where `vocab_size` comes

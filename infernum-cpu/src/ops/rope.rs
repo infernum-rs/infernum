@@ -203,6 +203,61 @@ impl RopeOps for CpuBackend {
         Ok(CpuTensor::from_f32_vec(shape, out))
     }
 
+    fn apply_rope_pair(
+        input_a: &CpuTensor,
+        input_b: &CpuTensor,
+        cos_cache: &CpuTensor,
+        sin_cache: &CpuTensor,
+        offset_a: usize,
+        offset_b: usize,
+    ) -> Result<(CpuTensor, CpuTensor)> {
+        use infernum::DType;
+        // Fast path: all tensors are F32 — use the parallel fused kernel.
+        if input_a.dtype() == DType::F32
+            && input_b.dtype() == DType::F32
+            && cos_cache.dtype() == DType::F32
+            && sin_cache.dtype() == DType::F32
+        {
+            let shape_a = input_a.shape();
+            let shape_b = input_b.shape();
+            let cos_data = cos_cache.as_f32_slice();
+            let sin_data = sin_cache.as_f32_slice();
+            let inp_a = input_a.as_f32_slice();
+            let inp_b = input_b.as_f32_slice();
+            let mut out_a = vec![0.0f32; inp_a.len()];
+            let mut out_b = vec![0.0f32; inp_b.len()];
+            let op_a = RopeOperand {
+                inp_ptr: inp_a.as_ptr() as usize,
+                out_ptr: out_a.as_mut_ptr() as usize,
+                seq_len: shape_a[0],
+                num_heads: shape_a[1],
+                head_dim: shape_a[2],
+                offset: offset_a,
+            };
+            let op_b = RopeOperand {
+                inp_ptr: inp_b.as_ptr() as usize,
+                out_ptr: out_b.as_mut_ptr() as usize,
+                seq_len: shape_b[0],
+                num_heads: shape_b[1],
+                head_dim: shape_b[2],
+                offset: offset_b,
+            };
+            // Safety: `out_a` and `out_b` are freshly allocated and disjoint
+            // from each other and from the input slices.
+            unsafe {
+                apply_rope_pair_slices(&op_a, &op_b, cos_data, sin_data);
+            }
+            return Ok((
+                CpuTensor::from_f32_vec(shape_a, out_a),
+                CpuTensor::from_f32_vec(shape_b, out_b),
+            ));
+        }
+        // Slow path: dtype conversion needed — fall back to two sequential calls.
+        let a = <Self as RopeOps>::apply_rope(input_a, cos_cache, sin_cache, offset_a)?;
+        let b = <Self as RopeOps>::apply_rope(input_b, cos_cache, sin_cache, offset_b)?;
+        Ok((a, b))
+    }
+
     fn apply_rope_batched(
         input: &CpuTensor,
         cos_cache: &CpuTensor,

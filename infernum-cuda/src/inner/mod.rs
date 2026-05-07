@@ -4,6 +4,7 @@ pub mod cuda_graph_engine;
 pub mod cuda_logits;
 pub mod cuda_runtime_state;
 mod error;
+pub mod execute_context;
 pub mod executor;
 pub mod graph_engine;
 pub mod model;
@@ -13,6 +14,7 @@ pub use backend_impl::CudaBackend;
 pub use cuda_graph_engine::*;
 pub use cuda_logits::CudaLogits;
 pub use cuda_runtime_state::CudaRuntimeState;
+pub use execute_context::CudaExecutorState;
 pub use graph_engine::CudaDecodeEngine;
 
 pub use cuda::ops::LinearWeight;
