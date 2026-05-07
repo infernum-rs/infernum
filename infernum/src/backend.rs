@@ -846,10 +846,6 @@ pub trait MultiDeviceOps: Backend {
     ) -> Result<Self::Comm>;
 }
 
-/// Backend-specific tensor I/O for the executor context.
-///
-/// Implements read/write/next_input through the [`ExecuteContext`] for each
-/// backend. The generic [`OpNode::execute`](crate::graph::OpNode::execute)
 // ---------------------------------------------------------------------------
 // ArgmaxLastOps
 // ---------------------------------------------------------------------------

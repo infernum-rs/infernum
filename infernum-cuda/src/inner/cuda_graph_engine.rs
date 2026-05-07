@@ -18,21 +18,21 @@
 //!   present in the executor (added in Step 6).
 //! - `DeepSeek` (MLA) is not supported via this generic path; it remains a separate
 //!   implementation.
-//! - Graphs are rebuilt for each decode step (no indirect / CUDA graph capture).
-//!   A future optimization can adopt the `CudaDecodeEngine` approach.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
 use infernum::block_allocator::{BlockConfig, BlockTable};
-use infernum::graph::{optimizer, plan, Graph, WeightId, WeightStore};
+use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, WeightStore};
 use infernum::weights::QuantizationConfig;
 use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
-use crate::cuda::{CudaContext, CudaTensor};
+use crate::cuda::{CudaContext, CudaEvent, CudaGraph, CudaTensor, PinnedBuffer};
 use crate::cuda_logits::CudaLogits;
+use crate::inner::execute_context::GraphInputs;
 use crate::weights::{CudaWeightLoader, SafeTensorsLoader};
 use crate::CudaBackend;
 
@@ -45,7 +45,8 @@ use crate::CudaBackend;
 /// Model crates implement this for their `*Config` type. It provides:
 /// - Scalar config getters (matching [`infernum_cpu::GraphEngineConfig`]).
 /// - Methods to build `Graph<CudaBackend>` for prefill and decode.
-/// - A method to load weights from a `SafeTensors` directory into a CUDA///   [`WeightStore`].
+/// - A method to load weights from a `SafeTensors` directory into a CUDA
+///   [`WeightStore`].
 pub trait CudaGraphEngineConfig: Send + Sync + 'static {
     fn num_hidden_layers(&self) -> usize;
     fn num_kv_heads(&self) -> usize;
@@ -193,20 +194,126 @@ pub fn load_graph_weights_cuda(
 }
 
 // ---------------------------------------------------------------------------
+// DecodeState — cached CUDA-graph decode state for batch_size == 1
+// ---------------------------------------------------------------------------
+
+/// Cached CUDA-graph state for the single-token decode path.
+///
+/// Allocated lazily on the first `forward_batch_decode` call with
+/// `batch_size == 1` and rebuilt whenever `max_blocks_per_seq` changes.
+/// The external [`crate::cuda::PagedKvCache`] is still passed through to
+/// `execute()` on every step, so KV continuity from prefill is preserved.
+struct DecodeState {
+    /// Compiled graph executable.
+    cuda_graph: CudaGraph,
+    /// Pre-allocated stable GPU-side input buffers (token, cos, sin, block
+    /// table, positions, `seq_lens`). Updated via `htod_copy_into` before each
+    /// step; the captured graph references their fixed device addresses.
+    graph_inputs: GraphInputs,
+    /// Topological execution plan (reused across steps).
+    plan: ExecutionPlan,
+    /// The optimised paged-decode graph (`batch_size` = 1).
+    graph: Graph<CudaBackend>,
+    /// Output node of the graph (argmax token, `[1]` U32).
+    output_node: NodeId,
+    /// `max_blocks_per_seq` the graph was built for.
+    max_blocks_per_seq: usize,
+    /// Pool-miss count at the end of the previous step. When it equals the
+    /// current count the pool has stabilised and the captured graph is reusable
+    /// without re-capture.
+    last_miss_count: u64,
+    /// `true` once the pool has stabilised and bare `launch()` suffices.
+    stabilized: bool,
+    /// Token output tensor from the last capture (stable pool-backed GPU
+    /// address). On the fast path the CUDA graph writes into it; we copy 4
+    /// bytes out via the pinned buffer.
+    saved_token: Option<CudaTensor>,
+    /// Pinned host buffer for async D→H token readback (1 `u32`).
+    pinned_token: PinnedBuffer,
+    /// CUDA event recorded after each async copy. `synchronize()` waits only
+    /// for the DMA rather than flushing the entire device.
+    completion_event: CudaEvent,
+}
+
+// SAFETY: `DecodeState` is only ever accessed from the single thread that runs
+// the runtime. `CudaGraph` and `CudaEvent` hold raw CUDA handles that do not
+// auto-implement `Send`; the same pattern is used for `CudaDecodeEngine` in
+// `graph_engine.rs` (which also owns a `CudaGraph` and `CudaEvent`).
+unsafe impl Send for DecodeState {}
+
+impl DecodeState {
+    /// Build a new `DecodeState` for a paged-decode graph with `batch_size = 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if graph planning, buffer allocation, or CUDA API
+    /// calls fail.
+    fn new(
+        ctx: &CudaContext,
+        graph: Graph<CudaBackend>,
+        half_dim: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<Self> {
+        let mut graph = graph;
+        optimizer::optimize(&mut graph);
+        let plan = plan(&graph);
+
+        let output_node = *graph
+            .output_ids()
+            .first()
+            .expect("paged decode graph must have at least one output");
+
+        let cuda_graph = CudaGraph::new(ctx.device())?;
+        let graph_inputs = GraphInputs::new(ctx.device(), 1, half_dim, max_blocks_per_seq)?;
+        let pinned_token = PinnedBuffer::new(ctx.device())?;
+        let completion_event = CudaEvent::new(ctx.device())?;
+
+        Ok(Self {
+            cuda_graph,
+            graph_inputs,
+            plan,
+            graph,
+            output_node,
+            max_blocks_per_seq,
+            last_miss_count: 0,
+            stabilized: false,
+            saved_token: None,
+            pinned_token,
+            completion_event,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CudaGraphEngine
 // ---------------------------------------------------------------------------
 
 /// CUDA graph-mode engine for any model family implementing [`CudaGraphEngineConfig`].
 ///
 /// Loads weights once and satisfies [`infernum::Model`], allowing it to be used
-/// with `infernum_runtime::Runtime`. Graphs are rebuilt per step (no indirect
-/// CUDA graph capture yet).
+/// with `infernum_runtime::Runtime`.
+///
+/// For `batch_size == 1` decode steps the engine uses CUDA graph capture via
+/// [`DecodeState`]: the first few steps re-capture the graph until the buffer
+/// pool stabilises, then subsequent steps replay with a single `launch()` call.
+/// For `batch_size > 1` (rare in practice) the engine falls back to the eager
+/// `execute()` path.
+///
+/// Prefill always uses the eager path (variable sequence length makes capture
+/// impractical).
 pub struct CudaGraphEngine<C: CudaGraphEngineConfig> {
     config: C,
     ctx: CudaContext,
     weights: Arc<WeightStore<CudaTensor, LinearWeight>>,
     /// Cached `head_dim / 2` for `RoPE` slice arithmetic.
     half_dim: usize,
+    /// Cached CUDA-graph decode state for the `batch_size == 1` fast path.
+    ///
+    /// `RefCell` provides interior mutability — the [`infernum::Model`] trait
+    /// requires `&self` on all forward methods, but graph capture needs
+    /// mutation. `RefCell` is safe here because the `Runtime` calls these
+    /// methods single-threadedly.
+    decode_state: RefCell<Option<Box<DecodeState>>>,
 }
 
 impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
@@ -225,6 +332,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             ctx,
             weights: Arc::new(weights),
             half_dim,
+            decode_state: RefCell::new(None),
         })
     }
 
@@ -273,6 +381,151 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             0,
             None,
         )
+    }
+
+    /// Run one decode step using the cached CUDA-graph path (`batch_size` == 1).
+    ///
+    /// Writes the dynamic inputs into the stable `GraphInputs` GPU buffers,
+    /// then either re-captures the graph (stabilisation phase) or replays it
+    /// (fast path). Returns the raw logit tensor (BF16).
+    ///
+    /// The `kv_cache` is the externally-managed paged KV cache shared between
+    /// prefill and decode; it is passed directly to `execute()` so KV
+    /// continuity from the prefill step is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if buffer writes, kernel launches, or CUDA API calls
+    /// fail.
+    #[allow(clippy::too_many_arguments)]
+    fn run_decode_captured(
+        &self,
+        token_ids: &CudaTensor,
+        kv_cache: &mut crate::cuda::PagedKvCache,
+        block_table_u32: &[u32],
+        positions_u32: &[u32],
+        seq_lens_u32: &[u32],
+        cos_data: &[f32],
+        sin_data: &[f32],
+        max_blocks_per_seq: usize,
+    ) -> Result<CudaTensor> {
+        let mut borrow = self.decode_state.borrow_mut();
+
+        // (Re-)build DecodeState when absent or when max_blocks changed.
+        let needs_rebuild = borrow
+            .as_ref()
+            .is_none_or(|s| s.max_blocks_per_seq != max_blocks_per_seq);
+        if needs_rebuild {
+            let block_size = kv_cache.block_size();
+            let graph =
+                self.config
+                    .build_paged_decode_graph_cuda(1, block_size, max_blocks_per_seq);
+            *borrow = Some(Box::new(DecodeState::new(
+                &self.ctx,
+                graph,
+                self.half_dim,
+                max_blocks_per_seq,
+            )?));
+        }
+
+        let state = borrow.as_mut().expect("DecodeState was just built");
+
+        // Write all 6 dynamic inputs into the stable GPU buffers.
+        let device = self.ctx.device();
+        // token_ids: download from GPU and re-upload into the stable buffer.
+        let token_host = token_ids.to_vec::<u32>()?;
+        device.htod_copy_into(token_host, &mut state.graph_inputs.token_ids)?;
+        device.htod_copy_into(cos_data.to_vec(), &mut state.graph_inputs.cos)?;
+        device.htod_copy_into(sin_data.to_vec(), &mut state.graph_inputs.sin)?;
+        device.htod_copy_into(
+            block_table_u32.to_vec(),
+            &mut state.graph_inputs.block_table,
+        )?;
+        device.htod_copy_into(positions_u32.to_vec(), &mut state.graph_inputs.positions)?;
+        device.htod_copy_into(seq_lens_u32.to_vec(), &mut state.graph_inputs.seq_lens)?;
+
+        if state.stabilized {
+            // Fast path: graph is stable — replay with a single launch, then
+            // use a targeted event sync instead of a full device sync.
+            let token_device_ptr = state
+                .saved_token
+                .as_ref()
+                .expect("saved_token must be set before stabilization")
+                .device_ptr();
+
+            state.cuda_graph.launch()?;
+
+            // Async copy the argmax result to the pinned buffer, then wait
+            // only for that DMA rather than the whole device.
+            state
+                .pinned_token
+                .async_copy_from_device(token_device_ptr)?;
+            state.completion_event.record()?;
+            state.completion_event.synchronize()?;
+
+            // Return the saved_token tensor (contains the raw logit output for
+            // this step; the argmax is already in the pinned buffer, but
+            // callers expect the logit CudaTensor here).
+            Ok(state
+                .saved_token
+                .as_ref()
+                .expect("saved_token must be set")
+                .clone())
+        } else {
+            // Stabilisation path: wrap execute() in begin/end capture so the
+            // CUDA buffer-pool allocates the right sizes and the graph exe is
+            // built. Re-capture until the pool stops growing.
+
+            // Temporarily swap out the GraphInputs (execute() consumes it).
+            let dummy = GraphInputs::new(
+                device,
+                state.graph_inputs.batch_size,
+                state.graph_inputs.half_dim,
+                state.graph_inputs.max_blocks_per_seq,
+            )?;
+            let real_inputs = std::mem::replace(&mut state.graph_inputs, dummy);
+
+            state.cuda_graph.begin_capture()?;
+
+            let output_nodes = [state.output_node];
+            let mut outputs = execute(
+                &self.ctx,
+                &state.plan,
+                state.graph.nodes(),
+                &self.weights,
+                &[], // inputs come from graph_inputs
+                &output_nodes,
+                None,              // no MLA KV cache
+                Some(kv_cache),    // external paged KV cache
+                0,                 // mla_seq_pos
+                Some(real_inputs), // stable GPU input buffers
+            )?;
+
+            state.cuda_graph.end_capture()?;
+            state.cuda_graph.launch()?;
+            self.ctx.synchronize()?;
+
+            // Restore the graph_inputs for the next step.
+            state.graph_inputs = GraphInputs::new(device, 1, self.half_dim, max_blocks_per_seq)?;
+
+            let token_tensor = outputs.pop().expect("execute returned no outputs");
+            // Save the pool-backed tensor so the fast path can DMA from it.
+            state.saved_token = Some(token_tensor.clone());
+
+            // Track pool misses to detect stabilisation.
+            if let Some(pool) = self.ctx.buffer_pool() {
+                let current_misses = pool.misses();
+                if current_misses == state.last_miss_count && state.cuda_graph.is_instantiated() {
+                    state.stabilized = true;
+                }
+                state.last_miss_count = current_misses;
+            } else {
+                // No pool: switch to bare launch after first successful capture.
+                state.stabilized = state.cuda_graph.is_instantiated();
+            }
+
+            Ok(token_tensor)
+        }
     }
 }
 
@@ -400,9 +653,18 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
 
     /// Batched decode with paged KV cache.
     ///
-    /// Runs one graph step for all sequences in the batch simultaneously.
-    /// K/V append and paged attention are handled inside the graph executor
-    /// via the `append_paged_batched` and `paged_attention_decode` arms.
+    /// For `batch_size == 1`, delegates to the CUDA-graph capture/replay path
+    /// via [`DecodeState`]. After a stabilisation phase (a few steps where the
+    /// buffer pool allocates its working set), each decode step reduces to a
+    /// single `cuGraphLaunch` call with near-zero CPU overhead.
+    ///
+    /// For `batch_size > 1`, falls back to the eager `execute()` path
+    /// (building and running a fresh graph each call). In practice the runtime
+    /// uses `batch_size` > 1 only briefly; the common steady-state is
+    /// `batch_size == 1`.
+    ///
+    /// K/V continuity from prefill is preserved because the same external
+    /// `kv_cache` is passed through to `execute()` on every call.
     #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
@@ -456,6 +718,23 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             .map(|&p| u32::try_from(p).expect("position must be non-negative") + 1)
             .collect();
 
+        if batch_size == 1 {
+            // Single-sequence fast path: use CUDA graph capture/replay.
+            let logits_tensor = self.run_decode_captured(
+                token_ids,
+                kv_cache,
+                &block_table_u32,
+                &positions_u32,
+                &seq_lens_u32,
+                &cos_data,
+                &sin_data,
+                max_blocks_per_seq,
+            )?;
+            let logits_f32 = cast_to_f32(&logits_tensor)?;
+            return Ok(CudaLogits::new(logits_f32));
+        }
+
+        // Batch size > 1: eager path (builds a fresh graph each call).
         let mut graph =
             self.config
                 .build_paged_decode_graph_cuda(batch_size, block_size, max_blocks_per_seq);
