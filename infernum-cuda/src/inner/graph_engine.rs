@@ -97,6 +97,10 @@ pub struct CudaDecodeEngine {
     last_miss_count: u64,
     /// `true` once the graph no longer changes between steps.
     stabilized: bool,
+    /// `true` when the graph contains ops incompatible with CUDA graph capture
+    /// (e.g. `MoE` routing requires D→H sync copies). When set, capture is
+    /// permanently skipped and every step runs eagerly.
+    capture_unsafe: bool,
     /// Index of the graph output node (argmax token, `U32` `[1]`).
     output_node: NodeId,
     /// The token tensor (`[1]` `U32`) from the last captured execute. Its GPU
@@ -151,10 +155,10 @@ impl CudaDecodeEngine {
         let ep = plan(&graph);
 
         // MoE models require D→H sync copies during routing (logits → host top-K).
-        // D→H sync copies are forbidden during CUDA graph capture (they invalidate
-        // the capture stream on T4 and generally). Skip capture entirely for MoE
-        // models by pre-stabilizing: the engine will always run eagerly.
-        let moe_skip_capture = graph.has_moe_ops();
+        // D→H sync copies are illegal inside a CUDA stream capture window on T4
+        // (`CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 0`). Skip capture
+        // entirely for MoE models — the engine will always run eagerly.
+        let capture_unsafe = graph.has_moe_ops();
 
         // Locate the single output node (argmax token).
         let output_node = *graph
@@ -184,7 +188,8 @@ impl CudaDecodeEngine {
             rope_theta,
             head_dim,
             last_miss_count: 0,
-            stabilized: moe_skip_capture,
+            stabilized: false,
+            capture_unsafe,
             output_node,
             saved_token: None,
             pinned_token,
@@ -326,7 +331,9 @@ impl CudaDecodeEngine {
             )?;
             let real_inputs = std::mem::replace(&mut self.graph_inputs, dummy);
 
-            self.cuda_graph.begin_capture()?;
+            if !self.capture_unsafe {
+                self.cuda_graph.begin_capture()?;
+            }
 
             let output_nodes = [self.output_node];
             let (mut outputs, returned_inputs) = super::executor::execute(
@@ -342,8 +349,10 @@ impl CudaDecodeEngine {
                 Some(real_inputs),              // stable GPU input buffers
             )?;
 
-            self.cuda_graph.end_capture()?;
-            self.cuda_graph.launch()?;
+            if !self.capture_unsafe {
+                self.cuda_graph.end_capture()?;
+                self.cuda_graph.launch()?;
+            }
             self.ctx.synchronize()?;
 
             // Restore graph_inputs from the value returned by execute().
@@ -359,15 +368,19 @@ impl CudaDecodeEngine {
             self.saved_token = Some(token_tensor);
 
             // Track pool misses to detect stabilization.
-            if let Some(pool) = self.ctx.buffer_pool() {
-                let current_misses = pool.misses();
-                if current_misses == self.last_miss_count && self.cuda_graph.is_instantiated() {
-                    self.stabilized = true;
+            // Capture-unsafe models (e.g. MoE) never stabilise — they always
+            // run eagerly without a CUDA graph.
+            if !self.capture_unsafe {
+                if let Some(pool) = self.ctx.buffer_pool() {
+                    let current_misses = pool.misses();
+                    if current_misses == self.last_miss_count && self.cuda_graph.is_instantiated() {
+                        self.stabilized = true;
+                    }
+                    self.last_miss_count = current_misses;
+                } else {
+                    // No pool: switch to bare launch after first successful capture.
+                    self.stabilized = self.cuda_graph.is_instantiated();
                 }
-                self.last_miss_count = current_misses;
-            } else {
-                // No pool: switch to bare launch after first successful capture.
-                self.stabilized = self.cuda_graph.is_instantiated();
             }
 
             Ok(result[0])

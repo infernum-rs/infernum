@@ -224,6 +224,11 @@ struct DecodeState {
     last_miss_count: u64,
     /// `true` once the pool has stabilised and bare `launch()` suffices.
     stabilized: bool,
+    /// `true` when the graph contains ops that are incompatible with CUDA
+    /// graph capture (e.g. `MoE` routing requires a D→H sync copy for
+    /// host-side top-K selection). When set, `begin_capture`/`end_capture`
+    /// are never called and the engine always runs eagerly.
+    capture_unsafe: bool,
     /// Token output tensor from the last capture (stable pool-backed GPU
     /// address). On the fast path the CUDA graph writes into it; we copy 4
     /// bytes out via the pinned buffer.
@@ -255,6 +260,12 @@ impl DecodeState {
         max_blocks_per_seq: usize,
     ) -> Result<Self> {
         let mut graph = graph;
+        // Check for MoE ops before the optimizer consumes the graph.
+        // MoE routing (`moe_route`) calls `logits_to_f32_host` (a D→H sync
+        // copy) which is illegal inside a CUDA stream capture window on T4
+        // (`CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 0`). For these
+        // models we skip capture entirely and always run eagerly.
+        let capture_unsafe = graph.has_moe_ops();
         optimizer::optimize(&mut graph);
         let plan = plan(&graph);
 
@@ -278,6 +289,7 @@ impl DecodeState {
             max_blocks_per_seq,
             last_miss_count: 0,
             stabilized: false,
+            capture_unsafe,
             saved_token: None,
             pinned_token,
             completion_event,
@@ -485,6 +497,10 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             // Stabilisation path: wrap execute() in begin/end capture so the
             // CUDA buffer-pool allocates the right sizes and the graph exe is
             // built. Re-capture until the pool stops growing.
+            //
+            // Exception: capture-unsafe models (e.g. MoE) perform D→H sync
+            // copies during routing which are illegal inside a capture window.
+            // For these we skip capture entirely and run eagerly every step.
 
             // Temporarily swap out the GraphInputs (execute() consumes it).
             let dummy = GraphInputs::new(
@@ -496,7 +512,9 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             )?;
             let real_inputs = std::mem::replace(&mut state.graph_inputs, dummy);
 
-            state.cuda_graph.begin_capture()?;
+            if !state.capture_unsafe {
+                state.cuda_graph.begin_capture()?;
+            }
 
             let output_nodes = [state.output_node];
             let (mut outputs, returned_inputs) = execute(
@@ -512,8 +530,10 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 Some(real_inputs), // stable GPU input buffers
             )?;
 
-            state.cuda_graph.end_capture()?;
-            state.cuda_graph.launch()?;
+            if !state.capture_unsafe {
+                state.cuda_graph.end_capture()?;
+                state.cuda_graph.launch()?;
+            }
             self.ctx.synchronize()?;
 
             // Restore graph_inputs from the value returned by execute().
@@ -530,15 +550,20 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             state.saved_token = Some(token_tensor.clone());
 
             // Track pool misses to detect stabilisation.
-            if let Some(pool) = self.ctx.buffer_pool() {
-                let current_misses = pool.misses();
-                if current_misses == state.last_miss_count && state.cuda_graph.is_instantiated() {
-                    state.stabilized = true;
+            // Capture-unsafe models (e.g. MoE) never stabilise — they always
+            // run eagerly without a CUDA graph.
+            if !state.capture_unsafe {
+                if let Some(pool) = self.ctx.buffer_pool() {
+                    let current_misses = pool.misses();
+                    if current_misses == state.last_miss_count && state.cuda_graph.is_instantiated()
+                    {
+                        state.stabilized = true;
+                    }
+                    state.last_miss_count = current_misses;
+                } else {
+                    // No pool: switch to bare launch after first successful capture.
+                    state.stabilized = state.cuda_graph.is_instantiated();
                 }
-                state.last_miss_count = current_misses;
-            } else {
-                // No pool: switch to bare launch after first successful capture.
-                state.stabilized = state.cuda_graph.is_instantiated();
             }
 
             Ok(token_tensor)
