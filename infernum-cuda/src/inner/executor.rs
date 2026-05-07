@@ -19,21 +19,16 @@
 //! fallback lets external crates add new ops without modifying infernum.
 
 use infernum::backend::{
-    ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
-    MlaAttentionOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps, SwigluOps,
-    TensorOps,
+    ArithOps, MatmulOps, MlaAttentionOps, MoeOps, MoeSigmoidOps, SwigluOps, TensorOps,
 };
 use infernum::graph::builtin_ops::{
-    AddRmsNormOp, AppendKvIndirectOp, AppendPagedBatchedOp, ArgmaxLastOp, BiasAddOp, CastFromF32Op,
-    EmbeddingGatherIndirectOp, EmbeddingGatherOp, ExtractLastRowOp, FusedAttentionDecodeIndirectOp,
-    FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
-    LmHeadOp, LogitSoftcapOp, MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp,
-    PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
-    RopeInterleavedOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    AppendKvIndirectOp, AppendPagedBatchedOp, ArgmaxLastOp, EmbeddingGatherIndirectOp,
+    FusedAttentionDecodeIndirectOp, MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp,
+    PagedAttentionDecodeOp, RopeIndirectOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
-use infernum::{DType, ExecutionPlan, NodeId, Result};
+use infernum::{ExecutionPlan, NodeId, Result};
 
 use crate::cuda::ops;
 use crate::cuda::ops::LinearWeight;
@@ -126,52 +121,6 @@ pub fn execute(
                 let tensor = inputs[input_idx].clone();
                 input_idx += 1;
                 store(&mut buffers, node_id, 0, tensor);
-            }
-
-            "rope_batched" => {
-                let op = node.op.as_any().downcast_ref::<RopeBatchedOp>().unwrap();
-                let input = read(&buffers, node.inputs[0]);
-                let cos_cache = read(&buffers, node.inputs[1]);
-                let sin_cache = read(&buffers, node.inputs[2]);
-                let positions = read(&buffers, node.inputs[3]);
-                // Cast cos/sin to match activation dtype (same reason as "rope" arm).
-                let cos_cast;
-                let cos_ref = if cos_cache.dtype() == input.dtype() {
-                    cos_cache
-                } else {
-                    cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
-                    &cos_cast
-                };
-                let sin_cast;
-                let sin_ref = if sin_cache.dtype() == input.dtype() {
-                    sin_cache
-                } else {
-                    sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
-                    &sin_cast
-                };
-                let result = <CudaBackend as RopeOps>::apply_rope_batched(
-                    input,
-                    cos_ref,
-                    sin_ref,
-                    positions,
-                    op.batch_size,
-                )?;
-                store(&mut buffers, node_id, 0, result);
-            }
-
-            "rope_interleaved" => {
-                let op = node
-                    .op
-                    .as_any()
-                    .downcast_ref::<RopeInterleavedOp>()
-                    .unwrap();
-                let input = read(&buffers, node.inputs[0]);
-                let cos_cache = read(&buffers, node.inputs[1]);
-                let sin_cache = read(&buffers, node.inputs[2]);
-                let result = <CudaBackend as RopeInterleavedOps>::apply_rope_interleaved(
-                    input, cos_cache, sin_cache, op.offset,
-                )?;
-                store(&mut buffers, node_id, 0, result);
             }
 
             "concat_seq" => {
@@ -273,33 +222,6 @@ pub fn execute(
                     let shared_out = <CudaBackend as MatmulOps>::linear(&sact, sd)?;
                     <CudaBackend as ArithOps>::add_inplace(&mut result, &shared_out)?;
                 }
-                store(&mut buffers, node_id, 0, result);
-            }
-
-            // --- Logit soft-cap: tanh(x / cap) * cap (Gemma 2 final logit) ---
-            "logit_softcap" => {
-                // TODO: dedicated CUDA tanh kernel for better throughput.
-                // For now: cast to F32 → download → CPU loop → upload. Logits
-                // are small ([seq_len, vocab_size]) so this is not on the hot path.
-                let op = node.op.as_any().downcast_ref::<LogitSoftcapOp>().unwrap();
-                let input = read(&buffers, node.inputs[0]);
-                let ctx = input.context().clone();
-                // Use the runtime shape from the input, not the statically declared
-                // output shape — graphs with dynamic seq_len (0 placeholder) would
-                // produce the wrong shape here.
-                let shape = input.shape().to_vec();
-                // Cast to F32 if needed (input may be BF16/F16 for BF16 models).
-                let f32_input;
-                let input_f32 = if input.dtype() == DType::F32 {
-                    input
-                } else {
-                    f32_input = ops::cast_to_f32(input)?;
-                    &f32_input
-                };
-                let cap = op.cap;
-                let host: Vec<f32> = input_f32.to_vec::<f32>()?;
-                let softcapped: Vec<f32> = host.iter().map(|&x| (x / cap).tanh() * cap).collect();
-                let result = CudaTensor::from_slice::<f32>(&ctx, &shape, &softcapped)?;
                 store(&mut buffers, node_id, 0, result);
             }
 
@@ -606,35 +528,11 @@ pub fn execute_indirect(
                 store(&mut buffers, node_id, 0, result);
             }
 
-            // --- LM head (panics in OpNode::execute, needs explicit dispatch) ---
-            "lm_head" => {
-                let op = node.op.as_any().downcast_ref::<LmHeadOp>().unwrap();
-                let input = read(&buffers, node.inputs[0]).clone();
-                let w = weights.linear_weight(op.weight);
-                let result = <CudaBackend as MatmulOps>::linear(&input, w)?;
-                store(&mut buffers, node_id, 0, result);
-            }
-
             // --- Device-side argmax (avoids D→H sync inside the graph) ---
             "argmax_last" => {
                 let _op = node.op.as_any().downcast_ref::<ArgmaxLastOp>().unwrap();
                 let input = read(&buffers, node.inputs[0]).clone();
                 let result = ops::argmax_last_tensor(&input)?;
-                store(&mut buffers, node_id, 0, result);
-            }
-
-            // --- Zero-copy view ops (cannot use OpNode::execute) ---
-            "reshape" => {
-                let op = node.op.as_any().downcast_ref::<ReshapeOp>().unwrap();
-                let input = read(&buffers, node.inputs[0]).clone();
-                let result = input.reshape(&op.shape);
-                store(&mut buffers, node_id, 0, result);
-            }
-
-            "slice_view" => {
-                let op = node.op.as_any().downcast_ref::<SliceViewOp>().unwrap();
-                let input = read(&buffers, node.inputs[0]).clone();
-                let result = input.slice_view(op.offset, &op.shape);
                 store(&mut buffers, node_id, 0, result);
             }
 

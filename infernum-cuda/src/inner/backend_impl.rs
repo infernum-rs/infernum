@@ -6,7 +6,7 @@ use infernum::backend::{
     RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };
 use infernum::block_allocator::{BlockConfig, BlockTable};
-use infernum::{DType, Result};
+use infernum::{DType, Result, Tensor};
 
 use crate::cuda::ops;
 use crate::cuda::ops::LinearWeight;
@@ -387,11 +387,24 @@ impl RopeOps for CudaBackend {
         positions: &CudaTensor,
         batch_size: usize,
     ) -> Result<CudaTensor> {
-        // The tensor holds i32 positions; apply_rope_batched_indirect
-        // reads them from the GPU via CudaSlice<i32>. Since I32 and i32
-        // are bit-identical and cudarc passes raw device pointers, we
-        // can pass the CudaView<u8> directly to the kernel.
-        ops::apply_rope_batched_from_tensor(input, cos_cache, sin_cache, positions, batch_size)
+        // RoPE caches are stored as F32 but the activation tensor may be BF16
+        // or F16. Cast cos/sin to match the input dtype before dispatching.
+        // The positions tensor holds i32 values and is passed as-is.
+        let cos_cast;
+        let cos_ref = if cos_cache.dtype() == input.dtype() {
+            cos_cache
+        } else {
+            cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
+            &cos_cast
+        };
+        let sin_cast;
+        let sin_ref = if sin_cache.dtype() == input.dtype() {
+            sin_cache
+        } else {
+            sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
+            &sin_cast
+        };
+        ops::apply_rope_batched_from_tensor(input, cos_ref, sin_ref, positions, batch_size)
     }
 }
 
