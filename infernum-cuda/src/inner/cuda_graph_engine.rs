@@ -370,7 +370,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let inputs = vec![input_ids_t, cos_t, sin_t];
 
         let output_nodes = graph.output_ids().to_vec();
-        execute(
+        let (outputs, _) = execute(
             &self.ctx,
             &ep,
             graph.nodes(),
@@ -381,7 +381,8 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             None,
             0,
             None,
-        )
+        )?;
+        Ok(outputs)
     }
 
     /// Run one decode step using the cached CUDA-graph path (`batch_size` == 1).
@@ -498,7 +499,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             state.cuda_graph.begin_capture()?;
 
             let output_nodes = [state.output_node];
-            let mut outputs = execute(
+            let (mut outputs, returned_inputs) = execute(
                 &self.ctx,
                 &state.plan,
                 state.graph.nodes(),
@@ -512,6 +513,9 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             )?;
 
             state.cuda_graph.end_capture()?;
+            // Drop returned_inputs after end_capture() so cuMemFree is not called
+            // inside the capture window (which would cause CUDA_ERROR_INVALID_VALUE).
+            drop(returned_inputs);
             state.cuda_graph.launch()?;
             self.ctx.synchronize()?;
 
@@ -642,7 +646,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 seq_len_t,
             ];
             let output_nodes = graph.output_ids().to_vec();
-            let outputs = execute(
+            let (outputs, _) = execute(
                 &self.ctx,
                 &ep,
                 graph.nodes(),
@@ -771,7 +775,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             seq_lens_t,
         ];
         let output_nodes = graph.output_ids().to_vec();
-        let outputs = execute(
+        let (outputs, _) = execute(
             &self.ctx,
             &ep,
             graph.nodes(),

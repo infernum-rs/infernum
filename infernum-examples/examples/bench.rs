@@ -403,7 +403,7 @@ fn bench_graph(
 
     // Warm-up run
     {
-        let outputs = executor::execute(
+        let (outputs, _) = executor::execute(
             ctx,
             &exec_plan,
             graph.nodes(),
@@ -427,7 +427,7 @@ fn bench_graph(
     for iter in 0..n_iters {
         ctx.synchronize()?;
         let start = Instant::now();
-        let _outputs = executor::execute(
+        let (_outputs, _) = executor::execute(
             ctx,
             &exec_plan,
             graph.nodes(),
@@ -586,7 +586,7 @@ fn bench_graph_decode(
             }
         }
 
-        let outputs = executor::execute(
+        let (outputs, _) = executor::execute(
             ctx,
             &exec_plan,
             graph.nodes(),

@@ -323,7 +323,7 @@ impl CudaDecodeEngine {
             self.cuda_graph.begin_capture()?;
 
             let output_nodes = [self.output_node];
-            let mut outputs = super::executor::execute(
+            let (mut outputs, _returned_inputs) = super::executor::execute(
                 &self.ctx,
                 &self.plan,
                 self.graph.nodes(),
@@ -337,6 +337,8 @@ impl CudaDecodeEngine {
             )?;
 
             self.cuda_graph.end_capture()?;
+            // _returned_inputs is dropped here, after end_capture(), so cuMemFree
+            // is not called inside the capture window (avoids CUDA_ERROR_INVALID_VALUE).
             self.cuda_graph.launch()?;
             self.ctx.synchronize()?;
 

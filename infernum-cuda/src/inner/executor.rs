@@ -68,7 +68,10 @@ pub fn execute(
     paged_kv_cache: Option<&mut crate::cuda::PagedKvCache>,
     mla_seq_pos: usize,
     mut graph_inputs: Option<crate::inner::execute_context::GraphInputs>,
-) -> Result<Vec<CudaTensor>> {
+) -> Result<(
+    Vec<CudaTensor>,
+    Option<crate::inner::execute_context::GraphInputs>,
+)> {
     #[allow(clippy::needless_pass_by_ref_mut)]
     let mut paged_kv_cache = paged_kv_cache;
     let mut buffers: Vec<Vec<Option<CudaTensor>>> = nodes
@@ -142,5 +145,5 @@ pub fn execute(
         .map(|&id| take(&mut buffers, id, 0))
         .collect();
 
-    Ok(outputs)
+    Ok((outputs, graph_inputs))
 }
