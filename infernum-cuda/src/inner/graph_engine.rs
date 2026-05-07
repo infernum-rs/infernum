@@ -150,6 +150,12 @@ impl CudaDecodeEngine {
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
+        // MoE models require D→H sync copies during routing (logits → host top-K).
+        // D→H sync copies are forbidden during CUDA graph capture (they invalidate
+        // the capture stream on T4 and generally). Skip capture entirely for MoE
+        // models by pre-stabilizing: the engine will always run eagerly.
+        let moe_skip_capture = graph.has_moe_ops();
+
         // Locate the single output node (argmax token).
         let output_node = *graph
             .output_ids()
@@ -178,7 +184,7 @@ impl CudaDecodeEngine {
             rope_theta,
             head_dim,
             last_miss_count: 0,
-            stabilized: false,
+            stabilized: moe_skip_capture,
             output_node,
             saved_token: None,
             pinned_token,
