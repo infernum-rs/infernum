@@ -10,10 +10,8 @@
 //! are running on CPU or CUDA.
 
 use crate::backend::{Backend, MatmulOps};
-use crate::DType;
 
 use super::node::{GraphNode, NodeId};
-use super::op_node::OutputRef;
 use super::planner::ExecutionPlan;
 use super::weight_store::WeightStore;
 
@@ -119,11 +117,12 @@ pub trait KvCacheAccess<B: Backend> {
 
 /// Context passed to each op's [`super::op_node::OpNode::execute`] method.
 ///
-/// Ops call [`read_tensor`](ExecuteContext::read_tensor),
-/// [`write_tensor`](ExecuteContext::write_tensor), and
-/// [`next_input`](ExecuteContext::next_input) rather than touching backend
-/// internals directly.  The concrete implementations live in the backend
-/// crates (`infernum-cpu`, `infernum-cuda`).
+/// Ops access tensors via the static-dispatch helpers on [`crate::backend::ContextBackend`]:
+/// [`ctx_read`](crate::backend::ContextBackend::ctx_read),
+/// [`ctx_write`](crate::backend::ContextBackend::ctx_write), and
+/// [`ctx_next_input`](crate::backend::ContextBackend::ctx_next_input).
+/// These are associated functions rather than methods on `ExecuteContext` so
+/// that each backend can implement them without depending on the other backend.
 pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
     /// Backend-specific executor state.
     ///
@@ -149,85 +148,8 @@ pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
     /// Graph input tensors supplied by the caller for this forward pass.
     pub input_tensors: &'a [B::Tensor],
 
-    /// Cursor into `input_tensors` — advanced by [`next_input`](ExecuteContext::next_input).
+    /// Cursor into `input_tensors` — advanced by [`ContextBackend::ctx_next_input`](crate::backend::ContextBackend::ctx_next_input).
     pub input_idx: &'a mut usize,
 }
 
-impl<B: Backend + MatmulOps> ExecuteContext<'_, B> {
-    /// Returns `(byte_offset, element_count, dtype)` for an input tensor
-    /// identified by its [`OutputRef`].
-    ///
-    /// Used by op `execute()` bodies to locate arena slots without importing
-    /// planner internals directly.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node output has no buffer slot assigned by the planner.
-    #[must_use]
-    pub fn input_slot(&self, output_ref: OutputRef) -> (usize, usize, DType) {
-        let (node_id, output_idx) = output_ref;
-        let node = &self.nodes[node_id.index() as usize];
-        let slot = self
-            .plan
-            .slot(node_id, output_idx)
-            .expect("input node output has no buffer slot");
-        let shape = &node.output_shapes[output_idx as usize];
-        let dtype = node.output_dtypes[output_idx as usize];
-        let num_elements: usize = shape.iter().product();
-        (slot.offset, num_elements, dtype)
-    }
 
-    /// Returns `(byte_offset, element_count)` for this node's output slot, or
-    /// `None` if the planner did not assign a slot (side-effect-only outputs).
-    #[must_use]
-    pub fn output_slot(&self, node_id: NodeId, idx: u32) -> Option<(usize, usize)> {
-        let node = &self.nodes[node_id.index() as usize];
-        self.plan.slot(node_id, idx).map(|slot| {
-            let shape = &node.output_shapes[idx as usize];
-            let num_elements: usize = shape.iter().product();
-            (slot.offset, num_elements)
-        })
-    }
-
-    /// Read a tensor produced by a prior node in the graph.
-    ///
-    /// Returns an owned tensor (cloned from the backend's storage).
-    /// Implemented concretely for each backend in the backend crates.
-    ///
-    /// # Panics
-    ///
-    /// Panics with a backend-specific message if the tensor is not found.
-    #[must_use]
-    pub fn read_tensor(&self, _output_ref: OutputRef) -> B::Tensor {
-        unimplemented!(
-            "ExecuteContext::read_tensor — implement in the backend crate (infernum-cpu / infernum-cuda)"
-        )
-    }
-
-    /// Write an op's output tensor into the context for future ops to read.
-    ///
-    /// Implemented concretely for each backend in the backend crates.
-    ///
-    /// # Panics
-    ///
-    /// Panics with a backend-specific message if the write fails.
-    pub fn write_tensor(&mut self, _node_id: NodeId, _output_idx: u32, _tensor: B::Tensor) {
-        unimplemented!(
-            "ExecuteContext::write_tensor — implement in the backend crate (infernum-cpu / infernum-cuda)"
-        )
-    }
-
-    /// Consume the next graph input tensor, advancing the input cursor.
-    ///
-    /// Returns an owned tensor. Implemented concretely for each backend in the
-    /// backend crates.
-    ///
-    /// # Panics
-    ///
-    /// Panics if all input tensors have already been consumed.
-    pub fn next_input(&mut self) -> B::Tensor {
-        unimplemented!(
-            "ExecuteContext::next_input — implement in the backend crate (infernum-cpu / infernum-cuda)"
-        )
-    }
-}
