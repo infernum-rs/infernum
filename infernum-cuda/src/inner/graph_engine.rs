@@ -323,7 +323,7 @@ impl CudaDecodeEngine {
             self.cuda_graph.begin_capture()?;
 
             let output_nodes = [self.output_node];
-            let (mut outputs, _returned_inputs) = super::executor::execute(
+            let (mut outputs, returned_inputs) = super::executor::execute(
                 &self.ctx,
                 &self.plan,
                 self.graph.nodes(),
@@ -337,21 +337,15 @@ impl CudaDecodeEngine {
             )?;
 
             self.cuda_graph.end_capture()?;
-            // _returned_inputs is dropped here, after end_capture(), so cuMemFree
-            // is not called inside the capture window (avoids CUDA_ERROR_INVALID_VALUE).
             self.cuda_graph.launch()?;
             self.ctx.synchronize()?;
 
-            // Restore graph_inputs. The executor consumed it and we need a fresh
-            // one for the next step. max_seq_len is set by update_graph_inputs
-            // at the start of the next step.
-            self.graph_inputs = GraphInputs::new(
-                self.ctx.device(),
-                1,
-                self.head_dim / 2,
-                self.max_blocks_per_seq,
-                0, // set each step by update_graph_inputs
-            )?;
+            // Restore graph_inputs from the value returned by execute().
+            // The captured CUDA graph holds references to the GPU buffer addresses
+            // inside real_inputs; those buffers must remain live across launches.
+            // max_seq_len is overwritten by update_graph_inputs at the next step.
+            self.graph_inputs =
+                returned_inputs.expect("execute() must return the GraphInputs that was passed in");
 
             let token_tensor = outputs.pop().unwrap();
             let result = token_tensor.to_vec::<u32>()?;

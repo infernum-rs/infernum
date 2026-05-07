@@ -513,15 +513,17 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             )?;
 
             state.cuda_graph.end_capture()?;
-            // Drop returned_inputs after end_capture() so cuMemFree is not called
-            // inside the capture window (which would cause CUDA_ERROR_INVALID_VALUE).
-            drop(returned_inputs);
             state.cuda_graph.launch()?;
             self.ctx.synchronize()?;
 
-            // Restore the graph_inputs for the next step.
-            // max_seq_len is written at the top of the next run_decode_captured call.
-            state.graph_inputs = GraphInputs::new(device, 1, self.half_dim, max_blocks_per_seq, 0)?;
+            // Restore graph_inputs from the value returned by execute().
+            // The captured CUDA graph holds references to the GPU buffer addresses
+            // inside real_inputs; those buffers must remain live for the graph's
+            // entire lifetime. Storing them back here (rather than allocating a
+            // fresh GraphInputs) keeps those addresses valid across launches.
+            // max_seq_len is overwritten at the top of the next run_decode_captured call.
+            state.graph_inputs =
+                returned_inputs.expect("execute() must return the GraphInputs that was passed in");
 
             let token_tensor = outputs.pop().expect("execute returned no outputs");
             // Save the pool-backed tensor so the fast path can DMA from it.
