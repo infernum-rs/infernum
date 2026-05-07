@@ -70,8 +70,7 @@ impl ArgmaxLastOps for CpuBackend {
                 row.iter()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
-                    .map(|(i, _)| i as u32)
-                    .unwrap_or(0)
+                    .map_or(0, |(i, _)| u32::try_from(i).unwrap_or(0))
             })
             .collect();
         Ok(CpuTensor::from_u32(&[rows], &indices))
