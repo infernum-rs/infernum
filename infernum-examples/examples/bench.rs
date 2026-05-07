@@ -40,9 +40,9 @@ use infernum_cuda::cuda::ops::{
     embedding_gather_from_device, fused_attention_decode_indirect, linear, rms_norm, swiglu,
     LinearWeight,
 };
-use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache, SeqPosition};
+use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache};
 use infernum_cuda::executor;
-use infernum_cuda::{CudaBackend, CudaDecodeEngine};
+use infernum_cuda::CudaBackend;
 use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _};
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaCudaGraphEngine,
@@ -404,6 +404,7 @@ fn bench_graph(
     // Warm-up run
     {
         let outputs = executor::execute(
+            ctx,
             &exec_plan,
             graph.nodes(),
             &weights,
@@ -412,6 +413,7 @@ fn bench_graph(
             None,
             None,
             0,
+            None,
         )?;
         ctx.synchronize()?;
         assert_eq!(outputs[0].shape()[0], n_tokens);
@@ -426,6 +428,7 @@ fn bench_graph(
         ctx.synchronize()?;
         let start = Instant::now();
         let _outputs = executor::execute(
+            ctx,
             &exec_plan,
             graph.nodes(),
             &weights,
@@ -434,6 +437,7 @@ fn bench_graph(
             None,
             None,
             0,
+            None,
         )?;
         ctx.synchronize()?;
         let elapsed = start.elapsed();
@@ -583,6 +587,7 @@ fn bench_graph_decode(
         }
 
         let outputs = executor::execute(
+            ctx,
             &exec_plan,
             graph.nodes(),
             weights,
@@ -591,6 +596,7 @@ fn bench_graph_decode(
             None,
             None,
             0,
+            None,
         )?;
 
         // Outputs: [logits, k_0, k_1, ..., k_{n-1}, v_0, v_1, ..., v_{n-1}]
@@ -930,33 +936,142 @@ fn bench_cuda_graphs_decode(
     Ok(())
 }
 
-/// Benchmark decode throughput using the architecture-correct `CudaDecodeEngine`.
+/// Benchmark decode throughput using the high-level `CudaGraphEngine` path.
 ///
-/// Unlike `bench_cuda_graphs_decode` (the bypass), this path uses the computation
-/// graph IR and `execute_indirect` — the same path that will become the production
-/// inference path. Specifically:
+/// This exercises the same code path as production inference: `forward_prefill`
+/// populates the paged KV cache from a short prompt, then `forward_batch_decode`
+/// runs one decode step per token. After the buffer pool stabilizes, each decode
+/// step reduces to a single `cuGraphLaunch` call via the `DecodeState` captured
+/// in Step 4.
 ///
-/// - Builds a graph via `build_indirect_decode_graph` (no `kv_len` parameter).
-/// - Populates a `WeightStore` with model weights, RoPE cos/sin caches, and
-///   per-layer KV cache buffer handles.
-/// - Runs `CudaDecodeEngine` which re-captures until the buffer pool stabilizes,
-///   then replays with bare `launch()` calls.
-///
-/// Supports dense SafeTensors (F32, BF16) Llama-family models only.
+/// Supports Llama-family SafeTensors models only.
 ///
 /// # Errors
+///
 /// Returns an error if weight loading or any CUDA kernel launch fails.
-#[allow(clippy::too_many_lines)]
 fn bench_cuda_graph_engine(
-    _ctx: &CudaContext,
-    _model_path: &str,
-    _n_gen: usize,
+    ctx: &CudaContext,
+    model_path: &str,
+    n_gen: usize,
     _weight_dtype: DType,
 ) -> infernum::Result<()> {
-    // TODO(Step 3): Reimplement using GraphInputs-based decode graph.
-    // build_indirect_decode_graph has been removed; this benchmark will be
-    // updated once the new capture path is wired through CudaDecodeEngine.
-    eprintln!("bench_cuda_graph_engine: not yet implemented (Step 3)");
+    use infernum::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
+    use infernum::logits::Logits as _;
+    use infernum::DecodeBufferOps as _;
+    use infernum::Model as _;
+    use infernum_cuda::cuda::PagedKvCache;
+    use infernum_cuda::{CudaBackend, CudaRuntimeState};
+
+    assert!(
+        !model_path.ends_with(".gguf"),
+        "--cuda-graph-engine only supports SafeTensors directories"
+    );
+
+    let model = LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?;
+    let model_cfg = <LlamaCudaGraphEngine as infernum::Model>::config(&model);
+
+    let prompt_len: usize = 8;
+    let block_size: usize = 16;
+    let max_seq = prompt_len + n_gen + 1;
+    let num_blocks = max_seq.div_ceil(block_size) + 4;
+
+    let block_config = BlockConfig {
+        block_size,
+        num_blocks,
+    };
+    let max_blocks_per_seq = num_blocks;
+
+    eprintln!(
+        "Model: {} layers, head_dim={} (cuda-graph-engine, n_gen={})",
+        model_cfg.num_layers, model_cfg.head_dim, n_gen,
+    );
+
+    let mut kv_cache: PagedKvCache = model.allocate_kv_cache(&block_config)?;
+    let mut runtime_state = CudaRuntimeState::test_placeholder();
+
+    // Build block table for the single sequence.
+    let mut allocator = BlockAllocator::new(&block_config);
+    let mut block_table = BlockTable::new(block_size);
+    for _ in 0..prompt_len.div_ceil(block_size) {
+        let blk = allocator.allocate().expect("block pool exhausted");
+        block_table.append_block(blk);
+    }
+
+    // --- Phase 1: Prefill (not timed) ---
+    eprintln!("Warm-up: prefilling {prompt_len} prompt tokens...");
+    let prompt: Vec<u32> = (0..prompt_len).map(|i| (i % 256) as u32).collect();
+    let prefill_logits =
+        model.forward_prefill(&prompt, &mut kv_cache, &mut runtime_state, &block_table, 0)?;
+    block_table.advance(prompt_len);
+
+    // Greedy argmax from the last row of the prefill logits.
+    let mut last_token = prefill_logits.argmax(prefill_logits.batch_size() - 1)?;
+
+    ctx.synchronize()?;
+    eprintln!("Warm-up done. First decode token: {last_token}");
+
+    // --- Phase 2: Timed decode of n_gen tokens ---
+    ctx.synchronize()?;
+    let start = Instant::now();
+
+    for step in 0..n_gen {
+        let pos = prompt_len + step;
+        #[allow(clippy::cast_possible_wrap)]
+        let pos_i32 = pos as i32;
+        #[allow(clippy::cast_possible_wrap)]
+        let seq_len_i32 = (pos + 1) as i32;
+
+        if block_table.needs_new_block() {
+            let blk = allocator.allocate().expect("block pool exhausted");
+            block_table.append_block(blk);
+        }
+
+        // Flatten block table into (batch_size=1 × max_blocks_per_seq) with i32.
+        #[allow(clippy::cast_possible_wrap)]
+        let block_tables_flat: Vec<i32> = {
+            let mut flat = vec![0i32; max_blocks_per_seq];
+            for (j, &b) in block_table.blocks().iter().enumerate() {
+                flat[j] = b as i32;
+            }
+            flat
+        };
+
+        let decode = CudaBackend::prepare_decode_tensors(
+            &mut runtime_state,
+            ctx,
+            &[last_token],
+            &[pos_i32],
+            &block_tables_flat,
+            &[seq_len_i32],
+            max_blocks_per_seq,
+        )?;
+
+        let logits = model.forward_batch_decode(
+            &decode.token_ids,
+            &mut kv_cache,
+            &mut runtime_state,
+            &decode.block_tables,
+            &decode.seq_lens,
+            &decode.positions,
+            1,
+            max_blocks_per_seq,
+            pos + 1,
+        )?;
+        block_table.advance(1);
+
+        last_token = logits.argmax(0)?;
+    }
+
+    ctx.synchronize()?;
+    let elapsed = start.elapsed();
+    let tok_s = n_gen as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "{n_gen} tokens in {:.2}s = {:.1} tok/s",
+        elapsed.as_secs_f64(),
+        tok_s,
+    );
+
     Ok(())
 }
 
