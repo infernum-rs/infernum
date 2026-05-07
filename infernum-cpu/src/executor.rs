@@ -1063,8 +1063,22 @@ pub fn execute(
                 write_tensor(arena, plan, node_id, 0, &input);
             }
 
-            // --- Unimplemented ---
-            name => panic!("CPU executor: unimplemented op {name:?}"),
+            // --- Open dispatch: custom / unknown ops self-execute via OpNode::execute ---
+            _ => {
+                let mut ctx = infernum::graph::execute_context::ExecuteContext {
+                    state: arena,
+                    plan,
+                    nodes,
+                    weights,
+                    device: &(),
+                    kv_cache: kv_cache.as_deref_mut().map(|kv| {
+                        kv as &mut dyn infernum::graph::execute_context::KvCacheAccess<CpuBackend>
+                    }),
+                    input_tensors: inputs,
+                    input_idx: &mut input_idx,
+                };
+                node.op.execute(&mut ctx, node_id, &node.inputs)?;
+            }
         }
     }
 

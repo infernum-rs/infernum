@@ -742,8 +742,30 @@ pub fn execute(
                 store(&mut buffers, node_id, 0, result);
             }
 
-            // --- Unimplemented ---
-            _ => panic!("CUDA executor: unimplemented op {op_name:?}"),
+            // --- Open dispatch: custom / unknown ops self-execute via OpNode::execute ---
+            _ => {
+                use crate::inner::execute_context::CudaExecutorState;
+                use infernum::graph::execute_context::ExecuteContext;
+                let mut state = CudaExecutorState { buffers };
+                let mut input_idx_local = input_idx;
+                {
+                    let mut ctx = ExecuteContext {
+                        state: &mut state,
+                        plan,
+                        nodes,
+                        weights,
+                        device: &crate::cuda::CudaContext::current()?,
+                        kv_cache: None::<
+                            &mut dyn infernum::graph::execute_context::KvCacheAccess<CudaBackend>,
+                        >,
+                        input_tensors: inputs,
+                        input_idx: &mut input_idx_local,
+                    };
+                    node.op.execute(&mut ctx, node_id, &node.inputs)?;
+                }
+                buffers = state.buffers;
+                input_idx = input_idx_local;
+            }
         }
     }
 
@@ -933,10 +955,29 @@ pub fn execute_indirect(
                 store(&mut buffers, node_id, 0, tensor);
             }
 
-            // --- All other ops: fall through to standard dispatch ---
+            // --- Open dispatch: custom / unknown ops self-execute via OpNode::execute ---
             _ => {
-                // TODO(Step 5): rebuild with ExecuteContext-based dispatch.
-                unimplemented!("Step 5: executor rebuilt with ExecuteContext")
+                use crate::inner::execute_context::CudaExecutorState;
+                use infernum::graph::execute_context::ExecuteContext;
+                let mut state = CudaExecutorState { buffers };
+                let mut input_idx_local = input_idx;
+                {
+                    let mut exec_ctx = ExecuteContext {
+                        state: &mut state,
+                        plan,
+                        nodes,
+                        weights,
+                        device: ctx,
+                        kv_cache: None::<
+                            &mut dyn infernum::graph::execute_context::KvCacheAccess<CudaBackend>,
+                        >,
+                        input_tensors: inputs,
+                        input_idx: &mut input_idx_local,
+                    };
+                    node.op.execute(&mut exec_ctx, node_id, &node.inputs)?;
+                }
+                buffers = state.buffers;
+                input_idx = input_idx_local;
             }
         }
     }
