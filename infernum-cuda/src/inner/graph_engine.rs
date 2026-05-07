@@ -3,7 +3,7 @@
 //! [`CudaDecodeEngine`] owns a [`GraphInputs`] struct with pre-allocated
 //! stable GPU-side input buffers. On each `step()`:
 //!
-//! - New token ID, position, RoPE cos/sin, block table, and seq-len are
+//! - New token ID, position, `RoPE` cos/sin, block table, and seq-len are
 //!   written into the buffers via `htod_copy_into`.
 //! - During stabilization, the graph is captured inside
 //!   `begin_capture` / `end_capture` until the buffer pool stops growing.
@@ -22,7 +22,7 @@
 //! call to `execute` may miss the pool and allocate new buffers. The pool miss
 //! count is tracked via [`BufferPool::misses`]. After the count stops growing
 //! (i.e., the pool has enough buffers cached), the [`CudaGraph`]'s
-//! `cuGraphExec_t` is fully stable and `begin_capture`/`end_capture` are no
+//! `cudaGraphExec_t` is fully stable and `begin_capture`/`end_capture` are no
 //! longer needed each step — `launch()` alone suffices.
 
 use infernum::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
@@ -53,7 +53,7 @@ use crate::CudaBackend;
 ///
 /// [`step`](CudaDecodeEngine::step) runs one decode step:
 ///
-/// 1. Writes the current token ID, RoPE cos/sin, block table, positions, and
+/// 1. Writes the current token ID, `RoPE` cos/sin, block table, positions, and
 ///    seq-lens into the `GraphInputs` buffers via `htod_copy_into`.
 /// 2. **Stabilisation phase** (first few steps): wraps [`execute`] in
 ///    [`begin_capture`](CudaGraph::begin_capture) /
@@ -74,23 +74,23 @@ pub struct CudaDecodeEngine {
     plan: ExecutionPlan,
     graph: Graph<CudaBackend>,
     weights: WeightStore<CudaTensor, LinearWeight>,
-    /// Pre-allocated stable GPU-side input buffers (token_ids, cos, sin,
-    /// block_table, positions, seq_lens). Updated via `htod_copy_into` before
+    /// Pre-allocated stable GPU-side input buffers (`token_ids`, cos, sin,
+    /// `block_table`, positions, `seq_lens`). Updated via `htod_copy_into` before
     /// each step; the captured graph references these fixed addresses.
     graph_inputs: GraphInputs,
     /// Paged KV cache for all transformer layers.
     paged_kv_cache: PagedKvCache,
     /// Host-side block allocator for the single decode sequence.
     block_allocator: BlockAllocator,
-    /// Per-sequence block table (single sequence for batch_size=1).
+    /// Per-sequence block table (single sequence for `batch_size=1`).
     block_table: BlockTable,
     /// Maximum number of blocks per sequence that the graph was built for.
     max_blocks_per_seq: usize,
     /// Current sequence position (0-indexed). Incremented in `advance()`.
     current_pos: u32,
-    /// RoPE theta for cos/sin computation.
+    /// `RoPE` theta for cos/sin computation.
     rope_theta: f32,
-    /// Head dimension (used to compute half_dim for RoPE).
+    /// Head dimension (used to compute `half_dim` for `RoPE`).
     head_dim: usize,
     /// How many pool misses were seen at the end of the last step. When this
     /// value matches the current `pool.misses()` the graph has stabilized.
@@ -124,7 +124,7 @@ impl CudaDecodeEngine {
     /// * `paged_kv_cache` — Pre-allocated paged KV cache.
     /// * `block_config` — Block configuration (size + total pool).
     /// * `max_blocks_per_seq` — Max blocks per sequence (graph was built with this).
-    /// * `rope_theta` — RoPE theta for cos/sin computation.
+    /// * `rope_theta` — `RoPE` theta for cos/sin computation.
     /// * `head_dim` — Attention head dimension.
     ///
     /// # Panics
