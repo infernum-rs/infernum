@@ -825,7 +825,7 @@ pub struct BiasAddOp {
     pub bias: WeightId,
 }
 
-impl<B: ContextBackend + BiasOps> OpNode<B> for BiasAddOp {
+impl<B: ContextBackend + BiasOps + CastOps> OpNode<B> for BiasAddOp {
     fn name(&self) -> &'static str {
         "bias_add"
     }
@@ -848,8 +848,18 @@ impl<B: ContextBackend + BiasOps> OpNode<B> for BiasAddOp {
         inputs: &[OutputRef],
     ) -> Result<()> {
         let mut result = B::ctx_read(ctx, inputs[0]);
-        let bias = ctx.weights.tensor_weight(self.bias).clone();
-        <B as BiasOps>::bias_add_inplace(&mut result, &bias)?;
+        let bias_w = ctx.weights.tensor_weight(self.bias);
+        // Cast bias to match input dtype when they differ (e.g. F32 bias
+        // loaded from a Qwen2.5 checkpoint applied to a BF16 activation).
+        // The kernel requires both operands to share the same dtype.
+        let bias_cast;
+        let bias_ref = if bias_w.dtype() == result.dtype() {
+            bias_w
+        } else {
+            bias_cast = <B as CastOps>::cast_from_f32(bias_w, result.dtype())?;
+            &bias_cast
+        };
+        <B as BiasOps>::bias_add_inplace(&mut result, bias_ref)?;
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }

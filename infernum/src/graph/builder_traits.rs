@@ -309,7 +309,7 @@ pub trait GraphBiasOps {
     fn add_bias_add(&mut self, input: OutputRef, bias: WeightId) -> OutputRef;
 }
 
-impl<B: Backend + MatmulOps + BiasOps + ContextBackend> GraphBiasOps for Graph<B> {
+impl<B: Backend + MatmulOps + BiasOps + CastOps + ContextBackend> GraphBiasOps for Graph<B> {
     fn add_bias_add(&mut self, input: OutputRef, bias: WeightId) -> OutputRef {
         let node_id = self.add_node(Box::new(BiasAddOp { bias }), &[input]);
         (node_id, 0)

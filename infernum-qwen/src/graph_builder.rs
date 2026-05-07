@@ -11,7 +11,7 @@
 //! - `SafeTensors` weight loading on the CPU backend
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, ContextBackend, EmbedOps, MatmulOps, MoeOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, MatmulOps, MoeOps,
     MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
@@ -152,6 +152,7 @@ pub trait QwenGraphOps:
     + NormOps
     + ArithOps
     + BiasOps
+    + CastOps
     + EmbedOps
     + TensorOps
     + RopeOps
@@ -169,6 +170,7 @@ impl<B> QwenGraphOps for B where
         + NormOps
         + ArithOps
         + BiasOps
+        + CastOps
         + EmbedOps
         + TensorOps
         + RopeOps
@@ -1221,6 +1223,18 @@ mod tests {
     impl infernum::backend::BiasOps for TestBackend {
         fn bias_add_inplace(_input: &mut DummyTensor, _bias: &DummyTensor) -> infernum::Result<()> {
             Ok(())
+        }
+    }
+
+    impl infernum::backend::CastOps for TestBackend {
+        fn cast_to_f32(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn cast_from_f32(
+            _input: &DummyTensor,
+            _target: infernum::dtype::DType,
+        ) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
         }
     }
 
