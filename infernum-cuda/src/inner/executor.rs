@@ -1,12 +1,22 @@
 //! Graph executor for the CUDA backend.
 //!
 //! Walks an [`ExecutionPlan`] in topological order and dispatches each
-//! operation to the existing CUDA kernels. Intermediate tensors are stored
+//! operation to the appropriate CUDA kernel. Intermediate tensors are stored
 //! in a `Vec<Vec<Option<CudaTensor>>>` indexed by `(NodeId, output_index)`.
-//!
-//! Unlike the CPU executor which uses a flat byte arena, the GPU executor
+//! Unlike the CPU executor, which uses a flat byte arena, the GPU executor
 //! stores tensors as individual [`CudaTensor`] values. The [`BufferPool`]
 //! provides allocation reuse automatically.
+//!
+//! ## Dispatch strategy
+//!
+//! Both `execute` and `execute_indirect` use a `match op_name { ... }` block
+//! for all built-in ops. This keeps dispatch overhead to zero — no trait-object
+//! vtable calls for the hot path. Rope-fusion look-ahead is handled inline in
+//! that block.
+//!
+//! Unknown or custom ops fall through to the `_ =>` arm, which constructs an
+//! [`ExecuteContext`] and calls `node.op.execute(ctx)`. This open-dispatch
+//! fallback lets external crates add new ops without modifying infernum.
 
 use infernum::backend::{
     ArithOps, AttentionOps, BiasOps, CastOps, EmbedOps, GegluOps, MatmulExtOps, MatmulOps,
@@ -60,9 +70,13 @@ fn store(
 
 /// Execute a computation graph on the CUDA backend.
 ///
-/// Walks the `plan.schedule` in topological order, dispatching each operation
-/// to the appropriate CUDA kernel. Intermediate tensors are stored as
-/// `CudaTensor` values (leveraging `BufferPool` for allocation reuse).
+/// Walks the `plan.schedule` in topological order. Built-in ops are dispatched
+/// via a `match op_name { ... }` block (zero overhead, no trait-object call).
+/// Rope-fusion look-ahead is handled inline in that block. Unknown or custom
+/// ops fall through to the `_ =>` arm, which constructs an [`ExecuteContext`]
+/// and calls `node.op.execute(ctx)` — the open-dispatch path for ops added by
+/// external crates. Intermediate tensors are stored as `CudaTensor` values
+/// (leveraging `BufferPool` for allocation reuse).
 ///
 /// # Arguments
 ///
@@ -793,6 +807,10 @@ pub fn execute(
 /// positions corresponding to the `input` graph nodes (one K buffer and one V
 /// buffer per layer, in layer order). Their stable GPU addresses mean the
 /// captured `cudaGraphExec_t` can be replayed without re-capture.
+///
+/// Like [`execute`], the `_ =>` fallback arm uses open dispatch: it constructs
+/// an [`ExecuteContext`] and calls `node.op.execute(ctx)`, allowing external
+/// crates to add new indirect-compatible ops without modifying infernum.
 ///
 /// # Errors
 /// Returns an error if any kernel launch fails.

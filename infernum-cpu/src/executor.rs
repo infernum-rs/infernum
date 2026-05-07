@@ -1,8 +1,19 @@
 //! Graph executor for the CPU backend.
 //!
 //! Walks an [`ExecutionPlan`] in topological order and dispatches each
-//! operation to the existing CPU SIMD kernels. Intermediate tensors are
+//! operation to the appropriate CPU SIMD kernel. Intermediate tensors are
 //! read from / written to a shared [`Arena`].
+//!
+//! ## Dispatch strategy
+//!
+//! The `execute` function uses a `match op_name { ... }` block for all
+//! built-in ops. This keeps dispatch overhead to zero — no trait-object
+//! vtable calls for the hot path. Rope-fusion look-ahead is also handled
+//! inline in the match block.
+//!
+//! Unknown or custom ops fall through to the `_ =>` arm, which constructs
+//! an [`ExecuteContext`] and calls `node.op.execute(ctx)`. This open-dispatch
+//! fallback is how external crates register new ops without modifying infernum.
 
 use std::collections::HashMap;
 
@@ -233,9 +244,12 @@ fn write_tensor(
 
 /// Execute a computation graph on the CPU backend.
 ///
-/// Walks the `plan.schedule` in topological order, dispatching each operation
-/// to the appropriate CPU SIMD kernel. Intermediate tensors are stored in
-/// the shared `arena`.
+/// Walks the `plan.schedule` in topological order. Built-in ops are dispatched
+/// via a `match op_name { ... }` block (zero overhead, no trait-object call).
+/// Rope-fusion look-ahead is handled inline in that block. Unknown or custom
+/// ops fall through to the `_ =>` arm, which constructs an [`ExecuteContext`]
+/// and calls `node.op.execute(ctx)` — the open-dispatch path for ops added by
+/// external crates. Intermediate tensors are stored in the shared `arena`.
 ///
 /// # Arguments
 ///
