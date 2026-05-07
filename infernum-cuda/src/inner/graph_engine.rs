@@ -1,34 +1,37 @@
 //! CUDA-graph-accelerated decode engine for Llama-family models.
 //!
-//! [`CudaDecodeEngine`] pre-builds an indirect decode graph once and replays
-//! it with `begin_capture` / `end_capture` until the pool stabilizes, then
-//! switches to bare `launch()` calls — avoiding the per-step
-//! `cuGraphExecUpdate_v2` overhead once the graph topology is fixed.
+//! [`CudaDecodeEngine`] owns a [`GraphInputs`] struct with pre-allocated
+//! stable GPU-side input buffers. On each `step()`:
+//!
+//! - New token ID, position, RoPE cos/sin, block table, and seq-len are
+//!   written into the buffers via `htod_copy_into`.
+//! - During stabilization, the graph is captured inside
+//!   `begin_capture` / `end_capture` until the buffer pool stops growing.
+//! - On the fast path, only `cuda_graph.launch()` is called per step.
 //!
 //! The engine owns:
 //! - A single [`CudaGraph`] instance (wraps a `cudaGraphExec_t`).
-//! - The pre-computed `RoPE` cos/sin cache (stable GPU address, registered as a
-//!   tensor weight).
-//! - A [`KvCache`] with pre-allocated `[max_seq_len, …]` buffers per layer.
-//! - A [`SeqPosition`] holding the current step position on the GPU.
+//! - A [`GraphInputs`] with stable GPU-side input buffers.
+//! - A [`PagedKvCache`] for the KV cache.
+//! - A [`BlockAllocator`] and [`BlockTable`] for paged memory management.
 //! - The compiled [`ExecutionPlan`] (topological schedule).
 //!
 //! ## Stabilization
 //!
 //! On first use the buffer pool has not yet allocated the right sizes, so each
-//! call to `execute_indirect` may miss the pool and allocate new buffers. The
-//! pool miss count is tracked via [`BufferPool::misses`]. After the count stops
-//! growing (i.e., the pool has enough buffers cached), the [`CudaGraph`]'s
+//! call to `execute` may miss the pool and allocate new buffers. The pool miss
+//! count is tracked via [`BufferPool::misses`]. After the count stops growing
+//! (i.e., the pool has enough buffers cached), the [`CudaGraph`]'s
 //! `cuGraphExec_t` is fully stable and `begin_capture`/`end_capture` are no
 //! longer needed each step — `launch()` alone suffices.
 
+use infernum::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
 use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightStore};
-use infernum::Result;
+use infernum::{precompute_rope_row, Result};
 
 use crate::cuda::ops::LinearWeight;
-use crate::cuda::{
-    CudaContext, CudaEvent, CudaGraph, CudaTensor, KvCache, PinnedBuffer, SeqPosition,
-};
+use crate::cuda::{CudaContext, CudaEvent, CudaGraph, CudaTensor, PagedKvCache, PinnedBuffer};
+use crate::inner::execute_context::GraphInputs;
 use crate::CudaBackend;
 
 // ---------------------------------------------------------------------------
@@ -40,24 +43,44 @@ use crate::CudaBackend;
 /// Call [`CudaDecodeEngine::step`] once per decode step. The first few steps
 /// re-capture the graph until the buffer pool stabilizes; subsequent steps
 /// replay the captured graph with a single `launch()` call.
+///
+/// Call [`CudaDecodeEngine::advance`] **after** each `step()`. The host-side
+/// block table and position counter cannot be updated inside the capture
+/// boundary.
 pub struct CudaDecodeEngine {
     ctx: CudaContext,
     cuda_graph: CudaGraph,
     plan: ExecutionPlan,
     graph: Graph<CudaBackend>,
     weights: WeightStore<CudaTensor, LinearWeight>,
-    kv_cache: KvCache,
-    seq_pos: SeqPosition,
+    /// Pre-allocated stable GPU-side input buffers (token_ids, cos, sin,
+    /// block_table, positions, seq_lens). Updated via `htod_copy_into` before
+    /// each step; the captured graph references these fixed addresses.
+    graph_inputs: GraphInputs,
+    /// Paged KV cache for all transformer layers.
+    paged_kv_cache: PagedKvCache,
+    /// Host-side block allocator for the single decode sequence.
+    block_allocator: BlockAllocator,
+    /// Per-sequence block table (single sequence for batch_size=1).
+    block_table: BlockTable,
+    /// Maximum number of blocks per sequence that the graph was built for.
+    max_blocks_per_seq: usize,
+    /// Current sequence position (0-indexed). Incremented in `advance()`.
+    current_pos: u32,
+    /// RoPE theta for cos/sin computation.
+    rope_theta: f32,
+    /// Head dimension (used to compute half_dim for RoPE).
+    head_dim: usize,
     /// How many pool misses were seen at the end of the last step. When this
     /// value matches the current `pool.misses()` the graph has stabilized.
     last_miss_count: u64,
     /// `true` once the graph no longer changes between steps.
     stabilized: bool,
-    /// Index of the graph output node (`U32` token tensor `[1]`).
+    /// Index of the graph output node (argmax token, `U32` `[1]`).
     output_node: NodeId,
     /// The token tensor (`[1]` `U32`) from the last captured execute. Its GPU
     /// address is stable (pool-backed). On the fast path the CUDA graph writes
-    /// fresh values into it each step; we read 4 bytes from the pinned buffer.
+    /// fresh values into it; we read 4 bytes from the pinned buffer.
     saved_token: Option<CudaTensor>,
     /// Pinned host buffer for async D→H token readback (1 `u32`).
     pinned_token: PinnedBuffer,
@@ -68,65 +91,56 @@ pub struct CudaDecodeEngine {
 }
 
 impl CudaDecodeEngine {
-    /// Build a CUDA-graph decode engine from an already-compiled indirect
-    /// decode graph and a freshly-populated [`WeightStore`].
+    /// Build a CUDA-graph decode engine from a paged decode graph and a
+    /// freshly-populated [`WeightStore`].
     ///
     /// # Parameters
     ///
-    /// * `ctx` — CUDA context (device 0 or whichever device the weights live on).
-    /// * `graph` — Indirect decode graph built by `build_indirect_decode_graph`.
-    /// * `weights` — Fully populated [`WeightStore`] (model weights, `RoPE` caches,
-    ///   KV cache tensors registered at construction time).
-    /// * `kv_cache` — Pre-allocated KV cache with `max_seq_len` capacity.
-    /// * `seq_pos` — GPU-resident sequence position counter (device pointer).
+    /// * `ctx` — CUDA context.
+    /// * `graph` — Paged decode graph built by `build_paged_decode_graph`.
+    /// * `weights` — Fully populated [`WeightStore`] (model weights).
+    /// * `graph_inputs` — Pre-allocated stable GPU-side input buffers.
+    /// * `paged_kv_cache` — Pre-allocated paged KV cache.
+    /// * `block_config` — Block configuration (size + total pool).
+    /// * `max_blocks_per_seq` — Max blocks per sequence (graph was built with this).
+    /// * `rope_theta` — RoPE theta for cos/sin computation.
+    /// * `head_dim` — Attention head dimension.
     ///
     /// # Panics
     ///
-    /// Panics if the indirect decode graph has no output nodes.
+    /// Panics if the decode graph has no output nodes.
     ///
     /// # Errors
     ///
     /// Returns an error if graph planning or [`CudaGraph`] allocation fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: CudaContext,
         graph: Graph<CudaBackend>,
         weights: WeightStore<CudaTensor, LinearWeight>,
-        kv_cache: KvCache,
-        seq_pos: SeqPosition,
+        graph_inputs: GraphInputs,
+        paged_kv_cache: PagedKvCache,
+        block_config: &BlockConfig,
+        max_blocks_per_seq: usize,
+        rope_theta: f32,
+        head_dim: usize,
     ) -> Result<Self> {
         let mut graph = graph;
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
-        // -- DIAGNOSTIC: dump the full graph and schedule (remove before shipping) --
-        eprintln!("[graph_engine] graph has {} nodes", graph.nodes().len());
-        for (i, node) in graph.nodes().iter().enumerate() {
-            eprintln!(
-                "  node {:3}: op={:30} inputs={:?} side_effect={}",
-                i,
-                node.op.name(),
-                node.inputs,
-                node.op.is_side_effect(),
-            );
-        }
-        eprintln!(
-            "[graph_engine] plan schedule ({} entries):",
-            ep.schedule.len()
-        );
-        for &nid in &ep.schedule {
-            let node = &graph.nodes()[nid.index() as usize];
-            eprintln!("  {:?} op={}", nid, node.op.name());
-        }
-
-        // Locate the single output node (logits).
+        // Locate the single output node (argmax token).
         let output_node = *graph
             .output_ids()
             .first()
-            .expect("indirect decode graph must have at least one output");
+            .expect("paged decode graph must have at least one output");
 
         let cuda_graph = CudaGraph::new(ctx.device())?;
         let pinned_token = PinnedBuffer::new(ctx.device())?;
         let completion_event = CudaEvent::new(ctx.device())?;
+
+        let block_allocator = BlockAllocator::new(block_config);
+        let block_table = BlockTable::new(block_config.block_size);
 
         Ok(Self {
             ctx,
@@ -134,8 +148,14 @@ impl CudaDecodeEngine {
             plan: ep,
             graph,
             weights,
-            kv_cache,
-            seq_pos,
+            graph_inputs,
+            paged_kv_cache,
+            block_allocator,
+            block_table,
+            max_blocks_per_seq,
+            current_pos: 0,
+            rope_theta,
+            head_dim,
             last_miss_count: 0,
             stabilized: false,
             output_node,
@@ -145,12 +165,70 @@ impl CudaDecodeEngine {
         })
     }
 
+    /// Write updated decode inputs into the [`GraphInputs`] GPU buffers.
+    ///
+    /// Must be called before every `execute` or `launch()` call. The block
+    /// table must already have a block allocated for the current position
+    /// (call `ensure_block()` first).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `htod_copy_into` fails.
+    fn update_graph_inputs(&mut self, next_token: u32) -> Result<()> {
+        let device = self.ctx.device();
+        let half_dim = self.head_dim / 2;
+        let (cos_row, sin_row) =
+            precompute_rope_row(self.current_pos as usize, self.head_dim, self.rope_theta);
+
+        device.htod_copy_into(vec![next_token], &mut self.graph_inputs.token_ids)?;
+        device.htod_copy_into(cos_row, &mut self.graph_inputs.cos)?;
+        device.htod_copy_into(sin_row, &mut self.graph_inputs.sin)?;
+
+        // Block table: pad to max_blocks_per_seq with zeros.
+        let raw_blocks: Vec<u32> = self
+            .block_table
+            .blocks()
+            .iter()
+            .map(|&b| u32::try_from(b).expect("block index exceeds u32::MAX"))
+            .collect();
+        let mut block_row = vec![0u32; self.max_blocks_per_seq];
+        let n = raw_blocks.len().min(self.max_blocks_per_seq);
+        block_row[..n].copy_from_slice(&raw_blocks[..n]);
+        device.htod_copy_into(block_row, &mut self.graph_inputs.block_table)?;
+
+        // positions: the token's absolute position in the sequence.
+        device.htod_copy_into(vec![self.current_pos], &mut self.graph_inputs.positions)?;
+
+        // seq_lens: after appending, the KV cache contains current_pos + 1 tokens.
+        device.htod_copy_into(vec![self.current_pos + 1], &mut self.graph_inputs.seq_lens)?;
+
+        let _ = half_dim; // half_dim is the length of cos/sin, already correct
+        Ok(())
+    }
+
+    /// Ensure a block is allocated for the current position. Must be called
+    /// before `update_graph_inputs` when the current block is full.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the block pool is exhausted.
+    fn ensure_block(&mut self) {
+        if self.block_table.needs_new_block() {
+            let block_idx = self
+                .block_allocator
+                .allocate()
+                .expect("block pool exhausted; increase max_blocks_per_seq");
+            self.block_table.append_block(block_idx);
+        }
+    }
+
     /// Write the next token ID to the GPU buffer and run one decode step.
     ///
     /// Returns the predicted next token as a `u32`. The argmax is computed
     /// on-device inside the CUDA graph; only 4 bytes are copied host-side.
-    /// Caller must call [`CudaDecodeEngine::advance`] **after** this — the KV
-    /// cache host-side pointer update cannot be captured inside the graph.
+    /// Caller must call [`CudaDecodeEngine::advance`] **after** this — the
+    /// host-side block table and position counter cannot be captured inside
+    /// the graph.
     ///
     /// The first calls re-capture the graph (cheap once the pool is warm); once
     /// the pool has stabilized, only `launch()` is called.
@@ -164,23 +242,15 @@ impl CudaDecodeEngine {
     ///
     /// Returns an error if any kernel launch or CUDA API call fails.
     pub fn step(&mut self, next_token: u32) -> Result<u32> {
-        // TODO(Step 3): write next_token into GraphInputs::token_ids buffer here.
-        // The old indirect-ops token_input buffer is no longer used; the token
-        // is now passed via GraphInputs on each step.
-        let _ = next_token;
+        // Ensure a block is available for the current position.
+        self.ensure_block();
+
+        // Write dynamic decode values into the stable GPU buffers.
+        self.update_graph_inputs(next_token)?;
 
         if self.stabilized {
             // Fast path: graph is stable — replay with a single launch, then
             // use a targeted event sync instead of a full device sync.
-            //
-            // Stream ordering guarantees:
-            //   cuGraphLaunch  (async, writes token to saved_token GPU buffer)
-            //   cuMemcpyDtoHAsync  (async, copies token → pinned_token, after graph)
-            //   cuEventRecord  (marks completion fence)
-            //   cuEventSynchronize  (wait only until the DtoH copy is done)
-            //
-            // This is substantially cheaper than ctx.synchronize() which waits
-            // for ALL work on ALL CUDA streams (cuBLAS internal streams, etc.).
             let token_device_ptr = self
                 .saved_token
                 .as_ref()
@@ -198,25 +268,58 @@ impl CudaDecodeEngine {
             // capture so the pool allocates all required buffers. The resulting
             // token tensor has a stable pool-backed GPU address — save it so
             // the fast path can read it without re-executing.
+
+            // GraphInputs ownership: CudaExecutorState takes it via `take()`,
+            // then returns it after the node. We reconstruct it from the state
+            // after execute completes by transferring the buffers back. To avoid
+            // moving self.graph_inputs, we construct a temporary GraphInputs
+            // that borrows the same device memory by re-creating it with the
+            // same slices. The simplest approach: replace graph_inputs with a
+            // new allocation temporarily and restore after.
+            //
+            // However CudaSlice cannot be easily cloned. The cleanest approach
+            // is to make GraphInputs available for the duration of execute by
+            // passing it through the call and getting it back.
+            //
+            // Since execute() takes `mut graph_inputs: Option<GraphInputs>`,
+            // we move self.graph_inputs into a temporary and rebuild it from
+            // state after. Use std::mem::replace with a dummy.
+            let dummy = GraphInputs::new(
+                self.ctx.device(),
+                self.graph_inputs.batch_size,
+                self.graph_inputs.half_dim,
+                self.graph_inputs.max_blocks_per_seq,
+            )?;
+            let real_inputs = std::mem::replace(&mut self.graph_inputs, dummy);
+
             self.cuda_graph.begin_capture()?;
 
-            // TODO(Step 3): replace `inputs` with views into GraphInputs buffers.
-            // For now pass an empty slice — graph inputs are supplied via
-            // registered weights (KV cache, RoPE tables).
+            let output_nodes = [self.output_node];
             let mut outputs = super::executor::execute(
+                &self.ctx,
                 &self.plan,
                 self.graph.nodes(),
                 &self.weights,
-                &[], // inputs come from registered weights
-                &[self.output_node],
-                None, // no MLA KV cache
-                None, // no paged KV cache
-                0,    // mla_seq_pos
+                &[], // inputs come from graph_inputs
+                &output_nodes,
+                None,                           // no MLA KV cache
+                Some(&mut self.paged_kv_cache), // paged KV cache
+                0,                              // mla_seq_pos
+                Some(real_inputs),              // stable GPU input buffers
             )?;
 
             self.cuda_graph.end_capture()?;
             self.cuda_graph.launch()?;
             self.ctx.synchronize()?;
+
+            // Restore graph_inputs. The executor consumed it and we need a fresh
+            // one for the next step. Allocate a replacement.
+            self.graph_inputs = GraphInputs::new(
+                self.ctx.device(),
+                1,
+                self.head_dim / 2,
+                self.max_blocks_per_seq,
+            )?;
 
             let token_tensor = outputs.pop().unwrap();
             let result = token_tensor.to_vec::<u32>()?;
@@ -241,26 +344,24 @@ impl CudaDecodeEngine {
 
     /// Advance the sequence position by one step (must be called after `step`).
     ///
-    /// This is a host-side update of the GPU position pointer and cannot be
-    /// captured inside a CUDA graph. It must stay outside the capture boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the device copy fails.
-    pub fn advance(&mut self) -> Result<()> {
-        self.kv_cache.advance(1)
+    /// Updates the host-side block table and position counter. These cannot
+    /// be captured inside a CUDA graph and must stay outside the capture
+    /// boundary.
+    pub fn advance(&mut self) {
+        self.block_table.advance(1);
+        self.current_pos += 1;
     }
 
-    /// Return a shared reference to the KV cache (e.g., for reading `current_len`).
+    /// Return a shared reference to the paged KV cache.
     #[must_use]
-    pub fn kv_cache(&self) -> &KvCache {
-        &self.kv_cache
+    pub fn paged_kv_cache(&self) -> &PagedKvCache {
+        &self.paged_kv_cache
     }
 
-    /// Return a shared reference to the sequence position counter.
+    /// Return the current sequence position (number of tokens generated so far).
     #[must_use]
-    pub fn seq_pos(&self) -> &SeqPosition {
-        &self.seq_pos
+    pub fn current_pos(&self) -> u32 {
+        self.current_pos
     }
 
     /// Return whether the CUDA graph has stabilized (pool misses stopped growing).

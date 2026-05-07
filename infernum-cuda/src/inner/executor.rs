@@ -15,42 +15,19 @@
 //! [`MlaAttentionOp`] (in `execute_context.rs`) can access them without any
 //! named arm in the executor. Paged KV ops are wired via [`CudaPagedKvCacheAccess`].
 
-use infernum::graph::builtin_ops::ArgmaxLastOp;
 use infernum::graph::execute_context::KvCacheAccess;
-use infernum::graph::{GraphNode, OutputRef, WeightStore};
+use infernum::graph::{GraphNode, WeightStore};
 use infernum::{ExecutionPlan, NodeId, Result};
 
-use crate::cuda::ops;
 use crate::cuda::ops::LinearWeight;
 use crate::cuda::CudaTensor;
 use crate::CudaBackend;
-
-/// Read a tensor from the node buffer by `OutputRef`.
-///
-/// # Panics
-/// Panics if the node output has no stored tensor.
-fn read(buffers: &[Vec<Option<CudaTensor>>], output_ref: OutputRef) -> &CudaTensor {
-    let (node_id, output_idx) = output_ref;
-    buffers[node_id.index() as usize][output_idx as usize]
-        .as_ref()
-        .unwrap_or_else(|| panic!("node {node_id:?} output {output_idx} has no stored tensor"))
-}
 
 /// Take (move) a tensor out of the node buffer. Used for the final outputs.
 fn take(buffers: &mut [Vec<Option<CudaTensor>>], node_id: NodeId, output_idx: u32) -> CudaTensor {
     buffers[node_id.index() as usize][output_idx as usize]
         .take()
         .unwrap_or_else(|| panic!("node {node_id:?} output {output_idx} has no stored tensor"))
-}
-
-/// Store a tensor in the node buffer.
-fn store(
-    buffers: &mut [Vec<Option<CudaTensor>>],
-    node_id: NodeId,
-    output_idx: u32,
-    tensor: CudaTensor,
-) {
-    buffers[node_id.index() as usize][output_idx as usize] = Some(tensor);
 }
 
 /// Execute a computation graph on the CUDA backend.
@@ -81,6 +58,7 @@ fn store(
     clippy::similar_names
 )]
 pub fn execute(
+    ctx: &crate::cuda::CudaContext,
     plan: &ExecutionPlan,
     nodes: &[GraphNode<CudaBackend>],
     weights: &WeightStore<CudaTensor, LinearWeight>,
@@ -89,6 +67,7 @@ pub fn execute(
     mut mla_kv_cache: Option<&mut Vec<Vec<CudaTensor>>>,
     paged_kv_cache: Option<&mut crate::cuda::PagedKvCache>,
     mla_seq_pos: usize,
+    mut graph_inputs: Option<crate::inner::execute_context::GraphInputs>,
 ) -> Result<Vec<CudaTensor>> {
     #[allow(clippy::needless_pass_by_ref_mut)]
     let mut paged_kv_cache = paged_kv_cache;
@@ -107,10 +86,11 @@ pub fn execute(
         // --- Open dispatch: all ops self-execute via OpNode::execute ---
         // MlaAttentionOp has a concrete impl<CudaBackend> in execute_context.rs
         // that reads mla_kv_cache_ptr and mla_seq_pos directly from ctx.state.
+        // graph_inputs (when Some) routes ctx_next_input to stable GPU buffers
+        // instead of the inputs slice, enabling CUDA graph capture.
         {
             use crate::inner::execute_context::{CudaExecutorState, CudaPagedKvCacheAccess};
             use infernum::graph::execute_context::ExecuteContext;
-            let device = inputs[0].context().clone();
             let mla_ptr = mla_kv_cache
                 .as_deref_mut()
                 .map_or(std::ptr::null_mut(), std::ptr::from_mut);
@@ -118,7 +98,7 @@ pub fn execute(
                 buffers,
                 mla_kv_cache_ptr: mla_ptr,
                 mla_seq_pos,
-                graph_inputs: None,
+                graph_inputs: graph_inputs.take(),
             };
             let mut input_idx_local = input_idx;
             {
@@ -131,7 +111,7 @@ pub fn execute(
                     plan,
                     nodes,
                     weights,
-                    device: &device,
+                    device: ctx,
                     kv_cache: kv,
                     input_tensors: inputs,
                     input_idx: &mut input_idx_local,
@@ -139,6 +119,8 @@ pub fn execute(
                 node.op.execute(&mut exec_ctx, node_id, &node.inputs)?;
             }
             buffers = state.buffers;
+            // Restore graph_inputs so it stays alive across loop iterations.
+            graph_inputs = state.graph_inputs.take();
             input_idx = input_idx_local;
         }
     }

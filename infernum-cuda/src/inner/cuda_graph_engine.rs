@@ -262,6 +262,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
 
         let output_nodes = graph.output_ids().to_vec();
         execute(
+            &self.ctx,
             &ep,
             graph.nodes(),
             &self.weights,
@@ -270,6 +271,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             None,
             None,
             0,
+            None,
         )
     }
 }
@@ -377,6 +379,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             ];
             let output_nodes = graph.output_ids().to_vec();
             let outputs = execute(
+                &self.ctx,
                 &ep,
                 graph.nodes(),
                 &self.weights,
@@ -385,6 +388,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 None,
                 Some(kv_cache),
                 0,
+                None,
             )?;
             last_logits = Some(outputs.into_iter().next().expect("no outputs"));
         }
@@ -478,6 +482,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         ];
         let output_nodes = graph.output_ids().to_vec();
         let outputs = execute(
+            &self.ctx,
             &ep,
             graph.nodes(),
             &self.weights,
@@ -486,6 +491,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             None,
             Some(kv_cache),
             0,
+            None,
         )?;
 
         let logits_bf16 = outputs.into_iter().next().expect("no outputs");

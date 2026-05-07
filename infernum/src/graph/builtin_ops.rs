@@ -9,8 +9,8 @@
 use std::any::Any;
 
 use crate::backend::{
-    ArgmaxLastOps, ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps,
-    GegluOps, MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, GegluOps,
+    MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps,
     SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
