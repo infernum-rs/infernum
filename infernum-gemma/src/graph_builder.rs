@@ -981,6 +981,12 @@ mod tests {
         fn scale_inplace(_a: &mut DummyTensor, _scale: f32) -> infernum::Result<()> {
             Ok(())
         }
+        fn silu(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn logit_softcap(_input: &DummyTensor, _cap: f32) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
     }
 
     impl infernum::backend::TensorOps for TestBackend {

@@ -254,6 +254,12 @@ pub trait ArithOps: Backend {
 
     /// In-place scalar scaling: `a *= scale`.
     fn scale_inplace(a: &mut Self::Tensor, scale: f32) -> Result<()>;
+
+    /// Element-wise SiLU activation: `x * sigmoid(x)`.
+    fn silu(input: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Element-wise logit soft-cap: `tanh(x / cap) * cap`.
+    fn logit_softcap(input: &Self::Tensor, cap: f32) -> Result<Self::Tensor>;
 }
 
 /// Matrix multiplication and linear layers.
@@ -831,7 +837,7 @@ pub trait MultiDeviceOps: Backend {
 /// `ExecuteContext` type (which would violate Rust's orphan rules).
 ///
 /// [`ExecuteContext`]: crate::graph::execute_context::ExecuteContext
-pub trait ContextBackend: Backend + MatmulOps + Sized {
+pub trait ContextBackend: Backend + ArithOps + MatmulOps + Sized {
     /// Read a tensor produced by a prior node in the graph.
     ///
     /// Checks backend-specific caches (e.g., KV overrides on CPU) before

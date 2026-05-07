@@ -339,6 +339,12 @@ mod tests {
         fn scale_inplace(_a: &mut DummyTensor, _scale: f32) -> crate::Result<()> {
             Ok(())
         }
+        fn silu(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn logit_softcap(_input: &DummyTensor, _cap: f32) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
     }
 
     impl crate::backend::AttentionOps for TestBackend {

@@ -101,6 +101,14 @@ impl ArithOps for CudaBackend {
     fn scale_inplace(a: &mut CudaTensor, scale: f32) -> Result<()> {
         ops::scale_inplace(a, scale)
     }
+
+    fn silu(input: &CudaTensor) -> Result<CudaTensor> {
+        ops::silu(input)
+    }
+
+    fn logit_softcap(input: &CudaTensor, cap: f32) -> Result<CudaTensor> {
+        ops::logit_softcap(input, cap)
+    }
 }
 
 // ---- Matmul ----

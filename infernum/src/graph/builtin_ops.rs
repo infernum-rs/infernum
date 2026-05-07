@@ -603,7 +603,7 @@ impl<B: ContextBackend + GegluOps> OpNode<B> for GegluOp {
 #[derive(Debug)]
 pub struct SiluOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
+impl<B: ContextBackend> OpNode<B> for SiluOp {
     fn name(&self) -> &'static str {
         "silu"
     }
@@ -621,13 +621,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        // SiluOp requires f32 slice access which is not available on the
-        // generic Tensor trait. It is handled directly in the executor match arm.
-        unimplemented!("SiluOp: handled by executor (requires concrete tensor type)")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as ArithOps>::silu(&input)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2359,7 +2360,7 @@ pub struct LogitSoftcapOp {
     pub cap: f32,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
+impl<B: ContextBackend> OpNode<B> for LogitSoftcapOp {
     fn name(&self) -> &'static str {
         "logit_softcap"
     }
@@ -2377,13 +2378,14 @@ impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        // LogitSoftcapOp requires f32 slice access which is not available on the
-        // generic Tensor trait. It is handled directly in the executor match arm.
-        unimplemented!("LogitSoftcapOp: handled by executor (requires concrete tensor type)")
+        let input = B::ctx_read(ctx, inputs[0]);
+        let result = <B as ArithOps>::logit_softcap(&input, self.cap)?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self

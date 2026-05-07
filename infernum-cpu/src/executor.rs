@@ -16,8 +16,6 @@
 //! - `"input"` — KV cache routing (reads from persistent [`KvCacheStore`])
 //! - `"rope"` — look-ahead Q+K fusion (fuses consecutive rope ops into one
 //!   SIMD dispatch)
-//! - `"silu"` / `"logit_softcap"` — require `CpuTensor::as_f32_slice`,
-//!   which is not on the generic `Tensor` trait
 //! - `"moe_dispatch_softmax"` / `"moe_dispatch_sigmoid"` — closure-based
 //!   expert dispatch
 //! - `"concat_seq"` — KV cache sequence concatenation
@@ -25,9 +23,7 @@
 use std::collections::HashMap;
 
 use infernum::backend::{ArithOps, MatmulOps, RopeOps};
-use infernum::graph::builtin_ops::{
-    LogitSoftcapOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, RopeOp,
-};
+use infernum::graph::builtin_ops::{MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, RopeOp};
 use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -303,18 +299,6 @@ pub fn execute(
                 write_tensor(arena, plan, node_id, 0, tensor);
             }
 
-            // --- Activations ---
-            "silu" => {
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let data = input.as_f32_slice();
-                let mut out = vec![0.0f32; data.len()];
-                for (o, &x) in out.iter_mut().zip(data.iter()) {
-                    *o = x / (1.0 + (-x).exp());
-                }
-                let result = CpuTensor::from_f32(&node.output_shapes[0], &out);
-                write_tensor(arena, plan, node_id, 0, &result);
-            }
-
             // --- RoPE (zero-copy, with pair fusion) ---
             "rope" => {
                 let op = node.op.as_any().downcast_ref::<RopeOp>().unwrap();
@@ -485,17 +469,6 @@ pub fn execute(
                     let result = CpuTensor::from_f32_vec(&node.output_shapes[0], data);
                     write_tensor(arena, plan, node_id, 0, &result);
                 }
-            }
-
-            // --- Logit soft-cap: tanh(x / cap) * cap (Gemma 2 final logit) ---
-            "logit_softcap" => {
-                let op = node.op.as_any().downcast_ref::<LogitSoftcapOp>().unwrap();
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let cap = op.cap;
-                let data = input.as_f32_slice();
-                let out: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
-                let result = CpuTensor::from_f32_vec(&node.output_shapes[0], out);
-                write_tensor(arena, plan, node_id, 0, &result);
             }
 
             // --- MoE softmax dispatch (Mixtral, Qwen3-MoE) ---
