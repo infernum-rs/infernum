@@ -264,7 +264,8 @@ impl DecodeState {
             .expect("paged decode graph must have at least one output");
 
         let cuda_graph = CudaGraph::new(ctx.device())?;
-        let graph_inputs = GraphInputs::new(ctx.device(), 1, half_dim, max_blocks_per_seq)?;
+        // max_seq_len is set each step in run_decode_captured before capture begins.
+        let graph_inputs = GraphInputs::new(ctx.device(), 1, half_dim, max_blocks_per_seq, 0)?;
         let pinned_token = PinnedBuffer::new(ctx.device())?;
         let completion_event = CudaEvent::new(ctx.device())?;
 
@@ -443,6 +444,14 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         )?;
         device.htod_copy_into(positions_u32.to_vec(), &mut state.graph_inputs.positions)?;
         device.htod_copy_into(seq_lens_u32.to_vec(), &mut state.graph_inputs.seq_lens)?;
+        // Compute max_seq_len on the host now (before capture) so that
+        // CudaPagedKvCacheAccess can use it without a D→H copy during capture.
+        state.graph_inputs.max_seq_len = seq_lens_u32
+            .iter()
+            .copied()
+            .map(|s| s as usize)
+            .max()
+            .unwrap_or(1);
 
         if state.stabilized {
             // Fast path: graph is stable — replay with a single launch, then
@@ -482,6 +491,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 state.graph_inputs.batch_size,
                 state.graph_inputs.half_dim,
                 state.graph_inputs.max_blocks_per_seq,
+                0, // placeholder; real_inputs carries the actual max_seq_len
             )?;
             let real_inputs = std::mem::replace(&mut state.graph_inputs, dummy);
 
@@ -506,7 +516,8 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             self.ctx.synchronize()?;
 
             // Restore the graph_inputs for the next step.
-            state.graph_inputs = GraphInputs::new(device, 1, self.half_dim, max_blocks_per_seq)?;
+            // max_seq_len is written at the top of the next run_decode_captured call.
+            state.graph_inputs = GraphInputs::new(device, 1, self.half_dim, max_blocks_per_seq, 0)?;
 
             let token_tensor = outputs.pop().expect("execute returned no outputs");
             // Save the pool-backed tensor so the fast path can DMA from it.

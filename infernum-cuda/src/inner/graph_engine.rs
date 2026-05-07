@@ -221,7 +221,11 @@ impl CudaDecodeEngine {
         device.htod_copy_into(vec![self.current_pos], &mut self.graph_inputs.positions)?;
 
         // seq_lens: after appending, the KV cache contains current_pos + 1 tokens.
-        device.htod_copy_into(vec![self.current_pos + 1], &mut self.graph_inputs.seq_lens)?;
+        let seq_len = self.current_pos + 1;
+        device.htod_copy_into(vec![seq_len], &mut self.graph_inputs.seq_lens)?;
+        // Pre-compute max_seq_len on the host so CudaPagedKvCacheAccess can
+        // avoid a synchronous D→H copy of seq_lens inside CUDA graph capture.
+        self.graph_inputs.max_seq_len = seq_len as usize;
 
         let _ = half_dim; // half_dim is the length of cos/sin, already correct
         Ok(())
@@ -305,11 +309,14 @@ impl CudaDecodeEngine {
             // Since execute() takes `mut graph_inputs: Option<GraphInputs>`,
             // we move self.graph_inputs into a temporary and rebuild it from
             // state after. Use std::mem::replace with a dummy.
+            // Dummy is never passed to execute(); real_inputs carries the
+            // max_seq_len that was set by update_graph_inputs above.
             let dummy = GraphInputs::new(
                 self.ctx.device(),
                 self.graph_inputs.batch_size,
                 self.graph_inputs.half_dim,
                 self.graph_inputs.max_blocks_per_seq,
+                0, // placeholder — never passed to execute()
             )?;
             let real_inputs = std::mem::replace(&mut self.graph_inputs, dummy);
 
@@ -334,12 +341,14 @@ impl CudaDecodeEngine {
             self.ctx.synchronize()?;
 
             // Restore graph_inputs. The executor consumed it and we need a fresh
-            // one for the next step. Allocate a replacement.
+            // one for the next step. max_seq_len is set by update_graph_inputs
+            // at the start of the next step.
             self.graph_inputs = GraphInputs::new(
                 self.ctx.device(),
                 1,
                 self.head_dim / 2,
                 self.max_blocks_per_seq,
+                0, // set each step by update_graph_inputs
             )?;
 
             let token_tensor = outputs.pop().unwrap();

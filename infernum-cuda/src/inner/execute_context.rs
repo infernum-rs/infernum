@@ -47,10 +47,21 @@ pub struct GraphInputs {
     pub batch_size: usize,
     pub half_dim: usize,
     pub max_blocks_per_seq: usize,
+    /// The maximum sequence length for this decode step (`max(seq_lens)`).
+    ///
+    /// Pre-computed on the host from the `seq_lens` slice before the CUDA
+    /// graph capture window begins, so that [`CudaPagedKvCacheAccess`] can
+    /// pass a concrete value to the paged-attention kernel without performing
+    /// a synchronous device-to-host transfer inside the capture.
+    pub max_seq_len: usize,
 }
 
 impl GraphInputs {
     /// Allocate all input buffers on the given device, zeroed.
+    ///
+    /// `max_seq_len` is the pre-computed maximum sequence length for this
+    /// decode step.  Pass `0` for dummy/placeholder `GraphInputs` instances
+    /// that are swapped out before capture begins.
     ///
     /// # Errors
     ///
@@ -60,6 +71,7 @@ impl GraphInputs {
         batch_size: usize,
         half_dim: usize,
         max_blocks_per_seq: usize,
+        max_seq_len: usize,
     ) -> Result<Self> {
         Ok(Self {
             token_ids: device.alloc_zeros::<u32>(batch_size)?,
@@ -71,6 +83,7 @@ impl GraphInputs {
             batch_size,
             half_dim,
             max_blocks_per_seq,
+            max_seq_len,
         })
     }
 }
@@ -271,7 +284,12 @@ impl ContextBackend for CudaBackend {
 /// `cache_concat_info`, `try_append_kv`, `finalize_step`) are all no-ops:
 /// the paged cache has no concept of per-node dense KV slots and these methods
 /// are never called on this type.
-pub struct CudaPagedKvCacheAccess<'a>(pub &'a mut PagedKvCache);
+pub struct CudaPagedKvCacheAccess<'a> {
+    pub cache: &'a mut PagedKvCache,
+    /// Pre-computed `max(seq_lens)` for the current decode step.
+    /// `0` means "compute from GPU tensor" (eager path only, never during capture).
+    pub max_seq_len: usize,
+}
 
 impl KvCacheAccess<CudaBackend> for CudaPagedKvCacheAccess<'_> {
     fn is_cache_input(&self, _node_id: NodeId) -> bool {
@@ -304,7 +322,7 @@ impl KvCacheAccess<CudaBackend> for CudaPagedKvCacheAccess<'_> {
         batch_size: usize,
         max_blocks_per_seq: usize,
     ) -> Result<()> {
-        self.0.append_paged_batched_tensor(
+        self.cache.append_paged_batched_tensor(
             layer_idx,
             k,
             v,
@@ -328,10 +346,23 @@ impl KvCacheAccess<CudaBackend> for CudaPagedKvCacheAccess<'_> {
         sliding_window: Option<usize>,
     ) -> Result<CudaTensor> {
         // The generic `PagedAttentionDecodeOp` passes `max_seq_len = 0` as a
-        // sentinel, expecting the backend to compute the real value.  The CUDA
-        // kernel uses `max_seq_len` to size its shared-memory allocation; a
-        // zero value causes under-allocation and corrupted attention output.
-        let max_seq_len = if max_seq_len == 0 {
+        // sentinel.  The CUDA kernel uses `max_seq_len` to size its
+        // shared-memory allocation; a zero value causes under-allocation and
+        // corrupted attention output.
+        //
+        // Resolution priority:
+        // 1. Non-zero sentinel passed by the op (future callers that know it).
+        // 2. `self.max_seq_len` — pre-computed on the host from `seq_lens_u32`
+        //    *before* the CUDA graph capture window.  This is always set for the
+        //    graph-capture path, avoiding a synchronous D→H copy inside capture
+        //    which would invalidate the stream on all GPU generations.
+        // 3. Fallback: read from the GPU tensor (eager / non-captured paths only).
+        let resolved = if max_seq_len != 0 {
+            max_seq_len
+        } else if self.max_seq_len != 0 {
+            self.max_seq_len
+        } else {
+            // Eager path only — safe because we are not inside a stream capture.
             let seq_lens_vec = seq_lens.to_vec::<u32>()?;
             seq_lens_vec
                 .iter()
@@ -339,10 +370,8 @@ impl KvCacheAccess<CudaBackend> for CudaPagedKvCacheAccess<'_> {
                 .map(|x| x as usize)
                 .max()
                 .unwrap_or(1)
-        } else {
-            max_seq_len
         };
-        let (k_pool, v_pool) = self.0.get_pools(layer_idx);
+        let (k_pool, v_pool) = self.cache.get_pools(layer_idx);
         ops::paged_attention_decode_from_tensor(
             q.context(),
             q,
@@ -352,7 +381,7 @@ impl KvCacheAccess<CudaBackend> for CudaPagedKvCacheAccess<'_> {
             seq_lens,
             block_size,
             max_blocks_per_seq,
-            max_seq_len,
+            resolved,
             None, // scale: auto (1/sqrt(head_dim))
             softcap,
             sliding_window,

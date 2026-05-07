@@ -102,7 +102,18 @@ pub fn execute(
             };
             let mut input_idx_local = input_idx;
             {
-                let mut paged_acc = paged_kv_cache.as_deref_mut().map(CudaPagedKvCacheAccess);
+                // Pass max_seq_len from GraphInputs when in capture mode so that
+                // CudaPagedKvCacheAccess::paged_attention_decode can skip the
+                // synchronous D→H copy of seq_lens (which invalidates stream capture).
+                let captured_max_seq_len =
+                    state.graph_inputs.as_ref().map_or(0, |gi| gi.max_seq_len);
+                let mut paged_acc =
+                    paged_kv_cache
+                        .as_deref_mut()
+                        .map(|cache| CudaPagedKvCacheAccess {
+                            cache,
+                            max_seq_len: captured_max_seq_len,
+                        });
                 let kv: Option<&mut dyn KvCacheAccess<CudaBackend>> = paged_acc
                     .as_mut()
                     .map(|a| a as &mut dyn KvCacheAccess<CudaBackend>);
