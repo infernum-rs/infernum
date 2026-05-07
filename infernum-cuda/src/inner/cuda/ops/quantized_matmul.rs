@@ -2222,8 +2222,8 @@ mod tests {
         let (act_fp8, d_inv_scale) =
             quantize_activations_to_fp8(&ctx, &input, values.len()).unwrap();
 
-        let fp8_host = ctx.device().dtoh_sync_copy(&act_fp8).unwrap();
-        let inv_scale = ctx.device().dtoh_sync_copy(&d_inv_scale).unwrap()[0];
+        let fp8_host = ctx.device().dtoh_sync_copy(&*act_fp8).unwrap();
+        let inv_scale = ctx.device().dtoh_sync_copy(&*d_inv_scale).unwrap()[0];
 
         // Dequantize and check roundtrip accuracy
         for (i, &original) in values.iter().enumerate() {
