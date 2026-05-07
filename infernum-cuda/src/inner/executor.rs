@@ -116,20 +116,6 @@ pub fn execute(
         let op_name = node.op.name();
 
         match op_name {
-            // --- Input ---
-            "input" => {
-                let tensor = inputs[input_idx].clone();
-                input_idx += 1;
-                store(&mut buffers, node_id, 0, tensor);
-            }
-
-            "concat_seq" => {
-                let a = read(&buffers, node.inputs[0]);
-                let b = read(&buffers, node.inputs[1]);
-                let result = <CudaBackend as TensorOps>::concat_rows(&[a.clone(), b.clone()])?;
-                store(&mut buffers, node_id, 0, result);
-            }
-
             // --- MoE softmax dispatch (Mixtral, Qwen3-MoE) ---
             "moe_dispatch_softmax" => {
                 let op = node

@@ -463,6 +463,37 @@ mod tests {
         }
     }
 
+    impl crate::backend::TensorOps for TestBackend {
+        fn transpose_2d(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn split_inner_dim(
+            _tensor: &DummyTensor,
+            _dim1: usize,
+            _dim2: usize,
+        ) -> crate::Result<(DummyTensor, DummyTensor)> {
+            Ok((DummyTensor, DummyTensor))
+        }
+        fn concat_inner_dim(_a: &DummyTensor, _b: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn pad_inner_dim(_tensor: &DummyTensor, _new_width: usize) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn broadcast_to_heads(
+            _tensor: &DummyTensor,
+            _num_heads: usize,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn repeat_kv(_tensor: &DummyTensor, _num_repeats: usize) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn concat_rows(_parts: &[DummyTensor]) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     impl crate::backend::ContextBackend for TestBackend {
         fn ctx_read(
             _ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,

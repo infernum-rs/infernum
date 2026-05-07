@@ -1650,7 +1650,7 @@ impl<B: ContextBackend + TensorOps> OpNode<B> for ConcatInnerDimOp {
 #[derive(Debug)]
 pub struct ConcatSeqOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for ConcatSeqOp {
+impl<B: ContextBackend> OpNode<B> for ConcatSeqOp {
     fn name(&self) -> &'static str {
         "concat_seq"
     }
@@ -1670,11 +1670,32 @@ impl<B: Backend + MatmulOps> OpNode<B> for ConcatSeqOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("ConcatSeqOp requires KV cache sequence concat — handled by executor")
+        // KV cache path: if this is a KV sequence concat, delegate to the
+        // cache's append logic and store the full updated cache tensor.
+        if ctx
+            .kv_cache
+            .as_ref()
+            .is_some_and(|kv| kv.cache_concat_info(node_id).is_some())
+        {
+            let new_row = B::ctx_read(ctx, inputs[1]);
+            let full_kv = ctx
+                .kv_cache
+                .as_mut()
+                .and_then(|kv| kv.try_append_kv(node_id, &new_row))
+                .expect("cache_concat_info returned Some but try_append_kv returned None");
+            B::ctx_write(ctx, node_id, 0, full_kv);
+            return Ok(());
+        }
+        // Plain concat path.
+        let a = B::ctx_read(ctx, inputs[0]);
+        let b = B::ctx_read(ctx, inputs[1]);
+        let result = <B as TensorOps>::concat_rows(&[a, b])?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self

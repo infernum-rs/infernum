@@ -13,10 +13,8 @@
 //! A small set of ops remain as named match arms because they require
 //! resources unavailable through the generic `OpNode::execute` interface:
 //!
-//! - `"input"` — KV cache routing (reads from persistent [`KvCacheStore`])
 //! - `"moe_dispatch_softmax"` / `"moe_dispatch_sigmoid"` — closure-based
 //!   expert dispatch
-//! - `"concat_seq"` — KV cache sequence concatenation
 
 use std::collections::HashMap;
 
@@ -119,6 +117,7 @@ impl KvCacheStore {
     }
 
     /// Check if a node ID is a KV cache input node.
+    #[allow(dead_code)]
     fn is_cache_input(&self, node_id: NodeId) -> bool {
         self.cache_input_node_ids.contains(&node_id)
     }
@@ -280,55 +279,6 @@ pub fn execute(
         let op_name = node.op.name();
 
         match op_name {
-            // --- Input ---
-            "input" => {
-                if kv_cache
-                    .as_ref()
-                    .is_some_and(|kv| kv.is_cache_input(node_id))
-                {
-                    // KV cache lives in the persistent store; skip arena copy.
-                    continue;
-                }
-                let tensor = &inputs[input_idx];
-                input_idx += 1;
-                write_tensor(arena, plan, node_id, 0, tensor);
-            }
-
-            // --- Shape / Data movement ---
-            "concat_seq" => {
-                let concat_info = kv_cache
-                    .as_ref()
-                    .and_then(|kv| kv.cache_concat_info(node_id));
-
-                if let Some((layer, is_key)) = concat_info {
-                    // KV cache path: append new row to persistent buffer.
-                    // Store the result in `overrides` so downstream attention
-                    // reads directly — no arena copy of the full KV cache.
-                    let new_row = read_tensor(arena, plan, nodes, node.inputs[1]);
-                    let kv = kv_cache.as_mut().unwrap();
-                    kv.append(layer, is_key, new_row.as_f32_slice());
-                    // Compute actual length from vec size to avoid stale `len` field.
-                    let row_elems = kv.num_kv_heads * kv.head_dim;
-                    let new_len = if is_key {
-                        kv.k_caches[layer].len() / row_elems
-                    } else {
-                        kv.v_caches[layer].len() / row_elems
-                    };
-                    let full_cache = kv.get_cache(layer, is_key, new_len);
-                    overrides.insert(node_id, full_cache);
-                } else {
-                    let a = read_tensor(arena, plan, nodes, node.inputs[0]);
-                    let b = read_tensor(arena, plan, nodes, node.inputs[1]);
-                    let a_data = a.as_f32_slice();
-                    let b_data = b.as_f32_slice();
-                    let mut data = Vec::with_capacity(a_data.len() + b_data.len());
-                    data.extend_from_slice(a_data);
-                    data.extend_from_slice(b_data);
-                    let result = CpuTensor::from_f32_vec(&node.output_shapes[0], data);
-                    write_tensor(arena, plan, node_id, 0, &result);
-                }
-            }
-
             // --- MoE softmax dispatch (Mixtral, Qwen3-MoE) ---
             "moe_dispatch_softmax" => {
                 use infernum::backend::MoeOps as _;

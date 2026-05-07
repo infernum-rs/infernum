@@ -855,7 +855,7 @@ pub trait MultiDeviceOps: Backend {
 /// `ExecuteContext` type (which would violate Rust's orphan rules).
 ///
 /// [`ExecuteContext`]: crate::graph::execute_context::ExecuteContext
-pub trait ContextBackend: Backend + ArithOps + MatmulOps + Sized {
+pub trait ContextBackend: Backend + ArithOps + MatmulOps + TensorOps + Sized {
     /// Read a tensor produced by a prior node in the graph.
     ///
     /// Checks backend-specific caches (e.g., KV overrides on CPU) before
