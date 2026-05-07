@@ -265,7 +265,7 @@ impl DecodeState {
         // copy) which is illegal inside a CUDA stream capture window on T4
         // (`CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 0`). For these
         // models we skip capture entirely and always run eagerly.
-        let capture_unsafe = graph.has_moe_ops();
+        let capture_unsafe = graph.has_capture_unsafe_ops();
         optimizer::optimize(&mut graph);
         let plan = plan(&graph);
 
