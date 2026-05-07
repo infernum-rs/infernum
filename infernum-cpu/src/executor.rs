@@ -417,6 +417,7 @@ mod tests {
     #[test]
     fn llama_prefill_graph_synthetic() {
         use infernum::graph::WeightId;
+        use infernum::tensor::Tensor;
         use infernum_llama::build_prefill_graph;
         use infernum_llama::LlamaConfig;
 
