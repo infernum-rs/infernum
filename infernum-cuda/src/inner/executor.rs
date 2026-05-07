@@ -9,20 +9,18 @@
 //!
 //! ## Dispatch strategy
 //!
-//! `execute` has a single named match arm for `mla_attention`, which requires
-//! MLA-specific executor resources (`mla_kv_cache`, `mla_seq_pos`) not yet
-//! expressible through [`ExecuteContext`]. All other ops — including paged KV
-//! append and decode — fall through to the `_ =>` arm, which constructs an
-//! [`ExecuteContext`] (wiring in a [`CudaPagedKvCacheAccess`] when a paged KV
-//! cache is present) and calls `node.op.execute(ctx)`.
+//! `execute` is now a pure open-dispatch loop: every op goes through
+//! `node.op.execute(ctx)`. [`CudaExecutorState`] carries `mla_kv_cache_ptr`
+//! and `mla_seq_pos` so the concrete [`OpNode<CudaBackend>`] impl for
+//! [`MlaAttentionOp`] (in `execute_context.rs`) can access them without any
+//! named arm in the executor. Paged KV ops are wired via [`CudaPagedKvCacheAccess`].
 //!
 //! `execute_indirect` retains its named arms for the CUDA-graph indirect ops;
 //! those will be removed when the `cuda-graph-capture` work lands.
 
-use infernum::backend::MlaAttentionOps;
 use infernum::graph::builtin_ops::{
     AppendKvIndirectOp, ArgmaxLastOp, EmbeddingGatherIndirectOp, FusedAttentionDecodeIndirectOp,
-    MlaAttentionOp, RopeIndirectOp,
+    RopeIndirectOp,
 };
 use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
@@ -111,63 +109,22 @@ pub fn execute(
 
     for &node_id in &plan.schedule {
         let node = &nodes[node_id.index() as usize];
-        let op_name = node.op.name();
 
-        // --- MLA Attention (DeepSeek V3/R1): requires executor-internal mla_kv_cache ---
-        if op_name == "mla_attention" {
-            let op = node.op.as_any().downcast_ref::<MlaAttentionOp>().unwrap();
-            let hidden = read(&buffers, node.inputs[0]).clone();
-            let q_a_proj = weights.linear_weight(op.q_a_proj);
-            let q_a_layernorm = weights.tensor_weight(op.q_a_layernorm);
-            let q_b_proj = weights.linear_weight(op.q_b_proj);
-            let kv_a_proj_with_mqa = weights.linear_weight(op.kv_a_proj_with_mqa);
-            let kv_a_layernorm = weights.tensor_weight(op.kv_a_layernorm);
-            let kv_b_proj_k = weights.linear_weight(op.kv_b_proj_k);
-            let kv_b_proj_v = weights.linear_weight(op.kv_b_proj_v);
-            let kv_b_proj_k_t = weights.linear_weight(op.kv_b_proj_k_t);
-            let o_proj = weights.linear_weight(op.o_proj);
-            let layer_kv = mla_kv_cache
-                .as_deref_mut()
-                .unwrap_or_else(|| {
-                    panic!("CUDA executor: mla_attention op requires mla_kv_cache to be provided")
-                })
-                .get_mut(op.layer_idx)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "CUDA executor: mla_kv_cache has no entry for layer {}",
-                        op.layer_idx
-                    )
-                });
-            let result = <CudaBackend as MlaAttentionOps>::mla_attention(
-                &hidden,
-                q_a_proj,
-                q_a_layernorm,
-                q_b_proj,
-                kv_a_proj_with_mqa,
-                kv_a_layernorm,
-                kv_b_proj_k,
-                kv_b_proj_v,
-                kv_b_proj_k_t,
-                o_proj,
-                layer_kv,
-                mla_seq_pos,
-                op.num_heads,
-                op.qk_nope_head_dim,
-                op.qk_rope_head_dim,
-                op.v_head_dim,
-                op.kv_lora_rank,
-                op.rms_norm_eps,
-                op.attn_scale,
-            )?;
-            store(&mut buffers, node_id, 0, result);
-        } else {
-            // --- Open dispatch: all other ops self-execute via OpNode::execute ---
+        // --- Open dispatch: all ops self-execute via OpNode::execute ---
+        // MlaAttentionOp has a concrete impl<CudaBackend> in execute_context.rs
+        // that reads mla_kv_cache_ptr and mla_seq_pos directly from ctx.state.
+        {
             use crate::inner::execute_context::{CudaExecutorState, CudaPagedKvCacheAccess};
             use infernum::graph::execute_context::ExecuteContext;
-            // Get the CUDA context from the first input tensor — every graph
-            // has at least one input, so this is always valid.
             let device = inputs[0].context().clone();
-            let mut state = CudaExecutorState { buffers };
+            let mla_ptr = mla_kv_cache
+                .as_deref_mut()
+                .map_or(std::ptr::null_mut(), std::ptr::from_mut);
+            let mut state = CudaExecutorState {
+                buffers,
+                mla_kv_cache_ptr: mla_ptr,
+                mla_seq_pos,
+            };
             let mut input_idx_local = input_idx;
             {
                 let mut paged_acc = paged_kv_cache.as_deref_mut().map(CudaPagedKvCacheAccess);
@@ -361,7 +318,11 @@ pub fn execute_indirect(
             _ => {
                 use crate::inner::execute_context::CudaExecutorState;
                 use infernum::graph::execute_context::ExecuteContext;
-                let mut state = CudaExecutorState { buffers };
+                let mut state = CudaExecutorState {
+                    buffers,
+                    mla_kv_cache_ptr: std::ptr::null_mut(),
+                    mla_seq_pos: 0,
+                };
                 let mut input_idx_local = input_idx;
                 {
                     let mut exec_ctx = ExecuteContext {

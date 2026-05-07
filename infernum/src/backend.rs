@@ -887,4 +887,26 @@ pub trait ContextBackend:
     fn ctx_next_input(
         ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
     ) -> Self::Tensor;
+
+    /// Execute an [`MlaAttentionOp`] using backend-specific MLA KV cache state.
+    ///
+    /// The default implementation panics — only backends that support MLA
+    /// (currently only CUDA) override this.  Called by
+    /// [`MlaAttentionOp::execute`](crate::graph::builtin_ops::MlaAttentionOp).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the MLA attention kernel fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics on backends that do not implement MLA attention.
+    fn ctx_execute_mla(
+        _op: &crate::graph::builtin_ops::MlaAttentionOp,
+        _ctx: &mut crate::graph::execute_context::ExecuteContext<'_, Self>,
+        _node_id: crate::graph::NodeId,
+        _inputs: &[crate::graph::OutputRef],
+    ) -> crate::error::Result<()> {
+        unimplemented!("MlaAttentionOp is not supported on this backend")
+    }
 }

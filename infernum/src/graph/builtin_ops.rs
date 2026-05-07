@@ -2659,7 +2659,7 @@ pub struct MlaAttentionOp {
     pub layer_idx: usize,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for MlaAttentionOp {
+impl<B: crate::backend::ContextBackend + MatmulOps> OpNode<B> for MlaAttentionOp {
     fn name(&self) -> &'static str {
         "mla_attention"
     }
@@ -2678,13 +2678,11 @@ impl<B: Backend + MatmulOps> OpNode<B> for MlaAttentionOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!(
-            "MlaAttentionOp is a composite op requiring MLA-specific KV cache logic — handled by executor"
-        )
+        B::ctx_execute_mla(self, ctx, node_id, inputs)
     }
     fn as_any(&self) -> &dyn Any {
         self

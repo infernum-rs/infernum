@@ -5,7 +5,8 @@
 //! `B::ctx_write`, and `B::ctx_next_input` without violating Rust's orphan
 //! rules (which forbid inherent `impl` blocks on foreign types).
 
-use infernum::backend::ContextBackend;
+use infernum::backend::{ContextBackend, MlaAttentionOps};
+use infernum::graph::builtin_ops::MlaAttentionOp;
 use infernum::graph::execute_context::{ExecuteContext, KvCacheAccess};
 use infernum::graph::{NodeId, OutputRef};
 use infernum::Result;
@@ -15,12 +16,47 @@ use crate::CudaBackend;
 
 /// Backend-specific executor state for [`CudaBackend`].
 ///
-/// Wraps the intermediate tensor buffer used by the CUDA executor:
-/// a `Vec<Vec<Option<CudaTensor>>>` indexed by `(NodeId, output_index)`.
-/// Each node gets a slot per output; slots are filled as ops execute and
-/// freed (taken) once all downstream consumers have read them.
+/// Holds the intermediate tensor buffer indexed by `(NodeId, output_index)`,
+/// plus optional MLA KV cache state for `DeepSeek` V3/R1 attention.
+///
+/// `mla_kv_cache_ptr` is a raw pointer to the per-layer MLA KV cache owned by
+/// the graph engine.  It is valid for the lifetime of the `execute` call that
+/// constructs this state; the `get_mla_layer` accessor re-borrows it safely
+/// inside that scope.  Using a raw pointer avoids propagating a lifetime
+/// parameter through the `Backend::ExecutorState` associated type.
 pub struct CudaExecutorState {
     pub buffers: Vec<Vec<Option<CudaTensor>>>,
+    /// Raw pointer to `Vec<Vec<CudaTensor>>` (per-layer MLA KV tensors), or
+    /// null if this execution has no MLA KV cache.
+    pub mla_kv_cache_ptr: *mut Vec<Vec<CudaTensor>>,
+    /// Current sequence position for MLA attention.
+    pub mla_seq_pos: usize,
+}
+
+// SAFETY: `CudaExecutorState` is only constructed and used within a single
+// `execute` call on one thread.  The raw pointer is never aliased across
+// threads.
+unsafe impl Send for CudaExecutorState {}
+
+impl CudaExecutorState {
+    /// Borrow the MLA KV tensors for `layer_idx`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no MLA KV cache was provided or if `layer_idx` is out of
+    /// range.
+    pub fn get_mla_layer(&mut self, layer_idx: usize) -> &mut Vec<CudaTensor> {
+        assert!(
+            !self.mla_kv_cache_ptr.is_null(),
+            "CUDA executor: mla_attention op requires mla_kv_cache to be provided"
+        );
+        // SAFETY: pointer is non-null and valid for the duration of the
+        // enclosing `execute` call (see field doc).
+        let cache = unsafe { &mut *self.mla_kv_cache_ptr };
+        cache.get_mut(layer_idx).unwrap_or_else(|| {
+            panic!("CUDA executor: mla_kv_cache has no entry for layer {layer_idx}")
+        })
+    }
 }
 
 impl ContextBackend for CudaBackend {
@@ -56,6 +92,53 @@ impl ContextBackend for CudaBackend {
         let tensor = ctx.input_tensors[*ctx.input_idx].clone();
         *ctx.input_idx += 1;
         tensor
+    }
+
+    // Weight names (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj_k, …) are
+    // dictated by the DeepSeek V3 checkpoint and cannot be renamed.
+    #[allow(clippy::similar_names)]
+    fn ctx_execute_mla(
+        op: &MlaAttentionOp,
+        ctx: &mut ExecuteContext<'_, CudaBackend>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let hidden = CudaBackend::ctx_read(ctx, inputs[0]);
+        let q_a_proj = ctx.weights.linear_weight(op.q_a_proj);
+        let q_a_layernorm = ctx.weights.tensor_weight(op.q_a_layernorm);
+        let q_b_proj = ctx.weights.linear_weight(op.q_b_proj);
+        let kv_a_proj_with_mqa = ctx.weights.linear_weight(op.kv_a_proj_with_mqa);
+        let kv_a_layernorm = ctx.weights.tensor_weight(op.kv_a_layernorm);
+        let kv_b_proj_k = ctx.weights.linear_weight(op.kv_b_proj_k);
+        let kv_b_proj_v = ctx.weights.linear_weight(op.kv_b_proj_v);
+        let kv_b_proj_k_t = ctx.weights.linear_weight(op.kv_b_proj_k_t);
+        let o_proj = ctx.weights.linear_weight(op.o_proj);
+        // Read seq_pos before get_mla_layer to avoid simultaneous borrows.
+        let seq_pos = ctx.state.mla_seq_pos;
+        let layer_kv = ctx.state.get_mla_layer(op.layer_idx);
+        let result = <CudaBackend as MlaAttentionOps>::mla_attention(
+            &hidden,
+            q_a_proj,
+            q_a_layernorm,
+            q_b_proj,
+            kv_a_proj_with_mqa,
+            kv_a_layernorm,
+            kv_b_proj_k,
+            kv_b_proj_v,
+            kv_b_proj_k_t,
+            o_proj,
+            layer_kv,
+            seq_pos,
+            op.num_heads,
+            op.qk_nope_head_dim,
+            op.qk_rope_head_dim,
+            op.v_head_dim,
+            op.kv_lora_rank,
+            op.rms_norm_eps,
+            op.attn_scale,
+        )?;
+        CudaBackend::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
 }
 
