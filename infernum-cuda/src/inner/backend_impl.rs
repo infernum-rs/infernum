@@ -23,7 +23,7 @@ impl Backend for CudaBackend {
     type PagedKvCache = crate::cuda::PagedKvCache;
     type KvCache = crate::cuda::KvCache;
     type RuntimeState = CudaRuntimeState;
-    type ExecutorState = ();
+    type ExecutorState = crate::inner::execute_context::CudaExecutorState;
     type Logits = CudaLogits;
 
     #[cfg(feature = "nccl")]
