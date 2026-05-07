@@ -1727,12 +1727,16 @@ impl<B: ContextBackend> OpNode<B> for ConcatSeqOp {
             .is_some_and(|kv| kv.cache_concat_info(node_id).is_some())
         {
             let new_row = B::ctx_read(ctx, inputs[1]);
-            let full_kv = ctx
-                .kv_cache
+            // NOTE: do NOT call ctx_write here. The arena slot was allocated
+            // for the initial kv_len (typically 1 token), but the accumulated
+            // KV tensor grows each step. Writing it to the arena would overflow
+            // the slot and corrupt adjacent tensor data. try_append_kv already
+            // stores the full updated cache in the KvCache's overrides map,
+            // where downstream ctx_read calls will find it.
+            ctx.kv_cache
                 .as_mut()
                 .and_then(|kv| kv.try_append_kv(node_id, &new_row))
                 .expect("cache_concat_info returned Some but try_append_kv returned None");
-            B::ctx_write(ctx, node_id, 0, full_kv);
             return Ok(());
         }
         // Plain concat path.
