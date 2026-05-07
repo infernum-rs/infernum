@@ -1110,13 +1110,29 @@ fn quantized_matmul_2d(
                 return quantized_matmul_fp8_cublas(input.context(), input, weight, m, n, k);
             }
 
-            // Per-channel scales: use stored buffer or broadcast scalar
+            // Per-channel scales: use the pre-allocated GPU buffer when
+            // available.  Weights with a scalar `weight_scale` have it
+            // broadcast to a full N-element `d_channel_scales` buffer by
+            // `QuantizedTensor::set_weight_scale` at load time, so the first
+            // branch covers both per-channel and broadcast-scalar cases.
+            // This avoids any host→device copy inside the capture boundary,
+            // which is required for CUDA graph capture on all GPU generations
+            // (including T4/sm_75 where htod_copy_into is synchronous).
             let scales_owned;
             let scales_slice = if let Some(cs) = weight.d_channel_scales() {
                 cs
             } else {
-                scales_owned = device.htod_sync_copy(&vec![weight.weight_scale(); n])?;
-                &scales_owned
+                // Last-resort fallback: weight has neither per-channel nor
+                // broadcast-scalar scales (weight_scale == 1.0).  Allocate
+                // an N-element buffer of 1.0s.  This path is only safe on
+                // sm_80+ (where memory pools make htod_copy_into async);
+                // in practice it is never reached for FP8 weights.
+                let ctx = input.context();
+                let mut buf = unsafe { ctx.pool_alloc::<f32>(n)? };
+                ctx.device()
+                    .htod_copy_into(vec![weight.weight_scale(); n], &mut *buf)?;
+                scales_owned = buf;
+                &*scales_owned
             };
 
             let func = device.get_func(module_name, "matmul_fp8_f32").unwrap();
