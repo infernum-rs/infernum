@@ -959,7 +959,7 @@ impl<B: ContextBackend + RopeOps> OpNode<B> for RopeBatchedOp {
 // FusedRopePairOp
 // ---------------------------------------------------------------------------
 
-/// Fused RoPE for Q and K tensors sharing the same cos/sin cache.
+/// Fused `RoPE` for Q and K tensors sharing the same cos/sin cache.
 ///
 /// Created at optimize time by [`crate::graph::optimizer::fuse_rope_pairs`]
 /// when two consecutive [`RopeOp`] nodes share identical cos/sin inputs.
@@ -1233,11 +1233,34 @@ impl<B: Backend + MatmulOps> OpNode<B> for PagedAttentionDecodeOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("PagedAttentionDecodeOp requires paged KV cache — handled by executor")
+        let q = ctx.read_tensor(inputs[0]);
+        let block_tables = ctx.read_tensor(inputs[1]);
+        let seq_lens = ctx.read_tensor(inputs[2]);
+        let max_blocks_per_seq = block_tables.shape()[1];
+        // max_seq_len is passed as 0 — the KvCacheAccess impl computes the
+        // real value from the seq_lens tensor, which requires backend-specific
+        // host data access (e.g. CudaTensor::to_vec).
+        let attn_out = ctx
+            .kv_cache
+            .as_mut()
+            .expect("paged_attention_decode requires a paged KV cache")
+            .paged_attention_decode(
+                self.layer_idx,
+                &q,
+                &block_tables,
+                &seq_lens,
+                self.block_size,
+                max_blocks_per_seq,
+                0, // sentinel: backend impl computes from seq_lens
+                self.softcap,
+                self.sliding_window,
+            )?;
+        ctx.write_tensor(node_id, 0, attn_out);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1333,13 +1356,34 @@ impl<B: Backend + MatmulOps> OpNode<B> for AppendPagedBatchedOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!(
-            "AppendPagedBatchedOp requires paged KV cache write access — handled by executor"
-        )
+        let k = ctx.read_tensor(inputs[0]);
+        let v = ctx.read_tensor(inputs[1]);
+        let block_tables = ctx.read_tensor(inputs[2]);
+        let positions = ctx.read_tensor(inputs[3]);
+        let batch_size = k.shape()[0];
+        let max_blocks_per_seq = block_tables.shape()[1];
+        ctx.kv_cache
+            .as_mut()
+            .expect("append_paged_batched requires a paged KV cache")
+            .append_paged_batched(
+                self.layer_idx,
+                &k,
+                &v,
+                &block_tables,
+                &positions,
+                batch_size,
+                max_blocks_per_seq,
+            )?;
+        // Side-effect op: write a dummy tensor to keep the buffer slot non-None.
+        // The executor allocates a slot for every node output via `.max(1)`, and
+        // the subsequent `paged_attention_decode` node takes a scheduling edge
+        // on `(node_id, 0)` — the slot must be filled, but the value is ignored.
+        ctx.write_tensor(node_id, 0, k);
+        Ok(())
     }
     fn is_side_effect(&self) -> bool {
         true

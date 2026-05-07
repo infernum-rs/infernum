@@ -208,12 +208,10 @@ fn read_tensor(
 
 /// Execute a computation graph on the CPU backend.
 ///
-/// Walks the `plan.schedule` in topological order. Built-in ops are dispatched
-/// via a `match op_name { ... }` block (zero overhead, no trait-object call).
-/// Rope-fusion look-ahead is handled inline in that block. Unknown or custom
-/// ops fall through to the `_ =>` arm, which constructs an [`ExecuteContext`]
-/// and calls `node.op.execute(ctx)` — the open-dispatch path for ops added by
-/// external crates. Intermediate tensors are stored in the shared `arena`.
+/// Walks the `plan.schedule` in topological order. All ops are dispatched
+/// through [`ExecuteContext`] and `node.op.execute(ctx)` — each op's own
+/// `execute()` implementation in `builtin_ops.rs` handles its logic.
+/// Intermediate tensors are stored in the shared `arena`.
 ///
 /// # Arguments
 ///
@@ -238,33 +236,22 @@ pub fn execute(
     mut kv_cache: Option<&mut KvCacheStore>,
 ) -> Result<Vec<CpuTensor>> {
     let mut input_idx: usize = 0;
-    // Tensor overrides: nodes whose output lives outside the arena (e.g., KV
-    // caches in the persistent `KvCacheStore`). `read_tensor` is bypassed for
-    // these — the override is consumed directly instead of copying through arena.
-    let mut overrides: HashMap<NodeId, CpuTensor> = HashMap::new();
 
     for &node_id in &plan.schedule {
         let node = &nodes[node_id.index() as usize];
-        let op_name = node.op.name();
-
-        match op_name {
-            // --- Open dispatch: custom / unknown ops self-execute via OpNode::execute ---
-            _ => {
-                let mut ctx = infernum::graph::execute_context::ExecuteContext {
-                    state: arena,
-                    plan,
-                    nodes,
-                    weights,
-                    device: &(),
-                    kv_cache: kv_cache.as_deref_mut().map(|kv| {
-                        kv as &mut dyn infernum::graph::execute_context::KvCacheAccess<CpuBackend>
-                    }),
-                    input_tensors: inputs,
-                    input_idx: &mut input_idx,
-                };
-                node.op.execute(&mut ctx, node_id, &node.inputs)?;
-            }
-        }
+        let mut ctx = infernum::graph::execute_context::ExecuteContext {
+            state: arena,
+            plan,
+            nodes,
+            weights,
+            device: &(),
+            kv_cache: kv_cache.as_deref_mut().map(|kv| {
+                kv as &mut dyn infernum::graph::execute_context::KvCacheAccess<CpuBackend>
+            }),
+            input_tensors: inputs,
+            input_idx: &mut input_idx,
+        };
+        node.op.execute(&mut ctx, node_id, &node.inputs)?;
     }
 
     // Update persistent KV cache length after all layers have appended.
@@ -272,14 +259,10 @@ pub fn execute(
         kv.len += 1;
     }
 
-    // Collect output tensors (check overrides first, then arena).
+    // Collect output tensors from the arena.
     let outputs = output_nodes
         .iter()
-        .map(|&id| {
-            overrides
-                .remove(&id)
-                .unwrap_or_else(|| read_tensor(arena, plan, nodes, (id, 0)))
-        })
+        .map(|&id| read_tensor(arena, plan, nodes, (id, 0)))
         .collect();
 
     Ok(outputs)

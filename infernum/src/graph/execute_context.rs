@@ -46,6 +46,75 @@ pub trait KvCacheAccess<B: Backend> {
     /// Called after all ops in one decode step have executed, to advance
     /// internal sequence-length counters.
     fn finalize_step(&mut self);
+
+    /// Append K/V tensors to the paged cache (batched, device-side block tables).
+    ///
+    /// `block_tables`: shape `(batch_size, max_blocks_per_seq)` i32 tensor.
+    /// `positions`: shape `(batch_size,)` i32 tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend has no paged KV cache or if the kernel fails.
+    #[allow(clippy::too_many_arguments)]
+    fn append_paged_batched(
+        &mut self,
+        layer_idx: usize,
+        k: &B::Tensor,
+        v: &B::Tensor,
+        block_tables: &B::Tensor,
+        positions: &B::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> crate::error::Result<()> {
+        let _ = (
+            layer_idx,
+            k,
+            v,
+            block_tables,
+            positions,
+            batch_size,
+            max_blocks_per_seq,
+        );
+        Err(crate::error::Error::Other(
+            "append_paged_batched not supported by this KV cache".to_string(),
+        ))
+    }
+
+    /// Paged attention decode: attends over the paged KV pool for `layer_idx`.
+    ///
+    /// Returns the attention output tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend has no paged KV cache or if the kernel fails.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_attention_decode(
+        &mut self,
+        layer_idx: usize,
+        q: &B::Tensor,
+        block_tables: &B::Tensor,
+        seq_lens: &B::Tensor,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+        softcap: Option<f32>,
+        sliding_window: Option<usize>,
+    ) -> crate::error::Result<B::Tensor> {
+        let _ = (
+            layer_idx,
+            q,
+            block_tables,
+            seq_lens,
+            block_size,
+            max_blocks_per_seq,
+            max_seq_len,
+            softcap,
+            sliding_window,
+        );
+        Err(crate::error::Error::Other(
+            "paged_attention_decode not supported by this KV cache".to_string(),
+        ))
+    }
 }
 
 /// Context passed to each op's [`super::op_node::OpNode::execute`] method.
