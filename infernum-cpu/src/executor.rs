@@ -6,26 +6,16 @@
 //!
 //! ## Dispatch strategy
 //!
-//! Almost all ops are dispatched through the `_ =>` fallback arm, which
-//! constructs an [`ExecuteContext`] and calls `node.op.execute(ctx)`. The
-//! op's own `execute()` implementation in `builtin_ops.rs` handles the logic.
-//!
-//! A small set of ops remain as named match arms because they require
-//! resources unavailable through the generic `OpNode::execute` interface:
-//!
-//! - `"moe_dispatch_softmax"` / `"moe_dispatch_sigmoid"` — closure-based
-//!   expert dispatch
+//! All ops are dispatched through the `_ =>` fallback arm, which constructs
+//! an [`ExecuteContext`] and calls `node.op.execute(ctx)`. Each op's own
+//! `execute()` implementation in `builtin_ops.rs` handles the logic.
 
 use std::collections::HashMap;
 
-use infernum::backend::{ArithOps, MatmulOps};
-use infernum::graph::builtin_ops::{MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp};
 use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
-use infernum::tensor::Tensor;
 use infernum::{DType, ExecutionPlan, NodeId, Result};
 
-use crate::simd;
 use crate::tensor::{CpuLinearWeight, CpuTensor};
 use crate::CpuBackend;
 
@@ -216,27 +206,6 @@ fn read_tensor(
     }
 }
 
-/// Write a tensor into the arena at the plan's buffer slot for a node output.
-fn write_tensor(
-    arena: &mut Arena,
-    plan: &ExecutionPlan,
-    node_id: NodeId,
-    output_idx: u32,
-    tensor: &CpuTensor,
-) {
-    if let Some(slot) = plan.slot(node_id, output_idx) {
-        if tensor.dtype() == DType::U32 {
-            let src = tensor.as_u32_slice();
-            let dst = arena.u32_slice_mut(slot.offset, src.len());
-            dst.copy_from_slice(src);
-        } else {
-            let src = tensor.as_f32_slice();
-            let dst = arena.f32_slice_mut(slot.offset, src.len());
-            dst.copy_from_slice(src);
-        }
-    }
-}
-
 /// Execute a computation graph on the CPU backend.
 ///
 /// Walks the `plan.schedule` in topological order. Built-in ops are dispatched
@@ -279,114 +248,6 @@ pub fn execute(
         let op_name = node.op.name();
 
         match op_name {
-            // --- MoE softmax dispatch (Mixtral, Qwen3-MoE) ---
-            "moe_dispatch_softmax" => {
-                use infernum::backend::MoeOps as _;
-                let op = node
-                    .op
-                    .as_any()
-                    .downcast_ref::<MoeDispatchSoftmaxOp>()
-                    .unwrap();
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let gate_t = weights.tensor_weight(op.gate);
-                let num_experts = op.experts.len();
-                let num_experts_per_tok = op.num_experts_per_tok;
-                let norm_topk = op.norm_topk;
-                // Snapshot expert weight IDs so we can pass them to the closure.
-                let expert_ids = op.experts.clone();
-                let result = crate::CpuBackend::moe_forward_softmax(
-                    &input,
-                    gate_t,
-                    num_experts,
-                    num_experts_per_tok,
-                    norm_topk,
-                    |expert_idx, expert_input| {
-                        let eids = &expert_ids[expert_idx];
-                        let gate_w = weights.linear_weight(eids.gate_proj);
-                        let up_w = weights.linear_weight(eids.up_proj);
-                        let down_w = weights.linear_weight(eids.down_proj);
-                        let gate_out = crate::CpuBackend::linear(expert_input, gate_w)?;
-                        let up_out = crate::CpuBackend::linear(expert_input, up_w)?;
-                        // Fused SiLU-Mul: gate_act[i] = silu(gate[i]) * up[i]
-                        let gate_data = gate_out.as_f32_slice();
-                        let up_data = up_out.as_f32_slice();
-                        let mut fused = vec![0.0f32; gate_data.len()];
-                        simd::vec_silu_mul(gate_data, up_data, &mut fused);
-                        let shape = gate_out.shape().to_vec();
-                        let activated = CpuTensor::from_f32_vec(&shape, fused);
-                        crate::CpuBackend::linear(&activated, down_w)
-                    },
-                )?;
-                write_tensor(arena, plan, node_id, 0, &result);
-            }
-
-            // --- MoE sigmoid dispatch with bias correction (DeepSeek) ---
-            "moe_dispatch_sigmoid" => {
-                use infernum::backend::MoeSigmoidOps as _;
-                let op = node
-                    .op
-                    .as_any()
-                    .downcast_ref::<MoeDispatchSigmoidOp>()
-                    .unwrap();
-                let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                let gate_t = weights.tensor_weight(op.gate);
-                let bias_data: Vec<f32> = if let Some(bias_id) = op.bias {
-                    weights.tensor_weight(bias_id).as_f32_slice().to_vec()
-                } else {
-                    vec![0.0f32; op.experts.len()]
-                };
-                let num_experts = op.experts.len();
-                let num_experts_per_tok = op.num_experts_per_tok;
-                let n_group = op.n_group;
-                let topk_group = op.topk_group;
-                let routed_scaling_factor = op.routed_scaling_factor;
-                let expert_ids = op.experts.clone();
-                let shared_ids = op.shared_expert.clone();
-                let mut result = crate::CpuBackend::moe_forward_sigmoid(
-                    &input,
-                    gate_t,
-                    &bias_data,
-                    num_experts,
-                    num_experts_per_tok,
-                    n_group,
-                    topk_group,
-                    false, // norm_topk_prob: DeepSeek normalises inside the kernel
-                    routed_scaling_factor,
-                    |expert_idx, expert_input| {
-                        let eids = &expert_ids[expert_idx];
-                        let gate_w = weights.linear_weight(eids.gate_proj);
-                        let up_w = weights.linear_weight(eids.up_proj);
-                        let down_w = weights.linear_weight(eids.down_proj);
-                        let gate_out = crate::CpuBackend::linear(expert_input, gate_w)?;
-                        let up_out = crate::CpuBackend::linear(expert_input, up_w)?;
-                        let gate_data = gate_out.as_f32_slice();
-                        let up_data = up_out.as_f32_slice();
-                        let mut fused = vec![0.0f32; gate_data.len()];
-                        simd::vec_silu_mul(gate_data, up_data, &mut fused);
-                        let shape = gate_out.shape().to_vec();
-                        let activated = CpuTensor::from_f32_vec(&shape, fused);
-                        crate::CpuBackend::linear(&activated, down_w)
-                    },
-                )?;
-                // Add shared expert output if present.
-                if let Some(sids) = shared_ids {
-                    let sg = weights.linear_weight(sids.gate_proj);
-                    let su = weights.linear_weight(sids.up_proj);
-                    let sd = weights.linear_weight(sids.down_proj);
-                    let sgate = crate::CpuBackend::linear(&input, sg)?;
-                    let sup_out = crate::CpuBackend::linear(&input, su)?;
-                    let shared_gate_data = sgate.as_f32_slice();
-                    let shared_up_data = sup_out.as_f32_slice();
-                    let mut sfused = vec![0.0f32; shared_gate_data.len()];
-                    simd::vec_silu_mul(shared_gate_data, shared_up_data, &mut sfused);
-                    let sshape = sgate.shape().to_vec();
-                    let sact = CpuTensor::from_f32_vec(&sshape, sfused);
-                    let shared_out = crate::CpuBackend::linear(&sact, sd)?;
-                    crate::CpuBackend::add_inplace(&mut result, &shared_out)?;
-                }
-                write_tensor(arena, plan, node_id, 0, &result);
-            }
-
             // --- Open dispatch: custom / unknown ops self-execute via OpNode::execute ---
             _ => {
                 let mut ctx = infernum::graph::execute_context::ExecuteContext {

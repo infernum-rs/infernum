@@ -282,7 +282,7 @@ fn fuse_rope_pairs<B: Backend + MatmulOps + RopeOps + ContextBackend>(graph: &mu
 mod tests {
     use super::*;
     use crate::dtype::DType;
-    use crate::graph::builder_traits::{GraphArithOps, GraphNormOps, GraphRopeOps, GraphSiluOps};
+    use crate::graph::builder_traits::{GraphArithOps, GraphNormOps, GraphSiluOps};
     use crate::graph::op_node::OutputRef;
 
     /// Minimal test backend (same pattern as graph/mod.rs tests).
@@ -460,6 +460,51 @@ mod tests {
     impl crate::backend::SwigluOps for TestBackend {
         fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> crate::Result<DummyTensor> {
             Ok(DummyTensor)
+        }
+    }
+
+    impl crate::backend::MoeOps for TestBackend {
+        fn moe_forward_softmax<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _norm_topk_prob: bool,
+            _expert_fn: F,
+        ) -> crate::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> crate::Result<DummyTensor>,
+        {
+            unimplemented!()
+        }
+    }
+
+    impl crate::backend::MoeSigmoidOps for TestBackend {
+        fn moe_forward_sigmoid<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _e_score_correction_bias: &[f32],
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _n_group: usize,
+            _topk_group: usize,
+            _norm_topk_prob: bool,
+            _routed_scaling_factor: f32,
+            _expert_fn: F,
+        ) -> crate::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> crate::Result<DummyTensor>,
+        {
+            unimplemented!()
+        }
+    }
+
+    impl crate::backend::TensorDataOps for TestBackend {
+        fn to_f32_vec(_tensor: &DummyTensor) -> crate::Result<Vec<f32>> {
+            unimplemented!()
+        }
+        fn to_raw_bytes(_tensor: &DummyTensor) -> crate::Result<Vec<u8>> {
+            unimplemented!()
         }
     }
 

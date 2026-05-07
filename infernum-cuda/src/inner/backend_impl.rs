@@ -610,9 +610,12 @@ impl MoeOps for CudaBackend {
     where
         F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
     {
+        // gate_weight is (num_experts, hidden_size) in checkpoint layout;
+        // moe_forward expects (hidden_size, num_experts) for hidden @ gate matmul.
+        let gate_t = crate::cuda::ops::transpose_2d(gate_weight)?;
         crate::cuda::moe::moe_forward(
             hidden,
-            gate_weight,
+            &gate_t,
             num_experts,
             num_experts_per_tok,
             norm_topk_prob,
@@ -637,9 +640,12 @@ impl MoeSigmoidOps for CudaBackend {
     where
         F: Fn(usize, &CudaTensor) -> Result<CudaTensor>,
     {
+        // gate_weight is (num_experts, hidden_size) in checkpoint layout;
+        // moe_forward_sigmoid expects (hidden_size, num_experts) for the routing matmul.
+        let gate_t = crate::cuda::ops::transpose_2d(gate_weight)?;
         crate::cuda::moe::moe_forward_sigmoid(
             hidden,
-            gate_weight,
+            &gate_t,
             e_score_correction_bias,
             num_experts,
             num_experts_per_tok,

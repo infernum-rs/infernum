@@ -1326,6 +1326,15 @@ mod tests {
         }
     }
 
+    impl infernum::backend::TensorDataOps for TestBackend {
+        fn to_f32_vec(_tensor: &DummyTensor) -> infernum::Result<Vec<f32>> {
+            unimplemented!()
+        }
+        fn to_raw_bytes(_tensor: &DummyTensor) -> infernum::Result<Vec<u8>> {
+            unimplemented!()
+        }
+    }
+
     impl infernum::backend::ContextBackend for TestBackend {
         fn ctx_read(
             _ctx: &infernum::graph::execute_context::ExecuteContext<'_, Self>,

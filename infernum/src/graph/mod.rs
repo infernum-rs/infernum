@@ -456,6 +456,51 @@ mod tests {
         }
     }
 
+    impl crate::backend::MoeOps for TestBackend {
+        fn moe_forward_softmax<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _norm_topk_prob: bool,
+            _expert_fn: F,
+        ) -> crate::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> crate::Result<DummyTensor>,
+        {
+            unimplemented!()
+        }
+    }
+
+    impl crate::backend::MoeSigmoidOps for TestBackend {
+        fn moe_forward_sigmoid<F>(
+            _hidden: &DummyTensor,
+            _gate_weight: &DummyTensor,
+            _e_score_correction_bias: &[f32],
+            _num_experts: usize,
+            _num_experts_per_tok: usize,
+            _n_group: usize,
+            _topk_group: usize,
+            _norm_topk_prob: bool,
+            _routed_scaling_factor: f32,
+            _expert_fn: F,
+        ) -> crate::Result<DummyTensor>
+        where
+            F: Fn(usize, &DummyTensor) -> crate::Result<DummyTensor>,
+        {
+            unimplemented!()
+        }
+    }
+
+    impl crate::backend::TensorDataOps for TestBackend {
+        fn to_f32_vec(_tensor: &DummyTensor) -> crate::Result<Vec<f32>> {
+            unimplemented!()
+        }
+        fn to_raw_bytes(_tensor: &DummyTensor) -> crate::Result<Vec<u8>> {
+            unimplemented!()
+        }
+    }
+
     impl crate::backend::ContextBackend for TestBackend {
         fn ctx_read(
             _ctx: &crate::graph::execute_context::ExecuteContext<'_, Self>,

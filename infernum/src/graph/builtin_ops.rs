@@ -10,7 +10,8 @@ use std::any::Any;
 
 use crate::backend::{
     ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, GegluOps,
-    MatmulExtOps, MatmulOps, NormOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorOps,
+    MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps,
+    SwigluOps, TensorOps,
 };
 use crate::dtype::DType;
 use crate::tensor::Tensor as TensorTrait;
@@ -1902,7 +1903,7 @@ pub struct MoeDispatchSoftmaxOp {
     pub norm_topk: bool,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSoftmaxOp {
+impl<B: ContextBackend> OpNode<B> for MoeDispatchSoftmaxOp {
     fn name(&self) -> &'static str {
         "moe_dispatch_softmax"
     }
@@ -1920,11 +1921,36 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSoftmaxOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        panic!("MoeDispatchSoftmaxOp requires closure-based expert dispatch — handled by executor")
+        let hidden = B::ctx_read(ctx, inputs[0]);
+        let gate = ctx.weights.tensor_weight(self.gate);
+        let num_experts = self.experts.len();
+        let expert_ids = &self.experts;
+        // Extract weights reference before closure to avoid borrowing ctx mutably
+        // while the closure holds an immutable borrow. `&WeightStore` is Copy.
+        let weights = ctx.weights;
+        let result = <B as MoeOps>::moe_forward_softmax(
+            &hidden,
+            gate,
+            num_experts,
+            self.num_experts_per_tok,
+            self.norm_topk,
+            |expert_idx, expert_input| {
+                let eids = &expert_ids[expert_idx];
+                let gate_w = weights.linear_weight(eids.gate_proj);
+                let up_w = weights.linear_weight(eids.up_proj);
+                let down_w = weights.linear_weight(eids.down_proj);
+                let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
+                let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
+                let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                <B as MatmulOps>::linear(&activated, down_w)
+            },
+        )?;
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1961,7 +1987,7 @@ pub struct MoeDispatchSigmoidOp {
     pub routed_scaling_factor: f32,
 }
 
-impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSigmoidOp {
+impl<B: ContextBackend> OpNode<B> for MoeDispatchSigmoidOp {
     fn name(&self) -> &'static str {
         "moe_dispatch_sigmoid"
     }
@@ -1979,11 +2005,57 @@ impl<B: Backend + MatmulOps> OpNode<B> for MoeDispatchSigmoidOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        panic!("MoeDispatchSigmoidOp requires closure-based expert dispatch — handled by executor")
+        let hidden = B::ctx_read(ctx, inputs[0]);
+        let gate = ctx.weights.tensor_weight(self.gate);
+        let bias_data: Vec<f32> = if let Some(bias_id) = self.bias {
+            B::to_f32_vec(ctx.weights.tensor_weight(bias_id))?
+        } else {
+            vec![0.0_f32; self.experts.len()]
+        };
+        let num_experts = self.experts.len();
+        let expert_ids = &self.experts;
+        let shared_ids = self.shared_expert.clone();
+        // Extract weights reference before closure to avoid borrowing ctx mutably
+        // while the closure holds an immutable borrow. `&WeightStore` is Copy.
+        let weights = ctx.weights;
+        let mut result = <B as MoeSigmoidOps>::moe_forward_sigmoid(
+            &hidden,
+            gate,
+            &bias_data,
+            num_experts,
+            self.num_experts_per_tok,
+            self.n_group,
+            self.topk_group,
+            false, // DeepSeek normalises inside the kernel
+            self.routed_scaling_factor,
+            |expert_idx, expert_input| {
+                let eids = &expert_ids[expert_idx];
+                let gate_w = weights.linear_weight(eids.gate_proj);
+                let up_w = weights.linear_weight(eids.up_proj);
+                let down_w = weights.linear_weight(eids.down_proj);
+                let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
+                let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
+                let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                <B as MatmulOps>::linear(&activated, down_w)
+            },
+        )?;
+        // Add shared expert output if present (DeepSeek shared expert).
+        if let Some(sids) = shared_ids {
+            let sg = weights.linear_weight(sids.gate_proj);
+            let su = weights.linear_weight(sids.up_proj);
+            let sd = weights.linear_weight(sids.down_proj);
+            let sgate = <B as MatmulOps>::linear(&hidden, sg)?;
+            let sup_out = <B as MatmulOps>::linear(&hidden, su)?;
+            let sact = <B as SwigluOps>::swiglu(&sgate, &sup_out)?;
+            let shared_out = <B as MatmulOps>::linear(&sact, sd)?;
+            <B as ArithOps>::add_inplace(&mut result, &shared_out)?;
+        }
+        B::ctx_write(ctx, node_id, 0, result);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
