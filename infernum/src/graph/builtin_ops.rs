@@ -625,7 +625,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for SiluOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!("SiluOp should be fused into SwigluOp by the graph optimiser")
+        // SiluOp requires f32 slice access which is not available on the
+        // generic Tensor trait. It is handled directly in the executor match arm.
+        unimplemented!("SiluOp: handled by executor (requires concrete tensor type)")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -2379,9 +2381,9 @@ impl<B: Backend + MatmulOps> OpNode<B> for LogitSoftcapOp {
         _node_id: NodeId,
         _inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!(
-            "LogitSoftcapOp requires backend-specific softcap kernel — handled by executor"
-        )
+        // LogitSoftcapOp requires f32 slice access which is not available on the
+        // generic Tensor trait. It is handled directly in the executor match arm.
+        unimplemented!("LogitSoftcapOp: handled by executor (requires concrete tensor type)")
     }
     fn as_any(&self) -> &dyn Any {
         self
