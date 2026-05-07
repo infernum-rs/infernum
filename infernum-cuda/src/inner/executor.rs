@@ -29,7 +29,7 @@ use infernum::graph::builtin_ops::{
     FusedAttentionDecodeOp, FusedAttentionPrefillOp, LinearOp, LinearPairOp, LinearTripleOp,
     LmHeadOp, LogitSoftcapOp, MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp,
     PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
-    RopeIndirectOp, RopeInterleavedOp, RopeOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
+    RopeInterleavedOp, ScaleOp, SliceViewOp, SplitInnerDimOp,
 };
 use infernum::graph::{GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -72,7 +72,7 @@ fn store(
 ///
 /// Walks the `plan.schedule` in topological order. Built-in ops are dispatched
 /// via a `match op_name { ... }` block (zero overhead, no trait-object call).
-/// Rope-fusion look-ahead is handled inline in that block. Unknown or custom
+/// Unknown or custom
 /// ops fall through to the `_ =>` arm, which constructs an [`ExecuteContext`]
 /// and calls `node.op.execute(ctx)` — the open-dispatch path for ops added by
 /// external crates. Intermediate tensors are stored as `CudaTensor` values
@@ -126,34 +126,6 @@ pub fn execute(
                 let tensor = inputs[input_idx].clone();
                 input_idx += 1;
                 store(&mut buffers, node_id, 0, tensor);
-            }
-
-            // --- RoPE ---
-            "rope" => {
-                let op = node.op.as_any().downcast_ref::<RopeOp>().unwrap();
-                let input = read(&buffers, node.inputs[0]);
-                let cos_cache = read(&buffers, node.inputs[1]);
-                let sin_cache = read(&buffers, node.inputs[2]);
-                // The rope kernel dispatches on input.dtype() and expects cos/sin
-                // to share that dtype. Precomputed caches are always F32, so cast
-                // them when the activation dtype differs (e.g. BF16 models).
-                let cos_cast;
-                let cos_ref = if cos_cache.dtype() == input.dtype() {
-                    cos_cache
-                } else {
-                    cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
-                    &cos_cast
-                };
-                let sin_cast;
-                let sin_ref = if sin_cache.dtype() == input.dtype() {
-                    sin_cache
-                } else {
-                    sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
-                    &sin_cast
-                };
-                let result =
-                    <CudaBackend as RopeOps>::apply_rope(input, cos_ref, sin_ref, op.offset)?;
-                store(&mut buffers, node_id, 0, result);
             }
 
             "rope_batched" => {

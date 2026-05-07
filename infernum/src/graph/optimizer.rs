@@ -8,18 +8,21 @@
 //! - `Silu(a) → Mul(silu_out, b)` → `Swiglu(a, b)` (when Silu has single consumer)
 //! - `Add(a, b) → RmsNorm(sum)` → `AddRmsNorm(a, b)` (when Add has single consumer)
 
-use crate::backend::{ArithOps, Backend, ContextBackend, MatmulOps, NormOps, SwigluOps};
+use crate::backend::{ArithOps, Backend, ContextBackend, MatmulOps, NormOps, RopeOps, SwigluOps};
 
 use super::builder::Graph;
-use super::builtin_ops::{AddRmsNormOp, RmsNormOp, SwigluOp};
+use super::builtin_ops::{AddRmsNormOp, FusedRopePairOp, RmsNormOp, RopeOp, SwigluOp};
 use super::node::NodeId;
 
 /// Apply all fusion rules to the graph in-place.
-pub fn optimize<B: Backend + MatmulOps + ArithOps + NormOps + SwigluOps + ContextBackend>(
+pub fn optimize<
+    B: Backend + MatmulOps + ArithOps + NormOps + SwigluOps + RopeOps + ContextBackend,
+>(
     graph: &mut Graph<B>,
 ) {
     fuse_swiglu(graph);
     fuse_add_rmsnorm(graph);
+    fuse_rope_pairs(graph);
 }
 
 /// Count how many nodes use any output of `target` as an input.
@@ -170,11 +173,116 @@ fn fuse_add_rmsnorm<B: Backend + MatmulOps + ArithOps + NormOps + ContextBackend
     }
 }
 
+/// Fuse pairs of `RopeOp` nodes sharing the same cos/sin inputs.
+///
+/// When two `RopeOp` nodes in the graph both read from the same `cos` and
+/// `sin` cache, they can be dispatched together as a single
+/// [`FusedRopePairOp`].  This is the typical Q/K pattern in every transformer
+/// layer.
+///
+/// After fusion:
+/// - Node A becomes `FusedRopePairOp` with inputs
+///   `[A_input, B_input, cos, sin]` and two outputs.
+/// - All downstream consumers of node B's output `(B_id, 0)` are rewired to
+///   `(A_id, 1)`.
+/// - Node B's inputs are cleared, making it dead (the planner will drop it).
+///
+/// The pass runs over all node indices and is idempotent (a rope node is only
+/// ever fused once because after fusion its name changes to
+/// `"fused_rope_pair"`).
+#[allow(clippy::cast_possible_truncation)] // graph will never have 2^32 nodes
+fn fuse_rope_pairs<B: Backend + MatmulOps + RopeOps + ContextBackend>(graph: &mut Graph<B>) {
+    let n = graph.nodes.len();
+    // Collect all RopeOp node indices first to avoid borrow issues.
+    let rope_nodes: Vec<usize> = (0..n)
+        .filter(|&i| graph.nodes[i].op.name() == "rope")
+        .collect();
+
+    // Set of node indices already fused (as the second operand) — skip them.
+    let mut fused_as_b: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for &i in &rope_nodes {
+        if fused_as_b.contains(&i) {
+            continue;
+        }
+
+        // Extract A's inputs: [A_input, cos_ref, sin_ref].
+        if graph.nodes[i].inputs.len() != 3 {
+            continue;
+        }
+        let a_input_ref = graph.nodes[i].inputs[0];
+        let cos_ref = graph.nodes[i].inputs[1];
+        let sin_ref = graph.nodes[i].inputs[2];
+
+        // Extract A's position offset.
+        let offset_a = {
+            let Some(rope_a) = graph.nodes[i].op.as_any().downcast_ref::<RopeOp>() else {
+                continue;
+            };
+            rope_a.offset
+        };
+
+        // Find another RopeOp that shares the same cos/sin.
+        let Some(&j) = rope_nodes.iter().find(|&&j| {
+            j != i
+                && !fused_as_b.contains(&j)
+                && graph.nodes[j].inputs.len() == 3
+                && graph.nodes[j].inputs[1] == cos_ref
+                && graph.nodes[j].inputs[2] == sin_ref
+        }) else {
+            continue;
+        };
+
+        let b_input_ref = graph.nodes[j].inputs[0];
+        let offset_b = {
+            let Some(rope_b) = graph.nodes[j].op.as_any().downcast_ref::<RopeOp>() else {
+                continue;
+            };
+            rope_b.offset
+        };
+
+        let a_id = NodeId(i as u32);
+        let b_id = NodeId(j as u32);
+
+        // Replace node A with FusedRopePairOp.
+        graph.nodes[i].op = Box::new(FusedRopePairOp { offset_a, offset_b });
+        // New inputs: [A_input, B_input, cos, sin].
+        graph.nodes[i].inputs = vec![a_input_ref, b_input_ref, cos_ref, sin_ref].into();
+        // Add a second output for the K result.
+        let shape_b = graph.nodes[j].output_shapes[0].clone();
+        let dtype_b = graph.nodes[j].output_dtypes[0];
+        graph.nodes[i].output_shapes.push(shape_b);
+        graph.nodes[i].output_dtypes.push(dtype_b);
+
+        // Rewire all consumers of B's output (B_id, 0) → (A_id, 1).
+        let old_b_ref = (b_id, 0u32);
+        let new_b_ref = (a_id, 1u32);
+        for k in 0..graph.nodes.len() {
+            for l in 0..graph.nodes[k].inputs.len() {
+                if graph.nodes[k].inputs[l] == old_b_ref {
+                    graph.nodes[k].inputs[l] = new_b_ref;
+                }
+            }
+        }
+        // Rewire graph outputs too.
+        for out in &mut graph.outputs {
+            if *out == b_id {
+                *out = a_id;
+            }
+        }
+
+        // Kill node B.
+        graph.nodes[j].inputs.clear();
+
+        fused_as_b.insert(j);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dtype::DType;
-    use crate::graph::builder_traits::{GraphArithOps, GraphNormOps, GraphSiluOps};
+    use crate::graph::builder_traits::{GraphArithOps, GraphNormOps, GraphRopeOps, GraphSiluOps};
     use crate::graph::op_node::OutputRef;
 
     /// Minimal test backend (same pattern as graph/mod.rs tests).
@@ -329,6 +437,26 @@ mod tests {
         }
     }
 
+    impl crate::backend::RopeOps for TestBackend {
+        fn apply_rope(
+            _input: &DummyTensor,
+            _cos_cache: &DummyTensor,
+            _sin_cache: &DummyTensor,
+            _position_offset: usize,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+        fn apply_rope_batched(
+            _input: &DummyTensor,
+            _cos_cache: &DummyTensor,
+            _sin_cache: &DummyTensor,
+            _positions: &DummyTensor,
+            _batch_size: usize,
+        ) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     impl crate::backend::SwigluOps for TestBackend {
         fn swiglu(_gate: &DummyTensor, _up: &DummyTensor) -> crate::Result<DummyTensor> {
             Ok(DummyTensor)
@@ -407,6 +535,70 @@ mod tests {
             "Expected mul (unfused), got {}",
             mul_node.op.name()
         );
+    }
+
+    #[test]
+    fn fuse_rope_pair_shared_cos_sin() {
+        use crate::graph::builder_traits::GraphRopeOps as _;
+        let mut graph = Graph::<TestBackend>::new();
+
+        // seq=8, heads=4, head_dim=64
+        let q = graph.add_input(&[8, 4, 64], DType::F32);
+        let k = graph.add_input(&[8, 4, 64], DType::F32);
+        let cos = graph.add_input(&[8, 32], DType::F32);
+        let sin = graph.add_input(&[8, 32], DType::F32);
+
+        let q_rope = graph.add_rope(q, cos, sin, 0);
+        let k_rope = graph.add_rope(k, cos, sin, 0);
+        graph.set_output(q_rope.0);
+        graph.set_output(k_rope.0);
+
+        optimize(&mut graph);
+
+        // Q node should have become FusedRopePairOp.
+        let q_node = &graph.nodes[q_rope.0 .0 as usize];
+        assert_eq!(
+            q_node.op.name(),
+            "fused_rope_pair",
+            "Expected fused_rope_pair, got {}",
+            q_node.op.name()
+        );
+        // FusedRopePairOp has 4 inputs and 2 outputs.
+        assert_eq!(q_node.inputs.len(), 4);
+        assert_eq!(q_node.output_shapes.len(), 2);
+        assert_eq!(q_node.output_dtypes.len(), 2);
+
+        // K node should be dead (inputs cleared).
+        let k_node = &graph.nodes[k_rope.0 .0 as usize];
+        assert!(k_node.inputs.is_empty());
+
+        // Graph outputs should both point at the Q (fused) node.
+        assert_eq!(graph.outputs[0], q_rope.0);
+        assert_eq!(graph.outputs[1], q_rope.0);
+    }
+
+    #[test]
+    fn no_fuse_rope_different_cos_sin() {
+        use crate::graph::builder_traits::GraphRopeOps as _;
+        let mut graph = Graph::<TestBackend>::new();
+
+        let q = graph.add_input(&[8, 4, 64], DType::F32);
+        let k = graph.add_input(&[8, 4, 64], DType::F32);
+        let cos1 = graph.add_input(&[8, 32], DType::F32);
+        let sin1 = graph.add_input(&[8, 32], DType::F32);
+        let cos2 = graph.add_input(&[8, 32], DType::F32);
+        let sin2 = graph.add_input(&[8, 32], DType::F32);
+
+        let q_rope = graph.add_rope(q, cos1, sin1, 0);
+        let k_rope = graph.add_rope(k, cos2, sin2, 0);
+        graph.set_output(q_rope.0);
+        graph.set_output(k_rope.0);
+
+        optimize(&mut graph);
+
+        // Neither should be fused — different cos/sin.
+        assert_eq!(graph.nodes[q_rope.0 .0 as usize].op.name(), "rope");
+        assert_eq!(graph.nodes[k_rope.0 .0 as usize].op.name(), "rope");
     }
 
     #[test]

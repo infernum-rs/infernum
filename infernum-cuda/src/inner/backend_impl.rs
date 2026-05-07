@@ -361,7 +361,23 @@ impl RopeOps for CudaBackend {
         sin_cache: &CudaTensor,
         position_offset: usize,
     ) -> Result<CudaTensor> {
-        ops::apply_rope(input, cos_cache, sin_cache, position_offset)
+        // RoPE caches are stored as F32 but the activation tensor may be BF16
+        // or F16. Cast cos/sin to match the input dtype before dispatching.
+        let cos_cast;
+        let cos_ref = if cos_cache.dtype() == input.dtype() {
+            cos_cache
+        } else {
+            cos_cast = ops::cast_from_f32(cos_cache, input.dtype())?;
+            &cos_cast
+        };
+        let sin_cast;
+        let sin_ref = if sin_cache.dtype() == input.dtype() {
+            sin_cache
+        } else {
+            sin_cast = ops::cast_from_f32(sin_cache, input.dtype())?;
+            &sin_cast
+        };
+        ops::apply_rope(input, cos_ref, sin_ref, position_offset)
     }
 
     fn apply_rope_batched(

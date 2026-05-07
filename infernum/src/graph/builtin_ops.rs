@@ -955,6 +955,74 @@ impl<B: ContextBackend + RopeOps> OpNode<B> for RopeBatchedOp {
 }
 
 // ---------------------------------------------------------------------------
+// FusedRopePairOp
+// ---------------------------------------------------------------------------
+
+/// Fused RoPE for Q and K tensors sharing the same cos/sin cache.
+///
+/// Created at optimize time by [`crate::graph::optimizer::fuse_rope_pairs`]
+/// when two consecutive [`RopeOp`] nodes share identical cos/sin inputs.
+/// Produces two outputs (RoPE-applied Q and K) in a single dispatch.
+///
+/// Shape contract:
+/// - `inputs[0]` — Q tensor `(seq, num_q_heads, head_dim)`
+/// - `inputs[1]` — K tensor `(seq, num_k_heads, head_dim)`
+/// - `inputs[2]` — cos cache (shared by both)
+/// - `inputs[3]` — sin cache (shared by both)
+/// - `outputs[0]` — RoPE-applied Q (same shape as input 0)
+/// - `outputs[1]` — RoPE-applied K (same shape as input 1)
+#[derive(Debug)]
+pub struct FusedRopePairOp {
+    /// Position offset for the Q rope (first operand).
+    pub offset_a: usize,
+    /// Position offset for the K rope (second operand).
+    pub offset_b: usize,
+}
+
+impl<B: ContextBackend + RopeOps> OpNode<B> for FusedRopePairOp {
+    fn name(&self) -> &'static str {
+        "fused_rope_pair"
+    }
+    fn num_inputs(&self) -> usize {
+        4
+    }
+    fn num_outputs(&self) -> usize {
+        2
+    }
+    fn output_shapes(&self, input_shapes: &[&[usize]]) -> Vec<Vec<usize>> {
+        vec![input_shapes[0].to_vec(), input_shapes[1].to_vec()]
+    }
+    fn output_dtypes(&self, input_dtypes: &[DType]) -> Vec<DType> {
+        vec![input_dtypes[0], input_dtypes[1]]
+    }
+    fn execute(
+        &self,
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
+    ) -> Result<()> {
+        let input_a = B::ctx_read(ctx, inputs[0]);
+        let input_b = B::ctx_read(ctx, inputs[1]);
+        let cos = B::ctx_read(ctx, inputs[2]);
+        let sin = B::ctx_read(ctx, inputs[3]);
+        let (out_a, out_b) = <B as RopeOps>::apply_rope_pair(
+            &input_a,
+            &input_b,
+            &cos,
+            &sin,
+            self.offset_a,
+            self.offset_b,
+        )?;
+        B::ctx_write(ctx, node_id, 0, out_a);
+        B::ctx_write(ctx, node_id, 1, out_b);
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RopeInterleavedOp
 // ---------------------------------------------------------------------------
 

@@ -14,16 +14,14 @@
 //! resources unavailable through the generic `OpNode::execute` interface:
 //!
 //! - `"input"` — KV cache routing (reads from persistent [`KvCacheStore`])
-//! - `"rope"` — look-ahead Q+K fusion (fuses consecutive rope ops into one
-//!   SIMD dispatch)
 //! - `"moe_dispatch_softmax"` / `"moe_dispatch_sigmoid"` — closure-based
 //!   expert dispatch
 //! - `"concat_seq"` — KV cache sequence concatenation
 
 use std::collections::HashMap;
 
-use infernum::backend::{ArithOps, MatmulOps, RopeOps};
-use infernum::graph::builtin_ops::{MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, RopeOp};
+use infernum::backend::{ArithOps, MatmulOps};
+use infernum::graph::builtin_ops::{MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp};
 use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
 use infernum::tensor::Tensor;
@@ -277,10 +275,7 @@ pub fn execute(
     // these — the override is consumed directly instead of copying through arena.
     let mut overrides: HashMap<NodeId, CpuTensor> = HashMap::new();
 
-    let mut sched_idx = 0;
-    while sched_idx < plan.schedule.len() {
-        let node_id = plan.schedule[sched_idx];
-        sched_idx += 1;
+    for &node_id in &plan.schedule {
         let node = &nodes[node_id.index() as usize];
         let op_name = node.op.name();
 
@@ -297,143 +292,6 @@ pub fn execute(
                 let tensor = &inputs[input_idx];
                 input_idx += 1;
                 write_tensor(arena, plan, node_id, 0, tensor);
-            }
-
-            // --- RoPE (zero-copy, with pair fusion) ---
-            "rope" => {
-                let op = node.op.as_any().downcast_ref::<RopeOp>().unwrap();
-                let cos_ref = node.inputs[1];
-                let sin_ref = node.inputs[2];
-                let cos_node = &nodes[cos_ref.0.index() as usize];
-                let sin_node = &nodes[sin_ref.0.index() as usize];
-
-                // Check if cos/sin are f32 in the arena.
-                if cos_node.output_dtypes[cos_ref.1 as usize] != DType::F32
-                    || sin_node.output_dtypes[sin_ref.1 as usize] != DType::F32
-                {
-                    // Fallback: cos/sin need dtype conversion.
-                    let input = read_tensor(arena, plan, nodes, node.inputs[0]);
-                    let cos_cache = read_tensor(arena, plan, nodes, cos_ref);
-                    let sin_cache = read_tensor(arena, plan, nodes, sin_ref);
-                    let result = <CpuBackend as RopeOps>::apply_rope(
-                        &input, &cos_cache, &sin_cache, op.offset,
-                    )?;
-                    write_tensor(arena, plan, node_id, 0, &result);
-                } else {
-                    // Check if the next scheduled op is also Rope with same
-                    // cos/sin inputs — if so, fuse both into one dispatch.
-                    let next_rope = if sched_idx < plan.schedule.len() {
-                        let next_id = plan.schedule[sched_idx];
-                        let next_node = &nodes[next_id.index() as usize];
-                        if next_node.op.name() == "rope" {
-                            let next_op = next_node.op.as_any().downcast_ref::<RopeOp>().unwrap();
-                            let n2_cos_ref = next_node.inputs[1];
-                            let n2_sin_ref = next_node.inputs[2];
-                            let n2_cos_node = &nodes[n2_cos_ref.0.index() as usize];
-                            let n2_sin_node = &nodes[n2_sin_ref.0.index() as usize];
-                            if n2_cos_ref == cos_ref
-                                && n2_sin_ref == sin_ref
-                                && n2_cos_node.output_dtypes[n2_cos_ref.1 as usize] == DType::F32
-                                && n2_sin_node.output_dtypes[n2_sin_ref.1 as usize] == DType::F32
-                            {
-                                Some((next_id, next_node, next_op.offset))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let cos_slot = plan
-                        .slot(cos_ref.0, cos_ref.1)
-                        .expect("rope cos has no slot");
-                    let sin_slot = plan
-                        .slot(sin_ref.0, sin_ref.1)
-                        .expect("rope sin has no slot");
-                    let cos_shape = &cos_node.output_shapes[cos_ref.1 as usize];
-                    let sin_shape = &sin_node.output_shapes[sin_ref.1 as usize];
-                    let cos_elements: usize = cos_shape.iter().product();
-                    let sin_elements: usize = sin_shape.iter().product();
-
-                    let base = arena.as_mut_ptr();
-                    let shape = &node.output_shapes[0];
-
-                    if let Some((next_id, next_node, offset_b)) = next_rope {
-                        // Fused pair: execute both ropes in a single dispatch.
-                        sched_idx += 1; // skip the second Rope
-
-                        let (inp_a_nid, inp_a_oidx) = node.inputs[0];
-                        let inp_a = plan.slot(inp_a_nid, inp_a_oidx).expect("rope A input");
-                        let out_a = plan.slot(node_id, 0).expect("rope A output");
-                        let (next_inp_nid, next_inp_oidx) = next_node.inputs[0];
-                        let inp_b = plan
-                            .slot(next_inp_nid, next_inp_oidx)
-                            .expect("rope B input");
-                        let out_b = plan.slot(next_id, 0).expect("rope B output");
-
-                        let next_shape = &next_node.output_shapes[0];
-                        unsafe {
-                            let cos_data = std::slice::from_raw_parts(
-                                base.add(cos_slot.offset).cast::<f32>(),
-                                cos_elements,
-                            );
-                            let sin_data = std::slice::from_raw_parts(
-                                base.add(sin_slot.offset).cast::<f32>(),
-                                sin_elements,
-                            );
-                            let op_a = crate::ops::rope::RopeOperand {
-                                inp_ptr: base.add(inp_a.offset) as usize,
-                                out_ptr: base.add(out_a.offset) as usize,
-                                seq_len: shape[0],
-                                num_heads: shape[1],
-                                head_dim: shape[2],
-                                offset: op.offset,
-                            };
-                            let op_b = crate::ops::rope::RopeOperand {
-                                inp_ptr: base.add(inp_b.offset) as usize,
-                                out_ptr: base.add(out_b.offset) as usize,
-                                seq_len: next_shape[0],
-                                num_heads: next_shape[1],
-                                head_dim: next_shape[2],
-                                offset: offset_b,
-                            };
-                            crate::ops::rope::apply_rope_pair_slices(
-                                &op_a, &op_b, cos_data, sin_data,
-                            );
-                        }
-                    } else {
-                        // Single rope — no fusion possible.
-                        let (inp_nid, inp_oidx) = node.inputs[0];
-                        let inp_slot = plan.slot(inp_nid, inp_oidx).expect("rope input");
-                        let out_slot = plan.slot(node_id, 0).expect("rope output");
-                        let num_elements: usize = shape.iter().product();
-                        unsafe {
-                            let input = std::slice::from_raw_parts(
-                                base.add(inp_slot.offset).cast::<f32>(),
-                                num_elements,
-                            );
-                            let cos_data = std::slice::from_raw_parts(
-                                base.add(cos_slot.offset).cast::<f32>(),
-                                cos_elements,
-                            );
-                            let sin_data = std::slice::from_raw_parts(
-                                base.add(sin_slot.offset).cast::<f32>(),
-                                sin_elements,
-                            );
-                            let output = std::slice::from_raw_parts_mut(
-                                base.add(out_slot.offset).cast::<f32>(),
-                                num_elements,
-                            );
-                            crate::ops::rope::apply_rope_slices(
-                                input, cos_data, sin_data, output, shape[0], shape[1], shape[2],
-                                op.offset,
-                            );
-                        }
-                    }
-                }
             }
 
             // --- Shape / Data movement ---

@@ -511,6 +511,24 @@ pub trait RopeOps: Backend {
         positions: &Self::Tensor,
         batch_size: usize,
     ) -> Result<Self::Tensor>;
+
+    /// Apply RoPE to two tensors (Q and K) sharing the same cos/sin cache.
+    ///
+    /// Backends that support a fused parallel dispatch (e.g. the CPU thread
+    /// pool) should override this method. The default implementation falls
+    /// back to two sequential [`apply_rope`](Self::apply_rope) calls.
+    fn apply_rope_pair(
+        input_a: &Self::Tensor,
+        input_b: &Self::Tensor,
+        cos_cache: &Self::Tensor,
+        sin_cache: &Self::Tensor,
+        offset_a: usize,
+        offset_b: usize,
+    ) -> Result<(Self::Tensor, Self::Tensor)> {
+        let a = Self::apply_rope(input_a, cos_cache, sin_cache, offset_a)?;
+        let b = Self::apply_rope(input_b, cos_cache, sin_cache, offset_b)?;
+        Ok((a, b))
+    }
 }
 
 /// Rotary positional embedding (interleaved layout, used by DeepSeek).

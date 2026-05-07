@@ -23,7 +23,7 @@ pub use builder_traits::{
     GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
     GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
 };
-pub use builtin_ops::{MlaAttentionOp, MoeExpertIds};
+pub use builtin_ops::{FusedRopePairOp, MlaAttentionOp, MoeExpertIds};
 pub use execute_context::{ExecuteContext, KvCacheAccess};
 pub use node::{GraphNode, NodeId, WeightId, WeightMeta, WeightRef};
 pub use op_node::{OpNode, OutputRef};
