@@ -18,7 +18,6 @@ use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_gemma::{GemmaMetalGraphEngine, GemmaMetalGraphEngineExt as _};
-use infernum_llama::LlamaModel;
 use infernum_llama::{LlamaMetalGraphEngine, LlamaMetalGraphEngineExt as _};
 use infernum_metal::{MetalBackend, MetalContext};
 use infernum_qwen::{QwenMetalGraphEngine, QwenMetalGraphEngineExt as _};
@@ -245,28 +244,9 @@ fn main() -> Result<()> {
     let is_gguf = cli.model.ends_with(".gguf");
 
     if is_gguf {
-        let arch = detect_gguf_arch(&cli.model)?;
-        println!(
-            "Loading model from: {} (Metal, GGUF, arch={arch})",
-            cli.model
-        );
-
-        match arch.as_str() {
-            "llama" => {
-                let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
-                let tokenizer =
-                    Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?);
-                let model = LlamaModel::<MetalBackend>::from_gguf(&ctx, Path::new(&cli.model))?;
-                run_model(model, tokenizer, &cli)
-            }
-            _ => {
-                eprintln!(
-                    "GGUF loading on Metal graph engine is only supported for Llama. 
-                     Unsupported architecture: {arch}"
-                );
-                std::process::exit(1);
-            }
-        }
+        eprintln!("GGUF loading is not yet supported on the Metal graph engine.");
+        eprintln!("Please use a SafeTensors model directory instead.");
+        std::process::exit(1);
     } else {
         let model_type = detect_model_type(&cli.model)?;
         println!(
