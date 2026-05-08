@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
+use infernum::tokenizer::LlamaTokenizer;
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_gemma::{GemmaMetalGraphEngine, GemmaMetalGraphEngineExt as _};
@@ -81,35 +81,30 @@ struct Cli {
 /// Abstraction over tokenizer backends so we can use either one.
 enum Tokenizer {
     HuggingFace(LlamaTokenizer),
-    Gguf(GgufTokenizer),
 }
 
 impl infernum::Tokenizer for Tokenizer {
     fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         match self {
             Self::HuggingFace(t) => t.encode(text, add_bos),
-            Self::Gguf(t) => t.encode(text, add_bos),
         }
     }
 
     fn decode(&self, ids: &[u32]) -> Result<String> {
         match self {
             Self::HuggingFace(t) => t.decode(ids),
-            Self::Gguf(t) => t.decode(ids),
         }
     }
 
     fn decode_token(&self, id: u32) -> Result<String> {
         match self {
             Self::HuggingFace(t) => t.decode_token(id),
-            Self::Gguf(t) => t.decode_token(id),
         }
     }
 
     fn eos_token_id(&self) -> u32 {
         match self {
             Self::HuggingFace(t) => t.eos_token_id(),
-            Self::Gguf(t) => t.eos_token_id(),
         }
     }
 }
@@ -118,7 +113,6 @@ impl Tokenizer {
     fn vocab_size(&self) -> usize {
         match self {
             Self::HuggingFace(t) => t.vocab_size(),
-            Self::Gguf(t) => t.vocab_size(),
         }
     }
 }
@@ -223,18 +217,6 @@ fn detect_model_type(model_path: &str) -> Result<String> {
     let config: serde_json::Value = serde_json::from_str(&config_str)?;
     let model_type = config["model_type"].as_str().unwrap_or("llama").to_string();
     Ok(model_type)
-}
-
-/// Detect architecture from GGUF metadata.
-fn detect_gguf_arch(path: &str) -> Result<String> {
-    let loader = infernum::weights::gguf::GgufLoader::from_file(path)?;
-    let arch = loader
-        .metadata()
-        .get("general.architecture")
-        .and_then(infernum::GgufValue::as_str)
-        .unwrap_or("llama")
-        .to_string();
-    Ok(arch)
 }
 
 fn main() -> Result<()> {
