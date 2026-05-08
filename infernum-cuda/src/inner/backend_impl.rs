@@ -1,11 +1,7 @@
 //! `CudaBackend` — implements the infernum `Backend` + op traits for CUDA.
 
 use infernum::backend::{
-<<<<<<< HEAD
     ArgmaxLastOps, ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps,
-=======
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, FusedDecodeOps, GegluOps,
->>>>>>> e5dc174 (perf: fuse RoPE+KV-append and SwiGLU+down_proj dispatches)
     KvCacheOps, MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps,
     PagedKvCacheOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };

@@ -7,6 +7,8 @@ pub mod cuda_graph_engine;
 pub mod graph_builder;
 #[cfg(feature = "cpu")]
 pub mod graph_engine;
+#[cfg(feature = "metal")]
+pub mod metal_graph_engine;
 
 pub use chat_templates::{Llama3Template, MistralTemplate};
 pub use config::{LlamaConfig, QuantizationConfig};
@@ -20,3 +22,5 @@ pub use graph_builder::{
 };
 #[cfg(feature = "cpu")]
 pub use graph_engine::{GraphKvCache, LlamaGraphEngine, LlamaGraphEngineExt};
+#[cfg(feature = "metal")]
+pub use metal_graph_engine::{LlamaMetalGraphEngine, LlamaMetalGraphEngineExt};

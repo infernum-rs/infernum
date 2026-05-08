@@ -3,6 +3,7 @@
 //! Op modules are added incrementally as kernels are implemented.
 
 pub mod activation;
+pub mod argmax;
 pub mod arith;
 pub mod attention;
 pub mod bias;

@@ -9,7 +9,7 @@ build = "build.rs"
 default = []
 cpu = ["dep:infernum-cpu", "infernum-llama/cpu", "infernum-gemma/cpu", "infernum-qwen/cpu"]
 cuda = ["dep:cudarc", "infernum-cuda", "infernum-cuda/cuda", "infernum-serve/cuda", "infernum-llama/cuda", "infernum-gemma/cuda", "infernum-qwen/cuda", "infernum-deepseek/cuda"]
-metal = ["dep:infernum-metal"]
+metal = ["dep:infernum-metal", "infernum-llama/metal", "infernum-qwen/metal", "infernum-gemma/metal"]
 nccl = ["cuda", "infernum-cuda/nccl", "infernum-llama/nccl", "infernum-gemma/nccl", "infernum-qwen/nccl"]
 
 [dependencies]

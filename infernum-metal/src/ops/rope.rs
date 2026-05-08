@@ -28,16 +28,6 @@ struct RopeInterleavedParams {
     pos_offset: u32,
 }
 
-/// Packed params struct matching MSL `RopeQkParams`.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct RopeQkParams {
-    q_heads: u32,
-    k_heads: u32,
-    head_dim: u32,
-    half_dim: u32,
-}
-
 impl RopeOps for MetalBackend {
     #[allow(clippy::cast_possible_truncation)]
     fn apply_rope(
@@ -121,57 +111,6 @@ impl RopeOps for MetalBackend {
         );
 
         Ok(out)
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn apply_rope_qk_batched(
-        q: &MetalTensor,
-        k: &MetalTensor,
-        cos_cache: &MetalTensor,
-        sin_cache: &MetalTensor,
-        positions: &MetalTensor,
-        batch_size: usize,
-    ) -> Result<(MetalTensor, MetalTensor)> {
-        let q_shape = q.shape();
-        let k_shape = k.shape();
-        let q_heads = q_shape[1];
-        let k_heads = k_shape[1];
-        let head_dim = q_shape[2];
-        let half_dim = head_dim / 2;
-
-        let ctx = q.context();
-        let q_out = MetalTensor::zeros(ctx, q_shape, q.dtype());
-        let k_out = MetalTensor::zeros(ctx, k_shape, q.dtype());
-
-        let n = batch_size * (q_heads + k_heads) * half_dim;
-        let params = RopeQkParams {
-            q_heads: q_heads as u32,
-            k_heads: k_heads as u32,
-            head_dim: head_dim as u32,
-            half_dim: half_dim as u32,
-        };
-
-        let kernel = if q.dtype() == DType::F16 {
-            "apply_rope_qk_batched_f16"
-        } else {
-            "apply_rope_qk_batched_f32"
-        };
-        ctx.dispatch_1d(
-            kernel,
-            &[
-                (q.metal_buffer(), q.buffer_offset()),
-                (k.metal_buffer(), k.buffer_offset()),
-                (cos_cache.metal_buffer(), cos_cache.buffer_offset()),
-                (sin_cache.metal_buffer(), sin_cache.buffer_offset()),
-                (positions.metal_buffer(), positions.buffer_offset()),
-                (q_out.metal_buffer(), q_out.buffer_offset()),
-                (k_out.metal_buffer(), k_out.buffer_offset()),
-            ],
-            bytemuck::bytes_of(&params),
-            n,
-        );
-
-        Ok((q_out, k_out))
     }
 }
 
@@ -263,66 +202,5 @@ mod tests {
         let out = MetalBackend::apply_rope_interleaved(&input, &cos, &sin, 0).unwrap();
         let result = MetalBackend::to_f32_vec(&out).unwrap();
         assert_eq!(result, [1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_rope_qk_fused_matches_separate() {
-        let c = ctx();
-        // GQA config: batch=2, q_heads=4, k_heads=2, head_dim=4
-        let q_data: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect(); // 2*4*4=32
-        let k_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.2 + 1.0).collect(); // 2*2*4=16
-        let q = MetalBackend::from_f32_slice(&c, &[2, 4, 4], &q_data).unwrap();
-        let k = MetalBackend::from_f32_slice(&c, &[2, 2, 4], &k_data).unwrap();
-        // cos/sin at positions 3,7 — 2 positions, half_dim=2
-        let cos = MetalBackend::from_f32_slice(
-            &c,
-            &[8, 2],
-            &[
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // pos 0-2 unused
-                0.5, 0.6, // pos 3
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // pos 4-6 unused
-                0.7, 0.8, // pos 7
-            ],
-        )
-        .unwrap();
-        let sin = MetalBackend::from_f32_slice(
-            &c,
-            &[8, 2],
-            &[
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // pos 0-2 unused
-                0.3, 0.4, // pos 3
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // pos 4-6 unused
-                0.1, 0.2, // pos 7
-            ],
-        )
-        .unwrap();
-        let positions =
-            MetalTensor::from_raw_bytes(&c, &[2], DType::U32, bytemuck::cast_slice(&[3i32, 7]));
-
-        // Separate path
-        let q_sep = MetalBackend::apply_rope_batched(&q, &cos, &sin, &positions, 2).unwrap();
-        let k_sep = MetalBackend::apply_rope_batched(&k, &cos, &sin, &positions, 2).unwrap();
-        let q_sep_data = MetalBackend::to_f32_vec(&q_sep).unwrap();
-        let k_sep_data = MetalBackend::to_f32_vec(&k_sep).unwrap();
-
-        // Fused path
-        let (q_fused, k_fused) =
-            MetalBackend::apply_rope_qk_batched(&q, &k, &cos, &sin, &positions, 2).unwrap();
-        let q_fused_data = MetalBackend::to_f32_vec(&q_fused).unwrap();
-        let k_fused_data = MetalBackend::to_f32_vec(&k_fused).unwrap();
-
-        // Compare
-        for (i, (a, b)) in q_sep_data.iter().zip(&q_fused_data).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "Q mismatch at {i}: sep={a}, fused={b}"
-            );
-        }
-        for (i, (a, b)) in k_sep_data.iter().zip(&k_fused_data).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "K mismatch at {i}: sep={a}, fused={b}"
-            );
-        }
     }
 }

@@ -92,6 +92,38 @@ impl ArithOps for MetalBackend {
         );
         Ok(())
     }
+
+    fn silu(input: &MetalTensor) -> Result<MetalTensor> {
+        let n = input.numel();
+        let ctx = input.context();
+        let out = MetalTensor::zeros(ctx, input.shape(), DType::F32);
+        ctx.dispatch_1d(
+            "silu_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            &[],
+            n,
+        );
+        Ok(out)
+    }
+
+    fn logit_softcap(input: &MetalTensor, cap: f32) -> Result<MetalTensor> {
+        let n = input.numel();
+        let ctx = input.context();
+        let out = MetalTensor::zeros(ctx, input.shape(), DType::F32);
+        ctx.dispatch_1d(
+            "logit_softcap_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&cap),
+            n,
+        );
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +173,31 @@ mod tests {
         MetalBackend::scale_inplace(&mut a, 0.5).unwrap();
         let result = MetalBackend::to_f32_vec(&a).unwrap();
         assert_eq!(result, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_silu() {
+        let c = ctx();
+        let input = MetalBackend::from_f32_slice(&c, &[3], &[0.0, 1.0, -1.0]).unwrap();
+        let out = MetalBackend::silu(&input).unwrap();
+        let result = MetalBackend::to_f32_vec(&out).unwrap();
+        // silu(0) = 0, silu(1) ≈ 0.7311, silu(-1) ≈ -0.2689
+        assert!(result[0].abs() < 1e-6);
+        assert!((result[1] - 0.7311).abs() < 1e-3);
+        assert!((result[2] - (-0.2689)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_logit_softcap() {
+        let c = ctx();
+        let input = MetalBackend::from_f32_slice(&c, &[3], &[0.0, 50.0, -50.0]).unwrap();
+        let out = MetalBackend::logit_softcap(&input, 10.0).unwrap();
+        let result = MetalBackend::to_f32_vec(&out).unwrap();
+        // softcap(0, 10) = tanh(0) * 10 = 0
+        assert!(result[0].abs() < 1e-6);
+        // softcap(50, 10) = tanh(5) * 10 ≈ 10 (saturated)
+        assert!((result[1] - 10.0).abs() < 0.01);
+        // softcap(-50, 10) = tanh(-5) * 10 ≈ -10
+        assert!((result[2] - (-10.0)).abs() < 0.01);
     }
 }

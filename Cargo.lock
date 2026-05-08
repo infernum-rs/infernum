@@ -1064,6 +1064,7 @@ dependencies = [
  "infernum",
  "infernum-cpu",
  "infernum-cuda",
+ "infernum-metal",
  "infernum-runtime",
  "serde",
  "serde_json",
@@ -1077,6 +1078,7 @@ dependencies = [
  "infernum",
  "infernum-cpu",
  "infernum-cuda",
+ "infernum-metal",
  "serde",
  "serde_json",
 ]
@@ -1124,6 +1126,7 @@ dependencies = [
  "infernum",
  "infernum-cpu",
  "infernum-cuda",
+ "infernum-metal",
  "infernum-runtime",
  "serde",
  "serde_json",

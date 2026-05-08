@@ -15,6 +15,9 @@
 )]
 
 pub mod context;
+pub mod execute_context;
+pub mod executor;
+pub mod graph_engine;
 pub mod logits;
 pub mod ops;
 pub mod tensor;
@@ -23,6 +26,7 @@ pub mod weights;
 use infernum::backend::Backend;
 
 pub use context::MetalContext;
+pub use graph_engine::{load_graph_weights_metal, MetalGraphEngine, MetalGraphEngineConfig};
 pub use logits::MetalLogits;
 pub use tensor::MetalTensor;
 pub use weights::{MetalLinearWeight, MetalQuantizedWeight, MetalSafeTensorsLoader};
@@ -64,6 +68,20 @@ pub(crate) struct MetalKvLayer {
 // SAFETY: MetalKvCache contains a MetalContext (Arc-wrapped, thread-safe) and Vec data.
 unsafe impl Send for MetalKvCache {}
 
+/// Executor state for graph-mode inference on Metal.
+///
+/// Mirrors the CUDA executor state: a 2D grid of optional tensors indexed
+/// by `(node_id, output_idx)`. Each graph node writes its outputs here
+/// during execution, and downstream nodes read them via `ctx_read`.
+pub struct MetalExecutorState {
+    /// Per-node output buffers: `buffers[node_id][output_idx]`.
+    pub buffers: Vec<Vec<Option<MetalTensor>>>,
+}
+
+// SAFETY: `MetalExecutorState` is only constructed and used within a single
+// `execute` call on one thread.
+unsafe impl Send for MetalExecutorState {}
+
 /// Marker type for the Metal backend.
 ///
 /// All op trait impls are on this type. Models parameterised by
@@ -76,6 +94,7 @@ impl Backend for MetalBackend {
     type PagedKvCache = MetalPagedKvCache;
     type KvCache = MetalKvCache;
     type RuntimeState = ();
+    type ExecutorState = MetalExecutorState;
     type Logits = MetalLogits;
     type Comm = ();
 

@@ -708,7 +708,7 @@ pub trait FusedDecodeOps: RopeOps + PagedKvCacheOps {
     /// Applies RoPE to Q and K, writes rotated K + V directly to the paged
     /// KV cache. Returns the rotated Q tensor.
     ///
-    /// Default: calls `apply_rope_qk_batched` + `append_paged_batched`.
+    /// Default: calls `apply_rope_batched` on Q and K + `append_paged_batched`.
     #[allow(clippy::too_many_arguments)]
     fn rope_kv_append_batched(
         q: &Self::Tensor,
@@ -723,8 +723,8 @@ pub trait FusedDecodeOps: RopeOps + PagedKvCacheOps {
         batch_size: usize,
         max_blocks_per_seq: usize,
     ) -> Result<Self::Tensor> {
-        let (q_rot, k_rot) =
-            Self::apply_rope_qk_batched(q, k, cos_cache, sin_cache, positions, batch_size)?;
+        let q_rot = Self::apply_rope_batched(q, cos_cache, sin_cache, positions, batch_size)?;
+        let k_rot = Self::apply_rope_batched(k, cos_cache, sin_cache, positions, batch_size)?;
         Self::append_paged_batched(
             paged_kv,
             layer_idx,

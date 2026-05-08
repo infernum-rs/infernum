@@ -17,17 +17,18 @@ use clap::Parser;
 use infernum::tokenizer::{GgufTokenizer, LlamaTokenizer};
 use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result, SamplingParams};
-use infernum_gemma::GemmaModel;
+use infernum_gemma::{GemmaMetalGraphEngine, GemmaMetalGraphEngineExt as _};
 use infernum_llama::LlamaModel;
+use infernum_llama::{LlamaMetalGraphEngine, LlamaMetalGraphEngineExt as _};
 use infernum_metal::{MetalBackend, MetalContext};
-use infernum_qwen::QwenModel;
+use infernum_qwen::{QwenMetalGraphEngine, QwenMetalGraphEngineExt as _};
 use infernum_runtime::{Engine, Runtime};
 
 /// Metal text generation with LLMs (SafeTensors + GGUF)
 ///
 /// Supports Llama, Mistral, Mixtral, Qwen, and Gemma model families.
-/// SafeTensors models load as f32. GGUF models load quantized weights
-/// (Q8_0, Q4_0, Q4_1) with dequantize-on-the-fly inference.
+/// SafeTensors models use the graph engine path (f32).
+/// GGUF models use the legacy model path (Llama only).
 /// Architecture is auto-detected from config.json or GGUF metadata.
 /// Uses KV cache and nucleus sampling by default.
 #[derive(Parser)]
@@ -250,25 +251,19 @@ fn main() -> Result<()> {
             cli.model
         );
 
-        let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
-        let tokenizer = Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?);
-
         match arch.as_str() {
             "llama" => {
+                let loader = infernum::weights::gguf::GgufLoader::from_file(&cli.model)?;
+                let tokenizer =
+                    Tokenizer::Gguf(GgufTokenizer::from_gguf_metadata(loader.metadata())?);
                 let model = LlamaModel::<MetalBackend>::from_gguf(&ctx, Path::new(&cli.model))?;
                 run_model(model, tokenizer, &cli)
             }
-            "qwen2" => {
-                let model = QwenModel::<MetalBackend>::from_gguf(&ctx, Path::new(&cli.model))?;
-                run_model(model, tokenizer, &cli)
-            }
-            "gemma2" | "gemma3" => {
-                let model = GemmaModel::<MetalBackend>::from_gguf(&ctx, Path::new(&cli.model))?;
-                run_model(model, tokenizer, &cli)
-            }
             _ => {
-                eprintln!("Unsupported GGUF architecture: {arch}");
-                eprintln!("Supported: llama, qwen2, gemma2, gemma3");
+                eprintln!(
+                    "GGUF loading on Metal graph engine is only supported for Llama. 
+                     Unsupported architecture: {arch}"
+                );
                 std::process::exit(1);
             }
         }
@@ -280,18 +275,19 @@ fn main() -> Result<()> {
         );
 
         let tokenizer = Tokenizer::HuggingFace(LlamaTokenizer::from_pretrained(&cli.model)?);
+        let model_dir = Path::new(&cli.model);
 
         match model_type.as_str() {
             "llama" | "mistral" => {
-                let model = LlamaModel::<MetalBackend>::from_pretrained(&ctx, &cli.model)?;
+                let model = LlamaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
                 run_model(model, tokenizer, &cli)
             }
             "qwen2" | "qwen3" => {
-                let model = QwenModel::<MetalBackend>::from_pretrained(&ctx, &cli.model)?;
+                let model = QwenMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
                 run_model(model, tokenizer, &cli)
             }
             "gemma2" | "gemma3_text" => {
-                let model = GemmaModel::<MetalBackend>::from_pretrained(&ctx, &cli.model)?;
+                let model = GemmaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
                 run_model(model, tokenizer, &cli)
             }
             _ => {
