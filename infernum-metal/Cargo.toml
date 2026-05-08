@@ -42,8 +42,8 @@ inventory = "0.3"
 
 [dev-dependencies]
 approx = "0.5"
-infernum-llama = { path = "../infernum-llama" }
-infernum-qwen = { path = "../infernum-qwen" }
-infernum-gemma = { path = "../infernum-gemma" }
+infernum-llama = { path = "../infernum-llama", features = ["metal"] }
+infernum-qwen = { path = "../infernum-qwen", features = ["metal"] }
+infernum-gemma = { path = "../infernum-gemma", features = ["metal"] }
 infernum-runtime = { path = "../infernum-runtime" }
 ureq = { version = "3", features = ["json"] }
