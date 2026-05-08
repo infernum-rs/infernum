@@ -229,7 +229,7 @@ impl MetalContext {
             let total_time: Duration = entries.iter().map(|(_, s)| s.total_time).sum();
             let total_ms = total_time.as_secs_f64() * 1000.0;
 
-            entries.sort_by(|a, b| b.1.total_time.cmp(&a.1.total_time));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1.total_time));
 
             eprintln!();
             eprintln!(
