@@ -314,10 +314,13 @@ impl MetalContext {
         // work while we're still encoding subsequent dispatches.
         cmd_ref.enqueue();
 
-        // Concurrent dispatch type lets the GPU reorder and overlap
-        // independent kernel dispatches within this command buffer.
+        // Serial dispatch type ensures kernels execute in recording order.
+        // This is required for correctness: the paged KV append (write) must
+        // complete before any paged attention decode (read) that follows it.
+        // Concurrent dispatch would allow the GPU to reorder these dependent
+        // operations, producing stale or garbage attention outputs.
         let enc =
-            cmd_ref.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+            cmd_ref.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
         let encoder = std::ptr::from_ref(enc).cast_mut();
         *active = Some(ActiveEncoder {
             cmd,
