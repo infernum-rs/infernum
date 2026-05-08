@@ -6,8 +6,8 @@ build = "build.rs"
 
 [features]
 default = []
-# Integration tests — downloads real models
-integration = []
+# Integration tests — downloads real models, enables metal graph engines in model crates
+integration = ["infernum-llama/metal", "infernum-qwen/metal", "infernum-gemma/metal"]
 
 [dependencies]
 # Core crate (tensor traits, ops, error types, weight loading)
@@ -42,8 +42,8 @@ inventory = "0.3"
 
 [dev-dependencies]
 approx = "0.5"
-infernum-llama = { path = "../infernum-llama", features = ["metal"] }
-infernum-qwen = { path = "../infernum-qwen", features = ["metal"] }
-infernum-gemma = { path = "../infernum-gemma", features = ["metal"] }
+infernum-llama = { path = "../infernum-llama" }
+infernum-qwen = { path = "../infernum-qwen" }
+infernum-gemma = { path = "../infernum-gemma" }
 infernum-runtime = { path = "../infernum-runtime" }
 ureq = { version = "3", features = ["json"] }
