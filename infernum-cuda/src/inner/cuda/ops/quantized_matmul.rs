@@ -66,12 +66,13 @@ const MMQ_Q8_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels/mmq_q8.
 /// Uses a single fused kernel that computes absmax and quantizes in one launch,
 /// eliminating the overhead of a separate absmax kernel call.
 ///
-/// Everything runs on the GPU — no CPU↔GPU synchronization.
+/// All temporary allocations go through the buffer pool so this function is
+/// safe to call inside a CUDA graph capture boundary.
 fn quantize_activations_to_fp8(
     ctx: &CudaContext,
     input: &CudaTensor,
     numel: usize,
-) -> Result<(CudaSlice<u8>, CudaSlice<f32>)> {
+) -> Result<(PooledSlice<u8>, PooledSlice<f32>)> {
     let device = ctx.device();
 
     let module_name = "fp8_quantize";
@@ -87,9 +88,12 @@ fn quantize_activations_to_fp8(
         )?;
     }
 
-    let mut max_bits = device.alloc_zeros::<u32>(1)?;
-    let mut act_fp8 = unsafe { device.alloc::<u8>(numel)? };
-    let mut d_inv_scale = unsafe { device.alloc::<f32>(1)? };
+    // Use pool allocations so this function is safe inside a CUDA graph
+    // capture boundary — raw cudaMalloc is forbidden during capture.
+    let mut max_bits = unsafe { ctx.pool_alloc::<u32>(1)? };
+    device.memset_zeros(&mut *max_bits)?; // async; capture-safe
+    let mut act_fp8 = unsafe { ctx.pool_alloc::<u8>(numel)? };
+    let mut d_inv_scale = unsafe { ctx.pool_alloc::<f32>(1)? };
 
     let threads = 256;
     let blocks = ((numel + threads - 1) / threads).min(1024);
@@ -112,7 +116,7 @@ fn quantize_activations_to_fp8(
 
     let absmax_func = device.get_func(module_name, "absmax_f32").unwrap();
     unsafe {
-        absmax_func.launch(cfg, (&input.cuda_slice(), &mut max_bits, numel as i32))?;
+        absmax_func.launch(cfg, (&input.cuda_slice(), &mut *max_bits, numel as i32))?;
     }
 
     let quant_func = device.get_func(module_name, "quantize_f32_to_fp8").unwrap();
@@ -121,9 +125,9 @@ fn quantize_activations_to_fp8(
             cfg,
             (
                 &input.cuda_slice(),
-                &mut act_fp8,
-                &max_bits,
-                &mut d_inv_scale,
+                &mut *act_fp8,
+                &*max_bits,
+                &mut *d_inv_scale,
                 numel as i32,
             ),
         )?;
@@ -149,13 +153,17 @@ fn execute_fp8_gemm(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor> {
-    // Resolve weight scale from the tensor
+    // Resolve weight scale from the tensor. Use pool + async htod_copy_into
+    // instead of htod_sync_copy so this is safe inside a CUDA graph capture.
     let d_scale_b_owned;
     let d_scale_b = if let Some(s) = weight.d_weight_scale() {
         s
     } else {
-        d_scale_b_owned = ctx.device().htod_sync_copy(&[weight.weight_scale()])?;
-        &d_scale_b_owned
+        let mut buf = unsafe { ctx.pool_alloc::<f32>(1)? };
+        ctx.device()
+            .htod_copy_into(vec![weight.weight_scale()], &mut *buf)?;
+        d_scale_b_owned = buf;
+        &*d_scale_b_owned
     };
     execute_fp8_gemm_with_scale(ctx, act_fp8, weight, d_inv_scale_a, d_scale_b, m, n, k)
 }
@@ -295,8 +303,10 @@ fn quantized_matmul_fp8_cublas(
     let (act_fp8, d_inv_scale_a) = quantize_activations_to_fp8(ctx, input, m * k)?;
 
     if let Some(channel_scales) = weight.d_channel_scales() {
-        // Per-channel scales: run GEMM with weight_scale=1.0, then post-multiply
-        let d_one = ctx.device().htod_sync_copy(&[1.0_f32])?;
+        // Per-channel scales: run GEMM with weight_scale=1.0, then post-multiply.
+        // Use pool + async htod_copy_into so this is safe inside a graph capture.
+        let mut d_one = unsafe { ctx.pool_alloc::<f32>(1)? };
+        ctx.device().htod_copy_into(vec![1.0_f32], &mut *d_one)?;
         let mut output =
             execute_fp8_gemm_with_scale(ctx, &act_fp8, weight, &d_inv_scale_a, &d_one, m, n, k)?;
 
@@ -1100,13 +1110,29 @@ fn quantized_matmul_2d(
                 return quantized_matmul_fp8_cublas(input.context(), input, weight, m, n, k);
             }
 
-            // Per-channel scales: use stored buffer or broadcast scalar
+            // Per-channel scales: use the pre-allocated GPU buffer when
+            // available.  Weights with a scalar `weight_scale` have it
+            // broadcast to a full N-element `d_channel_scales` buffer by
+            // `QuantizedTensor::set_weight_scale` at load time, so the first
+            // branch covers both per-channel and broadcast-scalar cases.
+            // This avoids any host→device copy inside the capture boundary,
+            // which is required for CUDA graph capture on all GPU generations
+            // (including T4/sm_75 where htod_copy_into is synchronous).
             let scales_owned;
             let scales_slice = if let Some(cs) = weight.d_channel_scales() {
                 cs
             } else {
-                scales_owned = device.htod_sync_copy(&vec![weight.weight_scale(); n])?;
-                &scales_owned
+                // Last-resort fallback: weight has neither per-channel nor
+                // broadcast-scalar scales (weight_scale == 1.0).  Allocate
+                // an N-element buffer of 1.0s.  This path is only safe on
+                // sm_80+ (where memory pools make htod_copy_into async);
+                // in practice it is never reached for FP8 weights.
+                let ctx = input.context();
+                let mut buf = unsafe { ctx.pool_alloc::<f32>(n)? };
+                ctx.device()
+                    .htod_copy_into(vec![weight.weight_scale(); n], &mut *buf)?;
+                scales_owned = buf;
+                &*scales_owned
             };
 
             let func = device.get_func(module_name, "matmul_fp8_f32").unwrap();
@@ -2212,8 +2238,8 @@ mod tests {
         let (act_fp8, d_inv_scale) =
             quantize_activations_to_fp8(&ctx, &input, values.len()).unwrap();
 
-        let fp8_host = ctx.device().dtoh_sync_copy(&act_fp8).unwrap();
-        let inv_scale = ctx.device().dtoh_sync_copy(&d_inv_scale).unwrap()[0];
+        let fp8_host = ctx.device().dtoh_sync_copy(&*act_fp8).unwrap();
+        let inv_scale = ctx.device().dtoh_sync_copy(&*d_inv_scale).unwrap()[0];
 
         // Dequantize and check roundtrip accuracy
         for (i, &original) in values.iter().enumerate() {

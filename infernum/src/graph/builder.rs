@@ -211,6 +211,30 @@ impl<B: Backend + MatmulOps + ContextBackend> Graph<B> {
     pub fn linear_weight_count(&self) -> usize {
         self.linear_weights.len()
     }
+
+    /// Returns `true` if the graph contains any operation that is incompatible
+    /// with CUDA stream capture.
+    ///
+    /// Operations are capture-unsafe when they perform synchronous host↔device
+    /// copies (`cuStreamSynchronize`, `dtoh_sync_copy`, `htod_sync_copy`) or
+    /// allocate device memory (`cuMemAlloc`) during the forward pass:
+    ///
+    /// - `moe_dispatch_softmax` / `moe_dispatch_sigmoid` — `MoE` routing calls
+    ///   `logits_to_f32_host` (a D→H sync copy) for host-side top-K selection.
+    /// - `logit_softcap` — Gemma 2 final logit soft-capping implements via a
+    ///   full CPU round-trip (`to_vec` + `from_slice`), both sync.
+    ///
+    /// When this returns `true`, callers should skip CUDA graph capture and
+    /// always run the executor eagerly.
+    #[must_use]
+    pub fn has_capture_unsafe_ops(&self) -> bool {
+        self.nodes.iter().any(|n| {
+            matches!(
+                n.op.name(),
+                "moe_dispatch_softmax" | "moe_dispatch_sigmoid" | "logit_softcap"
+            )
+        })
+    }
 }
 
 impl<B: Backend + MatmulOps + ContextBackend> Default for Graph<B> {

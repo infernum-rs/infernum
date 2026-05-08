@@ -17,6 +17,11 @@ use infernum::Result;
 /// Stores raw bytes (`CudaSlice<u8>`) — the tensor's `DType` determines
 /// interpretation. When pool-backed, the buffer is leaked on drop and the
 /// raw device pointer is returned to the pool for reuse.
+///
+/// When `owned` is `false` the buffer is a non-owning view (e.g. wrapping a
+/// pre-allocated `GraphInputs` buffer).  In that case the `CudaSlice<u8>` is
+/// forgotten on drop so that `cuMemFree` is **not** called — the real owner
+/// (e.g. `GraphInputs`) manages the lifetime of the device memory.
 struct PoolableBuffer {
     /// The raw GPU allocation (bytes). Wrapped in `Option` so we can `take()`
     /// it in `drop()` to call `leak()`.
@@ -25,6 +30,8 @@ struct PoolableBuffer {
     pool: Option<BufferPool>,
     /// Original byte size of the allocation (for pool bookkeeping).
     byte_size: usize,
+    /// When `false`, the slice is forgotten on drop (non-owning view).
+    owned: bool,
 }
 
 impl PoolableBuffer {
@@ -34,6 +41,7 @@ impl PoolableBuffer {
             slice: Some(slice),
             pool: None,
             byte_size: 0,
+            owned: true,
         }
     }
 
@@ -43,12 +51,33 @@ impl PoolableBuffer {
             slice: Some(slice),
             pool: Some(pool),
             byte_size,
+            owned: true,
+        }
+    }
+
+    /// Wrap a `CudaSlice<u8>` as a non-owning view.
+    ///
+    /// The slice is forgotten on drop — `cuMemFree` is NOT called.
+    /// The caller guarantees the device memory outlives this buffer.
+    fn non_owning(slice: CudaSlice<u8>) -> Self {
+        Self {
+            slice: Some(slice),
+            pool: None,
+            byte_size: 0,
+            owned: false,
         }
     }
 }
 
 impl Drop for PoolableBuffer {
     fn drop(&mut self) {
+        if !self.owned {
+            // Non-owning view: forget the slice to suppress cuMemFree.
+            if let Some(slice) = self.slice.take() {
+                std::mem::forget(slice);
+            }
+            return;
+        }
         if let (Some(pool), Some(slice)) = (self.pool.take(), self.slice.take()) {
             // Leak the CudaSlice (suppresses cuMemFree) and return to pool.
             pool.release(slice, self.byte_size);
@@ -130,6 +159,49 @@ impl CudaTensor {
             dtype: T::DTYPE,
             ctx: ctx.clone(),
         })
+    }
+
+    /// Create a non-owning `CudaTensor` view over an existing `CudaSlice<T>`.
+    ///
+    /// The tensor borrows the device memory from `slice` without taking
+    /// ownership and without copying.  The caller is responsible for ensuring
+    /// that `slice` outlives the returned `CudaTensor`.
+    ///
+    /// Internally this reinterprets the typed device pointer as `CudaSlice<u8>`
+    /// wrapped in a non-owning buffer that suppresses `cuMemFree` on drop.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shape.iter().product()` does not equal `slice.len()`.
+    #[must_use]
+    pub fn from_cuda_slice_view<T: TensorDType + DeviceRepr>(
+        ctx: &CudaContext,
+        shape: &[usize],
+        slice: &CudaSlice<T>,
+    ) -> Self {
+        let numel: usize = shape.iter().product();
+        assert_eq!(
+            slice.len(),
+            numel,
+            "from_cuda_slice_view: slice length {} doesn't match shape {:?} (numel={})",
+            slice.len(),
+            shape,
+            numel
+        );
+        let byte_size = numel * std::mem::size_of::<T>();
+        let raw_ptr = *slice.device_ptr();
+        // Reinterpret the typed device pointer as CudaSlice<u8>. The
+        // PoolableBuffer is marked non_owning so it forgets (never frees) the
+        // slice on drop — the real owner (GraphInputs) manages the allocation.
+        let raw_slice: CudaSlice<u8> =
+            unsafe { ctx.device().upgrade_device_ptr(raw_ptr, byte_size) };
+        Self {
+            data: Arc::new(PoolableBuffer::non_owning(raw_slice)),
+            offset_bytes: 0,
+            shape: shape.to_vec(),
+            dtype: T::DTYPE,
+            ctx: ctx.clone(),
+        }
     }
 
     /// Create an uninitialized tensor on the GPU.

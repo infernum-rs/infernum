@@ -560,6 +560,17 @@ mod tests {
         }
     }
 
+    // NOTE: `ArgmaxLastOps` is required by `GraphArgmaxOps`. This impl is
+    // local to this test module because `TestBackend` is defined here.
+    // The canonical no-op body is identical across all test backends; the
+    // orphan rule prevents moving it to `test_helpers` without also moving
+    // the `TestBackend` type itself.
+    impl crate::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> crate::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
     #[test]
     fn fuse_silu_mul_into_swiglu() {
         let mut graph = Graph::<TestBackend>::new();

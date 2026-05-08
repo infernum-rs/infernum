@@ -214,7 +214,14 @@ impl QuantizedTensor {
     /// Returns an error if GPU allocation fails.
     pub fn set_weight_scale(&mut self, ctx: &CudaContext, scale: f32) -> Result<()> {
         self.weight_scale = scale;
+        // Upload a 1-element buffer for kernels that accept a scalar pointer.
         self.d_weight_scale = Some(ctx.device().htod_sync_copy(&[scale])?);
+        // Broadcast the scalar to a full N-element channel-scales buffer so
+        // that `matmul_fp8_f32` (which reads `channel_scales[n]` for each
+        // output column `n`) can use it safely — including inside a CUDA graph
+        // capture boundary where host→device copies are forbidden.
+        let n = self.shape[0];
+        self.d_channel_scales = Some(ctx.device().htod_sync_copy(&vec![scale; n])?);
         Ok(())
     }
 

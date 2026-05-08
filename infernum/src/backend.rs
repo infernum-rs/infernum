@@ -846,11 +846,33 @@ pub trait MultiDeviceOps: Backend {
     ) -> Result<Self::Comm>;
 }
 
-/// Backend-specific tensor I/O for the executor context.
+// ---------------------------------------------------------------------------
+// ArgmaxLastOps
+// ---------------------------------------------------------------------------
+
+/// Compute device-side argmax over the last dimension of a 2D tensor.
 ///
-/// Implements read/write/next_input through the [`ExecuteContext`] for each
-/// backend. The generic [`OpNode::execute`](crate::graph::OpNode::execute)
-/// bodies call these static methods so that context interaction is
+/// Returns a `[num_rows]` tensor of `U32` indices — one argmax per row.
+/// Used by [`crate::graph::builtin_ops::ArgmaxLastOp`] so that the op can
+/// self-execute generically without a named arm in any executor.
+pub trait ArgmaxLastOps: Backend {
+    /// Argmax over the last dimension of `input` (shape `[rows, cols]`).
+    ///
+    /// Returns a tensor of shape `[rows]` with dtype `U32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying kernel or computation fails.
+    fn argmax_last_tensor(input: &Self::Tensor) -> crate::error::Result<Self::Tensor>;
+}
+
+// ---------------------------------------------------------------------------
+// ContextBackend
+// ---------------------------------------------------------------------------
+
+/// Static-dispatch helpers for op bodies interacting with [`ExecuteContext`].
+///
+/// Op bodies call these static methods so that context interaction is
 /// backend-dispatched without requiring inherent impls on the foreign
 /// `ExecuteContext` type (which would violate Rust's orphan rules).
 ///
@@ -858,6 +880,7 @@ pub trait MultiDeviceOps: Backend {
 pub trait ContextBackend:
     Backend
     + ArithOps
+    + ArgmaxLastOps
     + MatmulOps
     + TensorOps
     + TensorDataOps

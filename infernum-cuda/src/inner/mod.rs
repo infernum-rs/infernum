@@ -6,17 +6,10 @@ pub mod cuda_runtime_state;
 mod error;
 pub mod execute_context;
 pub mod executor;
-pub mod graph_engine;
 pub mod model;
 pub mod weights;
 
 pub use backend_impl::CudaBackend;
-pub use cuda_graph_engine::*;
-pub use cuda_logits::CudaLogits;
-pub use cuda_runtime_state::CudaRuntimeState;
-pub use execute_context::CudaExecutorState;
-pub use graph_engine::CudaDecodeEngine;
-
 pub use cuda::ops::LinearWeight;
 pub use cuda::BlockAllocator;
 pub use cuda::BlockConfig;
@@ -32,6 +25,10 @@ pub use cuda::SeqPosition;
 pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
 #[cfg(feature = "nccl")]
 pub use cuda::{NcclCommunicator, NcclId};
+pub use cuda_graph_engine::*;
+pub use cuda_logits::CudaLogits;
+pub use cuda_runtime_state::CudaRuntimeState;
+pub use execute_context::{CudaExecutorState, GraphInputs};
 pub use weights::{CudaWeightLoader, GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
 
 // Re-export cudarc types/traits needed by downstream generic model code

@@ -1,9 +1,9 @@
 //! `CudaBackend` — implements the infernum `Backend` + op traits for CUDA.
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps, KvCacheOps,
-    MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps, PagedKvCacheOps,
-    RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
+    ArgmaxLastOps, ArithOps, AttentionOps, Backend, BiasOps, CastOps, EmbedOps, GegluOps,
+    KvCacheOps, MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, PagedAttentionOps,
+    PagedKvCacheOps, RopeInterleavedOps, RopeOps, SwigluOps, TensorFactory, TensorOps,
 };
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::{DType, Result, Tensor};
@@ -108,6 +108,14 @@ impl ArithOps for CudaBackend {
 
     fn logit_softcap(input: &CudaTensor, cap: f32) -> Result<CudaTensor> {
         ops::logit_softcap(input, cap)
+    }
+}
+
+// ---- ArgmaxLast ----
+
+impl ArgmaxLastOps for CudaBackend {
+    fn argmax_last_tensor(input: &CudaTensor) -> Result<CudaTensor> {
+        ops::argmax_last_tensor(input)
     }
 }
 

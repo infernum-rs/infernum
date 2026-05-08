@@ -1,6 +1,6 @@
-//! ArithOps implementation for CpuBackend.
+//! ArithOps and ArgmaxLastOps implementations for CpuBackend.
 
-use infernum::backend::ArithOps;
+use infernum::backend::{ArgmaxLastOps, ArithOps};
 use infernum::tensor::Tensor;
 use infernum::Result;
 
@@ -51,5 +51,28 @@ impl ArithOps for CpuBackend {
         let data = input.as_f32_slice();
         let out: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
         Ok(CpuTensor::from_f32(input.shape(), &out))
+    }
+}
+
+impl ArgmaxLastOps for CpuBackend {
+    /// Argmax over the last dimension of a 2-D F32 tensor.
+    ///
+    /// Input shape `[rows, cols]`; output shape `[rows]` with dtype `U32`.
+    fn argmax_last_tensor(input: &CpuTensor) -> Result<CpuTensor> {
+        let shape = input.shape();
+        assert_eq!(shape.len(), 2, "argmax_last_tensor: expected 2-D tensor");
+        let rows = shape[0];
+        let cols = shape[1];
+        let data = input.as_f32_slice();
+        let indices: Vec<u32> = (0..rows)
+            .map(|r| {
+                let row = &data[r * cols..(r + 1) * cols];
+                row.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
+                    .map_or(0, |(i, _)| u32::try_from(i).unwrap_or(0))
+            })
+            .collect();
+        Ok(CpuTensor::from_u32(&[rows], &indices))
     }
 }
