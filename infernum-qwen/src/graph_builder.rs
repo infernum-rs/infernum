@@ -1370,6 +1370,11 @@ mod tests {
         }
     }
 
+    // NOTE: `ArgmaxLastOps` is required by `GraphArgmaxOps`. This impl is
+    // local to this test module because `TestBackend` is defined here.
+    // The canonical no-op body is identical across all test backends; the
+    // orphan rule prevents moving it to `test_helpers` without also moving
+    // the `TestBackend` type itself.
     impl infernum::backend::ArgmaxLastOps for TestBackend {
         fn argmax_last_tensor(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
             Ok(DummyTensor)

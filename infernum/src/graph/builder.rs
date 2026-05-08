@@ -212,19 +212,6 @@ impl<B: Backend + MatmulOps + ContextBackend> Graph<B> {
         self.linear_weights.len()
     }
 
-    /// Returns `true` if the graph contains any `MoE` dispatch operations
-    /// (`moe_dispatch_softmax` or `moe_dispatch_sigmoid`).
-    ///
-    /// CUDA graph capture is not possible for `MoE` models because `MoE` routing
-    /// requires a host-side top-K selection (a D→H sync copy) which
-    /// invalidates the capture stream.
-    #[must_use]
-    pub fn has_moe_ops(&self) -> bool {
-        self.nodes
-            .iter()
-            .any(|n| matches!(n.op.name(), "moe_dispatch_softmax" | "moe_dispatch_sigmoid"))
-    }
-
     /// Returns `true` if the graph contains any operation that is incompatible
     /// with CUDA stream capture.
     ///

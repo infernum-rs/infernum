@@ -8,10 +8,11 @@
 //!   single forward pass through the GPU graph executor. Llama family only.
 //! - **Graph decode (`--graph-decode`):** Decode throughput — generates N tokens
 //!   one-by-one through the GPU graph executor with KV cache management. Llama only.
-//! - **CUDA graphs (`--cuda-graphs`):** Decode using CUDA graph capture/replay.
-//!   Eliminates per-step kernel launch overhead by capturing the full decode
-//!   step into a CUDA graph using indirect (GPU-resident position pointer) ops.
+//! - **CUDA graphs (`--cuda-graphs`):** LEGACY low-level CUDA graph decode using
+//!   indirect ops on a dense KvCache. Not the production path; kept for comparison.
 //!   Llama family SafeTensors dense only.
+//! - **CUDA graph engine (`--cuda-graph-engine`):** Production graph capture/replay
+//!   via `CudaGraphEngine` + `ExecuteContext`. Supports all model families.
 //!
 //! Graph modes support SafeTensors (dense, FP8, GPTQ, AWQ) and GGUF (Q8_0, Q4_0, etc.).
 //!
@@ -69,11 +70,12 @@ struct Cli {
     #[arg(long)]
     graph_decode: bool,
 
-    /// Use CUDA graph capture/replay for decode (Llama SafeTensors dense only)
+    /// LEGACY: low-level CUDA graph decode using indirect ops on a dense KvCache.
+    /// Not the production path. Use --cuda-graph-engine for the real engine.
     #[arg(long)]
     cuda_graphs: bool,
 
-    /// Use the architecture-correct CUDA graph engine (indirect ops, no bypass)
+    /// Production CudaGraphEngine path (graph capture/replay via ExecuteContext)
     #[arg(long)]
     cuda_graph_engine: bool,
 
@@ -642,24 +644,15 @@ fn bench_graph_decode(
     Ok(())
 }
 
-/// Benchmark decode throughput using CUDA graph capture/replay with indirect ops.
+/// LEGACY: Benchmark decode throughput using low-level CUDA graph capture with indirect ops.
 ///
-/// Each decode step is captured into a [`CudaGraph`]. The graph reads positions
-/// and attention lengths from stable GPU-resident pointers (`SeqPosition`), so
-/// only the values at those addresses need to change between replays — no graph
-/// rebuild or re-instantiation is required after the first step.
+/// This function manually dispatches op kernels (`apply_rope_indirect`,
+/// `fused_attention_decode_indirect`) on a dense [`KvCache`]. It does **not**
+/// go through the production `CudaGraphEngine` / `ExecuteContext` path. It is
+/// kept only for low-level comparison benchmarking.
 ///
-/// Supports dense SafeTensors (F32, BF16) Llama family models only.
-///
-/// # How it works
-///
-/// 1. Load weights via a single-token prefill graph (same naming convention).
-/// 2. Precompute a full cos/sin RoPE table on GPU for all positions.
-/// 3. Allocate a [`KvCache`] sized for `prompt_len + n_gen` tokens.
-/// 4. Warm up by appending prompt tokens eagerly (not captured).
-/// 5. In the timed loop: write the next token ID into the graph's pre-allocated
-///    device buffer, capture the forward pass (with indirect ops), launch the
-///    graph, synchronize, advance the KV cache position counters.
+/// For the production graph-engine benchmark, use [`bench_cuda_graph_engine`]
+/// (the `--cuda-graph-engine` CLI flag).
 ///
 /// # Errors
 /// Returns an error if weight loading or the GPU kernel fails.

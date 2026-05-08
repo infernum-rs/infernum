@@ -242,8 +242,8 @@ struct DecodeState {
 
 // SAFETY: `DecodeState` is only ever accessed from the single thread that runs
 // the runtime. `CudaGraph` and `CudaEvent` hold raw CUDA handles that do not
-// auto-implement `Send`; the same pattern is used for `CudaDecodeEngine` in
-// `graph_engine.rs` (which also owns a `CudaGraph` and `CudaEvent`).
+// auto-implement `Send`; `DecodeState` owns them exclusively and is never
+// aliased across threads.
 unsafe impl Send for DecodeState {}
 
 impl DecodeState {

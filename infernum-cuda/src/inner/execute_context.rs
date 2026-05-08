@@ -111,7 +111,7 @@ pub struct CudaExecutorState {
     pub mla_seq_pos: usize,
     /// Pre-allocated GPU-side input buffers for CUDA graph capture.
     ///
-    /// `Some` during `CudaDecodeEngine::step()` (captured decode).
+    /// `Some` during `DecodeState::step()` (captured decode).
     /// `None` during eager prefill/decode (inputs come from `input_tensors`).
     pub graph_inputs: Option<GraphInputs>,
 }
