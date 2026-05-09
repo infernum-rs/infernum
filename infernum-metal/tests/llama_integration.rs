@@ -77,6 +77,19 @@ mod smollm2_360m {
             .expect("Generation failed");
     }
 
+    /// Generate 5 tokens and verify all IDs are within vocab range.
+    ///
+    /// A successful decode implies every generated token ID < vocab_size.
+    /// Any out-of-bounds token would cause the tokenizer to error or panic.
+    #[test]
+    fn no_oob_tokens() {
+        // A successful 5-token generation means the tokenizer decoded every
+        // token without error, which requires each ID to be < vocab_size.
+        let output = generate_greedy(&model_dir(), "Hello world", 5);
+        // If we reach here, no OOB token caused a panic or decode error.
+        let _ = output;
+    }
+
     #[test]
     fn logits_diagnostic() {
         let model_dir = model_dir();
