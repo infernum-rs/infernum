@@ -31,19 +31,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check with Clippy (pedantic, deny warnings)
-        run: cargo clippy --all -- -W clippy::pedantic -D warnings
+        run: cargo clippy --all --exclude infernum-metal -- -W clippy::pedantic -D warnings
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run tests (no CUDA)
-        run: cargo test --all
+      - name: Run tests (no CUDA, no Metal)
+        run: cargo test --all --exclude infernum-metal
 
       - name: Run tests (force-fuse)
-        run: cargo test --all --features force-fuse
+        run: cargo test --all --exclude infernum-metal --features force-fuse
 
       - name: Run tests (no-fuse)
-        run: cargo test --all --features no-fuse
+        run: cargo test --all --exclude infernum-metal --features no-fuse
 
   # CPU backend integration tests (x86-64 + AArch64)
   check-cpu:
@@ -158,16 +158,16 @@ jobs:
           echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
 
       - name: Check with Clippy (CUDA, pedantic, deny warnings)
-        run: cargo clippy --all --features cuda -- -W clippy::pedantic -D warnings
+        run: cargo clippy --all --exclude infernum-metal --features cuda -- -W clippy::pedantic -D warnings
 
       - name: Build with CUDA
-        run: cargo build --features cuda
+        run: cargo build --workspace --exclude infernum-metal --features cuda
 
       - name: Run CUDA tests
-        run: cargo test --features cuda -- --test-threads=1
+        run: cargo test --workspace --exclude infernum-metal --features cuda -- --test-threads=1
 
       - name: Build examples (CUDA)
-        run: cargo build --features cuda --examples
+        run: cargo build --workspace --exclude infernum-metal --features cuda --examples
 
       - name: Build examples (NCCL)
         run: cargo build -p infernum-examples --features nccl --examples
@@ -192,3 +192,53 @@ jobs:
 
       - name: Run integration tests (Gemma)
         run: cargo test -p infernum-cuda --features integration -- --test-threads=1 gemma
+
+  # Metal backend checks (Apple Silicon runner)
+  check-metal:
+    runs-on: macos-14  # Apple Silicon (M1) runner
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-metal-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check with Clippy (pedantic, deny warnings)
+        run: cargo clippy -p infernum-metal -- -W clippy::pedantic -D warnings
+
+      - name: Run unit tests
+        run: cargo test -p infernum-metal
+
+      - name: Build Metal example
+        run: cargo build -p infernum-examples --features metal --example generate_metal
+
+  # Metal integration tests (downloads models, runs on Apple Silicon)
+  integration-metal:
+    runs-on: macos-14
+    needs: check-metal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-metal-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/infernum/models
+          key: infernum-models-metal-v1
+
+      - name: Run Metal integration tests
+        run: cargo test --release -p infernum-metal --features integration -- --test-threads=1

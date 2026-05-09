@@ -1,0 +1,199 @@
+//! CastOps implementation for Metal — dtype casting via GPU kernels.
+//!
+//! BF16→F32 and F16→F32 use dedicated GPU kernels.
+//! F32→F32 is a no-op clone.
+
+use infernum::backend::CastOps;
+use infernum::tensor::Tensor;
+use infernum::DType;
+use infernum::Result;
+
+use crate::tensor::MetalTensor;
+use crate::MetalBackend;
+
+impl CastOps for MetalBackend {
+    fn cast_to_f32(input: &MetalTensor) -> Result<MetalTensor> {
+        match input.dtype() {
+            DType::F32 => Ok(input.clone()),
+            DType::BF16 => {
+                let ctx = input.context();
+                let n = input.numel();
+                let out = MetalTensor::zeros(ctx, input.shape(), DType::F32);
+                ctx.dispatch_1d(
+                    "cast_bf16_to_f32",
+                    &[
+                        (input.metal_buffer(), input.buffer_offset()),
+                        (out.metal_buffer(), out.buffer_offset()),
+                    ],
+                    &[],
+                    n,
+                );
+                Ok(out)
+            }
+            DType::F16 => {
+                let ctx = input.context();
+                let n = input.numel();
+                let out = MetalTensor::zeros(ctx, input.shape(), DType::F32);
+                ctx.dispatch_1d(
+                    "cast_f16_to_f32",
+                    &[
+                        (input.metal_buffer(), input.buffer_offset()),
+                        (out.metal_buffer(), out.buffer_offset()),
+                    ],
+                    &[],
+                    n,
+                );
+                Ok(out)
+            }
+            other => Err(infernum::Error::UnsupportedDtype(format!(
+                "cast_to_f32: unsupported dtype {other}"
+            ))),
+        }
+    }
+
+    fn cast_from_f32(input: &MetalTensor, target: DType) -> Result<MetalTensor> {
+        if input.dtype() == target {
+            return Ok(input.clone());
+        }
+        match target {
+            DType::F16 => {
+                let ctx = input.context();
+                let n = input.numel();
+                let out = MetalTensor::zeros(ctx, input.shape(), DType::F16);
+                ctx.dispatch_1d(
+                    "cast_f32_to_f16",
+                    &[
+                        (input.metal_buffer(), input.buffer_offset()),
+                        (out.metal_buffer(), out.buffer_offset()),
+                    ],
+                    &[],
+                    n,
+                );
+                Ok(out)
+            }
+            // For other dtypes, keep F32 (no-op) to avoid breaking existing paths
+            _ => Ok(input.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MetalContext;
+    use infernum::backend::{TensorDataOps, TensorFactory};
+
+    fn ctx() -> MetalContext {
+        MetalContext::new()
+    }
+
+    #[test]
+    fn test_from_f32_roundtrip() {
+        let c = ctx();
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t = MetalBackend::from_f32_slice(&c, &[2, 3], &data).unwrap();
+        let out = MetalBackend::to_f32_vec(&t).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_from_raw_bytes_f32() {
+        let c = ctx();
+        let data = [1.5f32, -2.5, 0.0];
+        let bytes: &[u8] = bytemuck::cast_slice(&data);
+        let t = MetalBackend::from_raw_bytes(&c, &[3], DType::F32, bytes).unwrap();
+        let out = MetalBackend::to_f32_vec(&t).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_from_raw_bytes_bf16() {
+        let c = ctx();
+        let f32_data = [1.0f32, 2.0, 3.0];
+        let bf16_data: Vec<half::bf16> =
+            f32_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&bf16_data);
+        let t = MetalBackend::from_raw_bytes(&c, &[3], DType::BF16, bytes).unwrap();
+        let out = MetalBackend::to_f32_vec(&t).unwrap();
+        for (a, b) in out.iter().zip(f32_data.iter()) {
+            assert!((a - b).abs() < 0.01, "bf16 roundtrip: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_from_u32_slice() {
+        let c = ctx();
+        let data = [10u32, 20, 30];
+        let t = MetalBackend::from_u32_slice(&c, &[3], &data).unwrap();
+        let bytes = MetalBackend::to_raw_bytes(&t).unwrap();
+        let out: &[u32] = bytemuck::cast_slice(&bytes);
+        assert_eq!(out, &data);
+    }
+
+    #[test]
+    fn test_from_i32_slice() {
+        let c = ctx();
+        let data = [-1i32, 0, 42];
+        let t = MetalBackend::from_i32_slice(&c, &[3], &data).unwrap();
+        let bytes = MetalBackend::to_raw_bytes(&t).unwrap();
+        let out: &[i32] = bytemuck::cast_slice(&bytes);
+        assert_eq!(out, &data);
+    }
+
+    #[test]
+    fn test_shape_and_dtype() {
+        let c = ctx();
+        let t = MetalBackend::from_f32_slice(&c, &[2, 3], &[0.0; 6]).unwrap();
+        assert_eq!(t.shape(), &[2, 3]);
+        assert_eq!(t.dtype(), DType::F32);
+        assert_eq!(t.numel(), 6);
+        assert_eq!(t.ndim(), 2);
+    }
+
+    #[test]
+    fn test_reshape() {
+        let c = ctx();
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t = MetalBackend::from_f32_slice(&c, &[2, 3], &data).unwrap();
+        let t2 = t.reshape(&[3, 2]);
+        assert_eq!(t2.shape(), &[3, 2]);
+        let out = MetalBackend::to_f32_vec(&t2).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_slice_view() {
+        let c = ctx();
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t = MetalBackend::from_f32_slice(&c, &[6], &data).unwrap();
+        let view = t.slice_view(2, &[3]);
+        assert_eq!(view.shape(), &[3]);
+        let out = MetalBackend::to_f32_vec(&view).unwrap();
+        assert_eq!(out, &[3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_cast_from_f32_stays_f32() {
+        // Phase 1: cast_from_f32 always returns F32 regardless of target.
+        let c = ctx();
+        let data = [1.0f32, 2.5, -3.0, 0.0];
+        let t = MetalBackend::from_f32_slice(&c, &[4], &data).unwrap();
+        let result = MetalBackend::cast_from_f32(&t, DType::BF16).unwrap();
+        assert_eq!(result.dtype(), DType::F32);
+        let out = MetalBackend::to_f32_vec(&result).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_cast_f16_to_f32() {
+        let c = ctx();
+        let f32_data = [1.0f32, -2.5, 0.0, 42.0];
+        let f16_data: Vec<half::f16> = f32_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&f16_data);
+        let t = MetalBackend::from_raw_bytes(&c, &[4], DType::F16, bytes).unwrap();
+        let out = MetalBackend::to_f32_vec(&t).unwrap();
+        for (a, b) in out.iter().zip(f32_data.iter()) {
+            assert!((a - b).abs() < 0.01, "f16 roundtrip: {a} vs {b}");
+        }
+    }
+}

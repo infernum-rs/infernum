@@ -14,6 +14,8 @@ pub mod cuda_graph_engine;
 pub mod graph_builder;
 #[cfg(feature = "cpu")]
 pub mod graph_engine;
+#[cfg(feature = "metal")]
+pub mod metal_graph_engine;
 
 pub use chat_templates::GemmaTemplate;
 pub use config::GemmaConfig;
@@ -27,3 +29,5 @@ pub use graph_builder::{
 };
 #[cfg(feature = "cpu")]
 pub use graph_engine::{GemmaGraphEngine, GemmaGraphEngineExt};
+#[cfg(feature = "metal")]
+pub use metal_graph_engine::{GemmaMetalGraphEngine, GemmaMetalGraphEngineExt};

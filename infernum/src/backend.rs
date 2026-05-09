@@ -290,6 +290,18 @@ pub trait MatmulOps: Backend {
     /// Check whether a `LinearWeight` is a dense (non-quantized) tensor.
     fn is_dense_weight(weight: &Self::LinearWeight) -> bool;
 
+    /// Try to vertically concatenate two linear weights (append output rows).
+    ///
+    /// Both weights must have the same `in_features`. Returns `None` if
+    /// the weights cannot be fused (e.g., different dtypes, unsupported
+    /// format). Backends override this to fuse quantized Q4/Q8 weights.
+    fn try_concat_linear_rows(
+        _a: &Self::LinearWeight,
+        _b: &Self::LinearWeight,
+    ) -> Option<Self::LinearWeight> {
+        None
+    }
+
     /// Compute two independent linear projections from the same input in a
     /// single parallel dispatch.
     ///
@@ -347,6 +359,22 @@ pub trait MatmulOps: Backend {
         device: &Self::DeviceHandle,
         weight: &crate::weights::host::HostLinearWeight,
     ) -> Result<Self::LinearWeight>;
+
+    /// Fused SwiGLU + linear projection.
+    ///
+    /// Takes a concatenated `gate_up` tensor of shape `[batch, 2*intermediate_size]`
+    /// and `down_proj` weights. Computes `linear(silu(gate) * up, down_proj)` in a
+    /// single GEMV dispatch by applying SwiGLU on-the-fly while reading the input.
+    ///
+    /// Returns `None` if the backend does not support this fusion (caller falls
+    /// back to separate `swiglu` + `linear` calls).
+    fn swiglu_linear(
+        _gate_up: &Self::Tensor,
+        _intermediate_size: usize,
+        _down_proj: &Self::LinearWeight,
+    ) -> Option<Result<Self::Tensor>> {
+        None
+    }
 }
 
 /// Normalization operations.
@@ -668,6 +696,47 @@ pub trait PagedKvCacheOps: Backend {
         batch_size: usize,
         max_blocks_per_seq: usize,
     ) -> Result<()>;
+}
+
+/// Fused decode operations for reducing dispatch count.
+///
+/// Provides default implementations that delegate to the underlying ops.
+/// Backends can override with fused kernels to reduce dispatch overhead.
+pub trait FusedDecodeOps: RopeOps + PagedKvCacheOps {
+    /// Fused RoPE + paged KV-cache append for batched decode.
+    ///
+    /// Applies RoPE to Q and K, writes rotated K + V directly to the paged
+    /// KV cache. Returns the rotated Q tensor.
+    ///
+    /// Default: calls `apply_rope_batched` on Q and K + `append_paged_batched`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_kv_append_batched(
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        cos_cache: &Self::Tensor,
+        sin_cache: &Self::Tensor,
+        positions: &Self::Tensor,
+        paged_kv: &mut Self::PagedKvCache,
+        layer_idx: usize,
+        block_tables: &Self::Tensor,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<Self::Tensor> {
+        let q_rot = Self::apply_rope_batched(q, cos_cache, sin_cache, positions, batch_size)?;
+        let k_rot = Self::apply_rope_batched(k, cos_cache, sin_cache, positions, batch_size)?;
+        Self::append_paged_batched(
+            paged_kv,
+            layer_idx,
+            &k_rot,
+            v,
+            block_tables,
+            positions,
+            batch_size,
+            max_blocks_per_seq,
+        )?;
+        Ok(q_rot)
+    }
 }
 
 /// Contiguous (non-paged) KV cache operations (DeepSeek MLA).

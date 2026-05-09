@@ -35,6 +35,17 @@ use crate::Result;
 
 /// K+V projection storage: fused for dense weights, separate for quantized.
 pub enum KvProjWeight<B: Backend + MatmulOps> {
+    /// Q, K and V weights fused into a single `LinearWeight` with output dim
+    /// `q_dim + 2*kv_dim`. After linear the output columns split as
+    /// `[q(q_dim), k(kv_dim), v(kv_dim)]`.
+    ///
+    /// When this variant is present, the `q_proj` field on the attention
+    /// weights struct is unused (but must still exist for type compatibility).
+    QkvFused {
+        weight: <B as MatmulOps>::LinearWeight,
+        q_dim: usize,
+        kv_dim: usize,
+    },
     /// K and V weights fused into a single `LinearWeight` with output dim
     /// `2*kv_dim`. After linear the output columns split as
     /// `[k(kv_dim), v(kv_dim)]`.
@@ -82,6 +93,19 @@ pub fn compute_kv_proj<B: MatmulOps + TensorOps>(
     kv_proj: &KvProjWeight<B>,
 ) -> Result<(B::Tensor, B::Tensor)> {
     match kv_proj {
+        KvProjWeight::<B>::QkvFused {
+            weight,
+            q_dim,
+            kv_dim,
+        } => {
+            // Prefill path: Q is computed separately by the caller, so we
+            // do the full QKV matmul and discard Q. Slightly wasteful but
+            // prefill is compute-bound, not dispatch-bound.
+            let qkv = B::linear(hidden, weight)?;
+            let (_q, rest) = B::split_inner_dim(&qkv, *q_dim, kv_dim * 2)?;
+            let (k, v) = B::split_inner_dim(&rest, *kv_dim, *kv_dim)?;
+            Ok((k, v))
+        }
         KvProjWeight::<B>::Fused { weight, kv_dim } => {
             let kv = B::linear(hidden, weight)?;
             B::split_inner_dim(&kv, *kv_dim, *kv_dim)
@@ -100,6 +124,21 @@ pub fn compute_kv_proj_decode<B: MatmulOps + TensorOps>(
     batch_size: usize,
 ) -> Result<(B::Tensor, B::Tensor)> {
     match kv_proj {
+        KvProjWeight::<B>::QkvFused {
+            weight,
+            q_dim,
+            kv_dim,
+        } => {
+            let qkv = B::linear(hidden, weight)?;
+            if batch_size == 1 {
+                let k = qkv.slice_view(*q_dim, &[1, *kv_dim]);
+                let v = qkv.slice_view(q_dim + kv_dim, &[1, *kv_dim]);
+                Ok((k, v))
+            } else {
+                let (_q, rest) = B::split_inner_dim(&qkv, *q_dim, kv_dim * 2)?;
+                B::split_inner_dim(&rest, *kv_dim, *kv_dim)
+            }
+        }
         KvProjWeight::<B>::Fused { weight, kv_dim } => {
             let kv = B::linear(hidden, weight)?;
             if batch_size == 1 {
@@ -127,6 +166,23 @@ pub fn compute_qkv_proj_decode<B: MatmulOps + TensorOps>(
     batch_size: usize,
 ) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
     match kv_proj {
+        KvProjWeight::<B>::QkvFused {
+            weight,
+            q_dim,
+            kv_dim,
+        } => {
+            let qkv = B::linear(hidden, weight)?;
+            if batch_size == 1 {
+                let q = qkv.slice_view(0, &[1, *q_dim]);
+                let k = qkv.slice_view(*q_dim, &[1, *kv_dim]);
+                let v = qkv.slice_view(q_dim + kv_dim, &[1, *kv_dim]);
+                Ok((q, k, v))
+            } else {
+                let (q, rest) = B::split_inner_dim(&qkv, *q_dim, kv_dim * 2)?;
+                let (k, v) = B::split_inner_dim(&rest, *kv_dim, *kv_dim)?;
+                Ok((q, k, v))
+            }
+        }
         KvProjWeight::<B>::Separate { k_proj, v_proj } => {
             B::linear_triple(hidden, q_proj, k_proj, v_proj)
         }
@@ -179,11 +235,40 @@ pub fn compute_gate_up<B: MatmulOps + TensorOps>(
 ///
 /// Computes `silu(gate) * up`, then projects down via `down_proj`.
 /// Calls all-reduce if a communicator is provided (tensor parallelism).
+///
+/// When gate+up weights are fused and seq_len == 1, tries the backend's
+/// `swiglu_linear` fused path to eliminate a separate SwiGLU dispatch.
 pub fn forward_mlp<B: MatmulOps + SwigluOps + TensorOps>(
     hidden: &B::Tensor,
     weights: &MlpWeights<B>,
     comm: Option<&B::Comm>,
 ) -> Result<B::Tensor> {
+    // Try fused SwiGLU + down_proj path (single dispatch) for decode.
+    if let GateUpWeight::<B>::Fused {
+        weight,
+        intermediate_size,
+    } = &weights.gate_up
+    {
+        let seq_len = hidden.shape()[0];
+        if seq_len == 1 {
+            let gate_up = B::linear(hidden, weight)?;
+            if let Some(result) = B::swiglu_linear(&gate_up, *intermediate_size, &weights.down_proj)
+            {
+                let mut out = result?;
+                maybe_all_reduce::<B>(comm, &mut out)?;
+                return Ok(out);
+            }
+            // Backend doesn't support fusion — fall through to unfused path
+            // using the already-computed gate_up.
+            let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
+            let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
+            let intermediate = B::swiglu(&gate, &up)?;
+            let mut out = B::linear(&intermediate, &weights.down_proj)?;
+            maybe_all_reduce::<B>(comm, &mut out)?;
+            return Ok(out);
+        }
+    }
+
     let (gate, up) = compute_gate_up::<B>(hidden, &weights.gate_up)?;
     let intermediate = B::swiglu(&gate, &up)?;
     let mut out = B::linear(&intermediate, &weights.down_proj)?;
@@ -198,6 +283,26 @@ pub fn forward_mlp_no_reduce<B: MatmulOps + SwigluOps + TensorOps>(
     hidden: &B::Tensor,
     weights: &MlpWeights<B>,
 ) -> Result<B::Tensor> {
+    // Try fused SwiGLU + down_proj path for decode.
+    if let GateUpWeight::<B>::Fused {
+        weight,
+        intermediate_size,
+    } = &weights.gate_up
+    {
+        let seq_len = hidden.shape()[0];
+        if seq_len == 1 {
+            let gate_up = B::linear(hidden, weight)?;
+            if let Some(result) = B::swiglu_linear(&gate_up, *intermediate_size, &weights.down_proj)
+            {
+                return result;
+            }
+            let gate = gate_up.slice_view(0, &[1, *intermediate_size]);
+            let up = gate_up.slice_view(*intermediate_size, &[1, *intermediate_size]);
+            let intermediate = B::swiglu(&gate, &up)?;
+            return B::linear(&intermediate, &weights.down_proj);
+        }
+    }
+
     let (gate, up) = compute_gate_up::<B>(hidden, &weights.gate_up)?;
     let intermediate = B::swiglu(&gate, &up)?;
     B::linear(&intermediate, &weights.down_proj)
@@ -333,6 +438,11 @@ pub fn load_mlp_weights<B: MatmulOps + TensorOps>(
         let u = B::as_dense_weight(&up).expect("checked dense");
         GateUpWeight::<B>::Fused {
             weight: B::dense_weight(B::concat_inner_dim(g, u)?),
+            intermediate_size,
+        }
+    } else if let Some(fused) = B::try_concat_linear_rows(&gate, &up) {
+        GateUpWeight::<B>::Fused {
+            weight: fused,
             intermediate_size,
         }
     } else {
