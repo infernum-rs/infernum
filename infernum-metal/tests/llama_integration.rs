@@ -119,8 +119,8 @@ mod smollm2_360m {
 
         // Check it doesn't repeat the same token (degenerate output).
         assert!(
-            result.contains("Paris") || !result.contains("is is is"),
-            "Model produced degenerate output: {result}"
+            !result.contains("is is is"),
+            "Model produced degenerate repeated output: {result}"
         );
     }
 

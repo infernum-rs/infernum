@@ -56,9 +56,6 @@ pub trait MetalGraphEngineConfig: Send + Sync + 'static {
     /// Build a prefill-mode graph for the given sequence length.
     fn build_prefill_graph_metal(&self, seq_len: usize) -> Graph<MetalBackend>;
 
-    /// Build a decode-mode graph for a KV cache of the given length.
-    fn build_decode_graph_metal(&self, kv_len: usize) -> Graph<MetalBackend>;
-
     /// Build a batched paged-KV decode graph.
     fn build_paged_decode_graph_metal(
         &self,
@@ -82,6 +79,35 @@ pub trait MetalGraphEngineConfig: Send + Sync + 'static {
         ctx: &MetalContext,
         model_dir: &Path,
     ) -> Result<WeightStore<MetalTensor, MetalLinearWeight>>;
+}
+
+// ---------------------------------------------------------------------------
+// Shared config-getter macro
+// ---------------------------------------------------------------------------
+
+/// Implements the five scalar config getters required by [`MetalGraphEngineConfig`]
+/// (and the equivalent CPU/CUDA traits) by forwarding to the config struct's fields.
+///
+/// Used by model crates to avoid repeating boilerplate in each `metal_graph_engine.rs`.
+#[macro_export]
+macro_rules! impl_metal_config_getters {
+    () => {
+        fn num_hidden_layers(&self) -> usize {
+            self.num_hidden_layers
+        }
+        fn max_position_embeddings(&self) -> usize {
+            self.max_position_embeddings
+        }
+        fn rope_theta(&self) -> f32 {
+            self.rope_theta
+        }
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+        fn eos_token_id(&self) -> u32 {
+            self.eos_token_id
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -301,15 +327,18 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
             .map(|&b| u32::try_from(b).expect("block ID fits u32"))
             .collect();
 
+        // Build and plan the graph once — topology is identical for every token;
+        // only the input tensors change each iteration.
+        let mut graph = self
+            .config
+            .build_paged_decode_graph_metal(1, block_size, max_blocks);
+        optimizer::optimize(&mut graph);
+        let ep = plan(&graph);
+        let output_nodes = graph.output_ids().to_vec();
+
         let mut last_logits: Option<MetalTensor> = None;
 
         for (pos, &token) in input_ids.iter().enumerate() {
-            let mut graph = self
-                .config
-                .build_paged_decode_graph_metal(1, block_size, max_blocks);
-            optimizer::optimize(&mut graph);
-            let ep = plan(&graph);
-
             let (cos_row, sin_row) =
                 precompute_rope_row(pos, self.config.head_dim(), self.config.rope_theta());
 
@@ -349,7 +378,6 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
                 positions_t,
                 seq_len_t,
             ];
-            let output_nodes = graph.output_ids().to_vec();
             let outputs = execute(
                 &self.ctx,
                 &ep,
@@ -384,37 +412,22 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
         let head_dim = self.config.head_dim();
         let half_dim = self.half_dim;
 
-        // Read positions from unified memory (I32/U32 layout).
-        let positions_data: &[i32] = positions.as_i32_slice();
-
-        // Read block_tables from unified memory and reinterpret as U32.
-        let block_table_data: &[i32] = block_tables.as_i32_slice();
-        let block_table_u32: Vec<u32> = block_table_data
-            .iter()
-            .map(|&v| v.cast_unsigned())
-            .collect();
+        // Read positions and block_tables directly as U32 (their actual dtype).
+        let positions_data: &[u32] = positions.as_u32_slice();
+        let block_table_u32: &[u32] = block_tables.as_u32_slice();
 
         // Build batched RoPE: cos/sin for each sequence's current position.
         let mut cos_data = Vec::with_capacity(batch_size * half_dim);
         let mut sin_data = Vec::with_capacity(batch_size * half_dim);
-        for &pos_i32 in positions_data {
-            let pos = usize::try_from(pos_i32).expect("position must be non-negative");
+        for &pos_u32 in positions_data {
+            let pos = pos_u32 as usize;
             let (c, s) = precompute_rope_row(pos, head_dim, self.config.rope_theta());
             cos_data.extend(c);
             sin_data.extend(s);
         }
 
-        // positions_u32: write index for K/V append.
-        let positions_u32: Vec<u32> = positions_data
-            .iter()
-            .map(|&p| u32::try_from(p).expect("position must be non-negative"))
-            .collect();
-
         // seq_lens_u32: K/V length for attention = positions + 1 (after appending).
-        let seq_lens_u32: Vec<u32> = positions_data
-            .iter()
-            .map(|&p| u32::try_from(p).expect("position must be non-negative") + 1)
-            .collect();
+        let seq_lens_u32: Vec<u32> = positions_data.iter().map(|&p| p + 1).collect();
 
         // Build the paged decode graph.
         let mut graph =
@@ -429,13 +442,13 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
             &self.ctx,
             &[batch_size, max_blocks_per_seq],
             DType::U32,
-            bytemuck::cast_slice(&block_table_u32),
+            bytemuck::cast_slice(block_table_u32),
         );
         let positions_t = MetalTensor::from_raw_bytes(
             &self.ctx,
             &[batch_size],
             DType::U32,
-            bytemuck::cast_slice(&positions_u32),
+            bytemuck::cast_slice(positions_data),
         );
         let seq_lens_t = MetalTensor::from_raw_bytes(
             &self.ctx,

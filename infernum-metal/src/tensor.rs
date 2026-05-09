@@ -154,6 +154,17 @@ impl MetalTensor {
         bytemuck::cast_slice(self.as_bytes())
     }
 
+    /// Read the tensor data as a u32 slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the dtype is not U32.
+    #[must_use]
+    pub fn as_u32_slice(&self) -> &[u32] {
+        assert_eq!(self.dtype, DType::U32, "as_u32_slice: expected U32 tensor");
+        bytemuck::cast_slice(self.as_bytes())
+    }
+
     /// Read the tensor data as an i32 slice (U32 dtype reinterpreted as i32).
     ///
     /// Block tables and positions are stored as U32 but contain signed values.

@@ -13,34 +13,14 @@ use infernum_metal::{
 };
 
 use crate::config::QwenConfig;
-use crate::graph_builder::{build_decode_graph, build_paged_decode_graph, build_prefill_graph};
+use crate::graph_builder::{build_paged_decode_graph, build_prefill_graph};
 
 // ---------------------------------------------------------------------------
 // MetalGraphEngineConfig impl
 // ---------------------------------------------------------------------------
 
-macro_rules! impl_common_config_getters {
-    () => {
-        fn num_hidden_layers(&self) -> usize {
-            self.num_hidden_layers
-        }
-        fn max_position_embeddings(&self) -> usize {
-            self.max_position_embeddings
-        }
-        fn rope_theta(&self) -> f32 {
-            self.rope_theta
-        }
-        fn vocab_size(&self) -> usize {
-            self.vocab_size
-        }
-        fn eos_token_id(&self) -> u32 {
-            self.eos_token_id
-        }
-    };
-}
-
 impl MetalGraphEngineConfig for QwenConfig {
-    impl_common_config_getters!();
+    infernum_metal::impl_metal_config_getters!();
 
     fn num_kv_heads(&self) -> usize {
         QwenConfig::num_kv_heads(self)
@@ -53,12 +33,6 @@ impl MetalGraphEngineConfig for QwenConfig {
     fn build_prefill_graph_metal(&self, seq_len: usize) -> Graph<infernum_metal::MetalBackend> {
         let (graph, _) =
             build_prefill_graph::<infernum_metal::MetalBackend>(self, seq_len, DType::F32);
-        graph
-    }
-
-    fn build_decode_graph_metal(&self, kv_len: usize) -> Graph<infernum_metal::MetalBackend> {
-        let (graph, _) =
-            build_decode_graph::<infernum_metal::MetalBackend>(self, kv_len, DType::F32);
         graph
     }
 
