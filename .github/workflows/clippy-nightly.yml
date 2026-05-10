@@ -68,3 +68,23 @@ jobs:
 
       - name: Run Clippy nightly (pedantic)
         run: cargo +nightly clippy --all --all-features --exclude infernum-metal -- -W clippy::pedantic -D warnings
+
+  clippy-nightly-metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --component clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run Clippy nightly (pedantic, Metal)
+        run: cargo +nightly clippy -p infernum-metal -- -W clippy::pedantic -D warnings
