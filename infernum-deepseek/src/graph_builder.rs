@@ -91,6 +91,7 @@ pub struct DeepSeekWeightIds {
 pub trait DeepSeekGraphOps:
     Backend
     + MatmulOps
+    + ContextBackend
     + NormOps
     + EmbedOps
     + TensorOps
@@ -106,6 +107,7 @@ pub trait DeepSeekGraphOps:
 impl<B> DeepSeekGraphOps for B where
     B: Backend
         + MatmulOps
+        + ContextBackend
         + NormOps
         + EmbedOps
         + TensorOps

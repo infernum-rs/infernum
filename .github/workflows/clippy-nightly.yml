@@ -66,5 +66,31 @@ jobs:
             target
           key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Compute non-metal features
+        run: |
+          # Collect all feature names across every workspace member, then strip:
+          #   - any feature with "metal" in its name (Apple-only)
+          #   - pure dep-alias features (sole value is "dep:<feature-name>"),
+          #     which only exist in one package and are rejected by other packages
+          #     when passed via --features at the workspace level
+          # The result covers every non-Apple code path without hardcoding names.
+          FEATURES=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '
+                .packages[].features
+                | to_entries[]
+                | . as $e
+                | select(
+                    ($e.value | length == 1 and .[0] == ("dep:" + $e.key)) | not
+                  )
+                | $e.key
+              ' \
+            | grep -v -i metal \
+            | grep -v "^default$" \
+            | sort -u \
+            | tr '\n' ',')
+          # Strip trailing comma
+          FEATURES="${FEATURES%,}"
+          echo "NON_METAL_FEATURES=$FEATURES" >> "$GITHUB_ENV"
+
       - name: Run Clippy nightly (pedantic)
-        run: cargo +nightly clippy --all --all-features --exclude infernum-metal -- -W clippy::pedantic -D warnings
+        run: cargo +nightly clippy --all --features "$NON_METAL_FEATURES" --exclude infernum-metal -- -W clippy::pedantic -D warnings
