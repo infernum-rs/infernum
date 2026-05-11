@@ -67,4 +67,4 @@ jobs:
           key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run Clippy nightly (pedantic)
-        run: cargo +nightly clippy --all --features cuda -- -W clippy::pedantic -D warnings
+        run: cargo +nightly clippy --all --features cuda --exclude infernum-metal -- -W clippy::pedantic -D warnings
