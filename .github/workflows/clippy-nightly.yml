@@ -66,5 +66,22 @@ jobs:
             target
           key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Compute non-metal features
+        run: |
+          # Collect all feature names across every workspace member, then strip
+          # any that are metal-related. The result is passed to --features so
+          # clippy checks every non-Apple code path without hardcoding them.
+          FEATURES=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '
+                .packages[].features
+                | keys[]
+              ' \
+            | grep -v -i metal \
+            | sort -u \
+            | tr '\n' ',')
+          # Strip trailing comma
+          FEATURES="${FEATURES%,}"
+          echo "NON_METAL_FEATURES=$FEATURES" >> "$GITHUB_ENV"
+
       - name: Run Clippy nightly (pedantic)
-        run: cargo +nightly clippy --all --features cuda --exclude infernum-metal -- -W clippy::pedantic -D warnings
+        run: cargo +nightly clippy --all --features "$NON_METAL_FEATURES" --exclude infernum-metal -- -W clippy::pedantic -D warnings
