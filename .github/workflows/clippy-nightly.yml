@@ -68,15 +68,24 @@ jobs:
 
       - name: Compute non-metal features
         run: |
-          # Collect all feature names across every workspace member, then strip
-          # any that are metal-related. The result is passed to --features so
-          # clippy checks every non-Apple code path without hardcoding them.
+          # Collect all feature names across every workspace member, then strip:
+          #   - any feature with "metal" in its name (Apple-only)
+          #   - pure dep-alias features (sole value is "dep:<feature-name>"),
+          #     which only exist in one package and are rejected by other packages
+          #     when passed via --features at the workspace level
+          # The result covers every non-Apple code path without hardcoding names.
           FEATURES=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '
                 .packages[].features
-                | keys[]
+                | to_entries[]
+                | . as $e
+                | select(
+                    ($e.value | length == 1 and .[0] == ("dep:" + $e.key)) | not
+                  )
+                | $e.key
               ' \
             | grep -v -i metal \
+            | grep -v "^default$" \
             | sort -u \
             | tr '\n' ',')
           # Strip trailing comma
