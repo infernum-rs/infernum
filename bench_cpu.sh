@@ -90,14 +90,13 @@ fi
 
 # Model paths
 SMOLLM_DIR="${MODEL_CACHE}/HuggingFaceTB/SmolLM2-360M"
-SMOLLM_Q4="${GGUF_DIR}/smollm2-360m-q4_0.gguf"
-SMOLLM_Q8="${GGUF_DIR}/smollm2-360m-q8_0.gguf"
+SMOLLM_Q4="${MODEL_CACHE}/bartowski/SmolLM2-360M-Instruct-GGUF/SmolLM2-360M-Instruct-Q4_0.gguf"
+SMOLLM_Q8="${MODEL_CACHE}/bartowski/SmolLM2-360M-Instruct-GGUF/SmolLM2-360M-Instruct-Q8_0.gguf"
 SMOLLM_F32="${GGUF_DIR}/smollm2-360m-f32.gguf"
 
 QWEN_DIR="${MODEL_CACHE}/Qwen/Qwen2.5-0.5B"
 
-GEMMA_GGUF_Q8="${GGUF_DIR}/gemma-2-2b-it-q8_0.gguf"
-GEMMA_GGUF_Q4="${GGUF_DIR}/gemma-2-2b-it-q4_0.gguf"
+GEMMA_GGUF_Q8="${MODEL_CACHE}/bartowski/gemma-2-2b-it-GGUF/gemma-2-2b-it-Q8_0.gguf"
 
 effective_threads="${THREADS:-$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo '?')}"
 
@@ -147,7 +146,8 @@ convert_to_gguf() {
     $HAS_LLAMA_CPP || { log "Skipping GGUF conversion (no llama.cpp)"; return 0; }
     log "Converting → ${output} (${outtype})"
     $DRY_RUN && return 0
-    python3 "${CONVERT_SCRIPT}" "${model_dir}" --outfile "${output}" --outtype "${outtype}" 2>/dev/null
+    python3 "${CONVERT_SCRIPT}" "${model_dir}" --outfile "${output}" --outtype "${outtype}" 2>/dev/null \
+        || { log "WARNING: GGUF conversion failed (missing python deps?) — ${output} skipped"; return 0; }
 }
 
 quantize_gguf() {
@@ -230,12 +230,11 @@ $DRY_RUN && log "(dry-run: skipping downloads)"
 
 [[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && {
     download_hf_model "HuggingFaceTB/SmolLM2-360M" "${SMOLLM_DIR}"
+    download_hf_file "bartowski/SmolLM2-360M-Instruct-GGUF" "SmolLM2-360M-Instruct-Q4_0.gguf" "${SMOLLM_Q4}"
+    download_hf_file "bartowski/SmolLM2-360M-Instruct-GGUF" "SmolLM2-360M-Instruct-Q8_0.gguf" "${SMOLLM_Q8}"
     if $HAS_LLAMA_CPP; then
-        local _f16="${GGUF_DIR}/smollm2-360m-f16.gguf"
+        _f16_smollm="${GGUF_DIR}/smollm2-360m-f16.gguf"
         convert_to_gguf "${SMOLLM_DIR}" "${SMOLLM_F32}" "f32"
-        convert_to_gguf "${SMOLLM_DIR}" "${_f16}" "f16"
-        quantize_gguf "${_f16}" "${SMOLLM_Q8}" "q8_0"
-        quantize_gguf "${_f16}" "${SMOLLM_Q4}" "q4_0"
     fi
 }
 
@@ -245,7 +244,6 @@ $DRY_RUN && log "(dry-run: skipping downloads)"
 
 [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]] && {
     download_hf_file "bartowski/gemma-2-2b-it-GGUF" "gemma-2-2b-it-Q8_0.gguf" "${GEMMA_GGUF_Q8}"
-    download_hf_file "bartowski/gemma-2-2b-it-GGUF" "gemma-2-2b-it-Q4_0.gguf" "${GEMMA_GGUF_Q4}"
 }
 
 # ── Build ──────────────────────────────────────────────────────────────────────
@@ -276,7 +274,7 @@ if [[ -n "${ENABLED_FAMILIES[llama]:-}" ]]; then
         log "[Llama] SmolLM2-360M GGUF Q8_0 decode"
         D_INFNUM["Llama/SmolLM2-360M Q8_0"]=$(run_infernum_decode "${SMOLLM_Q8}")
         D_LLAMA["Llama/SmolLM2-360M Q8_0"]=$(run_llama_bench_decode "${SMOLLM_Q8}")
-        P_INFNUM["Llama/SmolLM2-360M Q8_0"]=$(run_infernum_prefill "${SMOLLM_DIR}")
+        P_INFNUM["Llama/SmolLM2-360M Q8_0"]=$(run_infernum_prefill "${SMOLLM_Q8}")
         P_LLAMA["Llama/SmolLM2-360M Q8_0"]=$(run_llama_bench_prefill "${SMOLLM_Q8}")
     fi
 
@@ -284,7 +282,7 @@ if [[ -n "${ENABLED_FAMILIES[llama]:-}" ]]; then
         log "[Llama] SmolLM2-360M GGUF Q4_0 decode"
         D_INFNUM["Llama/SmolLM2-360M Q4_0"]=$(run_infernum_decode "${SMOLLM_Q4}")
         D_LLAMA["Llama/SmolLM2-360M Q4_0"]=$(run_llama_bench_decode "${SMOLLM_Q4}")
-        P_INFNUM["Llama/SmolLM2-360M Q4_0"]=$(run_infernum_prefill "${SMOLLM_DIR}")
+        P_INFNUM["Llama/SmolLM2-360M Q4_0"]=$(run_infernum_prefill "${SMOLLM_Q4}")
         P_LLAMA["Llama/SmolLM2-360M Q4_0"]=$(run_llama_bench_prefill "${SMOLLM_Q4}")
     fi
 
@@ -302,8 +300,7 @@ if [[ -n "${ENABLED_FAMILIES[qwen]:-}" ]]; then
     log "[Qwen] Qwen2.5-0.5B decode"
     D_INFNUM["Qwen/Qwen2.5-0.5B F32"]=$(run_infernum_decode "${QWEN_DIR}")
     D_LLAMA["Qwen/Qwen2.5-0.5B F32"]="—"
-    log "[Qwen] Qwen2.5-0.5B prefill"
-    P_INFNUM["Qwen/Qwen2.5-0.5B F32"]=$(run_infernum_prefill "${QWEN_DIR}")
+    P_INFNUM["Qwen/Qwen2.5-0.5B F32"]="—"  # --graph only supports Llama family
     P_LLAMA["Qwen/Qwen2.5-0.5B F32"]="—"
 fi
 
@@ -315,13 +312,6 @@ if [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]]; then
         D_LLAMA["Gemma/gemma-2-2b-it Q8_0"]=$(run_llama_bench_decode "${GEMMA_GGUF_Q8}")
         P_INFNUM["Gemma/gemma-2-2b-it Q8_0"]="—"  # GGUF prefill needs SafeTensors path
         P_LLAMA["Gemma/gemma-2-2b-it Q8_0"]=$(run_llama_bench_prefill "${GEMMA_GGUF_Q8}")
-    fi
-    if [[ -f "${GEMMA_GGUF_Q4}" ]]; then
-        log "[Gemma] gemma-2-2b-it Q4_0 decode"
-        D_INFNUM["Gemma/gemma-2-2b-it Q4_0"]=$(run_infernum_decode "${GEMMA_GGUF_Q4}")
-        D_LLAMA["Gemma/gemma-2-2b-it Q4_0"]=$(run_llama_bench_decode "${GEMMA_GGUF_Q4}")
-        P_INFNUM["Gemma/gemma-2-2b-it Q4_0"]="—"
-        P_LLAMA["Gemma/gemma-2-2b-it Q4_0"]=$(run_llama_bench_prefill "${GEMMA_GGUF_Q4}")
     fi
 fi
 
@@ -351,7 +341,6 @@ row_order=(
     "Llama/SmolLM2-360M F32"
     "Qwen/Qwen2.5-0.5B F32"
     "Gemma/gemma-2-2b-it Q8_0"
-    "Gemma/gemma-2-2b-it Q4_0"
 )
 
 echo ""
