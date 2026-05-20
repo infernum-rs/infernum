@@ -300,7 +300,8 @@ if [[ -n "${ENABLED_FAMILIES[qwen]:-}" ]]; then
     log "[Qwen] Qwen2.5-0.5B decode"
     D_INFNUM["Qwen/Qwen2.5-0.5B F32"]=$(run_infernum_decode "${QWEN_DIR}")
     D_LLAMA["Qwen/Qwen2.5-0.5B F32"]="—"
-    P_INFNUM["Qwen/Qwen2.5-0.5B F32"]="—"  # --graph only supports Llama family
+    log "[Qwen] Qwen2.5-0.5B prefill"
+    P_INFNUM["Qwen/Qwen2.5-0.5B F32"]=$(run_infernum_prefill "${QWEN_DIR}")
     P_LLAMA["Qwen/Qwen2.5-0.5B F32"]="—"
 fi
 
@@ -310,7 +311,8 @@ if [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]]; then
         log "[Gemma] gemma-2-2b-it Q8_0 decode"
         D_INFNUM["Gemma/gemma-2-2b-it Q8_0"]=$(run_infernum_decode "${GEMMA_GGUF_Q8}")
         D_LLAMA["Gemma/gemma-2-2b-it Q8_0"]=$(run_llama_bench_decode "${GEMMA_GGUF_Q8}")
-        P_INFNUM["Gemma/gemma-2-2b-it Q8_0"]="—"  # GGUF prefill needs SafeTensors path
+        log "[Gemma] gemma-2-2b-it Q8_0 prefill"
+        P_INFNUM["Gemma/gemma-2-2b-it Q8_0"]=$(run_infernum_prefill "${GEMMA_GGUF_Q8}")
         P_LLAMA["Gemma/gemma-2-2b-it Q8_0"]=$(run_llama_bench_prefill "${GEMMA_GGUF_Q8}")
     fi
 fi
