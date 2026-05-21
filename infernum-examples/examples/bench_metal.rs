@@ -70,7 +70,8 @@ fn detect_model_type_safetensors(model_path: &str) -> infernum::Result<String> {
 }
 
 fn detect_family_gguf(gguf_path: &Path) -> infernum::Result<&'static str> {
-    let loader = infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
+    let loader =
+        infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
     let arch = loader
         .metadata()
         .get("general.architecture")
@@ -119,9 +120,7 @@ fn bench_model<M: infernum::Model<B = MetalBackend> + Send + 'static>(
     // ── Prefill benchmark ────────────────────────────────────────────────────
     if n_prompt > 0 {
         let tok_s = bench_prefill(&model, n_prompt, ctx)?;
-        println!(
-            "prefill: {n_prompt} tokens = {tok_s:.1} tok/s",
-        );
+        println!("prefill: {n_prompt} tokens = {tok_s:.1} tok/s",);
     }
 
     // ── Decode benchmark ─────────────────────────────────────────────────────
@@ -174,13 +173,19 @@ fn main() -> infernum::Result<()> {
             "llama" => {
                 let model = LlamaMetalGraphEngine::from_gguf(ctx.clone(), gguf_path)?;
                 let cfg = model.config();
-                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                eprintln!(
+                    "Model: {} layers, {} hidden",
+                    cfg.num_hidden_layers, cfg.hidden_size
+                );
                 bench_model(model, cli.n_gen, cli.n_prompt, &ctx)
             }
             "gemma" => {
                 let model = GemmaMetalGraphEngine::from_gguf(ctx.clone(), gguf_path)?;
                 let cfg = model.config();
-                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                eprintln!(
+                    "Model: {} layers, {} hidden",
+                    cfg.num_hidden_layers, cfg.hidden_size
+                );
                 bench_model(model, cli.n_gen, cli.n_prompt, &ctx)
             }
             other => panic!("Unsupported GGUF family: {other}"),
@@ -205,19 +210,28 @@ fn main() -> infernum::Result<()> {
             "llama" => {
                 let model = LlamaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
                 let cfg = model.config();
-                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                eprintln!(
+                    "Model: {} layers, {} hidden",
+                    cfg.num_hidden_layers, cfg.hidden_size
+                );
                 bench_model(model, cli.n_gen, cli.n_prompt, &ctx)
             }
             "qwen" => {
                 let model = QwenMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
                 let cfg = model.config();
-                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                eprintln!(
+                    "Model: {} layers, {} hidden",
+                    cfg.num_hidden_layers, cfg.hidden_size
+                );
                 bench_model(model, cli.n_gen, cli.n_prompt, &ctx)
             }
             "gemma" => {
                 let model = GemmaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
                 let cfg = model.config();
-                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                eprintln!(
+                    "Model: {} layers, {} hidden",
+                    cfg.num_hidden_layers, cfg.hidden_size
+                );
                 bench_model(model, cli.n_gen, cli.n_prompt, &ctx)
             }
             other => panic!("Unsupported family: {other}"),

@@ -13,14 +13,14 @@
 //! - Single-GPU only (no tensor parallelism / `AllReduce`)
 
 use infernum::backend::{
-    ArithOps, AttentionOps, Backend, ContextBackend, EmbedOps, MatmulOps, NormOps,
-    PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
+    ArithOps, AttentionOps, Backend, ContextBackend, EmbedOps, MatmulOps, MoeOps, MoeSigmoidOps,
+    NormOps, PagedAttentionOps, PagedKvCacheOps, RopeOps, SwigluOps, TensorOps,
 };
 use infernum::dtype::DType;
 use infernum::graph::{
-    Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphMatmulOps, GraphNormOps,
-    GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSiluOps, GraphTensorOps,
-    WeightId,
+    Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphMatmulOps, GraphMoeOps,
+    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSiluOps,
+    GraphTensorOps, MoeExpertIds, WeightId,
 };
 
 use crate::config::LlamaConfig;
@@ -29,26 +29,87 @@ use crate::config::LlamaConfig;
 // Weight ID structures
 // ---------------------------------------------------------------------------
 
-/// Weight IDs for a single transformer layer.
-pub struct LayerWeightIds {
-    /// RMS norm weight before attention.
+/// Weight IDs for a dense (non-MoE) transformer layer.
+pub struct DenseLayerWeightIds {
     pub input_layernorm: WeightId,
-    /// Q projection (linear weight).
     pub q_proj: WeightId,
-    /// K projection (linear weight).
     pub k_proj: WeightId,
-    /// V projection (linear weight).
     pub v_proj: WeightId,
-    /// Output projection (linear weight).
     pub o_proj: WeightId,
-    /// RMS norm weight before FFN.
     pub post_attention_layernorm: WeightId,
-    /// Gate projection (linear weight).
     pub gate_proj: WeightId,
-    /// Up projection (linear weight).
     pub up_proj: WeightId,
-    /// Down projection (linear weight).
     pub down_proj: WeightId,
+}
+
+/// Weight IDs for a `MoE` transformer layer (`Mixtral`).
+pub struct MoeLayerWeightIds {
+    pub input_layernorm: WeightId,
+    pub q_proj: WeightId,
+    pub k_proj: WeightId,
+    pub v_proj: WeightId,
+    pub o_proj: WeightId,
+    pub post_attention_layernorm: WeightId,
+    /// Router gate weight (`block_sparse_moe.gate.weight`).
+    pub moe_gate: WeightId,
+    /// Per-expert MLP weight IDs.
+    pub experts: Vec<MoeExpertIds>,
+}
+
+/// Weight IDs for a single transformer layer — either dense or `MoE`.
+pub enum LayerWeightIds {
+    Dense(DenseLayerWeightIds),
+    Moe(MoeLayerWeightIds),
+}
+
+impl LayerWeightIds {
+    #[must_use]
+    pub fn input_layernorm(&self) -> WeightId {
+        match self {
+            Self::Dense(dense) => dense.input_layernorm,
+            Self::Moe(moe) => moe.input_layernorm,
+        }
+    }
+
+    #[must_use]
+    pub fn q_proj(&self) -> WeightId {
+        match self {
+            Self::Dense(dense) => dense.q_proj,
+            Self::Moe(moe) => moe.q_proj,
+        }
+    }
+
+    #[must_use]
+    pub fn k_proj(&self) -> WeightId {
+        match self {
+            Self::Dense(dense) => dense.k_proj,
+            Self::Moe(moe) => moe.k_proj,
+        }
+    }
+
+    #[must_use]
+    pub fn v_proj(&self) -> WeightId {
+        match self {
+            Self::Dense(dense) => dense.v_proj,
+            Self::Moe(moe) => moe.v_proj,
+        }
+    }
+
+    #[must_use]
+    pub fn o_proj(&self) -> WeightId {
+        match self {
+            Self::Dense(dense) => dense.o_proj,
+            Self::Moe(moe) => moe.o_proj,
+        }
+    }
+
+    #[must_use]
+    pub fn post_attention_layernorm(&self) -> WeightId {
+        match self {
+            Self::Dense(dense) => dense.post_attention_layernorm,
+            Self::Moe(moe) => moe.post_attention_layernorm,
+        }
+    }
 }
 
 /// All weight IDs for the full Llama model.
@@ -68,9 +129,6 @@ pub struct ModelWeightIds {
 // ---------------------------------------------------------------------------
 
 /// Backend trait bounds required by the Llama graph builder.
-///
-/// This is the subset of [`LlamaOps`](crate::model::LlamaOps) needed for
-/// the prefill graph — excludes paged KV cache, `MoE`, and cast ops.
 pub trait LlamaGraphOps:
     Backend
     + MatmulOps
@@ -82,6 +140,8 @@ pub trait LlamaGraphOps:
     + RopeOps
     + AttentionOps
     + SwigluOps
+    + MoeOps
+    + MoeSigmoidOps
 {
 }
 
@@ -96,6 +156,8 @@ impl<B> LlamaGraphOps for B where
         + RopeOps
         + AttentionOps
         + SwigluOps
+        + MoeOps
+        + MoeSigmoidOps
 {
 }
 
@@ -107,6 +169,7 @@ impl<B> LlamaGraphOps for B where
 ///
 /// Weight names match the `SafeTensors` naming convention used by
 /// [`LlamaModel::load_weights`](crate::LlamaModel).
+#[allow(clippy::too_many_lines)]
 fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &LlamaConfig,
@@ -123,6 +186,9 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
         &[vocab_size, hidden],
         weight_dtype,
     );
+
+    let is_moe = config.is_moe();
+    let num_experts = config.num_local_experts.unwrap_or(0);
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
@@ -158,33 +224,77 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
             &[hidden],
             weight_dtype,
         );
-        let gate_proj = graph.register_linear_weight(
-            format!("{p}.mlp.gate_proj.weight"),
-            &[intermediate, hidden],
-            weight_dtype,
-        );
-        let up_proj = graph.register_linear_weight(
-            format!("{p}.mlp.up_proj.weight"),
-            &[intermediate, hidden],
-            weight_dtype,
-        );
-        let down_proj = graph.register_linear_weight(
-            format!("{p}.mlp.down_proj.weight"),
-            &[hidden, intermediate],
-            weight_dtype,
-        );
 
-        layers.push(LayerWeightIds {
-            input_layernorm,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            post_attention_layernorm,
-            gate_proj,
-            up_proj,
-            down_proj,
-        });
+        if is_moe {
+            // Mixtral naming: block_sparse_moe.gate (router) + per-expert w1/w2/w3.
+            // w1 = gate_proj, w3 = up_proj, w2 = down_proj (HF Mixtral convention).
+            let moe_gate = graph.register_tensor_weight(
+                format!("{p}.block_sparse_moe.gate.weight"),
+                &[num_experts, hidden],
+                DType::F32,
+            );
+            let mut experts = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let ep = format!("{p}.block_sparse_moe.experts.{e}");
+                let gate_proj = graph.register_linear_weight(
+                    format!("{ep}.w1"),
+                    &[intermediate, hidden],
+                    weight_dtype,
+                );
+                let up_proj = graph.register_linear_weight(
+                    format!("{ep}.w3"),
+                    &[intermediate, hidden],
+                    weight_dtype,
+                );
+                let down_proj = graph.register_linear_weight(
+                    format!("{ep}.w2"),
+                    &[hidden, intermediate],
+                    weight_dtype,
+                );
+                experts.push(MoeExpertIds {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                });
+            }
+            layers.push(LayerWeightIds::Moe(MoeLayerWeightIds {
+                input_layernorm,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                post_attention_layernorm,
+                moe_gate,
+                experts,
+            }));
+        } else {
+            let gate_proj = graph.register_linear_weight(
+                format!("{p}.mlp.gate_proj.weight"),
+                &[intermediate, hidden],
+                weight_dtype,
+            );
+            let up_proj = graph.register_linear_weight(
+                format!("{p}.mlp.up_proj.weight"),
+                &[intermediate, hidden],
+                weight_dtype,
+            );
+            let down_proj = graph.register_linear_weight(
+                format!("{p}.mlp.down_proj.weight"),
+                &[hidden, intermediate],
+                weight_dtype,
+            );
+            layers.push(LayerWeightIds::Dense(DenseLayerWeightIds {
+                input_layernorm,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                post_attention_layernorm,
+                gate_proj,
+                up_proj,
+                down_proj,
+            }));
+        }
     }
 
     let final_norm = graph.register_tensor_weight("model.norm.weight", &[hidden], weight_dtype);
@@ -218,18 +328,15 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 ///
 /// # Panics
 ///
-/// Panics if the config describes an `MoE` model (`num_local_experts > 1`).
 #[must_use]
 pub fn build_prefill_graph<B: LlamaGraphOps>(
     config: &LlamaConfig,
     seq_len: usize,
     weight_dtype: DType,
-) -> (Graph<B>, ModelWeightIds) {
-    assert!(
-        !config.is_moe(),
-        "build_prefill_graph does not support MoE models"
-    );
-
+) -> (Graph<B>, ModelWeightIds)
+where
+    Graph<B>: GraphMoeOps,
+{
     let mut graph = Graph::<B>::new();
 
     let hidden = config.hidden_size;
@@ -260,13 +367,15 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
     // -- Embedding --
     let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_ids);
 
+    let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
+
     // -- Transformer layers --
     for lw in &model_weights.layers {
         // 1. Pre-attention RMS norm
-        let normed = graph.add_rms_norm(h, lw.input_layernorm, eps);
+        let normed = graph.add_rms_norm(h, lw.input_layernorm(), eps);
 
-        // 2. Q/K/V projections (fused triple — single dispatch, shared quantization)
-        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
+        // 2. Q/K/V projections (fused triple)
+        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj(), lw.k_proj(), lw.v_proj());
 
         // 3. Reshape to 3D: [seq_len, num_heads, head_dim]
         let q_3d = graph.add_reshape(q, &[seq_len, num_heads, head_dim]);
@@ -282,20 +391,33 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
 
         // 6. Reshape back to 2D and output projection
         let attn_flat = graph.add_reshape(attn_out, &[seq_len, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
+        let attn_proj = graph.add_linear(attn_flat, lw.o_proj());
 
-        // 7. Residual add + post-attention RMS norm (primitives — optimizer fuses)
+        // 7. Residual add + post-attention RMS norm
         let h_updated = graph.add_add(h, attn_proj);
-        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm, eps);
+        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm(), eps);
 
-        // 8. FFN: SiLU + Mul MLP (primitives — optimizer fuses into Swiglu)
-        let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
-        let gate_activated = graph.add_silu(gate);
-        let activated = graph.add_mul(gate_activated, up);
-        let down = graph.add_linear(activated, lw.down_proj);
-
-        // 9. Residual add
-        h = graph.add_add_inplace(h_updated, down);
+        // 8. FFN (dense SwiGLU or MoE dispatch)
+        h = match lw {
+            LayerWeightIds::Dense(dense) => {
+                let (gate, up) = graph.add_linear_pair(normed_post, dense.gate_proj, dense.up_proj);
+                let gate_activated = graph.add_silu(gate);
+                let activated = graph.add_mul(gate_activated, up);
+                let down = graph.add_linear(activated, dense.down_proj);
+                graph.add_add_inplace(h_updated, down)
+            }
+            LayerWeightIds::Moe(moe) => {
+                // Mixtral uses softmax routing with top-k renormalization.
+                let moe_out = graph.add_moe_dispatch_softmax(
+                    normed_post,
+                    moe.moe_gate,
+                    moe.experts.clone(),
+                    num_experts_per_tok,
+                    true,
+                );
+                graph.add_add_inplace(h_updated, moe_out)
+            }
+        };
     }
 
     // -- Final norm --
@@ -333,18 +455,15 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
 ///
 /// # Panics
 ///
-/// Panics if the config describes an `MoE` model (`num_local_experts > 1`).
 #[must_use]
 pub fn build_decode_graph<B: LlamaGraphOps>(
     config: &LlamaConfig,
     kv_len: usize,
     weight_dtype: DType,
-) -> (Graph<B>, ModelWeightIds) {
-    assert!(
-        !config.is_moe(),
-        "build_decode_graph does not support MoE models"
-    );
-
+) -> (Graph<B>, ModelWeightIds)
+where
+    Graph<B>: GraphMoeOps,
+{
     let mut graph = Graph::<B>::new();
 
     let hidden = config.hidden_size;
@@ -384,16 +503,18 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
     // -- Embedding --
     let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_id);
 
+    let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
+
     // -- Transformer layers --
     let mut k_outputs = Vec::with_capacity(num_layers);
     let mut v_outputs = Vec::with_capacity(num_layers);
 
     for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
         // 1. Pre-attention RMS norm
-        let normed = graph.add_rms_norm(h, lw.input_layernorm, eps);
+        let normed = graph.add_rms_norm(h, lw.input_layernorm(), eps);
 
         // 2. Q/K/V projections (fused triple)
-        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
+        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj(), lw.k_proj(), lw.v_proj());
 
         // 3. Reshape to 3D: [1, num_heads, head_dim]
         let q_3d = graph.add_reshape(q, &[1, num_heads, head_dim]);
@@ -417,20 +538,32 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
 
         // 7. Reshape back to 2D and output projection
         let attn_flat = graph.add_reshape(attn_out, &[1, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
+        let attn_proj = graph.add_linear(attn_flat, lw.o_proj());
 
         // 8. Residual add + post-attention RMS norm (primitives — optimizer fuses)
         let h_updated = graph.add_add(h, attn_proj);
-        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm, eps);
+        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm(), eps);
 
-        // 9. FFN: SiLU + Mul MLP (primitives — optimizer fuses into Swiglu)
-        let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
-        let gate_activated = graph.add_silu(gate);
-        let activated = graph.add_mul(gate_activated, up);
-        let down = graph.add_linear(activated, lw.down_proj);
-
-        // 10. Residual add
-        h = graph.add_add_inplace(h_updated, down);
+        // 9. FFN (dense SwiGLU or MoE dispatch)
+        h = match lw {
+            LayerWeightIds::Dense(dense) => {
+                let (gate, up) = graph.add_linear_pair(normed_post, dense.gate_proj, dense.up_proj);
+                let gate_activated = graph.add_silu(gate);
+                let activated = graph.add_mul(gate_activated, up);
+                let down = graph.add_linear(activated, dense.down_proj);
+                graph.add_add_inplace(h_updated, down)
+            }
+            LayerWeightIds::Moe(moe) => {
+                let moe_out = graph.add_moe_dispatch_softmax(
+                    normed_post,
+                    moe.moe_gate,
+                    moe.experts.clone(),
+                    num_experts_per_tok,
+                    true,
+                );
+                graph.add_add_inplace(h_updated, moe_out)
+            }
+        };
     }
 
     // -- Final norm --
@@ -476,7 +609,6 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
 ///
 /// # Panics
 ///
-/// Panics if the config describes an `MoE` model.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_paged_decode_graph<B>(
@@ -488,13 +620,8 @@ pub fn build_paged_decode_graph<B>(
 ) -> Graph<B>
 where
     B: LlamaGraphOps + PagedKvCacheOps + PagedAttentionOps,
-    Graph<B>: GraphPagedKvCacheOps + GraphPagedAttentionOps,
+    Graph<B>: GraphMoeOps + GraphPagedKvCacheOps + GraphPagedAttentionOps,
 {
-    assert!(
-        !config.is_moe(),
-        "build_paged_decode_graph does not support MoE models"
-    );
-
     let mut graph = Graph::<B>::new();
 
     let hidden = config.hidden_size;
@@ -528,13 +655,15 @@ where
     // -- Embedding --
     let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_ids);
 
+    let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
+
     // -- Transformer layers --
     for (layer_idx, lw) in model_weights.layers.iter().enumerate() {
         // 1. Pre-attention RMS norm
-        let normed = graph.add_rms_norm(h, lw.input_layernorm, eps);
+        let normed = graph.add_rms_norm(h, lw.input_layernorm(), eps);
 
         // 2. Q/K/V projections
-        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj, lw.k_proj, lw.v_proj);
+        let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj(), lw.k_proj(), lw.v_proj());
 
         // 3. Reshape to 3D: [batch_size, num_heads, head_dim]
         let q_3d = graph.add_reshape(q, &[batch_size, num_heads, head_dim]);
@@ -569,20 +698,32 @@ where
 
         // 7. Reshape back to 2D and output projection
         let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, lw.o_proj);
+        let attn_proj = graph.add_linear(attn_flat, lw.o_proj());
 
         // 8. Residual add + post-attention RMS norm
         let h_updated = graph.add_add(h, attn_proj);
-        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm, eps);
+        let normed_post = graph.add_rms_norm(h_updated, lw.post_attention_layernorm(), eps);
 
-        // 9. FFN: SiLU + Mul MLP
-        let (gate, up) = graph.add_linear_pair(normed_post, lw.gate_proj, lw.up_proj);
-        let gate_activated = graph.add_silu(gate);
-        let activated = graph.add_mul(gate_activated, up);
-        let down = graph.add_linear(activated, lw.down_proj);
-
-        // 10. Residual add
-        h = graph.add_add_inplace(h_updated, down);
+        // 9. FFN (dense SwiGLU or MoE dispatch)
+        h = match lw {
+            LayerWeightIds::Dense(dense) => {
+                let (gate, up) = graph.add_linear_pair(normed_post, dense.gate_proj, dense.up_proj);
+                let gate_activated = graph.add_silu(gate);
+                let activated = graph.add_mul(gate_activated, up);
+                let down = graph.add_linear(activated, dense.down_proj);
+                graph.add_add_inplace(h_updated, down)
+            }
+            LayerWeightIds::Moe(moe) => {
+                let moe_out = graph.add_moe_dispatch_softmax(
+                    normed_post,
+                    moe.moe_gate,
+                    moe.experts.clone(),
+                    num_experts_per_tok,
+                    true,
+                );
+                graph.add_add_inplace(h_updated, moe_out)
+            }
+        };
     }
 
     // -- Final norm --
@@ -1122,39 +1263,42 @@ mod tests {
         // Verify layer 0 weight names
         let lw = &weights.layers[0];
         assert_eq!(
-            graph.tensor_weight_meta(lw.input_layernorm).name,
+            graph.tensor_weight_meta(lw.input_layernorm()).name,
             "model.layers.0.input_layernorm.weight"
         );
         assert_eq!(
-            graph.linear_weight_meta(lw.q_proj).name,
+            graph.linear_weight_meta(lw.q_proj()).name,
             "model.layers.0.self_attn.q_proj.weight"
         );
         assert_eq!(
-            graph.linear_weight_meta(lw.k_proj).name,
+            graph.linear_weight_meta(lw.k_proj()).name,
             "model.layers.0.self_attn.k_proj.weight"
         );
         assert_eq!(
-            graph.linear_weight_meta(lw.v_proj).name,
+            graph.linear_weight_meta(lw.v_proj()).name,
             "model.layers.0.self_attn.v_proj.weight"
         );
         assert_eq!(
-            graph.linear_weight_meta(lw.o_proj).name,
+            graph.linear_weight_meta(lw.o_proj()).name,
             "model.layers.0.self_attn.o_proj.weight"
         );
         assert_eq!(
-            graph.tensor_weight_meta(lw.post_attention_layernorm).name,
+            graph.tensor_weight_meta(lw.post_attention_layernorm()).name,
             "model.layers.0.post_attention_layernorm.weight"
         );
+        let LayerWeightIds::Dense(dense) = lw else {
+            panic!("expected dense layer in dense test config");
+        };
         assert_eq!(
-            graph.linear_weight_meta(lw.gate_proj).name,
+            graph.linear_weight_meta(dense.gate_proj).name,
             "model.layers.0.mlp.gate_proj.weight"
         );
         assert_eq!(
-            graph.linear_weight_meta(lw.up_proj).name,
+            graph.linear_weight_meta(dense.up_proj).name,
             "model.layers.0.mlp.up_proj.weight"
         );
         assert_eq!(
-            graph.linear_weight_meta(lw.down_proj).name,
+            graph.linear_weight_meta(dense.down_proj).name,
             "model.layers.0.mlp.down_proj.weight"
         );
 
@@ -1178,8 +1322,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "does not support MoE")]
-    fn prefill_graph_panics_on_moe() {
+    fn prefill_graph_moe_builds_correctly() {
         let config: LlamaConfig = serde_json::from_str(
             r#"{
                 "model_type": "mixtral",
@@ -1195,7 +1338,17 @@ mod tests {
         )
         .unwrap();
 
-        let _ = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16);
+        let (graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16);
+        assert_eq!(weights.layers.len(), config.num_hidden_layers);
+        // Each layer should be MoE with 8 experts
+        for lw in &weights.layers {
+            let LayerWeightIds::Moe(m) = lw else {
+                panic!("expected MoE layer for Mixtral config");
+            };
+            assert_eq!(m.experts.len(), 8);
+        }
+        // Output is logits [seq_len, vocab_size]
+        assert_eq!(graph.output_ids().len(), 1);
     }
 
     #[test]

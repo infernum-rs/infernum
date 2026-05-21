@@ -800,10 +800,10 @@ fn bench_cuda_graphs_decode(
         for layer_idx in 0..num_layers {
             let ids = &model_weight_ids.layers[layer_idx];
 
-            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm), eps)?;
-            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj))?;
-            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj))?;
-            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj))?;
+            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm()), eps)?;
+            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj()))?;
+            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj()))?;
+            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj()))?;
 
             let q = q_flat.reshape(&[1, num_heads, head_dim]);
             let k = k_flat.reshape(&[1, num_kv_heads, head_dim]);
@@ -839,18 +839,21 @@ fn bench_cuda_graphs_decode(
                 config.effective_sliding_window(layer_idx),
             )?;
             let attn_flat = attn.reshape(&[1, hidden_size]);
-            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj))?;
+            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj()))?;
             add_inplace(&mut hidden, &attn_proj)?;
 
             let ffn_normed = rms_norm(
                 &hidden,
-                weights.tensor_weight(ids.post_attention_layernorm),
+                weights.tensor_weight(ids.post_attention_layernorm()),
                 eps,
             )?;
-            let gate = linear(&ffn_normed, weights.linear_weight(ids.gate_proj))?;
-            let up = linear(&ffn_normed, weights.linear_weight(ids.up_proj))?;
+            let infernum_llama::LayerWeightIds::Dense(dense) = ids else {
+                unreachable!("bench_graph only runs for dense models")
+            };
+            let gate = linear(&ffn_normed, weights.linear_weight(dense.gate_proj))?;
+            let up = linear(&ffn_normed, weights.linear_weight(dense.up_proj))?;
             let activated = swiglu(&gate, &up)?;
-            let ffn_out = linear(&activated, weights.linear_weight(ids.down_proj))?;
+            let ffn_out = linear(&activated, weights.linear_weight(dense.down_proj))?;
             add_inplace(&mut hidden, &ffn_out)?;
         }
 
@@ -897,10 +900,10 @@ fn bench_cuda_graphs_decode(
         for layer_idx in 0..num_layers {
             let ids = &model_weight_ids.layers[layer_idx];
 
-            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm), eps)?;
-            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj))?;
-            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj))?;
-            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj))?;
+            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm()), eps)?;
+            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj()))?;
+            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj()))?;
+            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj()))?;
 
             let q = q_flat.reshape(&[1, num_heads, head_dim]);
             let k = k_flat.reshape(&[1, num_kv_heads, head_dim]);
@@ -930,18 +933,21 @@ fn bench_cuda_graphs_decode(
                 config.effective_sliding_window(layer_idx),
             )?;
             let attn_flat = attn.reshape(&[1, hidden_size]);
-            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj))?;
+            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj()))?;
             add_inplace(&mut hidden, &attn_proj)?;
 
             let ffn_normed = rms_norm(
                 &hidden,
-                weights.tensor_weight(ids.post_attention_layernorm),
+                weights.tensor_weight(ids.post_attention_layernorm()),
                 eps,
             )?;
-            let gate = linear(&ffn_normed, weights.linear_weight(ids.gate_proj))?;
-            let up = linear(&ffn_normed, weights.linear_weight(ids.up_proj))?;
+            let infernum_llama::LayerWeightIds::Dense(dense) = ids else {
+                unreachable!("bench_graph only runs for dense models")
+            };
+            let gate = linear(&ffn_normed, weights.linear_weight(dense.gate_proj))?;
+            let up = linear(&ffn_normed, weights.linear_weight(dense.up_proj))?;
             let activated = swiglu(&gate, &up)?;
-            let ffn_out = linear(&activated, weights.linear_weight(ids.down_proj))?;
+            let ffn_out = linear(&activated, weights.linear_weight(dense.down_proj))?;
             add_inplace(&mut hidden, &ffn_out)?;
         }
 
