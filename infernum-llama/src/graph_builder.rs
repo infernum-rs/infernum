@@ -608,8 +608,7 @@ where
 /// # Panics
 ///
 /// Panics on an unrecognised layer suffix (indicates a bug in weight registration).
-#[cfg(feature = "cpu")]
-fn safetensors_to_gguf_name(name: &str) -> String {
+pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     match name {
         "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
         "model.norm.weight" => return "output_norm.weight".to_string(),
@@ -639,8 +638,7 @@ fn safetensors_to_gguf_name(name: &str) -> String {
 
 /// Returns `true` if this GGUF tensor name is a Q or K projection that needs
 /// the GGUF row-permutation reversal before use.
-#[cfg(feature = "cpu")]
-fn needs_unpermute(gguf_name: &str) -> bool {
+pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {
     gguf_name.ends_with(".attn_q.weight") || gguf_name.ends_with(".attn_k.weight")
 }
 

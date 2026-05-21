@@ -214,21 +214,22 @@ declare -A D_INFNUM D_LLAMA
 # llama.cpp only supports GGUF. So Llama and Gemma get separate rows per format.
 
 [[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && {
-    # infernum: SafeTensors F32 (only format supported on Metal today)
+    # infernum: SafeTensors F32 (no llama.cpp comparison — different format)
     if [[ -d "${SMOLLM_DIR}" ]]; then
         log "[Llama] SmolLM2-360M SafeTensors F32 — infernum"
         D_INFNUM["Llama/SmolLM2-360M|SafeTensors F32"]=$(run_infernum "${SMOLLM_DIR}")
         D_LLAMA["Llama/SmolLM2-360M|SafeTensors F32"]="—"
     fi
-    # llama.cpp: GGUF Q8_0 and Q4_0 (no infernum comparison — different format)
+    # GGUF Q8_0: both infernum and llama.cpp — direct ratio comparison
     if [[ -f "${SMOLLM_Q8}" ]]; then
-        log "[Llama] SmolLM2-360M GGUF Q8_0 — llama.cpp"
-        D_INFNUM["Llama/SmolLM2-360M|GGUF Q8_0"]="—"
+        log "[Llama] SmolLM2-360M GGUF Q8_0 — infernum + llama.cpp"
+        D_INFNUM["Llama/SmolLM2-360M|GGUF Q8_0"]=$(run_infernum "${SMOLLM_Q8}")
         D_LLAMA["Llama/SmolLM2-360M|GGUF Q8_0"]=$(run_llama_bench "${SMOLLM_Q8}")
     fi
+    # GGUF Q4_0: both infernum and llama.cpp — direct ratio comparison
     if [[ -f "${SMOLLM_Q4}" ]]; then
-        log "[Llama] SmolLM2-360M GGUF Q4_0 — llama.cpp"
-        D_INFNUM["Llama/SmolLM2-360M|GGUF Q4_0"]="—"
+        log "[Llama] SmolLM2-360M GGUF Q4_0 — infernum + llama.cpp"
+        D_INFNUM["Llama/SmolLM2-360M|GGUF Q4_0"]=$(run_infernum "${SMOLLM_Q4}")
         D_LLAMA["Llama/SmolLM2-360M|GGUF Q4_0"]=$(run_llama_bench "${SMOLLM_Q4}")
     fi
 }
@@ -242,16 +243,16 @@ declare -A D_INFNUM D_LLAMA
 }
 
 [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]] && {
-    # infernum: no ungated SafeTensors available for Gemma 2-2B — skip
-    # llama.cpp: GGUF Q8_0 for reference
+    # GGUF Q8_0: both infernum and llama.cpp — direct ratio comparison
     if [[ -f "${GEMMA_GGUF_Q8}" ]]; then
-        log "[Gemma] gemma-2-2b-it GGUF Q8_0 — llama.cpp only"
-        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q8_0"]="—"
+        log "[Gemma] gemma-2-2b-it GGUF Q8_0 — infernum + llama.cpp"
+        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q8_0"]=$(run_infernum "${GEMMA_GGUF_Q8}")
         D_LLAMA["Gemma/gemma-2-2b-it|GGUF Q8_0"]=$(run_llama_bench "${GEMMA_GGUF_Q8}")
     fi
+    # GGUF Q4_K_M: both infernum and llama.cpp — direct ratio comparison
     if [[ -f "${GEMMA_GGUF_Q4}" ]]; then
-        log "[Gemma] gemma-2-2b-it GGUF Q4_K_M — llama.cpp only"
-        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q4_K_M"]="—"
+        log "[Gemma] gemma-2-2b-it GGUF Q4_K_M — infernum + llama.cpp"
+        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q4_K_M"]=$(run_infernum "${GEMMA_GGUF_Q4}")
         D_LLAMA["Gemma/gemma-2-2b-it|GGUF Q4_K_M"]=$(run_llama_bench "${GEMMA_GGUF_Q4}")
     fi
 }
@@ -289,8 +290,8 @@ row_order=(
 echo ""
 echo "### Decode throughput (tok/s)"
 echo ""
-echo "- infernum Metal supports SafeTensors only (GGUF loading not yet implemented)"
-echo "- llama.cpp supports GGUF only, so Llama and Gemma rows use different formats"
+echo "- Llama/Gemma GGUF rows: both infernum and llama.cpp — direct ratio comparison"
+echo "- Llama SafeTensors F32 / Qwen BF16: infernum only (llama.cpp supports GGUF only)"
 echo ""
 echo "| Model | Format | infernum | llama.cpp | ratio |"
 echo "| ----- | ------ | -------: | --------: | ----: |"

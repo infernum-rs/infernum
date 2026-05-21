@@ -2,9 +2,9 @@
 //! Measures raw forward pass performance with greedy decoding (no sampling)
 //!
 //! Usage:
-//!   cargo run --release --example bench_metal --features metal -- /path/to/safetensors_dir 128
+//!   cargo run --release --example bench_metal --features metal -- /path/to/model 128
 //!
-//! Note: GGUF loading is not yet supported on Metal. Pass a SafeTensors directory.
+//! Accepts either a SafeTensors directory or a GGUF file (.gguf).
 
 use std::path::Path;
 use std::time::Instant;
@@ -22,7 +22,7 @@ use infernum_runtime::Engine;
 #[derive(Parser)]
 #[command(name = "bench_metal")]
 struct Cli {
-    /// Path to SafeTensors model directory
+    /// Path to SafeTensors model directory or GGUF file
     model: String,
 
     /// Number of tokens to generate
@@ -45,7 +45,7 @@ fn default_model_type() -> String {
     "llama".to_string()
 }
 
-fn detect_model_type(model_path: &str) -> infernum::Result<String> {
+fn detect_model_type_safetensors(model_path: &str) -> infernum::Result<String> {
     let config_path = Path::new(model_path).join("config.json");
     let data = std::fs::read_to_string(&config_path).map_err(|e| {
         infernum::Error::Io(std::io::Error::new(
@@ -60,6 +60,24 @@ fn detect_model_type(model_path: &str) -> infernum::Result<String> {
         ))
     })?;
     Ok(probe.model_type)
+}
+
+fn detect_family_gguf(gguf_path: &Path) -> infernum::Result<&'static str> {
+    let loader = infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
+    let arch = loader
+        .metadata()
+        .get("general.architecture")
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "llama".to_string());
+    let family = match arch.as_str() {
+        "llama" | "mistral" | "mixtral" => "llama",
+        "gemma2" | "gemma3" => "gemma",
+        other => {
+            eprintln!("ERROR: Unsupported GGUF architecture: {other}");
+            std::process::exit(1);
+        }
+    };
+    Ok(family)
 }
 
 fn bench_model<M: infernum::Model<B = MetalBackend> + Send + 'static>(
@@ -101,62 +119,70 @@ fn bench_model<M: infernum::Model<B = MetalBackend> + Send + 'static>(
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
 
-    if cli.model.ends_with(".gguf") {
-        eprintln!("ERROR: GGUF loading is not yet supported on Metal. Pass a SafeTensors directory.");
-        std::process::exit(1);
-    }
-
     let mut ctx = MetalContext::new();
     if cli.profile {
         ctx.set_profile_per_kernel(true);
     }
 
-    let model_type = detect_model_type(&cli.model)?;
-    let family = match model_type.as_str() {
-        "llama" | "mistral" | "mixtral" => "llama",
-        "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
-        "gemma2" | "gemma3_text" => "gemma",
-        other => {
-            eprintln!("ERROR: Unsupported model_type: {other}");
-            std::process::exit(1);
-        }
-    };
+    let model_path = &cli.model;
 
-    eprintln!(
-        "Loading: {} (Metal, SafeTensors, {model_type})",
-        cli.model,
-    );
+    if model_path.ends_with(".gguf") {
+        let gguf_path = Path::new(model_path);
+        let family = detect_family_gguf(gguf_path)?;
 
-    let model_dir = Path::new(&cli.model);
+        eprintln!("Loading: {model_path} (Metal, GGUF, {family})");
 
-    match family {
-        "llama" => {
-            let model = LlamaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
-            let cfg = model.config();
-            eprintln!(
-                "Model: {} layers, {} hidden",
-                cfg.num_hidden_layers, cfg.hidden_size,
-            );
-            bench_model(model, cli.n_gen, &ctx)
+        match family {
+            "llama" => {
+                let model = LlamaMetalGraphEngine::from_gguf(ctx.clone(), gguf_path)?;
+                let cfg = model.config();
+                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                bench_model(model, cli.n_gen, &ctx)
+            }
+            "gemma" => {
+                let model = GemmaMetalGraphEngine::from_gguf(ctx.clone(), gguf_path)?;
+                let cfg = model.config();
+                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                bench_model(model, cli.n_gen, &ctx)
+            }
+            other => panic!("Unsupported GGUF family: {other}"),
         }
-        "qwen" => {
-            let model = QwenMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
-            let cfg = model.config();
-            eprintln!(
-                "Model: {} layers, {} hidden",
-                cfg.num_hidden_layers, cfg.hidden_size,
-            );
-            bench_model(model, cli.n_gen, &ctx)
+    } else {
+        let model_type = detect_model_type_safetensors(model_path)?;
+        let family = match model_type.as_str() {
+            "llama" | "mistral" | "mixtral" => "llama",
+            "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+            "gemma2" | "gemma3_text" => "gemma",
+            other => {
+                eprintln!("ERROR: Unsupported model_type: {other}");
+                std::process::exit(1);
+            }
+        };
+
+        eprintln!("Loading: {model_path} (Metal, SafeTensors, {model_type})");
+
+        let model_dir = Path::new(model_path);
+
+        match family {
+            "llama" => {
+                let model = LlamaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
+                let cfg = model.config();
+                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                bench_model(model, cli.n_gen, &ctx)
+            }
+            "qwen" => {
+                let model = QwenMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
+                let cfg = model.config();
+                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                bench_model(model, cli.n_gen, &ctx)
+            }
+            "gemma" => {
+                let model = GemmaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
+                let cfg = model.config();
+                eprintln!("Model: {} layers, {} hidden", cfg.num_hidden_layers, cfg.hidden_size);
+                bench_model(model, cli.n_gen, &ctx)
+            }
+            other => panic!("Unsupported family: {other}"),
         }
-        "gemma" => {
-            let model = GemmaMetalGraphEngine::from_pretrained(ctx.clone(), model_dir)?;
-            let cfg = model.config();
-            eprintln!(
-                "Model: {} layers, {} hidden",
-                cfg.num_hidden_layers, cfg.hidden_size,
-            );
-            bench_model(model, cli.n_gen, &ctx)
-        }
-        other => panic!("Unsupported family: {other}"),
     }
 }
