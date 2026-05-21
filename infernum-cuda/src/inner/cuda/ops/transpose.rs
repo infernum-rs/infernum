@@ -36,9 +36,17 @@ fn ensure_transpose_kernel(device: &std::sync::Arc<cudarc::driver::CudaDevice>) 
 
 /// Transpose a 2D tensor: (rows, cols) -> (cols, rows)
 ///
+/// Dispatches to a dtype-appropriate kernel (F32 or BF16).
+///
 /// # Errors
 /// Returns an error if the operation fails
 pub fn transpose_2d(tensor: &CudaTensor) -> Result<CudaTensor> {
+    match tensor.dtype() {
+        DType::BF16 => return transpose_2d_bf16(tensor),
+        DType::F32 => {}
+        other => panic!("transpose_2d: unsupported dtype {other}"),
+    }
+
     let shape = tensor.shape();
     assert_eq!(shape.len(), 2, "Expected 2D tensor");
 

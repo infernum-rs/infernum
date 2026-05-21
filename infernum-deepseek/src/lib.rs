@@ -6,15 +6,20 @@ mod chat_templates;
 mod config;
 pub mod weights;
 
-#[cfg(feature = "cpu")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 pub mod graph_builder;
 // graph_engine is deferred: CpuBackend does not yet implement MlaAttentionOps.
 // Once MlaAttentionOps is implemented for CpuBackend, re-enable this module.
 // #[cfg(feature = "cpu")]
 // pub mod graph_engine;
 
+#[cfg(feature = "cuda")]
+pub mod cuda_graph_engine;
+
 pub use chat_templates::DeepSeekTemplate;
 pub use config::DeepSeekConfig;
 // #[cfg(feature = "cpu")]
 // pub use graph_engine::DeepSeekGraphEngine;
+#[cfg(feature = "cuda")]
+pub use cuda_graph_engine::{DeepSeekCudaEngine, DeepSeekCudaGraphEngineExt, MlaKvState};
 pub use weights::split_kv_b_proj_dense;
