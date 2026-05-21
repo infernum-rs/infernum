@@ -381,7 +381,7 @@ fn bench_graph(
                 serde_json::from_str(&read_config_json(model_path)?).map_err(parse_err)?;
             let head_dim = config.head_dim();
             let (graph, _) =
-                qwen_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
+                qwen_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None);
             (
                 graph,
                 config.num_hidden_layers,
@@ -391,7 +391,8 @@ fn bench_graph(
             )
         } else if matches!(model_type, "gemma2" | "gemma3_text") {
             let config = GemmaConfig::from_file(Path::new(model_path).join("config.json"))?;
-            let graph = gemma_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
+            let graph =
+                gemma_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None);
             (
                 graph,
                 config.num_hidden_layers,
@@ -407,7 +408,8 @@ fn bench_graph(
                 serde_json::from_str(&read_config_json(model_path)?).map_err(parse_err)?
             };
             let head_dim = config.head_dim();
-            let (graph, _) = build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
+            let (graph, _) =
+                build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None);
             (
                 graph,
                 config.num_hidden_layers,
@@ -469,6 +471,7 @@ fn bench_graph(
             None,
             0,
             None,
+            None,
         )?;
         ctx.synchronize()?;
         assert_eq!(outputs[0].shape()[0], n_tokens);
@@ -492,6 +495,7 @@ fn bench_graph(
             None,
             None,
             0,
+            None,
             None,
         )?;
         ctx.synchronize()?;
@@ -565,7 +569,7 @@ fn bench_graph_decode(
     let mut weights = WeightStore::<CudaTensor, LinearWeight>::new();
     eprintln!("Loading weights...");
     {
-        let (tmp_graph, _) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype);
+        let (tmp_graph, _) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None);
         if is_gguf {
             load_graph_weights_gguf(
                 ctx,
@@ -598,7 +602,7 @@ fn bench_graph_decode(
         let kv_len = pos; // number of cached KV entries before this step
 
         // Build decode graph for current kv_len
-        let (graph, _) = build_decode_graph::<CudaBackend>(&config, kv_len, weight_dtype);
+        let (graph, _) = build_decode_graph::<CudaBackend>(&config, kv_len, weight_dtype, None);
         let exec_plan = plan(&graph);
 
         // Build inputs: token_id, cos, sin, then per-layer k_cache, v_cache
@@ -651,6 +655,7 @@ fn bench_graph_decode(
             None,
             None,
             0,
+            None,
             None,
         )?;
 
@@ -756,7 +761,7 @@ fn bench_cuda_graphs_decode(
     let model_weight_ids;
     eprintln!("Loading weights...");
     {
-        let (tmp_graph, ids) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype);
+        let (tmp_graph, ids) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None);
         model_weight_ids = ids;
         load_graph_weights(ctx, &tmp_graph, model_path, &mut weights)?;
     }
