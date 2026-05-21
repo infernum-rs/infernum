@@ -25,8 +25,10 @@ use std::sync::Arc;
 
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, WeightStore};
+use infernum::shard::{shard_strategy_for_weight, ShardConfig};
 use infernum::weights::QuantizationConfig;
 use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
+use infernum::WeightLoader as _;
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
@@ -68,10 +70,18 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
     }
 
     /// Build a prefill-mode graph for the given sequence length.
-    fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<CudaBackend>;
+    fn build_prefill_graph_cuda(
+        &self,
+        seq_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Graph<CudaBackend>;
 
     /// Build a decode-mode graph for a KV cache of the given length.
-    fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<CudaBackend>;
+    fn build_decode_graph_cuda(
+        &self,
+        kv_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Graph<CudaBackend>;
 
     /// Build a batched paged-KV decode graph for the given batch size and block config.
     fn build_paged_decode_graph_cuda(
@@ -79,6 +89,7 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
         batch_size: usize,
         block_size: usize,
         max_blocks_per_seq: usize,
+        shard: Option<&ShardConfig>,
     ) -> Graph<CudaBackend>;
 
     /// Load all model weights from a `SafeTensors` directory into CUDA memory.
@@ -86,6 +97,10 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
     /// The `dummy_graph` (a prefill graph built with a small `seq_len`) is
     /// used to enumerate weight metadata (names, shapes, dtypes). The weights
     /// are then loaded from disk and uploaded to the provided CUDA context.
+    ///
+    /// When `shard` is `Some`, each linear weight is sliced to the rank's
+    /// portion before uploading; tensor weights (norms, embeddings) are
+    /// replicated on all ranks.
     ///
     /// # Errors
     ///
@@ -95,6 +110,7 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
         dummy_graph: &Graph<CudaBackend>,
         ctx: &CudaContext,
         model_dir: &Path,
+        shard: Option<&ShardConfig>,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>>;
 }
 
@@ -131,9 +147,8 @@ pub fn load_graph_weights_cuda(
     model_dir: &Path,
     lm_head_fallback: bool,
     quant_config: Option<&QuantizationConfig>,
+    shard: Option<&ShardConfig>,
 ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
-    use infernum::WeightLoader as _;
-
     let format_loader = SafeTensorsLoader::from_directory(model_dir)?;
     let loader = CudaWeightLoader::new(ctx.clone(), format_loader);
 
@@ -146,6 +161,7 @@ pub fn load_graph_weights_cuda(
         let meta = graph.tensor_weight_meta(WeightId::from_index(
             u32::try_from(i).expect("weight count exceeds u32"),
         ));
+        // Tensor weights (norms, embeddings, RoPE caches) are always replicated.
         let tensor = loader.load_tensor(&meta.name, meta.dtype)?;
         store.push_tensor_weight(tensor);
     }
@@ -186,7 +202,12 @@ pub fn load_graph_weights_cuda(
                 None
             }
         });
-        let weight = loader.load_linear(name, meta.dtype, effective_quant)?;
+        let weight = if let Some(s) = shard {
+            let strategy = shard_strategy_for_weight(name);
+            loader.load_linear_sharded(name, meta.dtype, effective_quant, s, strategy)?
+        } else {
+            loader.load_linear(name, meta.dtype, effective_quant)?
+        };
         store.push_linear_weight(weight);
     }
 
@@ -327,6 +348,11 @@ pub struct CudaGraphEngine<C: CudaGraphEngineConfig> {
     /// mutation. `RefCell` is safe here because the `Runtime` calls these
     /// methods single-threadedly.
     decode_state: RefCell<Option<Box<DecodeState>>>,
+    /// Tensor-parallel shard config. `None` for single-GPU inference.
+    shard: Option<ShardConfig>,
+    /// NCCL communicator for tensor-parallel all-reduce.
+    #[cfg(feature = "nccl")]
+    comm: Option<crate::cuda::NcclCommunicator>,
 }
 
 impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
@@ -337,8 +363,8 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     /// Returns an error if the directory is missing, weights cannot be loaded,
     /// or the config file cannot be parsed.
     pub fn from_config_and_dir(config: C, ctx: CudaContext, model_dir: &Path) -> Result<Self> {
-        let dummy_graph = config.build_prefill_graph_cuda(1);
-        let weights = config.load_weights_cuda_safetensors(&dummy_graph, &ctx, model_dir)?;
+        let dummy_graph = config.build_prefill_graph_cuda(1, None);
+        let weights = config.load_weights_cuda_safetensors(&dummy_graph, &ctx, model_dir, None)?;
         let half_dim = config.head_dim() / 2;
         Ok(Self {
             config,
@@ -346,6 +372,41 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             weights: Arc::new(weights),
             half_dim,
             decode_state: RefCell::new(None),
+            shard: None,
+            #[cfg(feature = "nccl")]
+            comm: None,
+        })
+    }
+
+    /// Load a tensor-parallel shard from a `SafeTensors` directory.
+    ///
+    /// Each rank loads only its slice of the column-parallel and row-parallel
+    /// weights. The provided `comm` is used for all-reduce synchronisation
+    /// at the AllReduceSumOp nodes injected by the graph builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory is missing or weights cannot be loaded.
+    #[cfg(feature = "nccl")]
+    pub fn from_config_comm_and_dir(
+        config: C,
+        ctx: CudaContext,
+        comm: crate::cuda::NcclCommunicator,
+        shard: ShardConfig,
+        model_dir: &Path,
+    ) -> Result<Self> {
+        let dummy_graph = config.build_prefill_graph_cuda(1, Some(&shard));
+        let weights =
+            config.load_weights_cuda_safetensors(&dummy_graph, &ctx, model_dir, Some(&shard))?;
+        let half_dim = config.head_dim() / 2;
+        Ok(Self {
+            config,
+            ctx,
+            weights: Arc::new(weights),
+            half_dim,
+            decode_state: RefCell::new(None),
+            shard: Some(shard),
+            comm: Some(comm),
         })
     }
 
@@ -361,6 +422,17 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         &self.ctx
     }
 
+    /// Return a reference to the NCCL communicator, if any.
+    #[cfg(feature = "nccl")]
+    fn comm_ref(&self) -> Option<&crate::cuda::NcclCommunicator> {
+        self.comm.as_ref()
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    fn comm_ref(&self) -> Option<&()> {
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -370,7 +442,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let head_dim = self.config.head_dim();
         let half_dim = self.half_dim;
 
-        let mut graph = self.config.build_prefill_graph_cuda(seq_len);
+        let mut graph = self.config.build_prefill_graph_cuda(seq_len, self.shard.as_ref());
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
@@ -393,6 +465,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             None,
             0,
             None,
+            self.comm_ref(),
         )?;
         Ok(outputs)
     }
@@ -431,9 +504,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             .is_none_or(|s| s.max_blocks_per_seq != max_blocks_per_seq);
         if needs_rebuild {
             let block_size = kv_cache.block_size();
-            let graph =
-                self.config
-                    .build_paged_decode_graph_cuda(1, block_size, max_blocks_per_seq);
+            let graph = self.config.build_paged_decode_graph_cuda(
+                1,
+                block_size,
+                max_blocks_per_seq,
+                self.shard.as_ref(),
+            );
             *borrow = Some(Box::new(DecodeState::new(
                 &self.ctx,
                 graph,
@@ -528,6 +604,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 Some(kv_cache),    // external paged KV cache
                 0,                 // mla_seq_pos
                 Some(real_inputs), // stable GPU input buffers
+                self.comm_ref(),
             )?;
 
             if !state.capture_unsafe {
@@ -647,9 +724,12 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         let mut last_logits: Option<CudaTensor> = None;
 
         for (pos, &token) in input_ids.iter().enumerate() {
-            let mut graph = self
-                .config
-                .build_paged_decode_graph_cuda(1, block_size, max_blocks);
+            let mut graph = self.config.build_paged_decode_graph_cuda(
+                1,
+                block_size,
+                max_blocks,
+                self.shard.as_ref(),
+            );
             optimizer::optimize(&mut graph);
             let ep = plan(&graph);
 
@@ -684,6 +764,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 Some(kv_cache),
                 0,
                 None,
+                self.comm_ref(),
             )?;
             last_logits = Some(outputs.into_iter().next().expect("no outputs"));
         }
@@ -777,9 +858,12 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         }
 
         // Batch size > 1: eager path (builds a fresh graph each call).
-        let mut graph =
-            self.config
-                .build_paged_decode_graph_cuda(batch_size, block_size, max_blocks_per_seq);
+        let mut graph = self.config.build_paged_decode_graph_cuda(
+            batch_size,
+            block_size,
+            max_blocks_per_seq,
+            self.shard.as_ref(),
+        );
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
@@ -813,6 +897,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             Some(kv_cache),
             0,
             None,
+            self.comm_ref(),
         )?;
 
         let logits_bf16 = outputs.into_iter().next().expect("no outputs");

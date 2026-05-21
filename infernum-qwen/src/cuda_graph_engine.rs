@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use infernum::graph::{Graph, WeightStore};
+use infernum::shard::ShardConfig;
 use infernum::weights::QuantizationConfig;
 use infernum::{DType, Result};
 use infernum_cuda::{
@@ -55,15 +56,23 @@ impl CudaGraphEngineConfig for QwenConfig {
         self.quantization_config.as_ref()
     }
 
-    fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+    fn build_prefill_graph_cuda(
+        &self,
+        seq_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Graph<infernum_cuda::CudaBackend> {
         let (graph, _) =
-            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16, None);
+            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16, shard);
         graph
     }
 
-    fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+    fn build_decode_graph_cuda(
+        &self,
+        kv_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Graph<infernum_cuda::CudaBackend> {
         let (graph, _) =
-            build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16, None);
+            build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16, shard);
         graph
     }
 
@@ -72,6 +81,7 @@ impl CudaGraphEngineConfig for QwenConfig {
         batch_size: usize,
         block_size: usize,
         max_blocks_per_seq: usize,
+        shard: Option<&ShardConfig>,
     ) -> Graph<infernum_cuda::CudaBackend> {
         build_paged_decode_graph::<infernum_cuda::CudaBackend>(
             self,
@@ -79,7 +89,7 @@ impl CudaGraphEngineConfig for QwenConfig {
             block_size,
             max_blocks_per_seq,
             DType::BF16,
-            None,
+            shard,
         )
     }
 
@@ -88,6 +98,7 @@ impl CudaGraphEngineConfig for QwenConfig {
         dummy_graph: &Graph<infernum_cuda::CudaBackend>,
         ctx: &CudaContext,
         model_dir: &Path,
+        shard: Option<&ShardConfig>,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
         // Some Qwen models (Qwen2.5, Qwen3-MoE) use tied embeddings and do not
         // have a separate lm_head.weight; enable the fallback so the loader
@@ -98,6 +109,7 @@ impl CudaGraphEngineConfig for QwenConfig {
             model_dir,
             /* lm_head_fallback */ true,
             self.quantization_config.as_ref(),
+            shard,
         )
     }
 }
