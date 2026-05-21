@@ -429,6 +429,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     }
 
     #[cfg(not(feature = "nccl"))]
+    #[allow(clippy::unused_self)]
     fn comm_ref(&self) -> Option<&()> {
         None
     }
@@ -486,7 +487,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     ///
     /// Returns an error if buffer writes, kernel launches, or CUDA API calls
     /// fail.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn run_decode_captured(
         &self,
         token_ids: &CudaTensor,

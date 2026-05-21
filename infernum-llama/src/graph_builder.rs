@@ -832,7 +832,7 @@ where
 // GGUF weight loader helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cpu")]
+#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Map a SafeTensors-convention weight name to its GGUF tensor name.
 ///
 /// Handles the top-level tensors (`model.embed_tokens.weight`, `model.norm.weight`,
@@ -869,7 +869,7 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     panic!("Unknown weight name: {name}");
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Returns `true` if this GGUF tensor name is a Q or K projection that needs
 /// the GGUF row-permutation reversal before use.
 pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {
