@@ -12,6 +12,8 @@ nccl = ["cuda", "cudarc/nccl", "infernum/nccl-errors"]
 # Also activates the CUDA features on model crates so their CudaGraphEngine
 # types are visible in the test binaries.
 integration = ["cuda", "infernum-llama/cuda", "infernum-qwen/cuda", "infernum-gemma/cuda", "infernum-deepseek/cuda"]
+# Integration tests with NCCL (multi-GPU TP correctness). Implies integration.
+integration-nccl = ["integration", "nccl", "infernum-llama/nccl", "infernum-qwen/nccl", "infernum-gemma/nccl"]
 # Force fused kernels even in debug builds
 force-fuse = []
 # Disable fused kernels even in release builds
