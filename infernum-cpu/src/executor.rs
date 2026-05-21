@@ -250,6 +250,7 @@ pub fn execute(
             }),
             input_tensors: inputs,
             input_idx: &mut input_idx,
+            comm: None,
         };
         node.op.execute(&mut ctx, node_id, &node.inputs)?;
     }

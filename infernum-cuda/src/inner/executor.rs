@@ -129,6 +129,7 @@ pub fn execute(
                     kv_cache: kv,
                     input_tensors: inputs,
                     input_idx: &mut input_idx_local,
+                    comm: None,
                 };
                 node.op.execute(&mut exec_ctx, node_id, &node.inputs)?;
             }
