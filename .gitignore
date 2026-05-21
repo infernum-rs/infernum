@@ -14,4 +14,4 @@ models/
 ephemeral-docs/
 
 # Git worktrees
-worktrees/
+worktrees/perf.data
