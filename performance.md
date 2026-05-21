@@ -356,64 +356,15 @@ For cross-family comparisons within a target: normalize by model parameter count
 
 ---
 
-## Baseline Reference (fill before starting optimization)
+## Benchmark Results
 
-Run the comparison scripts and manual bench commands, then fill in this table. This is the before-state; all optimization work is measured against it.
+Current results live in `results/` — one file per target. Each file records the
+before-state for optimization work and is updated (with a dated section) each time
+a meaningful measurement is taken. Git history provides the full timeline.
 
-### CPU (SmolLM2-360M, all-cores, lscpu: _______)
-
-| Format | Op | Infernum (tok/s) | llama.cpp (tok/s) | Ratio |
-|--------|----|-----------------|-------------------|-------|
-| GGUF Q4_0 | Decode | | | |
-| GGUF Q8_0 | Decode | | | |
-| GGUF F32 | Decode | | | |
-| GGUF Q8_0 | Prefill | | | |
-
-### Metal (chip: _____, memory: _____ GB)
-
-#### SmolLM2-360M
-
-| Format | Family | Infernum (tok/s) | llama.cpp (tok/s) | Ratio |
-|--------|--------|-----------------|-------------------|-------|
-| GGUF Q4_0 | Llama | | | |
-| GGUF Q8_0 | Llama | | | |
-| GGUF F32 | Llama | | | |
-| BF16 | Qwen | | | |
-| BF16 | Gemma | | | |
-
-#### Llama-3.1-70B (Ultra tier only)
-
-| Format | Infernum (tok/s) | llama.cpp (tok/s) | Ratio |
-|--------|-----------------|-------------------|-------|
-| BF16 | | | |
-| GGUF Q4_0 | | | |
-| GGUF Q8_0 | | | |
-
-### CUDA — Single L4
-
-| Family | Model | Format | Op | Infernum (tok/s) | llama.cpp (tok/s) | Ratio |
-|--------|-------|--------|----|-----------------|-------------------|-------|
-| Llama | Llama-3.2-1B | BF16 | Decode | | | |
-| Llama | Llama-3.2-1B | BF16 | Prefill | | | |
-| Llama | Llama-3.2-1B | GPTQ INT4 | Decode | | | |
-| Llama | Llama-3.2-1B | GGUF Q4_0 | Decode | | | |
-| Llama | Llama-3.1-8B | BF16 | Decode | | | |
-| Llama | Llama-3.1-8B | BF16 | Prefill | | | |
-| Mistral | Mistral-7B-v0.3 | BF16 | Decode | | | |
-| Qwen | Qwen3-0.6B | BF16 | Decode | | | |
-| Qwen | Qwen3-8B | BF16 | Decode | | | |
-| Qwen | Qwen2.5-7B | BF16 | Decode | | | |
-| Gemma | Gemma-2-9B | BF16 | Decode | | | |
-| DeepSeek | DeepSeek-V3-tiny | BF16 | Decode | n/a (random) | n/a | — |
-
-### CUDA — 8× H100 (GPU: H100 80GB SXM, TP=_____)
-
-| Family | Model | Format | Op | TP | Infernum (tok/s) | llama.cpp (tok/s) | Ratio |
-|--------|-------|--------|----|-----|-----------------|-------------------|-------|
-| Llama | Llama-3.1-70B | BF16 | Decode | 2 | | | |
-| Llama | Llama-3.1-70B | BF16 | Prefill | 2 | | | |
-| Qwen | Qwen3-72B | BF16 | Decode | 2 | | | |
-| Qwen | Qwen3-235B-A22B | BF16 | Decode | 8 | | | |
-| Mixtral | Mixtral-8x22B | BF16 | Decode | 4 | | | |
-| DeepSeek | DeepSeek-V3 | Q4 | Decode | 4–8 | | | |
+| Target | Results file | Status |
+|--------|-------------|--------|
+| CPU | [results/cpu.md](results/cpu.md) | ✓ baseline recorded |
+| Metal | results/metal.md | pending |
+| CUDA | results/cuda.md | pending |
 | Gemma | Gemma-3-27B | BF16 | Decode | 1 | | | |
