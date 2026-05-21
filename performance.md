@@ -366,5 +366,5 @@ a meaningful measurement is taken. Git history provides the full timeline.
 |--------|-------------|--------|
 | CPU | [results/cpu.md](results/cpu.md) | ✓ baseline recorded |
 | Metal | [results/metal.md](results/metal.md) | ✓ baseline recorded |
-| CUDA — single GPU (L4) | results/cuda-single.md | pending |
-| CUDA — multi-GPU (8× H100) | results/cuda-multi.md | pending |
+| CUDA — single GPU (L4) | [results/cuda-single.md](results/cuda-single.md) | ✓ L4 baseline + A100 baseline recorded |
+| CUDA — multi-GPU (8× A100) | [results/cuda-multi.md](results/cuda-multi.md) | ✓ llama.cpp GPU-scaling baseline recorded; infernum TP pending |

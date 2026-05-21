@@ -1,6 +1,41 @@
 # CUDA Single-GPU Benchmark Results
 
-Measured with `bench_cuda_small.sh`. See [performance.md](../performance.md) for methodology.
+See [performance.md](../performance.md) for methodology.
+
+---
+
+## 2026-05-21 — A100 80 GB Baseline (8B/9B class models)
+
+- **GPU:** NVIDIA A100-SXM4-80GB (81152 MiB VRAM) — node has 8× A100
+- **Driver:** 590.48.01 | CUDA 13.1
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** `891ced5`
+- **llama.cpp commit:** `40d5358` (build: 1), best of 3 reps, `-ngl 99`
+- **Format note:** infernum loads BF16 SafeTensors; llama.cpp runs Q8_0 GGUF. These differ by ~2× in weight bytes/parameter. The decode ratio therefore understates infernum's efficiency relative to a same-format comparison. Prefill is compute-bound and more comparable.
+
+### Decode throughput (tok/s)
+
+| Model | infernum format | infernum | llama.cpp format | llama.cpp | ratio |
+| ----- | --------------- | -------: | ---------------- | --------: | ----: |
+| Qwen / Qwen3-8B | BF16 SafeTensors (eager) | 46.0 | Q8_0 GGUF | 127.83 | 0.36x |
+| Gemma / Gemma-2-9B-it | BF16 SafeTensors (eager) | 12.9 | Q8_0 GGUF | 87.80 | 0.15x |
+
+### Prefill throughput (tok/s, 512-token prompt)
+
+| Model | infernum format | infernum | llama.cpp format | llama.cpp | ratio |
+| ----- | --------------- | -------: | ---------------- | --------: | ----: |
+| Qwen / Qwen3-8B | BF16 SafeTensors (`--graph`) | 2371 | Q8_0 GGUF | 2738 | **0.87x** |
+| Gemma / Gemma-2-9B-it | — (graph mode unsupported) | — | Q8_0 GGUF | 3472 | — |
+
+### Notes
+
+- **Llama family not tested:** `meta-llama/Llama-3.1-8B` is gated and the account lacks access. This is the primary A100 single-GPU Llama target (performance.md). Substitute needed.
+- **Qwen3 decode uses eager path:** `--cuda-graph-engine` returns `UnsupportedModel: "qwen3"`. Eager path has higher per-step overhead and a larger gap vs llama.cpp. Graph-engine Qwen3 support is pending.
+- **Gemma-2-9B decode uses eager path:** `--cuda-graph-engine` returns an error for `gemma2`. The 12.9 tok/s number (0.15x ratio) is primarily explained by the eager path overhead, not fundamental kernel efficiency. A100 theoretical max for 9B BF16 (~18 GB at 2 TB/s) is ~111 tok/s.
+- **Gemma prefill not measurable:** `--graph` mode returns `"graph mode only supports Llama/Mistral/Qwen, got: gemma2"`. Gemma graph prefill support is pending.
+- **Qwen3-8B prefill at 0.87x:** This is the most meaningful number — prefill is compute-bound (not bandwidth-bound), so the format difference (BF16 vs Q8_0) matters less. Infernum is close to parity on A100 compute throughput.
+- **DeepSeek:** CUDA support not yet implemented. No numbers.
+- **Mistral:** No ungated Mistral 7B model available in cache. No numbers.
 
 ---
 
