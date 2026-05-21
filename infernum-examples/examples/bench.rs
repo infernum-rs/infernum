@@ -5,7 +5,7 @@
 //! - **Eager (default):** Autoregressive decode — generates N tokens one-by-one
 //!   using the runtime engine with KV cache.
 //! - **Graph prefill (`--graph`):** Prefill throughput — processes N tokens in a
-//!   single forward pass through the GPU graph executor. Llama family only.
+//!   single forward pass through the GPU graph executor. Llama/Qwen family.
 //! - **Graph decode (`--graph-decode`):** Decode throughput — generates N tokens
 //!   one-by-one through the GPU graph executor with KV cache management. Llama only.
 //! - **CUDA graphs (`--cuda-graphs`):** LEGACY low-level CUDA graph decode using
@@ -49,7 +49,10 @@ use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaCudaGraphEngine,
     LlamaCudaGraphEngineExt as _,
 };
-use infernum_qwen::{QwenCudaGraphEngine, QwenCudaGraphEngineExt as _};
+use infernum_qwen::{
+    build_prefill_graph as qwen_build_prefill_graph, QwenConfig, QwenCudaGraphEngine,
+    QwenCudaGraphEngineExt as _,
+};
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
@@ -349,45 +352,83 @@ fn bench_graph(
     model_path: &str,
     n_tokens: usize,
     weight_dtype: DType,
+    model_type: &str,
 ) -> infernum::Result<()> {
     let is_gguf = model_path.ends_with(".gguf");
 
-    let config: LlamaConfig = if is_gguf {
-        let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
-        LlamaConfig::from_gguf_metadata(gguf.metadata())?
-    } else {
-        let config_path = Path::new(model_path).join("config.json");
-        let data = std::fs::read_to_string(&config_path).map_err(|e| {
+    let read_config_json = |path: &str| -> infernum::Result<String> {
+        let config_path = Path::new(path).join("config.json");
+        std::fs::read_to_string(&config_path).map_err(|e| {
             infernum::Error::Io(std::io::Error::new(
                 e.kind(),
                 format!("Failed to read {}: {e}", config_path.display()),
             ))
-        })?;
-        serde_json::from_str(&data).map_err(|e| {
-            infernum::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to parse config.json: {e}"),
-            ))
-        })?
+        })
+    };
+    let parse_err = |e: serde_json::Error| {
+        infernum::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse config.json: {e}"),
+        ))
     };
 
-    let head_dim = config.head_dim();
+    let (graph, num_hidden_layers, hidden_size, head_dim, rope_theta) =
+        if matches!(model_type, "qwen2" | "qwen3" | "qwen3_moe") {
+            let config: QwenConfig =
+                serde_json::from_str(&read_config_json(model_path)?).map_err(parse_err)?;
+            let head_dim = config.head_dim();
+            let (graph, _) =
+                qwen_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
+            (
+                graph,
+                config.num_hidden_layers,
+                config.hidden_size,
+                head_dim,
+                config.rope_theta,
+            )
+        } else {
+            let config: LlamaConfig = if is_gguf {
+                let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+                LlamaConfig::from_gguf_metadata(gguf.metadata())?
+            } else {
+                serde_json::from_str(&read_config_json(model_path)?).map_err(parse_err)?
+            };
+            let head_dim = config.head_dim();
+            let (graph, _) = build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
+            (
+                graph,
+                config.num_hidden_layers,
+                config.hidden_size,
+                head_dim,
+                config.rope_theta,
+            )
+        };
+
     let half_dim = head_dim / 2;
 
     eprintln!(
         "Model: {} layers, {} hidden (GPU graph prefill, seq_len={})",
-        config.num_hidden_layers, config.hidden_size, n_tokens,
+        num_hidden_layers, hidden_size, n_tokens,
     );
 
-    // Build graph
-    let (graph, _model_weights) =
-        build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
     let exec_plan = plan(&graph);
 
     let mut weights = WeightStore::<CudaTensor, LinearWeight>::new();
     eprintln!("Loading weights...");
     if is_gguf {
-        load_graph_weights_gguf(ctx, &graph, &config, model_path, weight_dtype, &mut weights)?;
+        // GGUF graph prefill only supported for Llama (gating upstream ensures this)
+        let llama_config: LlamaConfig = {
+            let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+            LlamaConfig::from_gguf_metadata(gguf.metadata())?
+        };
+        load_graph_weights_gguf(
+            ctx,
+            &graph,
+            &llama_config,
+            model_path,
+            weight_dtype,
+            &mut weights,
+        )?;
     } else {
         load_graph_weights(ctx, &graph, model_path, &mut weights)?;
     }
@@ -397,7 +438,7 @@ fn bench_graph(
     let input_ids = CudaTensor::from_slice(ctx, &[n_tokens], &token_ids)?;
 
     let (cos_data, sin_data) =
-        infernum::rope::precompute_rope_data(n_tokens, head_dim, config.rope_theta);
+        infernum::rope::precompute_rope_data(n_tokens, head_dim, rope_theta);
     let cos_cache = CudaTensor::from_slice(ctx, &[n_tokens, half_dim], &cos_data)?;
     let sin_cache = CudaTensor::from_slice(ctx, &[n_tokens, half_dim], &sin_data)?;
 
@@ -1103,10 +1144,10 @@ fn main() -> infernum::Result<()> {
         } else {
             let mt = detect_model_type(&cli.model)?;
             match mt.as_str() {
-                "llama" | "mistral" => {}
+                "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3_moe" => {}
                 other => {
                     eprintln!(
-                        "ERROR: --graph/--graph-decode/--cuda-graphs/--cuda-graph-engine mode only supports Llama/Mistral, got: {other}"
+                        "ERROR: --graph/--graph-decode/--cuda-graphs/--cuda-graph-engine mode only supports Llama/Mistral/Qwen, got: {other}"
                     );
                     std::process::exit(1);
                 }
@@ -1136,7 +1177,7 @@ fn main() -> infernum::Result<()> {
         } else if cli.graph_decode {
             bench_graph_decode(&ctx, &cli.model, cli.n_gen, weight_dtype)
         } else {
-            bench_graph(&ctx, &cli.model, cli.n_gen, weight_dtype)
+            bench_graph(&ctx, &cli.model, cli.n_gen, weight_dtype, &model_type)
         };
 
         if let Some(pool) = ctx.buffer_pool() {
