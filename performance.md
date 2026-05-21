@@ -207,7 +207,7 @@ The comparison script covers Llama family only. Non-Llama families require manua
 - [ ] For the Ultra tier: include 70B BF16 decode throughput — this is the headline metric
 - [ ] Use `--profile` only on a dedicated diagnostic run, not in reported results
 - [ ] Compare all formats against llama.cpp `-ngl 99`
-- [ ] Once Metal prefill graph is implemented, add prefill measurements
+- [x] Prefill benchmarked — see results/metal.md. Note: GGUF prefill uses serial GEMV (0.001x llama.cpp); SafeTensors prefill uses GEMM and performs well.
 
 ---
 

@@ -1,8 +1,7 @@
 #!/opt/homebrew/bin/bash
-# bench_metal.sh — Metal (Apple Silicon) throughput across all supported model families
+# bench_metal.sh — Metal (Apple Silicon) decode and prefill throughput
 #
-# Measures decode throughput for Llama, Qwen, and Gemma families.
-# Prefill is not yet measured (Metal graph engine not yet implemented).
+# Measures both decode and prefill throughput for Llama, Qwen, and Gemma families.
 # DeepSeek is not supported on Metal.
 #
 # llama.cpp comparison is optional — if not found, that column shows "—".
@@ -19,7 +18,8 @@
 # Usage:
 #   ./bench_metal.sh                          # Run all families
 #   ./bench_metal.sh --dry-run                # Show plan without running
-#   ./bench_metal.sh --n-gen 128              # Override token count
+#   ./bench_metal.sh --n-gen 128              # Override decode token count
+#   ./bench_metal.sh --n-prompt 256           # Override prefill prompt length
 #   ./bench_metal.sh --llama-cpp ~/llama.cpp  # Enable comparison
 #   ./bench_metal.sh --families llama,qwen    # Only specific families
 
@@ -32,22 +32,27 @@ MODEL_CACHE="$HOME/.cache/infernum/models"
 GGUF_DIR="/tmp"
 
 N_GEN=256
+N_PROMPT=512
 LLAMA_BENCH_REPS=3
 DRY_RUN=false
 FAMILIES_FILTER="all"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry-run)      DRY_RUN=true; shift ;;
-        --n-gen)        N_GEN="$2"; shift 2 ;;
-        --n-gen=*)      N_GEN="${1#--n-gen=}"; shift ;;
-        --llama-cpp)    LLAMA_CPP="$2"; shift 2 ;;
-        --llama-cpp=*)  LLAMA_CPP="${1#--llama-cpp=}"; shift ;;
-        --families)     FAMILIES_FILTER="$2"; shift 2 ;;
-        --families=*)   FAMILIES_FILTER="${1#--families=}"; shift ;;
+        --dry-run)       DRY_RUN=true; shift ;;
+        --n-gen)         N_GEN="$2"; shift 2 ;;
+        --n-gen=*)       N_GEN="${1#--n-gen=}"; shift ;;
+        --n-prompt)      N_PROMPT="$2"; shift 2 ;;
+        --n-prompt=*)    N_PROMPT="${1#--n-prompt=}"; shift ;;
+        --llama-cpp)     LLAMA_CPP="$2"; shift 2 ;;
+        --llama-cpp=*)   LLAMA_CPP="${1#--llama-cpp=}"; shift ;;
+        --families)      FAMILIES_FILTER="$2"; shift 2 ;;
+        --families=*)    FAMILIES_FILTER="${1#--families=}"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--dry-run] [--n-gen N] [--llama-cpp PATH] [--families LIST]"
+            echo "Usage: $0 [--dry-run] [--n-gen N] [--n-prompt N] [--llama-cpp PATH] [--families LIST]"
             echo ""
+            echo "  --n-gen N         Decode tokens (default: 256)"
+            echo "  --n-prompt N      Prefill prompt length (default: 512)"
             echo "  --families LIST   Comma-separated: llama, qwen, gemma (default: all)"
             echo "  --llama-cpp PATH  Enable llama.cpp comparison (or set \$LLAMA_CPP)"
             exit 0 ;;
@@ -129,28 +134,46 @@ download_hf_file() {
     rm -rf "${tmpdir}"
 }
 
-extract_toks() {
-    sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1
-}
+# Global output vars from run_infernum / run_llama_bench
+INFNUM_PRE="—"; INFNUM_DEC="—"
+LLAMA_PRE="—";  LLAMA_DEC="—"
 
+# Run bench_metal binary; sets INFNUM_PRE and INFNUM_DEC.
 run_infernum() {
     local model_path="$1"
-    $DRY_RUN && { echo "—"; return; }
+    INFNUM_PRE="—"; INFNUM_DEC="—"
+    $DRY_RUN && return
     local out
     out=$(cargo run --release --example bench_metal --features metal -q -- \
-        "${model_path}" "${N_GEN}" 2>/dev/null || true)
-    local toks; toks=$(echo "${out}" | extract_toks)
-    echo "${toks:-ERR}"
+        "${model_path}" "${N_GEN}" --n-prompt "${N_PROMPT}" 2>/dev/null || true)
+    local pre; pre=$(echo "${out}" | grep "^prefill:" | sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1)
+    local dec; dec=$(echo "${out}" | grep "^decode:" | sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1)
+    INFNUM_PRE="${pre:-ERR}"; INFNUM_DEC="${dec:-ERR}"
 }
 
+# Run llama-bench for both prefill and decode; sets LLAMA_PRE and LLAMA_DEC.
 run_llama_bench() {
     local gguf="$1"
-    $HAS_LLAMA_CPP || { echo "—"; return; }
-    $DRY_RUN && { echo "—"; return; }
-    local json
-    json=$("${LLAMA_BENCH}" -m "${gguf}" -p 0 -n "${N_GEN}" -r "${LLAMA_BENCH_REPS}" \
-        -ngl 99 -o jsonl 2>/dev/null)
-    echo "${json}" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(round(d["avg_ts"],1))' 2>/dev/null || echo "—"
+    LLAMA_PRE="—"; LLAMA_DEC="—"
+    $HAS_LLAMA_CPP || return
+    $DRY_RUN && return
+    # One llama-bench invocation with both -p (prefill) and -n (decode) produces
+    # two JSONL lines: prompt-processing first, then token-generation.
+    local out
+    out=$("${LLAMA_BENCH}" -m "${gguf}" -p "${N_PROMPT}" -n "${N_GEN}" \
+        -r "${LLAMA_BENCH_REPS}" -ngl 99 -o jsonl 2>/dev/null)
+    LLAMA_PRE=$(echo "${out}" | python3 -c '
+import sys, json
+lines = [l for l in sys.stdin.read().strip().splitlines() if l]
+pp = next((json.loads(l) for l in lines if "pp" in json.loads(l).get("test","")), None)
+print(round(pp["avg_ts"], 1) if pp else "—")
+' 2>/dev/null || echo "—")
+    LLAMA_DEC=$(echo "${out}" | python3 -c '
+import sys, json
+lines = [l for l in sys.stdin.read().strip().splitlines() if l]
+tg = next((json.loads(l) for l in lines if "tg" in json.loads(l).get("test","")), None)
+print(round(tg["avg_ts"], 1) if tg else "—")
+' 2>/dev/null || echo "—")
 }
 
 ratio() {
@@ -170,13 +193,10 @@ log "Preparing models..."
 $DRY_RUN && log "(dry-run: skipping downloads)"
 
 [[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && {
-    # Use pre-built GGUF from bartowski — no llama.cpp conversion needed
     download_hf_file "bartowski/SmolLM2-360M-Instruct-GGUF" "SmolLM2-360M-Instruct-Q4_0.gguf" "${SMOLLM_Q4}"
     download_hf_file "bartowski/SmolLM2-360M-Instruct-GGUF" "SmolLM2-360M-Instruct-Q8_0.gguf" "${SMOLLM_Q8}"
-    # F32 GGUF only if llama.cpp is available (needed to convert)
     if $HAS_LLAMA_CPP; then
         download_hf_model "HuggingFaceTB/SmolLM2-360M" "${SMOLLM_DIR}"
-        _f16="${GGUF_DIR}/smollm2-360m-f16.gguf"
         [[ -f "${SMOLLM_F32}" ]] || {
             log "Converting SmolLM2-360M → F32 GGUF"
             $DRY_RUN || python3 "${LLAMA_CPP}/convert_hf_to_gguf.py" "${SMOLLM_DIR}" \
@@ -202,58 +222,66 @@ $DRY_RUN || cargo build --release --example bench_metal --features metal -q 2>/d
 # ── Run benchmarks ────────────────────────────────────────────────────────────
 
 log ""
-log "Running benchmarks (${N_GEN} tokens, Metal GPU)..."
+log "Running benchmarks (decode: ${N_GEN} tokens, prefill: ${N_PROMPT} tokens, Metal GPU)..."
 log "─────────────────────────────────────────────"
 
-declare -A D_INFNUM D_LLAMA
+# Four associative arrays: infernum prefill/decode, llama prefill/decode.
+declare -A D_INF_PRE D_INF_DEC D_LLA_PRE D_LLA_DEC
 
-# D_INFNUM and D_LLAMA share the same key space. Where only one side can run
-# a given format, the other side is pre-set to "—".
-#
-# Infernum Metal only supports SafeTensors (GGUF loading not yet implemented).
-# llama.cpp only supports GGUF. So Llama and Gemma get separate rows per format.
+record() {
+    # record KEY — stores current INFNUM_*/LLAMA_* globals under the key
+    local key="$1"
+    D_INF_PRE["${key}"]="${INFNUM_PRE}"
+    D_INF_DEC["${key}"]="${INFNUM_DEC}"
+    D_LLA_PRE["${key}"]="${LLAMA_PRE}"
+    D_LLA_DEC["${key}"]="${LLAMA_DEC}"
+}
 
 [[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && {
-    # infernum: SafeTensors F32 (no llama.cpp comparison — different format)
+    # SafeTensors F32: infernum only (llama.cpp can't benchmark SafeTensors)
     if [[ -d "${SMOLLM_DIR}" ]]; then
-        log "[Llama] SmolLM2-360M SafeTensors F32 — infernum"
-        D_INFNUM["Llama/SmolLM2-360M|SafeTensors F32"]=$(run_infernum "${SMOLLM_DIR}")
-        D_LLAMA["Llama/SmolLM2-360M|SafeTensors F32"]="—"
+        log "[Llama] SmolLM2-360M SafeTensors F32"
+        run_infernum "${SMOLLM_DIR}"
+        LLAMA_PRE="—"; LLAMA_DEC="—"
+        record "Llama/SmolLM2-360M|SafeTensors F32"
     fi
-    # GGUF Q8_0: both infernum and llama.cpp — direct ratio comparison
+    # GGUF Q8_0: infernum + llama.cpp
     if [[ -f "${SMOLLM_Q8}" ]]; then
-        log "[Llama] SmolLM2-360M GGUF Q8_0 — infernum + llama.cpp"
-        D_INFNUM["Llama/SmolLM2-360M|GGUF Q8_0"]=$(run_infernum "${SMOLLM_Q8}")
-        D_LLAMA["Llama/SmolLM2-360M|GGUF Q8_0"]=$(run_llama_bench "${SMOLLM_Q8}")
+        log "[Llama] SmolLM2-360M GGUF Q8_0"
+        run_infernum "${SMOLLM_Q8}"
+        run_llama_bench "${SMOLLM_Q8}"
+        record "Llama/SmolLM2-360M|GGUF Q8_0"
     fi
-    # GGUF Q4_0: both infernum and llama.cpp — direct ratio comparison
+    # GGUF Q4_0: infernum + llama.cpp
     if [[ -f "${SMOLLM_Q4}" ]]; then
-        log "[Llama] SmolLM2-360M GGUF Q4_0 — infernum + llama.cpp"
-        D_INFNUM["Llama/SmolLM2-360M|GGUF Q4_0"]=$(run_infernum "${SMOLLM_Q4}")
-        D_LLAMA["Llama/SmolLM2-360M|GGUF Q4_0"]=$(run_llama_bench "${SMOLLM_Q4}")
+        log "[Llama] SmolLM2-360M GGUF Q4_0"
+        run_infernum "${SMOLLM_Q4}"
+        run_llama_bench "${SMOLLM_Q4}"
+        record "Llama/SmolLM2-360M|GGUF Q4_0"
     fi
 }
 
 [[ -n "${ENABLED_FAMILIES[qwen]:-}" ]] && {
     if [[ -d "${QWEN_DIR}" ]]; then
-        log "[Qwen] Qwen3-0.6B SafeTensors BF16 — infernum"
-        D_INFNUM["Qwen/Qwen3-0.6B|SafeTensors BF16"]=$(run_infernum "${QWEN_DIR}")
-        D_LLAMA["Qwen/Qwen3-0.6B|SafeTensors BF16"]="—"
+        log "[Qwen] Qwen3-0.6B SafeTensors BF16"
+        run_infernum "${QWEN_DIR}"
+        LLAMA_PRE="—"; LLAMA_DEC="—"
+        record "Qwen/Qwen3-0.6B|SafeTensors BF16"
     fi
 }
 
 [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]] && {
-    # GGUF Q8_0: both infernum and llama.cpp — direct ratio comparison
     if [[ -f "${GEMMA_GGUF_Q8}" ]]; then
-        log "[Gemma] gemma-2-2b-it GGUF Q8_0 — infernum + llama.cpp"
-        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q8_0"]=$(run_infernum "${GEMMA_GGUF_Q8}")
-        D_LLAMA["Gemma/gemma-2-2b-it|GGUF Q8_0"]=$(run_llama_bench "${GEMMA_GGUF_Q8}")
+        log "[Gemma] gemma-2-2b-it GGUF Q8_0"
+        run_infernum "${GEMMA_GGUF_Q8}"
+        run_llama_bench "${GEMMA_GGUF_Q8}"
+        record "Gemma/gemma-2-2b-it|GGUF Q8_0"
     fi
-    # GGUF Q4_K_M: both infernum and llama.cpp — direct ratio comparison
     if [[ -f "${GEMMA_GGUF_Q4}" ]]; then
-        log "[Gemma] gemma-2-2b-it GGUF Q4_K_M — infernum + llama.cpp"
-        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q4_K_M"]=$(run_infernum "${GEMMA_GGUF_Q4}")
-        D_LLAMA["Gemma/gemma-2-2b-it|GGUF Q4_K_M"]=$(run_llama_bench "${GEMMA_GGUF_Q4}")
+        log "[Gemma] gemma-2-2b-it GGUF Q4_K_M"
+        run_infernum "${GEMMA_GGUF_Q4}"
+        run_llama_bench "${GEMMA_GGUF_Q4}"
+        record "Gemma/gemma-2-2b-it|GGUF Q4_K_M"
     fi
 }
 
@@ -272,11 +300,11 @@ echo ""
 echo "## Infernum Metal — all model families"
 echo ""
 echo "- **Chip:** ${gpu_name} (${mem_gb} unified memory)"
-echo "- **Tokens generated:** ${N_GEN} (8-token prompt, greedy)"
+echo "- **Decode tokens:** ${N_GEN} (8-token warm-up prompt, greedy)"
+echo "- **Prefill tokens:** ${N_PROMPT}"
 echo "- **infernum commit:** \`${infernum_commit}\`"
 $HAS_LLAMA_CPP && echo "- **llama.cpp commit:** \`${llama_commit}\` (\`-ngl 99\`, ${LLAMA_BENCH_REPS} reps)"
 echo "- **Date:** $(date +%Y-%m-%d)"
-echo "- **Note:** Prefill not yet benchmarked (Metal graph engine pending)"
 
 row_order=(
     "Llama/SmolLM2-360M|SafeTensors F32"
@@ -287,22 +315,28 @@ row_order=(
     "Gemma/gemma-2-2b-it|GGUF Q4_K_M"
 )
 
+print_table() {
+    local -n _inf="$1" _lla="$2"
+    echo ""
+    echo "| Model | Format | infernum | llama.cpp | ratio |"
+    echo "| ----- | ------ | -------: | --------: | ----: |"
+    for key in "${row_order[@]}"; do
+        [[ -v _inf["${key}"] ]] || continue
+        model="${key%%|*}"
+        fmt="${key##*|}"
+        inf="${_inf[${key}]}"
+        lla="${_lla[${key}]}"
+        r=$(ratio "${lla}" "${inf}")
+        printf "| %-28s | %-16s | %8s | %9s | %5s |\n" "${model}" "${fmt}" "${inf}" "${lla}" "${r}"
+    done
+}
+
 echo ""
-echo "### Decode throughput (tok/s)"
+echo "### Prefill throughput (tok/s) — ${N_PROMPT}-token prompt"
+print_table D_INF_PRE D_LLA_PRE
+
 echo ""
-echo "- Llama/Gemma GGUF rows: both infernum and llama.cpp — direct ratio comparison"
-echo "- Llama SafeTensors F32 / Qwen BF16: infernum only (llama.cpp supports GGUF only)"
-echo ""
-echo "| Model | Format | infernum | llama.cpp | ratio |"
-echo "| ----- | ------ | -------: | --------: | ----: |"
-for key in "${row_order[@]}"; do
-    [[ -v D_INFNUM["${key}"] ]] || continue
-    model="${key%%|*}"
-    fmt="${key##*|}"
-    inf="${D_INFNUM[${key}]}"
-    lla="${D_LLAMA[${key}]}"
-    r=$(ratio "${lla}" "${inf}")
-    printf "| %-28s | %-16s | %8s | %9s | %5s |\n" "${model}" "${fmt}" "${inf}" "${lla}" "${r}"
-done
+echo "### Decode throughput (tok/s) — ${N_GEN} tokens"
+print_table D_INF_DEC D_LLA_DEC
 
 echo ""
