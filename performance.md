@@ -367,4 +367,3 @@ a meaningful measurement is taken. Git history provides the full timeline.
 | CPU | [results/cpu.md](results/cpu.md) | ✓ baseline recorded |
 | Metal | results/metal.md | pending |
 | CUDA | results/cuda.md | pending |
-| Gemma | Gemma-3-27B | BF16 | Decode | 1 | | | |
