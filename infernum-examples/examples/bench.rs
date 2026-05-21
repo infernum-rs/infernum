@@ -44,7 +44,10 @@ use infernum_cuda::cuda::ops::{
 use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache};
 use infernum_cuda::executor;
 use infernum_cuda::CudaBackend;
-use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _};
+use infernum_gemma::{
+    build_prefill_graph as gemma_build_prefill_graph, GemmaConfig, GemmaCudaGraphEngine,
+    GemmaCudaGraphEngineExt as _,
+};
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaCudaGraphEngine,
     LlamaCudaGraphEngineExt as _,
@@ -386,6 +389,16 @@ fn bench_graph(
                 head_dim,
                 config.rope_theta,
             )
+        } else if matches!(model_type, "gemma2" | "gemma3_text") {
+            let config = GemmaConfig::from_file(Path::new(model_path).join("config.json"))?;
+            let graph = gemma_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
+            (
+                graph,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.head_dim,
+                config.rope_theta,
+            )
         } else {
             let config: LlamaConfig = if is_gguf {
                 let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
@@ -437,8 +450,7 @@ fn bench_graph(
     let token_ids: Vec<u32> = (0..n_tokens).map(|i| (i % 256) as u32).collect();
     let input_ids = CudaTensor::from_slice(ctx, &[n_tokens], &token_ids)?;
 
-    let (cos_data, sin_data) =
-        infernum::rope::precompute_rope_data(n_tokens, head_dim, rope_theta);
+    let (cos_data, sin_data) = infernum::rope::precompute_rope_data(n_tokens, head_dim, rope_theta);
     let cos_cache = CudaTensor::from_slice(ctx, &[n_tokens, half_dim], &cos_data)?;
     let sin_cache = CudaTensor::from_slice(ctx, &[n_tokens, half_dim], &sin_data)?;
 
@@ -1144,10 +1156,11 @@ fn main() -> infernum::Result<()> {
         } else {
             let mt = detect_model_type(&cli.model)?;
             match mt.as_str() {
-                "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3_moe" => {}
+                "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3_moe" | "gemma2"
+                | "gemma3_text" => {}
                 other => {
                     eprintln!(
-                        "ERROR: --graph/--graph-decode/--cuda-graphs/--cuda-graph-engine mode only supports Llama/Mistral/Qwen, got: {other}"
+                        "ERROR: --graph/--graph-decode/--cuda-graphs/--cuda-graph-engine mode only supports Llama/Mistral/Qwen/Gemma, got: {other}"
                     );
                     std::process::exit(1);
                 }
