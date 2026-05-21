@@ -14,10 +14,10 @@ use crate::dtype::DType;
 
 use super::builder::Graph;
 use super::builtin_ops::{
-    AddInplaceOp, AddOp, AddRmsNormOp, AppendPagedBatchedOp, AppendPagedOp, BiasAddOp,
-    CastFromF32Op, CastToF32Op, ConcatInnerDimOp, ConcatSeqOp, EmbeddingGatherOp, ExtractLastRowOp,
-    FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp, LinearOp,
-    LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp,
+    AddInplaceOp, AddOp, AddRmsNormOp, AllReduceSumOp, AppendPagedBatchedOp, AppendPagedOp,
+    BiasAddOp, CastFromF32Op, CastToF32Op, ConcatInnerDimOp, ConcatSeqOp, EmbeddingGatherOp,
+    ExtractLastRowOp, FusedAttentionDecodeOp, FusedAttentionPrefillOp, GatherPagedKvOp, GegluOp,
+    LinearOp, LinearPairOp, LinearTripleOp, LmHeadOp, LogitSoftcapOp, MatmulBf16F32Op, MatmulOp,
     MlaAttentionOp, MoeDispatchSigmoidOp, MoeDispatchSoftmaxOp, MoeExpertIds, MulOp,
     PagedAttentionDecodeOp, RepeatKvOp, ReshapeOp, RmsNormOp, RmsNormQkOp, RopeBatchedOp,
     RopeInterleavedOp as RopeIntOp, RopeOp, ScaleOp, SiluOp, SplitInnerDimOp, SwigluOp,
@@ -1019,6 +1019,30 @@ impl<B: Backend + MatmulOps + ContextBackend> Graph<B> {
             }),
             &[input],
         );
+        (node_id, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CommOps — tensor-parallel synchronisation
+// ---------------------------------------------------------------------------
+
+/// Graph builder methods for multi-device communication.
+pub trait GraphCommOps {
+    /// Insert an all-reduce-sum node.
+    ///
+    /// At runtime this calls `comm.all_reduce_sum()` when `ExecuteContext::comm`
+    /// is `Some`, and passes the tensor through unchanged when it is `None`
+    /// (single-GPU). Safe to insert unconditionally in TP-aware graph builders;
+    /// the no-op path has zero overhead in single-GPU mode.
+    ///
+    /// Output shape and dtype match the input.
+    fn add_all_reduce(&mut self, input: OutputRef) -> OutputRef;
+}
+
+impl<B: ContextBackend> GraphCommOps for Graph<B> {
+    fn add_all_reduce(&mut self, input: OutputRef) -> OutputRef {
+        let node_id = self.add_node(Box::new(AllReduceSumOp), &[input]);
         (node_id, 0)
     }
 }
