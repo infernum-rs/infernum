@@ -365,5 +365,5 @@ a meaningful measurement is taken. Git history provides the full timeline.
 | Target | Results file | Status |
 |--------|-------------|--------|
 | CPU | [results/cpu.md](results/cpu.md) | ✓ baseline recorded |
-| Metal | results/metal.md | pending |
+| Metal | [results/metal.md](results/metal.md) | ✓ baseline recorded |
 | CUDA | results/cuda.md | pending |

@@ -88,7 +88,7 @@ SMOLLM_DIR="${MODEL_CACHE}/HuggingFaceTB/SmolLM2-360M"
 QWEN_DIR="${MODEL_CACHE}/Qwen/Qwen3-0.6B"
 
 GEMMA_GGUF_Q8="${GGUF_DIR}/gemma-2-2b-it-q8_0.gguf"
-GEMMA_GGUF_Q4="${GGUF_DIR}/gemma-2-2b-it-q4_0.gguf"
+GEMMA_GGUF_Q4="${GGUF_DIR}/gemma-2-2b-it-q4_k_m.gguf"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -130,14 +130,14 @@ download_hf_file() {
 }
 
 extract_toks() {
-    grep -oP '[\d.]+(?= tok/s)' | tail -1
+    sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1
 }
 
 run_infernum() {
     local model_path="$1"
     $DRY_RUN && { echo "—"; return; }
     local out
-    out=$(timeout 600 cargo run --release --example bench_metal --features metal -q -- \
+    out=$(cargo run --release --example bench_metal --features metal -q -- \
         "${model_path}" "${N_GEN}" 2>/dev/null || true)
     local toks; toks=$(echo "${out}" | extract_toks)
     echo "${toks:-ERR}"
@@ -176,7 +176,7 @@ $DRY_RUN && log "(dry-run: skipping downloads)"
     # F32 GGUF only if llama.cpp is available (needed to convert)
     if $HAS_LLAMA_CPP; then
         download_hf_model "HuggingFaceTB/SmolLM2-360M" "${SMOLLM_DIR}"
-        local _f16="${GGUF_DIR}/smollm2-360m-f16.gguf"
+        _f16="${GGUF_DIR}/smollm2-360m-f16.gguf"
         [[ -f "${SMOLLM_F32}" ]] || {
             log "Converting SmolLM2-360M → F32 GGUF"
             $DRY_RUN || python3 "${LLAMA_CPP}/convert_hf_to_gguf.py" "${SMOLLM_DIR}" \
@@ -191,7 +191,7 @@ $DRY_RUN && log "(dry-run: skipping downloads)"
 
 [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]] && {
     download_hf_file "bartowski/gemma-2-2b-it-GGUF" "gemma-2-2b-it-Q8_0.gguf" "${GEMMA_GGUF_Q8}"
-    download_hf_file "bartowski/gemma-2-2b-it-GGUF" "gemma-2-2b-it-Q4_0.gguf" "${GEMMA_GGUF_Q4}"
+    download_hf_file "bartowski/gemma-2-2b-it-GGUF" "gemma-2-2b-it-Q4_K_M.gguf" "${GEMMA_GGUF_Q4}"
 }
 
 # ── Build ──────────────────────────────────────────────────────────────────────
@@ -207,42 +207,52 @@ log "─────────────────────────
 
 declare -A D_INFNUM D_LLAMA
 
+# D_INFNUM and D_LLAMA share the same key space. Where only one side can run
+# a given format, the other side is pre-set to "—".
+#
+# Infernum Metal only supports SafeTensors (GGUF loading not yet implemented).
+# llama.cpp only supports GGUF. So Llama and Gemma get separate rows per format.
+
 [[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && {
-    if [[ -f "${SMOLLM_Q4}" ]]; then
-        log "[Llama] SmolLM2-360M GGUF Q4_0"
-        D_INFNUM["Llama/SmolLM2-360M Q4_0"]=$(run_infernum "${SMOLLM_Q4}")
-        D_LLAMA["Llama/SmolLM2-360M Q4_0"]=$(run_llama_bench "${SMOLLM_Q4}")
+    # infernum: SafeTensors F32 (only format supported on Metal today)
+    if [[ -d "${SMOLLM_DIR}" ]]; then
+        log "[Llama] SmolLM2-360M SafeTensors F32 — infernum"
+        D_INFNUM["Llama/SmolLM2-360M|SafeTensors F32"]=$(run_infernum "${SMOLLM_DIR}")
+        D_LLAMA["Llama/SmolLM2-360M|SafeTensors F32"]="—"
     fi
+    # llama.cpp: GGUF Q8_0 and Q4_0 (no infernum comparison — different format)
     if [[ -f "${SMOLLM_Q8}" ]]; then
-        log "[Llama] SmolLM2-360M GGUF Q8_0"
-        D_INFNUM["Llama/SmolLM2-360M Q8_0"]=$(run_infernum "${SMOLLM_Q8}")
-        D_LLAMA["Llama/SmolLM2-360M Q8_0"]=$(run_llama_bench "${SMOLLM_Q8}")
+        log "[Llama] SmolLM2-360M GGUF Q8_0 — llama.cpp"
+        D_INFNUM["Llama/SmolLM2-360M|GGUF Q8_0"]="—"
+        D_LLAMA["Llama/SmolLM2-360M|GGUF Q8_0"]=$(run_llama_bench "${SMOLLM_Q8}")
     fi
-    if [[ -f "${SMOLLM_F32}" ]]; then
-        log "[Llama] SmolLM2-360M GGUF F32"
-        D_INFNUM["Llama/SmolLM2-360M F32"]=$(run_infernum "${SMOLLM_F32}")
-        D_LLAMA["Llama/SmolLM2-360M F32"]=$(run_llama_bench "${SMOLLM_F32}")
+    if [[ -f "${SMOLLM_Q4}" ]]; then
+        log "[Llama] SmolLM2-360M GGUF Q4_0 — llama.cpp"
+        D_INFNUM["Llama/SmolLM2-360M|GGUF Q4_0"]="—"
+        D_LLAMA["Llama/SmolLM2-360M|GGUF Q4_0"]=$(run_llama_bench "${SMOLLM_Q4}")
     fi
 }
 
 [[ -n "${ENABLED_FAMILIES[qwen]:-}" ]] && {
     if [[ -d "${QWEN_DIR}" ]]; then
-        log "[Qwen] Qwen3-0.6B BF16"
-        D_INFNUM["Qwen/Qwen3-0.6B BF16"]=$(run_infernum "${QWEN_DIR}")
-        D_LLAMA["Qwen/Qwen3-0.6B BF16"]="—"  # llama-bench doesn't support Qwen SafeTensors
+        log "[Qwen] Qwen3-0.6B SafeTensors BF16 — infernum"
+        D_INFNUM["Qwen/Qwen3-0.6B|SafeTensors BF16"]=$(run_infernum "${QWEN_DIR}")
+        D_LLAMA["Qwen/Qwen3-0.6B|SafeTensors BF16"]="—"
     fi
 }
 
 [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]] && {
+    # infernum: no ungated SafeTensors available for Gemma 2-2B — skip
+    # llama.cpp: GGUF Q8_0 for reference
     if [[ -f "${GEMMA_GGUF_Q8}" ]]; then
-        log "[Gemma] gemma-2-2b-it GGUF Q8_0"
-        D_INFNUM["Gemma/gemma-2-2b-it Q8_0"]=$(run_infernum "${GEMMA_GGUF_Q8}")
-        D_LLAMA["Gemma/gemma-2-2b-it Q8_0"]=$(run_llama_bench "${GEMMA_GGUF_Q8}")
+        log "[Gemma] gemma-2-2b-it GGUF Q8_0 — llama.cpp only"
+        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q8_0"]="—"
+        D_LLAMA["Gemma/gemma-2-2b-it|GGUF Q8_0"]=$(run_llama_bench "${GEMMA_GGUF_Q8}")
     fi
     if [[ -f "${GEMMA_GGUF_Q4}" ]]; then
-        log "[Gemma] gemma-2-2b-it GGUF Q4_0"
-        D_INFNUM["Gemma/gemma-2-2b-it Q4_0"]=$(run_infernum "${GEMMA_GGUF_Q4}")
-        D_LLAMA["Gemma/gemma-2-2b-it Q4_0"]=$(run_llama_bench "${GEMMA_GGUF_Q4}")
+        log "[Gemma] gemma-2-2b-it GGUF Q4_K_M — llama.cpp only"
+        D_INFNUM["Gemma/gemma-2-2b-it|GGUF Q4_K_M"]="—"
+        D_LLAMA["Gemma/gemma-2-2b-it|GGUF Q4_K_M"]=$(run_llama_bench "${GEMMA_GGUF_Q4}")
     fi
 }
 
@@ -268,25 +278,30 @@ echo "- **Date:** $(date +%Y-%m-%d)"
 echo "- **Note:** Prefill not yet benchmarked (Metal graph engine pending)"
 
 row_order=(
-    "Llama/SmolLM2-360M Q4_0"
-    "Llama/SmolLM2-360M Q8_0"
-    "Llama/SmolLM2-360M F32"
-    "Qwen/Qwen3-0.6B BF16"
-    "Gemma/gemma-2-2b-it Q4_0"
-    "Gemma/gemma-2-2b-it Q8_0"
+    "Llama/SmolLM2-360M|SafeTensors F32"
+    "Llama/SmolLM2-360M|GGUF Q8_0"
+    "Llama/SmolLM2-360M|GGUF Q4_0"
+    "Qwen/Qwen3-0.6B|SafeTensors BF16"
+    "Gemma/gemma-2-2b-it|GGUF Q8_0"
+    "Gemma/gemma-2-2b-it|GGUF Q4_K_M"
 )
 
 echo ""
 echo "### Decode throughput (tok/s)"
 echo ""
-echo "| Model | infernum | llama.cpp | ratio |"
-echo "| ----- | -------: | --------: | ----: |"
+echo "- infernum Metal supports SafeTensors only (GGUF loading not yet implemented)"
+echo "- llama.cpp supports GGUF only, so Llama and Gemma rows use different formats"
+echo ""
+echo "| Model | Format | infernum | llama.cpp | ratio |"
+echo "| ----- | ------ | -------: | --------: | ----: |"
 for key in "${row_order[@]}"; do
     [[ -v D_INFNUM["${key}"] ]] || continue
+    model="${key%%|*}"
+    fmt="${key##*|}"
     inf="${D_INFNUM[${key}]}"
     lla="${D_LLAMA[${key}]}"
     r=$(ratio "${lla}" "${inf}")
-    printf "| %-38s | %8s | %9s | %5s |\n" "${key}" "${inf}" "${lla}" "${r}"
+    printf "| %-28s | %-16s | %8s | %9s | %5s |\n" "${model}" "${fmt}" "${inf}" "${lla}" "${r}"
 done
 
 echo ""
