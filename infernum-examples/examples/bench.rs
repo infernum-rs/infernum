@@ -982,39 +982,19 @@ fn bench_cuda_graphs_decode(
     Ok(())
 }
 
-/// Benchmark decode throughput using the high-level `CudaGraphEngine` path.
+/// Inner benchmark loop shared by all `CudaGraphEngine` model families.
 ///
-/// This exercises the same code path as production inference: `forward_prefill`
-/// populates the paged KV cache from a short prompt, then `forward_batch_decode`
-/// runs one decode step per token. After the buffer pool stabilizes, each decode
-/// step reduces to a single `cuGraphLaunch` call via the `DecodeState` captured
-/// in Step 4.
-///
-/// Supports Llama-family SafeTensors models only.
-///
-/// # Errors
-///
-/// Returns an error if weight loading or any CUDA kernel launch fails.
-fn bench_cuda_graph_engine(
-    ctx: &CudaContext,
-    model_path: &str,
-    n_gen: usize,
-    _weight_dtype: DType,
-) -> infernum::Result<()> {
+/// Runs a prefill warm-up then times `n_gen` decode steps via the paged KV cache path.
+fn run_engine_bench<M>(ctx: &CudaContext, model: M, n_gen: usize) -> infernum::Result<()>
+where
+    M: infernum::Model<B = infernum_cuda::CudaBackend, KvCache = infernum_cuda::cuda::PagedKvCache>,
+{
     use infernum::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
     use infernum::logits::Logits as _;
     use infernum::DecodeBufferOps as _;
-    use infernum::Model as _;
-    use infernum_cuda::cuda::PagedKvCache;
     use infernum_cuda::{CudaBackend, CudaRuntimeState};
 
-    assert!(
-        !model_path.ends_with(".gguf"),
-        "--cuda-graph-engine only supports SafeTensors directories"
-    );
-
-    let model = LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?;
-    let model_cfg = <LlamaCudaGraphEngine as infernum::Model>::config(&model);
+    let model_cfg = model.config();
 
     let prompt_len: usize = 8;
     let block_size: usize = 16;
@@ -1032,7 +1012,7 @@ fn bench_cuda_graph_engine(
         model_cfg.num_layers, model_cfg.head_dim, n_gen,
     );
 
-    let mut kv_cache: PagedKvCache = model.allocate_kv_cache(&block_config)?;
+    let mut kv_cache = model.allocate_kv_cache(&block_config)?;
     let mut runtime_state = CudaRuntimeState::test_placeholder();
 
     // Build block table for the single sequence.
@@ -1119,6 +1099,53 @@ fn bench_cuda_graph_engine(
     );
 
     Ok(())
+}
+
+/// Benchmark decode throughput using the high-level `CudaGraphEngine` path.
+///
+/// This exercises the same code path as production inference: `forward_prefill`
+/// populates the paged KV cache from a short prompt, then `forward_batch_decode`
+/// runs one decode step per token. After the buffer pool stabilizes, each decode
+/// step reduces to a single `cuGraphLaunch` call via the `DecodeState` captured
+/// in Step 4.
+///
+/// Supports Llama/Qwen/Gemma SafeTensors models.
+///
+/// # Errors
+///
+/// Returns an error if weight loading or any CUDA kernel launch fails.
+fn bench_cuda_graph_engine(
+    ctx: &CudaContext,
+    model_path: &str,
+    n_gen: usize,
+    _weight_dtype: DType,
+) -> infernum::Result<()> {
+    assert!(
+        !model_path.ends_with(".gguf"),
+        "--cuda-graph-engine only supports SafeTensors directories"
+    );
+
+    let model_type = detect_model_type(model_path)?;
+    match model_type.as_str() {
+        "llama" | "mistral" | "mixtral" => run_engine_bench(
+            ctx,
+            LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+            n_gen,
+        ),
+        "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
+            ctx,
+            QwenCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+            n_gen,
+        ),
+        "gemma2" | "gemma3_text" => run_engine_bench(
+            ctx,
+            GemmaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+            n_gen,
+        ),
+        other => Err(infernum::Error::UnsupportedModel(format!(
+            "--cuda-graph-engine: unsupported model_type `{other}`. Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
+        ))),
+    }
 }
 
 fn main() -> infernum::Result<()> {
