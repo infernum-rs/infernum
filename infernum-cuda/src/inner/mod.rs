@@ -28,10 +28,10 @@ pub use cuda::{GpuConfig, ShardConfig, ShardStrategy};
 pub use cuda::{NcclCommunicator, NcclId};
 pub use cuda_graph_engine::*;
 pub use cuda_logits::CudaLogits;
-#[cfg(feature = "nccl")]
-pub use sharded_engine::{ShardedGraphEngine, ShardedPagedKvCache};
 pub use cuda_runtime_state::CudaRuntimeState;
 pub use execute_context::{CudaExecutorState, GraphInputs};
+#[cfg(feature = "nccl")]
+pub use sharded_engine::{ShardedGraphEngine, ShardedPagedKvCache};
 pub use weights::{CudaWeightLoader, GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
 
 // Re-export cudarc types/traits needed by downstream generic model code

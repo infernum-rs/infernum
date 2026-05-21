@@ -50,6 +50,14 @@ name = "serve"
 required-features = ["cuda"]
 
 [[example]]
+name = "generate_parallel"
+required-features = ["nccl"]
+
+[[example]]
+name = "verify_parallel"
+required-features = ["nccl"]
+
+[[example]]
 name = "generate_cpu"
 required-features = ["cpu"]
 

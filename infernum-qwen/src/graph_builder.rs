@@ -1553,7 +1553,8 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_dense() {
         let config = dense_config();
-        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32, None);
+        let (graph, weights): (Graph<TestBackend>, _) =
+            build_prefill_graph(&config, 4, DType::F32, None);
         assert!(weights.layers.len() == 2);
         // Non-tied: lm_head.weight is a distinct linear weight in the store.
         assert_eq!(
@@ -1565,7 +1566,8 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_tied_embeddings() {
         let config = dense_config_tied();
-        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32, None);
+        let (graph, weights): (Graph<TestBackend>, _) =
+            build_prefill_graph(&config, 4, DType::F32, None);
         // Tied: lm_head is still registered; the loader supplies embed_tokens at runtime.
         assert_eq!(
             graph.linear_weight_meta(weights.lm_head).name,
@@ -1609,7 +1611,8 @@ mod tests {
     #[test]
     fn test_build_paged_decode_graph_output_shape_batch_1() {
         let config = dense_config();
-        let graph: Graph<TestBackend> = build_paged_decode_graph(&config, 1, 16, 8, DType::F32, None);
+        let graph: Graph<TestBackend> =
+            build_paged_decode_graph(&config, 1, 16, 8, DType::F32, None);
         // Paged decode: only logits (no K/V outputs — KV is a side-effect via append).
         assert_eq!(graph.output_ids().len(), 1);
         let logits_shape = graph.output_shape(graph.output_ids()[0], 0);

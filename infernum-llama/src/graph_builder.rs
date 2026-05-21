@@ -1317,7 +1317,8 @@ mod tests {
     fn prefill_graph_output_shape() {
         let config = test_config();
         let seq_len = 16;
-        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
+        let (graph, _weights) =
+            build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
 
         assert_eq!(graph.output_ids().len(), 1);
         let logits_id = graph.output_ids()[0];
@@ -1457,7 +1458,8 @@ mod tests {
         .unwrap();
 
         let seq_len = 4;
-        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
+        let (graph, _weights) =
+            build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
 
         let logits_id = graph.output_ids()[0];
         assert_eq!(graph.node_shape((logits_id, 0)), &[seq_len, 32000]);

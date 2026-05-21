@@ -145,3 +145,22 @@ impl LlamaCudaGraphEngineExt for LlamaCudaGraphEngine {
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
     }
 }
+
+/// Extension trait providing Llama-specific tensor-parallel constructors.
+#[cfg(feature = "nccl")]
+pub trait LlamaShardedGraphEngineExt: Sized {
+    /// Load a Llama-family model across multiple GPUs using tensor parallelism.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device creation, NCCL setup, or weight loading fails.
+    fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self>;
+}
+
+#[cfg(feature = "nccl")]
+impl LlamaShardedGraphEngineExt for LlamaShardedGraphEngine {
+    fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self> {
+        let config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        infernum_cuda::ShardedGraphEngine::from_pretrained(config, num_devices, model_dir)
+    }
+}

@@ -17,6 +17,7 @@ mod inner {
     use infernum::backend::MultiDeviceOps as _;
     use infernum::block_allocator::{BlockConfig, BlockTable};
     use infernum::model::{Model, ModelConfig};
+    use infernum::runtime_state::RuntimeStateInit as _;
     use infernum::shard::ShardConfig;
     use infernum::{DType, Result};
 
@@ -24,7 +25,7 @@ mod inner {
     use crate::cuda_graph_engine::CudaGraphEngineConfig;
     use crate::cuda_logits::CudaLogits;
     use crate::inner::cuda_graph_engine::CudaGraphEngine;
-    use crate::CudaBackend;
+    use crate::{CudaBackend, CudaRuntimeState};
 
     /// Tensor-parallel CUDA graph engine spanning multiple GPUs.
     ///
@@ -40,9 +41,9 @@ mod inner {
         replicas: Vec<CudaGraphEngine<C>>,
     }
 
-    // SAFETY: each `CudaGraphEngine` lives on its own GPU thread; we never
-    // access them concurrently from the same thread. The `thread::scope` in
-    // each forward method ensures the borrows are properly scoped.
+    // SAFETY: CudaGraphEngine is Send (its CUDA handles are thread-safe with
+    // proper synchronisation). Each replica is accessed only from its own
+    // scoped thread inside the forward methods.
     unsafe impl<C: CudaGraphEngineConfig + Clone> Send for ShardedGraphEngine<C> {}
     unsafe impl<C: CudaGraphEngineConfig + Clone> Sync for ShardedGraphEngine<C> {}
 
@@ -60,11 +61,7 @@ mod inner {
         /// # Panics
         ///
         /// Panics if a device thread panics.
-        pub fn from_pretrained(
-            config: C,
-            num_devices: usize,
-            model_dir: &Path,
-        ) -> Result<Self> {
+        pub fn from_pretrained(config: C, num_devices: usize, model_dir: &Path) -> Result<Self> {
             let comm_id = CudaBackend::create_comm_id()?;
             let comm_id_raw = *comm_id.to_raw();
             let model_dir = model_dir.to_owned();
@@ -76,14 +73,8 @@ mod inner {
                         let model_dir = model_dir.clone();
                         s.spawn(move || {
                             let ctx = CudaBackend::create_device(rank)?;
-                            let comm_id =
-                                crate::cuda::NcclId::from_raw(comm_id_raw);
-                            let comm = CudaBackend::create_comm(
-                                &ctx,
-                                rank,
-                                num_devices,
-                                comm_id,
-                            )?;
+                            let comm_id = crate::cuda::NcclId::from_raw(comm_id_raw);
+                            let comm = CudaBackend::create_comm(&ctx, rank, num_devices, comm_id)?;
                             let shard = ShardConfig {
                                 rank,
                                 world_size: num_devices,
@@ -112,7 +103,7 @@ mod inner {
 
     unsafe impl Send for ShardedPagedKvCache {}
 
-    impl Model for ShardedGraphEngine<impl CudaGraphEngineConfig + Clone + Sync> {
+    impl<C: CudaGraphEngineConfig + Clone + Sync> Model for ShardedGraphEngine<C> {
         type B = CudaBackend;
         type KvCache = ShardedPagedKvCache;
 
@@ -156,7 +147,7 @@ mod inner {
             &self,
             input_ids: &[u32],
             kv_cache: &mut ShardedPagedKvCache,
-            _runtime_state: &mut crate::CudaRuntimeState,
+            _runtime_state: &mut CudaRuntimeState,
             block_table: &BlockTable,
             start_pos: usize,
         ) -> Result<CudaLogits> {
@@ -167,10 +158,8 @@ mod inner {
                     .zip(kv_cache.inner.iter_mut())
                     .map(|(e, kv)| {
                         s.spawn(move || {
-                            let mut state = crate::CudaRuntimeState::default();
-                            e.forward_prefill(
-                                input_ids, kv, &mut state, block_table, start_pos,
-                            )
+                            let mut state = CudaRuntimeState::new_placeholder();
+                            e.forward_prefill(input_ids, kv, &mut state, block_table, start_pos)
                         })
                     })
                     .collect();
@@ -183,7 +172,7 @@ mod inner {
             &self,
             token_ids: &crate::cuda::CudaTensor,
             kv_cache: &mut ShardedPagedKvCache,
-            _runtime_state: &mut crate::CudaRuntimeState,
+            _runtime_state: &mut CudaRuntimeState,
             block_tables: &crate::cuda::CudaTensor,
             seq_lens: &crate::cuda::CudaTensor,
             positions: &crate::cuda::CudaTensor,
@@ -202,7 +191,7 @@ mod inner {
                     .zip(kv_cache.inner.iter_mut())
                     .map(|(e, kv)| {
                         s.spawn(move || {
-                            let mut state = crate::CudaRuntimeState::default();
+                            let mut state = CudaRuntimeState::new_placeholder();
                             e.forward_batch_decode(
                                 token_ids,
                                 kv,
@@ -222,9 +211,7 @@ mod inner {
         }
     }
 
-    fn collect_rank0<T>(
-        handles: Vec<thread::ScopedJoinHandle<'_, Result<T>>>,
-    ) -> Result<T> {
+    fn collect_rank0<T>(handles: Vec<thread::ScopedJoinHandle<'_, Result<T>>>) -> Result<T> {
         handles
             .into_iter()
             .map(|h| h.join().expect("device thread panicked"))

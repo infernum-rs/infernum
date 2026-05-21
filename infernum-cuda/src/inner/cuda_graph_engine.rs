@@ -27,8 +27,8 @@ use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, WeightStore};
 use infernum::shard::{shard_strategy_for_weight, ShardConfig};
 use infernum::weights::QuantizationConfig;
-use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
 use infernum::WeightLoader as _;
+use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
@@ -442,7 +442,9 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let head_dim = self.config.head_dim();
         let half_dim = self.half_dim;
 
-        let mut graph = self.config.build_prefill_graph_cuda(seq_len, self.shard.as_ref());
+        let mut graph = self
+            .config
+            .build_prefill_graph_cuda(seq_len, self.shard.as_ref());
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
