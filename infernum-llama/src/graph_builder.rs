@@ -10,7 +10,7 @@
 //! - Prefill, single-token decode, paged-KV decode, and CUDA-graph-compatible
 //!   indirect decode graphs
 //! - Per-layer sliding window attention via mask (`effective_sliding_window`)
-//! - Single-GPU only (no tensor parallelism / `AllReduce`)
+//! - Optional tensor parallelism via `shard: Option<&ShardConfig>`
 
 use infernum::backend::{
     ArithOps, AttentionOps, Backend, ContextBackend, EmbedOps, MatmulOps, MoeOps, MoeSigmoidOps,
@@ -18,10 +18,11 @@ use infernum::backend::{
 };
 use infernum::dtype::DType;
 use infernum::graph::{
-    Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphMatmulOps, GraphMoeOps,
-    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSiluOps,
-    GraphTensorOps, MoeExpertIds, WeightId,
+    Graph, GraphArithOps, GraphAttentionOps, GraphCommOps, GraphEmbedOps, GraphMatmulOps,
+    GraphMoeOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps,
+    GraphSiluOps, GraphTensorOps, MoeExpertIds, WeightId,
 };
+use infernum::shard::ShardConfig;
 
 use crate::config::LlamaConfig;
 
@@ -169,7 +170,12 @@ impl<B> LlamaGraphOps for B where
 ///
 /// Weight names match the `SafeTensors` naming convention used by
 /// [`LlamaModel::load_weights`](crate::LlamaModel).
-#[allow(clippy::too_many_lines)]
+///
+/// When `shard` is `Some`, column-parallel weights (q/k/v/gate/up) are
+/// registered with their local (per-rank) output dimension. Row-parallel
+/// weights (o_proj/down_proj/expert w2) are registered with their local
+/// input dimension. The weight loader must slice accordingly.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &LlamaConfig,
@@ -178,8 +184,16 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     intermediate: usize,
     vocab_size: usize,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> ModelWeightIds {
     let q_dim = config.num_attention_heads * config.head_dim();
+
+    // Local (per-rank) dimensions for sharded weights. When not sharding,
+    // these equal the full dimensions.
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let q_dim_local = q_dim / world_size;
+    let kv_dim_local = kv_dim / world_size;
+    let intermediate_local = intermediate / world_size;
 
     let embed_tokens = graph.register_tensor_weight(
         "model.embed_tokens.weight",
@@ -201,22 +215,22 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
         );
         let q_proj = graph.register_linear_weight(
             format!("{p}.self_attn.q_proj.weight"),
-            &[q_dim, hidden],
+            &[q_dim_local, hidden],
             weight_dtype,
         );
         let k_proj = graph.register_linear_weight(
             format!("{p}.self_attn.k_proj.weight"),
-            &[kv_dim, hidden],
+            &[kv_dim_local, hidden],
             weight_dtype,
         );
         let v_proj = graph.register_linear_weight(
             format!("{p}.self_attn.v_proj.weight"),
-            &[kv_dim, hidden],
+            &[kv_dim_local, hidden],
             weight_dtype,
         );
         let o_proj = graph.register_linear_weight(
             format!("{p}.self_attn.o_proj.weight"),
-            &[hidden, q_dim],
+            &[hidden, q_dim_local],
             weight_dtype,
         );
         let post_attention_layernorm = graph.register_tensor_weight(
@@ -236,19 +250,21 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
             let mut experts = Vec::with_capacity(num_experts);
             for e in 0..num_experts {
                 let ep = format!("{p}.block_sparse_moe.experts.{e}");
+                // w1/w3 are column-parallel (output dim sharded).
+                // w2 is row-parallel (input dim sharded).
                 let gate_proj = graph.register_linear_weight(
                     format!("{ep}.w1"),
-                    &[intermediate, hidden],
+                    &[intermediate_local, hidden],
                     weight_dtype,
                 );
                 let up_proj = graph.register_linear_weight(
                     format!("{ep}.w3"),
-                    &[intermediate, hidden],
+                    &[intermediate_local, hidden],
                     weight_dtype,
                 );
                 let down_proj = graph.register_linear_weight(
                     format!("{ep}.w2"),
-                    &[hidden, intermediate],
+                    &[hidden, intermediate_local],
                     weight_dtype,
                 );
                 experts.push(MoeExpertIds {
@@ -268,19 +284,20 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
                 experts,
             }));
         } else {
+            // gate/up are column-parallel; down is row-parallel.
             let gate_proj = graph.register_linear_weight(
                 format!("{p}.mlp.gate_proj.weight"),
-                &[intermediate, hidden],
+                &[intermediate_local, hidden],
                 weight_dtype,
             );
             let up_proj = graph.register_linear_weight(
                 format!("{p}.mlp.up_proj.weight"),
-                &[intermediate, hidden],
+                &[intermediate_local, hidden],
                 weight_dtype,
             );
             let down_proj = graph.register_linear_weight(
                 format!("{p}.mlp.down_proj.weight"),
-                &[hidden, intermediate],
+                &[hidden, intermediate_local],
                 weight_dtype,
             );
             layers.push(LayerWeightIds::Dense(DenseLayerWeightIds {
@@ -326,6 +343,10 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 /// over the entire sequence. Suitable for initial prompt processing
 /// or for models running without caching.
 ///
+/// When `shard` is `Some`, the graph is built for tensor-parallel execution:
+/// weight shapes are local (per-rank) and `AllReduce` nodes are inserted after
+/// o_proj and down_proj.
+///
 /// # Panics
 ///
 #[must_use]
@@ -333,9 +354,10 @@ pub fn build_prefill_graph<B: LlamaGraphOps>(
     config: &LlamaConfig,
     seq_len: usize,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> (Graph<B>, ModelWeightIds)
 where
-    Graph<B>: GraphMoeOps,
+    Graph<B>: GraphMoeOps + GraphCommOps,
 {
     let mut graph = Graph::<B>::new();
 
@@ -348,6 +370,10 @@ where
     let vocab_size = config.vocab_size;
     let eps = config.rms_norm_eps;
 
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = num_heads / world_size;
+    let num_kv_heads_local = num_kv_heads / world_size;
+
     // -- Register weights --
     let model_weights = register_weights(
         &mut graph,
@@ -357,6 +383,7 @@ where
         intermediate,
         vocab_size,
         weight_dtype,
+        shard,
     );
 
     // -- Graph inputs --
@@ -377,10 +404,10 @@ where
         // 2. Q/K/V projections (fused triple)
         let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj(), lw.k_proj(), lw.v_proj());
 
-        // 3. Reshape to 3D: [seq_len, num_heads, head_dim]
-        let q_3d = graph.add_reshape(q, &[seq_len, num_heads, head_dim]);
-        let k_3d = graph.add_reshape(k, &[seq_len, num_kv_heads, head_dim]);
-        let v_3d = graph.add_reshape(v, &[seq_len, num_kv_heads, head_dim]);
+        // 3. Reshape to 3D: [seq_len, num_heads_local, head_dim]
+        let q_3d = graph.add_reshape(q, &[seq_len, num_heads_local, head_dim]);
+        let k_3d = graph.add_reshape(k, &[seq_len, num_kv_heads_local, head_dim]);
+        let v_3d = graph.add_reshape(v, &[seq_len, num_kv_heads_local, head_dim]);
 
         // 4. RoPE (offset = 0 for prefill)
         let q_rope = graph.add_rope(q_3d, cos_input, sin_input, 0);
@@ -390,8 +417,14 @@ where
         let attn_out = graph.add_fused_attention_prefill(q_rope, k_rope, v_3d, 0, None, None, None);
 
         // 6. Reshape back to 2D and output projection
-        let attn_flat = graph.add_reshape(attn_out, &[seq_len, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, lw.o_proj());
+        let attn_flat = graph.add_reshape(attn_out, &[seq_len, num_heads_local * head_dim]);
+        let attn_proj_raw = graph.add_linear(attn_flat, lw.o_proj());
+        // AllReduce sums partial row-parallel results across ranks.
+        let attn_proj = if shard.is_some() {
+            graph.add_all_reduce(attn_proj_raw)
+        } else {
+            attn_proj_raw
+        };
 
         // 7. Residual add + post-attention RMS norm
         let h_updated = graph.add_add(h, attn_proj);
@@ -403,18 +436,28 @@ where
                 let (gate, up) = graph.add_linear_pair(normed_post, dense.gate_proj, dense.up_proj);
                 let gate_activated = graph.add_silu(gate);
                 let activated = graph.add_mul(gate_activated, up);
-                let down = graph.add_linear(activated, dense.down_proj);
+                let down_raw = graph.add_linear(activated, dense.down_proj);
+                let down = if shard.is_some() {
+                    graph.add_all_reduce(down_raw)
+                } else {
+                    down_raw
+                };
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(moe) => {
                 // Mixtral uses softmax routing with top-k renormalization.
-                let moe_out = graph.add_moe_dispatch_softmax(
+                let moe_out_raw = graph.add_moe_dispatch_softmax(
                     normed_post,
                     moe.moe_gate,
                     moe.experts.clone(),
                     num_experts_per_tok,
                     true,
                 );
+                let moe_out = if shard.is_some() {
+                    graph.add_all_reduce(moe_out_raw)
+                } else {
+                    moe_out_raw
+                };
                 graph.add_add_inplace(h_updated, moe_out)
             }
         };
@@ -443,15 +486,18 @@ where
 /// 1. `input_id` — single token ID, shape `[1]`
 /// 2. `cos_cache` — `RoPE` cosine for the current position, shape `[1, head_dim / 2]`
 /// 3. `sin_cache` — `RoPE` sine for the current position, shape `[1, head_dim / 2]`
-/// 4. For each layer `i`: `k_cache_i` of shape `[kv_len, num_kv_heads, head_dim]`
-/// 5. For each layer `i`: `v_cache_i` of shape `[kv_len, num_kv_heads, head_dim]`
+/// 4. For each layer `i`: `k_cache_i` of shape `[kv_len, num_kv_heads_local, head_dim]`
+/// 5. For each layer `i`: `v_cache_i` of shape `[kv_len, num_kv_heads_local, head_dim]`
 ///
 /// And produces these outputs (in order):
 /// 1. `logits` of shape `[1, vocab_size]`
-/// 2. For each layer `i`: `full_k_i` of shape `[kv_len + 1, num_kv_heads, head_dim]`
-/// 3. For each layer `i`: `full_v_i` of shape `[kv_len + 1, num_kv_heads, head_dim]`
+/// 2. For each layer `i`: `full_k_i` of shape `[kv_len + 1, num_kv_heads_local, head_dim]`
+/// 3. For each layer `i`: `full_v_i` of shape `[kv_len + 1, num_kv_heads_local, head_dim]`
 ///
 /// The caller feeds the updated K/V outputs back as inputs on the next step.
+///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and down_proj.
 ///
 /// # Panics
 ///
@@ -460,9 +506,10 @@ pub fn build_decode_graph<B: LlamaGraphOps>(
     config: &LlamaConfig,
     kv_len: usize,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> (Graph<B>, ModelWeightIds)
 where
-    Graph<B>: GraphMoeOps,
+    Graph<B>: GraphMoeOps + GraphCommOps,
 {
     let mut graph = Graph::<B>::new();
 
@@ -475,6 +522,10 @@ where
     let vocab_size = config.vocab_size;
     let eps = config.rms_norm_eps;
 
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = num_heads / world_size;
+    let num_kv_heads_local = num_kv_heads / world_size;
+
     // -- Register weights --
     let model_weights = register_weights(
         &mut graph,
@@ -484,6 +535,7 @@ where
         intermediate,
         vocab_size,
         weight_dtype,
+        shard,
     );
 
     // -- Graph inputs --
@@ -491,13 +543,13 @@ where
     let cos_input = graph.add_input(&[1, head_dim / 2], DType::F32);
     let sin_input = graph.add_input(&[1, head_dim / 2], DType::F32);
 
-    // KV cache inputs: per-layer k and v
+    // KV cache inputs: per-layer k and v (num_kv_heads_local when sharded)
     let num_layers = config.num_hidden_layers;
     let mut k_cache_inputs = Vec::with_capacity(num_layers);
     let mut v_cache_inputs = Vec::with_capacity(num_layers);
     for _ in 0..num_layers {
-        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
-        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
+        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads_local, head_dim], weight_dtype));
+        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads_local, head_dim], weight_dtype));
     }
 
     // -- Embedding --
@@ -516,10 +568,10 @@ where
         // 2. Q/K/V projections (fused triple)
         let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj(), lw.k_proj(), lw.v_proj());
 
-        // 3. Reshape to 3D: [1, num_heads, head_dim]
-        let q_3d = graph.add_reshape(q, &[1, num_heads, head_dim]);
-        let k_3d = graph.add_reshape(k, &[1, num_kv_heads, head_dim]);
-        let v_3d = graph.add_reshape(v, &[1, num_kv_heads, head_dim]);
+        // 3. Reshape to 3D: [1, num_heads_local, head_dim]
+        let q_3d = graph.add_reshape(q, &[1, num_heads_local, head_dim]);
+        let k_3d = graph.add_reshape(k, &[1, num_kv_heads_local, head_dim]);
+        let v_3d = graph.add_reshape(v, &[1, num_kv_heads_local, head_dim]);
 
         // 4. RoPE — offset=0 because cos/sin inputs contain data for just the
         //    current position (the caller pre-indexes into the RoPE table).
@@ -533,12 +585,17 @@ where
         k_outputs.push(full_k);
         v_outputs.push(full_v);
 
-        // 6. Decode attention: Q [1, heads, dim] against full K/V [kv_len+1, kv_heads, dim]
+        // 6. Decode attention: Q [1, heads_local, dim] against full K/V
         let attn_out = graph.add_fused_attention_decode(q_rope, full_k, full_v, None);
 
         // 7. Reshape back to 2D and output projection
-        let attn_flat = graph.add_reshape(attn_out, &[1, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, lw.o_proj());
+        let attn_flat = graph.add_reshape(attn_out, &[1, num_heads_local * head_dim]);
+        let attn_proj_raw = graph.add_linear(attn_flat, lw.o_proj());
+        let attn_proj = if shard.is_some() {
+            graph.add_all_reduce(attn_proj_raw)
+        } else {
+            attn_proj_raw
+        };
 
         // 8. Residual add + post-attention RMS norm (primitives — optimizer fuses)
         let h_updated = graph.add_add(h, attn_proj);
@@ -550,17 +607,27 @@ where
                 let (gate, up) = graph.add_linear_pair(normed_post, dense.gate_proj, dense.up_proj);
                 let gate_activated = graph.add_silu(gate);
                 let activated = graph.add_mul(gate_activated, up);
-                let down = graph.add_linear(activated, dense.down_proj);
+                let down_raw = graph.add_linear(activated, dense.down_proj);
+                let down = if shard.is_some() {
+                    graph.add_all_reduce(down_raw)
+                } else {
+                    down_raw
+                };
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(moe) => {
-                let moe_out = graph.add_moe_dispatch_softmax(
+                let moe_out_raw = graph.add_moe_dispatch_softmax(
                     normed_post,
                     moe.moe_gate,
                     moe.experts.clone(),
                     num_experts_per_tok,
                     true,
                 );
+                let moe_out = if shard.is_some() {
+                    graph.add_all_reduce(moe_out_raw)
+                } else {
+                    moe_out_raw
+                };
                 graph.add_add_inplace(h_updated, moe_out)
             }
         };
@@ -607,6 +674,9 @@ where
 /// 4. `positions`  — U32, shape `[batch_size]` (write index for append)
 /// 5. `seq_lens`   — U32, shape `[batch_size]` (= positions + 1, for attention)
 ///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and down_proj.
+///
 /// # Panics
 ///
 #[must_use]
@@ -617,10 +687,11 @@ pub fn build_paged_decode_graph<B>(
     block_size: usize,
     max_blocks_per_seq: usize,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> Graph<B>
 where
     B: LlamaGraphOps + PagedKvCacheOps + PagedAttentionOps,
-    Graph<B>: GraphMoeOps + GraphPagedKvCacheOps + GraphPagedAttentionOps,
+    Graph<B>: GraphMoeOps + GraphPagedKvCacheOps + GraphPagedAttentionOps + GraphCommOps,
 {
     let mut graph = Graph::<B>::new();
 
@@ -633,6 +704,10 @@ where
     let vocab_size = config.vocab_size;
     let eps = config.rms_norm_eps;
 
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = num_heads / world_size;
+    let num_kv_heads_local = num_kv_heads / world_size;
+
     // -- Register weights (same order as build_decode_graph / build_prefill_graph) --
     let model_weights = register_weights(
         &mut graph,
@@ -642,6 +717,7 @@ where
         intermediate,
         vocab_size,
         weight_dtype,
+        shard,
     );
 
     // -- Graph inputs --
@@ -665,10 +741,10 @@ where
         // 2. Q/K/V projections
         let (q, k, v) = graph.add_linear_triple(normed, lw.q_proj(), lw.k_proj(), lw.v_proj());
 
-        // 3. Reshape to 3D: [batch_size, num_heads, head_dim]
-        let q_3d = graph.add_reshape(q, &[batch_size, num_heads, head_dim]);
-        let k_3d = graph.add_reshape(k, &[batch_size, num_kv_heads, head_dim]);
-        let v_3d = graph.add_reshape(v, &[batch_size, num_kv_heads, head_dim]);
+        // 3. Reshape to 3D: [batch_size, num_heads_local, head_dim]
+        let q_3d = graph.add_reshape(q, &[batch_size, num_heads_local, head_dim]);
+        let k_3d = graph.add_reshape(k, &[batch_size, num_kv_heads_local, head_dim]);
+        let v_3d = graph.add_reshape(v, &[batch_size, num_kv_heads_local, head_dim]);
 
         // 4. RoPE — offset = 0; cos/sin inputs carry per-token position data.
         let q_rope = graph.add_rope(q_3d, cos_input, sin_input, 0);
@@ -688,8 +764,8 @@ where
             positions,
             append,
             layer_idx,
-            num_heads,
-            num_kv_heads,
+            num_heads_local,
+            num_kv_heads_local,
             head_dim,
             block_size,
             config.effective_sliding_window(layer_idx),
@@ -697,8 +773,13 @@ where
         );
 
         // 7. Reshape back to 2D and output projection
-        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, lw.o_proj());
+        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads_local * head_dim]);
+        let attn_proj_raw = graph.add_linear(attn_flat, lw.o_proj());
+        let attn_proj = if shard.is_some() {
+            graph.add_all_reduce(attn_proj_raw)
+        } else {
+            attn_proj_raw
+        };
 
         // 8. Residual add + post-attention RMS norm
         let h_updated = graph.add_add(h, attn_proj);
@@ -710,17 +791,27 @@ where
                 let (gate, up) = graph.add_linear_pair(normed_post, dense.gate_proj, dense.up_proj);
                 let gate_activated = graph.add_silu(gate);
                 let activated = graph.add_mul(gate_activated, up);
-                let down = graph.add_linear(activated, dense.down_proj);
+                let down_raw = graph.add_linear(activated, dense.down_proj);
+                let down = if shard.is_some() {
+                    graph.add_all_reduce(down_raw)
+                } else {
+                    down_raw
+                };
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(moe) => {
-                let moe_out = graph.add_moe_dispatch_softmax(
+                let moe_out_raw = graph.add_moe_dispatch_softmax(
                     normed_post,
                     moe.moe_gate,
                     moe.experts.clone(),
                     num_experts_per_tok,
                     true,
                 );
+                let moe_out = if shard.is_some() {
+                    graph.add_all_reduce(moe_out_raw)
+                } else {
+                    moe_out_raw
+                };
                 graph.add_add_inplace(h_updated, moe_out)
             }
         };
@@ -1226,7 +1317,7 @@ mod tests {
     fn prefill_graph_output_shape() {
         let config = test_config();
         let seq_len = 16;
-        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16);
+        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
 
         assert_eq!(graph.output_ids().len(), 1);
         let logits_id = graph.output_ids()[0];
@@ -1238,7 +1329,7 @@ mod tests {
     #[test]
     fn prefill_graph_has_correct_input_count() {
         let config = test_config();
-        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16);
+        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
 
         // Should have exactly 3 Input nodes: input_ids, cos_cache, sin_cache
         let input_count = graph
@@ -1252,7 +1343,7 @@ mod tests {
     #[test]
     fn prefill_graph_weight_names_match_convention() {
         let config = test_config();
-        let (graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16);
+        let (graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
 
         // Verify embed weight name
         assert_eq!(
@@ -1316,7 +1407,7 @@ mod tests {
     #[test]
     fn prefill_graph_layer_count_matches_config() {
         let config = test_config();
-        let (_graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16);
+        let (_graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
 
         assert_eq!(weights.layers.len(), config.num_hidden_layers);
     }
@@ -1338,7 +1429,7 @@ mod tests {
         )
         .unwrap();
 
-        let (graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16);
+        let (graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
         assert_eq!(weights.layers.len(), config.num_hidden_layers);
         // Each layer should be MoE with 8 experts
         for lw in &weights.layers {
@@ -1366,7 +1457,7 @@ mod tests {
         .unwrap();
 
         let seq_len = 4;
-        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16);
+        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
 
         let logits_id = graph.output_ids()[0];
         assert_eq!(graph.node_shape((logits_id, 0)), &[seq_len, 32000]);
