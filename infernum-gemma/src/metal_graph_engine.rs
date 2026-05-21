@@ -9,12 +9,14 @@ use std::path::Path;
 use infernum::graph::{Graph, WeightId, WeightStore};
 use infernum::{DType, Result};
 use infernum_metal::{
-    load_graph_weights_metal, MetalBackend, MetalContext, MetalGraphEngineConfig, MetalLinearWeight,
-    MetalTensor,
+    load_graph_weights_metal, MetalBackend, MetalContext, MetalGraphEngineConfig,
+    MetalLinearWeight, MetalTensor,
 };
 
 use crate::config::GemmaConfig;
-use crate::graph_builder::{build_paged_decode_graph, build_prefill_graph, safetensors_to_gguf_name};
+use crate::graph_builder::{
+    build_paged_decode_graph, build_prefill_graph, safetensors_to_gguf_name,
+};
 
 // ---------------------------------------------------------------------------
 // MetalGraphEngineConfig impl
@@ -93,7 +95,8 @@ fn load_gemma_graph_weights_gguf_metal(
     use infernum::weights::format::{host_transpose_2d, FormatLoader};
     use infernum::weights::host::HostLinearWeight;
 
-    let loader = infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
+    let loader =
+        infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
 
     let tensor_count = graph.tensor_weight_count();
     let linear_count = graph.linear_weight_count();
@@ -177,6 +180,8 @@ impl GemmaMetalGraphEngineExt for GemmaMetalGraphEngine {
         let config = GemmaConfig::from_gguf_metadata(loader.metadata())?;
         let dummy_graph = config.build_prefill_graph_metal(1);
         let weights = load_gemma_graph_weights_gguf_metal(&dummy_graph, &ctx, gguf_path)?;
-        Ok(infernum_metal::MetalGraphEngine::from_weights(config, ctx, weights))
+        Ok(infernum_metal::MetalGraphEngine::from_weights(
+            config, ctx, weights,
+        ))
     }
 }

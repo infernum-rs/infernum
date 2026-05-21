@@ -9,12 +9,14 @@ use std::path::Path;
 use infernum::graph::{Graph, WeightId, WeightStore};
 use infernum::{DType, Result};
 use infernum_metal::{
-    load_graph_weights_metal, MetalBackend, MetalContext, MetalGraphEngineConfig, MetalLinearWeight,
-    MetalTensor,
+    load_graph_weights_metal, MetalBackend, MetalContext, MetalGraphEngineConfig,
+    MetalLinearWeight, MetalTensor,
 };
 
 use crate::config::LlamaConfig;
-use crate::graph_builder::{build_paged_decode_graph, build_prefill_graph, needs_unpermute, safetensors_to_gguf_name};
+use crate::graph_builder::{
+    build_paged_decode_graph, build_prefill_graph, needs_unpermute, safetensors_to_gguf_name,
+};
 
 // ---------------------------------------------------------------------------
 // MetalGraphEngineConfig impl
@@ -97,7 +99,8 @@ fn load_llama_graph_weights_gguf_metal(
     use infernum::weights::format::{host_transpose_2d, host_unpermute_f32, FormatLoader};
     use infernum::weights::host::HostLinearWeight;
 
-    let loader = infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
+    let loader =
+        infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
 
     let tensor_count = graph.tensor_weight_count();
     let linear_count = graph.linear_weight_count();
@@ -210,6 +213,8 @@ impl LlamaMetalGraphEngineExt for LlamaMetalGraphEngine {
             config.num_attention_heads,
             config.num_kv_heads(),
         )?;
-        Ok(infernum_metal::MetalGraphEngine::from_weights(config, ctx, weights))
+        Ok(infernum_metal::MetalGraphEngine::from_weights(
+            config, ctx, weights,
+        ))
     }
 }
