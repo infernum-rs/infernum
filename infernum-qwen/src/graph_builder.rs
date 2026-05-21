@@ -16,10 +16,11 @@ use infernum::backend::{
 };
 use infernum::dtype::DType;
 use infernum::graph::{
-    Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphEmbedOps, GraphMatmulOps,
-    GraphMoeOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps,
-    GraphSiluOps, GraphTensorOps, MoeExpertIds, OutputRef, WeightId,
+    Graph, GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCommOps, GraphEmbedOps,
+    GraphMatmulOps, GraphMoeOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps,
+    GraphRopeOps, GraphSiluOps, GraphTensorOps, MoeExpertIds, OutputRef, WeightId,
 };
+use infernum::shard::ShardConfig;
 
 use crate::config::QwenConfig;
 
@@ -198,11 +199,16 @@ fn is_moe_layer(config: &QwenConfig, layer_idx: usize) -> bool {
 ///
 /// Registration order must be identical across prefill and decode graphs so
 /// that the same [`WeightStore`] can be shared between them.
-#[allow(clippy::too_many_lines)]
+///
+/// When `shard` is `Some`, column-parallel weights (q/k/v/gate/up) are
+/// registered with local (per-rank) output dimensions, and row-parallel
+/// weights (o_proj/down_proj) with local input dimensions.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &QwenConfig,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> ModelWeightIds {
     let hidden = config.hidden_size;
     let num_heads = config.num_attention_heads;
@@ -213,6 +219,11 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     let vocab_size = config.vocab_size;
     let intermediate = config.intermediate_size;
     let num_layers = config.num_hidden_layers;
+
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let q_dim_local = q_dim / world_size;
+    let kv_dim_local = kv_dim / world_size;
+    let intermediate_local = intermediate / world_size;
 
     let has_qkv_bias = config.has_qkv_bias();
     let has_qk_norm = config.has_qk_norm();
@@ -234,33 +245,34 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
         );
         let q_proj = graph.register_linear_weight(
             format!("{p}.self_attn.q_proj.weight"),
-            &[q_dim, hidden],
+            &[q_dim_local, hidden],
             weight_dtype,
         );
         let k_proj = graph.register_linear_weight(
             format!("{p}.self_attn.k_proj.weight"),
-            &[kv_dim, hidden],
+            &[kv_dim_local, hidden],
             weight_dtype,
         );
         let v_proj = graph.register_linear_weight(
             format!("{p}.self_attn.v_proj.weight"),
-            &[kv_dim, hidden],
+            &[kv_dim_local, hidden],
             weight_dtype,
         );
         let qkv_bias = if has_qkv_bias {
+            // Biases are column-parallel: each rank holds its local slice.
             let qb = graph.register_tensor_weight(
                 format!("{p}.self_attn.q_proj.bias"),
-                &[q_dim],
+                &[q_dim_local],
                 DType::F32,
             );
             let kb = graph.register_tensor_weight(
                 format!("{p}.self_attn.k_proj.bias"),
-                &[kv_dim],
+                &[kv_dim_local],
                 DType::F32,
             );
             let vb = graph.register_tensor_weight(
                 format!("{p}.self_attn.v_proj.bias"),
-                &[kv_dim],
+                &[kv_dim_local],
                 DType::F32,
             );
             Some(QkvBiasIds {
@@ -291,7 +303,7 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
         };
         let o_proj = graph.register_linear_weight(
             format!("{p}.self_attn.o_proj.weight"),
-            &[hidden, q_dim],
+            &[hidden, q_dim_local],
             weight_dtype,
         );
         let post_attention_layernorm = graph.register_tensor_weight(
@@ -303,6 +315,7 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
         if is_moe_layer(config, i) {
             let num_experts = config.num_experts.unwrap_or(0);
             let expert_intermediate = config.moe_expert_intermediate_size();
+            let expert_intermediate_local = expert_intermediate / world_size;
 
             let moe_gate = graph.register_tensor_weight(
                 format!("{p}.mlp.gate.weight"),
@@ -312,19 +325,20 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
             let mut experts = Vec::with_capacity(num_experts);
             for e in 0..num_experts {
                 let ep = format!("{p}.mlp.experts.{e}");
+                // gate/up are column-parallel; down is row-parallel.
                 let gate_proj = graph.register_linear_weight(
                     format!("{ep}.gate_proj.weight"),
-                    &[expert_intermediate, hidden],
+                    &[expert_intermediate_local, hidden],
                     weight_dtype,
                 );
                 let up_proj = graph.register_linear_weight(
                     format!("{ep}.up_proj.weight"),
-                    &[expert_intermediate, hidden],
+                    &[expert_intermediate_local, hidden],
                     weight_dtype,
                 );
                 let down_proj = graph.register_linear_weight(
                     format!("{ep}.down_proj.weight"),
-                    &[hidden, expert_intermediate],
+                    &[hidden, expert_intermediate_local],
                     weight_dtype,
                 );
                 experts.push(MoeExpertIds {
@@ -336,19 +350,20 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 
             let (shared_gate, shared_up, shared_down) =
                 if let Some(shared_intermediate) = config.shared_expert_intermediate_size {
+                    let shared_intermediate_local = shared_intermediate / world_size;
                     let sg = graph.register_linear_weight(
                         format!("{p}.mlp.shared_expert.gate_proj.weight"),
-                        &[shared_intermediate, hidden],
+                        &[shared_intermediate_local, hidden],
                         weight_dtype,
                     );
                     let su = graph.register_linear_weight(
                         format!("{p}.mlp.shared_expert.up_proj.weight"),
-                        &[shared_intermediate, hidden],
+                        &[shared_intermediate_local, hidden],
                         weight_dtype,
                     );
                     let sd = graph.register_linear_weight(
                         format!("{p}.mlp.shared_expert.down_proj.weight"),
-                        &[hidden, shared_intermediate],
+                        &[hidden, shared_intermediate_local],
                         weight_dtype,
                     );
                     (Some(sg), Some(su), Some(sd))
@@ -374,17 +389,17 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
         } else {
             let gate_proj = graph.register_linear_weight(
                 format!("{p}.mlp.gate_proj.weight"),
-                &[intermediate, hidden],
+                &[intermediate_local, hidden],
                 weight_dtype,
             );
             let up_proj = graph.register_linear_weight(
                 format!("{p}.mlp.up_proj.weight"),
-                &[intermediate, hidden],
+                &[intermediate_local, hidden],
                 weight_dtype,
             );
             let down_proj = graph.register_linear_weight(
                 format!("{p}.mlp.down_proj.weight"),
-                &[hidden, intermediate],
+                &[hidden, intermediate_local],
                 weight_dtype,
             );
 
@@ -607,6 +622,9 @@ fn build_moe_ffn<B: QwenGraphOps>(
 ///
 /// And produces `logits` of shape `[seq_len, vocab_size]`.
 ///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and after each FFN output.
+///
 /// # Panics
 ///
 /// Panics if `seq_len == 0`.
@@ -616,7 +634,11 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
     config: &QwenConfig,
     seq_len: usize,
     weight_dtype: DType,
-) -> (Graph<B>, ModelWeightIds) {
+    shard: Option<&ShardConfig>,
+) -> (Graph<B>, ModelWeightIds)
+where
+    Graph<B>: GraphCommOps,
+{
     assert!(seq_len > 0, "seq_len must be > 0");
 
     let mut graph = Graph::<B>::new();
@@ -628,7 +650,11 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
     let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
     let norm_topk = config.norm_topk_prob;
 
-    let model_weights = register_weights(&mut graph, config, weight_dtype);
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = num_heads / world_size;
+    let num_kv_heads_local = num_kv_heads / world_size;
+
+    let model_weights = register_weights(&mut graph, config, weight_dtype, shard);
 
     // -- Graph inputs --
     let input_ids = graph.add_input(&[seq_len], DType::U32);
@@ -657,7 +683,7 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
         let normed = graph.add_rms_norm(h, input_layernorm, eps);
 
         // 2. Attention block
-        let attn_proj = build_attention_prefill(
+        let attn_proj_raw = build_attention_prefill(
             &mut graph,
             normed,
             q_proj,
@@ -668,13 +694,18 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
             qk_norm,
             eps,
             seq_len,
-            num_heads,
-            num_kv_heads,
+            num_heads_local,
+            num_kv_heads_local,
             head_dim,
             cos_input,
             sin_input,
             sliding_window,
         );
+        let attn_proj = if shard.is_some() {
+            graph.add_all_reduce(attn_proj_raw)
+        } else {
+            attn_proj_raw
+        };
 
         // 3. Residual + post-attention norm
         let h_updated = graph.add_add(h, attn_proj);
@@ -683,12 +714,22 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
         // 4. FFN or MoE
         h = match lw {
             LayerWeightIds::Dense(d) => {
-                let down = build_dense_ffn(&mut graph, normed_post, d);
+                let down_raw = build_dense_ffn(&mut graph, normed_post, d);
+                let down = if shard.is_some() {
+                    graph.add_all_reduce(down_raw)
+                } else {
+                    down_raw
+                };
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(m) => {
-                let ffn_out =
+                let ffn_out_raw =
                     build_moe_ffn(&mut graph, normed_post, m, num_experts_per_tok, norm_topk);
+                let ffn_out = if shard.is_some() {
+                    graph.add_all_reduce(ffn_out_raw)
+                } else {
+                    ffn_out_raw
+                };
                 graph.add_add_inplace(h_updated, ffn_out)
             }
         };
@@ -718,22 +759,29 @@ pub fn build_prefill_graph<B: QwenGraphOps>(
 /// 1. `input_id` — single token ID, shape `[1]`
 /// 2. `cos` — `RoPE` cosine for the current position, shape `[1, head_dim / 2]`
 /// 3. `sin` — `RoPE` sine for the current position, shape `[1, head_dim / 2]`
-/// 4. `k_cache_i` shape `[kv_len, num_kv_heads, head_dim]` for each layer
+/// 4. `k_cache_i` shape `[kv_len, num_kv_heads_local, head_dim]` for each layer
 ///    (indices `4..3+L`)
-/// 5. `v_cache_i` shape `[kv_len, num_kv_heads, head_dim]` for each layer
+/// 5. `v_cache_i` shape `[kv_len, num_kv_heads_local, head_dim]` for each layer
 ///    (indices `4+L..3+2L`)
 ///
 /// Outputs (in order):
 /// 1. `logits` shape `[1, vocab_size]`
-/// 2. `full_k_i` shape `[kv_len+1, num_kv_heads, head_dim]` (indices `2..1+L`)
-/// 3. `full_v_i` shape `[kv_len+1, num_kv_heads, head_dim]` (indices `2+L..1+2L`)
+/// 2. `full_k_i` shape `[kv_len+1, num_kv_heads_local, head_dim]` (indices `2..1+L`)
+/// 3. `full_v_i` shape `[kv_len+1, num_kv_heads_local, head_dim]` (indices `2+L..1+2L`)
+///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and after each FFN output.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn build_decode_graph<B: QwenGraphOps>(
     config: &QwenConfig,
     kv_len: usize,
     weight_dtype: DType,
-) -> (Graph<B>, ModelWeightIds) {
+    shard: Option<&ShardConfig>,
+) -> (Graph<B>, ModelWeightIds)
+where
+    Graph<B>: GraphCommOps,
+{
     let mut graph = Graph::<B>::new();
 
     let num_heads = config.num_attention_heads;
@@ -744,7 +792,11 @@ pub fn build_decode_graph<B: QwenGraphOps>(
     let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
     let norm_topk = config.norm_topk_prob;
 
-    let model_weights = register_weights(&mut graph, config, weight_dtype);
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = num_heads / world_size;
+    let num_kv_heads_local = num_kv_heads / world_size;
+
+    let model_weights = register_weights(&mut graph, config, weight_dtype, shard);
 
     // -- Inputs --
     let input_id = graph.add_input(&[1], DType::U32);
@@ -754,8 +806,8 @@ pub fn build_decode_graph<B: QwenGraphOps>(
     let mut k_cache_inputs = Vec::with_capacity(num_layers);
     let mut v_cache_inputs = Vec::with_capacity(num_layers);
     for _ in 0..num_layers {
-        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
-        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
+        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads_local, head_dim], weight_dtype));
+        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads_local, head_dim], weight_dtype));
     }
 
     // -- Embedding --
@@ -778,7 +830,7 @@ pub fn build_decode_graph<B: QwenGraphOps>(
 
         let normed = graph.add_rms_norm(h, input_layernorm, eps);
 
-        let (attn_proj, full_k, full_v) = build_attention_decode(
+        let (attn_proj_raw, full_k, full_v) = build_attention_decode(
             &mut graph,
             normed,
             q_proj,
@@ -788,14 +840,19 @@ pub fn build_decode_graph<B: QwenGraphOps>(
             qkv_bias,
             qk_norm,
             eps,
-            num_heads,
-            num_kv_heads,
+            num_heads_local,
+            num_kv_heads_local,
             head_dim,
             cos_input,
             sin_input,
             k_cache_inputs[layer_idx],
             v_cache_inputs[layer_idx],
         );
+        let attn_proj = if shard.is_some() {
+            graph.add_all_reduce(attn_proj_raw)
+        } else {
+            attn_proj_raw
+        };
 
         k_outputs.push(full_k);
         v_outputs.push(full_v);
@@ -805,12 +862,22 @@ pub fn build_decode_graph<B: QwenGraphOps>(
 
         h = match lw {
             LayerWeightIds::Dense(d) => {
-                let down = build_dense_ffn(&mut graph, normed_post, d);
+                let down_raw = build_dense_ffn(&mut graph, normed_post, d);
+                let down = if shard.is_some() {
+                    graph.add_all_reduce(down_raw)
+                } else {
+                    down_raw
+                };
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(m) => {
-                let ffn_out =
+                let ffn_out_raw =
                     build_moe_ffn(&mut graph, normed_post, m, num_experts_per_tok, norm_topk);
+                let ffn_out = if shard.is_some() {
+                    graph.add_all_reduce(ffn_out_raw)
+                } else {
+                    ffn_out_raw
+                };
                 graph.add_add_inplace(h_updated, ffn_out)
             }
         };
@@ -852,6 +919,9 @@ pub fn build_decode_graph<B: QwenGraphOps>(
 /// 4. `positions`    — U32, shape `[batch_size]`
 /// 5. `seq_lens`     — U32, shape `[batch_size]`
 ///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and after each FFN output.
+///
 /// # Panics
 ///
 /// Panics if `batch_size == 0`.
@@ -867,10 +937,11 @@ pub fn build_paged_decode_graph<B>(
     block_size: usize,
     max_blocks_per_seq: usize,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> Graph<B>
 where
     B: QwenGraphOps + PagedKvCacheOps + PagedAttentionOps,
-    Graph<B>: GraphPagedKvCacheOps + GraphPagedAttentionOps,
+    Graph<B>: GraphPagedKvCacheOps + GraphPagedAttentionOps + GraphCommOps,
 {
     assert!(batch_size > 0, "batch_size must be > 0");
 
@@ -883,7 +954,11 @@ where
     let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
     let norm_topk = config.norm_topk_prob;
 
-    let model_weights = register_weights(&mut graph, config, weight_dtype);
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = num_heads / world_size;
+    let num_kv_heads_local = num_kv_heads / world_size;
+
+    let model_weights = register_weights(&mut graph, config, weight_dtype, shard);
 
     // -- Graph inputs --
     let input_ids = graph.add_input(&[batch_size], DType::U32);
@@ -928,9 +1003,9 @@ where
         };
 
         // 4. Reshape to 3D
-        let q_3d = graph.add_reshape(q, &[batch_size, num_heads, head_dim]);
-        let k_3d = graph.add_reshape(k, &[batch_size, num_kv_heads, head_dim]);
-        let v_3d = graph.add_reshape(v, &[batch_size, num_kv_heads, head_dim]);
+        let q_3d = graph.add_reshape(q, &[batch_size, num_heads_local, head_dim]);
+        let k_3d = graph.add_reshape(k, &[batch_size, num_kv_heads_local, head_dim]);
+        let v_3d = graph.add_reshape(v, &[batch_size, num_kv_heads_local, head_dim]);
 
         // 5. Optional per-head QK RMSNorm (Qwen3)
         let (q_3d, k_3d) = if let Some(norms) = qk_norm {
@@ -957,8 +1032,8 @@ where
             positions,
             append,
             layer_idx,
-            num_heads,
-            num_kv_heads,
+            num_heads_local,
+            num_kv_heads_local,
             head_dim,
             block_size,
             sliding_window,
@@ -966,8 +1041,13 @@ where
         );
 
         // 9. Reshape and output projection
-        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, o_proj);
+        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads_local * head_dim]);
+        let attn_proj_raw = graph.add_linear(attn_flat, o_proj);
+        let attn_proj = if shard.is_some() {
+            graph.add_all_reduce(attn_proj_raw)
+        } else {
+            attn_proj_raw
+        };
 
         // 10. Residual + post-attention norm
         let h_updated = graph.add_add(h, attn_proj);
@@ -976,12 +1056,22 @@ where
         // 11. FFN or MoE
         h = match lw {
             LayerWeightIds::Dense(d) => {
-                let down = build_dense_ffn(&mut graph, normed_post, d);
+                let down_raw = build_dense_ffn(&mut graph, normed_post, d);
+                let down = if shard.is_some() {
+                    graph.add_all_reduce(down_raw)
+                } else {
+                    down_raw
+                };
                 graph.add_add_inplace(h_updated, down)
             }
             LayerWeightIds::Moe(m) => {
-                let ffn_out =
+                let ffn_out_raw =
                     build_moe_ffn(&mut graph, normed_post, m, num_experts_per_tok, norm_topk);
+                let ffn_out = if shard.is_some() {
+                    graph.add_all_reduce(ffn_out_raw)
+                } else {
+                    ffn_out_raw
+                };
                 graph.add_add_inplace(h_updated, ffn_out)
             }
         };
@@ -1463,7 +1553,7 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_dense() {
         let config = dense_config();
-        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32);
+        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32, None);
         assert!(weights.layers.len() == 2);
         // Non-tied: lm_head.weight is a distinct linear weight in the store.
         assert_eq!(
@@ -1475,7 +1565,7 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_tied_embeddings() {
         let config = dense_config_tied();
-        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32);
+        let (graph, weights): (Graph<TestBackend>, _) = build_prefill_graph(&config, 4, DType::F32, None);
         // Tied: lm_head is still registered; the loader supplies embed_tokens at runtime.
         assert_eq!(
             graph.linear_weight_meta(weights.lm_head).name,
@@ -1487,7 +1577,7 @@ mod tests {
     fn test_build_prefill_graph_qwen3() {
         let config = qwen3_config();
         let (_graph, weights): (Graph<TestBackend>, _) =
-            build_prefill_graph(&config, 4, DType::F32);
+            build_prefill_graph(&config, 4, DType::F32, None);
         // QK norms present on all layers.
         for lw in &weights.layers {
             if let LayerWeightIds::Dense(d) = lw {
@@ -1501,7 +1591,7 @@ mod tests {
     fn test_build_prefill_graph_moe() {
         let config = moe_config();
         let (_graph, weights): (Graph<TestBackend>, _) =
-            build_prefill_graph(&config, 4, DType::F32);
+            build_prefill_graph(&config, 4, DType::F32, None);
         // All layers are MoE with decoder_sparse_step=1.
         for lw in &weights.layers {
             assert!(matches!(lw, LayerWeightIds::Moe(_)));
@@ -1511,7 +1601,7 @@ mod tests {
     #[test]
     fn test_build_decode_graph_dense() {
         let config = dense_config();
-        let (graph, _): (Graph<TestBackend>, _) = build_decode_graph(&config, 10, DType::F32);
+        let (graph, _): (Graph<TestBackend>, _) = build_decode_graph(&config, 10, DType::F32, None);
         // Outputs: logits + K per layer + V per layer = 1 + 2 + 2 = 5.
         assert_eq!(graph.output_ids().len(), 5);
     }
@@ -1519,7 +1609,7 @@ mod tests {
     #[test]
     fn test_build_paged_decode_graph_output_shape_batch_1() {
         let config = dense_config();
-        let graph: Graph<TestBackend> = build_paged_decode_graph(&config, 1, 16, 8, DType::F32);
+        let graph: Graph<TestBackend> = build_paged_decode_graph(&config, 1, 16, 8, DType::F32, None);
         // Paged decode: only logits (no K/V outputs — KV is a side-effect via append).
         assert_eq!(graph.output_ids().len(), 1);
         let logits_shape = graph.output_shape(graph.output_ids()[0], 0);
@@ -1539,7 +1629,7 @@ mod tests {
         let config = dense_config();
         let batch_size = 4;
         let graph: Graph<TestBackend> =
-            build_paged_decode_graph(&config, batch_size, 16, 8, DType::F32);
+            build_paged_decode_graph(&config, batch_size, 16, 8, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
         let logits_shape = graph.output_shape(graph.output_ids()[0], 0);
         assert_eq!(
