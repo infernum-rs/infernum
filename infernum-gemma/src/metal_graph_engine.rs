@@ -34,7 +34,7 @@ impl MetalGraphEngineConfig for GemmaConfig {
     }
 
     fn build_prefill_graph_metal(&self, seq_len: usize) -> Graph<infernum_metal::MetalBackend> {
-        build_prefill_graph::<infernum_metal::MetalBackend>(self, seq_len, DType::F32)
+        build_prefill_graph::<infernum_metal::MetalBackend>(self, seq_len, DType::F32, None)
     }
 
     fn build_paged_decode_graph_metal(
@@ -49,6 +49,7 @@ impl MetalGraphEngineConfig for GemmaConfig {
             block_size,
             max_blocks_per_seq,
             DType::F32,
+            None,
         )
     }
 

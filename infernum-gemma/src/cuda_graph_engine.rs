@@ -56,11 +56,11 @@ impl CudaGraphEngineConfig for GemmaConfig {
     }
 
     fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
-        build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16)
+        build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16, None)
     }
 
     fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<infernum_cuda::CudaBackend> {
-        build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16)
+        build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16, None)
     }
 
     fn build_paged_decode_graph_cuda(
@@ -75,6 +75,7 @@ impl CudaGraphEngineConfig for GemmaConfig {
             block_size,
             max_blocks_per_seq,
             DType::BF16,
+            None,
         )
     }
 
