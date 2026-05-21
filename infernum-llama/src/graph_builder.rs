@@ -173,7 +173,7 @@ impl<B> LlamaGraphOps for B where
 ///
 /// When `shard` is `Some`, column-parallel weights (q/k/v/gate/up) are
 /// registered with their local (per-rank) output dimension. Row-parallel
-/// weights (o_proj/down_proj/expert w2) are registered with their local
+/// weights (`o_proj`/`down_proj`/expert w2) are registered with their local
 /// input dimension. The weight loader must slice accordingly.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn register_weights<B: Backend + MatmulOps + ContextBackend>(
@@ -345,7 +345,7 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 ///
 /// When `shard` is `Some`, the graph is built for tensor-parallel execution:
 /// weight shapes are local (per-rank) and `AllReduce` nodes are inserted after
-/// o_proj and down_proj.
+/// `o_proj` and `down_proj`.
 ///
 /// # Panics
 ///
@@ -497,7 +497,7 @@ where
 /// The caller feeds the updated K/V outputs back as inputs on the next step.
 ///
 /// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
-/// nodes are inserted after o_proj and down_proj.
+/// nodes are inserted after `o_proj` and `down_proj`.
 ///
 /// # Panics
 ///
@@ -675,7 +675,7 @@ where
 /// 5. `seq_lens`   — U32, shape `[batch_size]` (= positions + 1, for attention)
 ///
 /// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
-/// nodes are inserted after o_proj and down_proj.
+/// nodes are inserted after `o_proj` and `down_proj`.
 ///
 /// # Panics
 ///
@@ -832,6 +832,7 @@ where
 // GGUF weight loader helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "cpu")]
 /// Map a SafeTensors-convention weight name to its GGUF tensor name.
 ///
 /// Handles the top-level tensors (`model.embed_tokens.weight`, `model.norm.weight`,
@@ -868,6 +869,7 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     panic!("Unknown weight name: {name}");
 }
 
+#[cfg(feature = "cpu")]
 /// Returns `true` if this GGUF tensor name is a Q or K projection that needs
 /// the GGUF row-permutation reversal before use.
 pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {

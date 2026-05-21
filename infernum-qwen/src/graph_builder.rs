@@ -202,7 +202,7 @@ fn is_moe_layer(config: &QwenConfig, layer_idx: usize) -> bool {
 ///
 /// When `shard` is `Some`, column-parallel weights (q/k/v/gate/up) are
 /// registered with local (per-rank) output dimensions, and row-parallel
-/// weights (o_proj/down_proj) with local input dimensions.
+/// weights (`o_proj`/`down_proj`) with local input dimensions.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
@@ -623,7 +623,7 @@ fn build_moe_ffn<B: QwenGraphOps>(
 /// And produces `logits` of shape `[seq_len, vocab_size]`.
 ///
 /// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
-/// nodes are inserted after o_proj and after each FFN output.
+/// nodes are inserted after `o_proj` and after each FFN output.
 ///
 /// # Panics
 ///
@@ -770,7 +770,7 @@ where
 /// 3. `full_v_i` shape `[kv_len+1, num_kv_heads_local, head_dim]` (indices `2+L..1+2L`)
 ///
 /// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
-/// nodes are inserted after o_proj and after each FFN output.
+/// nodes are inserted after `o_proj` and after each FFN output.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn build_decode_graph<B: QwenGraphOps>(
@@ -920,7 +920,7 @@ where
 /// 5. `seq_lens`     — U32, shape `[batch_size]`
 ///
 /// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
-/// nodes are inserted after o_proj and after each FFN output.
+/// nodes are inserted after `o_proj` and after each FFN output.
 ///
 /// # Panics
 ///
