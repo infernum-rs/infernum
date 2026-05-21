@@ -122,6 +122,12 @@ impl CudaGraphEngineConfig for LlamaConfig {
 /// A type alias for [`infernum_cuda::CudaGraphEngine<LlamaConfig>`].
 pub type LlamaCudaGraphEngine = infernum_cuda::CudaGraphEngine<LlamaConfig>;
 
+/// Tensor-parallel CUDA graph engine for Llama-family models.
+///
+/// A type alias for [`infernum_cuda::ShardedGraphEngine<LlamaConfig>`].
+#[cfg(feature = "nccl")]
+pub type LlamaShardedGraphEngine = infernum_cuda::ShardedGraphEngine<LlamaConfig>;
+
 /// Extension trait providing Llama-specific CUDA constructors.
 pub trait LlamaCudaGraphEngineExt: Sized {
     /// Load a Llama-family model from a `SafeTensors` directory onto a CUDA device.

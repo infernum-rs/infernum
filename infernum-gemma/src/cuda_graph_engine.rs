@@ -118,6 +118,12 @@ impl CudaGraphEngineConfig for GemmaConfig {
 /// A type alias for [`infernum_cuda::CudaGraphEngine<GemmaConfig>`].
 pub type GemmaCudaGraphEngine = infernum_cuda::CudaGraphEngine<GemmaConfig>;
 
+/// Tensor-parallel CUDA graph engine for Gemma-family models.
+///
+/// A type alias for [`infernum_cuda::ShardedGraphEngine<GemmaConfig>`].
+#[cfg(feature = "nccl")]
+pub type GemmaShardedGraphEngine = infernum_cuda::ShardedGraphEngine<GemmaConfig>;
+
 /// Extension trait providing Gemma-specific CUDA constructors.
 pub trait GemmaCudaGraphEngineExt: Sized {
     /// Load a Gemma-family model from a SafeTensors directory onto a CUDA device.

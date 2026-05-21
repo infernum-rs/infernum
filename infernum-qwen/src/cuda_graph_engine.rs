@@ -123,6 +123,12 @@ impl CudaGraphEngineConfig for QwenConfig {
 /// A type alias for [`infernum_cuda::CudaGraphEngine<QwenConfig>`].
 pub type QwenCudaGraphEngine = infernum_cuda::CudaGraphEngine<QwenConfig>;
 
+/// Tensor-parallel CUDA graph engine for Qwen-family models.
+///
+/// A type alias for [`infernum_cuda::ShardedGraphEngine<QwenConfig>`].
+#[cfg(feature = "nccl")]
+pub type QwenShardedGraphEngine = infernum_cuda::ShardedGraphEngine<QwenConfig>;
+
 /// Extension trait providing Qwen-specific CUDA constructors.
 pub trait QwenCudaGraphEngineExt: Sized {
     /// Load a Qwen-family model from a `SafeTensors` directory onto a CUDA device.
