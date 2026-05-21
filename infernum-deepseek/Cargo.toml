@@ -19,6 +19,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
-infernum-cuda = { path = "../infernum-cuda", features = ["cuda"] }
-infernum-runtime = { path = "../infernum-runtime" }
+infernum = { path = "../infernum", features = ["test-helpers"] }
 ureq = { version = "3", features = ["json"] }
