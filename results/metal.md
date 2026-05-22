@@ -26,6 +26,8 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 
 ### Prefill throughput (tok/s)
 
+`llama-bench` only accepts GGUF — SafeTensors rows have no llama.cpp comparison and never will.
+
 | Model | Format | infernum | llama.cpp | ratio | Date |
 | ----- | ------ | -------: | --------: | ----: | ---- |
 | Llama / Llama-3.1-8B | GGUF Q4_0 | — | 290.8 | — | 2026-05-22 |
