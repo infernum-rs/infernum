@@ -13,10 +13,11 @@ use infernum::backend::{
 };
 use infernum::dtype::DType;
 use infernum::graph::{
-    Graph, GraphArithOps, GraphAttentionOps, GraphEmbedOps, GraphGegluOps, GraphMatmulOps,
-    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps, GraphSoftcapOps,
-    GraphTensorOps, OutputRef, WeightId,
+    Graph, GraphArithOps, GraphAttentionOps, GraphCommOps, GraphEmbedOps, GraphGegluOps,
+    GraphMatmulOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeOps,
+    GraphSoftcapOps, GraphTensorOps, OutputRef, WeightId,
 };
+use infernum::shard::ShardConfig;
 
 use crate::config::GemmaConfig;
 
@@ -112,14 +113,24 @@ impl<B> GemmaGraphOps for B where
 /// Register all Gemma model weights into the graph and return their IDs.
 ///
 /// Names match the `SafeTensors` convention used by the HuggingFace checkpoints.
+///
+/// When `shard` is `Some`, column-parallel weights (Q/K/V/gate/up) use local
+/// (per-rank) output dimensions, and row-parallel weights (o_proj/down_proj)
+/// use local input dimensions.
 #[allow(clippy::too_many_lines)]
 fn register_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &GemmaConfig,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> ModelWeightIds {
     let hidden = config.hidden_size;
     let head_dim = config.head_dim;
+
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = config.num_attention_heads / world_size;
+    let num_kv_heads_local = config.num_key_value_heads / world_size;
+    let intermediate_local = config.intermediate_size / world_size;
 
     let embed_tokens = graph.register_tensor_weight(
         "model.embed_tokens.weight",
@@ -154,22 +165,22 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 
         let q_proj = graph.register_linear_weight(
             format!("{pfx}.self_attn.q_proj.weight"),
-            &[config.num_attention_heads * head_dim, hidden],
+            &[num_heads_local * head_dim, hidden],
             weight_dtype,
         );
         let k_proj = graph.register_linear_weight(
             format!("{pfx}.self_attn.k_proj.weight"),
-            &[config.num_key_value_heads * head_dim, hidden],
+            &[num_kv_heads_local * head_dim, hidden],
             weight_dtype,
         );
         let v_proj = graph.register_linear_weight(
             format!("{pfx}.self_attn.v_proj.weight"),
-            &[config.num_key_value_heads * head_dim, hidden],
+            &[num_kv_heads_local * head_dim, hidden],
             weight_dtype,
         );
         let o_proj = graph.register_linear_weight(
             format!("{pfx}.self_attn.o_proj.weight"),
-            &[hidden, config.num_attention_heads * head_dim],
+            &[hidden, num_heads_local * head_dim],
             weight_dtype,
         );
 
@@ -192,17 +203,17 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 
         let gate_proj = graph.register_linear_weight(
             format!("{pfx}.mlp.gate_proj.weight"),
-            &[config.intermediate_size, hidden],
+            &[intermediate_local, hidden],
             weight_dtype,
         );
         let up_proj = graph.register_linear_weight(
             format!("{pfx}.mlp.up_proj.weight"),
-            &[config.intermediate_size, hidden],
+            &[intermediate_local, hidden],
             weight_dtype,
         );
         let down_proj = graph.register_linear_weight(
             format!("{pfx}.mlp.down_proj.weight"),
-            &[hidden, config.intermediate_size],
+            &[hidden, intermediate_local],
             weight_dtype,
         );
 
@@ -254,6 +265,8 @@ fn build_attention_prefill<B>(
     h_normed: OutputRef,
     cos_input: OutputRef,
     sin_input: OutputRef,
+    num_heads_local: usize,
+    num_kv_heads_local: usize,
 ) -> OutputRef
 where
     B: GemmaGraphOps,
@@ -266,18 +279,16 @@ where
         + GraphGegluOps
         + GraphSoftcapOps,
 {
-    let num_heads = config.num_attention_heads;
-    let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
 
     let q = graph.add_linear(h_normed, ids.q_proj);
     let k = graph.add_linear(h_normed, ids.k_proj);
     let v = graph.add_linear(h_normed, ids.v_proj);
 
-    // Reshape to 3D [seq_len, num_heads, head_dim] for QK-norm and RoPE.
-    let q = graph.add_reshape(q, &[seq_len, num_heads, head_dim]);
-    let k = graph.add_reshape(k, &[seq_len, num_kv_heads, head_dim]);
-    let v = graph.add_reshape(v, &[seq_len, num_kv_heads, head_dim]);
+    // Reshape to 3D [seq_len, num_heads_local, head_dim] for QK-norm and RoPE.
+    let q = graph.add_reshape(q, &[seq_len, num_heads_local, head_dim]);
+    let k = graph.add_reshape(k, &[seq_len, num_kv_heads_local, head_dim]);
+    let v = graph.add_reshape(v, &[seq_len, num_kv_heads_local, head_dim]);
 
     // Optional QK-norm (Gemma 3)
     let (q, k) = if let Some(ref qkn) = ids.qk_norm {
@@ -295,8 +306,8 @@ where
     let attn_out =
         graph.add_fused_attention_prefill(q, k, v, 0, attn_scale, softcap, sliding_window);
 
-    // Reshape back to 2D [seq_len, num_heads * head_dim] before the output projection.
-    let attn_flat = graph.add_reshape(attn_out, &[seq_len, num_heads * head_dim]);
+    // Reshape back to 2D [seq_len, num_heads_local * head_dim] before the output projection.
+    let attn_flat = graph.add_reshape(attn_out, &[seq_len, num_heads_local * head_dim]);
     graph.add_linear(attn_flat, ids.o_proj)
 }
 
@@ -311,6 +322,8 @@ fn build_attention_decode<B>(
     sin_input: OutputRef,
     k_cache_input: OutputRef,
     v_cache_input: OutputRef,
+    num_heads_local: usize,
+    num_kv_heads_local: usize,
 ) -> (OutputRef, OutputRef, OutputRef)
 where
     B: GemmaGraphOps,
@@ -323,18 +336,16 @@ where
         + GraphGegluOps
         + GraphSoftcapOps,
 {
-    let num_heads = config.num_attention_heads;
-    let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
 
     let q = graph.add_linear(h_normed, ids.q_proj);
     let k = graph.add_linear(h_normed, ids.k_proj);
     let v = graph.add_linear(h_normed, ids.v_proj);
 
-    // Reshape to 3D [1, num_heads, head_dim] for QK-norm and RoPE.
-    let q = graph.add_reshape(q, &[1, num_heads, head_dim]);
-    let k = graph.add_reshape(k, &[1, num_kv_heads, head_dim]);
-    let v = graph.add_reshape(v, &[1, num_kv_heads, head_dim]);
+    // Reshape to 3D [1, num_heads_local, head_dim] for QK-norm and RoPE.
+    let q = graph.add_reshape(q, &[1, num_heads_local, head_dim]);
+    let k = graph.add_reshape(k, &[1, num_kv_heads_local, head_dim]);
+    let v = graph.add_reshape(v, &[1, num_kv_heads_local, head_dim]);
 
     // Optional QK-norm (Gemma 3)
     let (q, k) = if let Some(ref qkn) = ids.qk_norm {
@@ -354,8 +365,8 @@ where
     // Sliding window is tracked via KV cache metadata at decode time; not passed here.
     let attn_out = graph.add_fused_attention_decode(q, full_k, full_v, softcap);
 
-    // Reshape back to 2D [1, num_heads * head_dim] before the output projection.
-    let attn_flat = graph.add_reshape(attn_out, &[1, num_heads * head_dim]);
+    // Reshape back to 2D [1, num_heads_local * head_dim] before the output projection.
+    let attn_flat = graph.add_reshape(attn_out, &[1, num_heads_local * head_dim]);
     (graph.add_linear(attn_flat, ids.o_proj), full_k, full_v)
 }
 
@@ -366,8 +377,16 @@ where
 /// Build the Gemma prefill graph.
 ///
 /// The graph has two inputs: token IDs and a `RoPE` cache tensor.
+///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and after down_proj.
 #[must_use]
-pub fn build_prefill_graph<B>(config: &GemmaConfig, seq_len: usize, weight_dtype: DType) -> Graph<B>
+pub fn build_prefill_graph<B>(
+    config: &GemmaConfig,
+    seq_len: usize,
+    weight_dtype: DType,
+    shard: Option<&ShardConfig>,
+) -> Graph<B>
 where
     B: GemmaGraphOps,
     Graph<B>: GraphMatmulOps
@@ -378,13 +397,17 @@ where
         + GraphAttentionOps
         + GraphArithOps
         + GraphGegluOps
-        + GraphSoftcapOps,
+        + GraphSoftcapOps
+        + GraphCommOps,
 {
     let mut graph = Graph::<B>::new();
 
-    let ids = register_weights(&mut graph, config, weight_dtype);
+    let ids = register_weights(&mut graph, config, weight_dtype, shard);
 
     let hidden = config.hidden_size;
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = config.num_attention_heads / world_size;
+    let num_kv_heads_local = config.num_key_value_heads / world_size;
 
     // Inputs: token IDs + RoPE cos/sin cache.
     // cos/sin have shape [seq_len, head_dim / 2] — the RoPE op uses only the
@@ -404,9 +427,23 @@ where
         let normed = graph.add_rms_norm(h, layer_ids.input_layernorm, config.rms_norm_eps);
 
         // Attention
-        let attn_out = build_attention_prefill(
-            &mut graph, config, seq_len, layer_idx, layer_ids, normed, cos_input, sin_input,
+        let attn_out_raw = build_attention_prefill(
+            &mut graph,
+            config,
+            seq_len,
+            layer_idx,
+            layer_ids,
+            normed,
+            cos_input,
+            sin_input,
+            num_heads_local,
+            num_kv_heads_local,
         );
+        let attn_out = if shard.is_some() {
+            graph.add_all_reduce(attn_out_raw)
+        } else {
+            attn_out_raw
+        };
 
         // Post-attention norm then residual
         let post_attn_normed = graph.add_rms_norm(
@@ -424,7 +461,12 @@ where
         let gate = graph.add_linear(normed_ffn, layer_ids.gate_proj);
         let up = graph.add_linear(normed_ffn, layer_ids.up_proj);
         let activated = graph.add_geglu(gate, up);
-        let down = graph.add_linear(activated, layer_ids.down_proj);
+        let down_raw = graph.add_linear(activated, layer_ids.down_proj);
+        let down = if shard.is_some() {
+            graph.add_all_reduce(down_raw)
+        } else {
+            down_raw
+        };
 
         // Post-FFN norm then residual
         let post_ffn_normed = graph.add_rms_norm(
@@ -456,18 +498,26 @@ where
 /// 0. `token_id` — shape `[1]`, U32
 /// 1. `cos_cache` — shape `[1, head_dim]`
 /// 2. `sin_cache` — shape `[1, head_dim]`
-/// 3. `k_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
+/// 3. `k_cache_i` — shape `[kv_len, num_kv_heads_local, head_dim]` per layer
 ///    (indices `3..3+L`)
-/// 4. `v_cache_i` — shape `[kv_len, num_kv_heads, head_dim]` per layer
+/// 4. `v_cache_i` — shape `[kv_len, num_kv_heads_local, head_dim]` per layer
 ///    (indices `3+L..3+2L`)
 ///
 /// ## Outputs
 /// 0. `logits` — shape `[1, vocab_size]`
 /// 1. `full_k_i` — updated K caches (shape `[kv_len+1, ...]`, indices `1..1+L`)
 /// 2. `full_v_i` — updated V caches (indices `1+L..1+2L`)
+///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and after down_proj.
 #[must_use]
 #[allow(clippy::similar_names)]
-pub fn build_decode_graph<B>(config: &GemmaConfig, kv_len: usize, weight_dtype: DType) -> Graph<B>
+pub fn build_decode_graph<B>(
+    config: &GemmaConfig,
+    kv_len: usize,
+    weight_dtype: DType,
+    shard: Option<&ShardConfig>,
+) -> Graph<B>
 where
     B: GemmaGraphOps,
     Graph<B>: GraphMatmulOps
@@ -478,16 +528,20 @@ where
         + GraphAttentionOps
         + GraphArithOps
         + GraphGegluOps
-        + GraphSoftcapOps,
+        + GraphSoftcapOps
+        + GraphCommOps,
 {
     let mut graph = Graph::<B>::new();
 
-    let ids = register_weights(&mut graph, config, weight_dtype);
+    let ids = register_weights(&mut graph, config, weight_dtype, shard);
 
     let hidden = config.hidden_size;
-    let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
     let num_layers = config.num_hidden_layers;
+
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = config.num_attention_heads / world_size;
+    let num_kv_heads_local = config.num_key_value_heads / world_size;
 
     // Inputs: single token ID + RoPE cos/sin
     let input_id = graph.add_input(&[1], DType::U32);
@@ -499,8 +553,8 @@ where
     let mut k_cache_inputs = Vec::with_capacity(num_layers);
     let mut v_cache_inputs = Vec::with_capacity(num_layers);
     for _ in 0..num_layers {
-        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
-        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads, head_dim], weight_dtype));
+        k_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads_local, head_dim], weight_dtype));
+        v_cache_inputs.push(graph.add_input(&[kv_len, num_kv_heads_local, head_dim], weight_dtype));
     }
 
     // Embedding lookup + scale
@@ -517,7 +571,7 @@ where
         let normed = graph.add_rms_norm(h, layer_ids.input_layernorm, config.rms_norm_eps);
 
         // Attention (decode with KV cache accumulation)
-        let (attn_out, full_k, full_v) = build_attention_decode(
+        let (attn_out_raw, full_k, full_v) = build_attention_decode(
             &mut graph,
             config,
             layer_idx,
@@ -527,7 +581,14 @@ where
             sin_input,
             k_cache_inputs[layer_idx],
             v_cache_inputs[layer_idx],
+            num_heads_local,
+            num_kv_heads_local,
         );
+        let attn_out = if shard.is_some() {
+            graph.add_all_reduce(attn_out_raw)
+        } else {
+            attn_out_raw
+        };
         full_k_outputs.push(full_k);
         full_v_outputs.push(full_v);
 
@@ -547,7 +608,12 @@ where
         let gate = graph.add_linear(normed_ffn, layer_ids.gate_proj);
         let up = graph.add_linear(normed_ffn, layer_ids.up_proj);
         let activated = graph.add_geglu(gate, up);
-        let down = graph.add_linear(activated, layer_ids.down_proj);
+        let down_raw = graph.add_linear(activated, layer_ids.down_proj);
+        let down = if shard.is_some() {
+            graph.add_all_reduce(down_raw)
+        } else {
+            down_raw
+        };
 
         // Post-FFN norm then residual
         let post_ffn_normed = graph.add_rms_norm(
@@ -596,6 +662,9 @@ where
 /// - 5: `seq_lens` — U32, `[batch_size]` — K/V lengths for attention lookup
 ///
 /// **Graph output:** logits only — no K/V outputs.
+///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// nodes are inserted after o_proj and after down_proj.
 #[must_use]
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub fn build_paged_decode_graph<B>(
@@ -604,6 +673,7 @@ pub fn build_paged_decode_graph<B>(
     block_size: usize,
     max_blocks_per_seq: usize,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> Graph<B>
 where
     B: GemmaGraphOps + PagedAttentionOps + PagedKvCacheOps,
@@ -617,16 +687,19 @@ where
         + GraphGegluOps
         + GraphSoftcapOps
         + GraphPagedAttentionOps
-        + GraphPagedKvCacheOps,
+        + GraphPagedKvCacheOps
+        + GraphCommOps,
 {
     let mut graph = Graph::<B>::new();
 
-    let ids = register_weights(&mut graph, config, weight_dtype);
+    let ids = register_weights(&mut graph, config, weight_dtype, shard);
 
     let hidden = config.hidden_size;
-    let num_heads = config.num_attention_heads;
-    let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
+
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = config.num_attention_heads / world_size;
+    let num_kv_heads_local = config.num_key_value_heads / world_size;
 
     // --- Inputs ---
     let input_ids = graph.add_input(&[batch_size], DType::U32);
@@ -651,10 +724,10 @@ where
         let k = graph.add_linear(normed, layer_ids.k_proj);
         let v = graph.add_linear(normed, layer_ids.v_proj);
 
-        // 3. Reshape to 3D [batch_size, num_heads, head_dim]
-        let q = graph.add_reshape(q, &[batch_size, num_heads, head_dim]);
-        let k = graph.add_reshape(k, &[batch_size, num_kv_heads, head_dim]);
-        let v = graph.add_reshape(v, &[batch_size, num_kv_heads, head_dim]);
+        // 3. Reshape to 3D [batch_size, num_heads_local, head_dim]
+        let q = graph.add_reshape(q, &[batch_size, num_heads_local, head_dim]);
+        let k = graph.add_reshape(k, &[batch_size, num_kv_heads_local, head_dim]);
+        let v = graph.add_reshape(v, &[batch_size, num_kv_heads_local, head_dim]);
 
         // 4. Optional QK-norm (Gemma 3)
         let (q, k) = if let Some(ref qkn) = layer_ids.qk_norm {
@@ -681,8 +754,8 @@ where
             positions,
             append,
             layer_idx,
-            num_heads,
-            num_kv_heads,
+            num_heads_local,
+            num_kv_heads_local,
             head_dim,
             block_size,
             sliding_window,
@@ -690,8 +763,13 @@ where
         );
 
         // 8. Reshape back to 2D and output projection
-        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads * head_dim]);
-        let attn_proj = graph.add_linear(attn_flat, layer_ids.o_proj);
+        let attn_flat = graph.add_reshape(attn_out, &[batch_size, num_heads_local * head_dim]);
+        let attn_proj_raw = graph.add_linear(attn_flat, layer_ids.o_proj);
+        let attn_proj = if shard.is_some() {
+            graph.add_all_reduce(attn_proj_raw)
+        } else {
+            attn_proj_raw
+        };
 
         // 9. Post-attention norm then residual
         let post_attn_normed = graph.add_rms_norm(
@@ -709,7 +787,12 @@ where
         let gate = graph.add_linear(normed_ffn, layer_ids.gate_proj);
         let up = graph.add_linear(normed_ffn, layer_ids.up_proj);
         let activated = graph.add_geglu(gate, up);
-        let down = graph.add_linear(activated, layer_ids.down_proj);
+        let down_raw = graph.add_linear(activated, layer_ids.down_proj);
+        let down = if shard.is_some() {
+            graph.add_all_reduce(down_raw)
+        } else {
+            down_raw
+        };
 
         // 12. Post-FFN norm then residual
         let post_ffn_normed = graph.add_rms_norm(
@@ -740,6 +823,7 @@ where
 // GGUF name mapping
 // ---------------------------------------------------------------------------
 
+#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Map a SafeTensors weight name (HuggingFace convention) to its GGUF key.
 ///
 /// Gemma 2 / Gemma 3 use `blk.N.*` block prefixes with the following suffixes:
@@ -747,8 +831,7 @@ where
 /// - `attn_q` / `attn_k` / `attn_v` / `attn_output` for attention projections
 /// - `ffn_gate` / `ffn_up` / `ffn_down` for GeGLU projections
 /// - Optional `attn_q_norm` / `attn_k_norm` for Gemma 3 per-head QK-norm
-#[cfg(feature = "cpu")]
-fn safetensors_to_gguf_name(name: &str) -> String {
+pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     match name {
         "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
         "model.norm.weight" => return "output_norm.weight".to_string(),
@@ -1225,21 +1308,21 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_gemma2() {
         let config = gemma2_config();
-        let graph: Graph<TestBackend> = build_prefill_graph(&config, 4, DType::F32);
+        let graph: Graph<TestBackend> = build_prefill_graph(&config, 4, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
     }
 
     #[test]
     fn test_build_prefill_graph_gemma3() {
         let config = gemma3_config();
-        let graph: Graph<TestBackend> = build_prefill_graph(&config, 4, DType::F32);
+        let graph: Graph<TestBackend> = build_prefill_graph(&config, 4, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
     }
 
     #[test]
     fn test_build_decode_graph_gemma2() {
         let config = gemma2_config();
-        let graph: Graph<TestBackend> = build_decode_graph(&config, 0, DType::F32);
+        let graph: Graph<TestBackend> = build_decode_graph(&config, 0, DType::F32, None);
         // Output 0: logits; outputs 1..1+L: full_k; outputs 1+L..1+2L: full_v.
         assert_eq!(graph.output_ids().len(), 1 + 2 * config.num_hidden_layers);
     }
@@ -1247,7 +1330,7 @@ mod tests {
     #[test]
     fn test_build_decode_graph_gemma3() {
         let config = gemma3_config();
-        let graph: Graph<TestBackend> = build_decode_graph(&config, 0, DType::F32);
+        let graph: Graph<TestBackend> = build_decode_graph(&config, 0, DType::F32, None);
         // Output 0: logits; outputs 1..1+L: full_k; outputs 1+L..1+2L: full_v.
         assert_eq!(graph.output_ids().len(), 1 + 2 * config.num_hidden_layers);
     }

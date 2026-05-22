@@ -210,6 +210,26 @@ impl<C: MetalGraphEngineConfig> MetalGraphEngine<C> {
         })
     }
 
+    /// Create an engine from a pre-built weight store.
+    ///
+    /// Used by model crates that load weights via a format-specific loader
+    /// (e.g. GGUF) and want to avoid adding new methods to
+    /// [`MetalGraphEngineConfig`].
+    #[must_use]
+    pub fn from_weights(
+        config: C,
+        ctx: MetalContext,
+        weights: WeightStore<MetalTensor, MetalLinearWeight>,
+    ) -> Self {
+        let half_dim = config.head_dim() / 2;
+        Self {
+            config,
+            ctx,
+            weights: Arc::new(weights),
+            half_dim,
+        }
+    }
+
     /// Return a reference to the model configuration.
     #[must_use]
     pub fn config(&self) -> &C {

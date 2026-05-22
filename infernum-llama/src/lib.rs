@@ -14,6 +14,8 @@ pub use chat_templates::{Llama3Template, MistralTemplate};
 pub use config::{LlamaConfig, QuantizationConfig};
 #[cfg(feature = "cuda")]
 pub use cuda_graph_engine::{LlamaCudaGraphEngine, LlamaCudaGraphEngineExt};
+#[cfg(feature = "nccl")]
+pub use cuda_graph_engine::{LlamaShardedGraphEngine, LlamaShardedGraphEngineExt};
 #[cfg(feature = "cpu")]
 pub use graph_builder::load_graph_weights_gguf;
 pub use graph_builder::{

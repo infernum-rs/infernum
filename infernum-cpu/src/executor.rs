@@ -250,6 +250,7 @@ pub fn execute(
             }),
             input_tensors: inputs,
             input_idx: &mut input_idx,
+            comm: None,
         };
         node.op.execute(&mut ctx, node_id, &node.inputs)?;
     }
@@ -431,7 +432,7 @@ mod tests {
         let half_dim = head_dim / 2;
 
         let (mut graph, _model_weights) =
-            build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32);
+            build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32, None);
         infernum::graph::optimizer::optimize(&mut graph);
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);
@@ -534,7 +535,7 @@ mod tests {
         let half_dim = head_dim / 2;
         let num_layers = config.num_hidden_layers;
 
-        let mut graph = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+        let mut graph = build_decode_graph::<CpuBackend>(&config, 0, DType::F32, None);
         optimizer::optimize(&mut graph);
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);

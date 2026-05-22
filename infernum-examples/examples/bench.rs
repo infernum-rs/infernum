@@ -5,7 +5,7 @@
 //! - **Eager (default):** Autoregressive decode — generates N tokens one-by-one
 //!   using the runtime engine with KV cache.
 //! - **Graph prefill (`--graph`):** Prefill throughput — processes N tokens in a
-//!   single forward pass through the GPU graph executor. Llama family only.
+//!   single forward pass through the GPU graph executor. Llama/Qwen family.
 //! - **Graph decode (`--graph-decode`):** Decode throughput — generates N tokens
 //!   one-by-one through the GPU graph executor with KV cache management. Llama only.
 //! - **CUDA graphs (`--cuda-graphs`):** LEGACY low-level CUDA graph decode using
@@ -44,12 +44,18 @@ use infernum_cuda::cuda::ops::{
 use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache};
 use infernum_cuda::executor;
 use infernum_cuda::CudaBackend;
-use infernum_gemma::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt as _};
+use infernum_gemma::{
+    build_prefill_graph as gemma_build_prefill_graph, GemmaConfig, GemmaCudaGraphEngine,
+    GemmaCudaGraphEngineExt as _,
+};
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaCudaGraphEngine,
     LlamaCudaGraphEngineExt as _,
 };
-use infernum_qwen::{QwenCudaGraphEngine, QwenCudaGraphEngineExt as _};
+use infernum_qwen::{
+    build_prefill_graph as qwen_build_prefill_graph, QwenConfig, QwenCudaGraphEngine,
+    QwenCudaGraphEngineExt as _,
+};
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
@@ -349,45 +355,95 @@ fn bench_graph(
     model_path: &str,
     n_tokens: usize,
     weight_dtype: DType,
+    model_type: &str,
 ) -> infernum::Result<()> {
     let is_gguf = model_path.ends_with(".gguf");
 
-    let config: LlamaConfig = if is_gguf {
-        let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
-        LlamaConfig::from_gguf_metadata(gguf.metadata())?
-    } else {
-        let config_path = Path::new(model_path).join("config.json");
-        let data = std::fs::read_to_string(&config_path).map_err(|e| {
+    let read_config_json = |path: &str| -> infernum::Result<String> {
+        let config_path = Path::new(path).join("config.json");
+        std::fs::read_to_string(&config_path).map_err(|e| {
             infernum::Error::Io(std::io::Error::new(
                 e.kind(),
                 format!("Failed to read {}: {e}", config_path.display()),
             ))
-        })?;
-        serde_json::from_str(&data).map_err(|e| {
-            infernum::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to parse config.json: {e}"),
-            ))
-        })?
+        })
+    };
+    let parse_err = |e: serde_json::Error| {
+        infernum::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse config.json: {e}"),
+        ))
     };
 
-    let head_dim = config.head_dim();
+    let (graph, num_hidden_layers, hidden_size, head_dim, rope_theta) =
+        if matches!(model_type, "qwen2" | "qwen3" | "qwen3_moe") {
+            let config: QwenConfig =
+                serde_json::from_str(&read_config_json(model_path)?).map_err(parse_err)?;
+            let head_dim = config.head_dim();
+            let (graph, _) =
+                qwen_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None);
+            (
+                graph,
+                config.num_hidden_layers,
+                config.hidden_size,
+                head_dim,
+                config.rope_theta,
+            )
+        } else if matches!(model_type, "gemma2" | "gemma3_text") {
+            let config = GemmaConfig::from_file(Path::new(model_path).join("config.json"))?;
+            let graph =
+                gemma_build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None);
+            (
+                graph,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.head_dim,
+                config.rope_theta,
+            )
+        } else {
+            let config: LlamaConfig = if is_gguf {
+                let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+                LlamaConfig::from_gguf_metadata(gguf.metadata())?
+            } else {
+                serde_json::from_str(&read_config_json(model_path)?).map_err(parse_err)?
+            };
+            let head_dim = config.head_dim();
+            let (graph, _) =
+                build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None);
+            (
+                graph,
+                config.num_hidden_layers,
+                config.hidden_size,
+                head_dim,
+                config.rope_theta,
+            )
+        };
+
     let half_dim = head_dim / 2;
 
     eprintln!(
         "Model: {} layers, {} hidden (GPU graph prefill, seq_len={})",
-        config.num_hidden_layers, config.hidden_size, n_tokens,
+        num_hidden_layers, hidden_size, n_tokens,
     );
 
-    // Build graph
-    let (graph, _model_weights) =
-        build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype);
     let exec_plan = plan(&graph);
 
     let mut weights = WeightStore::<CudaTensor, LinearWeight>::new();
     eprintln!("Loading weights...");
     if is_gguf {
-        load_graph_weights_gguf(ctx, &graph, &config, model_path, weight_dtype, &mut weights)?;
+        // GGUF graph prefill only supported for Llama (gating upstream ensures this)
+        let llama_config: LlamaConfig = {
+            let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+            LlamaConfig::from_gguf_metadata(gguf.metadata())?
+        };
+        load_graph_weights_gguf(
+            ctx,
+            &graph,
+            &llama_config,
+            model_path,
+            weight_dtype,
+            &mut weights,
+        )?;
     } else {
         load_graph_weights(ctx, &graph, model_path, &mut weights)?;
     }
@@ -396,8 +452,7 @@ fn bench_graph(
     let token_ids: Vec<u32> = (0..n_tokens).map(|i| (i % 256) as u32).collect();
     let input_ids = CudaTensor::from_slice(ctx, &[n_tokens], &token_ids)?;
 
-    let (cos_data, sin_data) =
-        infernum::rope::precompute_rope_data(n_tokens, head_dim, config.rope_theta);
+    let (cos_data, sin_data) = infernum::rope::precompute_rope_data(n_tokens, head_dim, rope_theta);
     let cos_cache = CudaTensor::from_slice(ctx, &[n_tokens, half_dim], &cos_data)?;
     let sin_cache = CudaTensor::from_slice(ctx, &[n_tokens, half_dim], &sin_data)?;
 
@@ -415,6 +470,7 @@ fn bench_graph(
             None,
             None,
             0,
+            None,
             None,
         )?;
         ctx.synchronize()?;
@@ -439,6 +495,7 @@ fn bench_graph(
             None,
             None,
             0,
+            None,
             None,
         )?;
         ctx.synchronize()?;
@@ -512,7 +569,7 @@ fn bench_graph_decode(
     let mut weights = WeightStore::<CudaTensor, LinearWeight>::new();
     eprintln!("Loading weights...");
     {
-        let (tmp_graph, _) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype);
+        let (tmp_graph, _) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None);
         if is_gguf {
             load_graph_weights_gguf(
                 ctx,
@@ -545,7 +602,7 @@ fn bench_graph_decode(
         let kv_len = pos; // number of cached KV entries before this step
 
         // Build decode graph for current kv_len
-        let (graph, _) = build_decode_graph::<CudaBackend>(&config, kv_len, weight_dtype);
+        let (graph, _) = build_decode_graph::<CudaBackend>(&config, kv_len, weight_dtype, None);
         let exec_plan = plan(&graph);
 
         // Build inputs: token_id, cos, sin, then per-layer k_cache, v_cache
@@ -598,6 +655,7 @@ fn bench_graph_decode(
             None,
             None,
             0,
+            None,
             None,
         )?;
 
@@ -703,7 +761,7 @@ fn bench_cuda_graphs_decode(
     let model_weight_ids;
     eprintln!("Loading weights...");
     {
-        let (tmp_graph, ids) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype);
+        let (tmp_graph, ids) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None);
         model_weight_ids = ids;
         load_graph_weights(ctx, &tmp_graph, model_path, &mut weights)?;
     }
@@ -747,10 +805,10 @@ fn bench_cuda_graphs_decode(
         for layer_idx in 0..num_layers {
             let ids = &model_weight_ids.layers[layer_idx];
 
-            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm), eps)?;
-            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj))?;
-            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj))?;
-            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj))?;
+            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm()), eps)?;
+            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj()))?;
+            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj()))?;
+            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj()))?;
 
             let q = q_flat.reshape(&[1, num_heads, head_dim]);
             let k = k_flat.reshape(&[1, num_kv_heads, head_dim]);
@@ -786,18 +844,21 @@ fn bench_cuda_graphs_decode(
                 config.effective_sliding_window(layer_idx),
             )?;
             let attn_flat = attn.reshape(&[1, hidden_size]);
-            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj))?;
+            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj()))?;
             add_inplace(&mut hidden, &attn_proj)?;
 
             let ffn_normed = rms_norm(
                 &hidden,
-                weights.tensor_weight(ids.post_attention_layernorm),
+                weights.tensor_weight(ids.post_attention_layernorm()),
                 eps,
             )?;
-            let gate = linear(&ffn_normed, weights.linear_weight(ids.gate_proj))?;
-            let up = linear(&ffn_normed, weights.linear_weight(ids.up_proj))?;
+            let infernum_llama::LayerWeightIds::Dense(dense) = ids else {
+                unreachable!("bench_graph only runs for dense models")
+            };
+            let gate = linear(&ffn_normed, weights.linear_weight(dense.gate_proj))?;
+            let up = linear(&ffn_normed, weights.linear_weight(dense.up_proj))?;
             let activated = swiglu(&gate, &up)?;
-            let ffn_out = linear(&activated, weights.linear_weight(ids.down_proj))?;
+            let ffn_out = linear(&activated, weights.linear_weight(dense.down_proj))?;
             add_inplace(&mut hidden, &ffn_out)?;
         }
 
@@ -844,10 +905,10 @@ fn bench_cuda_graphs_decode(
         for layer_idx in 0..num_layers {
             let ids = &model_weight_ids.layers[layer_idx];
 
-            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm), eps)?;
-            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj))?;
-            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj))?;
-            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj))?;
+            let normed = rms_norm(&hidden, weights.tensor_weight(ids.input_layernorm()), eps)?;
+            let q_flat = linear(&normed, weights.linear_weight(ids.q_proj()))?;
+            let k_flat = linear(&normed, weights.linear_weight(ids.k_proj()))?;
+            let v_flat = linear(&normed, weights.linear_weight(ids.v_proj()))?;
 
             let q = q_flat.reshape(&[1, num_heads, head_dim]);
             let k = k_flat.reshape(&[1, num_kv_heads, head_dim]);
@@ -877,18 +938,21 @@ fn bench_cuda_graphs_decode(
                 config.effective_sliding_window(layer_idx),
             )?;
             let attn_flat = attn.reshape(&[1, hidden_size]);
-            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj))?;
+            let attn_proj = linear(&attn_flat, weights.linear_weight(ids.o_proj()))?;
             add_inplace(&mut hidden, &attn_proj)?;
 
             let ffn_normed = rms_norm(
                 &hidden,
-                weights.tensor_weight(ids.post_attention_layernorm),
+                weights.tensor_weight(ids.post_attention_layernorm()),
                 eps,
             )?;
-            let gate = linear(&ffn_normed, weights.linear_weight(ids.gate_proj))?;
-            let up = linear(&ffn_normed, weights.linear_weight(ids.up_proj))?;
+            let infernum_llama::LayerWeightIds::Dense(dense) = ids else {
+                unreachable!("bench_graph only runs for dense models")
+            };
+            let gate = linear(&ffn_normed, weights.linear_weight(dense.gate_proj))?;
+            let up = linear(&ffn_normed, weights.linear_weight(dense.up_proj))?;
             let activated = swiglu(&gate, &up)?;
-            let ffn_out = linear(&activated, weights.linear_weight(ids.down_proj))?;
+            let ffn_out = linear(&activated, weights.linear_weight(dense.down_proj))?;
             add_inplace(&mut hidden, &ffn_out)?;
         }
 
@@ -929,39 +993,19 @@ fn bench_cuda_graphs_decode(
     Ok(())
 }
 
-/// Benchmark decode throughput using the high-level `CudaGraphEngine` path.
+/// Inner benchmark loop shared by all `CudaGraphEngine` model families.
 ///
-/// This exercises the same code path as production inference: `forward_prefill`
-/// populates the paged KV cache from a short prompt, then `forward_batch_decode`
-/// runs one decode step per token. After the buffer pool stabilizes, each decode
-/// step reduces to a single `cuGraphLaunch` call via the `DecodeState` captured
-/// in Step 4.
-///
-/// Supports Llama-family SafeTensors models only.
-///
-/// # Errors
-///
-/// Returns an error if weight loading or any CUDA kernel launch fails.
-fn bench_cuda_graph_engine(
-    ctx: &CudaContext,
-    model_path: &str,
-    n_gen: usize,
-    _weight_dtype: DType,
-) -> infernum::Result<()> {
+/// Runs a prefill warm-up then times `n_gen` decode steps via the paged KV cache path.
+fn run_engine_bench<M>(ctx: &CudaContext, model: M, n_gen: usize) -> infernum::Result<()>
+where
+    M: infernum::Model<B = infernum_cuda::CudaBackend, KvCache = infernum_cuda::cuda::PagedKvCache>,
+{
     use infernum::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
     use infernum::logits::Logits as _;
     use infernum::DecodeBufferOps as _;
-    use infernum::Model as _;
-    use infernum_cuda::cuda::PagedKvCache;
     use infernum_cuda::{CudaBackend, CudaRuntimeState};
 
-    assert!(
-        !model_path.ends_with(".gguf"),
-        "--cuda-graph-engine only supports SafeTensors directories"
-    );
-
-    let model = LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?;
-    let model_cfg = <LlamaCudaGraphEngine as infernum::Model>::config(&model);
+    let model_cfg = model.config();
 
     let prompt_len: usize = 8;
     let block_size: usize = 16;
@@ -979,7 +1023,7 @@ fn bench_cuda_graph_engine(
         model_cfg.num_layers, model_cfg.head_dim, n_gen,
     );
 
-    let mut kv_cache: PagedKvCache = model.allocate_kv_cache(&block_config)?;
+    let mut kv_cache = model.allocate_kv_cache(&block_config)?;
     let mut runtime_state = CudaRuntimeState::test_placeholder();
 
     // Build block table for the single sequence.
@@ -1068,6 +1112,53 @@ fn bench_cuda_graph_engine(
     Ok(())
 }
 
+/// Benchmark decode throughput using the high-level `CudaGraphEngine` path.
+///
+/// This exercises the same code path as production inference: `forward_prefill`
+/// populates the paged KV cache from a short prompt, then `forward_batch_decode`
+/// runs one decode step per token. After the buffer pool stabilizes, each decode
+/// step reduces to a single `cuGraphLaunch` call via the `DecodeState` captured
+/// in Step 4.
+///
+/// Supports Llama/Qwen/Gemma SafeTensors models.
+///
+/// # Errors
+///
+/// Returns an error if weight loading or any CUDA kernel launch fails.
+fn bench_cuda_graph_engine(
+    ctx: &CudaContext,
+    model_path: &str,
+    n_gen: usize,
+    _weight_dtype: DType,
+) -> infernum::Result<()> {
+    assert!(
+        !model_path.ends_with(".gguf"),
+        "--cuda-graph-engine only supports SafeTensors directories"
+    );
+
+    let model_type = detect_model_type(model_path)?;
+    match model_type.as_str() {
+        "llama" | "mistral" | "mixtral" => run_engine_bench(
+            ctx,
+            LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+            n_gen,
+        ),
+        "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
+            ctx,
+            QwenCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+            n_gen,
+        ),
+        "gemma2" | "gemma3_text" => run_engine_bench(
+            ctx,
+            GemmaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+            n_gen,
+        ),
+        other => Err(infernum::Error::UnsupportedModel(format!(
+            "--cuda-graph-engine: unsupported model_type `{other}`. Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
+        ))),
+    }
+}
+
 fn main() -> infernum::Result<()> {
     let cli = Cli::parse();
     let ctx = CudaContext::new(0)?;
@@ -1103,10 +1194,11 @@ fn main() -> infernum::Result<()> {
         } else {
             let mt = detect_model_type(&cli.model)?;
             match mt.as_str() {
-                "llama" | "mistral" => {}
+                "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3_moe" | "gemma2"
+                | "gemma3_text" => {}
                 other => {
                     eprintln!(
-                        "ERROR: --graph/--graph-decode/--cuda-graphs/--cuda-graph-engine mode only supports Llama/Mistral, got: {other}"
+                        "ERROR: --graph/--graph-decode/--cuda-graphs/--cuda-graph-engine mode only supports Llama/Mistral/Qwen/Gemma, got: {other}"
                     );
                     std::process::exit(1);
                 }
@@ -1136,7 +1228,7 @@ fn main() -> infernum::Result<()> {
         } else if cli.graph_decode {
             bench_graph_decode(&ctx, &cli.model, cli.n_gen, weight_dtype)
         } else {
-            bench_graph(&ctx, &cli.model, cli.n_gen, weight_dtype)
+            bench_graph(&ctx, &cli.model, cli.n_gen, weight_dtype, &model_type)
         };
 
         if let Some(pool) = ctx.buffer_pool() {

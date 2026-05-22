@@ -4,10 +4,11 @@
 //! - **Eager (default):** Autoregressive decode — generates N tokens one-by-one
 //!   using the runtime engine with KV cache.
 //! - **Graph prefill (`--graph`):** Prefill throughput — processes N tokens in a
-//!   single forward pass through the graph executor. Only supports Llama family.
+//!   single forward pass through the graph executor. Supports Llama, Qwen, Gemma.
+//!   Qwen does not yet support GGUF in this mode (SafeTensors only).
 //! - **Graph decode (`--graph-decode`):** Decode throughput — generates N tokens
-//!   one-by-one through the graph executor with KV cache management. Only supports
-//!   Llama family.
+//!   one-by-one through the graph executor with KV cache management. Supports
+//!   Llama, Qwen, Gemma. Qwen does not yet support GGUF in this mode.
 //!
 //! Usage:
 //!   cargo run --release --example bench_cpu --features cpu -- /path/to/model.gguf 128
@@ -29,12 +30,20 @@ use infernum::Tensor;
 use infernum::{GenerateOptions, NodeId};
 use infernum_cpu::executor::{execute, KvCacheStore};
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
-use infernum_gemma::{GemmaGraphEngine, GemmaGraphEngineExt as _};
+use infernum_gemma::{
+    build_decode_graph as gemma_build_decode_graph,
+    build_prefill_graph as gemma_build_prefill_graph,
+    load_graph_weights_gguf as gemma_load_graph_weights_gguf, GemmaConfig, GemmaGraphEngine,
+    GemmaGraphEngineExt as _,
+};
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaGraphEngine,
     LlamaGraphEngineExt as _,
 };
-use infernum_qwen::{QwenGraphEngine, QwenGraphEngineExt as _};
+use infernum_qwen::{
+    build_decode_graph as qwen_build_decode_graph, build_prefill_graph as qwen_build_prefill_graph,
+    QwenConfig, QwenGraphEngine, QwenGraphEngineExt as _,
+};
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
@@ -167,6 +176,22 @@ fn load_graph_weights_safetensors(
     Ok(())
 }
 
+fn load_config_json<T: serde::de::DeserializeOwned>(model_dir: &str) -> infernum::Result<T> {
+    let config_path = Path::new(model_dir).join("config.json");
+    let data = std::fs::read_to_string(&config_path).map_err(|e| {
+        infernum::Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read {}: {e}", config_path.display()),
+        ))
+    })?;
+    serde_json::from_str(&data).map_err(|e| {
+        infernum::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse config.json: {e}"),
+        ))
+    })
+}
+
 /// Map a SafeTensors-convention weight name to a GGUF tensor name.
 fn safetensors_to_gguf_name(name: &str) -> String {
     // Special top-level tensors
@@ -285,68 +310,17 @@ fn load_graph_weights_gguf(
     Ok(())
 }
 
-/// Benchmark prefill throughput using the graph executor.
-///
-/// Builds a Llama prefill graph for `seq_len` tokens, loads real weights from
-/// SafeTensors or GGUF, runs the graph once to warm up, then measures multiple
-/// iterations.
-fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
-    let is_gguf = model_path.ends_with(".gguf");
-
-    let config: LlamaConfig = if is_gguf {
-        let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
-        LlamaConfig::from_gguf_metadata(gguf.metadata())?
-    } else {
-        let config_path = Path::new(model_path).join("config.json");
-        let data = std::fs::read_to_string(&config_path).map_err(|e| {
-            infernum::Error::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to read {}: {e}", config_path.display()),
-            ))
-        })?;
-        serde_json::from_str(&data).map_err(|e| {
-            infernum::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to parse config.json: {e}"),
-            ))
-        })?
-    };
-
-    let head_dim = config.head_dim();
-    let half_dim = head_dim / 2;
-
-    eprintln!(
-        "Model: {} layers, {} hidden (graph prefill, seq_len={})",
-        config.num_hidden_layers, config.hidden_size, n_tokens,
-    );
-
-    // Build graph
-    let (mut graph, _model_weights) =
-        build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+/// Shared timing loop for prefill benchmarks. Caller builds the graph, loads
+/// weights, and constructs the inputs; this function handles warm-up + timing.
+fn run_prefill_bench(
+    mut graph: infernum::graph::Graph<CpuBackend>,
+    weights: WeightStore<CpuTensor, CpuLinearWeight>,
+    inputs: Vec<CpuTensor>,
+    n_tokens: usize,
+) -> infernum::Result<()> {
     infernum::graph::optimizer::optimize(&mut graph);
     let exec_plan = plan(&graph);
 
-    let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
-    eprintln!("Loading weights...");
-
-    if is_gguf {
-        load_graph_weights_gguf(&graph, &config, model_path, &mut weights)?;
-    } else {
-        load_graph_weights_safetensors(&graph, model_path, &mut weights)?;
-    }
-
-    // Build inputs: token_ids, cos_cache, sin_cache
-    let token_ids: Vec<u32> = (0..n_tokens).map(|i| (i % 256) as u32).collect();
-    let input_ids = CpuTensor::from_u32(&[n_tokens], &token_ids);
-
-    let (cos_data, sin_data) =
-        infernum::rope::precompute_rope_data(n_tokens, head_dim, config.rope_theta);
-    let cos_cache = CpuTensor::from_f32(&[n_tokens, half_dim], &cos_data);
-    let sin_cache = CpuTensor::from_f32(&[n_tokens, half_dim], &sin_data);
-
-    let inputs = vec![input_ids, cos_cache, sin_cache];
-
-    // Warm-up run
     {
         let mut arena = Arena::new(exec_plan.arena_size);
         let outputs = execute(
@@ -362,10 +336,8 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
         eprintln!("Warm-up done, output shape: {:?}", outputs[0].shape());
     }
 
-    // Benchmark: run 3 iterations and take the best
     let n_iters = 3;
     let mut best_elapsed = std::time::Duration::MAX;
-
     for iter in 0..n_iters {
         let mut arena = Arena::new(exec_plan.arena_size);
         let start = Instant::now();
@@ -396,8 +368,98 @@ fn bench_graph(model_path: &str, n_tokens: usize) -> infernum::Result<()> {
         best_elapsed.as_secs_f64(),
         tok_s,
     );
-
     Ok(())
+}
+
+/// Benchmark prefill throughput using the graph executor.
+///
+/// Supports Llama/Mistral (SafeTensors + GGUF), Qwen (SafeTensors only), and
+/// Gemma (SafeTensors + GGUF). Builds a prefill graph, loads real weights, runs
+/// once to warm up, then measures 3 iterations and reports the best.
+fn bench_graph(model_path: &str, n_tokens: usize, model_type: &str) -> infernum::Result<()> {
+    let is_gguf = model_path.ends_with(".gguf");
+    let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+
+    let (graph, head_dim, rope_theta, n_layers, hidden_size) = match model_type {
+        "llama" | "mistral" => {
+            let config: LlamaConfig = if is_gguf {
+                let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+                LlamaConfig::from_gguf_metadata(gguf.metadata())?
+            } else {
+                load_config_json(model_path)?
+            };
+            let (graph, _) = build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+            if is_gguf {
+                load_graph_weights_gguf(&graph, &config, model_path, &mut weights)?;
+            } else {
+                load_graph_weights_safetensors(&graph, model_path, &mut weights)?;
+            }
+            (
+                graph,
+                config.head_dim(),
+                config.rope_theta,
+                config.num_hidden_layers,
+                config.hidden_size,
+            )
+        }
+        "qwen2" | "qwen3" | "qwen3_moe" => {
+            if is_gguf {
+                eprintln!("ERROR: Qwen --graph does not yet support GGUF (use SafeTensors)");
+                std::process::exit(1);
+            }
+            let config: QwenConfig = load_config_json(model_path)?;
+            let (graph, _) = qwen_build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+            load_graph_weights_safetensors(&graph, model_path, &mut weights)?;
+            (
+                graph,
+                config.head_dim(),
+                config.rope_theta,
+                config.num_hidden_layers,
+                config.hidden_size,
+            )
+        }
+        "gemma2" | "gemma3_text" => {
+            let config: GemmaConfig = if is_gguf {
+                let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+                GemmaConfig::from_gguf_metadata(gguf.metadata())?
+            } else {
+                GemmaConfig::from_file(Path::new(model_path).join("config.json"))?
+            };
+            let graph = gemma_build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+            if is_gguf {
+                weights = gemma_load_graph_weights_gguf(&graph, &config, Path::new(model_path))?;
+            } else {
+                load_graph_weights_safetensors(&graph, model_path, &mut weights)?;
+            }
+            (
+                graph,
+                config.head_dim,
+                config.rope_theta,
+                config.num_hidden_layers,
+                config.hidden_size,
+            )
+        }
+        other => {
+            eprintln!("ERROR: --graph does not support model_type '{other}'");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "Model: {} layers, {} hidden (graph prefill, seq_len={}, {})",
+        n_layers, hidden_size, n_tokens, model_type,
+    );
+
+    let half_dim = head_dim / 2;
+    let token_ids: Vec<u32> = (0..n_tokens).map(|i| (i % 256) as u32).collect();
+    let input_ids = CpuTensor::from_u32(&[n_tokens], &token_ids);
+    let (cos_data, sin_data) = infernum::rope::precompute_rope_data(n_tokens, head_dim, rope_theta);
+    let cos_cache = CpuTensor::from_f32(&[n_tokens, half_dim], &cos_data);
+    let sin_cache = CpuTensor::from_f32(&[n_tokens, half_dim], &sin_data);
+    let inputs = vec![input_ids, cos_cache, sin_cache];
+
+    eprintln!("Loading weights...");
+    run_prefill_bench(graph, weights, inputs, n_tokens)
 }
 
 /// Find KV cache Input and ConcatSeq node IDs from a decode graph.
@@ -436,79 +498,140 @@ fn find_kv_cache_node_ids(
 
 /// Benchmark decode throughput using the graph executor with persistent KV caches.
 ///
-/// Uses `KvCacheStore` to avoid copying KV caches through the arena every step.
-/// The graph is still rebuilt each step (node shapes depend on kv_len), but the
-/// expensive O(seq_len) KV cache copies are eliminated.
-fn bench_graph_decode(model_path: &str, n_gen: usize) -> infernum::Result<()> {
+/// Supports Llama/Mistral (SafeTensors + GGUF), Qwen (SafeTensors only), and
+/// Gemma (SafeTensors + GGUF). Uses `KvCacheStore` to avoid copying KV caches
+/// through the arena every step.
+fn bench_graph_decode(model_path: &str, n_gen: usize, model_type: &str) -> infernum::Result<()> {
     let is_gguf = model_path.ends_with(".gguf");
 
-    let config: LlamaConfig = if is_gguf {
-        let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
-        LlamaConfig::from_gguf_metadata(gguf.metadata())?
-    } else {
-        let config_path = Path::new(model_path).join("config.json");
-        let data = std::fs::read_to_string(&config_path).map_err(|e| {
-            infernum::Error::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to read {}: {e}", config_path.display()),
-            ))
-        })?;
-        serde_json::from_str(&data).map_err(|e| {
-            infernum::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to parse config.json: {e}"),
-            ))
-        })?
+    // Family-specific setup: parse config, load weights, build decode graph.
+    // Returns (decode_graph, weights, num_layers, head_dim, num_kv_heads, rope_theta, max_pos).
+    let (
+        decode_graph,
+        weights,
+        num_layers,
+        head_dim,
+        num_kv_heads,
+        rope_theta,
+        max_pos,
+        hidden_size,
+    ) = match model_type {
+        "llama" | "mistral" => {
+            let config: LlamaConfig = if is_gguf {
+                let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+                LlamaConfig::from_gguf_metadata(gguf.metadata())?
+            } else {
+                load_config_json(model_path)?
+            };
+            let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+            {
+                let (tmp_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+                if is_gguf {
+                    load_graph_weights_gguf(&tmp_graph, &config, model_path, &mut weights)?;
+                } else {
+                    load_graph_weights_safetensors(&tmp_graph, model_path, &mut weights)?;
+                }
+            }
+            let (mut g, _) = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+            infernum::graph::optimizer::optimize(&mut g);
+            (
+                g,
+                weights,
+                config.num_hidden_layers,
+                config.head_dim(),
+                config.num_kv_heads(),
+                config.rope_theta,
+                config.max_position_embeddings,
+                config.hidden_size,
+            )
+        }
+        "qwen2" | "qwen3" | "qwen3_moe" => {
+            if is_gguf {
+                eprintln!("ERROR: Qwen --graph-decode does not yet support GGUF (use SafeTensors)");
+                std::process::exit(1);
+            }
+            let config: QwenConfig = load_config_json(model_path)?;
+            let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+            {
+                let (tmp_graph, _) = qwen_build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+                load_graph_weights_safetensors(&tmp_graph, model_path, &mut weights)?;
+            }
+            let (mut g, _) = qwen_build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+            infernum::graph::optimizer::optimize(&mut g);
+            (
+                g,
+                weights,
+                config.num_hidden_layers,
+                config.head_dim(),
+                config.num_kv_heads(),
+                config.rope_theta,
+                config.max_position_embeddings,
+                config.hidden_size,
+            )
+        }
+        "gemma2" | "gemma3_text" => {
+            let config: GemmaConfig = if is_gguf {
+                let gguf = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+                GemmaConfig::from_gguf_metadata(gguf.metadata())?
+            } else {
+                GemmaConfig::from_file(Path::new(model_path).join("config.json"))?
+            };
+            let weights = {
+                let tmp_graph = gemma_build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+                if is_gguf {
+                    gemma_load_graph_weights_gguf(&tmp_graph, &config, Path::new(model_path))?
+                } else {
+                    let mut w = WeightStore::<CpuTensor, CpuLinearWeight>::new();
+                    load_graph_weights_safetensors(&tmp_graph, model_path, &mut w)?;
+                    w
+                }
+            };
+            let mut g = gemma_build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+            infernum::graph::optimizer::optimize(&mut g);
+            (
+                g,
+                weights,
+                config.num_hidden_layers,
+                config.head_dim,
+                config.num_key_value_heads,
+                config.rope_theta,
+                config.max_position_embeddings,
+                config.hidden_size,
+            )
+        }
+        other => {
+            eprintln!("ERROR: --graph-decode does not support model_type '{other}'");
+            std::process::exit(1);
+        }
     };
 
-    let num_layers = config.num_hidden_layers;
-    let head_dim = config.head_dim();
-    let half_dim = head_dim / 2;
-    let num_kv_heads = config.num_kv_heads();
-
     eprintln!(
-        "Model: {} layers, {} hidden (graph decode, n_gen={})",
-        num_layers, config.hidden_size, n_gen,
+        "Model: {} layers, {} hidden (graph decode, n_gen={}, {})",
+        num_layers, hidden_size, n_gen, model_type,
     );
 
-    // Load weights using a temporary graph (weight order is consistent across graphs)
+    let half_dim = head_dim / 2;
     let prompt_len = 8;
-    let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
-    eprintln!("Loading weights...");
-    {
-        let (tmp_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
-        if is_gguf {
-            load_graph_weights_gguf(&tmp_graph, &config, model_path, &mut weights)?;
-        } else {
-            load_graph_weights_safetensors(&tmp_graph, model_path, &mut weights)?;
-        }
-    }
 
     // Pre-compute RoPE for all positions we'll need
-    let max_pos = prompt_len + n_gen;
     let (all_cos, all_sin) =
-        infernum::rope::precompute_rope_data(max_pos, head_dim, config.rope_theta);
+        infernum::rope::precompute_rope_data(prompt_len + n_gen, head_dim, rope_theta);
 
-    // Build decode graph once with kv_len=0. KvCacheStore intercepts all KV
-    // cache Input and ConcatSeq nodes, so the graph never touches KV data
-    // through the arena. The graph/plan/arena can be reused across all steps.
-    let (mut decode_graph, _) = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
-    infernum::graph::optimizer::optimize(&mut decode_graph);
     let decode_plan = plan(&decode_graph);
     let mut arena = Arena::new(decode_plan.arena_size);
     let logits_id = decode_graph.output_ids()[0];
 
     let (cache_input_ids, concat_ids) = find_kv_cache_node_ids(decode_graph.nodes(), num_layers);
-
-    // Create persistent KV cache store, pre-allocated to avoid reallocations.
     let mut kv_cache = KvCacheStore::new(
         num_layers,
         num_kv_heads,
         head_dim,
-        config.max_position_embeddings,
+        max_pos,
         cache_input_ids,
         concat_ids,
     );
+
+    eprintln!("Loading weights...");
 
     // Helper: run one decode step, reusing the cached graph/plan/arena.
     let run_decode_step = |pos: usize,
@@ -662,16 +785,6 @@ fn main() -> infernum::Result<()> {
             detect_model_type(&cli.model)?
         };
 
-        match model_type.as_str() {
-            "llama" | "mistral" => {}
-            other => {
-                eprintln!(
-                    "ERROR: --graph/--graph-decode mode only supports Llama/Mistral, got: {other}"
-                );
-                std::process::exit(1);
-            }
-        };
-
         let mode = if cli.graph_decode {
             "graph-decode"
         } else {
@@ -686,9 +799,9 @@ fn main() -> infernum::Result<()> {
         );
 
         return if cli.graph_decode {
-            bench_graph_decode(&cli.model, cli.n_gen)
+            bench_graph_decode(&cli.model, cli.n_gen, &model_type)
         } else {
-            bench_graph(&cli.model, cli.n_gen)
+            bench_graph(&cli.model, cli.n_gen, &model_type)
         };
     }
 

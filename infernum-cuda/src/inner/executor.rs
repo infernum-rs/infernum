@@ -15,6 +15,7 @@
 //! [`MlaAttentionOp`] (in `execute_context.rs`) can access them without any
 //! named arm in the executor. Paged KV ops are wired via [`CudaPagedKvCacheAccess`].
 
+use infernum::backend::Backend;
 use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{GraphNode, WeightStore};
 use infernum::{ExecutionPlan, NodeId, Result};
@@ -68,6 +69,7 @@ pub fn execute(
     paged_kv_cache: Option<&mut crate::cuda::PagedKvCache>,
     mla_seq_pos: usize,
     mut graph_inputs: Option<crate::inner::execute_context::GraphInputs>,
+    comm: Option<&'_ <CudaBackend as Backend>::Comm>,
 ) -> Result<(
     Vec<CudaTensor>,
     Option<crate::inner::execute_context::GraphInputs>,
@@ -129,6 +131,7 @@ pub fn execute(
                     kv_cache: kv,
                     input_tensors: inputs,
                     input_idx: &mut input_idx_local,
+                    comm,
                 };
                 node.op.execute(&mut exec_ctx, node_id, &node.inputs)?;
             }

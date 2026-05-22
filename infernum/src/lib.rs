@@ -45,7 +45,7 @@ pub use rope::{precompute_rope_data, precompute_rope_row, RopeScaling};
 pub use runtime_state::{BatchConfig, RuntimeStateInit};
 pub use sampling::{GenerateOptions, SamplingParams};
 pub use shard::{shard_strategy_for_weight, GpuConfig, ShardConfig, ShardStrategy};
-pub use sharded::{ShardedKvCache, ShardedModel};
+pub use sharded::ShardedKvCache;
 pub use tensor::Tensor;
 pub use tokenizer::GgufTokenizer;
 pub use tokenizer::Tokenizer;

@@ -21,6 +21,8 @@ pub use chat_templates::GemmaTemplate;
 pub use config::GemmaConfig;
 #[cfg(feature = "cuda")]
 pub use cuda_graph_engine::{GemmaCudaGraphEngine, GemmaCudaGraphEngineExt};
+#[cfg(feature = "nccl")]
+pub use cuda_graph_engine::{GemmaShardedGraphEngine, GemmaShardedGraphEngineExt};
 #[cfg(feature = "cpu")]
 pub use graph_builder::load_graph_weights_gguf;
 pub use graph_builder::{

@@ -62,12 +62,12 @@ impl GraphEngineConfig for QwenConfig {
     }
 
     fn build_prefill_graph(&self, seq_len: usize) -> Graph<CpuBackend> {
-        let (graph, _) = build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32);
+        let (graph, _) = build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32, None);
         graph
     }
 
     fn build_decode_graph(&self, kv_len: usize) -> Graph<CpuBackend> {
-        let (graph, _) = build_decode_graph::<CpuBackend>(self, kv_len, DType::F32);
+        let (graph, _) = build_decode_graph::<CpuBackend>(self, kv_len, DType::F32, None);
         graph
     }
 
