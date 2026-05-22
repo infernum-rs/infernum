@@ -261,6 +261,7 @@ impl DeepSeekCudaEngine {
             None, // no paged KV cache
             kv.seq_pos,
             None, // no CUDA graph capture
+            None, // no comm (single-GPU)
         )?;
         kv.seq_pos += 1;
 
