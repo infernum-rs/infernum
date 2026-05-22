@@ -1093,6 +1093,58 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// GGUF name mapping
+// ---------------------------------------------------------------------------
+
+/// Convert a HuggingFace SafeTensors weight name to its GGUF (llama.cpp) equivalent.
+///
+/// Used by the CUDA GGUF loader to map graph weight metadata names to the
+/// GGUF key namespace. Covers dense Qwen2/Qwen3 weights; MoE expert weights
+/// are not yet supported.
+///
+/// # Panics
+///
+/// Panics on an unrecognised weight name (indicates a bug in weight registration).
+pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
+    match name {
+        "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
+        "model.norm.weight" => return "output_norm.weight".to_string(),
+        "lm_head.weight" => return "output.weight".to_string(),
+        _ => {}
+    }
+    if let Some(rest) = name.strip_prefix("model.layers.") {
+        let dot = rest.find('.').expect("malformed layer weight name");
+        let layer_idx = &rest[..dot];
+        let suffix = &rest[dot + 1..];
+        let gguf_suffix = match suffix {
+            "input_layernorm.weight" => "attn_norm.weight",
+            "post_attention_layernorm.weight" => "ffn_norm.weight",
+            "self_attn.q_proj.weight" => "attn_q.weight",
+            "self_attn.q_proj.bias" => "attn_q.bias",
+            "self_attn.k_proj.weight" => "attn_k.weight",
+            "self_attn.k_proj.bias" => "attn_k.bias",
+            "self_attn.v_proj.weight" => "attn_v.weight",
+            "self_attn.v_proj.bias" => "attn_v.bias",
+            "self_attn.o_proj.weight" => "attn_output.weight",
+            "self_attn.q_norm.weight" => "attn_q_norm.weight",
+            "self_attn.k_norm.weight" => "attn_k_norm.weight",
+            "mlp.gate_proj.weight" => "ffn_gate.weight",
+            "mlp.up_proj.weight" => "ffn_up.weight",
+            "mlp.down_proj.weight" => "ffn_down.weight",
+            other => panic!("Unknown Qwen layer suffix for GGUF mapping: {other}"),
+        };
+        return format!("blk.{layer_idx}.{gguf_suffix}");
+    }
+    panic!("Unknown Qwen weight name for GGUF mapping: {name}");
+}
+
+/// Returns `true` if this GGUF tensor name is a Q or K projection weight that
+/// needs the GGUF row-permutation reversal before use.
+pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {
+    gguf_name.ends_with(".attn_q.weight") || gguf_name.ends_with(".attn_k.weight")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

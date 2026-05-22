@@ -94,7 +94,7 @@ impl NcclCommunicator {
         let device = tensor.context().device().clone();
 
         // Allocate a temporary output buffer for the reduction
-        let mut recv = unsafe { CudaTensor::uninit(tensor.context(), &shape, dtype)? };
+        let recv = unsafe { CudaTensor::uninit(tensor.context(), &shape, dtype)? };
 
         // NCCL AllReduce must use the correct element type so it performs
         // floating-point summation, not byte-wise integer summation.

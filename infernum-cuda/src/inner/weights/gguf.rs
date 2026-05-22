@@ -159,6 +159,123 @@ impl GgufLoader {
         self.metadata.get(key)
     }
 
+    /// Dequantize any GGUF tensor to a host `Vec<f32>`.
+    ///
+    /// Handles F32, F16, BF16, Q8_0, Q4_0, and Q6_K. Returns the element
+    /// data and the tensor shape (used by callers that need to post-process
+    /// before uploading, e.g. `load_bf16_unpermute`).
+    fn dequantize_to_f32_vec(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
+        let data_start = self.tensor_data_offset + info.offset as usize;
+        let numel: usize = info.shape.iter().product();
+
+        let f32_data: Vec<f32> = match dtype {
+            DType::F32 => {
+                let byte_len = numel * 4;
+                bytemuck::cast_slice(&self.mmap[data_start..data_start + byte_len]).to_vec()
+            }
+            DType::F16 => {
+                let byte_len = numel * 2;
+                let raw = &self.mmap[data_start..data_start + byte_len];
+                bytemuck::cast_slice::<_, half::f16>(raw)
+                    .iter()
+                    .map(|x| x.to_f32())
+                    .collect()
+            }
+            DType::BF16 => {
+                let byte_len = numel * 2;
+                let raw = &self.mmap[data_start..data_start + byte_len];
+                bytemuck::cast_slice::<_, half::bf16>(raw)
+                    .iter()
+                    .map(|x| x.to_f32())
+                    .collect()
+            }
+            DType::Q8_0 => {
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes();
+                let raw = &self.mmap[data_start..data_start + num_blocks * block_bytes];
+                let mut out = Vec::with_capacity(numel);
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * block_bytes;
+                    let scale = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
+                    for j in 0..QUANTIZATION_BLOCK_SIZE {
+                        out.push(f32::from(raw[bs + 2 + j] as i8) * scale);
+                    }
+                }
+                out
+            }
+            DType::Q4_0 => {
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let block_bytes = dtype.block_size_in_bytes();
+                let raw = &self.mmap[data_start..data_start + num_blocks * block_bytes];
+                let mut out = vec![0.0f32; numel];
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * block_bytes;
+                    let scale = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
+                    let base = block_idx * QUANTIZATION_BLOCK_SIZE;
+                    #[allow(clippy::cast_precision_loss)]
+                    for j in 0..QUANTIZATION_BLOCK_SIZE / 2 {
+                        let byte = raw[bs + 2 + j];
+                        out[base + j] = (i32::from(byte & 0x0F) - 8) as f32 * scale;
+                        out[base + j + 16] = (i32::from(byte >> 4) - 8) as f32 * scale;
+                    }
+                }
+                out
+            }
+            other => {
+                return Err(Error::UnsupportedDtype(format!(
+                    "dequantize_to_f32_vec: unsupported dtype {other} for '{name}'"
+                )));
+            }
+        };
+        Ok((f32_data, info.shape.clone()))
+    }
+
+    /// Load a tensor as BF16, dequantizing quantized types on the host and
+    /// applying the GGUF Q/K row-permutation reversal before upload.
+    ///
+    /// `n_head` is the number of attention heads for this projection (use
+    /// `num_attention_heads` for Q, `num_key_value_heads` for K).
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found, the dtype is unsupported,
+    /// or GPU allocation fails.
+    pub fn load_bf16_unpermute(
+        &self,
+        ctx: &CudaContext,
+        name: &str,
+        n_head: usize,
+    ) -> Result<CudaTensor> {
+        let (data, shape) = self.dequantize_to_f32_vec(name)?;
+        let n_rows = shape[0];
+        let n_cols = shape[1];
+        let head_dim = n_rows / n_head;
+        let half_dim = head_dim / 2;
+
+        let mut unpermuted = vec![0.0f32; data.len()];
+        for h in 0..n_head {
+            for i in 0..half_dim {
+                let src0 = (h * head_dim + 2 * i) * n_cols;
+                let src1 = (h * head_dim + 2 * i + 1) * n_cols;
+                let dst0 = (h * head_dim + i) * n_cols;
+                let dst1 = (h * head_dim + i + half_dim) * n_cols;
+                unpermuted[dst0..dst0 + n_cols].copy_from_slice(&data[src0..src0 + n_cols]);
+                unpermuted[dst1..dst1 + n_cols].copy_from_slice(&data[src1..src1 + n_cols]);
+            }
+        }
+
+        let bf16_data: Vec<half::bf16> = unpermuted
+            .iter()
+            .map(|&x| half::bf16::from_f32(x))
+            .collect();
+        CudaTensor::from_slice(ctx, &shape, &bf16_data)
+    }
+
     /// Load a tensor as a `QuantizedTensor` (for Q8_0 / Q4_0 weights).
     ///
     /// # Errors
@@ -587,10 +704,13 @@ impl WeightLoader for GgufLoader {
                     .map(|x| half::bf16::from_f32(x.to_f32()))
                     .collect()
             }
-            other => {
-                return Err(Error::UnsupportedDtype(format!(
-                    "Cannot load '{name}' as bf16: dtype is {other}"
-                )));
+            _ => {
+                // Quantized or other type: dequantize to f32 first, then cast.
+                let (f32_data, _) = self.dequantize_to_f32_vec(name)?;
+                f32_data
+                    .iter()
+                    .map(|&x| half::bf16::from_f32(x))
+                    .collect()
             }
         };
 

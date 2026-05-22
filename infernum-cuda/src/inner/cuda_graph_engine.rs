@@ -28,14 +28,14 @@ use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, W
 use infernum::shard::{shard_strategy_for_weight, ShardConfig};
 use infernum::weights::QuantizationConfig;
 use infernum::WeightLoader as _;
-use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
+use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, Tensor};
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
 use crate::cuda::{CudaContext, CudaEvent, CudaGraph, CudaTensor, PinnedBuffer};
 use crate::cuda_logits::CudaLogits;
 use crate::inner::execute_context::GraphInputs;
-use crate::weights::{CudaWeightLoader, SafeTensorsLoader};
+use crate::weights::{CudaWeightLoader, SafeTensorsLoader, WeightLoader};
 use crate::CudaBackend;
 
 // ---------------------------------------------------------------------------
@@ -112,6 +112,30 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
         model_dir: &Path,
         shard: Option<&ShardConfig>,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>>;
+
+    /// Load all model weights from a GGUF file into CUDA memory.
+    ///
+    /// Weights are dequantized to BF16 on the host and uploaded. Q and K
+    /// projection weights are un-permuted from GGUF's interleaved RoPE layout
+    /// to the HuggingFace sequential layout before upload.
+    ///
+    /// Returns `Err` by default; override for each model family.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GGUF loading is not implemented for this config,
+    /// or if any weight is missing or cannot be uploaded.
+    fn load_weights_cuda_gguf(
+        &self,
+        dummy_graph: &Graph<CudaBackend>,
+        ctx: &CudaContext,
+        gguf_path: &Path,
+    ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
+        let _ = (dummy_graph, ctx, gguf_path);
+        Err(infernum::Error::UnsupportedModel(
+            "GGUF loading is not yet supported by the CUDA graph engine for this model".to_string(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +236,108 @@ pub fn load_graph_weights_cuda(
     }
 
     Ok(store)
+}
+
+/// Load all graph weights from a GGUF file into CUDA memory as BF16.
+///
+/// Weights are dequantized on the host; Q and K projections are un-permuted
+/// from GGUF's interleaved RoPE layout before upload.
+///
+/// `name_mapper` converts SafeTensors weight names (as registered in the graph)
+/// to GGUF key names. `n_heads` / `n_kv_heads` are used to compute the head
+/// dimension for the Q/K unpermutation. `is_qk` identifies which mapped GGUF
+/// names require unpermutation. When `lm_head_fallback` is `true`, a missing
+/// `output.weight` falls back to `token_embd.weight`.
+///
+/// # Errors
+///
+/// Returns an error if the GGUF file cannot be opened, a required tensor is
+/// missing, or GPU allocation fails.
+///
+/// # Panics
+///
+/// Panics if the number of registered weights exceeds `u32::MAX`.
+#[allow(clippy::too_many_arguments)]
+pub fn load_graph_weights_gguf_cuda(
+    graph: &Graph<CudaBackend>,
+    ctx: &CudaContext,
+    gguf_path: &Path,
+    name_mapper: impl Fn(&str) -> String,
+    is_qk: impl Fn(&str) -> bool,
+    n_heads: usize,
+    n_kv_heads: usize,
+    lm_head_fallback: bool,
+) -> Result<WeightStore<CudaTensor, LinearWeight>> {
+    use infernum::graph::WeightId;
+
+    let loader = crate::weights::GgufLoader::from_file(gguf_path)?;
+
+    let tensor_count = graph.tensor_weight_count();
+    let linear_count = graph.linear_weight_count();
+    let mut store = WeightStore::with_capacity(tensor_count, linear_count);
+
+    for i in 0..tensor_count {
+        let meta = graph.tensor_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight count exceeds u32"),
+        ));
+        let gguf_name = name_mapper(&meta.name);
+        let tensor = loader.load_bf16(ctx, &gguf_name)?;
+        store.push_tensor_weight(tensor);
+    }
+
+    for i in 0..linear_count {
+        let meta = graph.linear_weight_meta(WeightId::from_index(
+            u32::try_from(i).expect("weight count exceeds u32"),
+        ));
+        let safetensors_name = &meta.name;
+        let gguf_name = name_mapper(safetensors_name);
+
+        // lm_head fallback: GGUF may not have output.weight for tied-embedding models.
+        let effective_gguf_name = if lm_head_fallback
+            && gguf_name == "output.weight"
+            && !loader.contains("output.weight")
+        {
+            "token_embd.weight".to_string()
+        } else {
+            gguf_name.clone()
+        };
+
+        // Q and K projections need row-unpermutation; use appropriate head count.
+        let tensor = if is_qk(&gguf_name) {
+            let n_head = if gguf_name.contains("attn_q") {
+                n_heads
+            } else {
+                n_kv_heads
+            };
+            loader.load_bf16_unpermute(ctx, &effective_gguf_name, n_head)?
+        } else {
+            loader.load_bf16(ctx, &effective_gguf_name)?
+        };
+
+        // BF16 linear weights need to be transposed (row-major → column-major for matmul).
+        let transposed = host_transpose_bf16(ctx, &tensor)?;
+        store.push_linear_weight(LinearWeight::Dense(transposed));
+    }
+
+    Ok(store)
+}
+
+/// Transpose a 2-D BF16 `CudaTensor` on the host.
+fn host_transpose_bf16(ctx: &CudaContext, tensor: &CudaTensor) -> Result<CudaTensor> {
+    let shape = tensor.shape().to_vec();
+    let rows = shape[0];
+    let cols = shape[1];
+    let data = tensor.to_raw_bytes()?;
+    let elem = 2usize; // bf16
+    let mut transposed = vec![0u8; data.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            let src = (r * cols + c) * elem;
+            let dst = (c * rows + r) * elem;
+            transposed[dst..dst + elem].copy_from_slice(&data[src..src + elem]);
+        }
+    }
+    CudaTensor::from_raw_bytes(ctx, &[cols, rows], infernum::dtype::DType::BF16, &transposed)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +497,28 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     pub fn from_config_and_dir(config: C, ctx: CudaContext, model_dir: &Path) -> Result<Self> {
         let dummy_graph = config.build_prefill_graph_cuda(1, None);
         let weights = config.load_weights_cuda_safetensors(&dummy_graph, &ctx, model_dir, None)?;
+        let half_dim = config.head_dim() / 2;
+        Ok(Self {
+            config,
+            ctx,
+            weights: Arc::new(weights),
+            half_dim,
+            decode_state: RefCell::new(None),
+            shard: None,
+            #[cfg(feature = "nccl")]
+            comm: None,
+        })
+    }
+
+    /// Load a model from a GGUF file, dequantizing weights to BF16.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GGUF loading is not supported for this config,
+    /// or if the file cannot be opened or weights cannot be uploaded.
+    pub fn from_gguf(config: C, ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
+        let dummy_graph = config.build_prefill_graph_cuda(1, None);
+        let weights = config.load_weights_cuda_gguf(&dummy_graph, &ctx, gguf_path)?;
         let half_dim = config.head_dim() / 2;
         Ok(Self {
             config,

@@ -873,7 +873,6 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     panic!("Unknown weight name: {name}");
 }
 
-#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Returns `true` if this GGUF tensor name is a Q or K projection that needs
 /// the GGUF row-permutation reversal before use.
 pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {

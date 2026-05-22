@@ -11,11 +11,14 @@ use infernum::shard::ShardConfig;
 use infernum::weights::QuantizationConfig;
 use infernum::{DType, Result};
 use infernum_cuda::{
-    load_graph_weights_cuda, CudaContext, CudaGraphEngineConfig, CudaTensor, LinearWeight,
+    load_graph_weights_cuda, load_graph_weights_gguf_cuda, CudaContext, CudaGraphEngineConfig,
+    CudaTensor, LinearWeight,
 };
 
 use crate::config::GemmaConfig;
-use crate::graph_builder::{build_decode_graph, build_paged_decode_graph, build_prefill_graph};
+use crate::graph_builder::{
+    build_decode_graph, build_paged_decode_graph, build_prefill_graph, safetensors_to_gguf_name,
+};
 
 // ---------------------------------------------------------------------------
 // CudaGraphEngineConfig impl
@@ -107,6 +110,26 @@ impl CudaGraphEngineConfig for GemmaConfig {
             shard,
         )
     }
+
+    fn load_weights_cuda_gguf(
+        &self,
+        dummy_graph: &Graph<infernum_cuda::CudaBackend>,
+        ctx: &CudaContext,
+        gguf_path: &Path,
+    ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
+        // Gemma does not use the Llama-style interleaved RoPE layout in GGUF,
+        // so no Q/K row-unpermutation is needed.
+        load_graph_weights_gguf_cuda(
+            dummy_graph,
+            ctx,
+            gguf_path,
+            safetensors_to_gguf_name,
+            |_| false,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            /* lm_head_fallback */ true,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,12 +156,28 @@ pub trait GemmaCudaGraphEngineExt: Sized {
     /// Returns an error if the directory is missing, weights cannot be loaded,
     /// or `config.json` cannot be parsed.
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self>;
+
+    /// Load a Gemma-family model from a GGUF file onto a CUDA device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GGUF file is missing, metadata cannot be
+    /// parsed, or weights cannot be uploaded.
+    fn from_gguf(ctx: CudaContext, gguf_path: &Path) -> Result<Self>;
 }
 
 impl GemmaCudaGraphEngineExt for GemmaCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
         let config = GemmaConfig::from_file(model_dir.join("config.json"))?;
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
+    }
+
+    fn from_gguf(ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(
+            infernum::path_to_utf8(gguf_path)?,
+        )?;
+        let config = GemmaConfig::from_gguf_metadata(loader.metadata())?;
+        infernum_cuda::CudaGraphEngine::from_gguf(config, ctx, gguf_path)
     }
 }
 

@@ -1131,31 +1131,57 @@ fn bench_cuda_graph_engine(
     n_gen: usize,
     _weight_dtype: DType,
 ) -> infernum::Result<()> {
-    assert!(
-        !model_path.ends_with(".gguf"),
-        "--cuda-graph-engine only supports SafeTensors directories"
-    );
+    let is_gguf = model_path.ends_with(".gguf");
 
-    let model_type = detect_model_type(model_path)?;
-    match model_type.as_str() {
-        "llama" | "mistral" | "mixtral" => run_engine_bench(
-            ctx,
-            LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
-            n_gen,
-        ),
-        "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
-            ctx,
-            QwenCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
-            n_gen,
-        ),
-        "gemma2" | "gemma3_text" => run_engine_bench(
-            ctx,
-            GemmaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
-            n_gen,
-        ),
-        other => Err(infernum::Error::UnsupportedModel(format!(
-            "--cuda-graph-engine: unsupported model_type `{other}`. Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
-        ))),
+    if is_gguf {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+        let arch = loader
+            .metadata()
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("llama");
+        match arch {
+            "llama" | "mistral" | "mixtral" => run_engine_bench(
+                ctx,
+                LlamaCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+            ),
+            "qwen2" | "qwen3" => run_engine_bench(
+                ctx,
+                QwenCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+            ),
+            "gemma2" | "gemma3" => run_engine_bench(
+                ctx,
+                GemmaCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+            ),
+            other => Err(infernum::Error::UnsupportedModel(format!(
+                "--cuda-graph-engine GGUF: unsupported architecture `{other}`"
+            ))),
+        }
+    } else {
+        let model_type = detect_model_type(model_path)?;
+        match model_type.as_str() {
+            "llama" | "mistral" | "mixtral" => run_engine_bench(
+                ctx,
+                LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+            ),
+            "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
+                ctx,
+                QwenCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+            ),
+            "gemma2" | "gemma3_text" => run_engine_bench(
+                ctx,
+                GemmaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+            ),
+            other => Err(infernum::Error::UnsupportedModel(format!(
+                "--cuda-graph-engine: unsupported model_type `{other}`. Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
+            ))),
+        }
     }
 }
 
@@ -1177,10 +1203,6 @@ fn main() -> infernum::Result<()> {
 
         if cli.cuda_graphs && is_gguf {
             eprintln!("ERROR: --cuda-graphs does not support GGUF files");
-            std::process::exit(1);
-        }
-        if cli.cuda_graph_engine && is_gguf {
-            eprintln!("ERROR: --cuda-graph-engine does not support GGUF files");
             std::process::exit(1);
         }
 
