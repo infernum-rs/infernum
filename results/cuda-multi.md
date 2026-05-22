@@ -5,15 +5,36 @@ See [performance.md](../performance.md) for methodology.
 ## Current Results
 
 **Node:** 8× NVIDIA A100-SXM4-80GB — NVLink interconnect | Driver 590.48.01 | CUDA 13.1  
-**Run date:** 2026-05-22 (clean sequential runs, no GPU interference)  
+**Run date:** 2026-05-22 — clean sequential runs, all GPUs idle between measurements  
 **infernum commit:** `perf/measurement-doc` branch | **llama.cpp commit:** `40d5358` (build 1)
+
+### Single-GPU decode — all models (greedy, 100 tokens)
+
+infernum column is BF16 SafeTensors unless noted. llama.cpp uses best available quantization.
+
+| Model | Params | infernum (tok/s) | llama.cpp (tok/s) | llama.cpp format | ratio |
+| ----- | -----: | ---------------: | ----------------: | :--------------- | ----: |
+| Qwen3-8B | 8B | 52.6 | 127.0 | Q8_0 | 0.41x |
+| Qwen3-8B ¹ | 8B | 53.0 | 127.0 | Q8_0 | 0.42x |
+| Gemma-2-9B | 9B | 13.4 | 94.5 | Q8_0 | 0.14x |
+| Gemma-2-9B ¹ | 9B | 13.4 | 94.5 | Q8_0 | 0.14x |
+| Llama-3.1-70B | 70B | — | 30.1 | Q4_0 | — |
+| Qwen3-72B | 72B | — | 23.4 | Q4_K_M | — |
+
+¹ infernum loading Q8_0 GGUF (new feature, 2026-05-22). Dequantizes to BF16 on host before upload — identical runtime behaviour to SafeTensors. llama.cpp runs native Q8_0 GEMV kernels and never dequantizes.
+
+**Main performance gap:** infernum uses BF16 weights (2 bytes/param); llama.cpp uses Q8_0 (1 byte/param). Decode is memory-bandwidth-bound, so the format alone accounts for roughly 2× of the gap. Even with matching Q8_0 GGUF input, infernum's runtime is BF16 (0.42×) while llama.cpp's runtime stays Q8_0.
+
+**Gemma gap is wider** (0.14×): Gemma-2-9B has head_dim=256 (vs 128 for Qwen), 42 layers, and a known slow prefill path in infernum (137 tok/s vs llama.cpp's 3404 tok/s at pp512). The decode gap is also larger than Qwen's, likely due to suboptimal BF16 attention for large head_dim.
+
+**Llama-70B / Qwen3-72B (infernum):** BF16 SafeTensors weights not downloaded; pending.
 
 ---
 
 ### Qwen3-8B — TP scaling decode (greedy argmax, 100 tokens)
 
-infernum: BF16 SafeTensors, CudaGraphEngine (TP=1) or ShardedGraphEngine (TP>1)  
-llama.cpp: Q8_0 GGUF, best of 3, `-ngl 99`, `tg100`
+infernum uses ShardedGraphEngine for TP>1 (eager path — see note).  
+llama.cpp uses tensor-parallel with best of 3, `-ngl 99`, `tg100`.
 
 | GPUs | infernum BF16 (tok/s) | llama.cpp Q8_0 (tok/s) | ratio |
 | ---: | --------------------: | ---------------------: | ----: |
@@ -22,51 +43,25 @@ llama.cpp: Q8_0 GGUF, best of 3, `-ngl 99`, `tg100`
 | 4    | 10.0                  | 112.5                  | 0.09x |
 | 8    |  5.6                  | 110.4                  | 0.05x |
 
-**TP decode is structurally eager:** `all_reduce_sum` ops are flagged capture-unsafe — NCCL's AllReduce internally calls `cuMemAlloc` which is illegal inside a CUDA graph capture window. TP=1 uses the CUDA graph fast path; TP>1 runs every decode step eagerly via the interpreter. This is a hard constraint, not a configuration choice.
+**TP decode is structurally eager:** `all_reduce_sum` ops are flagged capture-unsafe because NCCL's AllReduce internally calls `cuMemAlloc`, which is illegal inside a CUDA graph capture window. TP=1 uses the CUDA graph fast path; TP>1 runs every decode step eagerly via the interpreter. This is a hard constraint, not a configuration choice.
 
-**Format gap at TP=1:** infernum BF16 (~2 bytes/param) vs llama.cpp Q8_0 (~1 byte/param). Decode is memory-bandwidth-bound. Even at TP=1 with the CUDA graph path, infernum runs at 0.41× of llama.cpp because it moves twice as much weight per step.
+**TP degrades throughput for this model:** Qwen3-8B fits on one GPU. NCCL AllReduce overhead exceeds any per-GPU compute savings at single-batch decode, so throughput falls as GPU count increases. Multi-GPU gains require models too large for one GPU, or batching.
 
-**TP degrades throughput:** Qwen3-8B fits on one GPU. NCCL AllReduce overhead exceeds any per-GPU compute savings at single-batch decode, so throughput falls as GPU count increases. Meaningful multi-GPU gains require either (a) models that don't fit on a single GPU, or (b) batching multiple concurrent requests.
-
----
-
-### infernum GGUF loading (new — 2026-05-22)
-
-Q8_0 GGUF weights are dequantized to BF16 on host before upload. Runtime behaviour is identical to BF16 SafeTensors; the only difference is file size and load time.
-
-| Model | Format | infernum (tok/s) | llama.cpp (tok/s) | ratio |
-| ----- | ------ | ---------------: | ----------------: | ----: |
-| Qwen3-8B | BF16 SafeTensors | 52.6 | 127.0 | 0.41x |
-| Qwen3-8B | Q8_0 GGUF (infernum new) | 53.0 | 127.0 | 0.42x |
-| Gemma-2-9B | BF16 SafeTensors | 13.4 | 94.5 | 0.14x |
-| Gemma-2-9B | Q8_0 GGUF (infernum new) | 13.4 | 94.5 | 0.14x |
-
-GGUF and SafeTensors are within noise — confirming correct dequantization. The format gap vs llama.cpp remains because llama.cpp runs native Q8_0 GEMV kernels (never dequantizes at inference time).
+**llama.cpp multi-GPU pattern:** llama.cpp uses layer-parallel sharding (not NCCL tensor-parallel for decode), so 2-GPU barely changes decode throughput (127→127) and 4-8 GPU degrades less than infernum (127→112). Same root cause: the model is too small to benefit.
 
 ---
 
-### 8B/9B models — single GPU decode (greedy, 100 tokens)
+### Large models — llama.cpp baseline (pp512 prefill + tg256 decode, best of 3)
 
-| Model | Format | infernum (tok/s) | llama.cpp (tok/s) | ratio |
-| ----- | ------ | ---------------: | ----------------: | ----: |
-| Qwen3-8B | BF16 SafeTensors | 52.6 | 127.0 Q8_0 | 0.41x |
-| Gemma-2-9B | BF16 SafeTensors | 13.4 | 94.5 Q8_0 | 0.14x |
-
-Gemma-2-9B gap is wider (0.14×). Gemma has head_dim=256 (vs 128 for Qwen) and 42 layers. The prefill path is also slower than expected (infernum: 137 tok/s vs llama.cpp: 3404 tok/s at 512 tokens) — this is a known gap in infernum's Gemma attention kernel, not a measurement artifact.
-
----
-
-### Large models — llama.cpp baseline (decode tg256, prefill pp512)
-
-| Model | Format | GPUs | decode (tok/s) | prefill (tok/s) |
-| ----- | ------ | ---: | -------------: | --------------: |
+| Model | Format | GPUs | decode (tok/s) | prefill pp512 (tok/s) |
+| ----- | ------ | ---: | -------------: | --------------------: |
 | Llama-3.1-70B | Q4_0 | 1 | 30.1 | 530 |
 | Llama-3.1-70B | Q4_0 | 2 | 30.1 | 532 |
 | Llama-3.1-70B | Q4_0 | 4 | 26.9 | 532 |
 | Qwen3-72B | Q4_K_M | 1 | 23.4 | 517 |
 | Qwen3-72B | Q4_K_M | 2 | 23.6 | 520 |
 
-Llama-70B (37 GiB) fits on one 80GB A100; adding GPUs gives no decode speedup and degrades it at 4× (NCCL overhead). Qwen3-72B (44 GiB) also fits on one GPU; same pattern.
+Both models fit on a single 80GB A100 at these quantizations. Adding GPUs provides no decode benefit.
 
 ---
 
@@ -74,8 +69,8 @@ Llama-70B (37 GiB) fits on one 80GB A100; adding GPUs gives no decode speedup an
 
 | Model | Status |
 | ----- | ------ |
-| Llama-3.1-70B BF16 TP=2 infernum | No BF16 weights downloaded (gated HF repo) |
-| Qwen3-72B BF16 TP=2 infernum | Weights not downloaded |
+| Llama-3.1-70B BF16 TP=2 infernum | BF16 weights not downloaded (gated HF repo) |
+| Qwen3-72B BF16 TP=2 infernum | BF16 weights not downloaded |
 | DeepSeek-V3 | infernum CUDA not implemented; GGUF not available |
 
 ---
