@@ -33,12 +33,12 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q4_0 | — | 290.8 | — | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x | 2026-05-22 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 252 | — | — | 2026-05-21 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 4.0 | 4541 | 0.001x | 2026-05-21 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 4.3 | 4596 | 0.001x | 2026-05-21 |
-| Qwen / Qwen3-0.6B | SafeTensors BF16 | 86 | — | — | 2026-05-21 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 0.6 | 938 | 0.001x | 2026-05-21 |
-| Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-21 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 265 | — | — | 2026-05-22 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 253 | 4541 | 0.056x | 2026-05-22 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 253 | 4596 | 0.055x | 2026-05-22 |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 91 | — | — | 2026-05-22 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 576 | 938 | 0.61x | 2026-05-22 |
+| Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-22 |
 
 ---
 
