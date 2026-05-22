@@ -8,7 +8,7 @@ See [performance.md](../performance.md) for methodology.
 
 ### Qwen3-8B — TP scaling decode comparison (greedy, 100 tokens)
 
-infernum: BF16 SafeTensors, eager execution (no CUDA graph capture) | llama.cpp: Q8_0 GGUF, best of 3 reps, `-ngl 99`
+infernum: BF16 SafeTensors | llama.cpp: Q8_0 GGUF, best of 3 reps, `-ngl 99`
 
 | GPUs | infernum BF16 (tok/s) | llama.cpp Q8_0 (tok/s) | ratio |
 | ---: | --------------------: | ---------------------: | ----: |
@@ -17,9 +17,13 @@ infernum: BF16 SafeTensors, eager execution (no CUDA graph capture) | llama.cpp:
 | 4 | 10.8 | 112.50 | 0.10x |
 | 8 | 5.9 | 110.64 | 0.05x |
 
-¹ Single-GPU eager, from `cuda-single.md` (2026-05-21). No TP.
+¹ Single-GPU with CUDA graph engine, from `cuda-single.md` (2026-05-21). No TP.
 
-**Why the gap is large:** Two compounding factors. First, llama.cpp uses Q8_0 (~1 byte/param, 8 GB) vs infernum BF16 (~2 bytes/param, 16 GB) — format alone accounts for ~2x since decode is memory-bandwidth-bound. Second, infernum TP runs in eager mode (no CUDA graph capture): every decode step re-executes the graph interpreter and pays full kernel launch overhead, whereas llama.cpp uses CUDA graphs. Closing the gap requires graph-capture support in the TP path. **TP does not improve throughput for this model size** — Qwen3-8B fits on one GPU and the NCCL AllReduce overhead exceeds any per-GPU compute savings at single-batch decode.
+**Format difference:** llama.cpp Q8_0 uses ~1 byte/param (8 GB); infernum BF16 uses ~2 bytes/param (16 GB). Decode is memory-bandwidth-bound, so format alone accounts for roughly 2x of the gap. For a like-for-like comparison, infernum would need quantisation support or llama.cpp would need to run BF16 GGUF — neither is available today.
+
+**TP decode is always eager (no CUDA graph):** The `all_reduce_sum` op in the decode graph is flagged capture-unsafe because NCCL's AllReduce internally calls `cuMemAlloc`, which is illegal inside a CUDA graph capture window. Every decode step therefore falls through to the eager interpreter path. This is not a configuration choice — it is a hard constraint until the TP path is reworked to use NCCL's CUDA-graph-compatible API (available since NCCL 2.21 / CUDA 12). Single-GPU decode uses the graph-capture fast path; TP decode cannot.
+
+**TP does not improve throughput for this model size:** Qwen3-8B fits on one GPU. NCCL AllReduce overhead exceeds any per-GPU compute savings at single-batch decode, so throughput falls as GPU count increases.
 
 ### llama.cpp baseline — large quantised models (decode, pp512 prefill, 256 tokens)
 
