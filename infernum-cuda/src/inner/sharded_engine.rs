@@ -109,10 +109,13 @@ mod inner {
 
         fn config(&self) -> ModelConfig {
             let c = self.replicas[0].config();
+            let world_size = self.replicas.len();
             ModelConfig {
                 num_layers: c.num_hidden_layers(),
                 max_seq_len: c.max_position_embeddings(),
-                num_kv_heads: c.num_kv_heads(),
+                // Each replica holds num_kv_heads / world_size heads; the runtime
+                // uses this to size per-GPU KV cache blocks.
+                num_kv_heads: c.num_kv_heads() / world_size,
                 head_dim: c.head_dim(),
                 eos_token_id: c.eos_token_id(),
                 cache_dtype: DType::BF16,

@@ -678,11 +678,15 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
     }
 
     fn allocate_kv_cache(&self, block_config: &BlockConfig) -> Result<crate::cuda::PagedKvCache> {
+        let num_kv_heads = match &self.shard {
+            Some(s) => self.config.num_kv_heads() / s.world_size,
+            None => self.config.num_kv_heads(),
+        };
         crate::cuda::PagedKvCache::new(
             &self.ctx,
             self.config.num_hidden_layers(),
             block_config,
-            self.config.num_kv_heads(),
+            num_kv_heads,
             self.config.head_dim(),
             DType::BF16,
         )

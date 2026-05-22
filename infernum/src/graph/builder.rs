@@ -231,7 +231,13 @@ impl<B: Backend + MatmulOps + ContextBackend> Graph<B> {
         self.nodes.iter().any(|n| {
             matches!(
                 n.op.name(),
-                "moe_dispatch_softmax" | "moe_dispatch_sigmoid" | "logit_softcap"
+                // MoE routing and logit softcap do D→H sync copies.
+                // all_reduce_sum allocates a temporary GPU buffer (cuMemAlloc)
+                // inside the AllReduce, which invalidates stream capture.
+                "moe_dispatch_softmax"
+                    | "moe_dispatch_sigmoid"
+                    | "logit_softcap"
+                    | "all_reduce_sum"
             )
         })
     }
