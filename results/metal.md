@@ -15,6 +15,7 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Model | Format | infernum | llama.cpp | ratio | Date |
 | ----- | ------ | -------: | --------: | ----: | ---- |
 | Llama / Llama-3.1-8B | GGUF Q4_0 | 12.8 | 28.1 | 0.46x | 2026-05-22 |
+| Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
 | Llama / SmolLM2-360M | GGUF Q4_0 | 58.1 | 226.7 | 0.26x | 2026-05-21 |
@@ -31,6 +32,7 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Model | Format | infernum | llama.cpp | ratio | Date |
 | ----- | ------ | -------: | --------: | ----: | ---- |
 | Llama / Llama-3.1-8B | GGUF Q4_0 | — | 290.8 | — | 2026-05-22 |
+| Llama / Llama-3.1-8B | GGUF Q8_0 | 51.8 | 285.8 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x | 2026-05-22 |
 | Llama / SmolLM2-360M | SafeTensors F32 | 265 | — | — | 2026-05-22 |
@@ -72,6 +74,36 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 - **Prefill skipped for infernum:** Same serial GEMV issue as at 3B scale — impractical for GGUF prefill. Only llama.cpp numbers recorded.
 - **Ratio improvement with model scale (Q4_0 decode):** 360M=0.26x → 3B=0.36x → 8B=0.46x. Dispatch overhead (135 K Metal dispatches per 256-token decode) is constant per layer; larger models have more compute per dispatch, so the gap narrows.
 - **Q8_0 not yet measured:** The 8.54 GB Q8_0 file spans multiple xet shards and cannot be downloaded via direct curl in this environment. Only Q4_0 numbers recorded.
+- Machine is Apple M3 Pro (below Standard tier; Standard is 24–48 GB).
+
+---
+
+## 2026-05-22 — Llama 3.1 8B Q8_0 (first Q8_0 8B results)
+
+- **Chip:** Apple M3 Pro (18 GB unified memory)
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **Prefill prompt:** 512 tokens
+- **infernum commit:** `c5a5604`
+- **llama.cpp commit:** `e22cd0aa1` (`-ngl 99`, 1 rep)
+- **Model:** `QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF`
+
+### Prefill throughput (tok/s) — 512-token prompt
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / Llama-3.1-8B | GGUF Q8_0 | 51.8 | 285.8 | 0.18x |
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x |
+
+### Notes
+
+- **Q8_0 decode regression at 8B scale:** At 3B, Q8_0 and Q4_0 decode both measure ~21 tok/s (dispatch-overhead-bound). At 8B, Q4_0 decodes at 12.8 tok/s but Q8_0 decodes at only 2.9 tok/s — a 4.4× gap vs the expected ~1.9× (proportional to data size). The M3 Pro's GPU memory bandwidth (~150 GB/s) and 8 GB Q8_0 weight data imply a ~18 tok/s theoretical ceiling; llama.cpp reaches 89% of that (16.3 tok/s) while infernum reaches 16%. The Q8_0 GEMV kernel is not yet bandwidth-saturating at this scale.
+- **Prefill ratio (0.18×) is significantly below 3B (0.62×):** At 8B the weight matrices are larger (4096→4096 vs 3072→3072 linear layers) and the dequant+GEMM path shows lower GPU utilization. The M3 Pro has less GPU compute relative to memory than the M3 Max/Ultra.
+- **Q8_0 decode on this machine is impractical:** 2.9 tok/s is below useful interactive speed. Q4_0 (12.8 tok/s) is the better choice on M3 Pro 18 GB.
 - Machine is Apple M3 Pro (below Standard tier; Standard is 24–48 GB).
 
 ---
