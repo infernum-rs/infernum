@@ -6,13 +6,20 @@ See [performance.md](../performance.md) for methodology.
 
 **Node:** 8× NVIDIA A100-SXM4-80GB — NVLink interconnect | Driver 590.48.01 | CUDA 13.1
 
-### infernum — Qwen3-8B BF16 TP scaling (decode, greedy, 100 tokens)
+### Qwen3-8B — TP scaling decode comparison (greedy, 100 tokens)
 
-| GPUs (TP) | decode (tok/s) |
-| --------: | -------------: |
-| 2 | 16.7 |
-| 4 | 10.8 |
-| 8 | 5.9 |
+infernum: BF16 SafeTensors, eager execution (no CUDA graph capture) | llama.cpp: Q8_0 GGUF, best of 3 reps, `-ngl 99`
+
+| GPUs | infernum BF16 (tok/s) | llama.cpp Q8_0 (tok/s) | ratio |
+| ---: | --------------------: | ---------------------: | ----: |
+| 1 | 46.0 ¹ | 127.83 | 0.36x |
+| 2 | 16.7 | 126.88 | 0.13x |
+| 4 | 10.8 | 112.50 | 0.10x |
+| 8 | 5.9 | 110.64 | 0.05x |
+
+¹ Single-GPU eager, from `cuda-single.md` (2026-05-21). No TP.
+
+**Why the gap is large:** Two compounding factors. First, llama.cpp uses Q8_0 (~1 byte/param, 8 GB) vs infernum BF16 (~2 bytes/param, 16 GB) — format alone accounts for ~2x since decode is memory-bandwidth-bound. Second, infernum TP runs in eager mode (no CUDA graph capture): every decode step re-executes the graph interpreter and pays full kernel launch overhead, whereas llama.cpp uses CUDA graphs. Closing the gap requires graph-capture support in the TP path. **TP does not improve throughput for this model size** — Qwen3-8B fits on one GPU and the NCCL AllReduce overhead exceeds any per-GPU compute savings at single-batch decode.
 
 ### llama.cpp baseline — large quantised models (decode, pp512 prefill, 256 tokens)
 
