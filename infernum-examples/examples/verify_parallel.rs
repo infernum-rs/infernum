@@ -18,7 +18,6 @@ use cudarc::driver::CudaDevice;
 use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::Tokenizer as _;
 use infernum::{GenerateOptions, Result};
 use infernum_cuda::cuda::CudaContext;
 use infernum_gemma::{
