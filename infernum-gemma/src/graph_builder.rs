@@ -824,7 +824,6 @@ where
 // GGUF name mapping
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Map a SafeTensors weight name (HuggingFace convention) to its GGUF key.
 ///
 /// Gemma 2 / Gemma 3 use `blk.N.*` block prefixes with the following suffixes:

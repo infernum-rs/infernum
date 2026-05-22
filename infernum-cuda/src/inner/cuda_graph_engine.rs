@@ -516,7 +516,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     ///
     /// Returns an error if GGUF loading is not supported for this config,
     /// or if the file cannot be opened or weights cannot be uploaded.
-    pub fn from_gguf(config: C, ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
+    pub fn from_config_gguf(config: C, ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
         let dummy_graph = config.build_prefill_graph_cuda(1, None);
         let weights = config.load_weights_cuda_gguf(&dummy_graph, &ctx, gguf_path)?;
         let half_dim = config.head_dim() / 2;

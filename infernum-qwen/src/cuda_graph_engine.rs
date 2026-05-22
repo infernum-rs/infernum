@@ -181,7 +181,7 @@ impl QwenCudaGraphEngineExt for QwenCudaGraphEngine {
             infernum::path_to_utf8(gguf_path)?,
         )?;
         let config = QwenConfig::from_gguf_metadata(loader.metadata())?;
-        infernum_cuda::CudaGraphEngine::from_gguf(config, ctx, gguf_path)
+        infernum_cuda::CudaGraphEngine::from_config_gguf(config, ctx, gguf_path)
     }
 }
 

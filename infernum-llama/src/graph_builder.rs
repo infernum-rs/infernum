@@ -836,7 +836,6 @@ where
 // GGUF weight loader helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Map a SafeTensors-convention weight name to its GGUF tensor name.
 ///
 /// Handles the top-level tensors (`model.embed_tokens.weight`, `model.norm.weight`,
