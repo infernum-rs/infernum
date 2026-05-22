@@ -62,11 +62,11 @@ impl GraphEngineConfig for GemmaConfig {
     }
 
     fn build_prefill_graph(&self, seq_len: usize) -> Graph<CpuBackend> {
-        build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32)
+        build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32, None)
     }
 
     fn build_decode_graph(&self, kv_len: usize) -> Graph<CpuBackend> {
-        build_decode_graph::<CpuBackend>(self, kv_len, DType::F32)
+        build_decode_graph::<CpuBackend>(self, kv_len, DType::F32, None)
     }
 
     fn load_weights_safetensors(

@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use infernum::graph::{Graph, WeightStore};
+use infernum::shard::ShardConfig;
 use infernum::weights::QuantizationConfig;
 use infernum::{DType, Result};
 use infernum_cuda::{
@@ -55,15 +56,23 @@ impl CudaGraphEngineConfig for QwenConfig {
         self.quantization_config.as_ref()
     }
 
-    fn build_prefill_graph_cuda(&self, seq_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+    fn build_prefill_graph_cuda(
+        &self,
+        seq_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Graph<infernum_cuda::CudaBackend> {
         let (graph, _) =
-            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16);
+            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16, shard);
         graph
     }
 
-    fn build_decode_graph_cuda(&self, kv_len: usize) -> Graph<infernum_cuda::CudaBackend> {
+    fn build_decode_graph_cuda(
+        &self,
+        kv_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Graph<infernum_cuda::CudaBackend> {
         let (graph, _) =
-            build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16);
+            build_decode_graph::<infernum_cuda::CudaBackend>(self, kv_len, DType::BF16, shard);
         graph
     }
 
@@ -72,6 +81,7 @@ impl CudaGraphEngineConfig for QwenConfig {
         batch_size: usize,
         block_size: usize,
         max_blocks_per_seq: usize,
+        shard: Option<&ShardConfig>,
     ) -> Graph<infernum_cuda::CudaBackend> {
         build_paged_decode_graph::<infernum_cuda::CudaBackend>(
             self,
@@ -79,6 +89,7 @@ impl CudaGraphEngineConfig for QwenConfig {
             block_size,
             max_blocks_per_seq,
             DType::BF16,
+            shard,
         )
     }
 
@@ -87,6 +98,7 @@ impl CudaGraphEngineConfig for QwenConfig {
         dummy_graph: &Graph<infernum_cuda::CudaBackend>,
         ctx: &CudaContext,
         model_dir: &Path,
+        shard: Option<&ShardConfig>,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
         // Some Qwen models (Qwen2.5, Qwen3-MoE) use tied embeddings and do not
         // have a separate lm_head.weight; enable the fallback so the loader
@@ -97,6 +109,7 @@ impl CudaGraphEngineConfig for QwenConfig {
             model_dir,
             /* lm_head_fallback */ true,
             self.quantization_config.as_ref(),
+            shard,
         )
     }
 }
@@ -109,6 +122,12 @@ impl CudaGraphEngineConfig for QwenConfig {
 ///
 /// A type alias for [`infernum_cuda::CudaGraphEngine<QwenConfig>`].
 pub type QwenCudaGraphEngine = infernum_cuda::CudaGraphEngine<QwenConfig>;
+
+/// Tensor-parallel CUDA graph engine for Qwen-family models.
+///
+/// A type alias for [`infernum_cuda::ShardedGraphEngine<QwenConfig>`].
+#[cfg(feature = "nccl")]
+pub type QwenShardedGraphEngine = infernum_cuda::ShardedGraphEngine<QwenConfig>;
 
 /// Extension trait providing Qwen-specific CUDA constructors.
 pub trait QwenCudaGraphEngineExt: Sized {
@@ -125,5 +144,24 @@ impl QwenCudaGraphEngineExt for QwenCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
         let config = QwenConfig::from_file(model_dir.join("config.json"))?;
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
+    }
+}
+
+/// Extension trait providing Qwen-specific tensor-parallel constructors.
+#[cfg(feature = "nccl")]
+pub trait QwenShardedGraphEngineExt: Sized {
+    /// Load a Qwen-family model across multiple GPUs using tensor parallelism.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device creation, NCCL setup, or weight loading fails.
+    fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self>;
+}
+
+#[cfg(feature = "nccl")]
+impl QwenShardedGraphEngineExt for QwenShardedGraphEngine {
+    fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self> {
+        let config = QwenConfig::from_file(model_dir.join("config.json"))?;
+        infernum_cuda::ShardedGraphEngine::from_config(config, num_devices, model_dir)
     }
 }

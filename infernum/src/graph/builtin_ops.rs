@@ -9,7 +9,7 @@
 use std::any::Any;
 
 use crate::backend::{
-    ArithOps, AttentionOps, Backend, BiasOps, CastOps, ContextBackend, EmbedOps, GegluOps,
+    ArithOps, AttentionOps, Backend, BiasOps, CastOps, Comm, ContextBackend, EmbedOps, GegluOps,
     MatmulExtOps, MatmulOps, MoeOps, MoeSigmoidOps, NormOps, RopeInterleavedOps, RopeOps,
     SwigluOps, TensorOps,
 };
@@ -2126,12 +2126,14 @@ impl<B: ContextBackend> OpNode<B> for MoeDispatchSigmoidOp {
 
 /// Multi-device all-reduce sum for tensor parallelism.
 ///
-/// Requires communicator access which is not available through the
-/// [`OpNode::execute`] interface; handled specially by the executor.
+/// When `ExecuteContext::comm` is `None` (single-GPU), passes the tensor
+/// through unchanged. When `Some`, calls `comm.all_reduce_sum()` in-place
+/// and writes the result. Included in CUDA graph captures automatically
+/// because NCCL enqueues work on the device stream without blocking the CPU.
 #[derive(Debug)]
 pub struct AllReduceSumOp;
 
-impl<B: Backend + MatmulOps> OpNode<B> for AllReduceSumOp {
+impl<B: ContextBackend> OpNode<B> for AllReduceSumOp {
     fn name(&self) -> &'static str {
         "all_reduce_sum"
     }
@@ -2149,13 +2151,16 @@ impl<B: Backend + MatmulOps> OpNode<B> for AllReduceSumOp {
     }
     fn execute(
         &self,
-        _ctx: &mut ExecuteContext<'_, B>,
-        _node_id: NodeId,
-        _inputs: &[OutputRef],
+        ctx: &mut ExecuteContext<'_, B>,
+        node_id: NodeId,
+        inputs: &[OutputRef],
     ) -> Result<()> {
-        unimplemented!(
-            "AllReduceSumOp requires multi-device NCCL communicator — handled by executor"
-        )
+        let mut tensor = B::ctx_read(ctx, inputs[0]);
+        if let Some(comm) = ctx.comm {
+            comm.all_reduce_sum(&mut tensor)?;
+        }
+        B::ctx_write(ctx, node_id, 0, tensor);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self

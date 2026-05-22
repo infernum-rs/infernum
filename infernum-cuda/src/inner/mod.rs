@@ -7,9 +7,11 @@ mod error;
 pub mod execute_context;
 pub mod executor;
 pub mod model;
+pub mod sharded_engine;
 pub mod weights;
 
 pub use backend_impl::CudaBackend;
+pub use cuda::ops::cast_to_f32;
 pub use cuda::ops::LinearWeight;
 pub use cuda::BlockAllocator;
 pub use cuda::BlockConfig;
@@ -29,6 +31,9 @@ pub use cuda_graph_engine::*;
 pub use cuda_logits::CudaLogits;
 pub use cuda_runtime_state::CudaRuntimeState;
 pub use execute_context::{CudaExecutorState, GraphInputs};
+pub use executor::execute;
+#[cfg(feature = "nccl")]
+pub use sharded_engine::{ShardedGraphEngine, ShardedPagedKvCache};
 pub use weights::{CudaWeightLoader, GgufLoader, GgufValue, SafeTensorsLoader, WeightLoader};
 
 // Re-export cudarc types/traits needed by downstream generic model code

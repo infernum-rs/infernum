@@ -1033,6 +1033,7 @@ dependencies = [
  "infernum-runtime",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

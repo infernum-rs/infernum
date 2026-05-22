@@ -35,7 +35,7 @@ impl MetalGraphEngineConfig for LlamaConfig {
 
     fn build_prefill_graph_metal(&self, seq_len: usize) -> Graph<infernum_metal::MetalBackend> {
         let (graph, _) =
-            build_prefill_graph::<infernum_metal::MetalBackend>(self, seq_len, DType::F32);
+            build_prefill_graph::<infernum_metal::MetalBackend>(self, seq_len, DType::F32, None);
         graph
     }
 
@@ -51,6 +51,7 @@ impl MetalGraphEngineConfig for LlamaConfig {
             block_size,
             max_blocks_per_seq,
             DType::F32,
+            None,
         )
     }
 

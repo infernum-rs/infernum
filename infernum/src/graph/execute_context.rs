@@ -158,4 +158,11 @@ pub struct ExecuteContext<'a, B: Backend + MatmulOps> {
 
     /// Cursor into `input_tensors` — advanced by [`ContextBackend::ctx_next_input`](crate::backend::ContextBackend::ctx_next_input).
     pub input_idx: &'a mut usize,
+
+    /// Optional NCCL communicator for tensor-parallel all-reduce.
+    ///
+    /// `None` for single-GPU execution — `AllReduceSumOp` is a no-op in that
+    /// case. `Some` when the engine was constructed with a shard config; the
+    /// communicator is owned by `CudaGraphEngine` and borrowed here.
+    pub comm: Option<&'a B::Comm>,
 }

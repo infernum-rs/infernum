@@ -18,10 +18,11 @@ mod weight_store;
 pub use arena::Arena;
 pub use builder::Graph;
 pub use builder_traits::{
-    GraphArgmaxOps, GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphEmbedOps,
-    GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphMlaAttentionOps, GraphMoeOps,
-    GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps, GraphRopeInterleavedOps,
-    GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps, GraphTensorOps,
+    GraphArgmaxOps, GraphArithOps, GraphAttentionOps, GraphBiasOps, GraphCastOps, GraphCommOps,
+    GraphEmbedOps, GraphGegluOps, GraphMatmulExtOps, GraphMatmulOps, GraphMlaAttentionOps,
+    GraphMoeOps, GraphNormOps, GraphPagedAttentionOps, GraphPagedKvCacheOps,
+    GraphRopeInterleavedOps, GraphRopeOps, GraphSiluOps, GraphSoftcapOps, GraphSwigluOps,
+    GraphTensorOps,
 };
 pub use builtin_ops::{FusedRopePairOp, MlaAttentionOp, MoeExpertIds};
 pub use execute_context::{ExecuteContext, KvCacheAccess};
