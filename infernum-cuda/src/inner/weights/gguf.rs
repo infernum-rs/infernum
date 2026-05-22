@@ -58,97 +58,145 @@ pub use infernum::GgufValue;
 struct GgufTensorInfo {
     shape: Vec<usize>,
     ggml_type: u32,
-    offset: u64, // relative to tensor data start
+    offset: u64, // relative to tensor data start of its shard
+    shard_idx: usize, // which mmap/tensor_data_offsets entry this tensor lives in
 }
 
 // ---------------------------------------------------------------------------
 // GGUF Loader
 // ---------------------------------------------------------------------------
 
-/// Loads model weights from a GGUF file.
+/// Loads model weights from a GGUF file (single-file or split-file format).
 ///
-/// Supports F32, F16, Q8_0, and Q4_0 tensor types. Tensors are memory-mapped
-/// and loaded to the GPU on demand.
+/// Supports F32, F16, Q8_0, Q4_0, and quantized types. Tensors are memory-mapped
+/// and loaded to the GPU on demand. Use `from_file` for a single GGUF file or
+/// `from_split_files` for a multi-shard split (e.g. `model-00001-of-00005.gguf`).
 pub struct GgufLoader {
-    mmap: Mmap,
+    mmaps: Vec<Mmap>,
     metadata: HashMap<String, GgufValue>,
     tensors: HashMap<String, GgufTensorInfo>,
-    tensor_data_offset: usize,
+    tensor_data_offsets: Vec<usize>,
 }
 
 impl GgufLoader {
-    /// Open and parse a GGUF file.
+    /// Open and parse a single GGUF file.
     ///
     /// # Errors
     /// Returns an error if the file cannot be opened, is not a valid GGUF file,
     /// or uses an unsupported version.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        Self::from_split_files(&[path])
+    }
 
-        let mut cursor = Cursor::new(mmap.as_ref());
+    /// Open a GGUF file, auto-detecting split-shard format.
+    ///
+    /// If the filename matches the pattern `*-NNNNN-of-MMMMM.gguf` (e.g.
+    /// `model-00001-of-00005.gguf`), all shards are loaded from the same
+    /// directory. Otherwise, the file is opened as a single-file GGUF.
+    ///
+    /// # Errors
+    /// Returns an error if any shard cannot be opened or parsed.
+    pub fn from_file_or_split(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        // Parse header
-        let magic = read_u32(&mut cursor)?;
-        if magic != GGUF_MAGIC {
-            return Err(Error::InvalidShape(format!(
-                "Not a GGUF file (magic: 0x{magic:08x}, expected 0x{GGUF_MAGIC:08x})"
-            )));
+        // Detect pattern: something-NNNNN-of-MMMMM.gguf
+        let shard_paths = detect_split_gguf_shards(path, name);
+        if let Some(shards) = shard_paths {
+            let refs: Vec<&Path> = shards.iter().map(|p| p.as_path()).collect();
+            Self::from_split_files(&refs)
+        } else {
+            Self::from_split_files(&[path])
         }
+    }
 
-        let version = read_u32(&mut cursor)?;
-        if version != GGUF_VERSION_3 {
-            return Err(Error::UnsupportedDtype(format!(
-                "Unsupported GGUF version {version} (only v3 supported)"
-            )));
-        }
+    /// Open and parse a split GGUF model (multiple shard files).
+    ///
+    /// Pass all shards in order (shard 1 first). Each shard is a self-contained
+    /// GGUF file with a subset of the model's tensors. Metadata is taken from
+    /// the first shard; tensors are merged across all shards.
+    ///
+    /// # Errors
+    /// Returns an error if any file cannot be opened, is not a valid GGUF file,
+    /// or uses an unsupported version.
+    pub fn from_split_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
+        assert!(!paths.is_empty(), "from_split_files: paths must not be empty");
 
-        let tensor_count = read_u64(&mut cursor)? as usize;
-        let metadata_kv_count = read_u64(&mut cursor)? as usize;
+        let mut mmaps = Vec::with_capacity(paths.len());
+        let mut tensor_data_offsets = Vec::with_capacity(paths.len());
+        let mut all_tensors: HashMap<String, GgufTensorInfo> = HashMap::new();
+        let mut metadata = HashMap::new();
 
-        // Parse metadata
-        let mut metadata = HashMap::with_capacity(metadata_kv_count);
-        for _ in 0..metadata_kv_count {
-            let key = read_gguf_string(&mut cursor)?;
-            let value = read_gguf_value(&mut cursor)?;
-            metadata.insert(key, value);
-        }
+        for (shard_idx, path) in paths.iter().enumerate() {
+            let file = std::fs::File::open(path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let mut cursor = Cursor::new(mmap.as_ref());
 
-        // Parse tensor descriptors
-        let mut tensors = HashMap::with_capacity(tensor_count);
-        for _ in 0..tensor_count {
-            let name = read_gguf_string(&mut cursor)?;
-            let n_dims = read_u32(&mut cursor)? as usize;
-            let mut shape = Vec::with_capacity(n_dims);
-            for _ in 0..n_dims {
-                shape.push(read_u64(&mut cursor)? as usize);
+            let magic = read_u32(&mut cursor)?;
+            if magic != GGUF_MAGIC {
+                return Err(Error::InvalidShape(format!(
+                    "Not a GGUF file (magic: 0x{magic:08x}, expected 0x{GGUF_MAGIC:08x})"
+                )));
             }
-            // GGUF stores dimensions in column-major order (ne[0] = innermost),
-            // reverse to our row-major convention (first dim = outermost).
-            shape.reverse();
-            let ggml_type = read_u32(&mut cursor)?;
-            let offset = read_u64(&mut cursor)?;
 
-            tensors.insert(
-                name,
-                GgufTensorInfo {
-                    shape,
-                    ggml_type,
-                    offset,
-                },
-            );
+            let version = read_u32(&mut cursor)?;
+            if version != GGUF_VERSION_3 {
+                return Err(Error::UnsupportedDtype(format!(
+                    "Unsupported GGUF version {version} (only v3 supported)"
+                )));
+            }
+
+            let tensor_count = read_u64(&mut cursor)? as usize;
+            let metadata_kv_count = read_u64(&mut cursor)? as usize;
+
+            let mut shard_metadata = HashMap::with_capacity(metadata_kv_count);
+            for _ in 0..metadata_kv_count {
+                let key = read_gguf_string(&mut cursor)?;
+                let value = read_gguf_value(&mut cursor)?;
+                shard_metadata.insert(key, value);
+            }
+            if shard_idx == 0 {
+                metadata = shard_metadata;
+            }
+
+            for _ in 0..tensor_count {
+                let name = read_gguf_string(&mut cursor)?;
+                let n_dims = read_u32(&mut cursor)? as usize;
+                let mut shape = Vec::with_capacity(n_dims);
+                for _ in 0..n_dims {
+                    shape.push(read_u64(&mut cursor)? as usize);
+                }
+                // GGUF stores dimensions in column-major order (ne[0] = innermost),
+                // reverse to our row-major convention (first dim = outermost).
+                shape.reverse();
+                let ggml_type = read_u32(&mut cursor)?;
+                let offset = read_u64(&mut cursor)?;
+
+                all_tensors.insert(
+                    name,
+                    GgufTensorInfo { shape, ggml_type, offset, shard_idx },
+                );
+            }
+
+            let pos = cursor.position() as usize;
+            tensor_data_offsets.push((pos + 31) & !31);
+            mmaps.push(mmap);
         }
-
-        // Tensor data starts at current position, aligned to 32 bytes
-        let pos = cursor.position() as usize;
-        let tensor_data_offset = (pos + 31) & !31;
 
         Ok(Self {
-            mmap,
+            mmaps,
             metadata,
-            tensors,
-            tensor_data_offset,
+            tensors: all_tensors,
+            tensor_data_offsets,
         })
+    }
+
+    /// Return the raw byte slice for a tensor's data region.
+    ///
+    /// Picks the correct shard mmap and applies the shard's base offset.
+    fn tensor_slice<'a>(&'a self, info: &GgufTensorInfo, byte_len: usize) -> &'a [u8] {
+        let start = self.tensor_data_offsets[info.shard_idx] + info.offset as usize;
+        &self.mmaps[info.shard_idx][start..start + byte_len]
     }
 
     /// Access parsed metadata
@@ -175,25 +223,21 @@ impl GgufLoader {
             .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
 
         let f32_data: Vec<f32> = match dtype {
             DType::F32 => {
-                let byte_len = numel * 4;
-                bytemuck::cast_slice(&self.mmap[data_start..data_start + byte_len]).to_vec()
+                bytemuck::cast_slice(self.tensor_slice(info, numel * 4)).to_vec()
             }
             DType::F16 => {
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
+                let raw = self.tensor_slice(info, numel * 2);
                 bytemuck::cast_slice::<_, half::f16>(raw)
                     .iter()
                     .map(|x| x.to_f32())
                     .collect()
             }
             DType::BF16 => {
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
+                let raw = self.tensor_slice(info, numel * 2);
                 bytemuck::cast_slice::<_, half::bf16>(raw)
                     .iter()
                     .map(|x| x.to_f32())
@@ -202,7 +246,7 @@ impl GgufLoader {
             DType::Q8_0 => {
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 let block_bytes = dtype.block_size_in_bytes();
-                let raw = &self.mmap[data_start..data_start + num_blocks * block_bytes];
+                let raw = self.tensor_slice(info, num_blocks * block_bytes);
                 let mut out = Vec::with_capacity(numel);
                 for block_idx in 0..num_blocks {
                     let bs = block_idx * block_bytes;
@@ -216,7 +260,7 @@ impl GgufLoader {
             DType::Q4_0 => {
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 let block_bytes = dtype.block_size_in_bytes();
-                let raw = &self.mmap[data_start..data_start + num_blocks * block_bytes];
+                let raw = self.tensor_slice(info, num_blocks * block_bytes);
                 let mut out = vec![0.0f32; numel];
                 for block_idx in 0..num_blocks {
                     let bs = block_idx * block_bytes;
@@ -238,7 +282,7 @@ impl GgufLoader {
                 // Lower 4 bits are packed 2 per byte in qs.
                 const Q5_0_BLOCK_BYTES: usize = 22;
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
-                let raw = &self.mmap[data_start..data_start + num_blocks * Q5_0_BLOCK_BYTES];
+                let raw = self.tensor_slice(info, num_blocks * Q5_0_BLOCK_BYTES);
                 let mut out = vec![0.0f32; numel];
                 #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
                 for block_idx in 0..num_blocks {
@@ -267,7 +311,7 @@ impl GgufLoader {
                 const Q5K_BLOCK_ELEMS: usize = 256;
                 const Q5K_BLOCK_BYTES: usize = 176;
                 let num_blocks = numel / Q5K_BLOCK_ELEMS;
-                let raw = &self.mmap[data_start..data_start + num_blocks * Q5K_BLOCK_BYTES];
+                let raw = self.tensor_slice(info, num_blocks * Q5K_BLOCK_BYTES);
                 let mut out = Vec::with_capacity(numel);
                 #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
                 for block_idx in 0..num_blocks {
@@ -309,7 +353,7 @@ impl GgufLoader {
                 // Layout: ql[128] | qh[64] | scales[16 × i8] | d(f16)
                 // Element mapping matches dequant_q6k_f16 CUDA kernel exactly.
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
-                let raw = &self.mmap[data_start..data_start + num_blocks * Q6_K_BLOCK_SIZE_BYTES];
+                let raw = self.tensor_slice(info, num_blocks * Q6_K_BLOCK_SIZE_BYTES);
                 let mut out = vec![0.0f32; numel];
                 #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
                 for block_idx in 0..num_blocks {
@@ -345,7 +389,7 @@ impl GgufLoader {
                 const Q4K_BLOCK_ELEMS: usize = 256;
                 const Q4K_BLOCK_BYTES: usize = 144;
                 let num_blocks = numel / Q4K_BLOCK_ELEMS;
-                let raw = &self.mmap[data_start..data_start + num_blocks * Q4K_BLOCK_BYTES];
+                let raw = self.tensor_slice(info, num_blocks * Q4K_BLOCK_BYTES);
                 let mut out = Vec::with_capacity(numel);
                 #[allow(clippy::cast_precision_loss)]
                 for block_idx in 0..num_blocks {
@@ -434,23 +478,19 @@ impl GgufLoader {
             .get(name)
             .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
         let bf16_data: Vec<half::bf16> = match dtype {
             DType::BF16 => {
-                let raw = &self.mmap[data_start..data_start + numel * 2];
-                bytemuck::cast_slice(raw).to_vec()
+                bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec()
             }
             DType::F32 => {
-                let raw = &self.mmap[data_start..data_start + numel * 4];
-                bytemuck::cast_slice::<_, f32>(raw)
+                bytemuck::cast_slice::<_, f32>(self.tensor_slice(info, numel * 4))
                     .iter()
                     .map(|&x| half::bf16::from_f32(x))
                     .collect()
             }
             DType::F16 => {
-                let raw = &self.mmap[data_start..data_start + numel * 2];
-                bytemuck::cast_slice::<_, half::f16>(raw)
+                bytemuck::cast_slice::<_, half::f16>(self.tensor_slice(info, numel * 2))
                     .iter()
                     .map(|x| half::bf16::from_f32(x.to_f32()))
                     .collect()
@@ -512,7 +552,6 @@ impl GgufLoader {
             )));
         }
 
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
 
         match dtype {
@@ -520,7 +559,7 @@ impl GgufLoader {
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 let block_bytes = dtype.block_size_in_bytes();
                 let total_bytes = num_blocks * block_bytes;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, total_bytes);
 
                 // GGUF block layout: [scale_f16 (2 bytes) | quants (block_bytes - 2)]
                 // We need to split into separate data and scales arrays
@@ -539,13 +578,13 @@ impl GgufLoader {
                 QuantizedTensor::from_raw(ctx, &info.shape, dtype, &data_buf, &scales_buf)
             }
             DType::F8E4M3 => {
-                let raw = &self.mmap[data_start..data_start + numel];
+                let raw = self.tensor_slice(info, numel);
                 QuantizedTensor::from_raw(ctx, &info.shape, dtype, raw, &[])
             }
             DType::Q6_K => {
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
                 let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, total_bytes);
                 // Store packed super-blocks directly — kernel reads them as-is
                 QuantizedTensor::from_raw(ctx, &info.shape, dtype, raw, &[])
             }
@@ -589,7 +628,6 @@ impl GgufLoader {
             )));
         }
 
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
 
         // shape is [out_features, in_features] after GGUF→row-major conversion
@@ -603,7 +641,7 @@ impl GgufLoader {
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 let block_bytes = dtype.block_size_in_bytes();
                 let total_bytes = num_blocks * block_bytes;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, total_bytes);
 
                 // Compute per-row byte count in the raw (interleaved) format
                 let blocks_per_row = n_cols / QUANTIZATION_BLOCK_SIZE;
@@ -643,7 +681,7 @@ impl GgufLoader {
             DType::Q6_K => {
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
                 let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, total_bytes);
 
                 // Un-permute rows for Q6_K super-blocks
                 let blocks_per_row = n_cols / Q6_K_BLOCK_ELEMENTS;
@@ -704,7 +742,6 @@ impl GgufLoader {
             )));
         }
 
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let n_rows = info.shape[0];
         let n_cols = info.shape[1];
 
@@ -714,7 +751,7 @@ impl GgufLoader {
                 let blocks_per_row = n_cols / QUANTIZATION_BLOCK_SIZE;
                 let row_bytes = blocks_per_row * block_bytes;
                 let total_bytes = n_rows * row_bytes;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, total_bytes);
 
                 let (shard_raw, shard_shape): (Vec<u8>, Vec<usize>) = match strategy {
                     ShardStrategy::Replicate => unreachable!(),
@@ -801,7 +838,6 @@ impl GgufLoader {
             )));
         }
 
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
         let n_rows = info.shape[0];
         let n_cols = info.shape[1];
@@ -814,7 +850,7 @@ impl GgufLoader {
                 let blocks_per_row = n_cols / QUANTIZATION_BLOCK_SIZE;
                 let row_bytes = blocks_per_row * block_bytes;
                 let total_bytes = num_blocks_from_numel(numel, block_bytes);
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, total_bytes);
 
                 // Un-permute all rows into a contiguous host buffer (same as
                 // load_quantized_unpermute), then slice the shard.
@@ -893,27 +929,22 @@ impl WeightLoader for GgufLoader {
             .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
 
         let f32_data: Vec<f32> = match dtype {
             DType::F32 => {
-                let byte_len = numel * 4;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                bytemuck::cast_slice(raw).to_vec()
+                bytemuck::cast_slice(self.tensor_slice(info, numel * 4)).to_vec()
             }
             DType::F16 => {
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let f16_slice: &[half::f16] = bytemuck::cast_slice(raw);
+                let f16_slice: &[half::f16] =
+                    bytemuck::cast_slice(self.tensor_slice(info, numel * 2));
                 f16_slice.iter().map(|x| x.to_f32()).collect()
             }
             DType::Q8_0 => {
                 // Block layout: [f16 scale (2 bytes) | 32 × i8 quants (32 bytes)] = 34 bytes
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 let block_bytes = dtype.block_size_in_bytes();
-                let total_bytes = num_blocks * block_bytes;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, num_blocks * block_bytes);
 
                 let mut out = Vec::with_capacity(numel);
                 for block_idx in 0..num_blocks {
@@ -933,8 +964,7 @@ impl WeightLoader for GgufLoader {
                 // Unsigned [0,15] centered at 8 → signed [-8, 7]
                 let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
                 let block_bytes = dtype.block_size_in_bytes();
-                let total_bytes = num_blocks * block_bytes;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, num_blocks * block_bytes);
 
                 let mut out = vec![0.0; numel];
                 for block_idx in 0..num_blocks {
@@ -967,7 +997,7 @@ impl WeightLoader for GgufLoader {
                 // ql and qh are accessed using the ggml interleaved layout.
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
                 let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
-                let raw = &self.mmap[data_start..data_start + total_bytes];
+                let raw = self.tensor_slice(info, total_bytes);
 
                 let mut out = Vec::with_capacity(numel);
                 for block_idx in 0..num_blocks {
@@ -1054,28 +1084,19 @@ impl WeightLoader for GgufLoader {
             .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
 
         let f16_data: Vec<half::f16> = match dtype {
             DType::F16 => {
-                // Direct load - no conversion needed
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                bytemuck::cast_slice(raw).to_vec()
+                bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec()
             }
             DType::F32 => {
-                // Convert F32 -> F16
-                let byte_len = numel * 4;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let f32_slice: &[f32] = bytemuck::cast_slice(raw);
+                let f32_slice: &[f32] = bytemuck::cast_slice(self.tensor_slice(info, numel * 4));
                 f32_slice.iter().map(|&x| half::f16::from_f32(x)).collect()
             }
             DType::BF16 => {
-                // Convert BF16 -> F16
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let bf16_slice: &[half::bf16] = bytemuck::cast_slice(raw);
+                let bf16_slice: &[half::bf16] =
+                    bytemuck::cast_slice(self.tensor_slice(info, numel * 2));
                 bf16_slice
                     .iter()
                     .map(|x| half::f16::from_f32(x.to_f32()))
@@ -1098,28 +1119,19 @@ impl WeightLoader for GgufLoader {
             .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
-        let data_start = self.tensor_data_offset + info.offset as usize;
         let numel: usize = info.shape.iter().product();
 
         let bf16_data: Vec<half::bf16> = match dtype {
             DType::BF16 => {
-                // Direct load - no conversion needed
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                bytemuck::cast_slice(raw).to_vec()
+                bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec()
             }
             DType::F32 => {
-                // Convert F32 -> BF16
-                let byte_len = numel * 4;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let f32_slice: &[f32] = bytemuck::cast_slice(raw);
+                let f32_slice: &[f32] = bytemuck::cast_slice(self.tensor_slice(info, numel * 4));
                 f32_slice.iter().map(|&x| half::bf16::from_f32(x)).collect()
             }
             DType::F16 => {
-                // Convert F16 -> BF16
-                let byte_len = numel * 2;
-                let raw = &self.mmap[data_start..data_start + byte_len];
-                let f16_slice: &[half::f16] = bytemuck::cast_slice(raw);
+                let f16_slice: &[half::f16] =
+                    bytemuck::cast_slice(self.tensor_slice(info, numel * 2));
                 f16_slice
                     .iter()
                     .map(|x| half::bf16::from_f32(x.to_f32()))
@@ -1156,6 +1168,54 @@ impl WeightLoader for GgufLoader {
 
     fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split GGUF detection
+// ---------------------------------------------------------------------------
+
+/// Detect the split-GGUF filename pattern `stem-NNNNN-of-MMMMM.gguf`.
+///
+/// Returns all shard paths in order if the pattern matches, or `None` for
+/// single-file GGUFs.
+fn detect_split_gguf_shards(path: &Path, name: &str) -> Option<Vec<std::path::PathBuf>> {
+    // Strip .gguf suffix
+    let stem = name.strip_suffix(".gguf")?;
+
+    // Find the last two numeric segments separated by "-of-"
+    // e.g. "model-00001-of-00005" → prefix="model", n=1, total=5
+    let of_pos = stem.rfind("-of-")?;
+    let after_of = &stem[of_pos + 4..];
+    let total: usize = after_of.parse().ok()?;
+    if total <= 1 {
+        return None; // single "shard" — treat as regular file
+    }
+
+    // The segment before "-of-MMMMM" is the current shard number
+    let before_of = &stem[..of_pos];
+    let dash_pos = before_of.rfind('-')?;
+    let _shard_n: usize = before_of[dash_pos + 1..].parse().ok()?;
+    let prefix = &before_of[..dash_pos]; // e.g. "model"
+
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let digit_width = after_of.len(); // width of the MMMMM field (reuse for NNNNN)
+
+    // Reconstruct all shard paths in order
+    let mut shards = Vec::with_capacity(total);
+    for i in 1..=total {
+        let shard_name = format!(
+            "{prefix}-{i:0width$}-of-{total:0width$}.gguf",
+            width = digit_width
+        );
+        shards.push(dir.join(shard_name));
+    }
+
+    // Verify all shards exist
+    if shards.iter().all(|p| p.exists()) {
+        Some(shards)
+    } else {
+        None
     }
 }
 

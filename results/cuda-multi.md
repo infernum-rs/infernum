@@ -16,7 +16,7 @@ llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for mod
 | Model | Format | infernum TP=2 (tok/s) | infernum TP=8 (tok/s) | llama.cpp 1GPU (tok/s) | ratio (TP=2) |
 | ----- | ------ | --------------------: | --------------------: | ---------------------: | -----------: |
 | Llama-3.1-70B | Q4_0 GGUF | 10.4 | 3.8 | 30.1 | 0.35x |
-| Qwen3-72B | Q4_K_M GGUF | 7.3 | — | 23.4 | 0.31x |
+| Qwen3-72B | Q4_K_M GGUF | 7.3 | 3.5 | 23.4 | 0.31x |
 | Qwen3-235B-A22B | Q4_K_M GGUF | — | — | — | — |
 
 **TP decode is structurally eager:** `all_reduce_sum` ops are flagged capture-unsafe because NCCL AllReduce internally calls `cuMemAlloc`, which is illegal inside a CUDA graph capture window. TP=1 uses the CUDA graph fast path; TP>1 runs every decode step eagerly via the interpreter. This is a hard constraint, not a configuration choice.
@@ -25,8 +25,8 @@ llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for mod
 
 **Footnotes:**
 - Llama-3.1-70B Q4_0: on-GPU Q4_0 GEMV kernels (0.5 byte/param), block-sharded across ranks at quantized boundaries.
-- Qwen3-72B Q4_K_M: BF16 dequant at load (Q4_K GPU kernel not yet implemented; 2 byte/param on GPU). Some layers have column counts not divisible by `32 × world_size` at TP=8, causing automatic fallback to BF16 sharding.
-- Qwen3-235B-A22B: pending download and benchmark run.
+- Qwen3-72B Q4_K_M: BF16 dequant at load (Q4_K GPU kernel not yet implemented; 2 byte/param on GPU). Some layers have column counts not divisible by `32 × world_size` at TP=8, causing automatic fallback to BF16 sharding. TP=8 slower than TP=2 (NCCL overhead dominates; model fits on 2 GPUs).
+- Qwen3-235B-A22B: blocked — see Pending table.
 
 ---
 
@@ -34,19 +34,22 @@ llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for mod
 
 | Item | Status |
 | ---- | ------ |
-| Qwen3-235B-A22B Q4_K_M | Downloading (~142 GB); will run at TP=2 and TP=8 |
-| Q4_K GPU kernel | Q4_K_M dequants to BF16 at load; native GPU Q4_K GEMV kernel would reduce VRAM and improve Qwen3-72B throughput |
+| Qwen3-235B-A22B Q4_K_M | **Blocked (2 issues).** (1) `qwen3moe` GGUF architecture not yet supported in the graph engine — needs config parsing + stacked-expert weight loading. (2) Q4_K_M has no GPU GEMV kernel; all 128 experts across 94 layers would dequant to BF16 (~530 GB), exceeding 8×80 GB VRAM. Both must be resolved before any TP run is possible. |
+| Q4_K GPU kernel | Q4_K_M dequants to BF16 at load; native GPU Q4_K GEMV kernel would reduce Qwen3-72B VRAM usage and unlock Qwen3-235B-A22B inference |
+| Qwen3-MoE GGUF support | `qwen3moe` architecture needs: GGUF metadata → `QwenConfig` MoE fields, `safetensors_to_gguf_name` MoE weight mappings (stacked `ffn_{gate,up,down}_exps.weight`), expert-slice loading in the GGUF weight loader |
 | CUDA graph TP | NCCL AllReduce blocks CUDA graph capture; TP>1 runs eager |
 
 ---
 
 ## History
 
-## 2026-05-22 — TP=8 runs for 70B and 72B models
+## 2026-05-22 — TP=8 runs for 70B and 72B models; 235B blocked
 
 - **New:** Llama-3.1-70B Q4_0 at TP=8: 3.8 tok/s (vs TP=2 at 10.4 tok/s — NCCL overhead dominates, model fits on 2 GPUs)
-- **New:** Qwen3-72B Q4_K_M at TP=8: pending
+- **New:** Qwen3-72B Q4_K_M at TP=8: 3.5 tok/s (vs TP=2 at 7.3 tok/s — same overhead pattern)
 - **Fix:** TP=8 alignment check — shapes not divisible by `32 × world_size` now fall back to BF16 sharding instead of panic (affects Qwen3-72B layers with 29568-column weights)
+- **Fix:** Split GGUF loading — `GgufLoader::from_file_or_split` auto-detects `NNNNN-of-MMMMM.gguf` shard sets; enables loading Qwen3-235B-A22B's 5-shard Q4_K_M GGUF
+- **Blocked:** Qwen3-235B-A22B Q4_K_M — `qwen3moe` GGUF architecture unsupported + Q4_K has no GPU GEMV kernel (BF16 dequant would require ~530 GB, exceeding 640 GB total VRAM)
 
 ---
 

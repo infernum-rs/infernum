@@ -282,7 +282,7 @@ pub fn load_graph_weights_gguf_cuda(
 ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
     use infernum::graph::WeightId;
 
-    let loader = crate::weights::GgufLoader::from_file(gguf_path)?;
+    let loader = crate::weights::GgufLoader::from_file_or_split(gguf_path)?;
 
     let tensor_count = graph.tensor_weight_count();
     let linear_count = graph.linear_weight_count();
