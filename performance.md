@@ -208,6 +208,7 @@ The comparison script covers Llama family only. Non-Llama families require manua
 - [ ] Use `--profile` only on a dedicated diagnostic run, not in reported results
 - [ ] Compare all formats against llama.cpp `-ngl 99`
 - [x] Prefill benchmarked — see results/metal.md. Note: GGUF prefill uses serial GEMV (0.001x llama.cpp); SafeTensors prefill uses GEMM and performs well.
+- [x] Llama 3.2 3B measured on M3 Pro 18 GB — first larger-model results recorded (decode only; GGUF prefill impractical at 3B scale). See results/metal.md 2026-05-22 section.
 
 ---
 
