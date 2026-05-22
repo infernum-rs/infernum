@@ -772,8 +772,20 @@ impl infernum::backend::MlaAttentionOps for CudaBackend {
                 (pos as f32 * theta).sin()
             })
             .collect();
-        let cos_t = CudaTensor::from_slice(&ctx, &[1, half_dim], &cos_data)?;
-        let sin_t = CudaTensor::from_slice(&ctx, &[1, half_dim], &sin_data)?;
+        // Build cos/sin in F32 then cast to match q_rope dtype (BF16 in practice).
+        // The rope_interleaved kernel expects cos/sin to have the same dtype as
+        // the input tensor; passing F32 to a BF16 kernel misinterprets the bytes
+        // and produces NaN for values near 1.0 (e.g. 0x3F7FFFFF → lower bytes 0xFFFF).
+        let cos_t_f32 = CudaTensor::from_slice(&ctx, &[1, half_dim], &cos_data)?;
+        let sin_t_f32 = CudaTensor::from_slice(&ctx, &[1, half_dim], &sin_data)?;
+        let (cos_t, sin_t) = match q_rope.dtype() {
+            DType::F32 => (cos_t_f32, sin_t_f32),
+            DType::BF16 => (
+                ops::cast_f32_to_bf16(&cos_t_f32)?,
+                ops::cast_f32_to_bf16(&sin_t_f32)?,
+            ),
+            other => panic!("mla_attention: unsupported dtype {other}"),
+        };
 
         // q_rope_3d: [1, num_heads, qk_rope_head_dim]
         let q_rope_3d = q_rope.reshape(&[1, num_heads, qk_rope_head_dim]);
@@ -800,10 +812,19 @@ impl infernum::backend::MlaAttentionOps for CudaBackend {
         let seq_len = full_kv.shape()[0];
 
         // --- Q absorption: q_nope @ kv_b_proj_k_t ---
-        // kv_b_proj_k_t registered as LinearWeight with shape [kv_lora, num_heads * qk_nope].
-        // linear([num_heads, qk_nope_head_dim], kv_b_proj_k_t) gives
-        // [num_heads, kv_lora_rank].
-        let q_absorbed_nope = <CudaBackend as MatmulOps>::linear(&q_nope, kv_b_proj_k_t)?;
+        // kv_b_proj_k_t is Dense with shape (num_heads, qk_nope_dim, kv_lora_rank).
+        // Use batched matmul: [num_heads, 1, qk_nope_dim] @ [num_heads, qk_nope_dim, kv_lora_rank]
+        //   → [num_heads, 1, kv_lora_rank].
+        let kv_b_proj_k_t_tensor = match kv_b_proj_k_t {
+            crate::cuda::ops::LinearWeight::Dense(w) => w,
+            crate::cuda::ops::LinearWeight::Quantized(_) => {
+                panic!("kv_b_proj_k_t must be a Dense weight")
+            }
+        };
+        let q_nope_3d = q_nope.reshape(&[num_heads, 1, qk_nope_head_dim]);
+        let absorbed_3d = <CudaBackend as MatmulOps>::matmul(&q_nope_3d, kv_b_proj_k_t_tensor)?;
+        // absorbed_3d: [num_heads, 1, kv_lora_rank]
+        let q_absorbed_nope = absorbed_3d.reshape(&[num_heads, kv_lora_rank]);
         // q_absorbed_nope: [num_heads, kv_lora_rank]
 
         // Concat absorbed nope with rotated rope to get full absorbed Q per head.
