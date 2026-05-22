@@ -94,6 +94,57 @@ mod inner {
 
             Ok(Self { replicas })
         }
+
+        /// Load a tensor-parallel model from a GGUF file.
+        ///
+        /// Like `from_config`, but each rank loads its shard directly from the
+        /// GGUF file. Quantized weights stay in their quantized format on GPU.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if device creation, NCCL setup, or weight loading
+        /// fails on any device.
+        ///
+        /// # Panics
+        ///
+        /// Panics if a device thread panics.
+        pub fn from_config_gguf(
+            config: C,
+            num_devices: usize,
+            gguf_path: &Path,
+        ) -> Result<Self> {
+            let comm_id = CudaBackend::create_comm_id()?;
+            let comm_id_raw = *comm_id.to_raw();
+            let gguf_path = gguf_path.to_owned();
+
+            let replicas = thread::scope(|s| {
+                let handles: Vec<_> = (0..num_devices)
+                    .map(|rank| {
+                        let config = config.clone();
+                        let gguf_path = gguf_path.clone();
+                        s.spawn(move || {
+                            let ctx = CudaBackend::create_device(rank)?;
+                            let comm_id = crate::cuda::NcclId::from_raw(comm_id_raw);
+                            let comm = CudaBackend::create_comm(&ctx, rank, num_devices, comm_id)?;
+                            let shard = ShardConfig {
+                                rank,
+                                world_size: num_devices,
+                            };
+                            CudaGraphEngine::from_config_comm_and_gguf(
+                                config, ctx, comm, shard, &gguf_path,
+                            )
+                        })
+                    })
+                    .collect();
+
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("device thread panicked"))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+
+            Ok(Self { replicas })
+        }
     }
 
     /// Per-rank KV cache wrapper for [`ShardedGraphEngine`].

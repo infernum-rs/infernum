@@ -46,15 +46,15 @@ use infernum_cuda::executor;
 use infernum_cuda::CudaBackend;
 use infernum_gemma::{
     build_prefill_graph as gemma_build_prefill_graph, GemmaConfig, GemmaCudaGraphEngine,
-    GemmaCudaGraphEngineExt as _,
+    GemmaCudaGraphEngineExt as _, GemmaShardedGraphEngine, GemmaShardedGraphEngineExt as _,
 };
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaCudaGraphEngine,
-    LlamaCudaGraphEngineExt as _,
+    LlamaCudaGraphEngineExt as _, LlamaShardedGraphEngine, LlamaShardedGraphEngineExt as _,
 };
 use infernum_qwen::{
     build_prefill_graph as qwen_build_prefill_graph, QwenConfig, QwenCudaGraphEngine,
-    QwenCudaGraphEngineExt as _,
+    QwenCudaGraphEngineExt as _, QwenShardedGraphEngine, QwenShardedGraphEngineExt as _,
 };
 use infernum_runtime::Engine;
 
@@ -88,6 +88,10 @@ struct Cli {
     /// Weight dtype for graph mode (f32 or bf16)
     #[arg(long, default_value = "bf16")]
     dtype: String,
+
+    /// Number of GPUs for tensor parallelism (--cuda-graph-engine only)
+    #[arg(long, default_value_t = 1)]
+    gpus: usize,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -998,7 +1002,7 @@ fn bench_cuda_graphs_decode(
 /// Runs a prefill warm-up then times `n_gen` decode steps via the paged KV cache path.
 fn run_engine_bench<M>(ctx: &CudaContext, model: M, n_gen: usize) -> infernum::Result<()>
 where
-    M: infernum::Model<B = infernum_cuda::CudaBackend, KvCache = infernum_cuda::cuda::PagedKvCache>,
+    M: infernum::Model<B = infernum_cuda::CudaBackend>,
 {
     use infernum::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
     use infernum::logits::Logits as _;
@@ -1130,9 +1134,70 @@ fn bench_cuda_graph_engine(
     model_path: &str,
     n_gen: usize,
     _weight_dtype: DType,
+    n_gpus: usize,
 ) -> infernum::Result<()> {
     let is_gguf = model_path.ends_with(".gguf");
 
+    // Multi-GPU path (TP=n_gpus) — requires nccl feature and n_gpus > 1.
+    #[cfg(feature = "nccl")]
+    if n_gpus > 1 {
+        if is_gguf {
+            let loader = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+            let arch = loader
+                .metadata()
+                .get("general.architecture")
+                .and_then(|v| v.as_str())
+                .unwrap_or("llama");
+            return match arch {
+                "llama" | "mistral" | "mixtral" => run_engine_bench(
+                    ctx,
+                    LlamaShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                ),
+                "qwen2" | "qwen3" => run_engine_bench(
+                    ctx,
+                    QwenShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                ),
+                "gemma2" | "gemma3" => run_engine_bench(
+                    ctx,
+                    GemmaShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                ),
+                other => Err(infernum::Error::UnsupportedModel(format!(
+                    "--cuda-graph-engine --gpus GGUF: unsupported architecture `{other}`"
+                ))),
+            };
+        }
+        let model_type = detect_model_type(model_path)?;
+        return match model_type.as_str() {
+            "llama" | "mistral" | "mixtral" => run_engine_bench(
+                ctx,
+                LlamaShardedGraphEngine::from_pretrained(n_gpus, Path::new(model_path))?,
+                n_gen,
+            ),
+            "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
+                ctx,
+                QwenShardedGraphEngine::from_pretrained(n_gpus, Path::new(model_path))?,
+                n_gen,
+            ),
+            "gemma2" | "gemma3_text" => run_engine_bench(
+                ctx,
+                GemmaShardedGraphEngine::from_pretrained(n_gpus, Path::new(model_path))?,
+                n_gen,
+            ),
+            other => Err(infernum::Error::UnsupportedModel(format!(
+                "--cuda-graph-engine --gpus: unsupported model_type `{other}`"
+            ))),
+        };
+    }
+    #[cfg(not(feature = "nccl"))]
+    if n_gpus > 1 {
+        eprintln!("ERROR: --gpus > 1 requires the `nccl` feature (rebuild with --features nccl)");
+        std::process::exit(1);
+    }
+
+    // Single-GPU path.
     if is_gguf {
         let loader = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
         let arch = loader
@@ -1244,7 +1309,7 @@ fn main() -> infernum::Result<()> {
         );
 
         let result = if cli.cuda_graph_engine {
-            bench_cuda_graph_engine(&ctx, &cli.model, cli.n_gen, weight_dtype)
+            bench_cuda_graph_engine(&ctx, &cli.model, cli.n_gen, weight_dtype, cli.gpus)
         } else if cli.cuda_graphs {
             bench_cuda_graphs_decode(&ctx, &cli.model, cli.n_gen, weight_dtype)
         } else if cli.graph_decode {

@@ -34,6 +34,15 @@ pub enum DType {
     Q4_1,
     /// 6-bit K-quant (super-block of 256 elements, 210 bytes per block)
     Q6_K,
+    /// 5-bit block-quantized (block size 32: d[f16] + qh[4 bytes high bits] + qs[16 bytes]).
+    /// Loaded by dequantizing to BF16 on CPU; no dedicated GPU kernel.
+    Q5_0,
+    /// 4-bit K-quant (super-block of 256 elements, 144 bytes per block).
+    /// Loaded by dequantizing to BF16 on CPU; no dedicated GPU kernel.
+    Q4_K,
+    /// 5-bit K-quant (super-block of 256 elements, 176 bytes per block).
+    /// Loaded by dequantizing to BF16 on CPU; no dedicated GPU kernel.
+    Q5_K,
     /// 8-bit floating point (E4M3 format: 4 exponent, 3 mantissa bits)
     F8E4M3,
     /// GPTQ INT4: group-quantized 4-bit (packed in int32, with f16 scales and int32 zero-points)
@@ -57,7 +66,10 @@ impl DType {
             Self::Q8_0
             | Self::Q4_0
             | Self::Q4_1
+            | Self::Q5_0
             | Self::Q6_K
+            | Self::Q4_K
+            | Self::Q5_K
             | Self::GPTQ_INT4
             | Self::AWQ_INT4 => {
                 panic!("Quantized types have no fixed per-element size")
@@ -95,10 +107,25 @@ impl DType {
             Self::Q8_0
                 | Self::Q4_0
                 | Self::Q4_1
+                | Self::Q5_0
                 | Self::Q6_K
+                | Self::Q4_K
+                | Self::Q5_K
                 | Self::F8E4M3
                 | Self::GPTQ_INT4
                 | Self::AWQ_INT4
+        )
+    }
+
+    /// Whether this dtype has a dedicated GPU quantized-matmul kernel.
+    ///
+    /// K-quant types like `Q4_K` are quantized but loaded as BF16 on GPU
+    /// because no on-device kernel exists for them yet.
+    #[must_use]
+    pub const fn has_gpu_quant_kernel(self) -> bool {
+        matches!(
+            self,
+            Self::Q8_0 | Self::Q4_0 | Self::Q4_1 | Self::Q6_K | Self::F8E4M3
         )
     }
 
@@ -139,7 +166,10 @@ impl fmt::Display for DType {
             Self::Q8_0 => write!(f, "q8_0"),
             Self::Q4_0 => write!(f, "q4_0"),
             Self::Q4_1 => write!(f, "q4_1"),
+            Self::Q5_0 => write!(f, "q5_0"),
             Self::Q6_K => write!(f, "q6_k"),
+            Self::Q4_K => write!(f, "q4_k"),
+            Self::Q5_K => write!(f, "q5_k"),
             Self::F8E4M3 => write!(f, "f8e4m3"),
             Self::GPTQ_INT4 => write!(f, "gptq_int4"),
             Self::AWQ_INT4 => write!(f, "awq_int4"),

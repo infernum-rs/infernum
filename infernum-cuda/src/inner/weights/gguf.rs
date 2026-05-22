@@ -23,7 +23,8 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
-use crate::weights::WeightLoader;
+use crate::cuda::{ShardConfig, ShardStrategy};
+use super::loader::WeightLoader;
 use infernum::dtype::{DType, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE};
 use infernum::Error;
 use infernum::Result;
@@ -40,6 +41,9 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q5_0: u32 = 6;
+const GGML_TYPE_Q4_K: u32 = 12;
+const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_BF16: u32 = 30;
 
@@ -227,6 +231,150 @@ impl GgufLoader {
                 }
                 out
             }
+            DType::Q5_0 => {
+                // Q5_0: 32 elements per block, 22 bytes.
+                // Layout: d[f16] | qh[4 bytes] | qs[16 bytes]
+                // High bit of each 5-bit value is packed in qh (1 bit per element).
+                // Lower 4 bits are packed 2 per byte in qs.
+                const Q5_0_BLOCK_BYTES: usize = 22;
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let raw = &self.mmap[data_start..data_start + num_blocks * Q5_0_BLOCK_BYTES];
+                let mut out = vec![0.0f32; numel];
+                #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+                for block_idx in 0..num_blocks {
+                    let b = block_idx * Q5_0_BLOCK_BYTES;
+                    let d = half::f16::from_le_bytes([raw[b], raw[b + 1]]).to_f32();
+                    let qh = &raw[b + 2..b + 6];
+                    let qs = &raw[b + 6..b + 22];
+                    let base = block_idx * QUANTIZATION_BLOCK_SIZE;
+                    for i in 0..QUANTIZATION_BLOCK_SIZE {
+                        let high = i32::from((qh[i / 8] >> (i % 8)) & 1);
+                        let low = if i % 2 == 0 {
+                            i32::from(qs[i / 2] & 0x0F)
+                        } else {
+                            i32::from(qs[i / 2] >> 4)
+                        };
+                        out[base + i] = d * ((high << 4 | low) as f32 - 16.0);
+                    }
+                }
+                out
+            }
+            DType::Q5_K => {
+                // Q5_K super-block: 256 elements, 176 bytes.
+                // Layout: d[f16] dmin[f16] scales[12] qh[32] qs[128]
+                // 8 sub-blocks of 32 elements; scales packed 6-bit in scales[12] (same as Q4_K).
+                // Each element uses lower 4 bits from qs and 1 high bit from qh.
+                const Q5K_BLOCK_ELEMS: usize = 256;
+                const Q5K_BLOCK_BYTES: usize = 176;
+                let num_blocks = numel / Q5K_BLOCK_ELEMS;
+                let raw = &self.mmap[data_start..data_start + num_blocks * Q5K_BLOCK_BYTES];
+                let mut out = Vec::with_capacity(numel);
+                #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+                for block_idx in 0..num_blocks {
+                    let b = block_idx * Q5K_BLOCK_BYTES;
+                    let d = half::f16::from_le_bytes([raw[b], raw[b + 1]]).to_f32();
+                    let dmin = half::f16::from_le_bytes([raw[b + 2], raw[b + 3]]).to_f32();
+                    let scales = &raw[b + 4..b + 16];
+                    let qh = &raw[b + 16..b + 48]; // 32 bytes: 256 high bits (1 per element)
+                    let qs = &raw[b + 48..b + Q5K_BLOCK_BYTES]; // 128 bytes: lower 4 bits
+                    let mut q_idx: usize = 0;
+                    let mut qh_idx: usize = 0;
+                    let mut is: usize = 0;
+                    for _ in 0..4 {
+                        let (sc0, m0) = get_scale_min_k4(is, scales);
+                        let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+                        let d1 = d * sc0 as f32;
+                        let m1v = dmin * m0 as f32;
+                        let d2 = d * sc1 as f32;
+                        let m2v = dmin * m1 as f32;
+                        for l in 0..32 {
+                            let high = i32::from((qh[qh_idx + l / 8] >> (l % 8)) & 1);
+                            let low = i32::from(qs[q_idx + l] & 0xF);
+                            out.push(d1 * ((high << 4 | low) as f32) - m1v);
+                        }
+                        for l in 0..32 {
+                            let high = i32::from((qh[qh_idx + 4 + l / 8] >> (l % 8)) & 1);
+                            let low = i32::from(qs[q_idx + l] >> 4);
+                            out.push(d2 * ((high << 4 | low) as f32) - m2v);
+                        }
+                        q_idx += 32;
+                        qh_idx += 8;
+                        is += 2;
+                    }
+                }
+                out
+            }
+            DType::Q6_K => {
+                // Q6_K super-block: 256 elements, 210 bytes.
+                // Layout: ql[128] | qh[64] | scales[16 × i8] | d(f16)
+                // Element mapping matches dequant_q6k_f16 CUDA kernel exactly.
+                let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
+                let raw = &self.mmap[data_start..data_start + num_blocks * Q6_K_BLOCK_SIZE_BYTES];
+                let mut out = vec![0.0f32; numel];
+                #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+                for block_idx in 0..num_blocks {
+                    let b = block_idx * Q6_K_BLOCK_SIZE_BYTES;
+                    let d = half::f16::from_le_bytes([raw[b + 208], raw[b + 209]]).to_f32();
+                    let ql = &raw[b..b + 128];
+                    let qh = &raw[b + 128..b + 192];
+                    let sc: &[i8] = bytemuck::cast_slice(&raw[b + 192..b + 208]);
+                    let out_base = block_idx * Q6_K_BLOCK_ELEMENTS;
+                    for elem in 0..Q6_K_BLOCK_ELEMENTS {
+                        let sb = elem / 16;
+                        let flat_idx = sb * 16 + (elem % 16);
+                        let row8 = flat_idx / 32;
+                        let col32 = flat_idx % 32;
+                        let ql_half = row8 / 4;
+                        let ql_nibble_sel = (row8 % 4) / 2;
+                        let ql_offset = (row8 % 4) % 2;
+                        let ql_byte = ql[ql_half * 64 + ql_offset * 32 + col32];
+                        let ql_val = if ql_nibble_sel == 0 { ql_byte & 0x0F } else { ql_byte >> 4 };
+                        let qh_half = row8 / 4;
+                        let qh_byte = qh[qh_half * 32 + col32];
+                        let qh_val = (qh_byte >> ((row8 % 4) * 2)) & 0x03;
+                        let q = (i32::from(ql_val) | (i32::from(qh_val) << 4)) - 32;
+                        out[out_base + elem] = d * sc[sb] as f32 * q as f32;
+                    }
+                }
+                out
+            }
+            DType::Q4_K => {
+                // Q4_K (K-quant): 256 elements per super-block (144 bytes).
+                // Block layout: d[f16] dmin[f16] scales[12] qs[128]
+                // 8 sub-blocks of 32 elements; scales packed 6-bit in scales[12].
+                const Q4K_BLOCK_ELEMS: usize = 256;
+                const Q4K_BLOCK_BYTES: usize = 144;
+                let num_blocks = numel / Q4K_BLOCK_ELEMS;
+                let raw = &self.mmap[data_start..data_start + num_blocks * Q4K_BLOCK_BYTES];
+                let mut out = Vec::with_capacity(numel);
+                #[allow(clippy::cast_precision_loss)]
+                for block_idx in 0..num_blocks {
+                    let b = block_idx * Q4K_BLOCK_BYTES;
+                    let d = half::f16::from_le_bytes([raw[b], raw[b + 1]]).to_f32();
+                    let dmin = half::f16::from_le_bytes([raw[b + 2], raw[b + 3]]).to_f32();
+                    let scales = &raw[b + 4..b + 16];
+                    let qs = &raw[b + 16..b + Q4K_BLOCK_BYTES];
+                    let mut q_idx: usize = 0;
+                    let mut is: usize = 0;
+                    for _ in 0..4 {
+                        let (sc0, m0) = get_scale_min_k4(is, scales);
+                        let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+                        let d1 = d * sc0 as f32;
+                        let m1v = dmin * m0 as f32;
+                        let d2 = d * sc1 as f32;
+                        let m2v = dmin * m1 as f32;
+                        for l in 0..32 {
+                            out.push(d1 * (qs[q_idx + l] & 0xF) as f32 - m1v);
+                        }
+                        for l in 0..32 {
+                            out.push(d2 * (qs[q_idx + l] >> 4) as f32 - m2v);
+                        }
+                        q_idx += 32;
+                        is += 2;
+                    }
+                }
+                out
+            }
             other => {
                 return Err(Error::UnsupportedDtype(format!(
                     "dequantize_to_f32_vec: unsupported dtype {other} for '{name}'"
@@ -274,6 +422,75 @@ impl GgufLoader {
             .map(|&x| half::bf16::from_f32(x))
             .collect();
         CudaTensor::from_slice(ctx, &shape, &bf16_data)
+    }
+
+    /// Load a tensor as raw BF16 bytes on the host (no GPU upload).
+    ///
+    /// Returns `(bytes, shape)`. Caller is responsible for uploading and transposing.
+    /// Use this in the sharded load path to avoid redundant GPU round-trips.
+    pub fn load_bf16_bytes(&self, name: &str) -> Result<(Vec<u8>, Vec<usize>)> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
+        let data_start = self.tensor_data_offset + info.offset as usize;
+        let numel: usize = info.shape.iter().product();
+        let bf16_data: Vec<half::bf16> = match dtype {
+            DType::BF16 => {
+                let raw = &self.mmap[data_start..data_start + numel * 2];
+                bytemuck::cast_slice(raw).to_vec()
+            }
+            DType::F32 => {
+                let raw = &self.mmap[data_start..data_start + numel * 4];
+                bytemuck::cast_slice::<_, f32>(raw)
+                    .iter()
+                    .map(|&x| half::bf16::from_f32(x))
+                    .collect()
+            }
+            DType::F16 => {
+                let raw = &self.mmap[data_start..data_start + numel * 2];
+                bytemuck::cast_slice::<_, half::f16>(raw)
+                    .iter()
+                    .map(|x| half::bf16::from_f32(x.to_f32()))
+                    .collect()
+            }
+            _ => {
+                let (f32_data, _) = self.dequantize_to_f32_vec(name)?;
+                f32_data.iter().map(|&x| half::bf16::from_f32(x)).collect()
+            }
+        };
+        Ok((
+            bytemuck::cast_slice(&bf16_data).to_vec(),
+            info.shape.clone(),
+        ))
+    }
+
+    /// Load a Q/K tensor as raw BF16 bytes on host, reversing the llama.cpp RoPE permutation.
+    pub fn load_bf16_bytes_unpermute(
+        &self,
+        name: &str,
+        n_head: usize,
+    ) -> Result<(Vec<u8>, Vec<usize>)> {
+        let (data, shape) = self.dequantize_to_f32_vec(name)?;
+        let n_rows = shape[0];
+        let n_cols = shape[1];
+        let head_dim = n_rows / n_head;
+        let half_dim = head_dim / 2;
+        let mut unpermuted = vec![0.0f32; data.len()];
+        for h in 0..n_head {
+            for i in 0..half_dim {
+                let src0 = (h * head_dim + 2 * i) * n_cols;
+                let src1 = (h * head_dim + 2 * i + 1) * n_cols;
+                let dst0 = (h * head_dim + i) * n_cols;
+                let dst1 = (h * head_dim + i + half_dim) * n_cols;
+                unpermuted[dst0..dst0 + n_cols].copy_from_slice(&data[src0..src0 + n_cols]);
+                unpermuted[dst1..dst1 + n_cols].copy_from_slice(&data[src1..src1 + n_cols]);
+            }
+        }
+        let bf16_data: Vec<half::bf16> =
+            unpermuted.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        Ok((bytemuck::cast_slice(&bf16_data).to_vec(), shape))
     }
 
     /// Load a tensor as a `QuantizedTensor` (for Q8_0 / Q4_0 weights).
@@ -454,6 +671,191 @@ impl GgufLoader {
         }
     }
 
+    /// Load a quantized tensor, sharding along row or column block boundaries.
+    ///
+    /// For `Column`: splits along output rows (dim 0). For `Row`: splits along
+    /// input columns (dim 1, must be a multiple of `block_size * world_size`).
+    /// For `Replicate` or `world_size == 1`: delegates to `load_quantized`.
+    ///
+    /// Works directly from the mmap — no GPU round-trip needed for the slice.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found, has an unsupported type,
+    /// or GPU allocation fails.
+    pub fn load_quantized_sharded(
+        &self,
+        ctx: &CudaContext,
+        name: &str,
+        shard: &ShardConfig,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        if strategy == ShardStrategy::Replicate || shard.world_size == 1 {
+            return self.load_quantized(ctx, name);
+        }
+
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
+        if !dtype.is_quantized() {
+            return Err(Error::UnsupportedDtype(format!(
+                "load_quantized_sharded: '{name}' is {dtype}, not a quantized type"
+            )));
+        }
+
+        let data_start = self.tensor_data_offset + info.offset as usize;
+        let n_rows = info.shape[0];
+        let n_cols = info.shape[1];
+
+        match dtype {
+            DType::Q8_0 | DType::Q4_0 => {
+                let block_bytes = dtype.block_size_in_bytes();
+                let blocks_per_row = n_cols / QUANTIZATION_BLOCK_SIZE;
+                let row_bytes = blocks_per_row * block_bytes;
+                let total_bytes = n_rows * row_bytes;
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                let (shard_raw, shard_shape): (Vec<u8>, Vec<usize>) = match strategy {
+                    ShardStrategy::Replicate => unreachable!(),
+                    ShardStrategy::Column => {
+                        let (start_row, shard_rows) = shard.shard_range(n_rows);
+                        let start = start_row * row_bytes;
+                        let end = start + shard_rows * row_bytes;
+                        (raw[start..end].to_vec(), vec![shard_rows, n_cols])
+                    }
+                    ShardStrategy::Row => {
+                        let blocks_per_shard = blocks_per_row / shard.world_size;
+                        assert_eq!(
+                            blocks_per_row % shard.world_size,
+                            0,
+                            "n_cols ({n_cols}) must be divisible by block_size*world_size \
+                             ({} * {})",
+                            QUANTIZATION_BLOCK_SIZE,
+                            shard.world_size
+                        );
+                        let shard_cols = blocks_per_shard * QUANTIZATION_BLOCK_SIZE;
+                        let start_block = shard.rank * blocks_per_shard;
+                        let shard_block_bytes = blocks_per_shard * block_bytes;
+
+                        let mut buf = Vec::with_capacity(n_rows * shard_block_bytes);
+                        for row in 0..n_rows {
+                            let row_start = row * row_bytes + start_block * block_bytes;
+                            buf.extend_from_slice(
+                                &raw[row_start..row_start + shard_block_bytes],
+                            );
+                        }
+                        (buf, vec![n_rows, shard_cols])
+                    }
+                };
+
+                // Split interleaved GGUF blocks into separate data and scales buffers.
+                let quant_bytes_per_block = block_bytes - 2;
+                let num_shard_blocks = shard_raw.len() / block_bytes;
+                let mut data_buf = Vec::with_capacity(num_shard_blocks * quant_bytes_per_block);
+                let mut scales_buf = Vec::with_capacity(num_shard_blocks * 2);
+                for block_idx in 0..num_shard_blocks {
+                    let bs = block_idx * block_bytes;
+                    scales_buf.extend_from_slice(&shard_raw[bs..bs + 2]);
+                    data_buf.extend_from_slice(&shard_raw[bs + 2..bs + block_bytes]);
+                }
+
+                QuantizedTensor::from_raw(ctx, &shard_shape, dtype, &data_buf, &scales_buf)
+            }
+            other => Err(Error::UnsupportedDtype(format!(
+                "load_quantized_sharded: {other} sharding not yet supported"
+            ))),
+        }
+    }
+
+    /// Load a quantized Q/K weight, reverse the llama.cpp row permutation,
+    /// and shard along the output dimension (Column strategy only).
+    ///
+    /// This is the sharded version of `load_quantized_unpermute`.
+    /// Row-sharding Q/K projections is not supported (they are always
+    /// Column-parallel in standard tensor-parallel layouts).
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is not found, has an unsupported type,
+    /// or GPU allocation fails.
+    pub fn load_quantized_unpermute_sharded(
+        &self,
+        ctx: &CudaContext,
+        name: &str,
+        n_head: usize,
+        shard: &ShardConfig,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        if strategy != ShardStrategy::Column || shard.world_size == 1 {
+            return self.load_quantized_unpermute(ctx, name, n_head);
+        }
+
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
+        if !dtype.is_quantized() {
+            return Err(Error::UnsupportedDtype(format!(
+                "load_quantized_unpermute_sharded: '{name}' is {dtype}, not a quantized type"
+            )));
+        }
+
+        let data_start = self.tensor_data_offset + info.offset as usize;
+        let numel: usize = info.shape.iter().product();
+        let n_rows = info.shape[0];
+        let n_cols = info.shape[1];
+        let head_dim = n_rows / n_head;
+        let half_dim = head_dim / 2;
+
+        match dtype {
+            DType::Q8_0 | DType::Q4_0 => {
+                let block_bytes = dtype.block_size_in_bytes();
+                let blocks_per_row = n_cols / QUANTIZATION_BLOCK_SIZE;
+                let row_bytes = blocks_per_row * block_bytes;
+                let total_bytes = num_blocks_from_numel(numel, block_bytes);
+                let raw = &self.mmap[data_start..data_start + total_bytes];
+
+                // Un-permute all rows into a contiguous host buffer (same as
+                // load_quantized_unpermute), then slice the shard.
+                let mut unpermuted = vec![0u8; total_bytes];
+                for h in 0..n_head {
+                    for i in 0..half_dim {
+                        let src0 = (h * head_dim + 2 * i) * row_bytes;
+                        let src1 = (h * head_dim + 2 * i + 1) * row_bytes;
+                        let dst0 = (h * head_dim + i) * row_bytes;
+                        let dst1 = (h * head_dim + i + half_dim) * row_bytes;
+                        unpermuted[dst0..dst0 + row_bytes]
+                            .copy_from_slice(&raw[src0..src0 + row_bytes]);
+                        unpermuted[dst1..dst1 + row_bytes]
+                            .copy_from_slice(&raw[src1..src1 + row_bytes]);
+                    }
+                }
+
+                // Column shard: take rows [start_row, start_row + shard_rows).
+                let (start_row, shard_rows) = shard.shard_range(n_rows);
+                let start = start_row * row_bytes;
+                let end = start + shard_rows * row_bytes;
+                let shard_raw = &unpermuted[start..end];
+
+                let quant_bytes_per_block = block_bytes - 2;
+                let num_shard_blocks = shard_rows * blocks_per_row;
+                let mut data_buf = Vec::with_capacity(num_shard_blocks * quant_bytes_per_block);
+                let mut scales_buf = Vec::with_capacity(num_shard_blocks * 2);
+                for block_idx in 0..num_shard_blocks {
+                    let bs = block_idx * block_bytes;
+                    scales_buf.extend_from_slice(&shard_raw[bs..bs + 2]);
+                    data_buf.extend_from_slice(&shard_raw[bs + 2..bs + block_bytes]);
+                }
+
+                QuantizedTensor::from_raw(ctx, &[shard_rows, n_cols], dtype, &data_buf, &scales_buf)
+            }
+            other => Err(Error::UnsupportedDtype(format!(
+                "load_quantized_unpermute_sharded: {other} not yet supported"
+            ))),
+        }
+    }
+
     /// Get the dtype of a tensor in the file
     fn tensor_dtype(&self, name: &str) -> Result<DType> {
         let info = self
@@ -464,7 +866,26 @@ impl GgufLoader {
     }
 }
 
+fn num_blocks_from_numel(numel: usize, block_bytes: usize) -> usize {
+    // block_bytes includes 2 bytes of scale; quant elements = QUANTIZATION_BLOCK_SIZE per block
+    numel / QUANTIZATION_BLOCK_SIZE * block_bytes
+}
+
 impl WeightLoader for GgufLoader {
+    fn load_quantized(&self, ctx: &CudaContext, name: &str) -> Result<QuantizedTensor> {
+        GgufLoader::load_quantized(self, ctx, name)
+    }
+
+    fn load_quantized_sharded(
+        &self,
+        ctx: &CudaContext,
+        name: &str,
+        shard: &ShardConfig,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        GgufLoader::load_quantized_sharded(self, ctx, name, shard, strategy)
+    }
+
     fn load_f32(&self, ctx: &CudaContext, name: &str) -> Result<CudaTensor> {
         let info = self
             .tensors
@@ -861,6 +1282,21 @@ fn read_gguf_typed_value(cursor: &mut Cursor<&[u8]>, value_type: u32) -> Result<
 // Type conversion
 // ---------------------------------------------------------------------------
 
+/// Decode one (scale, min) pair from the Q4_K packed 6-bit scales array.
+///
+/// `j` is the sub-block index (0..8); `q` is the 12-byte scales buffer.
+/// Matches llama.cpp's `get_scale_min_k4`.
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
 fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
     match ggml_type {
         GGML_TYPE_F32 => Ok(DType::F32),
@@ -868,6 +1304,9 @@ fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
         GGML_TYPE_BF16 => Ok(DType::BF16),
         GGML_TYPE_Q8_0 => Ok(DType::Q8_0),
         GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
+        GGML_TYPE_Q5_0 => Ok(DType::Q5_0),
+        GGML_TYPE_Q4_K => Ok(DType::Q4_K),
+        GGML_TYPE_Q5_K => Ok(DType::Q5_K),
         GGML_TYPE_Q6_K => Ok(DType::Q6_K),
         other => Err(Error::UnsupportedDtype(format!(
             "Unsupported GGML tensor type: {other}"

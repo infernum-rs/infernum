@@ -25,10 +25,10 @@ use std::sync::Arc;
 
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, WeightStore};
-use infernum::shard::{shard_strategy_for_weight, ShardConfig};
+use infernum::shard::{shard_strategy_for_weight, ShardConfig, ShardStrategy};
 use infernum::weights::QuantizationConfig;
 use infernum::WeightLoader as _;
-use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, Tensor};
+use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
@@ -115,9 +115,13 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
 
     /// Load all model weights from a GGUF file into CUDA memory.
     ///
-    /// Weights are dequantized to BF16 on the host and uploaded. Q and K
+    /// Quantized weights (Q8_0, Q4_0, Q6_K) are kept in their quantized form
+    /// on the GPU; non-quantized weights are dequantized to BF16. Q and K
     /// projection weights are un-permuted from GGUF's interleaved RoPE layout
     /// to the HuggingFace sequential layout before upload.
+    ///
+    /// When `shard` is `Some`, each linear weight is sliced at block boundaries
+    /// to this rank's portion before uploading (enabling GGUF tensor-parallel).
     ///
     /// Returns `Err` by default; override for each model family.
     ///
@@ -130,8 +134,9 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
         dummy_graph: &Graph<CudaBackend>,
         ctx: &CudaContext,
         gguf_path: &Path,
+        shard: Option<&ShardConfig>,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
-        let _ = (dummy_graph, ctx, gguf_path);
+        let _ = (dummy_graph, ctx, gguf_path, shard);
         Err(infernum::Error::UnsupportedModel(
             "GGUF loading is not yet supported by the CUDA graph engine for this model".to_string(),
         ))
@@ -238,10 +243,16 @@ pub fn load_graph_weights_cuda(
     Ok(store)
 }
 
-/// Load all graph weights from a GGUF file into CUDA memory as BF16.
+/// Load all graph weights from a GGUF file into CUDA memory.
 ///
-/// Weights are dequantized on the host; Q and K projections are un-permuted
-/// from GGUF's interleaved RoPE layout before upload.
+/// Quantized weights (Q8_0, Q4_0, Q6_K) are kept in quantized form on the GPU
+/// so the existing quantized GEMV kernels can run decode at native quantized
+/// memory bandwidth. Non-quantized weights (BF16/F16/F32) are dequantized to
+/// BF16 on the host.
+///
+/// Q and K projections are un-permuted from GGUF's interleaved RoPE layout
+/// before upload. When `shard` is `Some`, each linear weight is sliced at
+/// block boundaries to the rank's portion (enables GGUF tensor-parallelism).
 ///
 /// `name_mapper` converts SafeTensors weight names (as registered in the graph)
 /// to GGUF key names. `n_heads` / `n_kv_heads` are used to compute the head
@@ -267,6 +278,7 @@ pub fn load_graph_weights_gguf_cuda(
     n_heads: usize,
     n_kv_heads: usize,
     lm_head_fallback: bool,
+    shard: Option<&ShardConfig>,
 ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
     use infernum::graph::WeightId;
 
@@ -276,6 +288,7 @@ pub fn load_graph_weights_gguf_cuda(
     let linear_count = graph.linear_weight_count();
     let mut store = WeightStore::with_capacity(tensor_count, linear_count);
 
+    // Tensor weights (embeddings, norms, RoPE caches) are always replicated.
     for i in 0..tensor_count {
         let meta = graph.tensor_weight_meta(WeightId::from_index(
             u32::try_from(i).expect("weight count exceeds u32"),
@@ -302,42 +315,121 @@ pub fn load_graph_weights_gguf_cuda(
             gguf_name.clone()
         };
 
-        // Q and K projections need row-unpermutation; use appropriate head count.
-        let tensor = if is_qk(&gguf_name) {
-            let n_head = if gguf_name.contains("attn_q") {
-                n_heads
+        let file_dtype = loader.get_dtype(&effective_gguf_name)?;
+        let strategy = shard_strategy_for_weight(safetensors_name);
+
+        // Q8_0 and Q4_0 have both GPU kernels and sharding support.
+        // Q6_K has a GPU kernel for single-GPU but sharding isn't implemented yet.
+        // K-quants (Q4_K) and other unsupported types fall through to BF16.
+        let supports_quant_sharding =
+            matches!(file_dtype, DType::Q8_0 | DType::Q4_0);
+        let use_gpu_quant = file_dtype.has_gpu_quant_kernel()
+            && (shard.is_none() || supports_quant_sharding);
+
+        let weight = if use_gpu_quant {
+            // Keep quantized on GPU — GEMV kernels dequantize on the fly.
+            // No transpose needed: quantized matmul kernels use the native
+            // [out, in] layout, unlike dense weights which are transposed.
+            if is_qk(&gguf_name) {
+                let n_head = if gguf_name.contains("attn_q") { n_heads } else { n_kv_heads };
+                let qt = match shard {
+                    None => loader.load_quantized_unpermute(ctx, &effective_gguf_name, n_head)?,
+                    Some(s) => loader.load_quantized_unpermute_sharded(
+                        ctx,
+                        &effective_gguf_name,
+                        n_head,
+                        s,
+                        strategy,
+                    )?,
+                };
+                LinearWeight::Quantized(qt)
             } else {
-                n_kv_heads
-            };
-            loader.load_bf16_unpermute(ctx, &effective_gguf_name, n_head)?
+                let qt = match shard {
+                    None => loader.load_quantized(ctx, &effective_gguf_name)?,
+                    Some(s) => {
+                        loader.load_quantized_sharded(ctx, &effective_gguf_name, s, strategy)?
+                    }
+                };
+                LinearWeight::Quantized(qt)
+            }
         } else {
-            loader.load_bf16(ctx, &effective_gguf_name)?
+            // Non-quantized or unsupported quant (Q4_K, Q5_K, Q6_K+TP, etc.):
+            // dequantize to BF16 on host, shard host bytes, upload once, GPU-transpose.
+            let (host_bytes, shape) = if is_qk(&gguf_name) {
+                let n_head = if gguf_name.contains("attn_q") { n_heads } else { n_kv_heads };
+                loader.load_bf16_bytes_unpermute(&effective_gguf_name, n_head)?
+            } else {
+                loader.load_bf16_bytes(&effective_gguf_name)?
+            };
+            let (rows, cols) = (shape[0], shape[1]);
+            let tensor = match shard {
+                None => CudaTensor::from_raw_bytes(
+                    ctx,
+                    &[rows, cols],
+                    infernum::dtype::DType::BF16,
+                    &host_bytes,
+                )?,
+                Some(s) => shard_bf16_slice(ctx, &host_bytes, rows, cols, s, strategy)?,
+            };
+            // GPU transpose: (rows, cols) → (cols, rows)
+            LinearWeight::Dense(crate::cuda::ops::transpose_2d(&tensor)?)
         };
 
-        // BF16 linear weights need to be transposed (row-major → column-major for matmul).
-        let transposed = host_transpose_bf16(ctx, &tensor)?;
-        store.push_linear_weight(LinearWeight::Dense(transposed));
+        store.push_linear_weight(weight);
     }
 
     Ok(store)
 }
 
-/// Transpose a 2-D BF16 `CudaTensor` on the host.
-fn host_transpose_bf16(ctx: &CudaContext, tensor: &CudaTensor) -> Result<CudaTensor> {
-    let shape = tensor.shape().to_vec();
-    let rows = shape[0];
-    let cols = shape[1];
-    let data = tensor.to_raw_bytes()?;
+/// Shard a 2D BF16 slice on the host (slice, then upload).
+///
+/// Takes raw BF16 bytes (not yet on GPU) to avoid an unnecessary upload/download cycle.
+fn shard_bf16_slice(
+    ctx: &CudaContext,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    shard: &ShardConfig,
+    strategy: ShardStrategy,
+) -> Result<CudaTensor> {
     let elem = 2usize; // bf16
-    let mut transposed = vec![0u8; data.len()];
-    for r in 0..rows {
-        for c in 0..cols {
-            let src = (r * cols + c) * elem;
-            let dst = (c * rows + r) * elem;
-            transposed[dst..dst + elem].copy_from_slice(&data[src..src + elem]);
+    match strategy {
+        ShardStrategy::Replicate => CudaTensor::from_raw_bytes(
+            ctx,
+            &[rows, cols],
+            infernum::dtype::DType::BF16,
+            data,
+        ),
+        ShardStrategy::Column => {
+            let (start_row, shard_rows) = shard.shard_range(rows);
+            let row_bytes = cols * elem;
+            let start = start_row * row_bytes;
+            let end = start + shard_rows * row_bytes;
+            CudaTensor::from_raw_bytes(
+                ctx,
+                &[shard_rows, cols],
+                infernum::dtype::DType::BF16,
+                &data[start..end],
+            )
+        }
+        ShardStrategy::Row => {
+            let (start_col, shard_cols) = shard.shard_range(cols);
+            let mut shard_data = vec![0u8; rows * shard_cols * elem];
+            for r in 0..rows {
+                let src_start = (r * cols + start_col) * elem;
+                let dst_start = r * shard_cols * elem;
+                let chunk = shard_cols * elem;
+                shard_data[dst_start..dst_start + chunk]
+                    .copy_from_slice(&data[src_start..src_start + chunk]);
+            }
+            CudaTensor::from_raw_bytes(
+                ctx,
+                &[rows, shard_cols],
+                infernum::dtype::DType::BF16,
+                &shard_data,
+            )
         }
     }
-    CudaTensor::from_raw_bytes(ctx, &[cols, rows], infernum::dtype::DType::BF16, &transposed)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +610,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     /// or if the file cannot be opened or weights cannot be uploaded.
     pub fn from_config_gguf(config: C, ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
         let dummy_graph = config.build_prefill_graph_cuda(1, None);
-        let weights = config.load_weights_cuda_gguf(&dummy_graph, &ctx, gguf_path)?;
+        let weights = config.load_weights_cuda_gguf(&dummy_graph, &ctx, gguf_path, None)?;
         let half_dim = config.head_dim() / 2;
         Ok(Self {
             config,
@@ -552,6 +644,41 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let dummy_graph = config.build_prefill_graph_cuda(1, Some(&shard));
         let weights =
             config.load_weights_cuda_safetensors(&dummy_graph, &ctx, model_dir, Some(&shard))?;
+        let half_dim = config.head_dim() / 2;
+        Ok(Self {
+            config,
+            ctx,
+            weights: Arc::new(weights),
+            half_dim,
+            decode_state: RefCell::new(None),
+            shard: Some(shard),
+            comm: Some(comm),
+        })
+    }
+
+    /// Load a tensor-parallel shard from a GGUF file.
+    ///
+    /// Each rank loads only its slice of the column-parallel and row-parallel
+    /// weights (sliced at block boundaries in the GGUF loader). Quantized
+    /// weights stay quantized on GPU; non-quantized weights are dequantized
+    /// to BF16. The provided `comm` is used for all-reduce at AllReduceSumOp
+    /// nodes injected by the graph builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GGUF file is missing, metadata cannot be
+    /// parsed, or weights cannot be uploaded.
+    #[cfg(feature = "nccl")]
+    pub fn from_config_comm_and_gguf(
+        config: C,
+        ctx: CudaContext,
+        comm: crate::cuda::NcclCommunicator,
+        shard: ShardConfig,
+        gguf_path: &Path,
+    ) -> Result<Self> {
+        let dummy_graph = config.build_prefill_graph_cuda(1, Some(&shard));
+        let weights =
+            config.load_weights_cuda_gguf(&dummy_graph, &ctx, gguf_path, Some(&shard))?;
         let half_dim = config.head_dim() / 2;
         Ok(Self {
             config,

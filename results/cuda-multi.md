@@ -8,26 +8,28 @@ See [performance.md](../performance.md) for methodology.
 **Run date:** 2026-05-22 — clean sequential runs, all GPUs idle between measurements  
 **infernum commit:** `perf/measurement-doc` branch | **llama.cpp commit:** `40d5358` (build 1)
 
-### Single-GPU decode — all models (greedy, 100 tokens)
+### Single-GPU decode — all models (greedy, 200 tokens)
 
-infernum column is BF16 SafeTensors unless noted. llama.cpp uses best available quantization.
+infernum uses GPU Q8_0/Q4_0 kernels for GGUF files. llama.cpp uses best available quantization.
 
 | Model | Params | infernum (tok/s) | llama.cpp (tok/s) | llama.cpp format | ratio |
 | ----- | -----: | ---------------: | ----------------: | :--------------- | ----: |
-| Qwen3-8B | 8B | 52.6 | 127.0 | Q8_0 | 0.41x |
-| Qwen3-8B ¹ | 8B | 53.0 | 127.0 | Q8_0 | 0.42x |
-| Gemma-2-9B | 9B | 13.4 | 94.5 | Q8_0 | 0.14x |
-| Gemma-2-9B ¹ | 9B | 13.4 | 94.5 | Q8_0 | 0.14x |
-| Llama-3.1-70B | 70B | — | 30.1 | Q4_0 | — |
-| Qwen3-72B | 72B | — | 23.4 | Q4_K_M | — |
+| Qwen3-8B | 8B | 59.4 ¹ | 127.0 | Q8_0 | 0.47x |
+| Gemma-2-9B | 9B | 14.6 ¹ | 94.5 | Q8_0 | 0.15x |
+| Llama-3.1-70B | 70B | 10.4 ² | 30.1 | Q4_0 | 0.35x |
+| Qwen3-72B | 72B | 7.3 ³ | 23.4 | Q4_K_M | 0.31x |
 
-¹ infernum loading Q8_0 GGUF (new feature, 2026-05-22). Dequantizes to BF16 on host before upload — identical runtime behaviour to SafeTensors. llama.cpp runs native Q8_0 GEMV kernels and never dequantizes.
+¹ infernum GGUF Q8_0, on-GPU quantized GEMV kernels (dequantize on the fly). 1 GPU.  
+² infernum GGUF Q4_0, on-GPU quantized GEMV kernels, TP=2 (NCCL, 2× A100-80GB). llama.cpp single-GPU.  
+³ infernum GGUF Q4_K_M, BF16 dequant at load (Q4_K GPU kernel not yet implemented), TP=2. llama.cpp single-GPU.
 
-**Main performance gap:** infernum uses BF16 weights (2 bytes/param); llama.cpp uses Q8_0 (1 byte/param). Decode is memory-bandwidth-bound, so the format alone accounts for roughly 2× of the gap. Even with matching Q8_0 GGUF input, infernum's runtime is BF16 (0.42×) while llama.cpp's runtime stays Q8_0.
+**Runtime format comparison:**
+- infernum Q8_0 (Qwen/Gemma): on-GPU quantized, 1 byte/param for FFN/attn weights → 59.4/14.6 tok/s
+- infernum Q4_0 (Llama-70B TP=2): on-GPU quantized, 0.5 byte/param → 10.4 tok/s across 2 GPUs
+- infernum Q4_K_M (Qwen3-72B TP=2): BF16 on GPU (2 byte/param, Q4_K kernel pending) → 7.3 tok/s
+- llama.cpp: always native quantized GEMV at the stored precision
 
-**Gemma gap is wider** (0.14×): Gemma-2-9B has head_dim=256 (vs 128 for Qwen), 42 layers, and a known slow prefill path in infernum (137 tok/s vs llama.cpp's 3404 tok/s at pp512). The decode gap is also larger than Qwen's, likely due to suboptimal BF16 attention for large head_dim.
-
-**Llama-70B / Qwen3-72B (infernum):** BF16 SafeTensors weights not downloaded; pending.
+**Gemma gap is wider** (0.15×): Gemma-2-9B has head_dim=256 (vs 128 for Qwen), 42 layers, and a slower attention path at this head dimension.
 
 ---
 
@@ -69,13 +71,37 @@ Both models fit on a single 80GB A100 at these quantizations. Adding GPUs provid
 
 | Model | Status |
 | ----- | ------ |
-| Llama-3.1-70B BF16 TP=2 infernum | BF16 weights not downloaded (gated HF repo) |
-| Qwen3-72B BF16 TP=2 infernum | BF16 weights not downloaded |
-| DeepSeek-V3 | infernum CUDA not implemented; GGUF not available |
+| Q4_K GPU kernel | Q4_K_M dequants to BF16 at load; native GPU Q4_K GEMV kernel would close the gap for Qwen3-72B |
+| CUDA graph TP | NCCL AllReduce blocks CUDA graph capture; TP>1 runs eager |
 
 ---
 
 ## History
+
+## 2026-05-22 — GGUF quantized loading + TP GGUF (infernum)
+
+- **New:** GGUF weights for Q8_0 and Q4_0 now stay quantized on GPU (previously dequanted to BF16 at load). On-GPU GEMV kernels dequantize on the fly.
+- **New:** `--gpus N` flag enables GGUF tensor-parallel loading. Q8_0/Q4_0 weights are block-sharded across ranks without converting to BF16.
+- **New:** Q4_K, Q5_K, Q6_K, Q5_0 formats are now recognized; unsupported-for-GPU types (Q4_K, Q5_K) dequant to BF16 at load.
+- **New:** Llama-3.1-70B Q4_0 TP=2 and Qwen3-72B Q4_K_M TP=2 now produce results.
+
+### infernum: GGUF Q8_0 single-GPU (200 tokens, CudaGraphEngine)
+
+| Model | Format | decode (tok/s) | prev (BF16 host dequant) |
+| ----- | ------ | -------------: | -----------------------: |
+| Qwen3-8B | Q8_0 GGUF | 59.4 | 53.0 |
+| Gemma-2-9B | Q8_0 GGUF | 14.6 | 13.4 |
+
+### infernum: 70B/72B GGUF TP=2 (200 tokens, CudaGraphEngine)
+
+| Model | Format | GPUs | decode (tok/s) |
+| ----- | ------ | ---: | -------------: |
+| Llama-3.1-70B | Q4_0 GGUF | 2 | 10.4 |
+| Qwen3-72B | Q4_K_M GGUF | 2 | 7.3 |
+
+Llama-70B uses on-GPU Q4_0 kernels (0.5 byte/param). Qwen3-72B dequants Q4_K to BF16 at load (2 byte/param, Q4_K GPU kernel pending).
+
+---
 
 ## 2026-05-22 — Full re-run (clean sequential), all models
 
@@ -98,9 +124,9 @@ Both models fit on a single 80GB A100 at these quantizations. Adding GPUs provid
 | Model | Format | decode (tok/s) | prefill pp512 (tok/s) |
 | ----- | ------ | -------------: | --------------------: |
 | Qwen3-8B | BF16 SafeTensors | 52.6 | 2417 |
-| Qwen3-8B | Q8_0 GGUF | 53.0 | — |
+| Qwen3-8B | Q8_0 GGUF (BF16 host dequant) | 53.0 | — |
 | Gemma-2-9B | BF16 SafeTensors | 13.4 | 137 |
-| Gemma-2-9B | Q8_0 GGUF | 13.4 | — |
+| Gemma-2-9B | Q8_0 GGUF (BF16 host dequant) | 13.4 | — |
 
 ### llama.cpp: Qwen3-8B Q8_0 — GPU scaling (tg100, best of 3)
 

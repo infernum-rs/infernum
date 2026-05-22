@@ -116,6 +116,7 @@ impl CudaGraphEngineConfig for GemmaConfig {
         dummy_graph: &Graph<infernum_cuda::CudaBackend>,
         ctx: &CudaContext,
         gguf_path: &Path,
+        shard: Option<&ShardConfig>,
     ) -> Result<WeightStore<CudaTensor, LinearWeight>> {
         // Gemma does not use the Llama-style interleaved RoPE layout in GGUF,
         // so no Q/K row-unpermutation is needed.
@@ -128,6 +129,7 @@ impl CudaGraphEngineConfig for GemmaConfig {
             self.num_attention_heads,
             self.num_key_value_heads,
             /* lm_head_fallback */ true,
+            shard,
         )
     }
 }
@@ -184,12 +186,13 @@ impl GemmaCudaGraphEngineExt for GemmaCudaGraphEngine {
 /// Extension trait providing Gemma-specific tensor-parallel constructors.
 #[cfg(feature = "nccl")]
 pub trait GemmaShardedGraphEngineExt: Sized {
-    /// Load a Gemma-family model across multiple GPUs using tensor parallelism.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if device creation, NCCL setup, or weight loading fails.
+    /// Load a Gemma-family model across multiple GPUs using tensor parallelism
+    /// from a SafeTensors directory.
     fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self>;
+
+    /// Load a Gemma-family model across multiple GPUs using tensor parallelism
+    /// from a GGUF file. Quantized weights stay quantized on GPU.
+    fn from_gguf(num_devices: usize, gguf_path: &Path) -> Result<Self>;
 }
 
 #[cfg(feature = "nccl")]
@@ -197,5 +200,13 @@ impl GemmaShardedGraphEngineExt for GemmaShardedGraphEngine {
     fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self> {
         let config = GemmaConfig::from_file(model_dir.join("config.json"))?;
         infernum_cuda::ShardedGraphEngine::from_config(config, num_devices, model_dir)
+    }
+
+    fn from_gguf(num_devices: usize, gguf_path: &Path) -> Result<Self> {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(
+            infernum::path_to_utf8(gguf_path)?,
+        )?;
+        let config = GemmaConfig::from_gguf_metadata(loader.metadata())?;
+        infernum_cuda::ShardedGraphEngine::from_config_gguf(config, num_devices, gguf_path)
     }
 }
