@@ -118,11 +118,11 @@ The comparison script only covers the Llama family today. Non-Llama families nee
 
 ### Overview
 
-Metal uses the GPU on Apple Silicon Macs. Unified memory eliminates explicit host-device transfer; bottlenecks are GPU bandwidth and Metal shader efficiency. The gap vs llama.cpp on Metal is currently large.
+Metal uses the GPU on Apple Silicon Macs. Unified memory eliminates explicit host-device transfer; bottlenecks are GPU bandwidth and Metal shader efficiency. The gap vs llama.cpp on Metal is currently large for decode but has closed significantly for prefill.
 
 The most interesting Metal use case is **large models on high-memory Apple Silicon** — Macs with M-series Ultra chips can run 70B parameter models in BF16 that require a 4-GPU server on CUDA. This is a real differentiator worth optimizing for specifically.
 
-**Current limitation:** `bench_metal` measures decode throughput only. Prefill measurement requires a Metal graph engine (not yet implemented).
+Both prefill and decode are measured. The Metal graph engine supports GGUF (Q4_0, Q8_0, Q4_1, Q6_K) and SafeTensors. Prefill uses a GPU dequantize → dense GEMM path; decode uses quantized GEMV kernels.
 
 ### Hardware Tiers
 
@@ -182,23 +182,29 @@ Llama-3.1-70B BF16 on an M3/M4 Ultra is the headline number — it represents a 
 # Build once
 cargo build --release --example bench_metal --features metal
 
-# Decode throughput
+# Decode throughput (256 tokens, 8-token warm-up prompt)
 cargo run --release --example bench_metal --features metal -- /path/to/model 256
+
+# Prefill throughput (512-token prompt, default)
+cargo run --release --example bench_metal --features metal -- /path/to/model --n-prompt 512
+
+# Decode + prefill together
+cargo run --release --example bench_metal --features metal -- /path/to/model 256 --n-prompt 512
 
 # With per-kernel profiling (separate run — ~10% slower, use only to diagnose bottlenecks)
 cargo run --release --example bench_metal --features metal -- --profile /path/to/model 256
 
-# Full comparison table vs llama.cpp (SmolLM2-360M, Llama only)
-./bench_metal_comparison.sh
-./bench_metal_comparison.sh --tests q4,q8
-./bench_metal_comparison.sh --n-gen 256
+# Full comparison table vs llama.cpp (all supported families)
+./bench_metal.sh
+./bench_metal.sh --n-gen 256
+./bench_metal.sh --llama-cpp ~/llama.cpp   # enable llama.cpp column
 
 # Manual run for non-Llama families
 cargo run --release --example bench_metal --features metal -- /path/to/qwen3-72b 256
 cargo run --release --example bench_metal --features metal -- /path/to/gemma-3-27b 256
 ```
 
-The comparison script covers Llama family only. Non-Llama families require manual runs.
+`bench_metal.sh` covers Llama (GGUF Q4_0, Q8_0, SafeTensors), Qwen (SafeTensors BF16), and Gemma (GGUF Q8_0) families. Non-Llama families can also be run manually for larger models.
 
 ### Checklist
 
@@ -207,8 +213,8 @@ The comparison script covers Llama family only. Non-Llama families require manua
 - [ ] For the Ultra tier: include 70B BF16 decode throughput — this is the headline metric
 - [ ] Use `--profile` only on a dedicated diagnostic run, not in reported results
 - [ ] Compare all formats against llama.cpp `-ngl 99`
-- [x] Prefill benchmarked — see results/metal.md. Note: GGUF prefill uses serial GEMV (0.001x llama.cpp); SafeTensors prefill uses GEMM and performs well.
-- [x] Llama 3.2 3B measured on M3 Pro 18 GB — first larger-model results recorded (decode only; GGUF prefill impractical at 3B scale). See results/metal.md 2026-05-22 section.
+- [x] GGUF prefill implemented — GPU dequantize+GEMM path for Q4_0, Q8_0, Q4_1; Q6_K handled via GEMV after extract_last_row. See results/metal.md 2026-05-22 (GPU dequant+GEMM section).
+- [x] Llama 3.2 3B GGUF prefill at 0.61–0.62× llama.cpp (417–424 tok/s vs 683–687 tok/s at n=512). See results/metal.md.
 - [x] Llama 3.1 8B Q4_0 measured on M3 Pro 18 GB — 0.46x llama.cpp decode (trend: 360M=0.26x → 3B=0.36x → 8B=0.46x). See results/metal.md 2026-05-22 section.
 
 ---
