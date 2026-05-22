@@ -2,7 +2,40 @@
 
 See [performance.md](../performance.md) for methodology.
 
+## Current Results
+
+**Node:** 8× NVIDIA A100-SXM4-80GB — NVLink interconnect | Driver 590.48.01 | CUDA 13.1
+
+### infernum — Qwen3-8B BF16 TP scaling (decode, greedy, 100 tokens)
+
+| GPUs (TP) | decode (tok/s) |
+| --------: | -------------: |
+| 2 | 16.7 |
+| 4 | 10.8 |
+| 8 | 5.9 |
+
+### llama.cpp baseline — large quantised models (decode, pp512 prefill, 256 tokens)
+
+| Model | Format | GPUs | decode (tok/s) | prefill (tok/s) |
+| ----- | ------ | ---: | -------------: | --------------: |
+| Llama-3.1-70B | Q4_0 | 1 | 23.58 | 528 |
+| Llama-3.1-70B | Q4_0 | 2 | 23.62 | — |
+| Llama-3.1-70B | Q4_0 | 4 | 19.21 | 530 |
+| Qwen3-72B | Q4_K_M | 1 | 17.69 | 517 |
+| Qwen3-72B | Q4_K_M | 2 | 17.70 | — |
+
+### Pending (BF16 70B+ models — access / format issues)
+
+| Model | Format | GPUs | llama.cpp decode | infernum decode |
+| ----- | ------ | ---: | ---------------: | --------------: |
+| Llama-3.1-70B | BF16 | 2 | ~60–80 tok/s | pending |
+| Qwen3-72B | BF16 | 2 | ~55–75 tok/s | pending |
+| Qwen3-235B-A22B | Q4_K_M | 4–6 | ~15–25 tok/s | pending |
+| DeepSeek-V3 | GGUF Q4 | 4–5 | ~8–15 tok/s | pending |
+
 ---
+
+## History
 
 ## 2026-05-21 — A100 ×8 Node — Large-Model Baseline (llama.cpp only)
 
