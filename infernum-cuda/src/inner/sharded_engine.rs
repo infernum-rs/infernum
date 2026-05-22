@@ -103,7 +103,7 @@ mod inner {
 
     unsafe impl Send for ShardedPagedKvCache {}
 
-    impl<C: CudaGraphEngineConfig + Clone + Sync> Model for ShardedGraphEngine<C> {
+    impl<C: CudaGraphEngineConfig + Clone> Model for ShardedGraphEngine<C> {
         type B = CudaBackend;
         type KvCache = ShardedPagedKvCache;
 

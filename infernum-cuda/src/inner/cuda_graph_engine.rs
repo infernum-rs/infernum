@@ -267,6 +267,12 @@ struct DecodeState {
 // aliased across threads.
 unsafe impl Send for DecodeState {}
 
+// SAFETY: `CudaGraphEngine` is always accessed from a single thread — either
+// the caller's thread (single-GPU) or a dedicated scoped thread per engine
+// (multi-GPU via `ShardedGraphEngine`). The `RefCell<decode_state>` field is
+// therefore never accessed concurrently; `!Sync` is an over-approximation.
+unsafe impl<C: CudaGraphEngineConfig> Sync for CudaGraphEngine<C> {}
+
 impl DecodeState {
     /// Build a new `DecodeState` for a paged-decode graph with `batch_size = 1`.
     ///
