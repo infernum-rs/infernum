@@ -34,7 +34,7 @@ mod inner {
     ///
     /// ## Construction
     ///
-    /// Use [`ShardedGraphEngine::from_pretrained`] — it creates one
+    /// Use [`ShardedGraphEngine::from_config`] — it creates one
     /// `CudaGraphEngine` per GPU, wires up NCCL communicators, and loads the
     /// sharded weights on each device in parallel.
     pub struct ShardedGraphEngine<C: CudaGraphEngineConfig + Clone> {
@@ -61,7 +61,7 @@ mod inner {
         /// # Panics
         ///
         /// Panics if a device thread panics.
-        pub fn from_pretrained(config: C, num_devices: usize, model_dir: &Path) -> Result<Self> {
+        pub fn from_config(config: C, num_devices: usize, model_dir: &Path) -> Result<Self> {
             let comm_id = CudaBackend::create_comm_id()?;
             let comm_id_raw = *comm_id.to_raw();
             let model_dir = model_dir.to_owned();

@@ -157,6 +157,6 @@ pub trait GemmaShardedGraphEngineExt: Sized {
 impl GemmaShardedGraphEngineExt for GemmaShardedGraphEngine {
     fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self> {
         let config = GemmaConfig::from_file(model_dir.join("config.json"))?;
-        infernum_cuda::ShardedGraphEngine::from_pretrained(config, num_devices, model_dir)
+        infernum_cuda::ShardedGraphEngine::from_config(config, num_devices, model_dir)
     }
 }

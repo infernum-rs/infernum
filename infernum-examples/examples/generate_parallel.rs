@@ -17,7 +17,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 use infernum::tokenizer::LlamaTokenizer;
-use infernum::{GenerateOptions, Model as _, Result, SamplingParams};
+use infernum::{GenerateOptions, Result, SamplingParams};
 use infernum_gemma::{GemmaShardedGraphEngine, GemmaShardedGraphEngineExt as _};
 use infernum_llama::{LlamaShardedGraphEngine, LlamaShardedGraphEngineExt as _};
 use infernum_qwen::{QwenShardedGraphEngine, QwenShardedGraphEngineExt as _};
