@@ -738,8 +738,12 @@ where
     // -- Final norm --
     let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
 
+    // -- Select last token before LM head: avoids computing vocab projection
+    //    for all seq_len positions when only the last logit is needed. --
+    let last_hidden = graph.add_extract_last_row(normed_final, seq_len);
+
     // -- LM head --
-    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
+    let logits = graph.add_lm_head(last_hidden, model_weights.lm_head, weight_dtype);
 
     graph.set_output(logits.0);
 

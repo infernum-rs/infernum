@@ -27,13 +27,12 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 ### Prefill throughput (tok/s)
 
 `llama-bench` only accepts GGUF — SafeTensors rows have no llama.cpp comparison and never will.
-infernum GGUF prefill is also missing for 3B and 8B: the GGUF path reuses the decode GEMV kernel serially (one dispatch per token per layer), giving ~4 tok/s at 360M. At 3B+ scale a 512-token prefill would take 20+ minutes — impractical to measure. Implementing fused quantized GEMM for prefill is the top Metal optimization target.
 
 | Model | Format | infernum | llama.cpp | ratio | Date |
 | ----- | ------ | -------: | --------: | ----: | ---- |
 | Llama / Llama-3.1-8B | GGUF Q4_0 | — | 290.8 | — | 2026-05-22 |
-| Llama / Llama-3.2-3B | GGUF Q4_0 | — | 686.9 | — | 2026-05-22 |
-| Llama / Llama-3.2-3B | GGUF Q8_0 | — | 683.0 | — | 2026-05-22 |
+| Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x | 2026-05-22 |
+| Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x | 2026-05-22 |
 | Llama / SmolLM2-360M | SafeTensors F32 | 252 | — | — | 2026-05-21 |
 | Llama / SmolLM2-360M | GGUF Q8_0 | 4.0 | 4541 | 0.001x | 2026-05-21 |
 | Llama / SmolLM2-360M | GGUF Q4_0 | 4.3 | 4596 | 0.001x | 2026-05-21 |
@@ -77,6 +76,46 @@ infernum GGUF prefill is also missing for 3B and 8B: the GGUF path reuses the de
 
 ---
 
+## 2026-05-22 — Llama 3.2 3B (GPU dequant+GEMM prefill)
+
+- **Chip:** Apple M3 Pro (18 GB unified memory) — below Standard tier (24–48 GB); 8B+ BF16 does not fit
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **Prefill prompt:** 512 tokens (both infernum and llama.cpp)
+- **infernum commit:** `perf/measurement-doc` (GPU dequant+GEMM + extract_last_row)
+- **llama.cpp commit:** `e22cd0aa1` (`-ngl 99`, best of 3 reps)
+- **Models:** `bartowski/Llama-3.2-3B-Instruct-GGUF`
+
+### Prefill throughput (tok/s) — 512-token prompt
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x |
+| Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x |
+
+### Prefill throughput (tok/s) — varying prompt length
+
+| Model | Format | n=128 | n=256 | n=512 |
+| ----- | ------ | ----: | ----: | ----: |
+| Llama / Llama-3.2-3B | GGUF Q4_0 | 69 | 189 | 417 |
+| Llama / Llama-3.2-3B | GGUF Q8_0 | 89 | 183 | 424 |
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x |
+| Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x |
+
+### Notes
+
+- **GPU dequant+GEMM for prefill:** The previous session used the decode GEMV kernel serially at seq_len > 1. This session added a GPU dequantize (Q8_0, Q4_0, Q4_1) → F32 dense buffer followed by a SIMD-group MMAT GEMM, and an `extract_last_row` op before the LM head so only 1 token is projected through the 128K-vocab head instead of all 512. Together these bring prefill from impractical (>20 min) to 417–424 tok/s at 512 tokens, reaching 0.61–0.62× llama.cpp.
+- **Q4_0 vs Q8_0 prefill parity:** Both reach similar tok/s because the bottleneck at 512 tokens is GPU GEMM compute, not memory bandwidth. At small prompt sizes (n=128) Q8_0 is slightly faster — larger blocks are more GPU-friendly.
+- **Decode unchanged:** The GEMV path for decode is identical. 21.5–21.6 tok/s reflects dispatch overhead.
+- **3B Q4_0 GGUF contains mixed quant types:** most layers are Q4_0, but 3 down_proj layers are Q4_1 and the token embedding (reused as LM head) is Q6_K. The GPU dequant path handles Q4_1 via a new `dequantize_q4_1_to_f32` kernel; Q6_K falls to CPU only for the LM head (now m=1 after extract_last_row, so handled by the existing Q6_K GEMV).
+- Machine is Apple M3 Pro (below Standard tier; Standard is 24–48 GB).
+
+---
+
 ## 2026-05-22 — Llama 3.2 3B (first larger-model results)
 
 - **Chip:** Apple M3 Pro (18 GB unified memory) — below Standard tier (24–48 GB); 8B+ BF16 does not fit
@@ -105,7 +144,6 @@ infernum GGUF prefill is also missing for 3B and 8B: the GGUF path reuses the de
 - **Prefill skipped for infernum:** The serial GEMV issue (0.001x at 360M scale) is even worse at 3B. With ~28 layers and 3072 hidden dim, each token forward pass dispatches hundreds of serial kernel calls; a 512-token prefill would take ~20+ minutes. Only llama.cpp prefill numbers are recorded.
 - **Q4_0 vs Q8_0 decode throughput (infernum):** Both formats achieve nearly identical throughput (21.6 vs 21.5 tok/s). The bottleneck is dispatch overhead (118 K Metal dispatches per 256-token decode), not weight memory bandwidth. llama.cpp's more optimized GEMV kernels are faster for Q4_0 (59.6 tok/s) than Q8_0 (36.9 tok/s) because it actually saturates memory bandwidth; infernum does not.
 - **Ratio improvement over 360M:** 3B Q8_0 reaches 0.58x vs 0.30x at 360M scale. At larger model sizes the compute per kernel dispatch grows relative to launch overhead, narrowing the gap.
-- **8B not yet measured:** The M3 Pro 18 GB can fit Llama 3.1 8B in Q4_0/Q8_0 format, but the HuggingFace xet storage system was too slow to download the file in this session (<0.3 MB/s reconstructed rate). A future session will add 8B numbers.
 - Machine is Apple M3 Pro (below Standard tier; Standard is 24–48 GB).
 
 ---

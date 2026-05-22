@@ -477,9 +477,10 @@ where
         h = graph.add_add(h, post_ffn_normed);
     }
 
-    // Final norm and LM head
+    // Final norm, select last token, then LM head
     let normed = graph.add_rms_norm(h, ids.final_norm, config.rms_norm_eps);
-    let logits = graph.add_lm_head(normed, ids.lm_head, weight_dtype);
+    let last_hidden = graph.add_extract_last_row(normed, seq_len);
+    let logits = graph.add_lm_head(last_hidden, ids.lm_head, weight_dtype);
 
     // Optional final logit soft-capping (Gemma 2)
     let logits = if let Some(cap) = config.final_logit_softcapping {
