@@ -177,31 +177,47 @@ mod inner {
             kv_cache: &mut ShardedPagedKvCache,
             _runtime_state: &mut CudaRuntimeState,
             block_tables: &crate::cuda::CudaTensor,
-            seq_lens: &crate::cuda::CudaTensor,
+            _seq_lens: &crate::cuda::CudaTensor,
             positions: &crate::cuda::CudaTensor,
             batch_size: usize,
             max_blocks_per_seq: usize,
             max_seq_len: usize,
         ) -> Result<CudaLogits> {
-            // Each replica's forward_batch_decode downloads token_ids,
-            // block_tables, and positions to host and re-uploads to its own
-            // device. Passing the rank-0 CUDA tensors is safe: cudarc uses the
-            // tensor's own device context for dtoh copies.
+            // Pre-download all rank-0 GPU tensors to host before spawning rank
+            // threads. Without this, threads that call dtoh_sync_copy_into on
+            // the rank-0 device invoke cuStreamSynchronize(GPU-0 stream). If
+            // other ranks have already submitted NCCL AllReduces to that stream,
+            // the AllReduce deadlocks because ranks blocked in
+            // cuStreamSynchronize cannot participate in the collective.
+            let token_ids_host = token_ids.to_vec::<u32>()?;
+
+            // positions and block_tables are I32 tensors; use raw bytes + reinterpret.
+            let positions_bytes = positions.to_raw_bytes()?;
+            let positions_host: Vec<i32> = positions_bytes
+                .chunks_exact(4)
+                .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+                .collect();
+            let block_table_bytes = block_tables.to_raw_bytes()?;
+            let block_table_u32: Vec<u32> = block_table_bytes
+                .chunks_exact(4)
+                .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+                .collect();
+
             thread::scope(|s| {
+                let token_ids_host = &token_ids_host;
+                let positions_host = &positions_host;
+                let block_table_u32 = &block_table_u32;
                 let handles: Vec<_> = self
                     .replicas
                     .iter()
                     .zip(kv_cache.inner.iter_mut())
                     .map(|(e, kv)| {
                         s.spawn(move || {
-                            let mut state = CudaRuntimeState::new_placeholder();
-                            e.forward_batch_decode(
-                                token_ids,
+                            e.forward_batch_decode_precomputed(
+                                token_ids_host,
                                 kv,
-                                &mut state,
-                                block_tables,
-                                seq_lens,
-                                positions,
+                                positions_host,
+                                block_table_u32,
                                 batch_size,
                                 max_blocks_per_seq,
                                 max_seq_len,

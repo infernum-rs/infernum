@@ -34,6 +34,31 @@ Model size: 44.11 GiB — fits on a single A100. Same pattern as Llama-70B.
 | 1 | `CUDA_VISIBLE_DEVICES=4` | 17.69 | 517 | bandwidth-bound on single GPU |
 | 2 | `CUDA_VISIBLE_DEVICES=4,5` | 17.70 | — | no speedup — model fits in 1 GPU |
 
+---
+
+## 2026-05-22 — A100 ×8 Node — Qwen3-8B BF16 TP Scaling (infernum)
+
+- **Node:** 8× NVIDIA A100-SXM4-80GB — NVLink interconnect
+- **Driver:** 590.48.01 | CUDA 13.1
+- **Model:** Qwen/Qwen3-8B (BF16 SafeTensors) — ~16 GB
+- **Decode tokens:** 100 | **Decoding:** greedy (argmax)
+- **infernum commit:** `perf/measurement-doc` branch
+- **Notes:** TP via `generate_parallel` example; CUDA graph engine (`capture_unsafe=true` path bypassed for TP — all steps run eagerly via `execute()`)
+
+### Qwen3-8B BF16 — TP scaling (infernum)
+
+| GPUs (TP) | decode (tok/s) | wall time (100 tok) | notes |
+| --------: | -------------: | ------------------: | ----- |
+| 2 | 16.7 | 6.00s | |
+| 4 | 10.8 | 9.29s | fixed NCCL collective deadlock (see below) |
+| 8 | 5.9 | 16.90s | AllReduce overhead dominates at this model scale |
+
+**TP=4/TP=8 hang fix:** The original code passed rank-0 GPU tensors into per-rank threads. Inside each rank's thread, `dtoh_sync_copy_into` called `cuStreamSynchronize(GPU-0 stream)`. When ranks 0/1 had already submitted NCCL AllReduces to GPU-0's stream, ranks 2/3 blocked in `cuStreamSynchronize` and could not participate — deadlocking the ring. Fix: pre-download all rank-0 GPU tensors to host in `ShardedGraphEngine::forward_batch_decode` before spawning rank threads; each rank receives host data and uploads to its own device via `forward_batch_decode_precomputed`.
+
+**Observation:** Qwen3-8B fits comfortably in a single A100. TP=2 gives the best decode rate; TP=4 and TP=8 show diminishing returns because NCCL AllReduce communication cost grows with world size while the per-GPU compute shrinks. The model is too small to be compute-bound at this scale. Meaningful multi-GPU gains for 8B-class models require batching (multiple concurrent requests), not just TP degree.
+
+---
+
 ### What is missing (pending BF16 70B+ access)
 
 The performance.md primary H100×8 targets are:

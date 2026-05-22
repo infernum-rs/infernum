@@ -496,7 +496,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn run_decode_captured(
         &self,
-        token_ids: &CudaTensor,
+        token_ids_host: &[u32],
         kv_cache: &mut crate::cuda::PagedKvCache,
         block_table_u32: &[u32],
         positions_u32: &[u32],
@@ -531,9 +531,8 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
 
         // Write all 6 dynamic inputs into the stable GPU buffers.
         let device = self.ctx.device();
-        // token_ids: download from GPU and re-upload into the stable buffer.
-        let token_host = token_ids.to_vec::<u32>()?;
-        device.htod_copy_into(token_host, &mut state.graph_inputs.token_ids)?;
+        // token_ids: re-upload the pre-downloaded host values into the stable GPU buffer.
+        device.htod_copy_into(token_ids_host.to_vec(), &mut state.graph_inputs.token_ids)?;
         device.htod_copy_into(cos_data.to_vec(), &mut state.graph_inputs.cos)?;
         device.htod_copy_into(sin_data.to_vec(), &mut state.graph_inputs.sin)?;
         device.htod_copy_into(
@@ -654,6 +653,101 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
 
             Ok(token_tensor)
         }
+    }
+
+    /// Decode step using pre-downloaded host data, avoiding cross-rank GPU stream sync.
+    ///
+    /// Called by [`ShardedGraphEngine`] which downloads all rank-0 GPU tensors to host
+    /// before spawning rank threads, preventing an NCCL collective-op deadlock: without
+    /// this, some rank threads block in `cuStreamSynchronize(GPU-0 stream)` while other
+    /// threads have already submitted NCCL AllReduces to that stream, deadlocking the ring.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_batch_decode_precomputed(
+        &self,
+        token_ids_host: &[u32],
+        kv_cache: &mut crate::cuda::PagedKvCache,
+        positions_data: &[i32],
+        block_table_u32: &[u32],
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+        _max_seq_len: usize,
+    ) -> Result<CudaLogits> {
+        let block_size = kv_cache.block_size();
+        let head_dim = self.config.head_dim();
+        let half_dim = self.half_dim;
+
+        let mut cos_data = Vec::with_capacity(batch_size * half_dim);
+        let mut sin_data = Vec::with_capacity(batch_size * half_dim);
+        for &pos_i32 in positions_data {
+            let pos = usize::try_from(pos_i32).expect("position must be non-negative");
+            let (c, s) = precompute_rope_row(pos, head_dim, self.config.rope_theta());
+            cos_data.extend(c);
+            sin_data.extend(s);
+        }
+        let positions_u32: Vec<u32> = positions_data
+            .iter()
+            .map(|&p| u32::try_from(p).expect("position must be non-negative"))
+            .collect();
+        let seq_lens_u32: Vec<u32> = positions_data
+            .iter()
+            .map(|&p| u32::try_from(p).expect("position must be non-negative") + 1)
+            .collect();
+
+        if batch_size == 1 {
+            let logits_tensor = self.run_decode_captured(
+                token_ids_host,
+                kv_cache,
+                block_table_u32,
+                &positions_u32,
+                &seq_lens_u32,
+                &cos_data,
+                &sin_data,
+                max_blocks_per_seq,
+            )?;
+            let logits_f32 = cast_to_f32(&logits_tensor)?;
+            return Ok(CudaLogits::new(logits_f32));
+        }
+
+        // Batch > 1: create GPU tensors on this rank's own device from host data.
+        let token_ids_t = CudaTensor::from_slice(&self.ctx, &[batch_size], token_ids_host)?;
+        let mut graph = self.config.build_paged_decode_graph_cuda(
+            batch_size,
+            block_size,
+            max_blocks_per_seq,
+            self.shard.as_ref(),
+        );
+        optimizer::optimize(&mut graph);
+        let ep = plan(&graph);
+
+        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_data)?;
+        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_data)?;
+        let block_table_t = CudaTensor::from_slice(
+            &self.ctx,
+            &[batch_size, max_blocks_per_seq],
+            block_table_u32,
+        )?;
+        let positions_t = CudaTensor::from_slice(&self.ctx, &[batch_size], &positions_u32)?;
+        let seq_lens_t = CudaTensor::from_slice(&self.ctx, &[batch_size], &seq_lens_u32)?;
+
+        let inputs = vec![token_ids_t, cos_t, sin_t, block_table_t, positions_t, seq_lens_t];
+        let output_nodes = graph.output_ids().to_vec();
+        let (outputs, _) = execute(
+            &self.ctx,
+            &ep,
+            graph.nodes(),
+            &self.weights,
+            &inputs,
+            &output_nodes,
+            None,
+            Some(kv_cache),
+            0,
+            None,
+            self.comm_ref(),
+        )?;
+
+        let logits_bf16 = outputs.into_iter().next().expect("no outputs");
+        let logits_f32 = cast_to_f32(&logits_bf16)?;
+        Ok(CudaLogits::new(logits_f32))
     }
 }
 
@@ -856,8 +950,10 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
 
         if batch_size == 1 {
             // Single-sequence fast path: use CUDA graph capture/replay.
+            // Download token_ids from our own rank's GPU (no cross-rank stream sync).
+            let token_ids_host = token_ids.to_vec::<u32>()?;
             let logits_tensor = self.run_decode_captured(
-                token_ids,
+                &token_ids_host,
                 kv_cache,
                 &block_table_u32,
                 &positions_u32,
