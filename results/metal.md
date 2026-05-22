@@ -27,6 +27,7 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 ### Prefill throughput (tok/s)
 
 `llama-bench` only accepts GGUF — SafeTensors rows have no llama.cpp comparison and never will.
+infernum GGUF prefill is also missing for 3B and 8B: the GGUF path reuses the decode GEMV kernel serially (one dispatch per token per layer), giving ~4 tok/s at 360M. At 3B+ scale a 512-token prefill would take 20+ minutes — impractical to measure. Implementing fused quantized GEMM for prefill is the top Metal optimization target.
 
 | Model | Format | infernum | llama.cpp | ratio | Date |
 | ----- | ------ | -------: | --------: | ----: | ---- |
