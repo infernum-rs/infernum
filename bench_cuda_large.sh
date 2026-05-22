@@ -1,45 +1,37 @@
 #!/usr/bin/env bash
-# bench_cuda_large.sh — CUDA throughput for large models (H100 node)
+# bench_cuda_large.sh — multi-GPU CUDA throughput for large models
 #
-# Targets a multi-GPU H100 node. Benchmarks models that don't fit or aren't
-# interesting on a single L4 (< 24 GB VRAM).
+# Benchmarks models at TP=2 and TP=8 on a multi-GPU node (A100 ×8 / H100 ×8).
+# Single-GPU baselines live in bench_cuda_small.sh / bench_comparison.sh.
 #
-# Tiers:
-#   Standard (always run): 8B models per family — these fit on a single H100
-#     and establish a per-family baseline at a size that's more meaningful than 1B.
+# Model coverage:
+#   Llama-3.1-70B  Q4_0    GGUF   ~40 GB   always downloaded
+#   Qwen3-72B      Q4_K_M  GGUF   ~42 GB   always downloaded
+#   Qwen3-235B-A22B Q4_K_M GGUF  ~142 GB   downloaded with --download-large
 #
-#   Large (opt-in with --download-large): 70B+ models.
-#     Downloads are 50–150 GB each. Pass --download-large to auto-download.
-#     Without the flag, large models are only benchmarked if already cached.
+# Output: one markdown table with TP=2 and TP=8 columns for each model.
 #
-# NOTE: Multi-GPU tensor-parallel benchmarking (70B+ in BF16) is not yet
-# supported by the bench binary. A bench_parallel example is planned. Until
-# then, 70B+ models run on single-GPU via quantization (GGUF Q4 fits in ~40 GB).
-#
-# Prerequisites (required):
-#   - NVIDIA GPUs (H100 recommended), nvidia-smi
-#   - CUDA toolkit + Rust toolchain (cargo)
-#   - hf CLI: pip install 'huggingface_hub[cli]'
+# Prerequisites:
+#   - 2+ NVIDIA GPUs, nvidia-smi, NCCL
+#   - Rust toolchain (cargo), CUDA toolkit
+#   - hf CLI: pip install --break-system-packages huggingface_hub
 #
 # Usage:
-#   ./bench_cuda_large.sh                          # Standard models only
-#   ./bench_cuda_large.sh --download-large         # Also download 70B+ models
-#   ./bench_cuda_large.sh --dry-run                # Show plan without running
-#   ./bench_cuda_large.sh --n-tokens 128           # Override token count
-#   ./bench_cuda_large.sh --families llama,qwen    # Only specific families
+#   ./bench_cuda_large.sh                        # 70B + 72B (always cached)
+#   ./bench_cuda_large.sh --download-large       # also download 235B
+#   ./bench_cuda_large.sh --n-tokens 200         # override decode length
+#   ./bench_cuda_large.sh --dry-run              # show plan without running
+#   ./bench_cuda_large.sh --models 70b,235b      # specific models only
 
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 MODEL_CACHE="$HOME/.cache/infernum/models"
-GGUF_DIR="/tmp"
-
-N_TOKENS=256
-N_PREFILL=512
+N_TOKENS=200
 DRY_RUN=false
 DOWNLOAD_LARGE=false
-FAMILIES_FILTER="all"
+MODELS_FILTER="all"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,224 +39,123 @@ while [[ $# -gt 0 ]]; do
         --download-large) DOWNLOAD_LARGE=true; shift ;;
         --n-tokens)       N_TOKENS="$2"; shift 2 ;;
         --n-tokens=*)     N_TOKENS="${1#--n-tokens=}"; shift ;;
-        --families)       FAMILIES_FILTER="$2"; shift 2 ;;
-        --families=*)     FAMILIES_FILTER="${1#--families=}"; shift ;;
+        --models)         MODELS_FILTER="$2"; shift 2 ;;
+        --models=*)       MODELS_FILTER="${1#--models=}"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--download-large] [--dry-run] [--n-tokens N] [--families LIST]"
+            echo "Usage: $0 [OPTIONS]"
             echo ""
-            echo "  --download-large  Auto-download 70B+ models (50–150 GB each)"
-            echo "  --families LIST   Comma-separated: llama, qwen, gemma, deepseek (default: all)"
+            echo "  --download-large   Auto-download Qwen3-235B-A22B (~142 GB)"
+            echo "  --n-tokens N       Decode token count (default: 200)"
+            echo "  --models LIST      Comma-separated: 70b, 72b, 235b (default: all cached)"
+            echo "  --dry-run          Show plan without running benchmarks"
             exit 0 ;;
         *) echo "Unknown option: $1 (try --help)" >&2; exit 1 ;;
     esac
 done
 
-declare -A ENABLED_FAMILIES
-if [[ "${FAMILIES_FILTER,,}" == "all" ]]; then
-    ENABLED_FAMILIES[llama]=1; ENABLED_FAMILIES[qwen]=1
-    ENABLED_FAMILIES[gemma]=1; ENABLED_FAMILIES[deepseek]=1
-else
-    IFS=',' read -ra _fams <<< "${FAMILIES_FILTER,,}"
-    for f in "${_fams[@]}"; do
-        f=$(echo "$f" | xargs)
-        case "$f" in
-            llama|qwen|gemma|deepseek) ENABLED_FAMILIES[$f]=1 ;;
-            *) echo "ERROR: Unknown family '$f'. Valid: llama, qwen, gemma, deepseek" >&2; exit 1 ;;
-        esac
-    done
-fi
+# ── Model paths ───────────────────────────────────────────────────────────────
 
-# Model paths — standard (8B)
-LLAMA8B_DIR="${MODEL_CACHE}/meta-llama/Llama-3.1-8B"
-QWEN8B_DIR="${MODEL_CACHE}/Qwen/Qwen3-8B"
-GEMMA27B_DIR="${MODEL_CACHE}/google/gemma-3-27b"
-DEEPSEEK_TINY_DIR="${MODEL_CACHE}/yujiepan/deepseek-v3-tiny-random"
-
-# Model paths — large (70B+, single-GPU via GGUF Q4, ~40 GB each)
-LLAMA70B_DIR="${MODEL_CACHE}/meta-llama/Llama-3.1-70B"
-LLAMA70B_GGUF_Q4="${GGUF_DIR}/llama-3.1-70b-q4_0.gguf"
-QWEN72B_DIR="${MODEL_CACHE}/Qwen/Qwen3-72B"
-QWEN72B_GGUF_Q4="${GGUF_DIR}/qwen3-72b-q4_0.gguf"
+LLAMA70B_GGUF="${MODEL_CACHE}/llama-3.1-70b-gguf/Meta-Llama-3.1-70B-Instruct.Q4_0.gguf"
+QWEN72B_GGUF="${MODEL_CACHE}/Qwen/Qwen3-72B-GGUF/Qwen3-72B-Instruct.Q4_K_M.gguf"
+QWEN235B_DIR="${MODEL_CACHE}/Qwen/Qwen3-235B-A22B-GGUF/Q4_K_M"
+# first shard; infernum discovers the rest via the GGUF split-file header
+QWEN235B_GGUF="${QWEN235B_DIR}/Qwen3-235B-A22B-Q4_K_M-00001-of-00005.gguf"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 log() { echo ">>> $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-download_hf_model() {
-    local repo_id="$1" dest_dir="$2"
-    if [[ -f "${dest_dir}/config.json" ]]; then
-        log "Already cached: ${dest_dir}"; return 0
-    fi
-    log "Downloading ${repo_id} → ${dest_dir}"
-    $DRY_RUN && return 0
-    mkdir -p "${dest_dir}"
-    if ! hf download "${repo_id}" "model.safetensors" --local-dir "${dest_dir}" --quiet 2>/dev/null; then
-        hf download "${repo_id}" --local-dir "${dest_dir}" --quiet \
-            --include "model.safetensors.index.json" "model-*.safetensors" 2>/dev/null || true
-    fi
-    for f in config.json tokenizer.json tokenizer_config.json; do
-        [[ -f "${dest_dir}/${f}" ]] || \
-            hf download "${repo_id}" "${f}" --local-dir "${dest_dir}" --quiet 2>/dev/null || true
-    done
-    [[ -f "${dest_dir}/config.json" ]] || die "Failed to download ${repo_id}"
+extract_toks() {
+    grep -oP '[\d.]+(?= tok/s)' | tail -1
 }
 
-# Try to download a large model; skip gracefully if it fails (auth, disk, etc.)
-try_download_hf_model() {
-    local repo_id="$1" dest_dir="$2"
-    [[ -f "${dest_dir}/config.json" ]] && { log "Already cached: ${dest_dir}"; return 0; }
-    $DOWNLOAD_LARGE || { log "SKIP (use --download-large to download): ${repo_id}"; return 0; }
-    log "Downloading large model ${repo_id} (~50–150 GB) → ${dest_dir}"
-    $DRY_RUN && return 0
-    mkdir -p "${dest_dir}"
-    if ! hf download "${repo_id}" --local-dir "${dest_dir}" --quiet 2>/dev/null; then
-        log "WARNING: Failed to download ${repo_id} (check auth with: hf login)"
-        return 0
-    fi
-}
-
-extract_toks() { grep -oP '[\d.]+(?= tok/s)' | tail -1; }
-
-run_infernum_decode() {
-    local model_path="$1"
+run_bench() {
+    local model_path="$1" gpus="$2"
     $DRY_RUN && { echo "—"; return; }
     local out
-    out=$(timeout 1200 cargo run --release --example bench --features cuda -q -- \
-        --cuda-graph-engine "${model_path}" "${N_TOKENS}" 2>/dev/null || true)
+    out=$(timeout 900 cargo run --release --example bench --features nccl -q -- \
+        --cuda-graph-engine --gpus "${gpus}" "${model_path}" "${N_TOKENS}" 2>&1 || true)
     local toks; toks=$(echo "${out}" | extract_toks)
     echo "${toks:-ERR}"
 }
 
-run_infernum_decode_eager() {
-    local model_path="$1"
-    $DRY_RUN && { echo "—"; return; }
-    local out
-    out=$(timeout 1200 cargo run --release --example bench --features cuda -q -- \
-        "${model_path}" "${N_TOKENS}" 2>/dev/null || true)
-    local toks; toks=$(echo "${out}" | extract_toks)
-    echo "${toks:-ERR}"
-}
-
-run_infernum_prefill() {
-    local model_path="$1"
-    $DRY_RUN && { echo "—"; return; }
-    local out
-    out=$(timeout 1200 cargo run --release --example bench --features cuda -q -- \
-        --graph "${model_path}" "${N_PREFILL}" 2>/dev/null || true)
-    local toks; toks=$(echo "${out}" | extract_toks)
-    echo "${toks:-ERR}"
+model_enabled() {
+    local key="$1"
+    [[ "${MODELS_FILTER}" == "all" ]] || \
+        echo ",${MODELS_FILTER}," | grep -qi ",${key},"
 }
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
 command -v cargo >/dev/null 2>&1 || die "cargo not found"
-command -v hf    >/dev/null 2>&1 || die "hf not found — pip install 'huggingface_hub[cli]'"
 $DRY_RUN || command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found"
 
+gpu_count=0
 if command -v nvidia-smi >/dev/null 2>&1; then
     gpu_count=$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')
-else
-    gpu_count=0
 fi
-[[ "${gpu_count}" -gt 0 ]] || $DRY_RUN || die "No GPUs detected"
+[[ "${gpu_count}" -ge 2 ]] || $DRY_RUN || die "Need at least 2 GPUs (found ${gpu_count})"
 log "Detected ${gpu_count} GPU(s)"
 
-# ── Model preparation ─────────────────────────────────────────────────────────
+# ── Model download ────────────────────────────────────────────────────────────
 
-log "Preparing models..."
-$DRY_RUN && log "(dry-run: skipping downloads)"
+if model_enabled "235b"; then
+    if [[ ! -f "${QWEN235B_GGUF}" ]]; then
+        if $DOWNLOAD_LARGE; then
+            log "Downloading Qwen3-235B-A22B Q4_K_M (~142 GB)..."
+            $DRY_RUN || {
+                mkdir -p "${QWEN235B_DIR}"
+                command -v hf >/dev/null 2>&1 || die "hf not found — pip install --break-system-packages huggingface_hub"
+                hf download Qwen/Qwen3-235B-A22B-GGUF \
+                    --local-dir "$(dirname "${QWEN235B_DIR}")" \
+                    --include "Q4_K_M/*" --quiet
+            }
+        else
+            log "Qwen3-235B-A22B not cached — use --download-large to download"
+        fi
+    fi
+fi
 
-[[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && {
-    download_hf_model "meta-llama/Llama-3.1-8B" "${LLAMA8B_DIR}" || \
-        log "WARNING: Llama-3.1-8B requires HuggingFace auth (hf login)."
-    try_download_hf_model "meta-llama/Llama-3.1-70B" "${LLAMA70B_DIR}"
-}
+# ── Build ─────────────────────────────────────────────────────────────────────
 
-[[ -n "${ENABLED_FAMILIES[qwen]:-}" ]] && {
-    download_hf_model "Qwen/Qwen3-8B" "${QWEN8B_DIR}"
-    try_download_hf_model "Qwen/Qwen3-72B" "${QWEN72B_DIR}"
-}
+log "Building infernum bench (NCCL, release)..."
+$DRY_RUN || cargo build --release --example bench --features nccl -q
 
-[[ -n "${ENABLED_FAMILIES[gemma]:-}" ]] && {
-    download_hf_model "google/gemma-3-27b" "${GEMMA27B_DIR}" || \
-        log "WARNING: Gemma-3-27B requires HuggingFace auth (hf login)."
-}
-
-[[ -n "${ENABLED_FAMILIES[deepseek]:-}" ]] && {
-    download_hf_model "yujiepan/deepseek-v3-tiny-random" "${DEEPSEEK_TINY_DIR}"
-}
-
-# ── Build ──────────────────────────────────────────────────────────────────────
-
-log "Building infernum bench (CUDA, release)..."
-$DRY_RUN || cargo build --release --example bench --features cuda -q 2>/dev/null
-
-# ── Run benchmarks ────────────────────────────────────────────────────────────
+# ── Benchmarks ────────────────────────────────────────────────────────────────
 
 log ""
-log "Running benchmarks (${N_TOKENS} decode / ${N_PREFILL} prefill tokens)..."
-log "─────────────────────────────────────────────"
+log "Running multi-GPU benchmarks (${N_TOKENS} decode tokens, greedy argmax)..."
+log "Each run: TP=2 then TP=8 — GPUs idle between runs."
+log "──────────────────────────────────────────────────"
 
-declare -A D_INFNUM P_INFNUM NOTES
+declare -A R2 R8  # tok/s at TP=2 and TP=8
 
-# Standard 8B models (single H100)
-if [[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && [[ -d "${LLAMA8B_DIR}" ]]; then
-    log "[Llama] Llama-3.1-8B BF16 decode"
-    D_INFNUM["Llama/Llama-3.1-8B BF16"]=$(run_infernum_decode "${LLAMA8B_DIR}")
-    log "[Llama] Llama-3.1-8B BF16 prefill"
-    P_INFNUM["Llama/Llama-3.1-8B BF16"]=$(run_infernum_prefill "${LLAMA8B_DIR}")
+if model_enabled "70b" && [[ -f "${LLAMA70B_GGUF}" ]]; then
+    log "[Llama-3.1-70B Q4_0] TP=2"
+    R2["llama70b"]=$(run_bench "${LLAMA70B_GGUF}" 2)
+    log "[Llama-3.1-70B Q4_0] TP=8"
+    R8["llama70b"]=$(run_bench "${LLAMA70B_GGUF}" 8)
+elif model_enabled "70b"; then
+    log "Llama-3.1-70B not found at ${LLAMA70B_GGUF} — skipping"
 fi
 
-if [[ -n "${ENABLED_FAMILIES[qwen]:-}" ]] && [[ -d "${QWEN8B_DIR}" ]]; then
-    log "[Qwen] Qwen3-8B BF16 decode"
-    D_INFNUM["Qwen/Qwen3-8B BF16"]=$(run_infernum_decode "${QWEN8B_DIR}")
-    log "[Qwen] Qwen3-8B BF16 prefill"
-    P_INFNUM["Qwen/Qwen3-8B BF16"]=$(run_infernum_prefill "${QWEN8B_DIR}")
+if model_enabled "72b" && [[ -f "${QWEN72B_GGUF}" ]]; then
+    log "[Qwen3-72B Q4_K_M] TP=2"
+    R2["qwen72b"]=$(run_bench "${QWEN72B_GGUF}" 2)
+    log "[Qwen3-72B Q4_K_M] TP=8"
+    R8["qwen72b"]=$(run_bench "${QWEN72B_GGUF}" 8)
+elif model_enabled "72b"; then
+    log "Qwen3-72B not found at ${QWEN72B_GGUF} — skipping"
 fi
 
-if [[ -n "${ENABLED_FAMILIES[gemma]:-}" ]] && [[ -d "${GEMMA27B_DIR}" ]]; then
-    log "[Gemma] Gemma-3-27B BF16 decode"
-    D_INFNUM["Gemma/Gemma-3-27B BF16"]=$(run_infernum_decode "${GEMMA27B_DIR}")
-    log "[Gemma] Gemma-3-27B BF16 prefill"
-    P_INFNUM["Gemma/Gemma-3-27B BF16"]=$(run_infernum_prefill "${GEMMA27B_DIR}")
-fi
-
-if [[ -n "${ENABLED_FAMILIES[deepseek]:-}" ]] && [[ -d "${DEEPSEEK_TINY_DIR}" ]]; then
-    log "[DeepSeek] deepseek-v3-tiny (random weights, smoke test)"
-    D_INFNUM["DeepSeek/tiny-random (smoke)"]=$(run_infernum_decode_eager "${DEEPSEEK_TINY_DIR}")
-    P_INFNUM["DeepSeek/tiny-random (smoke)"]="—"
-    NOTES["DeepSeek/tiny-random (smoke)"]="random weights; no quality check"
-fi
-
-# Large models (70B+, single GPU via GGUF Q4 ~40 GB)
-if [[ -n "${ENABLED_FAMILIES[llama]:-}" ]] && [[ -d "${LLAMA70B_DIR}" ]]; then
-    # GGUF Q4 conversion for single-GPU inference
-    if [[ ! -f "${LLAMA70B_GGUF_Q4}" ]]; then
-        log "[Llama] Llama-3.1-70B: BF16 available but GGUF Q4 needed for single-GPU"
-        log "  Convert with: llama-quantize (requires llama.cpp)"
-        log "  Skipping 70B single-GPU benchmark — set LLAMA_CPP to enable conversion"
-    else
-        log "[Llama] Llama-3.1-70B GGUF Q4 decode (single GPU)"
-        D_INFNUM["Llama/Llama-3.1-70B Q4 (1 GPU)"]=$(run_infernum_decode "${LLAMA70B_GGUF_Q4}")
-        P_INFNUM["Llama/Llama-3.1-70B Q4 (1 GPU)"]=$(run_infernum_prefill "${LLAMA70B_GGUF_Q4}")
-        NOTES["Llama/Llama-3.1-70B Q4 (1 GPU)"]="single GPU; multi-GPU BF16 requires bench_parallel (pending)"
-    fi
-elif [[ -n "${ENABLED_FAMILIES[llama]:-}" ]]; then
-    log "[Llama] Llama-3.1-70B not cached (use --download-large)"
-fi
-
-if [[ -n "${ENABLED_FAMILIES[qwen]:-}" ]] && [[ -d "${QWEN72B_DIR}" ]]; then
-    if [[ ! -f "${QWEN72B_GGUF_Q4}" ]]; then
-        log "[Qwen] Qwen3-72B: GGUF Q4 needed for single-GPU — convert with llama-quantize"
-    else
-        log "[Qwen] Qwen3-72B GGUF Q4 decode (single GPU)"
-        D_INFNUM["Qwen/Qwen3-72B Q4 (1 GPU)"]=$(run_infernum_decode "${QWEN72B_GGUF_Q4}")
-        P_INFNUM["Qwen/Qwen3-72B Q4 (1 GPU)"]=$(run_infernum_prefill "${QWEN72B_GGUF_Q4}")
-        NOTES["Qwen/Qwen3-72B Q4 (1 GPU)"]="single GPU; multi-GPU BF16 requires bench_parallel (pending)"
-    fi
-elif [[ -n "${ENABLED_FAMILIES[qwen]:-}" ]]; then
-    log "[Qwen] Qwen3-72B not cached (use --download-large)"
+if model_enabled "235b" && [[ -f "${QWEN235B_GGUF}" ]]; then
+    log "[Qwen3-235B-A22B Q4_K_M] TP=2"
+    R2["qwen235b"]=$(run_bench "${QWEN235B_GGUF}" 2)
+    log "[Qwen3-235B-A22B Q4_K_M] TP=8"
+    R8["qwen235b"]=$(run_bench "${QWEN235B_GGUF}" 8)
+elif model_enabled "235b"; then
+    log "Qwen3-235B-A22B not found (use --download-large) — skipping"
 fi
 
 log ""
@@ -277,47 +168,21 @@ gpu_mem=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null 
 infernum_commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
 echo ""
-echo "## Infernum CUDA (H100 / large models) — all model families"
+echo "### infernum multi-GPU decode (greedy argmax, ${N_TOKENS} tokens)"
 echo ""
-echo "- **GPU:** ${gpu_name} × ${gpu_count} (${gpu_mem} each)"
-echo "- **Decode tokens:** ${N_TOKENS}  |  **Prefill tokens:** ${N_PREFILL}"
+echo "- **Node:** ${gpu_count}× ${gpu_name} (${gpu_mem} each)"
 echo "- **infernum commit:** \`${infernum_commit}\`"
 echo "- **Date:** $(date +%Y-%m-%d)"
-echo "- **Multi-GPU note:** 70B+ BF16 with tensor parallelism requires a"
-echo "  \`bench_parallel\` example (not yet implemented). The 70B rows use"
-echo "  single-GPU GGUF Q4 (~40 GB) as a proxy until that lands."
+echo "- **TP>1 note:** NCCL AllReduce blocks CUDA graph capture; TP>1 runs eager."
+echo ""
+echo "| Model | Format | 2 GPUs (tok/s) | 8 GPUs (tok/s) |"
+echo "| ----- | ------ | -------------: | -------------: |"
 
-row_order=(
-    "Llama/Llama-3.1-8B BF16"
-    "Qwen/Qwen3-8B BF16"
-    "Gemma/Gemma-3-27B BF16"
-    "DeepSeek/tiny-random (smoke)"
-    "Llama/Llama-3.1-70B Q4 (1 GPU)"
-    "Qwen/Qwen3-72B Q4 (1 GPU)"
-)
-
-echo ""
-echo "### Decode throughput (tok/s)"
-echo ""
-echo "| Model | infernum | notes |"
-echo "| ----- | -------: | ----- |"
-for key in "${row_order[@]}"; do
-    [[ -v D_INFNUM["${key}"] ]] || continue
-    inf="${D_INFNUM[${key}]}"
-    note="${NOTES[${key}]:-}"
-    printf "| %-38s | %8s | %s |\n" "${key}" "${inf}" "${note}"
-done
-
-echo ""
-echo "### Prefill throughput (tok/s)"
-echo ""
-echo "| Model | infernum | notes |"
-echo "| ----- | -------: | ----- |"
-for key in "${row_order[@]}"; do
-    [[ -v P_INFNUM["${key}"] ]] || continue
-    inf="${P_INFNUM[${key}]}"
-    note="${NOTES[${key}]:-}"
-    printf "| %-38s | %8s | %s |\n" "${key}" "${inf}" "${note}"
-done
+[[ -v R2[llama70b]  ]] && printf "| Llama-3.1-70B        | Q4_0    | %14s | %14s |\n" \
+    "${R2[llama70b]}"  "${R8[llama70b]:-—}"
+[[ -v R2[qwen72b]   ]] && printf "| Qwen3-72B            | Q4_K_M  | %14s | %14s |\n" \
+    "${R2[qwen72b]}"   "${R8[qwen72b]:-—}"
+[[ -v R2[qwen235b]  ]] && printf "| Qwen3-235B-A22B      | Q4_K_M  | %14s | %14s |\n" \
+    "${R2[qwen235b]}"  "${R8[qwen235b]:-—}"
 
 echo ""

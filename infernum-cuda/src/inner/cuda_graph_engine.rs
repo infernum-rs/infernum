@@ -28,7 +28,7 @@ use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, W
 use infernum::shard::{shard_strategy_for_weight, ShardConfig, ShardStrategy};
 use infernum::weights::QuantizationConfig;
 use infernum::WeightLoader as _;
-use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
+use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, QUANTIZATION_BLOCK_SIZE};
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
@@ -318,11 +318,21 @@ pub fn load_graph_weights_gguf_cuda(
         let file_dtype = loader.get_dtype(&effective_gguf_name)?;
         let strategy = shard_strategy_for_weight(safetensors_name);
 
-        // Q8_0 and Q4_0 have both GPU kernels and sharding support.
-        // Q6_K has a GPU kernel for single-GPU but sharding isn't implemented yet.
-        // K-quants (Q4_K) and other unsupported types fall through to BF16.
-        let supports_quant_sharding =
-            matches!(file_dtype, DType::Q8_0 | DType::Q4_0);
+        // Q8_0 and Q4_0 support GPU quantized sharding, but only when the
+        // column count is aligned to block_size × world_size for Row strategy.
+        // Misaligned shapes (e.g. Qwen3-72B at TP=8) fall through to BF16.
+        let supports_quant_sharding = matches!(file_dtype, DType::Q8_0 | DType::Q4_0)
+            && shard.map_or(true, |s| {
+                strategy != ShardStrategy::Row || {
+                    loader
+                        .get_shape(&effective_gguf_name)
+                        .ok()
+                        .and_then(|shape| shape.get(1).copied())
+                        .map_or(false, |n_cols| {
+                            (n_cols / QUANTIZATION_BLOCK_SIZE) % s.world_size == 0
+                        })
+                }
+            });
         let use_gpu_quant = file_dtype.has_gpu_quant_kernel()
             && (shard.is_none() || supports_quant_sharding);
 
