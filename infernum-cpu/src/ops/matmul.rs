@@ -439,8 +439,10 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                     }
                     let chunk_n = col_end - col_start;
 
-                    // Create a temporary contiguous output buffer for this column chunk.
-                    let mut local_out = vec![0.0f32; m * chunk_n];
+                    // The microkernel zeros its own accumulators and writes every element,
+                    // so we skip the redundant zero-init to save memory bandwidth.
+                    let mut local_out: Vec<f32> = Vec::with_capacity(m * chunk_n);
+                    unsafe { local_out.set_len(m * chunk_n) };
 
                     // Weight slices for columns [col_start..col_end].
                     let wt_data = unsafe {
@@ -640,7 +642,9 @@ fn q4_gemm_tiled(
         let chunk_n = col_end - col_start;
 
         // Expand Q4_0 → int8 for this thread's weight column chunk.
-        let mut expanded = vec![0u8; chunk_n * k];
+        // expand_q4_to_int8 writes every element, so skip the redundant zero-init.
+        let mut expanded: Vec<u8> = Vec::with_capacity(chunk_n * k);
+        unsafe { expanded.set_len(chunk_n * k) };
         let q4_data = unsafe {
             std::slice::from_raw_parts(
                 (wt_data_addr as *const u8).add(col_start * bpr),
@@ -656,7 +660,10 @@ fn q4_gemm_tiled(
             )
         };
 
-        let mut local_out = vec![0.0f32; m * chunk_n];
+        // The microkernel zeros its own accumulators and writes every element,
+        // so we skip the redundant zero-init to save memory bandwidth.
+        let mut local_out: Vec<f32> = Vec::with_capacity(m * chunk_n);
+        unsafe { local_out.set_len(m * chunk_n) };
         simd::gemm_q8_tiled(
             &mut local_out,
             &all_rows.quants,
