@@ -19,7 +19,7 @@ impl SwigluOps for CpuBackend {
         );
         let mut out = vec![0.0f32; gate_data.len()];
         simd::vec_silu_mul(gate_data, up_data, &mut out);
-        Ok(CpuTensor::from_f32(gate.shape(), &out))
+        Ok(CpuTensor::from_f32_vec(gate.shape(), out))
     }
 }
 
@@ -43,6 +43,6 @@ impl GegluOps for CpuBackend {
         for i in 0..gate_data.len() {
             out[i] = gelu_approx(gate_data[i]) * up_data[i];
         }
-        Ok(CpuTensor::from_f32(gate.shape(), &out))
+        Ok(CpuTensor::from_f32_vec(gate.shape(), out))
     }
 }
