@@ -11,6 +11,8 @@
 //! `execute()` implementation in `builtin_ops.rs` handles the logic.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
@@ -18,6 +20,55 @@ use infernum::{DType, ExecutionPlan, NodeId, Result};
 
 use crate::tensor::{CpuLinearWeight, CpuTensor};
 use crate::CpuBackend;
+
+// ---------- lightweight per-op profiling (INFERNUM_PROFILE=1) ----------
+
+static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn profile_enabled() -> bool {
+    *PROFILE_ENABLED.get_or_init(|| std::env::var("INFERNUM_PROFILE").as_deref() == Ok("1"))
+}
+
+// Per-thread accumulator: op_type_name → (total_duration, call_count).
+std::thread_local! {
+    static OP_TIMINGS: std::cell::RefCell<HashMap<&'static str, (Duration, u64)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Print accumulated per-op timing breakdown and reset counters.
+/// Call this at the end of a benchmark run when INFERNUM_PROFILE=1.
+pub fn print_op_profile() {
+    if !profile_enabled() {
+        return;
+    }
+    OP_TIMINGS.with(|cell| {
+        let map = cell.borrow();
+        if map.is_empty() {
+            return;
+        }
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let total: Duration = entries.iter().map(|e| e.1 .0).sum();
+        eprintln!("\n[INFERNUM_PROFILE] per-op timing breakdown:");
+        eprintln!(
+            "{:<40} {:>10} {:>10} {:>8}",
+            "op", "ms_total", "calls", "pct"
+        );
+        eprintln!("{}", "-".repeat(72));
+        for (name, (dur, count)) in &entries {
+            let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
+            eprintln!(
+                "{:<40} {:>10.2} {:>10} {:>7.1}%",
+                name,
+                dur.as_secs_f64() * 1000.0,
+                count,
+                pct
+            );
+        }
+        eprintln!("{}", "-".repeat(72));
+        eprintln!("{:<40} {:>10.2}", "TOTAL", total.as_secs_f64() * 1000.0);
+    });
+}
 
 /// Persistent KV cache storage for decode-mode graph execution.
 ///
@@ -237,6 +288,8 @@ pub fn execute(
 ) -> Result<Vec<CpuTensor>> {
     let mut input_idx: usize = 0;
 
+    let profiling = profile_enabled();
+
     for &node_id in &plan.schedule {
         let node = &nodes[node_id.index() as usize];
         let mut ctx = infernum::graph::execute_context::ExecuteContext {
@@ -252,7 +305,21 @@ pub fn execute(
             input_idx: &mut input_idx,
             comm: None,
         };
-        node.op.execute(&mut ctx, node_id, &node.inputs)?;
+
+        if profiling {
+            let op_name = node.op.name();
+            let t0 = Instant::now();
+            node.op.execute(&mut ctx, node_id, &node.inputs)?;
+            let elapsed = t0.elapsed();
+            OP_TIMINGS.with(|cell| {
+                let mut map = cell.borrow_mut();
+                let entry = map.entry(op_name).or_insert((Duration::ZERO, 0));
+                entry.0 += elapsed;
+                entry.1 += 1;
+            });
+        } else {
+            node.op.execute(&mut ctx, node_id, &node.inputs)?;
+        }
     }
 
     // Update persistent KV cache length after all layers have appended.
