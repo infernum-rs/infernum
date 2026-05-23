@@ -44,6 +44,9 @@ use infernum_cuda::cuda::ops::{
 use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache};
 use infernum_cuda::executor;
 use infernum_cuda::CudaBackend;
+use infernum_deepseek::DeepSeekCudaEngine;
+#[cfg(feature = "nccl")]
+use infernum_deepseek::DeepSeekShardedEngine;
 use infernum_gemma::{
     build_prefill_graph as gemma_build_prefill_graph, GemmaConfig, GemmaCudaGraphEngine,
     GemmaCudaGraphEngineExt as _, GemmaShardedGraphEngine, GemmaShardedGraphEngineExt as _,
@@ -1164,6 +1167,11 @@ fn bench_cuda_graph_engine(
                     GemmaShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
                     n_gen,
                 ),
+                "deepseek2" => run_engine_bench(
+                    ctx,
+                    DeepSeekShardedEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                ),
                 other => Err(infernum::Error::UnsupportedModel(format!(
                     "--cuda-graph-engine --gpus GGUF: unsupported architecture `{other}`"
                 ))),
@@ -1219,6 +1227,11 @@ fn bench_cuda_graph_engine(
             "gemma2" | "gemma3" => run_engine_bench(
                 ctx,
                 GemmaCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+            ),
+            "deepseek2" => run_engine_bench(
+                ctx,
+                DeepSeekCudaEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
                 n_gen,
             ),
             other => Err(infernum::Error::UnsupportedModel(format!(

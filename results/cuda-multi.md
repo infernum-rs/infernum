@@ -36,7 +36,7 @@ llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for mod
 | ---- | ------ |
 | Qwen3-235B-A22B TP=4 re-run | TP=4 tested during 2026-05-23 work: Q6_K Row sharding for k=1536 (6 blocks, not divisible by 4) triggers BF16 CPU fallback for `ffn_down_exps` expert slices — ~12,032 slices × CPU dequant = ~10 min load time. TP=4 is valid (1 KV head/rank ≥ min) but impractical until Row sharding handles misaligned super-blocks natively. |
 | Qwen3-72B Q4_K_M re-run | 7.3 tok/s measured with BF16 dequant (pre-2026-05-23). Q4_K/Q5_K GPU GEMV kernels now live; re-run expected to improve VRAM and potentially throughput. |
-| DeepSeek-V3/R1 Q4_0 | **Blocked** — `deepseek` GGUF architecture not yet supported in the graph engine. Planned: TP=2 and TP=8. |
+| DeepSeek-V3/R1 Q4_0 | **Ready to measure** — `deepseek2` GGUF arch now supported: `DeepSeekCudaEngine::from_gguf` (single GPU) and `DeepSeekShardedEngine::from_gguf` (TP=2/4/8). Awaiting model download and A100 run. |
 | CUDA graph TP | NCCL AllReduce blocks CUDA graph capture; TP>1 runs eager |
 
 ---
