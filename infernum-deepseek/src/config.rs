@@ -266,9 +266,8 @@ impl DeepSeekConfig {
             .ok()
             .filter(|&r| r > 0);
 
-        // rope.dimension_count is the full RoPE dim; half goes to Q/K RoPE portion
+        // rope.dimension_count is the per-head RoPE portion (qk_rope_head_dim directly).
         let qk_rope_head_dim = get_usize(metadata, &format!("{arch}.rope.dimension_count"))
-            .map(|d| d / 2)
             .unwrap_or(64);
 
         // scoring_func: 0=softmax, 1=sigmoid
@@ -320,9 +319,14 @@ impl DeepSeekConfig {
             q_lora_rank,
             kv_lora_rank,
             qk_nope_head_dim: get_usize(metadata, &format!("{arch}.attention.key_length_mla"))
+                .or_else(|_| {
+                    get_usize(metadata, &format!("{arch}.attention.key_length"))
+                        .map(|k| k.saturating_sub(qk_rope_head_dim))
+                })
                 .unwrap_or(128),
             qk_rope_head_dim,
             v_head_dim: get_usize(metadata, &format!("{arch}.attention.value_length_mla"))
+                .or_else(|_| get_usize(metadata, &format!("{arch}.attention.value_length")))
                 .unwrap_or(128),
             n_routed_experts: get_usize(metadata, &format!("{arch}.expert_count")).ok(),
             n_shared_experts: get_usize(metadata, &format!("{arch}.expert_shared_count"))
@@ -668,15 +672,16 @@ mod tests {
             "deepseek2.attention.kv_lora_rank".into(),
             GgufValue::U32(512),
         );
+        // Real GGUF uses key_length (nope+rope total) and value_length, not *_mla variants.
         meta.insert(
-            "deepseek2.attention.key_length_mla".into(),
-            GgufValue::U32(128),
+            "deepseek2.attention.key_length".into(),
+            GgufValue::U32(192), // qk_nope(128) + qk_rope(64)
         );
         meta.insert(
-            "deepseek2.attention.value_length_mla".into(),
+            "deepseek2.attention.value_length".into(),
             GgufValue::U32(128),
         );
-        meta.insert("deepseek2.rope.dimension_count".into(), GgufValue::U32(128));
+        meta.insert("deepseek2.rope.dimension_count".into(), GgufValue::U32(64));
         meta.insert("deepseek2.rope.freq_base".into(), GgufValue::F32(10000.0));
         meta.insert(
             "deepseek2.attention.layernorm_rms_eps".into(),
@@ -712,7 +717,7 @@ mod tests {
         assert_eq!(config.q_lora_rank, Some(1536));
         assert_eq!(config.kv_lora_rank, 512);
         assert_eq!(config.qk_nope_head_dim, 128);
-        assert_eq!(config.qk_rope_head_dim, 64); // 128 / 2
+        assert_eq!(config.qk_rope_head_dim, 64);
         assert_eq!(config.v_head_dim, 128);
         assert_eq!(config.qk_head_dim(), 192);
         assert_eq!(config.n_routed_experts, Some(256));

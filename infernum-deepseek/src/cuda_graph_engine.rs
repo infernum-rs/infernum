@@ -271,9 +271,11 @@ fn load_weights_gguf(
         let safetensors_name = &meta.name;
         let gguf_name = safetensors_to_gguf_name(safetensors_name);
 
-        // kv_b split: all three virtual weights map to blk.N.attn_kv_b.weight.
-        if let Some(st_disk_name) = kv_b_proj_disk_name(safetensors_name) {
-            let gguf_disk_name = safetensors_to_gguf_name(&st_disk_name);
+        // kv_b split: all three virtual weights (kv_b_proj_k/v/k_t) map to the
+        // same on-disk blk.N.attn_kv_b.weight. `gguf_name` is already correctly
+        // mapped (safetensors_to_gguf_name handles the _k/_v/_k_t suffixes).
+        if let Some(_st_disk_name) = kv_b_proj_disk_name(safetensors_name) {
+            let gguf_disk_name = gguf_name.clone();
 
             if !split_cache.contains_key(&gguf_disk_name) {
                 // Shape on disk: (n_heads*(qk_nope+v), kv_lora). Transpose before split.
