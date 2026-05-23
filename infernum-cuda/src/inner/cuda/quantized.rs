@@ -16,7 +16,8 @@ use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::cuda::CudaContext;
 use infernum::dtype::{
-    DType, GPTQ_GROUP_SIZE, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE,
+    DType, GPTQ_GROUP_SIZE, Q4K_BLOCK_ELEMENTS, Q4K_BLOCK_SIZE_BYTES, Q5K_BLOCK_ELEMENTS,
+    Q5K_BLOCK_SIZE_BYTES, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE,
 };
 use infernum::Result;
 
@@ -124,6 +125,18 @@ impl QuantizedTensor {
                 "Number of elements ({numel}) must be divisible by Q6_K block size ({Q6_K_BLOCK_ELEMENTS})"
             );
             // Q6_K stores packed super-blocks in data, no separate scales
+        } else if matches!(dtype, DType::Q4_K | DType::Q5_K) {
+            let block_elems = if dtype == DType::Q4_K {
+                Q4K_BLOCK_ELEMENTS
+            } else {
+                Q5K_BLOCK_ELEMENTS
+            };
+            assert_eq!(
+                numel % block_elems,
+                0,
+                "Number of elements ({numel}) must be divisible by {dtype} block size ({block_elems})"
+            );
+            // Q4_K/Q5_K store packed super-blocks in data, no separate scales
         } else if dtype.is_block_quantized() {
             assert_eq!(
                 numel % QUANTIZATION_BLOCK_SIZE,
@@ -473,6 +486,8 @@ impl QuantizedTensor {
             DType::Q8_0 | DType::F8E4M3 => numel, // 1 byte per element
             DType::Q4_0 => numel / 2,             // 0.5 bytes per element (packed)
             DType::Q6_K => (numel / Q6_K_BLOCK_ELEMENTS) * Q6_K_BLOCK_SIZE_BYTES,
+            DType::Q4_K => (numel / Q4K_BLOCK_ELEMENTS) * Q4K_BLOCK_SIZE_BYTES,
+            DType::Q5_K => (numel / Q5K_BLOCK_ELEMENTS) * Q5K_BLOCK_SIZE_BYTES,
             _ => unreachable!(),
         };
         assert_eq!(
@@ -500,6 +515,8 @@ impl QuantizedTensor {
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
                 num_blocks * Q6_K_BLOCK_SIZE_BYTES // packed super-blocks
             }
+            DType::Q4_K => (numel / Q4K_BLOCK_ELEMENTS) * Q4K_BLOCK_SIZE_BYTES,
+            DType::Q5_K => (numel / Q5K_BLOCK_ELEMENTS) * Q5K_BLOCK_SIZE_BYTES,
             DType::F8E4M3 => numel, // 1 byte per element, no scales
             DType::GPTQ_INT4 | DType::AWQ_INT4 => {
                 let gs = self.group_size.unwrap_or(GPTQ_GROUP_SIZE);

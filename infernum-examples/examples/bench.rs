@@ -1154,7 +1154,7 @@ fn bench_cuda_graph_engine(
                     LlamaShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
                     n_gen,
                 ),
-                "qwen2" | "qwen3" => run_engine_bench(
+                "qwen2" | "qwen3" | "qwen3moe" => run_engine_bench(
                     ctx,
                     QwenShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
                     n_gen,
@@ -1211,7 +1211,7 @@ fn bench_cuda_graph_engine(
                 LlamaCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
                 n_gen,
             ),
-            "qwen2" | "qwen3" => run_engine_bench(
+            "qwen2" | "qwen3" | "qwen3moe" => run_engine_bench(
                 ctx,
                 QwenCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
                 n_gen,

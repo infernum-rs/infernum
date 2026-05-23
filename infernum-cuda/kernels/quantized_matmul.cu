@@ -958,6 +958,292 @@ extern "C" __global__ void gemv_q4_q8_dp4a(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q4_K and Q5_K GEMV kernels
+// ---------------------------------------------------------------------------
+// Q4_K super-block (256 elements, 144 bytes): d[f16](2) + dmin[f16](2) + scales[12] + qs[128]
+// Q5_K super-block (256 elements, 176 bytes): d[f16](2) + dmin[f16](2) + scales[12] + qh[32] + qs[128]
+//
+// Scale decode: scales[12] encodes 6-bit sc and m for each of 8 sub-blocks.
+// Q4_K dequant: w = d * sc * q - dmin * m, q ∈ [0, 15]
+// Q5_K dequant: w = d * sc * (q5 - 16) - dmin * m, q5 ∈ [0, 31]
+//
+// Each super-block has 8 sub-blocks of 32 elements (one Q8_1 block each).
+// Iterates over Q8_1 blocks for good thread utilization.
+
+__device__ void get_scale_min_k4(int j, const unsigned char* q, int* sc, int* m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m  = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+// Shared reduction epilogue for Q4_K / Q5_K (same as Q6_K pattern)
+__device__ void reduce_and_write_f32(float acc, float* output, int n, int lane, int warp_id, int nwarps) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) smem[warp_id] = acc;
+        __syncthreads();
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) sum += smem[w];
+            output[n] = sum;
+        }
+    } else {
+        if (lane == 0) output[n] = acc;
+    }
+}
+
+__device__ void reduce_and_write_bf16(float acc, unsigned short* output, int n, int lane, int warp_id, int nwarps) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    if (nwarps > 1) {
+        extern __shared__ float smem[];
+        if (lane == 0) smem[warp_id] = acc;
+        __syncthreads();
+        if (warp_id == 0 && lane == 0) {
+            float sum = smem[0];
+            for (int w = 1; w < nwarps; w++) sum += smem[w];
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &sum, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
+        }
+    } else {
+        if (lane == 0) {
+            unsigned int f32_bits;
+            memcpy(&f32_bits, &acc, 4);
+            output[n] = (unsigned short)(f32_bits >> 16);
+        }
+    }
+}
+
+// Q4_K inner loop: process one Q8_1 block (32 elements from sub-block row8 of super-block sb)
+// Returns d*sc*d_a*sumi - dmin*m*d_a*asum
+__device__ float q4k_block_dot(
+    const unsigned char* block,  // pointer to Q4_K super-block
+    const int* a_ptr,            // activations for this Q8_1 block (32 int8 as 8 ints)
+    float d_a,                   // activation block scale
+    int row8                     // sub-block index 0..7
+) {
+    float d    = f16_to_f32(*(const unsigned short*)(block));
+    float dmin = f16_to_f32(*(const unsigned short*)(block + 2));
+    const unsigned char* sc_buf = block + 4;   // 12 scales bytes
+    const unsigned char* qs     = block + 16;  // 128 nibble bytes
+
+    int sc, m;
+    get_scale_min_k4(row8, sc_buf, &sc, &m);
+
+    const unsigned char* qs_sub = qs + row8 * 16;
+    const int ones = 0x01010101;
+    int sumi = 0, asum = 0;
+
+    // Groups g=0..3: elements 0-15 (low nibbles)
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        unsigned char b0 = qs_sub[g * 4 + 0];
+        unsigned char b1 = qs_sub[g * 4 + 1];
+        unsigned char b2 = qs_sub[g * 4 + 2];
+        unsigned char b3 = qs_sub[g * 4 + 3];
+        int q_packed = (b0 & 0xF) | ((b1 & 0xF) << 8) | ((b2 & 0xF) << 16) | ((b3 & 0xF) << 24);
+        sumi = __dp4a(q_packed, a_ptr[g], sumi);
+        asum = __dp4a(ones, a_ptr[g], asum);
+    }
+    // Groups g=4..7: elements 16-31 (high nibbles, same qs bytes)
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        unsigned char b0 = qs_sub[g * 4 + 0];
+        unsigned char b1 = qs_sub[g * 4 + 1];
+        unsigned char b2 = qs_sub[g * 4 + 2];
+        unsigned char b3 = qs_sub[g * 4 + 3];
+        int q_packed = ((b0 >> 4) & 0xF) | (((b1 >> 4) & 0xF) << 8)
+                     | (((b2 >> 4) & 0xF) << 16) | (((b3 >> 4) & 0xF) << 24);
+        sumi = __dp4a(q_packed, a_ptr[4 + g], sumi);
+        asum = __dp4a(ones, a_ptr[4 + g], asum);
+    }
+
+    return d * (float)sc * d_a * (float)sumi - dmin * (float)m * d_a * (float)asum;
+}
+
+// Q5_K inner loop: same as Q4_K but adds 5th bit from qh[32]
+__device__ float q5k_block_dot(
+    const unsigned char* block,
+    const int* a_ptr,
+    float d_a,
+    int row8
+) {
+    float d    = f16_to_f32(*(const unsigned short*)(block));
+    float dmin = f16_to_f32(*(const unsigned short*)(block + 2));
+    const unsigned char* sc_buf = block + 4;   // 12 bytes
+    const unsigned char* qh     = block + 16;  // 32 bytes
+    const unsigned char* qs     = block + 48;  // 128 bytes
+
+    int sc, m;
+    get_scale_min_k4(row8, sc_buf, &sc, &m);
+
+    const unsigned char* qs_sub = qs + row8 * 16;
+    const unsigned char* qh_sub = qh + row8 * 4;
+    const int ones = 0x01010101;
+    int sumi = 0, asum = 0;
+
+    // Groups g=0..3: elements 0-15 (low nibbles of qs_sub + 5th bits from qh_sub[0..1])
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        unsigned char b0 = qs_sub[g * 4 + 0];
+        unsigned char b1 = qs_sub[g * 4 + 1];
+        unsigned char b2 = qs_sub[g * 4 + 2];
+        unsigned char b3 = qs_sub[g * 4 + 3];
+        unsigned char qh_byte = qh_sub[g / 2];
+        int bit_base = (g % 2) * 4;
+        int q0 = (b0 & 0xF) | (((qh_byte >> (bit_base + 0)) & 1) << 4);
+        int q1 = (b1 & 0xF) | (((qh_byte >> (bit_base + 1)) & 1) << 4);
+        int q2 = (b2 & 0xF) | (((qh_byte >> (bit_base + 2)) & 1) << 4);
+        int q3 = (b3 & 0xF) | (((qh_byte >> (bit_base + 3)) & 1) << 4);
+        int q_packed = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+        sumi = __dp4a(q_packed, a_ptr[g], sumi);
+        asum = __dp4a(ones, a_ptr[g], asum);
+    }
+    // Groups g=4..7: elements 16-31 (high nibbles + 5th bits from qh_sub[2..3])
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        unsigned char b0 = qs_sub[g * 4 + 0];
+        unsigned char b1 = qs_sub[g * 4 + 1];
+        unsigned char b2 = qs_sub[g * 4 + 2];
+        unsigned char b3 = qs_sub[g * 4 + 3];
+        unsigned char qh_byte = qh_sub[2 + g / 2];
+        int bit_base = (g % 2) * 4;
+        int q0 = ((b0 >> 4) & 0xF) | (((qh_byte >> (bit_base + 0)) & 1) << 4);
+        int q1 = ((b1 >> 4) & 0xF) | (((qh_byte >> (bit_base + 1)) & 1) << 4);
+        int q2 = ((b2 >> 4) & 0xF) | (((qh_byte >> (bit_base + 2)) & 1) << 4);
+        int q3 = ((b3 >> 4) & 0xF) | (((qh_byte >> (bit_base + 3)) & 1) << 4);
+        int q_packed = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+        sumi = __dp4a(q_packed, a_ptr[4 + g], sumi);
+        asum = __dp4a(ones, a_ptr[4 + g], asum);
+    }
+
+    // dequant: d*sc*(q5-16) - dmin*m → d*sc*sumi - (16*d*sc + dmin*m)*asum
+    return d * (float)sc * d_a * (float)sumi
+         - (16.0f * d * (float)sc + dmin * (float)m) * d_a * (float)asum;
+}
+
+// Q4_K × Q8_1 dp4a GEMV — f32 output
+extern "C" __global__ void gemv_q4k_q8_dp4a(
+    float*              __restrict__ output,
+    const signed char*  __restrict__ act_data,
+    const float*        __restrict__ act_scales,
+    const float*        __restrict__ act_sums,     // unused; kept for uniform API
+    const unsigned char* __restrict__ weight_data,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int lane = threadIdx.x, warp_id = threadIdx.y, nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    const int sblocks_per_row = K / 256;
+    const int block_bytes = 144;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        int sb = b / 8, row8 = b % 8;
+        int sb_offset = (n * sblocks_per_row + sb) * block_bytes;
+        const int* a_ptr = (const int*)(act_data + b * 32);
+        acc += q4k_block_dot(weight_data + sb_offset, a_ptr, act_scales[b], row8);
+    }
+    reduce_and_write_f32(acc, output, n, lane, warp_id, nwarps);
+}
+
+// Q4_K × Q8_1 dp4a GEMV — bf16 output
+extern "C" __global__ void gemv_q4k_q8_dp4a_bf16(
+    unsigned short*     __restrict__ output,
+    const signed char*  __restrict__ act_data,
+    const float*        __restrict__ act_scales,
+    const float*        __restrict__ act_sums,
+    const unsigned char* __restrict__ weight_data,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int lane = threadIdx.x, warp_id = threadIdx.y, nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    const int sblocks_per_row = K / 256;
+    const int block_bytes = 144;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        int sb = b / 8, row8 = b % 8;
+        int sb_offset = (n * sblocks_per_row + sb) * block_bytes;
+        const int* a_ptr = (const int*)(act_data + b * 32);
+        acc += q4k_block_dot(weight_data + sb_offset, a_ptr, act_scales[b], row8);
+    }
+    reduce_and_write_bf16(acc, output, n, lane, warp_id, nwarps);
+}
+
+// Q5_K × Q8_1 dp4a GEMV — f32 output
+extern "C" __global__ void gemv_q5k_q8_dp4a(
+    float*              __restrict__ output,
+    const signed char*  __restrict__ act_data,
+    const float*        __restrict__ act_scales,
+    const float*        __restrict__ act_sums,
+    const unsigned char* __restrict__ weight_data,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int lane = threadIdx.x, warp_id = threadIdx.y, nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    const int sblocks_per_row = K / 256;
+    const int block_bytes = 176;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        int sb = b / 8, row8 = b % 8;
+        int sb_offset = (n * sblocks_per_row + sb) * block_bytes;
+        const int* a_ptr = (const int*)(act_data + b * 32);
+        acc += q5k_block_dot(weight_data + sb_offset, a_ptr, act_scales[b], row8);
+    }
+    reduce_and_write_f32(acc, output, n, lane, warp_id, nwarps);
+}
+
+// Q5_K × Q8_1 dp4a GEMV — bf16 output
+extern "C" __global__ void gemv_q5k_q8_dp4a_bf16(
+    unsigned short*     __restrict__ output,
+    const signed char*  __restrict__ act_data,
+    const float*        __restrict__ act_scales,
+    const float*        __restrict__ act_sums,
+    const unsigned char* __restrict__ weight_data,
+    const int N,
+    const int K
+) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int lane = threadIdx.x, warp_id = threadIdx.y, nwarps = blockDim.y;
+    const int tid = warp_id * 32 + lane;
+    const int nthreads = nwarps * 32;
+    const int blocks_per_row = K / 32;
+    const int sblocks_per_row = K / 256;
+    const int block_bytes = 176;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += nthreads) {
+        int sb = b / 8, row8 = b % 8;
+        int sb_offset = (n * sblocks_per_row + sb) * block_bytes;
+        const int* a_ptr = (const int*)(act_data + b * 32);
+        acc += q5k_block_dot(weight_data + sb_offset, a_ptr, act_scales[b], row8);
+    }
+    reduce_and_write_bf16(acc, output, n, lane, warp_id, nwarps);
+}
+
 // Q4_0 × Q8_1 dp4a GEMV — BF16 output variant
 // Identical to gemv_q4_q8_dp4a but writes bf16 (upper 16 bits of f32) output.
 extern "C" __global__ void gemv_q4_q8_dp4a_bf16(

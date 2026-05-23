@@ -1099,8 +1099,11 @@ where
 /// Convert a HuggingFace SafeTensors weight name to its GGUF (llama.cpp) equivalent.
 ///
 /// Used by the CUDA GGUF loader to map graph weight metadata names to the
-/// GGUF key namespace. Covers dense Qwen2/Qwen3 weights; MoE expert weights
-/// are not yet supported.
+/// GGUF key namespace. Covers dense Qwen2/Qwen3 and MoE (Qwen3-MoE) weights.
+///
+/// For per-expert weights the returned string carries a `[N]` expert index
+/// suffix (e.g. `"blk.0.ffn_gate_exps.weight[42]"`), which the GGUF engine
+/// parses to call `load_quantized_expert_slice`.
 ///
 /// # Panics
 ///
@@ -1116,6 +1119,22 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
         let dot = rest.find('.').expect("malformed layer weight name");
         let layer_idx = &rest[..dot];
         let suffix = &rest[dot + 1..];
+
+        // Per-expert weights: "mlp.experts.N.{gate,up,down}_proj.weight"
+        // The expert index is encoded in the returned name as "[N]".
+        if let Some(expert_rest) = suffix.strip_prefix("mlp.experts.") {
+            let edot = expert_rest.find('.').expect("malformed expert weight name");
+            let e: usize = expert_rest[..edot].parse().expect("expert index not a number");
+            let proj = &expert_rest[edot + 1..];
+            let gguf_base = match proj {
+                "gate_proj.weight" => "ffn_gate_exps.weight",
+                "up_proj.weight" => "ffn_up_exps.weight",
+                "down_proj.weight" => "ffn_down_exps.weight",
+                other => panic!("Unknown MoE expert weight suffix: {other}"),
+            };
+            return format!("blk.{layer_idx}.{gguf_base}[{e}]");
+        }
+
         let gguf_suffix = match suffix {
             "input_layernorm.weight" => "attn_norm.weight",
             "post_attention_layernorm.weight" => "ffn_norm.weight",
@@ -1128,9 +1147,15 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
             "self_attn.o_proj.weight" => "attn_output.weight",
             "self_attn.q_norm.weight" => "attn_q_norm.weight",
             "self_attn.k_norm.weight" => "attn_k_norm.weight",
+            // Dense FFN (Qwen2 / Qwen3 non-MoE layers)
             "mlp.gate_proj.weight" => "ffn_gate.weight",
             "mlp.up_proj.weight" => "ffn_up.weight",
             "mlp.down_proj.weight" => "ffn_down.weight",
+            // MoE router and shared expert (Qwen3-MoE)
+            "mlp.gate.weight" => "ffn_gate_inp.weight",
+            "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
+            "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
+            "mlp.shared_expert.down_proj.weight" => "ffn_down_shexp.weight",
             other => panic!("Unknown Qwen layer suffix for GGUF mapping: {other}"),
         };
         return format!("blk.{layer_idx}.{gguf_suffix}");

@@ -24,7 +24,7 @@ use crate::cuda::ops::cast_to_f32;
 use crate::cuda::quantized::QuantizedTensor;
 use crate::cuda::CudaContext;
 use crate::cuda::CudaTensor;
-use infernum::dtype::{DType, Q6_K_BLOCK_ELEMENTS};
+use infernum::dtype::{DType, Q4K_BLOCK_ELEMENTS, Q5K_BLOCK_ELEMENTS, Q6_K_BLOCK_ELEMENTS};
 use infernum::tensor::Tensor;
 use infernum::Result;
 
@@ -392,9 +392,13 @@ fn quantize_activations_to_q8_1(
                 "gemv_q8_q8_dp4a",
                 "gemv_q4_q8_dp4a",
                 "gemv_q6k_q8_dp4a",
+                "gemv_q4k_q8_dp4a",
+                "gemv_q5k_q8_dp4a",
                 "gemv_q8_q8_dp4a_bf16",
                 "gemv_q4_q8_dp4a_bf16",
                 "gemv_q6k_q8_dp4a_bf16",
+                "gemv_q4k_q8_dp4a_bf16",
+                "gemv_q5k_q8_dp4a_bf16",
             ],
         )?;
     }
@@ -520,6 +524,30 @@ fn quantized_gemv(
                 "gemv_q6k_q8_dp4a_bf16"
             } else {
                 "gemv_q6k_q8_dp4a"
+            };
+            let func = device.get_func(module_name, kernel).unwrap();
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        output.cuda_slice_mut(),
+                        &*act_data,
+                        &*act_scales,
+                        &*act_sums,
+                        weight.data_slice(),
+                        n as i32,
+                        k as i32,
+                    ),
+                )?;
+            }
+        }
+        DType::Q4_K | DType::Q5_K => {
+            let kernel = match (weight.dtype(), use_bf16_output) {
+                (DType::Q4_K, false) => "gemv_q4k_q8_dp4a",
+                (DType::Q4_K, true) => "gemv_q4k_q8_dp4a_bf16",
+                (DType::Q5_K, false) => "gemv_q5k_q8_dp4a",
+                (DType::Q5_K, true) => "gemv_q5k_q8_dp4a_bf16",
+                _ => unreachable!(),
             };
             let func = device.get_func(module_name, kernel).unwrap();
             unsafe {
@@ -756,6 +784,8 @@ fn ensure_dequant_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -
                 "dequant_q8_f16",
                 "dequant_q4_f16",
                 "dequant_q6k_f16",
+                "dequant_q4k_f16",
+                "dequant_q5k_f16",
                 "dequant_gptq_f16",
             ],
         )?;
@@ -867,6 +897,26 @@ fn dequant_cublas_matmul(
                         (&mut buf, weight.data_slice(), n as i32, k as i32),
                     )
                     .expect("dequant Q6K kernel launch");
+                }
+            }
+            DType::Q4_K => {
+                let func = device.get_func("dequantize", "dequant_q4k_f16").unwrap();
+                unsafe {
+                    func.launch(
+                        dequant_cfg,
+                        (&mut buf, weight.data_slice(), n as i32, k as i32),
+                    )
+                    .expect("dequant Q4K kernel launch");
+                }
+            }
+            DType::Q5_K => {
+                let func = device.get_func("dequantize", "dequant_q5k_f16").unwrap();
+                unsafe {
+                    func.launch(
+                        dequant_cfg,
+                        (&mut buf, weight.data_slice(), n as i32, k as i32),
+                    )
+                    .expect("dequant Q5K kernel launch");
                 }
             }
             DType::GPTQ_INT4 => {
@@ -1006,9 +1056,13 @@ fn quantized_matmul_2d(
                 "gemv_q8_q8_dp4a",
                 "gemv_q4_q8_dp4a",
                 "gemv_q6k_q8_dp4a",
+                "gemv_q4k_q8_dp4a",
+                "gemv_q5k_q8_dp4a",
                 "gemv_q8_q8_dp4a_bf16",
                 "gemv_q4_q8_dp4a_bf16",
                 "gemv_q6k_q8_dp4a_bf16",
+                "gemv_q4k_q8_dp4a_bf16",
+                "gemv_q5k_q8_dp4a_bf16",
             ],
         )?;
     }
@@ -1022,7 +1076,7 @@ fn quantized_matmul_2d(
     if m == 1
         && matches!(
             weight.dtype(),
-            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::GPTQ_INT4
+            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::Q4_K | DType::Q5_K | DType::GPTQ_INT4
         )
     {
         let output_dtype = input.dtype();
@@ -1040,7 +1094,7 @@ fn quantized_matmul_2d(
     if m > 1 {
         match weight.dtype() {
             // Dequant + cuBLAS: dequant to F16, then cuBLAS GEMM with tensor cores
-            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::GPTQ_INT4 => {
+            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::Q4_K | DType::Q5_K | DType::GPTQ_INT4 => {
                 return dequant_cublas_matmul(input, weight, m, n, k);
             }
             _ => {}

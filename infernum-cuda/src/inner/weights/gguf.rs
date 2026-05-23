@@ -25,7 +25,10 @@ use memmap2::Mmap;
 use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use crate::cuda::{ShardConfig, ShardStrategy};
 use super::loader::WeightLoader;
-use infernum::dtype::{DType, Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE};
+use infernum::dtype::{
+    DType, Q4K_BLOCK_ELEMENTS, Q4K_BLOCK_SIZE_BYTES, Q5K_BLOCK_ELEMENTS, Q5K_BLOCK_SIZE_BYTES,
+    Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE,
+};
 use infernum::Error;
 use infernum::Result;
 
@@ -197,6 +200,11 @@ impl GgufLoader {
     fn tensor_slice<'a>(&'a self, info: &GgufTensorInfo, byte_len: usize) -> &'a [u8] {
         let start = self.tensor_data_offsets[info.shard_idx] + info.offset as usize;
         &self.mmaps[info.shard_idx][start..start + byte_len]
+    }
+
+    fn tensor_slice_range<'a>(&'a self, info: &GgufTensorInfo, offset: usize, len: usize) -> &'a [u8] {
+        let start = self.tensor_data_offsets[info.shard_idx] + info.offset as usize;
+        &self.mmaps[info.shard_idx][start + offset..start + offset + len]
     }
 
     /// Access parsed metadata
@@ -585,7 +593,18 @@ impl GgufLoader {
                 let num_blocks = numel / Q6_K_BLOCK_ELEMENTS;
                 let total_bytes = num_blocks * Q6_K_BLOCK_SIZE_BYTES;
                 let raw = self.tensor_slice(info, total_bytes);
-                // Store packed super-blocks directly — kernel reads them as-is
+                QuantizedTensor::from_raw(ctx, &info.shape, dtype, raw, &[])
+            }
+            DType::Q4_K => {
+                let num_blocks = numel / Q4K_BLOCK_ELEMENTS;
+                let total_bytes = num_blocks * Q4K_BLOCK_SIZE_BYTES;
+                let raw = self.tensor_slice(info, total_bytes);
+                QuantizedTensor::from_raw(ctx, &info.shape, dtype, raw, &[])
+            }
+            DType::Q5_K => {
+                let num_blocks = numel / Q5K_BLOCK_ELEMENTS;
+                let total_bytes = num_blocks * Q5K_BLOCK_SIZE_BYTES;
+                let raw = self.tensor_slice(info, total_bytes);
                 QuantizedTensor::from_raw(ctx, &info.shape, dtype, raw, &[])
             }
             other => Err(Error::UnsupportedDtype(format!(
@@ -799,9 +818,139 @@ impl GgufLoader {
 
                 QuantizedTensor::from_raw(ctx, &shard_shape, dtype, &data_buf, &scales_buf)
             }
+            DType::Q4_K | DType::Q5_K => {
+                let (block_elems, block_bytes) = if dtype == DType::Q4_K {
+                    (Q4K_BLOCK_ELEMENTS, Q4K_BLOCK_SIZE_BYTES)
+                } else {
+                    (Q5K_BLOCK_ELEMENTS, Q5K_BLOCK_SIZE_BYTES)
+                };
+                let blocks_per_row = n_cols / block_elems;
+                let row_bytes = blocks_per_row * block_bytes;
+                let total_bytes = n_rows * row_bytes;
+                let raw = self.tensor_slice(info, total_bytes);
+
+                let (shard_raw, shard_shape): (Vec<u8>, Vec<usize>) = match strategy {
+                    ShardStrategy::Replicate => unreachable!(),
+                    ShardStrategy::Column => {
+                        let (start_row, shard_rows) = shard.shard_range(n_rows);
+                        let start = start_row * row_bytes;
+                        let end = start + shard_rows * row_bytes;
+                        (raw[start..end].to_vec(), vec![shard_rows, n_cols])
+                    }
+                    ShardStrategy::Row => {
+                        let blocks_per_shard = blocks_per_row / shard.world_size;
+                        assert_eq!(
+                            blocks_per_row % shard.world_size, 0,
+                            "n_cols/block_elems ({blocks_per_row}) must be divisible by world_size ({})",
+                            shard.world_size
+                        );
+                        let shard_cols = blocks_per_shard * block_elems;
+                        let start_block = shard.rank * blocks_per_shard;
+                        let shard_block_bytes = blocks_per_shard * block_bytes;
+
+                        let mut buf = Vec::with_capacity(n_rows * shard_block_bytes);
+                        for row in 0..n_rows {
+                            let row_start = row * row_bytes + start_block * block_bytes;
+                            buf.extend_from_slice(&raw[row_start..row_start + shard_block_bytes]);
+                        }
+                        (buf, vec![n_rows, shard_cols])
+                    }
+                };
+
+                QuantizedTensor::from_raw(ctx, &shard_shape, dtype, &shard_raw, &[])
+            }
             other => Err(Error::UnsupportedDtype(format!(
                 "load_quantized_sharded: {other} sharding not yet supported"
             ))),
+        }
+    }
+
+    /// Load a single expert's weight slice from a stacked expert tensor.
+    ///
+    /// Stacked expert tensors (e.g. `ffn_gate_exps.weight`) have GGUF shape
+    /// `[num_experts, expert_rows, k]` (row-major after reversal). Expert `e`'s
+    /// data is contiguous at byte offset `e * expert_bytes` from the tensor start.
+    ///
+    /// Supports Q4_K and Q5_K formats. Applies column or row sharding if requested.
+    pub fn load_quantized_expert_slice(
+        &self,
+        ctx: &CudaContext,
+        name: &str,
+        expert_idx: usize,
+        shard: Option<&ShardConfig>,
+        strategy: ShardStrategy,
+    ) -> Result<QuantizedTensor> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::WeightNotFound(name.to_string()))?;
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
+
+        assert_eq!(
+            info.shape.len(), 3,
+            "Expert tensor '{name}' must be 3D (num_experts, expert_rows, k), got {:?}",
+            info.shape
+        );
+
+        // Shape after reversal: [num_experts, expert_rows, k]
+        let expert_rows = info.shape[1];
+        let k = info.shape[2];
+
+        let (block_elems, block_bytes) = match dtype {
+            DType::Q4_K => (Q4K_BLOCK_ELEMENTS, Q4K_BLOCK_SIZE_BYTES),
+            DType::Q5_K => (Q5K_BLOCK_ELEMENTS, Q5K_BLOCK_SIZE_BYTES),
+            other => {
+                return Err(Error::UnsupportedDtype(format!(
+                    "load_quantized_expert_slice: unsupported dtype {other}"
+                )));
+            }
+        };
+
+        let blocks_per_k = k / block_elems;
+        let row_bytes = blocks_per_k * block_bytes;
+        let expert_bytes = expert_rows * row_bytes;
+
+        let raw_expert = self.tensor_slice_range(info, expert_idx * expert_bytes, expert_bytes);
+
+        let do_shard = shard.map_or(false, |s| s.world_size > 1)
+            && strategy != ShardStrategy::Replicate;
+
+        if !do_shard {
+            return QuantizedTensor::from_raw(ctx, &[expert_rows, k], dtype, raw_expert, &[]);
+        }
+
+        let s = shard.unwrap();
+        match strategy {
+            ShardStrategy::Column => {
+                let (start_row, shard_rows) = s.shard_range(expert_rows);
+                let start = start_row * row_bytes;
+                QuantizedTensor::from_raw(
+                    ctx,
+                    &[shard_rows, k],
+                    dtype,
+                    &raw_expert[start..start + shard_rows * row_bytes],
+                    &[],
+                )
+            }
+            ShardStrategy::Row => {
+                let blocks_per_shard = blocks_per_k / s.world_size;
+                assert_eq!(
+                    blocks_per_k % s.world_size, 0,
+                    "k/block_elems ({blocks_per_k}) must be divisible by world_size ({})",
+                    s.world_size
+                );
+                let shard_k = blocks_per_shard * block_elems;
+                let start_block = s.rank * blocks_per_shard;
+                let shard_row_bytes = blocks_per_shard * block_bytes;
+
+                let mut buf = Vec::with_capacity(expert_rows * shard_row_bytes);
+                for row in 0..expert_rows {
+                    let row_start = row * row_bytes + start_block * block_bytes;
+                    buf.extend_from_slice(&raw_expert[row_start..row_start + shard_row_bytes]);
+                }
+                QuantizedTensor::from_raw(ctx, &[expert_rows, shard_k], dtype, &buf, &[])
+            }
+            ShardStrategy::Replicate => unreachable!(),
         }
     }
 

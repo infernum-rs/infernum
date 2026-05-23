@@ -28,6 +28,7 @@ use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, W
 use infernum::shard::{shard_strategy_for_weight, ShardConfig, ShardStrategy};
 use infernum::weights::QuantizationConfig;
 use infernum::WeightLoader as _;
+use infernum::dtype::{Q4K_BLOCK_ELEMENTS, Q5K_BLOCK_ELEMENTS};
 use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, QUANTIZATION_BLOCK_SIZE};
 
 use super::executor::execute;
@@ -115,7 +116,7 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
 
     /// Load all model weights from a GGUF file into CUDA memory.
     ///
-    /// Quantized weights (Q8_0, Q4_0, Q6_K) are kept in their quantized form
+    /// Quantized weights (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) are kept in their quantized form
     /// on the GPU; non-quantized weights are dequantized to BF16. Q and K
     /// projection weights are un-permuted from GGUF's interleaved RoPE layout
     /// to the HuggingFace sequential layout before upload.
@@ -245,7 +246,7 @@ pub fn load_graph_weights_cuda(
 
 /// Load all graph weights from a GGUF file into CUDA memory.
 ///
-/// Quantized weights (Q8_0, Q4_0, Q6_K) are kept in quantized form on the GPU
+/// Quantized weights (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) are kept in quantized form on the GPU
 /// so the existing quantized GEMV kernels can run decode at native quantized
 /// memory bandwidth. Non-quantized weights (BF16/F16/F32) are dequantized to
 /// BF16 on the host.
@@ -315,14 +316,25 @@ pub fn load_graph_weights_gguf_cuda(
             gguf_name.clone()
         };
 
-        let file_dtype = loader.get_dtype(&effective_gguf_name)?;
         let strategy = shard_strategy_for_weight(safetensors_name);
+
+        // Expert weights carry a "[N]" suffix (e.g. "blk.0.ffn_gate_exps.weight[42]").
+        // The 3D stacked tensor is sliced per-expert directly from the mmap.
+        if let Some((base_name, expert_idx)) = parse_expert_suffix(&effective_gguf_name) {
+            let qt =
+                loader.load_quantized_expert_slice(ctx, &base_name, expert_idx, shard, strategy)?;
+            store.push_linear_weight(LinearWeight::Quantized(qt));
+            continue;
+        }
+
+        let file_dtype = loader.get_dtype(&effective_gguf_name)?;
 
         // Q8_0 and Q4_0 support GPU quantized sharding, but only when the
         // column count is aligned to block_size × world_size for Row strategy.
+        // Q4_K and Q5_K use 256-element super-blocks (same alignment check).
         // Misaligned shapes (e.g. Qwen3-72B at TP=8) fall through to BF16.
-        let supports_quant_sharding = matches!(file_dtype, DType::Q8_0 | DType::Q4_0)
-            && shard.map_or(true, |s| {
+        let supports_quant_sharding = match file_dtype {
+            DType::Q8_0 | DType::Q4_0 => shard.map_or(true, |s| {
                 strategy != ShardStrategy::Row || {
                     loader
                         .get_shape(&effective_gguf_name)
@@ -332,7 +344,20 @@ pub fn load_graph_weights_gguf_cuda(
                             (n_cols / QUANTIZATION_BLOCK_SIZE) % s.world_size == 0
                         })
                 }
-            });
+            }),
+            DType::Q4_K | DType::Q5_K => shard.map_or(true, |s| {
+                strategy != ShardStrategy::Row || {
+                    loader
+                        .get_shape(&effective_gguf_name)
+                        .ok()
+                        .and_then(|shape| shape.get(1).copied())
+                        .map_or(false, |n_cols| {
+                            (n_cols / Q4K_BLOCK_ELEMENTS) % s.world_size == 0
+                        })
+                }
+            }),
+            _ => false,
+        };
         let use_gpu_quant = file_dtype.has_gpu_quant_kernel()
             && (shard.is_none() || supports_quant_sharding);
 
@@ -363,7 +388,7 @@ pub fn load_graph_weights_gguf_cuda(
                 LinearWeight::Quantized(qt)
             }
         } else {
-            // Non-quantized or unsupported quant (Q4_K, Q5_K, Q6_K+TP, etc.):
+            // Non-quantized or unsupported quant (Q6_K+TP, etc.):
             // dequantize to BF16 on host, shard host bytes, upload once, GPU-transpose.
             let (host_bytes, shape) = if is_qk(&gguf_name) {
                 let n_head = if gguf_name.contains("attn_q") { n_heads } else { n_kv_heads };
@@ -389,6 +414,17 @@ pub fn load_graph_weights_gguf_cuda(
     }
 
     Ok(store)
+}
+
+/// Parse a `[N]` expert-index suffix from a GGUF weight name.
+///
+/// Returns `(base_name, expert_idx)` when the name ends with `[N]`, or `None`
+/// for ordinary (non-expert) names.
+fn parse_expert_suffix(name: &str) -> Option<(String, usize)> {
+    let name = name.strip_suffix(']')?;
+    let bracket = name.rfind('[')?;
+    let idx: usize = name[bracket + 1..].parse().ok()?;
+    Some((name[..bracket].to_string(), idx))
 }
 
 /// Shard a 2D BF16 slice on the host (slice, then upload).
