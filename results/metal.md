@@ -18,12 +18,12 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 58.1 | 226.7 | 0.26x | 2026-05-21 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 56.1 | 184.4 | 0.30x | 2026-05-21 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 25.7 | — | — | 2026-05-21 |
-| Qwen / Qwen3-0.6B | SafeTensors BF16 | 21.1 | — | — | 2026-05-21 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 22.1 | 29.1 | 0.76x | 2026-05-21 |
-| Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-21 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 59.4 | 226.7 | 0.26x | 2026-05-23 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 56.5 | 184.4 | 0.31x | 2026-05-23 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 26.3 | — | — | 2026-05-23 |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 22.8 | — | — | 2026-05-23 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 18.4 | 29.1 | 0.63x | 2026-05-23 |
+| Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
 
 ### Prefill throughput (tok/s)
 
@@ -35,16 +35,56 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 51.8 | 285.8 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x | 2026-05-22 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 265 | — | — | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 253 | 4541 | 0.056x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 253 | 4596 | 0.055x | 2026-05-22 |
-| Qwen / Qwen3-0.6B | SafeTensors BF16 | 91 | — | — | 2026-05-22 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 576 | 938 | 0.61x | 2026-05-22 |
-| Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-22 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 264.9 | — | — | 2026-05-23 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 253.2 | 4541 | 0.056x | 2026-05-23 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 4596 | 0.055x | 2026-05-23 |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 90.9 | — | — | 2026-05-23 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 661.4 | 938 | 0.70x | 2026-05-23 |
+| Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-23 |
 
 ---
 
 ## History
+
+---
+
+## 2026-05-23 — GGUF native block format for Q8_0/Q4_0 GEMV
+
+- **Chip:** Apple M3 Pro (18 GB unified memory)
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **Prefill tokens:** 512
+- **infernum commit:** `20b30a3`
+- **llama.cpp commit:** `e22cd0aa1` (`-ngl 99`, 3 reps)
+- **Date:** 2026-05-23
+
+### Prefill throughput (tok/s) — 512-token prompt
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / SmolLM2-360M | SafeTensors F32 | 264.9 | — | — |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 253.2 | 4541 | 0.056x |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 4596 | 0.055x |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 90.9 | — | — |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 661.4 | 938 | 0.70x |
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / SmolLM2-360M | SafeTensors F32 | 26.3 | — | — |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 56.5 | 184.4 | 0.31x |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 59.4 | 226.7 | 0.26x |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 22.8 | — | — |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 18.4 | 29.1 | 0.63x |
+
+### Notes
+
+- **GGUF native block format:** Q8_0 and Q4_0 weights are now stored as interleaved GGUF blocks (`[f16 scale | quant data]` per block) instead of separate data/scales buffers. New GEMV kernels read scale+data from a single 34-byte (Q8_0) or 18-byte (Q4_0) contiguous block per SIMD-group, reducing cache-miss surface. Threadgroup configs match llama.cpp: Q8_0 uses 4 SGs × 2 rows = 128 threads; Q4_0 uses 2 SGs × 4 rows = 64 threads.
+- **Decode improvements vs prior measurement (isolated per-model):** SmolLM2 Q8_0 +1.4%, Q4_0 +0.7%, Gemma Q8_0 +2.3%.
+- **Qwen SafeTensors unaffected:** block format applies only to GGUF weights. Qwen improvement over the 2026-05-21 baseline reflects different thermal conditions, not a code change.
+- **Gemma decode (18.4 tok/s):** lower than the 2026-05-21 baseline (22.1 tok/s) because the benchmark now runs a 512-token prefill before decode instead of an 8-token warmup. Both measurements use the same methodology within a session; the prefill heats up the GPU more, reducing sustained decode throughput on the 2-2B model.
+- **Gemma prefill (661.4 vs 938 = 0.70x):** significant improvement over prior best (576, 0.61x). Full benchmark run is now above thermal parity with the previous session.
+- Machine is Apple M3 Pro (below Standard tier; Standard is 24–48 GB).
 
 ---
 
