@@ -7,6 +7,7 @@
 //! Reference: <https://github.com/ggerganov/ggml/blob/master/docs/gguf.md>
 
 #![allow(
+    clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,

@@ -485,7 +485,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].shape(), &[seq_len, config.vocab_size]);
+        assert_eq!(outputs[0].shape(), &[1, config.vocab_size]);
 
         let logits = outputs[0].as_f32_slice();
         for (i, &v) in logits.iter().enumerate() {
