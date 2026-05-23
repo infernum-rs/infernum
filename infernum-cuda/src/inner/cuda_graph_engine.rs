@@ -320,10 +320,35 @@ pub fn load_graph_weights_gguf_cuda(
 
         // Expert weights carry a "[N]" suffix (e.g. "blk.0.ffn_gate_exps.weight[42]").
         // The 3D stacked tensor is sliced per-expert directly from the mmap.
+        // For Row sharding, if k is not block-aligned (e.g. Q6_K k=1536 at TP=8),
+        // fall back to host-dequant → BF16 → element-level shard → GPU transpose.
         if let Some((base_name, expert_idx)) = parse_expert_suffix(&effective_gguf_name) {
-            let qt =
-                loader.load_quantized_expert_slice(ctx, &base_name, expert_idx, shard, strategy)?;
-            store.push_linear_weight(LinearWeight::Quantized(qt));
+            match loader.load_quantized_expert_slice(ctx, &base_name, expert_idx, shard, strategy)
+            {
+                Ok(qt) => {
+                    store.push_linear_weight(LinearWeight::Quantized(qt));
+                }
+                Err(infernum::Error::UnsupportedDtype(ref msg))
+                    if msg.contains("expert_slice_row_unaligned") =>
+                {
+                    let (host_bytes, shape) =
+                        loader.load_bf16_bytes_expert_slice(&base_name, expert_idx)?;
+                    let (rows, cols) = (shape[0], shape[1]);
+                    let tensor = match shard {
+                        None => CudaTensor::from_raw_bytes(
+                            ctx,
+                            &[rows, cols],
+                            infernum::dtype::DType::BF16,
+                            &host_bytes,
+                        )?,
+                        Some(s) => shard_bf16_slice(ctx, &host_bytes, rows, cols, s, strategy)?,
+                    };
+                    store.push_linear_weight(LinearWeight::Dense(
+                        crate::cuda::ops::transpose_2d(&tensor)?,
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
 
