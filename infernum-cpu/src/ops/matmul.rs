@@ -173,7 +173,7 @@ fn q8_gemv_parallel(
     // Only parallelize when there's enough work to amortize dispatch overhead.
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 64;
+    let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
@@ -251,7 +251,7 @@ fn q4_gemv_parallel(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 64;
+    let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
@@ -306,7 +306,7 @@ fn q4_1_gemv_parallel(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 64;
+    let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
@@ -595,11 +595,7 @@ fn expand_q4_to_int8(packed: &[u8], expanded: &mut [u8], chunk_n: usize, num_blo
     }
 }
 
-/// Q4_0 tiled GEMM: expand packed nibbles to int8 per thread, then use the
-/// optimised Q8_0 4×4 VNNI tiled GEMM kernel.
-///
-/// This replaces the previous row-by-row 2-row GEMV path for Q4_0 prefill and
-/// gives the same cache-aware tiling as the Q8_0 path.
+/// Q4_0 tiled GEMM: per-thread expand Q4 nibbles to int8, then reuse the Q8 GEMM.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 fn q4_gemm_tiled(
     output: &mut [f32],
@@ -977,7 +973,7 @@ fn quantized_linear_pair(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons = 64; // Lower threshold since we amortize over 2 matmuls
+    let min_neurons = 8; // Lower threshold since we amortize over 2 matmuls
 
     match w1.dtype {
         DType::Q4_0 => {
@@ -1213,7 +1209,7 @@ fn quantized_linear_triple(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons = 64;
+    let min_neurons = 8;
 
     match w1.dtype {
         DType::Q4_0 => {

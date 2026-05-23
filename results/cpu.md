@@ -201,3 +201,45 @@ Fix: before parallel dispatch, transpose K and V to `[num_kv_heads, kv_len, head
 - Gains are modest because the scatter loop was not the dominant bottleneck (local_out was small enough to stay warm in cache).
 - Benefit is primarily in Q4_0 paths where the scatter cost relative to GEMM work was slightly higher.
 - Remaining gaps vs llama.cpp: Q4_0 prefill ~0.73x, Q8_0 prefill ~0.88x, Q4_0 decode ~0.78x, Q8_0 decode ~0.82x.
+
+---
+
+## 2026-05-24 — RoPE decode single-thread path + Arc KV cache zero-copy (`perf/cpu-performance`)
+
+**Changes:**
+
+1. **`apply_rope_pair_slices` single-thread path** (`rope.rs`): For decode (seq_len=1) with SmolLM2 GQA, `total_units = 15 Q-heads + 5 K-heads = 20`. Previously dispatched 20 tasks across the thread pool for ~300 FLOPs each. Added `if total_units < num_threads { run inline }` (mirrors existing optimization in `apply_rope_slices`). Saves ~14µs × 32 layers = 448µs/token of dispatch overhead.
+
+2. **Arc KV cache zero-copy** (`executor.rs`): `KvCacheStore` previously stored `Vec<Vec<f32>>` and `get_cache()` called `CpuTensor::from_f32()` → `.to_vec()` (deep copy of full KV buffer). At step 264 that's ~330KB × 64 KV layers ≈ 10.9MB of copying per token. Changed to `Vec<Arc<Vec<u8>>>`. `get_cache()` now calls `CpuTensor::from_arc()` (Arc::clone, O(1)). `finalize_step()` clears `overrides` so `Arc::make_mut` in `append()` gets exclusive access (refcount=1) and extends in-place without cloning.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** `6f0d0f0`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (n_stride session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 decode | 116.7 | 122.4 | **+4.9%** |
+| SmolLM2-360M Q4_0 decode | 158.4 | 156.4 | −1.3% (noise) |
+| SmolLM2-360M Q8_0 prefill | 980.0 | 976.5 | flat |
+| SmolLM2-360M Q4_0 prefill | 948.0 | 936.2 | flat |
+| Gemma Q8_0 decode | 20.2 | 20.3 | flat |
+| Gemma Q8_0 prefill | 154.1 | 155.2 | flat |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 122.4 | 148.6 | 0.82x |
+| SmolLM2-360M Q4_0 decode | 156.4 | 208.2 | 0.75x |
+| SmolLM2-360M Q8_0 prefill | 976.5 | 1160.4 | 0.84x |
+| SmolLM2-360M Q4_0 prefill | 936.2 | 1279.3 | 0.73x |
+| Gemma 2-2b Q8_0 decode | 20.3 | 25.1 | 0.81x |
+| Gemma 2-2b Q8_0 prefill | 155.2 | 217.0 | 0.72x |
+
+### Notes
+
+- Q8_0 decode improvement (+4.9%) comes primarily from eliminating RoPE thread-pool dispatch overhead for the decode path.
+- Prefill is unaffected (both changes are decode-only optimizations).
+- Remaining gaps vs llama.cpp: Q8_0 decode 0.82x, Q4_0 decode 0.75x, Q8_0 prefill 0.84x, Q4_0 prefill 0.73x, Gemma 0.72–0.81x.

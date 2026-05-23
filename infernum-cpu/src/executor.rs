@@ -11,7 +11,7 @@
 //! `execute()` implementation in `builtin_ops.rs` handles the logic.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use infernum::graph::execute_context::KvCacheAccess;
@@ -76,10 +76,10 @@ pub fn print_op_profile() {
 /// the arena every step, this store holds pre-allocated buffers that grow
 /// via in-place append. This eliminates the O(seq_len) per-step copy cost.
 pub struct KvCacheStore {
-    /// Per-layer K cache: `[current_len, num_kv_heads, head_dim]` stored flat.
-    k_caches: Vec<Vec<f32>>,
-    /// Per-layer V cache: `[current_len, num_kv_heads, head_dim]` stored flat.
-    v_caches: Vec<Vec<f32>>,
+    /// Per-layer K cache: `[current_len, num_kv_heads, head_dim]` as raw bytes (f32 layout).
+    k_caches: Vec<Arc<Vec<u8>>>,
+    /// Per-layer V cache: `[current_len, num_kv_heads, head_dim]` as raw bytes (f32 layout).
+    v_caches: Vec<Arc<Vec<u8>>>,
     /// Number of positions currently stored (same for all layers).
     len: usize,
     /// Number of KV heads (used to construct shapes).
@@ -120,11 +120,15 @@ impl KvCacheStore {
     ) -> Self {
         assert_eq!(cache_input_node_ids.len(), 2 * num_layers);
         assert_eq!(concat_node_ids.len(), 2 * num_layers);
-        let row_size = num_kv_heads * head_dim;
-        let cap = max_seq_len * row_size;
+        let row_bytes = num_kv_heads * head_dim * 4; // bytes per position (f32 × head elements)
+        let cap_bytes = max_seq_len * row_bytes;
         Self {
-            k_caches: (0..num_layers).map(|_| Vec::with_capacity(cap)).collect(),
-            v_caches: (0..num_layers).map(|_| Vec::with_capacity(cap)).collect(),
+            k_caches: (0..num_layers)
+                .map(|_| Arc::new(Vec::with_capacity(cap_bytes)))
+                .collect(),
+            v_caches: (0..num_layers)
+                .map(|_| Arc::new(Vec::with_capacity(cap_bytes)))
+                .collect(),
             len: 0,
             num_kv_heads,
             head_dim,
@@ -143,10 +147,15 @@ impl KvCacheStore {
         } else {
             &mut self.v_caches[layer]
         };
-        cache.extend_from_slice(data);
+        // Arc::make_mut is O(1) when refcount==1 (the usual case after finalize_step clears
+        // overrides). When refcount>1 it falls back to cloning, which should not happen in
+        // normal decode flow.
+        Arc::make_mut(cache).extend_from_slice(bytemuck::cast_slice(data));
     }
 
-    /// Get the full K or V cache for a layer as a `CpuTensor` view.
+    /// Get the full K or V cache for a layer as a zero-copy `CpuTensor` view.
+    ///
+    /// Clones the `Arc` (increments refcount, O(1)) — no data is copied.
     fn get_cache(&self, layer: usize, is_key: bool, len: usize) -> CpuTensor {
         let cache = if is_key {
             &self.k_caches[layer]
@@ -154,7 +163,7 @@ impl KvCacheStore {
             &self.v_caches[layer]
         };
         let shape = [len, self.num_kv_heads, self.head_dim];
-        CpuTensor::from_f32(&shape, &cache[..len * self.num_kv_heads * self.head_dim])
+        CpuTensor::from_arc(&shape, DType::F32, Arc::clone(cache))
     }
 
     /// Check if a node ID is a KV cache input node.
@@ -217,11 +226,11 @@ impl KvCacheAccess<CpuBackend> for KvCacheStore {
     fn try_append_kv(&mut self, node_id: NodeId, new_row: &CpuTensor) -> Option<CpuTensor> {
         let (layer, is_key) = self.cache_concat_info(node_id)?;
         self.append(layer, is_key, new_row.as_f32_slice());
-        let row_elems = self.num_kv_heads * self.head_dim;
+        let row_bytes = self.num_kv_heads * self.head_dim * 4;
         let new_len = if is_key {
-            self.k_caches[layer].len() / row_elems
+            self.k_caches[layer].len() / row_bytes
         } else {
-            self.v_caches[layer].len() / row_elems
+            self.v_caches[layer].len() / row_bytes
         };
         let full_cache = self.get_cache(layer, is_key, new_len);
         self.overrides.insert(node_id, full_cache.clone());
@@ -230,6 +239,9 @@ impl KvCacheAccess<CpuBackend> for KvCacheStore {
 
     fn finalize_step(&mut self) {
         self.len += 1;
+        // Clear overrides so that next step's Arc::make_mut can get exclusive access
+        // (refcount drops to 1) and append in-place without cloning the cache buffer.
+        self.overrides.clear();
     }
 }
 
