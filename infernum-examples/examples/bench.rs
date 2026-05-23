@@ -49,16 +49,22 @@ use infernum_deepseek::DeepSeekCudaEngine;
 use infernum_deepseek::DeepSeekShardedEngine;
 use infernum_gemma::{
     build_prefill_graph as gemma_build_prefill_graph, GemmaConfig, GemmaCudaGraphEngine,
-    GemmaCudaGraphEngineExt as _, GemmaShardedGraphEngine, GemmaShardedGraphEngineExt as _,
+    GemmaCudaGraphEngineExt as _,
 };
+#[cfg(feature = "nccl")]
+use infernum_gemma::{GemmaShardedGraphEngine, GemmaShardedGraphEngineExt as _};
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaCudaGraphEngine,
-    LlamaCudaGraphEngineExt as _, LlamaShardedGraphEngine, LlamaShardedGraphEngineExt as _,
+    LlamaCudaGraphEngineExt as _,
 };
+#[cfg(feature = "nccl")]
+use infernum_llama::{LlamaShardedGraphEngine, LlamaShardedGraphEngineExt as _};
 use infernum_qwen::{
     build_prefill_graph as qwen_build_prefill_graph, QwenConfig, QwenCudaGraphEngine,
-    QwenCudaGraphEngineExt as _, QwenShardedGraphEngine, QwenShardedGraphEngineExt as _,
+    QwenCudaGraphEngineExt as _,
 };
+#[cfg(feature = "nccl")]
+use infernum_qwen::{QwenShardedGraphEngine, QwenShardedGraphEngineExt as _};
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
