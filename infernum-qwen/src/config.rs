@@ -838,16 +838,16 @@ mod tests {
         meta.insert("qwen3moe.block_count".into(), GgufValue::U32(94));
         meta.insert("qwen3moe.feed_forward_length".into(), GgufValue::U32(12288));
         meta.insert("qwen3moe.attention.head_count".into(), GgufValue::U32(64));
-        meta.insert(
-            "qwen3moe.attention.head_count_kv".into(),
-            GgufValue::U32(4),
-        );
+        meta.insert("qwen3moe.attention.head_count_kv".into(), GgufValue::U32(4));
         meta.insert("qwen3moe.attention.key_length".into(), GgufValue::U32(128));
         meta.insert(
             "qwen3moe.attention.layer_norm_rms_epsilon".into(),
             GgufValue::F32(1e-6),
         );
-        meta.insert("qwen3moe.rope.freq_base".into(), GgufValue::F32(1_000_000.0));
+        meta.insert(
+            "qwen3moe.rope.freq_base".into(),
+            GgufValue::F32(1_000_000.0),
+        );
         meta.insert("qwen3moe.context_length".into(), GgufValue::U32(40960));
         meta.insert("qwen3moe.expert_count".into(), GgufValue::U32(128));
         meta.insert("qwen3moe.expert_used_count".into(), GgufValue::U32(8));
@@ -855,14 +855,8 @@ mod tests {
             "qwen3moe.expert_feed_forward_length".into(),
             GgufValue::U32(1536),
         );
-        meta.insert(
-            "tokenizer.ggml.bos_token_id".into(),
-            GgufValue::U32(151643),
-        );
-        meta.insert(
-            "tokenizer.ggml.eos_token_id".into(),
-            GgufValue::U32(151645),
-        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::U32(151643));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(151645));
 
         let config = QwenConfig::from_gguf_metadata(&meta).unwrap();
 

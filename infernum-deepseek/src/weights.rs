@@ -147,17 +147,29 @@ pub fn split_kv_b_proj_dense_sharded<B: TensorFactory + TensorDataOps>(
     // v_full: [num_heads, kv_lora, v_head] — contiguous head block.
     let v_data = B::to_raw_bytes(&v_full)?;
     let v_inner = kv_lora * v_head_dim;
-    let v_shard_data = v_data[rank * nh_local * v_inner * elem..(rank + 1) * nh_local * v_inner * elem].to_vec();
+    let v_shard_data =
+        v_data[rank * nh_local * v_inner * elem..(rank + 1) * nh_local * v_inner * elem].to_vec();
 
     // k_t_full: [num_heads, qk_nope, kv_lora] — contiguous head block.
     let k_t_data = B::to_raw_bytes(&k_t_full)?;
     let k_t_inner = qk_nope_dim * kv_lora;
-    let k_t_shard_data = k_t_data[rank * nh_local * k_t_inner * elem..(rank + 1) * nh_local * k_t_inner * elem].to_vec();
+    let k_t_shard_data = k_t_data
+        [rank * nh_local * k_t_inner * elem..(rank + 1) * nh_local * k_t_inner * elem]
+        .to_vec();
 
     let k_shard = B::from_raw_bytes(device, &[kv_lora, k_cols_local], dtype, &k_shard_data)?;
-    let v_shard = B::from_raw_bytes(device, &[nh_local, kv_lora, v_head_dim], dtype, &v_shard_data)?;
-    let k_t_shard =
-        B::from_raw_bytes(device, &[nh_local, qk_nope_dim, kv_lora], dtype, &k_t_shard_data)?;
+    let v_shard = B::from_raw_bytes(
+        device,
+        &[nh_local, kv_lora, v_head_dim],
+        dtype,
+        &v_shard_data,
+    )?;
+    let k_t_shard = B::from_raw_bytes(
+        device,
+        &[nh_local, qk_nope_dim, kv_lora],
+        dtype,
+        &k_t_shard_data,
+    )?;
 
     Ok((k_shard, v_shard, k_t_shard))
 }

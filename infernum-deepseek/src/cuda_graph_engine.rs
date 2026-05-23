@@ -327,8 +327,7 @@ fn load_weights_gguf(
 
         // Expert weights: blk.N.ffn_gate_exps.weight[E] etc.
         if let Some((base_name, expert_idx)) = parse_expert_suffix(&effective_gguf_name) {
-            match loader.load_quantized_expert_slice(ctx, &base_name, expert_idx, shard, strategy)
-            {
+            match loader.load_quantized_expert_slice(ctx, &base_name, expert_idx, shard, strategy) {
                 Ok(qt) => {
                     store.push_linear_weight(LinearWeight::Quantized(qt));
                 }
@@ -347,9 +346,9 @@ fn load_weights_gguf(
                         )?,
                         Some(s) => shard_bf16_slice(ctx, &host_bytes, rows, cols, s, strategy)?,
                     };
-                    store.push_linear_weight(LinearWeight::Dense(
-                        CudaBackend::transpose_2d(&tensor)?,
-                    ));
+                    store.push_linear_weight(LinearWeight::Dense(CudaBackend::transpose_2d(
+                        &tensor,
+                    )?));
                 }
                 Err(e) => return Err(e),
             }
@@ -388,18 +387,14 @@ fn load_weights_gguf(
         let weight = if use_gpu_quant {
             let qt = match shard {
                 None => loader.load_quantized(ctx, &effective_gguf_name)?,
-                Some(s) => {
-                    loader.load_quantized_sharded(ctx, &effective_gguf_name, s, strategy)?
-                }
+                Some(s) => loader.load_quantized_sharded(ctx, &effective_gguf_name, s, strategy)?,
             };
             LinearWeight::Quantized(qt)
         } else {
             let (host_bytes, shape) = loader.load_bf16_bytes(&effective_gguf_name)?;
             let (rows, cols) = (shape[0], shape[1]);
             let tensor = match shard {
-                None => {
-                    CudaTensor::from_raw_bytes(ctx, &[rows, cols], DType::BF16, &host_bytes)?
-                }
+                None => CudaTensor::from_raw_bytes(ctx, &[rows, cols], DType::BF16, &host_bytes)?,
                 Some(s) => shard_bf16_slice(ctx, &host_bytes, rows, cols, s, strategy)?,
             };
             LinearWeight::Dense(CudaBackend::transpose_2d(&tensor)?)

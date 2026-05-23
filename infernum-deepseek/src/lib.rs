@@ -20,8 +20,8 @@ pub use chat_templates::DeepSeekTemplate;
 pub use config::DeepSeekConfig;
 // #[cfg(feature = "cpu")]
 // pub use graph_engine::DeepSeekGraphEngine;
-#[cfg(feature = "cuda")]
-pub use cuda_graph_engine::{DeepSeekCudaEngine, DeepSeekCudaGraphEngineExt, MlaKvState};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 pub use cuda_graph_engine::DeepSeekShardedEngine;
+#[cfg(feature = "cuda")]
+pub use cuda_graph_engine::{DeepSeekCudaEngine, DeepSeekCudaGraphEngineExt, MlaKvState};
 pub use weights::split_kv_b_proj_dense;

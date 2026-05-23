@@ -1094,7 +1094,12 @@ fn quantized_matmul_2d(
     if m > 1 {
         match weight.dtype() {
             // Dequant + cuBLAS: dequant to F16, then cuBLAS GEMM with tensor cores
-            DType::Q8_0 | DType::Q4_0 | DType::Q6_K | DType::Q4_K | DType::Q5_K | DType::GPTQ_INT4 => {
+            DType::Q8_0
+            | DType::Q4_0
+            | DType::Q6_K
+            | DType::Q4_K
+            | DType::Q5_K
+            | DType::GPTQ_INT4 => {
                 return dequant_cublas_matmul(input, weight, m, n, k);
             }
             _ => {}

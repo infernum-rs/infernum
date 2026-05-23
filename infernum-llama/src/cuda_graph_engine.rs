@@ -181,9 +181,8 @@ impl LlamaCudaGraphEngineExt for LlamaCudaGraphEngine {
     }
 
     fn from_gguf(ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
-        let loader = infernum::weights::gguf::GgufLoader::from_file(
-            infernum::path_to_utf8(gguf_path)?,
-        )?;
+        let loader =
+            infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
         let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
         infernum_cuda::CudaGraphEngine::from_config_gguf(config, ctx, gguf_path)
     }
@@ -209,9 +208,8 @@ impl LlamaShardedGraphEngineExt for LlamaShardedGraphEngine {
     }
 
     fn from_gguf(num_devices: usize, gguf_path: &Path) -> Result<Self> {
-        let loader = infernum::weights::gguf::GgufLoader::from_file(
-            infernum::path_to_utf8(gguf_path)?,
-        )?;
+        let loader =
+            infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
         let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
         infernum_cuda::ShardedGraphEngine::from_config_gguf(config, num_devices, gguf_path)
     }

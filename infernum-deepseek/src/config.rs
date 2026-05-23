@@ -268,8 +268,8 @@ impl DeepSeekConfig {
             .filter(|&r| r > 0);
 
         // rope.dimension_count is the per-head RoPE portion (qk_rope_head_dim directly).
-        let qk_rope_head_dim = get_usize(metadata, &format!("{arch}.rope.dimension_count"))
-            .unwrap_or(64);
+        let qk_rope_head_dim =
+            get_usize(metadata, &format!("{arch}.rope.dimension_count")).unwrap_or(64);
 
         // scoring_func: 0=softmax, 1=sigmoid
         let scoring_func = metadata
@@ -660,7 +660,10 @@ mod tests {
         );
         meta.insert("deepseek2.block_count".into(), GgufValue::U32(61));
         meta.insert("deepseek2.embedding_length".into(), GgufValue::U32(7168));
-        meta.insert("deepseek2.feed_forward_length".into(), GgufValue::U32(18432));
+        meta.insert(
+            "deepseek2.feed_forward_length".into(),
+            GgufValue::U32(18432),
+        );
         meta.insert("deepseek2.attention.head_count".into(), GgufValue::U32(128));
         meta.insert(
             "deepseek2.attention.head_count_kv".into(),
@@ -702,7 +705,10 @@ mod tests {
         );
         meta.insert("deepseek2.expert_weights_scale".into(), GgufValue::F32(2.5));
         meta.insert("deepseek2.expert_group_count".into(), GgufValue::U32(8));
-        meta.insert("deepseek2.expert_group_used_count".into(), GgufValue::U32(4));
+        meta.insert(
+            "deepseek2.expert_group_used_count".into(),
+            GgufValue::U32(4),
+        );
         meta.insert("deepseek2.expert_gating_func".into(), GgufValue::U32(1));
         meta.insert("deepseek2.context_length".into(), GgufValue::U32(163840));
         meta.insert("deepseek2.vocab_size".into(), GgufValue::U32(129280));
@@ -752,7 +758,10 @@ mod tests {
         meta.insert("deepseek2.embedding_length".into(), GgufValue::U32(16));
         meta.insert("deepseek2.feed_forward_length".into(), GgufValue::U32(32));
         meta.insert("deepseek2.attention.head_count".into(), GgufValue::U32(2));
-        meta.insert("deepseek2.attention.kv_lora_rank".into(), GgufValue::U32(16));
+        meta.insert(
+            "deepseek2.attention.kv_lora_rank".into(),
+            GgufValue::U32(16),
+        );
         // q_lora_rank == 0 → no Q compression
         meta.insert("deepseek2.attention.q_lora_rank".into(), GgufValue::U32(0));
         meta.insert("deepseek2.expert_gating_func".into(), GgufValue::U32(0));
@@ -771,11 +780,11 @@ mod tests {
         meta.insert("deepseek2.embedding_length".into(), GgufValue::U32(16));
         meta.insert("deepseek2.feed_forward_length".into(), GgufValue::U32(32));
         meta.insert("deepseek2.attention.head_count".into(), GgufValue::U32(2));
-        meta.insert("deepseek2.attention.kv_lora_rank".into(), GgufValue::U32(16));
         meta.insert(
-            "deepseek2.rope.scaling.factor".into(),
-            GgufValue::F32(40.0),
+            "deepseek2.attention.kv_lora_rank".into(),
+            GgufValue::U32(16),
         );
+        meta.insert("deepseek2.rope.scaling.factor".into(), GgufValue::F32(40.0));
         meta.insert(
             "deepseek2.rope.scaling.original_context_length".into(),
             GgufValue::U32(4096),

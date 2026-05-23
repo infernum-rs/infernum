@@ -135,7 +135,13 @@ impl DType {
     pub const fn has_gpu_quant_kernel(self) -> bool {
         matches!(
             self,
-            Self::Q8_0 | Self::Q4_0 | Self::Q4_1 | Self::Q6_K | Self::Q4_K | Self::Q5_K | Self::F8E4M3
+            Self::Q8_0
+                | Self::Q4_0
+                | Self::Q4_1
+                | Self::Q6_K
+                | Self::Q4_K
+                | Self::Q5_K
+                | Self::F8E4M3
         )
     }
 

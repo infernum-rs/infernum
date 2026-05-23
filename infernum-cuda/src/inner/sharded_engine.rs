@@ -108,11 +108,7 @@ mod inner {
         /// # Panics
         ///
         /// Panics if a device thread panics.
-        pub fn from_config_gguf(
-            config: C,
-            num_devices: usize,
-            gguf_path: &Path,
-        ) -> Result<Self> {
+        pub fn from_config_gguf(config: C, num_devices: usize, gguf_path: &Path) -> Result<Self> {
             let comm_id = CudaBackend::create_comm_id()?;
             let comm_id_raw = *comm_id.to_raw();
             let gguf_path = gguf_path.to_owned();

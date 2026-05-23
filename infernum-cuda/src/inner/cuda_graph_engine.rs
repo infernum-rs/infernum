@@ -24,12 +24,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use infernum::block_allocator::{BlockConfig, BlockTable};
+use infernum::dtype::{Q4K_BLOCK_ELEMENTS, Q5K_BLOCK_ELEMENTS};
 use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, WeightStore};
 use infernum::shard::{shard_strategy_for_weight, ShardConfig, ShardStrategy};
 use infernum::weights::QuantizationConfig;
 use infernum::WeightLoader as _;
-use infernum::dtype::{Q4K_BLOCK_ELEMENTS, Q5K_BLOCK_ELEMENTS};
-use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, QUANTIZATION_BLOCK_SIZE};
+use infernum::{
+    precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, QUANTIZATION_BLOCK_SIZE,
+};
 
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
@@ -323,8 +325,7 @@ pub fn load_graph_weights_gguf_cuda(
         // For Row sharding, if k is not block-aligned (e.g. Q6_K k=1536 at TP=8),
         // fall back to host-dequant → BF16 → element-level shard → GPU transpose.
         if let Some((base_name, expert_idx)) = parse_expert_suffix(&effective_gguf_name) {
-            match loader.load_quantized_expert_slice(ctx, &base_name, expert_idx, shard, strategy)
-            {
+            match loader.load_quantized_expert_slice(ctx, &base_name, expert_idx, shard, strategy) {
                 Ok(qt) => {
                     store.push_linear_weight(LinearWeight::Quantized(qt));
                 }
@@ -343,9 +344,9 @@ pub fn load_graph_weights_gguf_cuda(
                         )?,
                         Some(s) => shard_bf16_slice(ctx, &host_bytes, rows, cols, s, strategy)?,
                     };
-                    store.push_linear_weight(LinearWeight::Dense(
-                        crate::cuda::ops::transpose_2d(&tensor)?,
-                    ));
+                    store.push_linear_weight(LinearWeight::Dense(crate::cuda::ops::transpose_2d(
+                        &tensor,
+                    )?));
                 }
                 Err(e) => return Err(e),
             }
@@ -383,15 +384,19 @@ pub fn load_graph_weights_gguf_cuda(
             }),
             _ => false,
         };
-        let use_gpu_quant = file_dtype.has_gpu_quant_kernel()
-            && (shard.is_none() || supports_quant_sharding);
+        let use_gpu_quant =
+            file_dtype.has_gpu_quant_kernel() && (shard.is_none() || supports_quant_sharding);
 
         let weight = if use_gpu_quant {
             // Keep quantized on GPU — GEMV kernels dequantize on the fly.
             // No transpose needed: quantized matmul kernels use the native
             // [out, in] layout, unlike dense weights which are transposed.
             if is_qk(&gguf_name) {
-                let n_head = if gguf_name.contains("attn_q") { n_heads } else { n_kv_heads };
+                let n_head = if gguf_name.contains("attn_q") {
+                    n_heads
+                } else {
+                    n_kv_heads
+                };
                 let qt = match shard {
                     None => loader.load_quantized_unpermute(ctx, &effective_gguf_name, n_head)?,
                     Some(s) => loader.load_quantized_unpermute_sharded(
@@ -416,7 +421,11 @@ pub fn load_graph_weights_gguf_cuda(
             // Non-quantized or unsupported quant (Q6_K+TP, etc.):
             // dequantize to BF16 on host, shard host bytes, upload once, GPU-transpose.
             let (host_bytes, shape) = if is_qk(&gguf_name) {
-                let n_head = if gguf_name.contains("attn_q") { n_heads } else { n_kv_heads };
+                let n_head = if gguf_name.contains("attn_q") {
+                    n_heads
+                } else {
+                    n_kv_heads
+                };
                 loader.load_bf16_bytes_unpermute(&effective_gguf_name, n_head)?
             } else {
                 loader.load_bf16_bytes(&effective_gguf_name)?
@@ -465,12 +474,9 @@ fn shard_bf16_slice(
 ) -> Result<CudaTensor> {
     let elem = 2usize; // bf16
     match strategy {
-        ShardStrategy::Replicate => CudaTensor::from_raw_bytes(
-            ctx,
-            &[rows, cols],
-            infernum::dtype::DType::BF16,
-            data,
-        ),
+        ShardStrategy::Replicate => {
+            CudaTensor::from_raw_bytes(ctx, &[rows, cols], infernum::dtype::DType::BF16, data)
+        }
         ShardStrategy::Column => {
             let (start_row, shard_rows) = shard.shard_range(rows);
             let row_bytes = cols * elem;
@@ -748,8 +754,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         gguf_path: &Path,
     ) -> Result<Self> {
         let dummy_graph = config.build_prefill_graph_cuda(1, Some(&shard));
-        let weights =
-            config.load_weights_cuda_gguf(&dummy_graph, &ctx, gguf_path, Some(&shard))?;
+        let weights = config.load_weights_cuda_gguf(&dummy_graph, &ctx, gguf_path, Some(&shard))?;
         let half_dim = config.head_dim() / 2;
         Ok(Self {
             config,
@@ -1075,7 +1080,14 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let positions_t = CudaTensor::from_slice(&self.ctx, &[batch_size], &positions_u32)?;
         let seq_lens_t = CudaTensor::from_slice(&self.ctx, &[batch_size], &seq_lens_u32)?;
 
-        let inputs = vec![token_ids_t, cos_t, sin_t, block_table_t, positions_t, seq_lens_t];
+        let inputs = vec![
+            token_ids_t,
+            cos_t,
+            sin_t,
+            block_table_t,
+            positions_t,
+            seq_lens_t,
+        ];
         let output_nodes = graph.output_ids().to_vec();
         let (outputs, _) = execute(
             &self.ctx,

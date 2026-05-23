@@ -1035,7 +1035,10 @@ where
     let num_blocks = max_seq.div_ceil(block_size) + 4;
     let max_blocks_per_seq = num_blocks;
 
-    let block_config = BlockConfig { block_size, num_blocks };
+    let block_config = BlockConfig {
+        block_size,
+        num_blocks,
+    };
 
     eprintln!(
         "Model: {} layers, head_dim={} (cuda-graph-engine, n_gen={n_gen})",
@@ -1044,8 +1047,7 @@ where
 
     // --- Phase 1: Timed prefill (512 tokens) ---
     if measure_prefill {
-        let prefill_prompt: Vec<u32> =
-            (0..PREFILL_TOKENS).map(|i| (i % 256) as u32).collect();
+        let prefill_prompt: Vec<u32> = (0..PREFILL_TOKENS).map(|i| (i % 256) as u32).collect();
 
         // Warm-up prefill (not timed)
         eprintln!("Prefill warm-up ({PREFILL_TOKENS} tokens)...");

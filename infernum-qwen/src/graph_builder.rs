@@ -1125,7 +1125,9 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
         // The expert index is encoded in the returned name as "[N]".
         if let Some(expert_rest) = suffix.strip_prefix("mlp.experts.") {
             let edot = expert_rest.find('.').expect("malformed expert weight name");
-            let e: usize = expert_rest[..edot].parse().expect("expert index not a number");
+            let e: usize = expert_rest[..edot]
+                .parse()
+                .expect("expert index not a number");
             let proj = &expert_rest[edot + 1..];
             let gguf_base = match proj {
                 "gate_proj.weight" => "ffn_gate_exps.weight",

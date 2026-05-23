@@ -22,9 +22,9 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
+use super::loader::WeightLoader;
 use crate::cuda::{CudaContext, CudaTensor, QuantizedTensor};
 use crate::cuda::{ShardConfig, ShardStrategy};
-use super::loader::WeightLoader;
 use infernum::dtype::{
     DType, Q4K_BLOCK_ELEMENTS, Q4K_BLOCK_SIZE_BYTES, Q5K_BLOCK_ELEMENTS, Q5K_BLOCK_SIZE_BYTES,
     Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_SIZE_BYTES, QUANTIZATION_BLOCK_SIZE,
@@ -61,7 +61,7 @@ pub use infernum::GgufValue;
 struct GgufTensorInfo {
     shape: Vec<usize>,
     ggml_type: u32,
-    offset: u64, // relative to tensor data start of its shard
+    offset: u64,      // relative to tensor data start of its shard
     shard_idx: usize, // which mmap/tensor_data_offsets entry this tensor lives in
 }
 
@@ -123,7 +123,10 @@ impl GgufLoader {
     /// Returns an error if any file cannot be opened, is not a valid GGUF file,
     /// or uses an unsupported version.
     pub fn from_split_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
-        assert!(!paths.is_empty(), "from_split_files: paths must not be empty");
+        assert!(
+            !paths.is_empty(),
+            "from_split_files: paths must not be empty"
+        );
 
         let mut mmaps = Vec::with_capacity(paths.len());
         let mut tensor_data_offsets = Vec::with_capacity(paths.len());
@@ -177,7 +180,12 @@ impl GgufLoader {
 
                 all_tensors.insert(
                     name,
-                    GgufTensorInfo { shape, ggml_type, offset, shard_idx },
+                    GgufTensorInfo {
+                        shape,
+                        ggml_type,
+                        offset,
+                        shard_idx,
+                    },
                 );
             }
 
@@ -202,7 +210,12 @@ impl GgufLoader {
         &self.mmaps[info.shard_idx][start..start + byte_len]
     }
 
-    fn tensor_slice_range<'a>(&'a self, info: &GgufTensorInfo, offset: usize, len: usize) -> &'a [u8] {
+    fn tensor_slice_range<'a>(
+        &'a self,
+        info: &GgufTensorInfo,
+        offset: usize,
+        len: usize,
+    ) -> &'a [u8] {
         let start = self.tensor_data_offsets[info.shard_idx] + info.offset as usize;
         &self.mmaps[info.shard_idx][start + offset..start + offset + len]
     }
@@ -234,9 +247,7 @@ impl GgufLoader {
         let numel: usize = info.shape.iter().product();
 
         let f32_data: Vec<f32> = match dtype {
-            DType::F32 => {
-                bytemuck::cast_slice(self.tensor_slice(info, numel * 4)).to_vec()
-            }
+            DType::F32 => bytemuck::cast_slice(self.tensor_slice(info, numel * 4)).to_vec(),
             DType::F16 => {
                 let raw = self.tensor_slice(info, numel * 2);
                 bytemuck::cast_slice::<_, half::f16>(raw)
@@ -380,7 +391,11 @@ impl GgufLoader {
                         let ql_nibble_sel = (row8 % 4) / 2;
                         let ql_offset = (row8 % 4) % 2;
                         let ql_byte = ql[ql_half * 64 + ql_offset * 32 + col32];
-                        let ql_val = if ql_nibble_sel == 0 { ql_byte & 0x0F } else { ql_byte >> 4 };
+                        let ql_val = if ql_nibble_sel == 0 {
+                            ql_byte & 0x0F
+                        } else {
+                            ql_byte >> 4
+                        };
                         let qh_half = row8 / 4;
                         let qh_byte = qh[qh_half * 32 + col32];
                         let qh_val = (qh_byte >> ((row8 % 4) * 2)) & 0x03;
@@ -488,21 +503,15 @@ impl GgufLoader {
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
         let numel: usize = info.shape.iter().product();
         let bf16_data: Vec<half::bf16> = match dtype {
-            DType::BF16 => {
-                bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec()
-            }
-            DType::F32 => {
-                bytemuck::cast_slice::<_, f32>(self.tensor_slice(info, numel * 4))
-                    .iter()
-                    .map(|&x| half::bf16::from_f32(x))
-                    .collect()
-            }
-            DType::F16 => {
-                bytemuck::cast_slice::<_, half::f16>(self.tensor_slice(info, numel * 2))
-                    .iter()
-                    .map(|x| half::bf16::from_f32(x.to_f32()))
-                    .collect()
-            }
+            DType::BF16 => bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec(),
+            DType::F32 => bytemuck::cast_slice::<_, f32>(self.tensor_slice(info, numel * 4))
+                .iter()
+                .map(|&x| half::bf16::from_f32(x))
+                .collect(),
+            DType::F16 => bytemuck::cast_slice::<_, half::f16>(self.tensor_slice(info, numel * 2))
+                .iter()
+                .map(|x| half::bf16::from_f32(x.to_f32()))
+                .collect(),
             _ => {
                 let (f32_data, _) = self.dequantize_to_f32_vec(name)?;
                 f32_data.iter().map(|&x| half::bf16::from_f32(x)).collect()
@@ -536,8 +545,10 @@ impl GgufLoader {
                 unpermuted[dst1..dst1 + n_cols].copy_from_slice(&data[src1..src1 + n_cols]);
             }
         }
-        let bf16_data: Vec<half::bf16> =
-            unpermuted.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let bf16_data: Vec<half::bf16> = unpermuted
+            .iter()
+            .map(|&x| half::bf16::from_f32(x))
+            .collect();
         Ok((bytemuck::cast_slice(&bf16_data).to_vec(), shape))
     }
 
@@ -823,9 +834,7 @@ impl GgufLoader {
                         let mut buf = Vec::with_capacity(n_rows * shard_block_bytes);
                         for row in 0..n_rows {
                             let row_start = row * row_bytes + start_block * block_bytes;
-                            buf.extend_from_slice(
-                                &raw[row_start..row_start + shard_block_bytes],
-                            );
+                            buf.extend_from_slice(&raw[row_start..row_start + shard_block_bytes]);
                         }
                         (buf, vec![n_rows, shard_cols])
                     }
@@ -909,7 +918,8 @@ impl GgufLoader {
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
 
         assert_eq!(
-            info.shape.len(), 3,
+            info.shape.len(),
+            3,
             "Expert tensor must be 3D, got {:?}",
             info.shape
         );
@@ -966,7 +976,8 @@ impl GgufLoader {
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
 
         assert_eq!(
-            info.shape.len(), 3,
+            info.shape.len(),
+            3,
             "Expert tensor '{name}' must be 3D (num_experts, expert_rows, k), got {:?}",
             info.shape
         );
@@ -992,8 +1003,8 @@ impl GgufLoader {
 
         let raw_expert = self.tensor_slice_range(info, expert_idx * expert_bytes, expert_bytes);
 
-        let do_shard = shard.map_or(false, |s| s.world_size > 1)
-            && strategy != ShardStrategy::Replicate;
+        let do_shard =
+            shard.map_or(false, |s| s.world_size > 1) && strategy != ShardStrategy::Replicate;
 
         if !do_shard {
             return QuantizedTensor::from_raw(ctx, &[expert_rows, k], dtype, raw_expert, &[]);
@@ -1199,9 +1210,7 @@ impl WeightLoader for GgufLoader {
         let numel: usize = info.shape.iter().product();
 
         let f32_data: Vec<f32> = match dtype {
-            DType::F32 => {
-                bytemuck::cast_slice(self.tensor_slice(info, numel * 4)).to_vec()
-            }
+            DType::F32 => bytemuck::cast_slice(self.tensor_slice(info, numel * 4)).to_vec(),
             DType::F16 => {
                 let f16_slice: &[half::f16] =
                     bytemuck::cast_slice(self.tensor_slice(info, numel * 2));
@@ -1354,9 +1363,7 @@ impl WeightLoader for GgufLoader {
         let numel: usize = info.shape.iter().product();
 
         let f16_data: Vec<half::f16> = match dtype {
-            DType::F16 => {
-                bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec()
-            }
+            DType::F16 => bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec(),
             DType::F32 => {
                 let f32_slice: &[f32] = bytemuck::cast_slice(self.tensor_slice(info, numel * 4));
                 f32_slice.iter().map(|&x| half::f16::from_f32(x)).collect()
@@ -1389,9 +1396,7 @@ impl WeightLoader for GgufLoader {
         let numel: usize = info.shape.iter().product();
 
         let bf16_data: Vec<half::bf16> = match dtype {
-            DType::BF16 => {
-                bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec()
-            }
+            DType::BF16 => bytemuck::cast_slice(self.tensor_slice(info, numel * 2)).to_vec(),
             DType::F32 => {
                 let f32_slice: &[f32] = bytemuck::cast_slice(self.tensor_slice(info, numel * 4));
                 f32_slice.iter().map(|&x| half::bf16::from_f32(x)).collect()
@@ -1407,10 +1412,7 @@ impl WeightLoader for GgufLoader {
             _ => {
                 // Quantized or other type: dequantize to f32 first, then cast.
                 let (f32_data, _) = self.dequantize_to_f32_vec(name)?;
-                f32_data
-                    .iter()
-                    .map(|&x| half::bf16::from_f32(x))
-                    .collect()
+                f32_data.iter().map(|&x| half::bf16::from_f32(x)).collect()
             }
         };
 
@@ -1639,7 +1641,11 @@ fn dequantize_raw_to_f32(raw: &[u8], dtype: DType, numel: usize) -> Vec<f32> {
                     let ql_nibble_sel = (row8 % 4) / 2;
                     let ql_offset = (row8 % 4) % 2;
                     let ql_byte = ql[ql_half * 64 + ql_offset * 32 + col32];
-                    let ql_val = if ql_nibble_sel == 0 { ql_byte & 0x0F } else { ql_byte >> 4 };
+                    let ql_val = if ql_nibble_sel == 0 {
+                        ql_byte & 0x0F
+                    } else {
+                        ql_byte >> 4
+                    };
                     let qh_byte = qh[(row8 / 4) * 32 + col32];
                     let qh_val = (qh_byte >> ((row8 % 4) * 2)) & 0x03;
                     let q = (i32::from(ql_val) | (i32::from(qh_val) << 4)) - 32;
@@ -1653,7 +1659,7 @@ fn dequantize_raw_to_f32(raw: &[u8], dtype: DType, numel: usize) -> Vec<f32> {
             let mut out = vec![0.0f32; numel];
             for block_idx in 0..num_blocks {
                 let b = block_idx * Q4K_BLOCK_SIZE_BYTES;
-                let d    = half::f16::from_le_bytes([raw[b],     raw[b + 1]]).to_f32();
+                let d = half::f16::from_le_bytes([raw[b], raw[b + 1]]).to_f32();
                 let dmin = half::f16::from_le_bytes([raw[b + 2], raw[b + 3]]).to_f32();
                 let scales = &raw[b + 4..b + 16];
                 let qs = &raw[b + 16..b + Q4K_BLOCK_SIZE_BYTES];
@@ -1664,8 +1670,7 @@ fn dequantize_raw_to_f32(raw: &[u8], dtype: DType, numel: usize) -> Vec<f32> {
                     for j in 0..32usize {
                         let byte = qs_sub[j % 16];
                         let q = if j < 16 { byte & 0xF } else { byte >> 4 };
-                        out[out_base + row8 * 32 + j] =
-                            d * sc as f32 * q as f32 - dmin * m as f32;
+                        out[out_base + row8 * 32 + j] = d * sc as f32 * q as f32 - dmin * m as f32;
                     }
                 }
             }
@@ -1676,7 +1681,7 @@ fn dequantize_raw_to_f32(raw: &[u8], dtype: DType, numel: usize) -> Vec<f32> {
             let mut out = vec![0.0f32; numel];
             for block_idx in 0..num_blocks {
                 let b = block_idx * Q5K_BLOCK_SIZE_BYTES;
-                let d    = half::f16::from_le_bytes([raw[b],     raw[b + 1]]).to_f32();
+                let d = half::f16::from_le_bytes([raw[b], raw[b + 1]]).to_f32();
                 let dmin = half::f16::from_le_bytes([raw[b + 2], raw[b + 3]]).to_f32();
                 let scales = &raw[b + 4..b + 16];
                 let qh = &raw[b + 16..b + 48];
