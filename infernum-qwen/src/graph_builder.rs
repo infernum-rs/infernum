@@ -1096,10 +1096,10 @@ where
 // GGUF name mapping
 // ---------------------------------------------------------------------------
 
-/// Convert a HuggingFace SafeTensors weight name to its GGUF (llama.cpp) equivalent.
+/// Convert a `HuggingFace` `SafeTensors` weight name to its GGUF (llama.cpp) equivalent.
 ///
 /// Used by the CUDA GGUF loader to map graph weight metadata names to the
-/// GGUF key namespace. Covers dense Qwen2/Qwen3 and MoE (Qwen3-MoE) weights.
+/// GGUF key namespace. Covers dense Qwen2/Qwen3 and `MoE` (Qwen3-MoE) weights.
 ///
 /// For per-expert weights the returned string carries a `[N]` expert index
 /// suffix (e.g. `"blk.0.ffn_gate_exps.weight[42]"`), which the GGUF engine
@@ -1108,6 +1108,7 @@ where
 /// # Panics
 ///
 /// Panics on an unrecognised weight name (indicates a bug in weight registration).
+#[allow(dead_code)]
 pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     match name {
         "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
@@ -1165,6 +1166,7 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
 
 /// Returns `true` if this GGUF tensor name is a Q or K projection weight that
 /// needs the GGUF row-permutation reversal before use.
+#[allow(dead_code)]
 pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {
     gguf_name.ends_with(".attn_q.weight") || gguf_name.ends_with(".attn_k.weight")
 }

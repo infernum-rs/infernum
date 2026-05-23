@@ -253,6 +253,7 @@ impl DeepSeekConfig {
     ///
     /// # Errors
     /// Returns an error if required metadata keys are missing.
+    #[allow(clippy::too_many_lines)]
     pub fn from_gguf_metadata(metadata: &HashMap<String, GgufValue>) -> Result<Self> {
         use infernum::gguf_meta::{get_f32, get_usize};
 
@@ -274,8 +275,9 @@ impl DeepSeekConfig {
         let scoring_func = metadata
             .get(&format!("{arch}.expert_gating_func"))
             .and_then(GgufValue::as_usize)
-            .map(|f| if f == 1 { "sigmoid" } else { "softmax" }.to_string())
-            .unwrap_or_else(default_scoring_func);
+            .map_or_else(default_scoring_func, |f| {
+                if f == 1 { "sigmoid" } else { "softmax" }.to_string()
+            });
 
         // Reconstruct RoPE YaRN scaling from GGUF keys when present
         let rope_scaling = {

@@ -844,6 +844,7 @@ where
 /// # Panics
 ///
 /// Panics on an unrecognised layer suffix (indicates a bug in weight registration).
+#[allow(dead_code)]
 pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     match name {
         "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
@@ -874,6 +875,7 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
 
 /// Returns `true` if this GGUF tensor name is a Q or K projection that needs
 /// the GGUF row-permutation reversal before use.
+#[allow(dead_code)]
 pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {
     gguf_name.ends_with(".attn_q.weight") || gguf_name.ends_with(".attn_k.weight")
 }

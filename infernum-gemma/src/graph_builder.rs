@@ -831,6 +831,7 @@ where
 /// - `attn_q` / `attn_k` / `attn_v` / `attn_output` for attention projections
 /// - `ffn_gate` / `ffn_up` / `ffn_down` for GeGLU projections
 /// - Optional `attn_q_norm` / `attn_k_norm` for Gemma 3 per-head QK-norm
+#[allow(dead_code)]
 pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     match name {
         "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
