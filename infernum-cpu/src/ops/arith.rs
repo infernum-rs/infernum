@@ -6,6 +6,7 @@ use infernum::Result;
 
 use crate::simd;
 use crate::tensor::CpuTensor;
+use crate::thread_pool::global_pool;
 use crate::CpuBackend;
 
 impl ArithOps for CpuBackend {
@@ -43,13 +44,50 @@ impl ArithOps for CpuBackend {
 
     fn silu(input: &CpuTensor) -> Result<CpuTensor> {
         let data = input.as_f32_slice();
-        let out: Vec<f32> = data.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+        let n = data.len();
+        let pool = global_pool();
+        let num_threads = pool.num_threads();
+        let chunk = n.div_ceil(num_threads);
+        let num_tasks = n.div_ceil(chunk);
+        let mut out = vec![0.0f32; n];
+        let in_addr = data.as_ptr() as usize;
+        let out_addr = out.as_mut_ptr() as usize;
+        pool.dispatch(num_tasks, |task_id, _| {
+            let start = task_id * chunk;
+            let end = (start + chunk).min(n);
+            // Safety: each task writes to a disjoint slice of out.
+            let src = unsafe { std::slice::from_raw_parts(in_addr as *const f32, n) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
+            for i in start..end {
+                let x = src[i];
+                dst[i] = x / (1.0 + (-x).exp());
+            }
+        });
         Ok(CpuTensor::from_f32(input.shape(), &out))
     }
 
     fn logit_softcap(input: &CpuTensor, cap: f32) -> Result<CpuTensor> {
         let data = input.as_f32_slice();
-        let out: Vec<f32> = data.iter().map(|&x| (x / cap).tanh() * cap).collect();
+        let n = data.len();
+        let pool = global_pool();
+        let num_threads = pool.num_threads();
+        let chunk = n.div_ceil(num_threads);
+        let num_tasks = n.div_ceil(chunk);
+        let mut out = vec![0.0f32; n];
+        let in_addr = data.as_ptr() as usize;
+        let out_addr = out.as_mut_ptr() as usize;
+        pool.dispatch(num_tasks, |task_id, _| {
+            let start = task_id * chunk;
+            let end = (start + chunk).min(n);
+            // Safety: each task writes to a disjoint slice of out.
+            let src = unsafe { std::slice::from_raw_parts(in_addr as *const f32, n) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
+            let inv_cap = 1.0 / cap;
+            for i in start..end {
+                let x = src[i];
+                dst[i] = (x * inv_cap).tanh() * cap;
+            }
+        });
         Ok(CpuTensor::from_f32(input.shape(), &out))
     }
 }
