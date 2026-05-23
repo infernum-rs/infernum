@@ -505,7 +505,11 @@ fn attention_head_unit(
 ///   (seq_pos, kv_head) GQA groups — reads K and V once per group instead of `gqa_ratio` times.
 /// - **Decode (seq_len = 1):** same per-(s,h) dispatch as before; K/V transposition overhead
 ///   is not amortized for a single query position so the original layout is kept.
-#[allow(clippy::too_many_arguments, clippy::many_single_char_names, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::many_single_char_names,
+    clippy::too_many_lines
+)]
 fn causal_attention(
     q: &[f32],
     k: &[f32],

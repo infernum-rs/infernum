@@ -439,11 +439,6 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                     }
                     let chunk_n = col_end - col_start;
 
-                    // The microkernel zeros its own accumulators and writes every element,
-                    // so we skip the redundant zero-init to save memory bandwidth.
-                    let mut local_out: Vec<f32> = Vec::with_capacity(m * chunk_n);
-                    unsafe { local_out.set_len(m * chunk_n) };
-
                     // Weight slices for columns [col_start..col_end].
                     let wt_data = unsafe {
                         std::slice::from_raw_parts(
@@ -458,26 +453,21 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                         )
                     };
 
+                    // Write directly into strided global output (stride = n).
+                    let out_global =
+                        unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
                     simd::gemm_q8_tiled(
-                        &mut local_out,
+                        &mut out_global[col_start..],
                         &all_quants.quants,
                         &all_quants.scales,
                         wt_data,
                         wt_scales,
                         m,
                         chunk_n,
+                        n,
                         num_blocks_per_row,
                         bpr,
                     );
-
-                    // Scatter local contiguous output [m × chunk_n] into strided global output.
-                    let out_global =
-                        unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
-                    for row in 0..m {
-                        let src = &local_out[row * chunk_n..(row + 1) * chunk_n];
-                        let dst = &mut out_global[row * n + col_start..row * n + col_end];
-                        dst.copy_from_slice(src);
-                    }
                 });
             }
             DType::Q4_0 => {
@@ -641,9 +631,13 @@ fn q4_gemm_tiled(
         let chunk_n = col_end - col_start;
 
         // Expand Q4_0 → int8 for this thread's weight column chunk.
-        // expand_q4_to_int8 writes every element, so skip the redundant zero-init.
-        let mut expanded: Vec<u8> = Vec::with_capacity(chunk_n * k);
-        unsafe { expanded.set_len(chunk_n * k) };
+        // expand_q4_to_int8 writes every element — skip zero-init.
+        #[allow(clippy::uninit_vec)]
+        let mut expanded: Vec<u8> = {
+            let mut v = Vec::with_capacity(chunk_n * k);
+            unsafe { v.set_len(chunk_n * k) };
+            v
+        };
         let q4_data = unsafe {
             std::slice::from_raw_parts(
                 (wt_data_addr as *const u8).add(col_start * bpr),
@@ -659,29 +653,20 @@ fn q4_gemm_tiled(
             )
         };
 
-        // The microkernel zeros its own accumulators and writes every element,
-        // so we skip the redundant zero-init to save memory bandwidth.
-        let mut local_out: Vec<f32> = Vec::with_capacity(m * chunk_n);
-        unsafe { local_out.set_len(m * chunk_n) };
+        // Write directly into strided global output (stride = n).
+        let out_global = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
         simd::gemm_q8_tiled(
-            &mut local_out,
+            &mut out_global[col_start..],
             &all_rows.quants,
             &all_rows.scales,
             &expanded,
             wt_scales,
             m,
             chunk_n,
+            n,
             num_blocks,
             ebpr,
         );
-
-        // Scatter local contiguous output [m × chunk_n] into strided global output.
-        let out_global = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
-        for row in 0..m {
-            let src = &local_out[row * chunk_n..(row + 1) * chunk_n];
-            let dst = &mut out_global[row * n + col_start..row * n + col_end];
-            dst.copy_from_slice(src);
-        }
     });
 }
 
@@ -733,7 +718,6 @@ fn quantized_linear_pair_batched(
                 if col_start1 < n1 {
                     let col_end1 = (col_start1 + cols_per_thread1).min(n1);
                     let chunk_n1 = col_end1 - col_start1;
-                    let mut local_out1 = vec![0.0f32; m * chunk_n1];
                     let wt_data1 = unsafe {
                         std::slice::from_raw_parts(
                             (w1_data_addr as *const u8).add(col_start1 * bpr),
@@ -746,23 +730,20 @@ fn quantized_linear_pair_batched(
                             chunk_n1 * num_blocks,
                         )
                     };
+                    let out_global1 =
+                        unsafe { std::slice::from_raw_parts_mut(out1_addr as *mut f32, m * n1) };
                     simd::gemm_q8_tiled(
-                        &mut local_out1,
+                        &mut out_global1[col_start1..],
                         &all_rows.quants,
                         &all_rows.scales,
                         wt_data1,
                         wt_scales1,
                         m,
                         chunk_n1,
+                        n1,
                         num_blocks,
                         bpr,
                     );
-                    let out_global1 =
-                        unsafe { std::slice::from_raw_parts_mut(out1_addr as *mut f32, m * n1) };
-                    for row in 0..m {
-                        out_global1[row * n1 + col_start1..row * n1 + col_end1]
-                            .copy_from_slice(&local_out1[row * chunk_n1..(row + 1) * chunk_n1]);
-                    }
                 }
 
                 // Weight 2
@@ -770,7 +751,6 @@ fn quantized_linear_pair_batched(
                 if col_start2 < n2 {
                     let col_end2 = (col_start2 + cols_per_thread2).min(n2);
                     let chunk_n2 = col_end2 - col_start2;
-                    let mut local_out2 = vec![0.0f32; m * chunk_n2];
                     let wt_data2 = unsafe {
                         std::slice::from_raw_parts(
                             (w2_data_addr as *const u8).add(col_start2 * bpr),
@@ -783,23 +763,20 @@ fn quantized_linear_pair_batched(
                             chunk_n2 * num_blocks,
                         )
                     };
+                    let out_global2 =
+                        unsafe { std::slice::from_raw_parts_mut(out2_addr as *mut f32, m * n2) };
                     simd::gemm_q8_tiled(
-                        &mut local_out2,
+                        &mut out_global2[col_start2..],
                         &all_rows.quants,
                         &all_rows.scales,
                         wt_data2,
                         wt_scales2,
                         m,
                         chunk_n2,
+                        n2,
                         num_blocks,
                         bpr,
                     );
-                    let out_global2 =
-                        unsafe { std::slice::from_raw_parts_mut(out2_addr as *mut f32, m * n2) };
-                    for row in 0..m {
-                        out_global2[row * n2 + col_start2..row * n2 + col_end2]
-                            .copy_from_slice(&local_out2[row * chunk_n2..(row + 1) * chunk_n2]);
-                    }
                 }
             });
         }
@@ -883,7 +860,6 @@ fn quantized_linear_triple_batched(
                         if cs < $n {
                             let ce = (cs + $cpt).min($n);
                             let cn = ce - cs;
-                            let mut local = vec![0.0f32; m * cn];
                             let wd = unsafe {
                                 std::slice::from_raw_parts(
                                     ($wd as *const u8).add(cs * bpr),
@@ -896,24 +872,21 @@ fn quantized_linear_triple_batched(
                                     cn * num_blocks,
                                 )
                             };
+                            let out = unsafe {
+                                std::slice::from_raw_parts_mut($out_addr as *mut f32, m * $n)
+                            };
                             simd::gemm_q8_tiled(
-                                &mut local,
+                                &mut out[cs..],
                                 &all_rows.quants,
                                 &all_rows.scales,
                                 wd,
                                 ws,
                                 m,
                                 cn,
+                                $n,
                                 num_blocks,
                                 bpr,
                             );
-                            let out = unsafe {
-                                std::slice::from_raw_parts_mut($out_addr as *mut f32, m * $n)
-                            };
-                            for row in 0..m {
-                                out[row * $n + cs..row * $n + ce]
-                                    .copy_from_slice(&local[row * cn..(row + 1) * cn]);
-                            }
                         }
                     };
                 }

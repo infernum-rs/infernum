@@ -420,6 +420,7 @@ pub fn gemm_q8_tiled(
     wt_scales: &[f32],
     m: usize,
     n: usize,
+    n_stride: usize,
     num_blocks: usize,
     bytes_per_row: usize,
 ) {
@@ -434,6 +435,7 @@ pub fn gemm_q8_tiled(
                 wt_scales,
                 m,
                 n,
+                n_stride,
                 num_blocks,
                 bytes_per_row,
             );
@@ -448,7 +450,7 @@ pub fn gemm_q8_tiled(
         for col in 0..n {
             let wq = &wt_quants[col * bytes_per_row..(col + 1) * bytes_per_row];
             let ws = &wt_scales[col * num_blocks..(col + 1) * num_blocks];
-            output[row * n + col] = dot_q8_q8_row(iq, is, wq, ws);
+            output[row * n_stride + col] = dot_q8_q8_row(iq, is, wq, ws);
         }
     }
 }

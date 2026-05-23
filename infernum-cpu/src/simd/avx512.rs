@@ -969,12 +969,17 @@ const RM_Q8: usize = 4;
 /// Micro-kernel column count for Q8 GEMM.
 const RN_Q8: usize = 4;
 
-/// Tiled Q8×Q8 GEMM: `output[m, n] = inp_quants[m, k] · wt_quants[n, k]`
+/// Tiled Q8×Q8 GEMM: `output[m, n_stride] = inp_quants[m, k] · wt_quants[n, k]`
 /// with per-block scales.
 ///
 /// Both input and weight data are in Q8_0 format: K dimension divided into
 /// blocks of 32 elements, each with a `[u8; 32]` quant array and one `f32`
 /// scale.
+///
+/// `n` is the number of weight columns to process (local chunk size).
+/// `n_stride` is the row stride of `output` — use `n` for a contiguous
+/// output buffer, or the global column count when writing directly into a
+/// column-striped slice of the global output matrix.
 ///
 /// Uses a 4×4 micro-kernel with AVX-512 VNNI for full tiles, falling back
 /// to single-row `dot_q8_q8_row` for remainder rows/columns.
@@ -987,6 +992,7 @@ pub fn gemm_q8_tiled(
     wt_scales: &[f32],
     m: usize,
     n: usize,
+    n_stride: usize,
     num_blocks: usize,
     bytes_per_row: usize,
 ) {
@@ -999,6 +1005,7 @@ pub fn gemm_q8_tiled(
             wt_scales,
             m,
             n,
+            n_stride,
             num_blocks,
             bytes_per_row,
         );
@@ -1025,6 +1032,7 @@ unsafe fn gemm_q8_tiled_inner(
     wt_scales: &[f32],
     m: usize,
     n: usize,
+    n_stride: usize,
     num_blocks: usize,
     bytes_per_row: usize,
 ) {
@@ -1040,7 +1048,7 @@ unsafe fn gemm_q8_tiled_inner(
                 inp_scales,
                 wt_quants,
                 wt_scales,
-                n,
+                n_stride,
                 num_blocks,
                 bytes_per_row,
                 i,
@@ -1050,7 +1058,7 @@ unsafe fn gemm_q8_tiled_inner(
         // N remainder: scalar fallback.
         for jj in n_full..n {
             for ii in i..i + RM_Q8 {
-                output[ii * n + jj] = dot_q8_q8_row(
+                output[ii * n_stride + jj] = dot_q8_q8_row(
                     &inp_quants[ii * bytes_per_row..(ii + 1) * bytes_per_row],
                     &inp_scales[ii * num_blocks..(ii + 1) * num_blocks],
                     &wt_quants[jj * bytes_per_row..(jj + 1) * bytes_per_row],
@@ -1063,7 +1071,7 @@ unsafe fn gemm_q8_tiled_inner(
     // M remainder: scalar fallback.
     for ii in m_full..m {
         for jj in 0..n {
-            output[ii * n + jj] = dot_q8_q8_row(
+            output[ii * n_stride + jj] = dot_q8_q8_row(
                 &inp_quants[ii * bytes_per_row..(ii + 1) * bytes_per_row],
                 &inp_scales[ii * num_blocks..(ii + 1) * num_blocks],
                 &wt_quants[jj * bytes_per_row..(jj + 1) * bytes_per_row],
