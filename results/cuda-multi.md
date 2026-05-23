@@ -5,7 +5,7 @@ See [performance.md](../performance.md) for methodology.
 ## Current Results
 
 **Node:** 8× NVIDIA A100-SXM4-80GB — NVLink interconnect | Driver 590.48.01 | CUDA 13.1  
-**Run date:** 2026-05-22 (small models) / 2026-05-23 (large models) — clean sequential runs, all GPUs idle between measurements  
+**Run date:** 2026-05-22 (small models) / 2026-05-23 (large models) / 2026-05-23 (prefill measurement + Qwen3-72B re-run) — clean sequential runs, all GPUs idle between measurements  
 **infernum commit:** `perf/measurement-doc` branch | **llama.cpp commit:** `40d5358` (build 1)
 
 ### Multi-GPU decode — large models (greedy argmax, 200 tokens)
@@ -13,12 +13,25 @@ See [performance.md](../performance.md) for methodology.
 infernum uses NCCL tensor-parallel (ShardedGraphEngine for TP>1).  
 llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for models that fit on one GPU.
 
-| Model | Format | infernum TP=2 (tok/s) | infernum TP=8 (tok/s) | llama.cpp ref (tok/s) | ratio (TP=8) |
-| ----- | ------ | --------------------: | --------------------: | ---------------------: | -----------: |
-| Llama-3.1-70B | Q4_0 GGUF | 10.4 | 3.8 | 30.1 (1GPU) | — |
-| Qwen3-72B | Q4_K_M GGUF | 7.3 | 3.5 | 23.4 (1GPU) | — |
-| Qwen3-235B-A22B | Q4_K_M GGUF | 11.5 | N/A† | 19.82 (2GPU)‡ | — |
+| Model | Format | infernum TP=2 decode (tok/s) | infernum TP=8 decode (tok/s) | llama.cpp ref decode (tok/s) | ratio (best TP) |
+| ----- | ------ | ---------------------------: | ---------------------------: | ---------------------------: | --------------: |
+| Llama-3.1-70B | Q4_0 GGUF | 10.5 | 3.8 | 30.1 (1GPU) | — |
+| Qwen3-72B | Q4_K_M GGUF | 7.6 | 3.5 | 23.4 (1GPU) | — |
+| Qwen3-235B-A22B | Q4_K_M GGUF | 11.6 | N/A† | 19.82 (2GPU)‡ | — |
 | DeepSeek-V3 | Q4_K_M GGUF | N/A§ | 5.0 | 7.07 (8GPU)‖ | 0.71x |
+
+### Multi-GPU prefill — large models (512 tokens, sequential via decode graph)
+
+**Architecture note:** infernum's `forward_prefill` in the engine path loops through prompt tokens **one at a time** using the decode graph. This is not a batch prefill and is not directly comparable to llama.cpp's `pp512` (which processes all 512 tokens in a single forward pass). True batch prefill is not implemented for TP>1. Numbers below are sequential single-token throughput over 512 steps with a growing KV cache (empty → 512).
+
+| Model | Format | infernum TP=N sequential prefill (tok/s) | llama.cpp pp512 (tok/s) |
+| ----- | ------ | ---------------------------------------: | ----------------------: |
+| Llama-3.1-70B | Q4_0 GGUF | 14.4 (TP=2) | 530 (1GPU) |
+| Qwen3-72B | Q4_K_M GGUF | 10.1 (TP=2) | 517 (1GPU) |
+| Qwen3-235B-A22B | Q4_K_M GGUF | 8.8 (TP=2) | 417 (2GPU) |
+| DeepSeek-V3 | Q4_K_M GGUF | N/A¶ | 112 (8GPU) |
+
+¶DeepSeek-V3 prefill excluded: `forward_prefill` is also token-by-token (decode speed ~5 tok/s); running 512 tokens would take ~100s and equal the decode number exactly.
 
 **TP decode is structurally eager:** `all_reduce_sum` ops are flagged capture-unsafe because NCCL AllReduce internally calls `cuMemAlloc`, which is illegal inside a CUDA graph capture window. TP=1 uses the CUDA graph fast path; TP>1 runs every decode step eagerly via the interpreter. This is a hard constraint, not a configuration choice.
 
@@ -28,7 +41,7 @@ llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for mod
 
 **Footnotes:**
 - Llama-3.1-70B Q4_0: on-GPU Q4_0 GEMV kernels (0.5 byte/param), block-sharded across ranks at quantized boundaries.
-- Qwen3-72B Q4_K_M: measured 2026-05-22 with BF16 dequant at load (Q4_K GPU kernels were added 2026-05-23; result not yet re-measured with quantized storage). Some layers have column counts not divisible by `32 × world_size` at TP=8, causing automatic fallback to BF16 sharding. TP=8 slower than TP=2 (NCCL overhead dominates; model fits on 2 GPUs).
+- Qwen3-72B Q4_K_M: re-measured 2026-05-23 with Q4_K GPU GEMV kernels active — **7.6 tok/s** (up from 7.3 tok/s measured 2026-05-22 with BF16 dequant at load). Some layers have column counts not divisible by `32 × world_size` at TP=8, causing automatic fallback to BF16 sharding. TP=8 slower than TP=2 (NCCL overhead dominates; model fits on 2 GPUs).
 - Qwen3-235B-A22B: measured 2026-05-23 at TP=2. †TP=8 is architecturally impossible — the model has only 4 KV heads total; TP=8 gives 0 KV heads per rank. Max usable TP=2 (2 KV heads/rank). ‡llama.cpp reference is a 2-GPU `--split-mode row` run (19.82 ± 0.42 tok/s tg256, 417 tok/s pp512); single-GPU is not possible (133 GB does not fit in 80 GB). infernum TP=2 was measured at 200 tokens decode vs llama.cpp tg256; both are near-empty cache.
 - DeepSeek-V3: measured 2026-05-23 at TP=8 (greedy argmax, 200 decode tokens). §TP=4 is infeasible: Q4_K_M at 377 GB / 4 GPUs ≈ 94 GB/GPU > 80 GB A100 VRAM. TP=2 equally infeasible (377/2 ≈ 188 GB). TP=8 minimum required. ‖llama.cpp reference is an 8-GPU `--split-mode row` run (7.07 ± 0.01 tok/s tg200, 112 tok/s pp512). infernum uses the bespoke `DeepSeekShardedEngine` (NCCL AllReduce, eager decode — CUDA graph capture blocked by AllReduce). MLA attention with Q4_K_M expert weights.
 
@@ -39,13 +52,21 @@ llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for mod
 | Item | Status |
 | ---- | ------ |
 | Qwen3-235B-A22B TP=4 re-run | TP=4 tested during 2026-05-23 work: Q6_K Row sharding for k=1536 (6 blocks, not divisible by 4) triggers BF16 CPU fallback for `ffn_down_exps` expert slices — ~12,032 slices × CPU dequant = ~10 min load time. TP=4 is valid (1 KV head/rank ≥ min) but impractical until Row sharding handles misaligned super-blocks natively. |
-| Qwen3-72B Q4_K_M re-run | 7.3 tok/s measured with BF16 dequant (pre-2026-05-23). Q4_K/Q5_K GPU GEMV kernels now live; re-run expected to improve VRAM and potentially throughput. |
+| Qwen3-72B Q4_K_M re-run | **Done** — 7.6 tok/s (2026-05-23, Q4_K GPU kernels active). Up from 7.3 tok/s (BF16 dequant). |
 | DeepSeek-V3 Q4_K_M TP=8 | **Done** — 5.0 tok/s (2026-05-23). See History for details. |
 | CUDA graph TP | NCCL AllReduce blocks CUDA graph capture; TP>1 runs eager |
 
 ---
 
 ## History
+
+## 2026-05-23 — Prefill measurement added; Qwen3-72B Q4_K_M re-run (7.6 tok/s)
+
+- **New:** Prefill timing added to `run_engine_bench` (`--cuda-graph-engine` path) via 512-token timed forward pass.
+- **Architecture note:** `CudaGraphEngine::forward_prefill` processes tokens sequentially via the decode graph (one token per forward pass). This is not batch prefill — numbers reflect sequential single-token throughput, not parallel prompt processing. True batch prefill for TP>1 is not implemented.
+- **Updated:** Qwen3-72B Q4_K_M TP=2 decode: **7.6 tok/s** (was 7.3 tok/s, BF16 dequant at load). Q4_K GPU GEMV kernels confirmed active.
+- **Confirmed:** Llama-3.1-70B Q4_0 TP=2: **10.5 tok/s** decode; Qwen3-235B-A22B Q4_K_M TP=2: **11.6 tok/s** decode; DeepSeek-V3 Q4_K_M TP=8: **5.0 tok/s** decode — all within noise of prior measurements.
+- **Sequential prefill (512 tok):** Llama-3.1-70B 14.4 tok/s, Qwen3-72B 10.1 tok/s, Qwen3-235B-A22B 8.8 tok/s. DeepSeek-V3 excluded (would equal decode speed).
 
 ## 2026-05-23 — DeepSeek-V3 Q4_K_M at TP=8 (5.0 tok/s) + MLA attention dtype fix
 
