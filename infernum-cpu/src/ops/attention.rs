@@ -527,7 +527,6 @@ fn causal_attention(
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
 
-    // For very small workloads (decode with few heads), skip dispatch overhead.
     if total_units <= num_threads {
         for s in 0..seq_len {
             for h in 0..num_heads {

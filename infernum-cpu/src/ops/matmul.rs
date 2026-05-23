@@ -66,7 +66,7 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
         let a_row = &a[..k];
         let pool = crate::thread_pool::global_pool();
         let num_threads = pool.num_threads();
-        let chunk_size = (n / num_threads).max(64).min(n);
+        let chunk_size = n.div_ceil(num_threads).max(64).min(n);
         let c_addr = ptr_to_usize(c.as_mut_ptr());
         let num_tasks = num_threads.min(n.div_ceil(chunk_size));
         pool.dispatch(num_tasks, |task_id, _| {
@@ -177,8 +177,8 @@ fn q8_gemv_parallel(
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
-        // Round chunk_size to even for clean pair processing
-        let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
+        // div_ceil so the last thread covers the tail; round up to even for 2-row kernel.
+        let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
         let chunk_size = (raw_chunk + 1) & !1; // round up to even
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         // SAFETY: each task writes to a disjoint slice [start..end].
@@ -255,8 +255,8 @@ fn q4_gemv_parallel(
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
-        // Round chunk_size to even for clean pair processing
-        let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
+        // div_ceil so the last chunk covers the tail; round up to even for 2-row kernel.
+        let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
         let chunk_size = (raw_chunk + 1) & !1; // round up to even
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
@@ -310,7 +310,7 @@ fn q4_1_gemv_parallel(
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
-        let chunk_size = (n / num_threads).max(min_neurons_per_task).min(n);
+        let chunk_size = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
             let start = task_id * chunk_size;
@@ -586,8 +586,7 @@ fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) 
 /// Input layout: `chunk_n` rows × `num_blocks` blocks × 16 packed bytes per block.
 /// Output layout: `chunk_n` rows × `num_blocks` blocks × 32 int8 bytes per block.
 ///
-/// Q4_0 block: `qs[i]` encodes element[i] in the low nibble and element[i+16] in
-/// the high nibble. Values are shifted by -8 to center them: (nibble - 8) ∈ [-8, 7].
+/// `qs[k]` encodes element[k] in the low nibble and element[k+16] in the high nibble.
 fn expand_q4_to_int8(packed: &[u8], expanded: &mut [u8], chunk_n: usize, num_blocks: usize) {
     let bpr = num_blocks * 16;
     let ebpr = num_blocks * 32;
