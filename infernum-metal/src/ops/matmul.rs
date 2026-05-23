@@ -40,6 +40,16 @@ const GEMV_V2_ROWS_PER_TG: u64 = GEMV_V2_NR * GEMV_V2_NSG;
 /// Threads per threadgroup for v2.
 const GEMV_V2_THREADS_PER_TG: u64 = GEMV_V2_NSG * SIMD_GROUP_SIZE;
 
+// --- GGUF native block-format GEMV (preferred path when blocks buffer is present) ---
+const Q8B_NR: u64 = 2;
+const Q8B_NSG: u64 = 4;
+const Q8B_ROWS_PER_TG: u64 = Q8B_NR * Q8B_NSG;
+const Q8B_THREADS_PER_TG: u64 = Q8B_NSG * SIMD_GROUP_SIZE;
+const Q4B_NR: u64 = 4;
+const Q4B_NSG: u64 = 2;
+const Q4B_ROWS_PER_TG: u64 = Q4B_NR * Q4B_NSG;
+const Q4B_THREADS_PER_TG: u64 = Q4B_NSG * SIMD_GROUP_SIZE;
+
 /// Packed params for the tiled matmul kernel.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -101,49 +111,93 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
 
         match weight.dtype {
             DType::Q8_0 => {
-                let kernel = if use_f16 {
-                    "gemv_q8_simd_v2_f16"
+                if let Some(blocks_buf) = &weight.blocks {
+                    let kernel = if use_f16 {
+                        "gemv_q8_blocks_f16"
+                    } else {
+                        "gemv_q8_blocks_f32"
+                    };
+                    let threadgroups = MTLSize::new((n as u64).div_ceil(Q8B_ROWS_PER_TG), 1, 1);
+                    let threads_per_group = MTLSize::new(Q8B_THREADS_PER_TG, 1, 1);
+                    ctx.dispatch_threadgroups(
+                        kernel,
+                        &[
+                            (input.metal_buffer(), input.buffer_offset()),
+                            (blocks_buf, 0),
+                            (out.metal_buffer(), out.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&params),
+                        threadgroups,
+                        threads_per_group,
+                        0,
+                    );
                 } else {
-                    "gemv_q8_simd_v2_f32"
-                };
-                let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
-                let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
-                ctx.dispatch_threadgroups(
-                    kernel,
-                    &[
-                        (input.metal_buffer(), input.buffer_offset()),
-                        (&weight.data, 0),
-                        (&weight.scales, 0),
-                        (out.metal_buffer(), out.buffer_offset()),
-                    ],
-                    bytemuck::bytes_of(&params),
-                    threadgroups,
-                    threads_per_group,
-                    0,
-                );
+                    let kernel = if use_f16 {
+                        "gemv_q8_simd_v2_f16"
+                    } else {
+                        "gemv_q8_simd_v2_f32"
+                    };
+                    let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
+                    let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
+                    ctx.dispatch_threadgroups(
+                        kernel,
+                        &[
+                            (input.metal_buffer(), input.buffer_offset()),
+                            (&weight.data, 0),
+                            (&weight.scales, 0),
+                            (out.metal_buffer(), out.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&params),
+                        threadgroups,
+                        threads_per_group,
+                        0,
+                    );
+                }
                 return Ok(out);
             }
             DType::Q4_0 => {
-                let kernel = if use_f16 {
-                    "gemv_q4_simd_v2_f16"
+                if let Some(blocks_buf) = &weight.blocks {
+                    let kernel = if use_f16 {
+                        "gemv_q4_blocks_f16"
+                    } else {
+                        "gemv_q4_blocks_f32"
+                    };
+                    let threadgroups = MTLSize::new((n as u64).div_ceil(Q4B_ROWS_PER_TG), 1, 1);
+                    let threads_per_group = MTLSize::new(Q4B_THREADS_PER_TG, 1, 1);
+                    ctx.dispatch_threadgroups(
+                        kernel,
+                        &[
+                            (input.metal_buffer(), input.buffer_offset()),
+                            (blocks_buf, 0),
+                            (out.metal_buffer(), out.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&params),
+                        threadgroups,
+                        threads_per_group,
+                        0,
+                    );
                 } else {
-                    "gemv_q4_simd_v2_f32"
-                };
-                let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
-                let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
-                ctx.dispatch_threadgroups(
-                    kernel,
-                    &[
-                        (input.metal_buffer(), input.buffer_offset()),
-                        (&weight.data, 0),
-                        (&weight.scales, 0),
-                        (out.metal_buffer(), out.buffer_offset()),
-                    ],
-                    bytemuck::bytes_of(&params),
-                    threadgroups,
-                    threads_per_group,
-                    0,
-                );
+                    let kernel = if use_f16 {
+                        "gemv_q4_simd_v2_f16"
+                    } else {
+                        "gemv_q4_simd_v2_f32"
+                    };
+                    let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
+                    let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
+                    ctx.dispatch_threadgroups(
+                        kernel,
+                        &[
+                            (input.metal_buffer(), input.buffer_offset()),
+                            (&weight.data, 0),
+                            (&weight.scales, 0),
+                            (out.metal_buffer(), out.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&params),
+                        threadgroups,
+                        threads_per_group,
+                        0,
+                    );
+                }
                 return Ok(out);
             }
             DType::Q4_1 => {
@@ -198,30 +252,56 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
         };
         match weight.dtype {
             DType::Q8_0 => {
-                ctx.dispatch_2d(
-                    "dequantize_q8_to_f32",
-                    &[
-                        (&weight.data, 0),
-                        (&weight.scales, 0),
-                        (dequant.metal_buffer(), dequant.buffer_offset()),
-                    ],
-                    bytemuck::bytes_of(&dq_params),
-                    k,
-                    n,
-                );
+                if let Some(blocks_buf) = &weight.blocks {
+                    ctx.dispatch_2d(
+                        "dequantize_q8_blocks_to_f32",
+                        &[
+                            (blocks_buf, 0),
+                            (dequant.metal_buffer(), dequant.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&dq_params),
+                        k,
+                        n,
+                    );
+                } else {
+                    ctx.dispatch_2d(
+                        "dequantize_q8_to_f32",
+                        &[
+                            (&weight.data, 0),
+                            (&weight.scales, 0),
+                            (dequant.metal_buffer(), dequant.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&dq_params),
+                        k,
+                        n,
+                    );
+                }
             }
             DType::Q4_0 => {
-                ctx.dispatch_2d(
-                    "dequantize_q4_to_f32",
-                    &[
-                        (&weight.data, 0),
-                        (&weight.scales, 0),
-                        (dequant.metal_buffer(), dequant.buffer_offset()),
-                    ],
-                    bytemuck::bytes_of(&dq_params),
-                    k,
-                    n,
-                );
+                if let Some(blocks_buf) = &weight.blocks {
+                    ctx.dispatch_2d(
+                        "dequantize_q4_blocks_to_f32",
+                        &[
+                            (blocks_buf, 0),
+                            (dequant.metal_buffer(), dequant.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&dq_params),
+                        k,
+                        n,
+                    );
+                } else {
+                    ctx.dispatch_2d(
+                        "dequantize_q4_to_f32",
+                        &[
+                            (&weight.data, 0),
+                            (&weight.scales, 0),
+                            (dequant.metal_buffer(), dequant.buffer_offset()),
+                        ],
+                        bytemuck::bytes_of(&dq_params),
+                        k,
+                        n,
+                    );
+                }
             }
             DType::Q4_1 => {
                 let mins_buf = weight.mins.as_ref().expect("Q4_1 missing mins");
@@ -616,6 +696,7 @@ impl MatmulOps for MetalBackend {
             data: new_metal_buffer(device, &qdata),
             scales: new_metal_buffer_f32(device, &scales),
             mins: None,
+            blocks: None,
         }))
     }
 
@@ -639,14 +720,31 @@ impl MatmulOps for MetalBackend {
             }
             HostLinearWeight::Quantized(hq) => match hq.dtype {
                 DType::Q8_0 | DType::Q4_0 => {
-                    let scales_f32 = decode_f16_scales(&hq.scales);
+                    // Store as native GGUF interleaved blocks: [f16 scale | quant_data] per block.
+                    // Q8_0: 2 + 32 = 34 bytes/block. Q4_0: 2 + 16 = 18 bytes/block.
+                    // Only the blocks buffer is populated; data and scales are placeholder stubs.
+                    // This halves GPU memory vs keeping separate data+scales+blocks.
+                    let (quant_bytes_per_block, block_bytes) = if hq.dtype == DType::Q8_0 {
+                        (QUANTIZATION_BLOCK_SIZE, 34_usize)
+                    } else {
+                        (QUANTIZATION_BLOCK_SIZE / 2, 18_usize)
+                    };
+                    let total_blocks = hq.scales.len() / 2; // 2 bytes per f16 scale
+                    let mut blocks_raw = Vec::with_capacity(total_blocks * block_bytes);
+                    for b in 0..total_blocks {
+                        blocks_raw.extend_from_slice(&hq.scales[b * 2..(b + 1) * 2]);
+                        blocks_raw.extend_from_slice(
+                            &hq.data[b * quant_bytes_per_block..(b + 1) * quant_bytes_per_block],
+                        );
+                    }
                     Ok(MetalLinearWeight::Quantized(MetalQuantizedWeight {
                         shape: hq.shape.clone(),
                         dtype: hq.dtype,
                         ctx: device.clone(),
-                        data: new_metal_buffer(device, &hq.data),
-                        scales: new_metal_buffer_f32(device, &scales_f32),
+                        data: new_metal_buffer(device, &[]), // placeholder — not used
+                        scales: new_metal_buffer(device, &[]), // placeholder — not used
                         mins: None,
+                        blocks: Some(new_metal_buffer(device, &blocks_raw)),
                     }))
                 }
                 DType::Q4_1 => {
@@ -659,6 +757,7 @@ impl MatmulOps for MetalBackend {
                         data: new_metal_buffer(device, &hq.data),
                         scales: new_metal_buffer_f32(device, &scales_f32),
                         mins: mins_f32.map(|m| new_metal_buffer_f32(device, &m)),
+                        blocks: None,
                     }))
                 }
                 DType::Q6_K => Ok(MetalLinearWeight::Quantized(MetalQuantizedWeight {
@@ -668,6 +767,7 @@ impl MatmulOps for MetalBackend {
                     data: new_metal_buffer(device, &hq.data),
                     scales: new_metal_buffer(device, &[]),
                     mins: None,
+                    blocks: None,
                 })),
                 other => Err(infernum::Error::UnsupportedDtype(format!(
                     "Metal backend does not support {other} quantized weights"
@@ -703,27 +803,56 @@ impl MatmulOps for MetalBackend {
             k: intermediate_size as u32,
         };
 
-        let kernel = match w.dtype {
-            DType::Q8_0 => "gemv_swiglu_q8_simd_v2_f16",
-            DType::Q4_0 => "gemv_swiglu_q4_simd_v2_f16",
-            _ => unreachable!(),
-        };
-
-        let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
-        let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
-        ctx.dispatch_threadgroups(
-            kernel,
-            &[
-                (gate_up.metal_buffer(), gate_up.buffer_offset()),
-                (&w.data, 0),
-                (&w.scales, 0),
-                (out.metal_buffer(), out.buffer_offset()),
-            ],
-            bytemuck::bytes_of(&params),
-            threadgroups,
-            threads_per_group,
-            0,
-        );
+        if let Some(blocks_buf) = &w.blocks {
+            let (kernel, rows_per_tg, threads_per_tg) = match w.dtype {
+                DType::Q8_0 => (
+                    "gemv_swiglu_q8_blocks_f16",
+                    Q8B_ROWS_PER_TG,
+                    Q8B_THREADS_PER_TG,
+                ),
+                DType::Q4_0 => (
+                    "gemv_swiglu_q4_blocks_f16",
+                    Q4B_ROWS_PER_TG,
+                    Q4B_THREADS_PER_TG,
+                ),
+                _ => unreachable!(),
+            };
+            let threadgroups = MTLSize::new((n as u64).div_ceil(rows_per_tg), 1, 1);
+            let threads_per_group = MTLSize::new(threads_per_tg, 1, 1);
+            ctx.dispatch_threadgroups(
+                kernel,
+                &[
+                    (gate_up.metal_buffer(), gate_up.buffer_offset()),
+                    (blocks_buf, 0),
+                    (out.metal_buffer(), out.buffer_offset()),
+                ],
+                bytemuck::bytes_of(&params),
+                threadgroups,
+                threads_per_group,
+                0,
+            );
+        } else {
+            let kernel = match w.dtype {
+                DType::Q8_0 => "gemv_swiglu_q8_simd_v2_f16",
+                DType::Q4_0 => "gemv_swiglu_q4_simd_v2_f16",
+                _ => unreachable!(),
+            };
+            let threadgroups = MTLSize::new((n as u64).div_ceil(GEMV_V2_ROWS_PER_TG), 1, 1);
+            let threads_per_group = MTLSize::new(GEMV_V2_THREADS_PER_TG, 1, 1);
+            ctx.dispatch_threadgroups(
+                kernel,
+                &[
+                    (gate_up.metal_buffer(), gate_up.buffer_offset()),
+                    (&w.data, 0),
+                    (&w.scales, 0),
+                    (out.metal_buffer(), out.buffer_offset()),
+                ],
+                bytemuck::bytes_of(&params),
+                threadgroups,
+                threads_per_group,
+                0,
+            );
+        }
 
         Some(Ok(out))
     }
@@ -806,6 +935,7 @@ mod tests {
             data: make_metal_buffer(&c, &qdata),
             scales: make_metal_buffer_f32(&c, &scales),
             mins: None,
+            blocks: None,
         });
 
         let input_data = vec![1.0f32; k];
@@ -857,6 +987,7 @@ mod tests {
             data: make_metal_buffer(&c, &qdata),
             scales: make_metal_buffer_f32(&c, &scales_vals),
             mins: None,
+            blocks: None,
         });
 
         let input = MetalBackend::from_f32_slice(&c, &[1, k], &vec![1.0f32; k]).unwrap();
@@ -893,6 +1024,7 @@ mod tests {
             data: make_metal_buffer(&c, &packed),
             scales: make_metal_buffer_f32(&c, &scales),
             mins: None,
+            blocks: None,
         });
 
         let input = MetalBackend::from_f32_slice(&c, &[2, k], &vec![1.0f32; 2 * k]).unwrap();
@@ -941,6 +1073,7 @@ mod tests {
             data: make_metal_buffer(&c, &qdata),
             scales: make_metal_buffer_f32(&c, &scales),
             mins: None,
+            blocks: None,
         });
 
         let input = MetalBackend::from_f32_slice(&c, &[2, k], &vec![1.0f32; 2 * k]).unwrap();
@@ -970,6 +1103,7 @@ mod tests {
             data: make_metal_buffer(&c, &packed),
             scales: make_metal_buffer_f32(&c, &[scale]),
             mins: None,
+            blocks: None,
         });
 
         let input_data = vec![1.0f32; k];
@@ -1001,6 +1135,7 @@ mod tests {
             data: make_metal_buffer(&c, &packed),
             scales: make_metal_buffer_f32(&c, &scales),
             mins: None,
+            blocks: None,
         });
 
         let input = MetalBackend::from_f32_slice(&c, &[1, k], &vec![1.0f32; k]).unwrap();
@@ -1040,6 +1175,7 @@ mod tests {
             data: make_metal_buffer(&c, &packed),
             scales: make_metal_buffer_f32(&c, &[scale]),
             mins: Some(make_metal_buffer_f32(&c, &[min])),
+            blocks: None,
         });
 
         let input_data = vec![1.0f32; k];
@@ -1116,6 +1252,7 @@ mod tests {
             data: make_metal_buffer(&c, &raw),
             scales: make_metal_buffer(&c, &[]),
             mins: None,
+            blocks: None,
         });
 
         let input_data = vec![1.0f32; k];
@@ -1156,6 +1293,7 @@ mod tests {
             data: make_metal_buffer(&c, &data),
             scales: make_metal_buffer(&c, &[]),
             mins: None,
+            blocks: None,
         });
 
         let input_data = vec![1.0f32; k];
@@ -1242,8 +1380,33 @@ mod tests {
         if let MetalLinearWeight::Quantized(q) = &weight {
             assert_eq!(q.dtype, DType::Q8_0);
             assert_eq!(q.shape, vec![n, k]);
-            assert_eq!(q.data_bytes(), &qdata);
-            assert!((q.scales_f32()[0] - 1.0).abs() < 1e-3);
+            // GGUF Q8_0 weights are stored as blocks-only (no separate data/scales).
+            let blocks_buf = q
+                .blocks
+                .as_ref()
+                .expect("Q8_0 upload should produce blocks");
+            let blocks = unsafe {
+                std::slice::from_raw_parts(
+                    blocks_buf.contents().cast::<u8>(),
+                    blocks_buf.length() as usize,
+                )
+            };
+            // Block layout: [f16 scale (2 bytes) | int8[32] (32 bytes)] = 34 bytes
+            assert_eq!(blocks.len(), 34);
+            let scale_f16 = half::f16::from_le_bytes([blocks[0], blocks[1]]);
+            assert!((scale_f16.to_f32() - 1.0).abs() < 1e-3);
+            assert_eq!(&blocks[2..], &qdata);
+            // Verify end-to-end inference still produces correct results
+            let input_data = vec![1.0f32; k];
+            let input = MetalBackend::from_f32_slice(&c, &[1, k], &input_data).unwrap();
+            let out = MetalBackend::linear(&input, &weight).unwrap();
+            // sum(0..32) * 1.0 = 496
+            let result = out.as_f32_slice();
+            assert!(
+                (result[0] - 496.0).abs() < 2.0,
+                "expected 496 got {}",
+                result[0]
+            );
         } else {
             panic!("Expected Quantized variant");
         }

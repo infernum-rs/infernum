@@ -32,6 +32,12 @@ use std::sync::Arc;
 /// For `Q6_K`: raw packed super-blocks (210 bytes per 256 elements) stored
 /// directly in `data`. Scales and `d` are embedded in the super-block bytes;
 /// the `scales` buffer is a placeholder.
+///
+/// When `blocks` is `Some`, it holds the weights in native GGUF interleaved
+/// format: each block is `[f16 scale | quant bytes]` contiguously in memory.
+/// The GPU kernels `gemv_q8_blocks_*` and `gemv_q4_blocks_*` use this layout
+/// to fetch data and scale from the same cache line, which is significantly
+/// faster than the split `data`+`scales` layout.
 #[derive(Clone)]
 pub struct MetalQuantizedWeight {
     /// Logical shape: `[out_features, in_features]`
@@ -47,6 +53,9 @@ pub struct MetalQuantizedWeight {
     pub scales: Arc<metal::Buffer>,
     /// Per-block mins as f32 in a Metal buffer (Q4_1 only).
     pub mins: Option<Arc<metal::Buffer>>,
+    /// Native GGUF interleaved blocks: `[f16_scale | quant_data]` per block.
+    /// When present, GPU GEMV kernels use this instead of `data`+`scales`.
+    pub blocks: Option<Arc<metal::Buffer>>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -133,6 +142,26 @@ impl MetalQuantizedWeight {
             );
         }
 
+        // Also concatenate the native GGUF blocks buffer if both weights have one.
+        let blocks = match (&a.blocks, &b.blocks) {
+            (Some(ba), Some(bb)) => {
+                let ba_len = ba.length() as usize;
+                let bb_len = bb.length() as usize;
+                let buf = device.new_buffer((ba_len + bb_len) as u64, opts);
+                unsafe {
+                    let dst = buf.contents().cast::<u8>();
+                    std::ptr::copy_nonoverlapping(ba.contents().cast::<u8>(), dst, ba_len);
+                    std::ptr::copy_nonoverlapping(
+                        bb.contents().cast::<u8>(),
+                        dst.add(ba_len),
+                        bb_len,
+                    );
+                }
+                Some(Arc::new(buf))
+            }
+            _ => None,
+        };
+
         Self {
             shape: vec![a.shape[0] + b.shape[0], a.shape[1]],
             dtype: a.dtype,
@@ -140,6 +169,7 @@ impl MetalQuantizedWeight {
             data: Arc::new(data_buf),
             scales: Arc::new(scales_buf),
             mins: None,
+            blocks,
         }
     }
 }

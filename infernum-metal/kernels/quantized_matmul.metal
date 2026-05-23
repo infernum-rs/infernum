@@ -1008,8 +1008,461 @@ kernel void dequantize_q4_1_to_f32(
     output[row * params.K + col] = q * scale + min_val;
 }
 
+// ==========================================================================
+// GGUF native block format kernels — interleaved [f16 scale | quant data]
+//
+// These kernels read weights in their native GGUF on-disk block layout,
+// avoiding the separate-scales-buffer double cache-miss that the v2 kernels
+// suffer from.  When loading a block, the F16 scale and the quantized bytes
+// come from the *same* cache line.
+//
+// Q8_0 block: 34 bytes — [f16 d (2B)] [int8 qs[32] (32B)]
+// Q4_0 block: 18 bytes — [f16 d (2B)] [uint8 qs[16] (16B)]
+//
+// Threadgroup configs (matching llama.cpp):
+//   Q8_0: NSG=4 SIMD-groups × NR=2 rows = 8 rows/TG, 128 threads/TG
+//   Q4_0: NSG=2 SIMD-groups × NR=4 rows = 8 rows/TG, 64 threads/TG
+//
+// Grid: (ceil(N / ROWS_PER_TG), 1, 1), threads_per_group = (THREADS_PER_TG, 1, 1).
+// ==========================================================================
+
+// ==========================================================================
+// Dequantize from native GGUF block format to F32
+// Used for M>1 (prefill) when weights are in blocks-only storage.
+// Grid: (K, N) — one thread per output element.
+// ==========================================================================
+
+kernel void dequantize_q8_blocks_to_f32(
+    device const uchar*             blocks [[buffer(0)]],
+    device float*                   output [[buffer(1)]],
+    constant QuantizedLinearParams& params [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    uint row = gid.y;
+    if (col >= params.K || row >= params.N) return;
+
+    uint block_idx = col / 32;
+    uint elem = col % 32;
+    uint nb = params.K / 32;
+    device const uchar* blk = blocks + (row * nb + block_idx) * 34u;
+    float scale = float(as_type<half>(*(device const ushort*)blk));
+    float q = float(as_type<char>(blk[2 + elem]));
+    output[row * params.K + col] = q * scale;
+}
+
+kernel void dequantize_q4_blocks_to_f32(
+    device const uchar*             blocks [[buffer(0)]],
+    device float*                   output [[buffer(1)]],
+    constant QuantizedLinearParams& params [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    uint row = gid.y;
+    if (col >= params.K || row >= params.N) return;
+
+    uint block_idx = col / 32;
+    uint j = col % 32;
+    uint nb = params.K / 32;
+    device const uchar* blk = blocks + (row * nb + block_idx) * 18u;
+    float scale = float(as_type<half>(*(device const ushort*)blk));
+    uchar byte_val;
+    float q;
+    if (j < 16) {
+        byte_val = blk[2 + j];
+        q = float(int(byte_val & 0x0F) - 8);
+    } else {
+        byte_val = blk[2 + (j - 16)];
+        q = float(int(byte_val >> 4) - 8);
+    }
+    output[row * params.K + col] = q * scale;
+}
+
+constant constexpr uint Q8_BLOCK_BYTES = 34;  // 2 (f16) + 32 (int8)
+constant constexpr uint Q4_BLOCK_BYTES = 18;  // 2 (f16) + 16 (nibbles)
+
+// Q8_0 config (matching llama.cpp N_R0_Q8_0=2, N_SG_Q8_0=4)
+constant constexpr uint Q8B_NR  = 2;
+constant constexpr uint Q8B_NSG = 4;
+constant constexpr uint Q8B_ROWS_PER_TG    = Q8B_NR * Q8B_NSG;   // 8
+constant constexpr uint Q8B_THREADS_PER_TG = Q8B_NSG * 32;        // 128
+
+// Q4_0 config (matching llama.cpp N_R0_Q4_0=4, N_SG_Q4_0=2)
+constant constexpr uint Q4B_NR  = 4;
+constant constexpr uint Q4B_NSG = 2;
+constant constexpr uint Q4B_ROWS_PER_TG    = Q4B_NR * Q4B_NSG;   // 8
+constant constexpr uint Q4B_THREADS_PER_TG = Q4B_NSG * 32;        // 64
+
+// --------------------------------------------------------------------------
+// Q8_0 blocks GEMV — f16 input, f16 output
+// --------------------------------------------------------------------------
+kernel void gemv_q8_blocks_f16(
+    device const half*              input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device half*                    output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane     = tid % 32;
+    const uint row_base = group_id * Q8B_ROWS_PER_TG + simd_idx * Q8B_NR;
+
+    const uint nb           = params.K / 32;
+    const uint block_stride = nb * Q8_BLOCK_BYTES;
+
+    float sums[Q8B_NR] = {0.0f};
+
+    for (uint b = lane; b < nb; b += 32) {
+        // Load input block (32 × f16 = 64 bytes) — shared across all rows
+        device const half4* inp = (device const half4*)(input + b * 32);
+        half4 x[8];
+        for (uint i = 0; i < 8; i++) x[i] = inp[i];
+
+        for (uint r = 0; r < Q8B_NR; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            // Single contiguous read: [f16 scale | int8[32]]
+            device const uchar* blk = blocks + neuron * block_stride + b * Q8_BLOCK_BYTES;
+            float scale = float(as_type<half>(*(device const ushort*)blk));
+            device const uint4* w_ptr = (device const uint4*)(blk + 2);
+            uint4 w0 = w_ptr[0];
+            uint4 w1 = w_ptr[1];
+
+            half4 wh[8];
+            wh[0] = half4(as_type<char4>(w0.x)); wh[1] = half4(as_type<char4>(w0.y));
+            wh[2] = half4(as_type<char4>(w0.z)); wh[3] = half4(as_type<char4>(w0.w));
+            wh[4] = half4(as_type<char4>(w1.x)); wh[5] = half4(as_type<char4>(w1.y));
+            wh[6] = half4(as_type<char4>(w1.z)); wh[7] = half4(as_type<char4>(w1.w));
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 8; i++) block_sum += dot(x[i], wh[i]);
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q8B_NR; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) output[neuron] = half(result);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Q8_0 blocks GEMV — f32 input, f32 output
+// --------------------------------------------------------------------------
+kernel void gemv_q8_blocks_f32(
+    device const float*             input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device float*                   output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane     = tid % 32;
+    const uint row_base = group_id * Q8B_ROWS_PER_TG + simd_idx * Q8B_NR;
+
+    const uint nb           = params.K / 32;
+    const uint block_stride = nb * Q8_BLOCK_BYTES;
+
+    float sums[Q8B_NR] = {0.0f};
+
+    for (uint b = lane; b < nb; b += 32) {
+        device const float4* inp = (device const float4*)(input + b * 32);
+        half4 x[8];
+        for (uint i = 0; i < 8; i++) x[i] = half4(inp[i]);
+
+        for (uint r = 0; r < Q8B_NR; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + b * Q8_BLOCK_BYTES;
+            float scale = float(as_type<half>(*(device const ushort*)blk));
+            device const uint4* w_ptr = (device const uint4*)(blk + 2);
+            uint4 w0 = w_ptr[0];
+            uint4 w1 = w_ptr[1];
+
+            half4 wh[8];
+            wh[0] = half4(as_type<char4>(w0.x)); wh[1] = half4(as_type<char4>(w0.y));
+            wh[2] = half4(as_type<char4>(w0.z)); wh[3] = half4(as_type<char4>(w0.w));
+            wh[4] = half4(as_type<char4>(w1.x)); wh[5] = half4(as_type<char4>(w1.y));
+            wh[6] = half4(as_type<char4>(w1.z)); wh[7] = half4(as_type<char4>(w1.w));
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 8; i++) block_sum += dot(x[i], wh[i]);
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q8B_NR; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) output[neuron] = result;
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Q4_0 blocks GEMV — f16 input, f16 output
+// Q4_0 block: [f16 d (2B)] [nibbles[16] (16B)], total 18 bytes
+// byte j: lo nibble = element j, hi nibble = element j+16, both offset -8
+// --------------------------------------------------------------------------
+kernel void gemv_q4_blocks_f16(
+    device const half*              input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device half*                    output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane     = tid % 32;
+    const uint row_base = group_id * Q4B_ROWS_PER_TG + simd_idx * Q4B_NR;
+
+    const uint nb           = params.K / 32;
+    const uint block_stride = nb * Q4_BLOCK_BYTES;
+
+    float sums[Q4B_NR] = {0.0f};
+
+    for (uint b = lane; b < nb; b += 32) {
+        // Load input lo and hi halves (32 × f16 total)
+        device const half4* lo_h = (device const half4*)(input + b * 32);
+        device const half4* hi_h = (device const half4*)(input + b * 32 + 16);
+        half4 xl[4], xh[4];
+        for (uint i = 0; i < 4; i++) { xl[i] = lo_h[i]; xh[i] = hi_h[i]; }
+
+        for (uint r = 0; r < Q4B_NR; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            // Single read: [f16 scale | nibbles[16]]
+            device const uchar* blk = blocks + neuron * block_stride + b * Q4_BLOCK_BYTES;
+            float scale = float(as_type<half>(*(device const ushort*)blk));
+            uint4 packed = *(device const uint4*)(blk + 2);
+
+            uchar4 p[4];
+            p[0] = as_type<uchar4>(packed.x); p[1] = as_type<uchar4>(packed.y);
+            p[2] = as_type<uchar4>(packed.z); p[3] = as_type<uchar4>(packed.w);
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 4; i++) {
+                half4 lo_w = half4(half(int(p[i].x & 0x0F)-8), half(int(p[i].y & 0x0F)-8),
+                                   half(int(p[i].z & 0x0F)-8), half(int(p[i].w & 0x0F)-8));
+                half4 hi_w = half4(half(int(p[i].x >> 4)-8),   half(int(p[i].y >> 4)-8),
+                                   half(int(p[i].z >> 4)-8),   half(int(p[i].w >> 4)-8));
+                block_sum += dot(xl[i], lo_w) + dot(xh[i], hi_w);
+            }
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q4B_NR; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) output[neuron] = half(result);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Q4_0 blocks GEMV — f32 input, f32 output
+// --------------------------------------------------------------------------
+kernel void gemv_q4_blocks_f32(
+    device const float*             input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device float*                   output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane     = tid % 32;
+    const uint row_base = group_id * Q4B_ROWS_PER_TG + simd_idx * Q4B_NR;
+
+    const uint nb           = params.K / 32;
+    const uint block_stride = nb * Q4_BLOCK_BYTES;
+
+    float sums[Q4B_NR] = {0.0f};
+
+    for (uint b = lane; b < nb; b += 32) {
+        device const float4* lo_f = (device const float4*)(input + b * 32);
+        device const float4* hi_f = (device const float4*)(input + b * 32 + 16);
+        half4 xl[4], xh[4];
+        for (uint i = 0; i < 4; i++) { xl[i] = half4(lo_f[i]); xh[i] = half4(hi_f[i]); }
+
+        for (uint r = 0; r < Q4B_NR; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + b * Q4_BLOCK_BYTES;
+            float scale = float(as_type<half>(*(device const ushort*)blk));
+            uint4 packed = *(device const uint4*)(blk + 2);
+
+            uchar4 p[4];
+            p[0] = as_type<uchar4>(packed.x); p[1] = as_type<uchar4>(packed.y);
+            p[2] = as_type<uchar4>(packed.z); p[3] = as_type<uchar4>(packed.w);
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 4; i++) {
+                half4 lo_w = half4(half(int(p[i].x & 0x0F)-8), half(int(p[i].y & 0x0F)-8),
+                                   half(int(p[i].z & 0x0F)-8), half(int(p[i].w & 0x0F)-8));
+                half4 hi_w = half4(half(int(p[i].x >> 4)-8),   half(int(p[i].y >> 4)-8),
+                                   half(int(p[i].z >> 4)-8),   half(int(p[i].w >> 4)-8));
+                block_sum += dot(xl[i], lo_w) + dot(xh[i], hi_w);
+            }
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q4B_NR; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) output[neuron] = result;
+        }
+    }
+}
+
 static inline half silu_h(half x) {
     return x / (half(1.0h) + exp(-x));
+}
+
+// --------------------------------------------------------------------------
+// Fused SwiGLU + Q8_0 blocks GEMV — f16 input, f16 output
+// --------------------------------------------------------------------------
+kernel void gemv_swiglu_q8_blocks_f16(
+    device const half*              gate_up [[buffer(0)]],
+    device const uchar*             blocks  [[buffer(1)]],
+    device half*                    output  [[buffer(2)]],
+    constant QuantizedLinearParams& params  [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane     = tid % 32;
+    const uint row_base = group_id * Q8B_ROWS_PER_TG + simd_idx * Q8B_NR;
+
+    const uint K           = params.K;
+    const uint nb          = K / 32;
+    const uint block_stride = nb * Q8_BLOCK_BYTES;
+
+    float sums[Q8B_NR] = {0.0f};
+
+    for (uint b = lane; b < nb; b += 32) {
+        uint inp_start = b * 32;
+        device const half4* gate_h = (device const half4*)(gate_up + inp_start);
+        device const half4* up_h   = (device const half4*)(gate_up + K + inp_start);
+        half4 x[8];
+        for (uint i = 0; i < 8; i++) {
+            half4 g = gate_h[i], u = up_h[i];
+            x[i] = half4(silu_h(g.x)*u.x, silu_h(g.y)*u.y,
+                         silu_h(g.z)*u.z, silu_h(g.w)*u.w);
+        }
+
+        for (uint r = 0; r < Q8B_NR; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + b * Q8_BLOCK_BYTES;
+            float scale = float(as_type<half>(*(device const ushort*)blk));
+            device const uint4* w_ptr = (device const uint4*)(blk + 2);
+            uint4 w0 = w_ptr[0], w1 = w_ptr[1];
+
+            half4 wh[8];
+            wh[0] = half4(as_type<char4>(w0.x)); wh[1] = half4(as_type<char4>(w0.y));
+            wh[2] = half4(as_type<char4>(w0.z)); wh[3] = half4(as_type<char4>(w0.w));
+            wh[4] = half4(as_type<char4>(w1.x)); wh[5] = half4(as_type<char4>(w1.y));
+            wh[6] = half4(as_type<char4>(w1.z)); wh[7] = half4(as_type<char4>(w1.w));
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 8; i++) block_sum += dot(x[i], wh[i]);
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q8B_NR; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) output[neuron] = half(result);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Fused SwiGLU + Q4_0 blocks GEMV — f16 input, f16 output
+// --------------------------------------------------------------------------
+kernel void gemv_swiglu_q4_blocks_f16(
+    device const half*              gate_up [[buffer(0)]],
+    device const uchar*             blocks  [[buffer(1)]],
+    device half*                    output  [[buffer(2)]],
+    constant QuantizedLinearParams& params  [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]])
+{
+    const uint simd_idx = tid / 32;
+    const uint lane     = tid % 32;
+    const uint row_base = group_id * Q4B_ROWS_PER_TG + simd_idx * Q4B_NR;
+
+    const uint K            = params.K;
+    const uint nb           = K / 32;
+    const uint block_stride = nb * Q4_BLOCK_BYTES;
+
+    float sums[Q4B_NR] = {0.0f};
+
+    for (uint b = lane; b < nb; b += 32) {
+        uint inp_start = b * 32;
+        device const half4* gate_lo = (device const half4*)(gate_up + inp_start);
+        device const half4* gate_hi = (device const half4*)(gate_up + inp_start + 16);
+        device const half4* up_lo   = (device const half4*)(gate_up + K + inp_start);
+        device const half4* up_hi   = (device const half4*)(gate_up + K + inp_start + 16);
+        half4 xl[4], xh[4];
+        for (uint i = 0; i < 4; i++) {
+            half4 gl = gate_lo[i], ul = up_lo[i];
+            xl[i] = half4(silu_h(gl.x)*ul.x, silu_h(gl.y)*ul.y,
+                          silu_h(gl.z)*ul.z, silu_h(gl.w)*ul.w);
+            half4 gh = gate_hi[i], uh = up_hi[i];
+            xh[i] = half4(silu_h(gh.x)*uh.x, silu_h(gh.y)*uh.y,
+                          silu_h(gh.z)*uh.z, silu_h(gh.w)*uh.w);
+        }
+
+        for (uint r = 0; r < Q4B_NR; r++) {
+            uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + b * Q4_BLOCK_BYTES;
+            float scale = float(as_type<half>(*(device const ushort*)blk));
+            uint4 packed = *(device const uint4*)(blk + 2);
+
+            uchar4 p[4];
+            p[0] = as_type<uchar4>(packed.x); p[1] = as_type<uchar4>(packed.y);
+            p[2] = as_type<uchar4>(packed.z); p[3] = as_type<uchar4>(packed.w);
+
+            half block_sum = 0.0h;
+            for (uint i = 0; i < 4; i++) {
+                half4 lo_w = half4(half(int(p[i].x & 0x0F)-8), half(int(p[i].y & 0x0F)-8),
+                                   half(int(p[i].z & 0x0F)-8), half(int(p[i].w & 0x0F)-8));
+                half4 hi_w = half4(half(int(p[i].x >> 4)-8),   half(int(p[i].y >> 4)-8),
+                                   half(int(p[i].z >> 4)-8),   half(int(p[i].w >> 4)-8));
+                block_sum += dot(xl[i], lo_w) + dot(xh[i], hi_w);
+            }
+            sums[r] += float(block_sum) * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q4B_NR; r++) {
+        float result = simd_sum(sums[r]);
+        if (lane == 0) {
+            uint neuron = row_base + r;
+            if (neuron < params.N) output[neuron] = half(result);
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
