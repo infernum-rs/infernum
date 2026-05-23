@@ -477,9 +477,10 @@ where
         h = graph.add_add(h, post_ffn_normed);
     }
 
-    // Final norm and LM head
+    // Final norm, select last token, then LM head
     let normed = graph.add_rms_norm(h, ids.final_norm, config.rms_norm_eps);
-    let logits = graph.add_lm_head(normed, ids.lm_head, weight_dtype);
+    let last_hidden = graph.add_extract_last_row(normed, seq_len);
+    let logits = graph.add_lm_head(last_hidden, ids.lm_head, weight_dtype);
 
     // Optional final logit soft-capping (Gemma 2)
     let logits = if let Some(cap) = config.final_logit_softcapping {
@@ -823,7 +824,6 @@ where
 // GGUF name mapping
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Map a SafeTensors weight name (HuggingFace convention) to its GGUF key.
 ///
 /// Gemma 2 / Gemma 3 use `blk.N.*` block prefixes with the following suffixes:
@@ -831,6 +831,7 @@ where
 /// - `attn_q` / `attn_k` / `attn_v` / `attn_output` for attention projections
 /// - `ffn_gate` / `ffn_up` / `ffn_down` for GeGLU projections
 /// - Optional `attn_q_norm` / `attn_k_norm` for Gemma 3 per-head QK-norm
+#[allow(dead_code)]
 pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     match name {
         "model.embed_tokens.weight" => return "token_embd.weight".to_string(),

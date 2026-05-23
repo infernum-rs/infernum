@@ -155,6 +155,120 @@ extern "C" __global__ void dequant_q6k_f16(
 }
 
 // ---------------------------------------------------------------------------
+// Q4_K → f16
+// ---------------------------------------------------------------------------
+// Q4_K super-block: d[f16](2) + dmin[f16](2) + scales[12] + qs[128] = 144 bytes
+// One thread per output element. Decodes super-block layout, extracts nibble,
+// applies scale: val = d * sc * q - dmin * m
+//
+// Launch: grid=(ceil(N*K / 256),), block=(256,)
+extern "C" __global__ void dequant_q4k_f16(
+    __half*              __restrict__ output,
+    const unsigned char* __restrict__ data,
+    const int N,
+    const int K
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * K;
+    if (idx >= total) return;
+
+    const int n = idx / K;
+    const int k = idx % K;
+
+    const int BLOCK_SIZE = 256;
+    const int BLOCK_BYTES = 144;
+    const int blocks_per_row = K / BLOCK_SIZE;
+    const int block_idx = k / BLOCK_SIZE;
+    const int elem = k % BLOCK_SIZE;
+
+    const unsigned char* block = data + (n * blocks_per_row + block_idx) * BLOCK_BYTES;
+    float d    = __half2float(*reinterpret_cast<const __half*>(block));
+    float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
+    const unsigned char* sc_buf = block + 4;
+    const unsigned char* qs     = block + 16;
+
+    // sub-block and element within sub-block
+    int row8 = elem / 32;
+    int j    = elem % 32;
+
+    // Scale decode
+    int sc, m;
+    if (row8 < 4) {
+        sc = sc_buf[row8] & 63;
+        m  = sc_buf[row8 + 4] & 63;
+    } else {
+        sc = (sc_buf[row8 + 4] & 0xF) | ((sc_buf[row8 - 4] >> 6) << 4);
+        m  = (sc_buf[row8 + 4] >> 4)  | ((sc_buf[row8]     >> 6) << 4);
+    }
+
+    // Nibble: qs[row8*16 + j%16], low nibble if j<16 else high nibble
+    unsigned char byte = qs[row8 * 16 + j % 16];
+    int q = (j < 16) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+
+    float val = d * (float)sc * (float)q - dmin * (float)m;
+    output[idx] = __float2half(val);
+}
+
+// ---------------------------------------------------------------------------
+// Q5_K → f16
+// ---------------------------------------------------------------------------
+// Q5_K super-block: d[f16](2) + dmin[f16](2) + scales[12] + qh[32] + qs[128] = 176 bytes
+// Same nibble/scale layout as Q4_K plus 5th bit from qh.
+// val = d * sc * (q5 - 16) - dmin * m
+//
+// Launch: grid=(ceil(N*K / 256),), block=(256,)
+extern "C" __global__ void dequant_q5k_f16(
+    __half*              __restrict__ output,
+    const unsigned char* __restrict__ data,
+    const int N,
+    const int K
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * K;
+    if (idx >= total) return;
+
+    const int n = idx / K;
+    const int k = idx % K;
+
+    const int BLOCK_SIZE = 256;
+    const int BLOCK_BYTES = 176;
+    const int blocks_per_row = K / BLOCK_SIZE;
+    const int block_idx = k / BLOCK_SIZE;
+    const int elem = k % BLOCK_SIZE;
+
+    const unsigned char* block = data + (n * blocks_per_row + block_idx) * BLOCK_BYTES;
+    float d    = __half2float(*reinterpret_cast<const __half*>(block));
+    float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
+    const unsigned char* sc_buf = block + 4;
+    const unsigned char* qh     = block + 16;
+    const unsigned char* qs     = block + 48;
+
+    int row8 = elem / 32;
+    int j    = elem % 32;
+
+    // Scale decode (same as Q4_K)
+    int sc, m;
+    if (row8 < 4) {
+        sc = sc_buf[row8] & 63;
+        m  = sc_buf[row8 + 4] & 63;
+    } else {
+        sc = (sc_buf[row8 + 4] & 0xF) | ((sc_buf[row8 - 4] >> 6) << 4);
+        m  = (sc_buf[row8 + 4] >> 4)  | ((sc_buf[row8]     >> 6) << 4);
+    }
+
+    // Low 4 bits
+    unsigned char byte = qs[row8 * 16 + j % 16];
+    int q_lo = (j < 16) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+
+    // 5th bit: qh[row8*4 + j/8], bit j%8
+    int q_hi = (qh[row8 * 4 + j / 8] >> (j % 8)) & 1;
+
+    int q5 = q_lo | (q_hi << 4);  // 5-bit value [0, 31]
+    float val = d * (float)sc * (float)(q5 - 16) - dmin * (float)m;
+    output[idx] = __float2half(val);
+}
+
+// ---------------------------------------------------------------------------
 // GPTQ INT4 → f16
 // ---------------------------------------------------------------------------
 // GPTQ transposed layout (repacked at load time):

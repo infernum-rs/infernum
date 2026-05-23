@@ -180,7 +180,93 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
         }
     }
 
-    // --- CPU fallback (M>1 or unsupported dtype) ---
+    // --- GPU dequantize + dense GEMM (M>1, Q8_0 / Q4_0 / Q4_1, F32 input) ---
+    //
+    // Expand quantized weights to a temporary F32 (N, K) buffer, then call
+    // linear_dense_f32. This eliminates the serial-GEMV bottleneck for prefill
+    // without requiring a fused quantized GEMM kernel.
+    if m > 1
+        && input.dtype() == DType::F32
+        && matches!(weight.dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_1)
+    {
+        let ctx = input.context();
+
+        let dequant = MetalTensor::zeros(ctx, &[n, k], DType::F32);
+        let dq_params = QuantizedLinearParams {
+            n: n as u32,
+            k: k as u32,
+        };
+        match weight.dtype {
+            DType::Q8_0 => {
+                ctx.dispatch_2d(
+                    "dequantize_q8_to_f32",
+                    &[
+                        (&weight.data, 0),
+                        (&weight.scales, 0),
+                        (dequant.metal_buffer(), dequant.buffer_offset()),
+                    ],
+                    bytemuck::bytes_of(&dq_params),
+                    k,
+                    n,
+                );
+            }
+            DType::Q4_0 => {
+                ctx.dispatch_2d(
+                    "dequantize_q4_to_f32",
+                    &[
+                        (&weight.data, 0),
+                        (&weight.scales, 0),
+                        (dequant.metal_buffer(), dequant.buffer_offset()),
+                    ],
+                    bytemuck::bytes_of(&dq_params),
+                    k,
+                    n,
+                );
+            }
+            DType::Q4_1 => {
+                let mins_buf = weight.mins.as_ref().expect("Q4_1 missing mins");
+                ctx.dispatch_2d(
+                    "dequantize_q4_1_to_f32",
+                    &[
+                        (&weight.data, 0),
+                        (&weight.scales, 0),
+                        (mins_buf, 0),
+                        (dequant.metal_buffer(), dequant.buffer_offset()),
+                    ],
+                    bytemuck::bytes_of(&dq_params),
+                    k,
+                    n,
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
+        out_shape.push(n);
+        let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
+        let gemm_params = MatmulParams {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        };
+        let threadgroups = MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1);
+        let threads_per_group = MTLSize::new(SIMD_GROUP_SIZE, 1, 1);
+        ctx.dispatch_threadgroups(
+            "linear_dense_f32",
+            &[
+                (input.metal_buffer(), input.buffer_offset()),
+                (dequant.metal_buffer(), dequant.buffer_offset()),
+                (out.metal_buffer(), out.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&gemm_params),
+            threadgroups,
+            threads_per_group,
+            0,
+        );
+        return Ok(out);
+    }
+
+    // --- CPU fallback (M>1 unsupported dtype, Q4_1, Q6_K, or F16 input) ---
     let input_data = input.as_f32_slice();
     let mut output = vec![0.0f32; m * n];
 
@@ -789,6 +875,54 @@ mod tests {
         assert!((result[2] - 72.0).abs() < 1e-3, "n2: {} vs 72", result[2]);
         // neuron 3: all zeros
         assert!(result[3].abs() < 1e-3, "n3: {} vs 0", result[3]);
+    }
+
+    #[test]
+    fn test_linear_q4_batched_gpu() {
+        // M=2 Q4_0 uses the GPU dequantize+GEMM path (same as Q8_0 M>1).
+        let c = ctx();
+        let k = QUANTIZATION_BLOCK_SIZE; // 32
+        let n = 2;
+        let packed: Vec<u8> = vec![0x53; n * k / 2]; // lo=3-8=-5, hi=5-8=-3
+        let scales = vec![2.0_f32, 1.0_f32]; // one scale per block per neuron
+
+        let weight = MetalLinearWeight::Quantized(MetalQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q4_0,
+            ctx: c.clone(),
+            data: make_metal_buffer(&c, &packed),
+            scales: make_metal_buffer_f32(&c, &scales),
+            mins: None,
+        });
+
+        let input = MetalBackend::from_f32_slice(&c, &[2, k], &vec![1.0f32; 2 * k]).unwrap();
+        let out = MetalBackend::linear(&input, &weight).unwrap();
+        c.flush();
+
+        assert_eq!(out.shape(), &[2, n]);
+        let result = out.as_f32_slice();
+        // neuron 0, scale=2.0: 16*(3-8)*2.0 + 16*(5-8)*2.0 = 16*(-5)*2.0 + 16*(-3)*2.0 = -256
+        // neuron 1, scale=1.0: 16*(-5)*1.0 + 16*(-3)*1.0 = -128
+        assert!(
+            (result[0] - (-256.0)).abs() < 1e-3,
+            "row0 n0: {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - (-128.0)).abs() < 1e-3,
+            "row0 n1: {}",
+            result[1]
+        );
+        assert!(
+            (result[2] - (-256.0)).abs() < 1e-3,
+            "row1 n0: {}",
+            result[2]
+        );
+        assert!(
+            (result[3] - (-128.0)).abs() < 1e-3,
+            "row1 n1: {}",
+            result[3]
+        );
     }
 
     #[test]

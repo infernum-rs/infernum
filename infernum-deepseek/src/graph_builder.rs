@@ -17,9 +17,10 @@ use infernum::backend::{
 };
 use infernum::dtype::DType;
 use infernum::graph::{
-    Graph, GraphArithOps, GraphEmbedOps, GraphMatmulOps, GraphMlaAttentionOps, GraphMoeOps,
-    GraphNormOps, GraphSwigluOps, GraphTensorOps, MoeExpertIds, OutputRef, WeightId,
+    Graph, GraphArithOps, GraphCommOps, GraphEmbedOps, GraphMatmulOps, GraphMlaAttentionOps,
+    GraphMoeOps, GraphNormOps, GraphSwigluOps, GraphTensorOps, MoeExpertIds, OutputRef, WeightId,
 };
+use infernum::shard::{ShardConfig, ShardStrategy};
 
 use crate::config::DeepSeekConfig;
 
@@ -121,6 +122,106 @@ impl<B> DeepSeekGraphOps for B where
 }
 
 // ---------------------------------------------------------------------------
+// GGUF name mapping and shard strategy
+// ---------------------------------------------------------------------------
+
+/// Map a `SafeTensors` weight name to its GGUF tensor name for `DeepSeek` models.
+///
+/// Virtual `kv_b` weights (`kv_b_proj_k/v/k_t`) all map to the same
+/// `blk.N.attn_kv_b.weight` on-disk tensor — the GGUF loader is responsible
+/// for splitting it after load.
+///
+/// # Panics
+///
+/// Panics if the layer name does not contain a dot-separated layer index.
+#[must_use]
+pub fn safetensors_to_gguf_name(name: &str) -> String {
+    if name == "model.embed_tokens.weight" {
+        return "token_embd.weight".into();
+    }
+    if name == "model.norm.weight" {
+        return "output_norm.weight".into();
+    }
+    if name == "lm_head.weight" {
+        return "output.weight".into();
+    }
+
+    let Some(rest) = name.strip_prefix("model.layers.") else {
+        return name.into();
+    };
+    let dot = rest.find('.').expect("layer index must be followed by '.'");
+    let (n, rest) = rest.split_at(dot);
+    let rest = &rest[1..]; // skip '.'
+
+    match rest {
+        "input_layernorm.weight" => format!("blk.{n}.attn_norm.weight"),
+        "post_attention_layernorm.weight" => format!("blk.{n}.ffn_norm.weight"),
+        "self_attn.q_a_proj.weight" => format!("blk.{n}.attn_q_a.weight"),
+        "self_attn.q_a_layernorm.weight" => format!("blk.{n}.attn_q_a_norm.weight"),
+        "self_attn.q_b_proj.weight" => format!("blk.{n}.attn_q_b.weight"),
+        "self_attn.kv_a_proj_with_mqa.weight" => format!("blk.{n}.attn_kv_a_mqa.weight"),
+        "self_attn.kv_a_layernorm.weight" => format!("blk.{n}.attn_kv_a_norm.weight"),
+        "self_attn.kv_b_proj_k.weight"
+        | "self_attn.kv_b_proj_v.weight"
+        | "self_attn.kv_b_proj_k_t.weight" => format!("blk.{n}.attn_kv_b.weight"),
+        "self_attn.o_proj.weight" => format!("blk.{n}.attn_output.weight"),
+        "mlp.gate_proj.weight" => format!("blk.{n}.ffn_gate.weight"),
+        "mlp.up_proj.weight" => format!("blk.{n}.ffn_up.weight"),
+        "mlp.down_proj.weight" => format!("blk.{n}.ffn_down.weight"),
+        "mlp.gate.weight" => format!("blk.{n}.ffn_gate_inp.weight"),
+        "mlp.gate.e_score_correction_bias" => format!("blk.{n}.exp_probs_b.bias"),
+        "mlp.shared_experts.gate_proj.weight" => format!("blk.{n}.ffn_gate_shexp.weight"),
+        "mlp.shared_experts.up_proj.weight" => format!("blk.{n}.ffn_up_shexp.weight"),
+        "mlp.shared_experts.down_proj.weight" => format!("blk.{n}.ffn_down_shexp.weight"),
+        _ => {
+            if let Some(rest) = rest.strip_prefix("mlp.experts.") {
+                let dot = rest.find('.').unwrap_or(0);
+                let (e, rest) = rest.split_at(dot);
+                let rest = &rest[1..];
+                match rest {
+                    "gate_proj.weight" => return format!("blk.{n}.ffn_gate_exps.weight[{e}]"),
+                    "up_proj.weight" => return format!("blk.{n}.ffn_up_exps.weight[{e}]"),
+                    "down_proj.weight" => return format!("blk.{n}.ffn_down_exps.weight[{e}]"),
+                    _ => {}
+                }
+            }
+            name.into()
+        }
+    }
+}
+
+/// Return the tensor-parallel shard strategy for a `DeepSeek` weight by its
+/// `SafeTensors` name.
+///
+/// MLA-specific rules:
+/// - `q_a_proj` and `kv_a_proj_with_mqa` are **replicated** — their outputs
+///   are bottleneck latents shared by all heads, so slicing them would be
+///   incorrect.
+/// - `q_b_proj`, `kv_b_proj_k/v` — Column-parallel (expand to per-head).
+/// - `kv_b_proj_k_t`, `o_proj` — Row-parallel (reduce across heads).
+#[must_use]
+pub fn shard_strategy_for_deepseek(name: &str) -> ShardStrategy {
+    if name.ends_with("q_a_proj.weight") || name.ends_with("kv_a_proj_with_mqa.weight") {
+        return ShardStrategy::Replicate;
+    }
+    if name.ends_with("kv_b_proj_k_t.weight")
+        || name.ends_with("o_proj.weight")
+        || name.ends_with("down_proj.weight")
+    {
+        return ShardStrategy::Row;
+    }
+    if name.ends_with("q_b_proj.weight")
+        || name.ends_with("kv_b_proj_k.weight")
+        || name.ends_with("kv_b_proj_v.weight")
+        || name.ends_with("gate_proj.weight")
+        || name.ends_with("up_proj.weight")
+    {
+        return ShardStrategy::Column;
+    }
+    ShardStrategy::Replicate
+}
+
+// ---------------------------------------------------------------------------
 // Weight registration
 // ---------------------------------------------------------------------------
 
@@ -129,9 +230,12 @@ fn register_all_weights<B: Backend + MatmulOps + ContextBackend>(
     graph: &mut Graph<B>,
     config: &DeepSeekConfig,
     weight_dtype: DType,
+    shard: Option<&ShardConfig>,
 ) -> DeepSeekWeightIds {
+    let world_size = shard.map_or(1, |s| s.world_size);
     let hidden = config.hidden_size;
     let num_heads = config.num_attention_heads;
+    let num_heads_local = num_heads / world_size;
     let qk_nope = config.qk_nope_head_dim;
     let qk_rope = config.qk_rope_head_dim;
     let v_head = config.v_head_dim;
@@ -159,7 +263,7 @@ fn register_all_weights<B: Backend + MatmulOps + ContextBackend>(
             config,
             weight_dtype,
             hidden,
-            num_heads,
+            num_heads_local,
             qk_nope,
             qk_rope,
             v_head,
@@ -179,23 +283,24 @@ fn register_all_weights<B: Backend + MatmulOps + ContextBackend>(
                 &pfx,
                 weight_dtype,
                 hidden,
+                world_size,
             ))
         } else {
-            let intermediate = config.intermediate_size;
+            let intermediate_local = config.intermediate_size / world_size;
             FfnIds::Dense(DenseMlpIds {
                 gate_proj: graph.register_linear_weight(
                     format!("{pfx}.mlp.gate_proj.weight"),
-                    &[intermediate, hidden],
+                    &[intermediate_local, hidden],
                     weight_dtype,
                 ),
                 up_proj: graph.register_linear_weight(
                     format!("{pfx}.mlp.up_proj.weight"),
-                    &[intermediate, hidden],
+                    &[intermediate_local, hidden],
                     weight_dtype,
                 ),
                 down_proj: graph.register_linear_weight(
                     format!("{pfx}.mlp.down_proj.weight"),
-                    &[hidden, intermediate],
+                    &[hidden, intermediate_local],
                     weight_dtype,
                 ),
             })
@@ -311,10 +416,11 @@ fn register_moe_weights<B: Backend + MatmulOps + ContextBackend>(
     pfx: &str,
     weight_dtype: DType,
     hidden: usize,
+    world_size: usize,
 ) -> SigmoidMoeIds {
     let num_experts = config.n_routed_experts.unwrap_or(0);
-    let expert_intermediate = config.moe_expert_intermediate_size();
-    let shared_intermediate = config.shared_expert_intermediate_size();
+    let expert_intermediate = config.moe_expert_intermediate_size() / world_size;
+    let shared_intermediate = config.shared_expert_intermediate_size() / world_size;
 
     let gate = graph.register_tensor_weight(
         format!("{pfx}.mlp.gate.weight"),
@@ -382,8 +488,15 @@ fn register_moe_weights<B: Backend + MatmulOps + ContextBackend>(
 // ---------------------------------------------------------------------------
 
 /// Build the prefill (multi-token) forward-pass graph for a `DeepSeek` model.
+///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// ops are inserted after `o_proj` and every `down_proj` output.
 #[must_use]
-pub fn build_prefill_graph<B>(config: &DeepSeekConfig, weight_dtype: DType) -> Graph<B>
+pub fn build_prefill_graph<B>(
+    config: &DeepSeekConfig,
+    weight_dtype: DType,
+    shard: Option<&ShardConfig>,
+) -> Graph<B>
 where
     B: DeepSeekGraphOps,
     Graph<B>: GraphMatmulOps
@@ -393,15 +506,16 @@ where
         + GraphArithOps
         + GraphSwigluOps
         + GraphMlaAttentionOps
-        + GraphMoeOps,
+        + GraphMoeOps
+        + GraphCommOps,
 {
     let mut graph = Graph::new();
-    let ids = register_all_weights(&mut graph, config, weight_dtype);
+    let ids = register_all_weights(&mut graph, config, weight_dtype, shard);
 
     let token_input = graph.add_input(&[0], DType::U32);
     let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
 
-    build_layers(&mut graph, config, &ids, &mut h);
+    build_layers(&mut graph, config, &ids, &mut h, shard);
 
     let normed = graph.add_rms_norm(h, ids.final_norm, config.rms_norm_eps);
     let logits = graph.add_lm_head(normed, ids.lm_head, weight_dtype);
@@ -410,8 +524,15 @@ where
 }
 
 /// Build the decode (single-token) forward-pass graph for a `DeepSeek` model.
+///
+/// When `shard` is `Some`, weight shapes are local (per-rank) and `AllReduce`
+/// ops are inserted after `o_proj` and every `down_proj` output.
 #[must_use]
-pub fn build_decode_graph<B>(config: &DeepSeekConfig, weight_dtype: DType) -> Graph<B>
+pub fn build_decode_graph<B>(
+    config: &DeepSeekConfig,
+    weight_dtype: DType,
+    shard: Option<&ShardConfig>,
+) -> Graph<B>
 where
     B: DeepSeekGraphOps,
     Graph<B>: GraphMatmulOps
@@ -421,15 +542,16 @@ where
         + GraphArithOps
         + GraphSwigluOps
         + GraphMlaAttentionOps
-        + GraphMoeOps,
+        + GraphMoeOps
+        + GraphCommOps,
 {
     let mut graph = Graph::new();
-    let ids = register_all_weights(&mut graph, config, weight_dtype);
+    let ids = register_all_weights(&mut graph, config, weight_dtype, shard);
 
     let token_input = graph.add_input(&[1], DType::U32);
     let mut h = graph.add_embedding_gather(ids.embed_tokens, token_input);
 
-    build_layers(&mut graph, config, &ids, &mut h);
+    build_layers(&mut graph, config, &ids, &mut h, shard);
 
     let normed = graph.add_rms_norm(h, ids.final_norm, config.rms_norm_eps);
     let logits = graph.add_lm_head(normed, ids.lm_head, weight_dtype);
@@ -443,6 +565,7 @@ fn build_layers<B>(
     config: &DeepSeekConfig,
     ids: &DeepSeekWeightIds,
     h: &mut OutputRef,
+    shard: Option<&ShardConfig>,
 ) where
     B: DeepSeekGraphOps,
     Graph<B>: GraphMatmulOps
@@ -450,17 +573,19 @@ fn build_layers<B>(
         + GraphArithOps
         + GraphSwigluOps
         + GraphMlaAttentionOps
-        + GraphMoeOps,
+        + GraphMoeOps
+        + GraphCommOps,
 {
     let attn_scale = config.mla_attn_scale();
-    let num_heads = config.num_attention_heads;
+    let world_size = shard.map_or(1, |s| s.world_size);
+    let num_heads_local = config.num_attention_heads / world_size;
 
     for (layer_idx, layer_ids) in ids.layers.iter().enumerate() {
         // Pre-attention RMSNorm
         let normed = graph.add_rms_norm(*h, layer_ids.input_layernorm, config.rms_norm_eps);
 
-        // MLA attention (opaque node)
-        let attn_out = graph.add_mla_attention(
+        // MLA attention (opaque node; o_proj is row-parallel when sharded)
+        let attn_out_raw = graph.add_mla_attention(
             normed,
             layer_ids.attention.q_a_proj,
             layer_ids.attention.q_a_layernorm,
@@ -471,7 +596,7 @@ fn build_layers<B>(
             layer_ids.attention.kv_b_proj_v,
             layer_ids.attention.kv_b_proj_k_t,
             layer_ids.attention.o_proj,
-            num_heads,
+            num_heads_local,
             config.qk_nope_head_dim,
             config.qk_rope_head_dim,
             config.v_head_dim,
@@ -480,6 +605,11 @@ fn build_layers<B>(
             attn_scale,
             layer_idx,
         );
+        let attn_out = if shard.is_some() {
+            graph.add_all_reduce(attn_out_raw)
+        } else {
+            attn_out_raw
+        };
 
         *h = graph.add_add(*h, attn_out);
 
@@ -487,8 +617,13 @@ fn build_layers<B>(
         let normed =
             graph.add_rms_norm(*h, layer_ids.post_attention_layernorm, config.rms_norm_eps);
 
-        // FFN: dense SwiGLU or sigmoid MoE
-        let ffn_out = build_ffn(graph, &layer_ids.ffn, normed, config);
+        // FFN: dense SwiGLU or sigmoid MoE (down_proj is row-parallel when sharded)
+        let ffn_out_raw = build_ffn(graph, &layer_ids.ffn, normed, config);
+        let ffn_out = if shard.is_some() {
+            graph.add_all_reduce(ffn_out_raw)
+        } else {
+            ffn_out_raw
+        };
 
         *h = graph.add_add(*h, ffn_out);
     }
@@ -602,6 +737,7 @@ mod tests {
 
     impl infernum::backend::Backend for TestBackend {
         type Tensor = DummyTensor;
+        type ExecutorState = ();
         type DeviceHandle = ();
         type PagedKvCache = ();
         type KvCache = ();
@@ -782,6 +918,42 @@ mod tests {
         }
     }
 
+    impl infernum::backend::TensorDataOps for TestBackend {
+        fn to_f32_vec(_tensor: &DummyTensor) -> infernum::Result<Vec<f32>> {
+            unimplemented!()
+        }
+        fn to_raw_bytes(_tensor: &DummyTensor) -> infernum::Result<Vec<u8>> {
+            unimplemented!()
+        }
+    }
+
+    impl infernum::backend::ArgmaxLastOps for TestBackend {
+        fn argmax_last_tensor(_input: &DummyTensor) -> infernum::Result<DummyTensor> {
+            Ok(DummyTensor)
+        }
+    }
+
+    impl infernum::backend::ContextBackend for TestBackend {
+        fn ctx_read(
+            _ctx: &infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _output_ref: infernum::graph::OutputRef,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+        fn ctx_write(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+            _node_id: infernum::graph::NodeId,
+            _idx: u32,
+            _tensor: DummyTensor,
+        ) {
+        }
+        fn ctx_next_input(
+            _ctx: &mut infernum::graph::execute_context::ExecuteContext<'_, Self>,
+        ) -> DummyTensor {
+            DummyTensor
+        }
+    }
+
     impl infernum::backend::MlaAttentionOps for TestBackend {
         #[allow(clippy::too_many_arguments)]
         fn mla_attention(
@@ -870,28 +1042,28 @@ mod tests {
     #[test]
     fn test_build_prefill_graph_dense() {
         let config = test_config_dense_only();
-        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32);
+        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
     }
 
     #[test]
     fn test_build_decode_graph_dense() {
         let config = test_config_dense_only();
-        let graph: Graph<TestBackend> = build_decode_graph(&config, DType::F32);
+        let graph: Graph<TestBackend> = build_decode_graph(&config, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
     }
 
     #[test]
     fn test_build_prefill_graph_moe() {
         let config = test_config_with_moe();
-        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32);
+        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
     }
 
     #[test]
     fn test_build_decode_graph_moe() {
         let config = test_config_with_moe();
-        let graph: Graph<TestBackend> = build_decode_graph(&config, DType::F32);
+        let graph: Graph<TestBackend> = build_decode_graph(&config, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
     }
 
@@ -926,7 +1098,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32);
+        let graph: Graph<TestBackend> = build_prefill_graph(&config, DType::F32, None);
         assert_eq!(graph.output_ids().len(), 1);
     }
 }

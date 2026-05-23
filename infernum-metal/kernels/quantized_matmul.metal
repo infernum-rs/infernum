@@ -922,6 +922,92 @@ kernel void gemv_q4_simd_v2_f16(
 // of down_proj).  The gate_up buffer has 2*K elements.
 // ==========================================================================
 
+// ==========================================================================
+// Dequantize Q8_0 / Q4_0 weights to F32 for batched prefill GEMM.
+//
+// Grid: 2D (width=K, height=N). Each thread writes one F32 element of the
+// dense (N, K) weight matrix. The result is passed directly to
+// linear_dense_f32 as weight_t (same layout expected by that kernel).
+// ==========================================================================
+
+kernel void dequantize_q8_to_f32(
+    device const uchar* data        [[buffer(0)]],
+    device const float* scales      [[buffer(1)]],
+    device float*       output      [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    uint row = gid.y;
+    if (col >= params.K || row >= params.N) return;
+
+    uint num_blocks = params.K / 32;
+    float scale = scales[row * num_blocks + col / 32];
+    float q = float(as_type<char>(data[row * params.K + col]));
+    output[row * params.K + col] = q * scale;
+}
+
+kernel void dequantize_q4_to_f32(
+    device const uchar* data        [[buffer(0)]],
+    device const float* scales      [[buffer(1)]],
+    device float*       output      [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    uint row = gid.y;
+    if (col >= params.K || row >= params.N) return;
+
+    uint block      = col / 32;
+    uint j_in_block = col % 32;
+    uint packed_bytes_per_row = params.K / 2;
+
+    uchar byte_val;
+    float q;
+    if (j_in_block < 16) {
+        byte_val = data[row * packed_bytes_per_row + block * 16 + j_in_block];
+        q = float(int(byte_val & 0x0F) - 8);
+    } else {
+        byte_val = data[row * packed_bytes_per_row + block * 16 + (j_in_block - 16)];
+        q = float(int(byte_val >> 4) - 8);
+    }
+    float scale = scales[row * (params.K / 32) + block];
+    output[row * params.K + col] = q * scale;
+}
+
+// Q4_1: same nibble layout as Q4_0 but unsigned (0..15) with per-block min.
+// Formula: output = nibble * scale + min.
+kernel void dequantize_q4_1_to_f32(
+    device const uchar* data        [[buffer(0)]],
+    device const float* scales      [[buffer(1)]],
+    device const float* mins        [[buffer(2)]],
+    device float*       output      [[buffer(3)]],
+    constant QuantizedLinearParams& params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    uint row = gid.y;
+    if (col >= params.K || row >= params.N) return;
+
+    uint block      = col / 32;
+    uint j_in_block = col % 32;
+    uint packed_bytes_per_row = params.K / 2;
+
+    uchar byte_val;
+    float q;
+    if (j_in_block < 16) {
+        byte_val = data[row * packed_bytes_per_row + block * 16 + j_in_block];
+        q = float(byte_val & 0x0F);
+    } else {
+        byte_val = data[row * packed_bytes_per_row + block * 16 + (j_in_block - 16)];
+        q = float(byte_val >> 4);
+    }
+    uint block_idx = row * (params.K / 32) + block;
+    float scale = scales[block_idx];
+    float min_val = mins[block_idx];
+    output[row * params.K + col] = q * scale + min_val;
+}
+
 static inline half silu_h(half x) {
     return x / (half(1.0h) + exp(-x));
 }

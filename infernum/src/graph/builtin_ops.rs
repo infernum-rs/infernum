@@ -2128,8 +2128,9 @@ impl<B: ContextBackend> OpNode<B> for MoeDispatchSigmoidOp {
 ///
 /// When `ExecuteContext::comm` is `None` (single-GPU), passes the tensor
 /// through unchanged. When `Some`, calls `comm.all_reduce_sum()` in-place
-/// and writes the result. Included in CUDA graph captures automatically
-/// because NCCL enqueues work on the device stream without blocking the CPU.
+/// and writes the result. Graphs containing this op are marked capture-unsafe
+/// because the `AllReduce` allocates a temporary GPU buffer (`cuMemAlloc`),
+/// which invalidates CUDA stream capture.
 #[derive(Debug)]
 pub struct AllReduceSumOp;
 

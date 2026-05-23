@@ -466,8 +466,12 @@ where
     // -- Final norm --
     let normed_final = graph.add_rms_norm(h, model_weights.final_norm, eps);
 
+    // -- Select last token hidden state before LM head to avoid computing
+    //    vocab-projection for all seq_len positions (only last token matters) --
+    let last_hidden = graph.add_extract_last_row(normed_final, seq_len);
+
     // -- LM head --
-    let logits = graph.add_lm_head(normed_final, model_weights.lm_head, weight_dtype);
+    let logits = graph.add_lm_head(last_hidden, model_weights.lm_head, weight_dtype);
     graph.set_output(logits.0);
 
     // -- Optimize: fuse primitives into efficient compound ops --
@@ -832,7 +836,6 @@ where
 // GGUF weight loader helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Map a SafeTensors-convention weight name to its GGUF tensor name.
 ///
 /// Handles the top-level tensors (`model.embed_tokens.weight`, `model.norm.weight`,
@@ -841,6 +844,7 @@ where
 /// # Panics
 ///
 /// Panics on an unrecognised layer suffix (indicates a bug in weight registration).
+#[allow(dead_code)]
 pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     match name {
         "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
@@ -869,9 +873,9 @@ pub(crate) fn safetensors_to_gguf_name(name: &str) -> String {
     panic!("Unknown weight name: {name}");
 }
 
-#[cfg(any(feature = "cpu", feature = "metal"))]
 /// Returns `true` if this GGUF tensor name is a Q or K projection that needs
 /// the GGUF row-permutation reversal before use.
+#[allow(dead_code)]
 pub(crate) fn needs_unpermute(gguf_name: &str) -> bool {
     gguf_name.ends_with(".attn_q.weight") || gguf_name.ends_with(".attn_k.weight")
 }
@@ -1325,7 +1329,7 @@ mod tests {
         assert_eq!(graph.output_ids().len(), 1);
         let logits_id = graph.output_ids()[0];
         let logits_ref = (logits_id, 0);
-        assert_eq!(graph.node_shape(logits_ref), &[seq_len, config.vocab_size]);
+        assert_eq!(graph.node_shape(logits_ref), &[1, config.vocab_size]);
         assert_eq!(graph.node_dtype(logits_ref), DType::F32);
     }
 
@@ -1464,6 +1468,6 @@ mod tests {
             build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
 
         let logits_id = graph.output_ids()[0];
-        assert_eq!(graph.node_shape((logits_id, 0)), &[seq_len, 32000]);
+        assert_eq!(graph.node_shape((logits_id, 0)), &[1, 32000]);
     }
 }

@@ -237,7 +237,8 @@ impl QwenConfig {
     ///
     /// GGUF metadata uses keys like `qwen2.embedding_length`, `qwen2.block_count`, etc.
     /// llama.cpp uses `qwen2` as the architecture string for all Qwen models
-    /// (Qwen2, Qwen2.5, Qwen3), but we also accept `qwen3` as a fallback.
+    /// (Qwen2, Qwen2.5, Qwen3), but we also accept `qwen3` and `qwen3moe` as
+    /// fallbacks for Qwen3-dense and Qwen3-MoE models respectively.
     ///
     /// # Errors
     /// Returns an error if required metadata keys are missing.
@@ -247,7 +248,7 @@ impl QwenConfig {
         use infernum::gguf_meta::{get_f32, get_usize};
         use infernum::GgufValue;
 
-        // Detect architecture prefix (qwen2 or qwen3)
+        // Detect architecture prefix (qwen2, qwen3, or qwen3moe)
         let arch = metadata
             .get("general.architecture")
             .and_then(GgufValue::as_str)
@@ -304,10 +305,14 @@ impl QwenConfig {
                 .unwrap_or(2) as u32,
             quantization_config: None,
             rope_scaling: None,
-            // MoE fields — not supported for GGUF yet
-            num_experts: None,
-            num_experts_per_tok: None,
-            moe_intermediate_size: None,
+            // MoE fields — populated for qwen3moe architecture
+            num_experts: get_usize(metadata, &format!("{arch}.expert_count")).ok(),
+            num_experts_per_tok: get_usize(metadata, &format!("{arch}.expert_used_count")).ok(),
+            moe_intermediate_size: get_usize(
+                metadata,
+                &format!("{arch}.expert_feed_forward_length"),
+            )
+            .ok(),
             shared_expert_intermediate_size: None,
             norm_topk_prob: true,
             decoder_sparse_step: 1,
@@ -817,5 +822,54 @@ mod tests {
         assert_eq!(config.max_window_layers, None);
         assert_eq!(config.effective_sliding_window(0), Some(4096));
         assert_eq!(config.effective_sliding_window(35), Some(4096));
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_qwen3moe() {
+        use infernum::GgufValue;
+        use std::collections::HashMap;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("qwen3moe".into()),
+        );
+        meta.insert("qwen3moe.embedding_length".into(), GgufValue::U32(4096));
+        meta.insert("qwen3moe.block_count".into(), GgufValue::U32(94));
+        meta.insert("qwen3moe.feed_forward_length".into(), GgufValue::U32(12288));
+        meta.insert("qwen3moe.attention.head_count".into(), GgufValue::U32(64));
+        meta.insert("qwen3moe.attention.head_count_kv".into(), GgufValue::U32(4));
+        meta.insert("qwen3moe.attention.key_length".into(), GgufValue::U32(128));
+        meta.insert(
+            "qwen3moe.attention.layer_norm_rms_epsilon".into(),
+            GgufValue::F32(1e-6),
+        );
+        meta.insert(
+            "qwen3moe.rope.freq_base".into(),
+            GgufValue::F32(1_000_000.0),
+        );
+        meta.insert("qwen3moe.context_length".into(), GgufValue::U32(40960));
+        meta.insert("qwen3moe.expert_count".into(), GgufValue::U32(128));
+        meta.insert("qwen3moe.expert_used_count".into(), GgufValue::U32(8));
+        meta.insert(
+            "qwen3moe.expert_feed_forward_length".into(),
+            GgufValue::U32(1536),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::U32(151643));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(151645));
+
+        let config = QwenConfig::from_gguf_metadata(&meta).unwrap();
+
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_hidden_layers, 94);
+        assert_eq!(config.num_attention_heads, 64);
+        assert_eq!(config.num_key_value_heads, Some(4));
+        assert_eq!(config.explicit_head_dim, Some(128));
+        assert_eq!(config.num_experts, Some(128));
+        assert_eq!(config.num_experts_per_tok, Some(8));
+        assert_eq!(config.moe_intermediate_size, Some(1536));
+        assert!(config.norm_topk_prob);
+        assert_eq!(config.decoder_sparse_step, 1);
+        assert!(config.is_moe());
     }
 }

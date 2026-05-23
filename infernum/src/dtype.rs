@@ -5,11 +5,23 @@ use std::fmt;
 /// Default block size for block-quantized formats (`Q8_0`, `Q4_0`)
 pub const QUANTIZATION_BLOCK_SIZE: usize = 32;
 
-/// Super-block size for K-quant formats (`Q6_K`)
+/// Super-block size for K-quant formats (`Q4_K`, `Q5_K`, `Q6_K`)
 pub const Q6_K_BLOCK_ELEMENTS: usize = 256;
 
 /// Byte size of one `Q6_K` super-block: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210
 pub const Q6_K_BLOCK_SIZE_BYTES: usize = 210;
+
+/// Super-block element count for `Q4_K` (256 elements per super-block)
+pub const Q4K_BLOCK_ELEMENTS: usize = 256;
+
+/// Byte size of one `Q4_K` super-block: 2 (d) + 2 (dmin) + 12 (scales) + 128 (qs) = 144
+pub const Q4K_BLOCK_SIZE_BYTES: usize = 144;
+
+/// Super-block element count for `Q5_K` (256 elements per super-block)
+pub const Q5K_BLOCK_ELEMENTS: usize = 256;
+
+/// Byte size of one `Q5_K` super-block: 2 (d) + 2 (dmin) + 12 (scales) + 32 (qh) + 128 (qs) = 176
+pub const Q5K_BLOCK_SIZE_BYTES: usize = 176;
 
 /// Default group size for GPTQ / AWQ quantization (elements per scale/zero group)
 pub const GPTQ_GROUP_SIZE: usize = 128;
@@ -34,6 +46,13 @@ pub enum DType {
     Q4_1,
     /// 6-bit K-quant (super-block of 256 elements, 210 bytes per block)
     Q6_K,
+    /// 5-bit block-quantized (block size 32: d[f16] + qh[4 bytes high bits] + qs[16 bytes]).
+    /// Loaded by dequantizing to BF16 on CPU; no dedicated GPU kernel.
+    Q5_0,
+    /// 4-bit K-quant (super-block of 256 elements, 144 bytes per block).
+    Q4_K,
+    /// 5-bit K-quant (super-block of 256 elements, 176 bytes per block).
+    Q5_K,
     /// 8-bit floating point (E4M3 format: 4 exponent, 3 mantissa bits)
     F8E4M3,
     /// GPTQ INT4: group-quantized 4-bit (packed in int32, with f16 scales and int32 zero-points)
@@ -57,7 +76,10 @@ impl DType {
             Self::Q8_0
             | Self::Q4_0
             | Self::Q4_1
+            | Self::Q5_0
             | Self::Q6_K
+            | Self::Q4_K
+            | Self::Q5_K
             | Self::GPTQ_INT4
             | Self::AWQ_INT4 => {
                 panic!("Quantized types have no fixed per-element size")
@@ -95,10 +117,31 @@ impl DType {
             Self::Q8_0
                 | Self::Q4_0
                 | Self::Q4_1
+                | Self::Q5_0
                 | Self::Q6_K
+                | Self::Q4_K
+                | Self::Q5_K
                 | Self::F8E4M3
                 | Self::GPTQ_INT4
                 | Self::AWQ_INT4
+        )
+    }
+
+    /// Whether this dtype has a dedicated GPU quantized-matmul kernel.
+    ///
+    /// K-quant types like `Q4_K` are quantized but loaded as BF16 on GPU
+    /// because no on-device kernel exists for them yet.
+    #[must_use]
+    pub const fn has_gpu_quant_kernel(self) -> bool {
+        matches!(
+            self,
+            Self::Q8_0
+                | Self::Q4_0
+                | Self::Q4_1
+                | Self::Q6_K
+                | Self::Q4_K
+                | Self::Q5_K
+                | Self::F8E4M3
         )
     }
 
@@ -139,7 +182,10 @@ impl fmt::Display for DType {
             Self::Q8_0 => write!(f, "q8_0"),
             Self::Q4_0 => write!(f, "q4_0"),
             Self::Q4_1 => write!(f, "q4_1"),
+            Self::Q5_0 => write!(f, "q5_0"),
             Self::Q6_K => write!(f, "q6_k"),
+            Self::Q4_K => write!(f, "q4_k"),
+            Self::Q5_K => write!(f, "q5_k"),
             Self::F8E4M3 => write!(f, "f8e4m3"),
             Self::GPTQ_INT4 => write!(f, "gptq_int4"),
             Self::AWQ_INT4 => write!(f, "awq_int4"),

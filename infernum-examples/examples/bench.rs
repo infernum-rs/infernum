@@ -44,18 +44,27 @@ use infernum_cuda::cuda::ops::{
 use infernum_cuda::cuda::{CudaContext, CudaGraph, CudaTensor, KvCache};
 use infernum_cuda::executor;
 use infernum_cuda::CudaBackend;
+use infernum_deepseek::DeepSeekCudaEngine;
+#[cfg(feature = "nccl")]
+use infernum_deepseek::DeepSeekShardedEngine;
 use infernum_gemma::{
     build_prefill_graph as gemma_build_prefill_graph, GemmaConfig, GemmaCudaGraphEngine,
     GemmaCudaGraphEngineExt as _,
 };
+#[cfg(feature = "nccl")]
+use infernum_gemma::{GemmaShardedGraphEngine, GemmaShardedGraphEngineExt as _};
 use infernum_llama::{
     build_decode_graph, build_prefill_graph, LlamaConfig, LlamaCudaGraphEngine,
     LlamaCudaGraphEngineExt as _,
 };
+#[cfg(feature = "nccl")]
+use infernum_llama::{LlamaShardedGraphEngine, LlamaShardedGraphEngineExt as _};
 use infernum_qwen::{
     build_prefill_graph as qwen_build_prefill_graph, QwenConfig, QwenCudaGraphEngine,
     QwenCudaGraphEngineExt as _,
 };
+#[cfg(feature = "nccl")]
+use infernum_qwen::{QwenShardedGraphEngine, QwenShardedGraphEngineExt as _};
 use infernum_runtime::Engine;
 
 #[derive(Parser)]
@@ -88,6 +97,10 @@ struct Cli {
     /// Weight dtype for graph mode (f32 or bf16)
     #[arg(long, default_value = "bf16")]
     dtype: String,
+
+    /// Number of GPUs for tensor parallelism (--cuda-graph-engine only)
+    #[arg(long, default_value_t = 1)]
+    gpus: usize,
 }
 
 /// Peek at just the `model_type` field from config.json.
@@ -995,10 +1008,17 @@ fn bench_cuda_graphs_decode(
 
 /// Inner benchmark loop shared by all `CudaGraphEngine` model families.
 ///
-/// Runs a prefill warm-up then times `n_gen` decode steps via the paged KV cache path.
-fn run_engine_bench<M>(ctx: &CudaContext, model: M, n_gen: usize) -> infernum::Result<()>
+/// When `measure_prefill` is true, runs a timed 512-token prefill pass before
+/// the decode measurement. Set false for models without true batch prefill
+/// (e.g. DeepSeek, which processes prefill token-by-token at decode speed).
+fn run_engine_bench<M>(
+    ctx: &CudaContext,
+    model: M,
+    n_gen: usize,
+    measure_prefill: bool,
+) -> infernum::Result<()>
 where
-    M: infernum::Model<B = infernum_cuda::CudaBackend, KvCache = infernum_cuda::cuda::PagedKvCache>,
+    M: infernum::Model<B = infernum_cuda::CudaBackend>,
 {
     use infernum::block_allocator::{BlockAllocator, BlockConfig, BlockTable};
     use infernum::logits::Logits as _;
@@ -1007,52 +1027,113 @@ where
 
     let model_cfg = model.config();
 
-    let prompt_len: usize = 8;
+    const PREFILL_TOKENS: usize = 512;
+    let decode_prompt_len: usize = 8;
     let block_size: usize = 16;
-    let max_seq = prompt_len + n_gen + 1;
+
+    // Size the block pool to cover both the timed prefill (512 tok) and the
+    // decode sequence (warm-up prompt + generated tokens).
+    let max_seq = if measure_prefill {
+        PREFILL_TOKENS.max(decode_prompt_len + n_gen + 1)
+    } else {
+        decode_prompt_len + n_gen + 1
+    };
     let num_blocks = max_seq.div_ceil(block_size) + 4;
+    let max_blocks_per_seq = num_blocks;
 
     let block_config = BlockConfig {
         block_size,
         num_blocks,
     };
-    let max_blocks_per_seq = num_blocks;
 
     eprintln!(
-        "Model: {} layers, head_dim={} (cuda-graph-engine, n_gen={})",
-        model_cfg.num_layers, model_cfg.head_dim, n_gen,
+        "Model: {} layers, head_dim={} (cuda-graph-engine, n_gen={n_gen})",
+        model_cfg.num_layers, model_cfg.head_dim,
     );
 
+    // --- Phase 1: Timed prefill (512 tokens) ---
+    if measure_prefill {
+        let prefill_prompt: Vec<u32> = (0..PREFILL_TOKENS).map(|i| (i % 256) as u32).collect();
+
+        // Warm-up prefill (not timed)
+        eprintln!("Prefill warm-up ({PREFILL_TOKENS} tokens)...");
+        {
+            let mut kv_cache = model.allocate_kv_cache(&block_config)?;
+            let mut runtime_state = CudaRuntimeState::test_placeholder();
+            let mut allocator = BlockAllocator::new(&block_config);
+            let mut block_table = BlockTable::new(block_size);
+            for _ in 0..PREFILL_TOKENS.div_ceil(block_size) {
+                let blk = allocator.allocate().expect("block pool exhausted");
+                block_table.append_block(blk);
+            }
+            model.forward_prefill(
+                &prefill_prompt,
+                &mut kv_cache,
+                &mut runtime_state,
+                &block_table,
+                0,
+            )?;
+            ctx.synchronize()?;
+        }
+
+        // Timed prefill
+        {
+            let mut kv_cache = model.allocate_kv_cache(&block_config)?;
+            let mut runtime_state = CudaRuntimeState::test_placeholder();
+            let mut allocator = BlockAllocator::new(&block_config);
+            let mut block_table = BlockTable::new(block_size);
+            for _ in 0..PREFILL_TOKENS.div_ceil(block_size) {
+                let blk = allocator.allocate().expect("block pool exhausted");
+                block_table.append_block(blk);
+            }
+            ctx.synchronize()?;
+            let start = Instant::now();
+            model.forward_prefill(
+                &prefill_prompt,
+                &mut kv_cache,
+                &mut runtime_state,
+                &block_table,
+                0,
+            )?;
+            ctx.synchronize()?;
+            let elapsed = start.elapsed();
+            let tok_s = PREFILL_TOKENS as f64 / elapsed.as_secs_f64();
+            println!(
+                "prefill {PREFILL_TOKENS} tokens in {:.2}s = {:.1} tok/s",
+                elapsed.as_secs_f64(),
+                tok_s,
+            );
+        }
+    }
+
+    // --- Phase 2: Timed decode ---
     let mut kv_cache = model.allocate_kv_cache(&block_config)?;
     let mut runtime_state = CudaRuntimeState::test_placeholder();
 
-    // Build block table for the single sequence.
     let mut allocator = BlockAllocator::new(&block_config);
     let mut block_table = BlockTable::new(block_size);
-    for _ in 0..prompt_len.div_ceil(block_size) {
+    for _ in 0..decode_prompt_len.div_ceil(block_size) {
         let blk = allocator.allocate().expect("block pool exhausted");
         block_table.append_block(blk);
     }
 
-    // --- Phase 1: Prefill (not timed) ---
-    eprintln!("Warm-up: prefilling {prompt_len} prompt tokens...");
-    let prompt: Vec<u32> = (0..prompt_len).map(|i| (i % 256) as u32).collect();
+    // Untimed warm-up prefill to populate KV cache before timing decode.
+    eprintln!("Decode warm-up: prefilling {decode_prompt_len} prompt tokens...");
+    let prompt: Vec<u32> = (0..decode_prompt_len).map(|i| (i % 256) as u32).collect();
     let prefill_logits =
         model.forward_prefill(&prompt, &mut kv_cache, &mut runtime_state, &block_table, 0)?;
-    block_table.advance(prompt_len);
+    block_table.advance(decode_prompt_len);
 
-    // Greedy argmax from the last row of the prefill logits.
     let mut last_token = prefill_logits.argmax(prefill_logits.batch_size() - 1)?;
 
     ctx.synchronize()?;
-    eprintln!("Warm-up done. First decode token: {last_token}");
+    eprintln!("Decode warm-up done. First decode token: {last_token}");
 
-    // --- Phase 2: Timed decode of n_gen tokens ---
     ctx.synchronize()?;
     let start = Instant::now();
 
     for step in 0..n_gen {
-        let pos = prompt_len + step;
+        let pos = decode_prompt_len + step;
         #[allow(clippy::cast_possible_wrap)]
         let pos_i32 = pos as i32;
         #[allow(clippy::cast_possible_wrap)]
@@ -1063,7 +1144,6 @@ where
             block_table.append_block(blk);
         }
 
-        // Flatten block table into (batch_size=1 × max_blocks_per_seq) with i32.
         #[allow(clippy::cast_possible_wrap)]
         let block_tables_flat: Vec<i32> = {
             let mut flat = vec![0i32; max_blocks_per_seq];
@@ -1104,7 +1184,7 @@ where
     let tok_s = n_gen as f64 / elapsed.as_secs_f64();
 
     println!(
-        "{n_gen} tokens in {:.2}s = {:.1} tok/s",
+        "decode {n_gen} tokens in {:.2}s = {:.1} tok/s",
         elapsed.as_secs_f64(),
         tok_s,
     );
@@ -1130,32 +1210,143 @@ fn bench_cuda_graph_engine(
     model_path: &str,
     n_gen: usize,
     _weight_dtype: DType,
+    n_gpus: usize,
 ) -> infernum::Result<()> {
-    assert!(
-        !model_path.ends_with(".gguf"),
-        "--cuda-graph-engine only supports SafeTensors directories"
-    );
+    let is_gguf = model_path.ends_with(".gguf");
 
-    let model_type = detect_model_type(model_path)?;
-    match model_type.as_str() {
-        "llama" | "mistral" | "mixtral" => run_engine_bench(
-            ctx,
-            LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
-            n_gen,
-        ),
-        "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
-            ctx,
-            QwenCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
-            n_gen,
-        ),
-        "gemma2" | "gemma3_text" => run_engine_bench(
-            ctx,
-            GemmaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
-            n_gen,
-        ),
-        other => Err(infernum::Error::UnsupportedModel(format!(
-            "--cuda-graph-engine: unsupported model_type `{other}`. Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
-        ))),
+    // Multi-GPU path (TP=n_gpus) — requires nccl feature and n_gpus > 1.
+    #[cfg(feature = "nccl")]
+    if n_gpus > 1 {
+        if is_gguf {
+            let loader = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+            let arch = loader
+                .metadata()
+                .get("general.architecture")
+                .and_then(|v| v.as_str())
+                .unwrap_or("llama");
+            return match arch {
+                "llama" | "mistral" | "mixtral" => run_engine_bench(
+                    ctx,
+                    LlamaShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                    true,
+                ),
+                "qwen2" | "qwen3" | "qwen3moe" => run_engine_bench(
+                    ctx,
+                    QwenShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                    true,
+                ),
+                "gemma2" | "gemma3" => run_engine_bench(
+                    ctx,
+                    GemmaShardedGraphEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                    true,
+                ),
+                "deepseek2" => run_engine_bench(
+                    ctx,
+                    DeepSeekShardedEngine::from_gguf(n_gpus, Path::new(model_path))?,
+                    n_gen,
+                    false, // no batch prefill: forward_prefill is token-by-token
+                ),
+                other => Err(infernum::Error::UnsupportedModel(format!(
+                    "--cuda-graph-engine --gpus GGUF: unsupported architecture `{other}`"
+                ))),
+            };
+        }
+        let model_type = detect_model_type(model_path)?;
+        return match model_type.as_str() {
+            "llama" | "mistral" | "mixtral" => run_engine_bench(
+                ctx,
+                LlamaShardedGraphEngine::from_pretrained(n_gpus, Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
+                ctx,
+                QwenShardedGraphEngine::from_pretrained(n_gpus, Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            "gemma2" | "gemma3_text" => run_engine_bench(
+                ctx,
+                GemmaShardedGraphEngine::from_pretrained(n_gpus, Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            other => Err(infernum::Error::UnsupportedModel(format!(
+                "--cuda-graph-engine --gpus: unsupported model_type `{other}`"
+            ))),
+        };
+    }
+    #[cfg(not(feature = "nccl"))]
+    if n_gpus > 1 {
+        eprintln!("ERROR: --gpus > 1 requires the `nccl` feature (rebuild with --features nccl)");
+        std::process::exit(1);
+    }
+
+    // Single-GPU path.
+    if is_gguf {
+        let loader = infernum::weights::gguf::GgufLoader::from_file(model_path)?;
+        let arch = loader
+            .metadata()
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("llama");
+        match arch {
+            "llama" | "mistral" | "mixtral" => run_engine_bench(
+                ctx,
+                LlamaCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            "qwen2" | "qwen3" | "qwen3moe" => run_engine_bench(
+                ctx,
+                QwenCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            "gemma2" | "gemma3" => run_engine_bench(
+                ctx,
+                GemmaCudaGraphEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            "deepseek2" => run_engine_bench(
+                ctx,
+                DeepSeekCudaEngine::from_gguf(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+                false, // no batch prefill: forward_prefill is token-by-token
+            ),
+            other => Err(infernum::Error::UnsupportedModel(format!(
+                "--cuda-graph-engine GGUF: unsupported architecture `{other}`"
+            ))),
+        }
+    } else {
+        let model_type = detect_model_type(model_path)?;
+        match model_type.as_str() {
+            "llama" | "mistral" | "mixtral" => run_engine_bench(
+                ctx,
+                LlamaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            "qwen2" | "qwen3" | "qwen3_moe" => run_engine_bench(
+                ctx,
+                QwenCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            "gemma2" | "gemma3_text" => run_engine_bench(
+                ctx,
+                GemmaCudaGraphEngine::from_pretrained(ctx.clone(), Path::new(model_path))?,
+                n_gen,
+                true,
+            ),
+            other => Err(infernum::Error::UnsupportedModel(format!(
+                "--cuda-graph-engine: unsupported model_type `{other}`. Supported: llama, mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text"
+            ))),
+        }
     }
 }
 
@@ -1177,10 +1368,6 @@ fn main() -> infernum::Result<()> {
 
         if cli.cuda_graphs && is_gguf {
             eprintln!("ERROR: --cuda-graphs does not support GGUF files");
-            std::process::exit(1);
-        }
-        if cli.cuda_graph_engine && is_gguf {
-            eprintln!("ERROR: --cuda-graph-engine does not support GGUF files");
             std::process::exit(1);
         }
 
@@ -1222,7 +1409,7 @@ fn main() -> infernum::Result<()> {
         );
 
         let result = if cli.cuda_graph_engine {
-            bench_cuda_graph_engine(&ctx, &cli.model, cli.n_gen, weight_dtype)
+            bench_cuda_graph_engine(&ctx, &cli.model, cli.n_gen, weight_dtype, cli.gpus)
         } else if cli.cuda_graphs {
             bench_cuda_graphs_decode(&ctx, &cli.model, cli.n_gen, weight_dtype)
         } else if cli.graph_decode {

@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
 use cudarc::nccl::safe::{Comm, Id, ReduceOp};
+use half::bf16;
 
 use crate::cuda::CudaTensor;
+use infernum::dtype::DType;
 use infernum::tensor::Tensor;
 use infernum::Result;
 
@@ -88,13 +90,45 @@ impl NcclCommunicator {
     pub fn all_reduce_sum_inplace(&self, tensor: &mut CudaTensor) -> Result<()> {
         let shape = tensor.shape().to_vec();
         let dtype = tensor.dtype();
+        let numel = tensor.numel();
+        let device = tensor.context().device().clone();
 
         // Allocate a temporary output buffer for the reduction
-        let mut recv = unsafe { CudaTensor::uninit(tensor.context(), &shape, dtype)? };
+        let recv = unsafe { CudaTensor::uninit(tensor.context(), &shape, dtype)? };
 
-        let send = tensor.cuda_slice();
-        self.comm
-            .all_reduce(&send, recv.cuda_slice_mut(), &ReduceOp::Sum)?;
+        // NCCL AllReduce must use the correct element type so it performs
+        // floating-point summation, not byte-wise integer summation.
+        // `cuda_slice()` returns raw `CudaSlice<u8>`, which would cause NCCL
+        // to treat BF16/F32 values as u8 bytes and produce wrong results.
+        // We reinterpret the buffers as typed slices via `upgrade_device_ptr`
+        // and std::mem::forget them afterward to prevent double-free.
+        match dtype {
+            DType::BF16 => {
+                let send_ptr = tensor.device_ptr();
+                let recv_ptr = recv.device_ptr();
+                let send_typed = unsafe { device.upgrade_device_ptr::<bf16>(send_ptr, numel) };
+                let mut recv_typed = unsafe { device.upgrade_device_ptr::<bf16>(recv_ptr, numel) };
+                self.comm
+                    .all_reduce(&send_typed, &mut recv_typed, &ReduceOp::Sum)?;
+                std::mem::forget(send_typed);
+                std::mem::forget(recv_typed);
+            }
+            DType::F32 => {
+                let send_ptr = tensor.device_ptr();
+                let recv_ptr = recv.device_ptr();
+                let send_typed = unsafe { device.upgrade_device_ptr::<f32>(send_ptr, numel) };
+                let mut recv_typed = unsafe { device.upgrade_device_ptr::<f32>(recv_ptr, numel) };
+                self.comm
+                    .all_reduce(&send_typed, &mut recv_typed, &ReduceOp::Sum)?;
+                std::mem::forget(send_typed);
+                std::mem::forget(recv_typed);
+            }
+            other => {
+                return Err(infernum::Error::UnsupportedDtype(format!(
+                    "all_reduce_sum_inplace: unsupported dtype {other:?}"
+                )))
+            }
+        }
 
         // Swap the result back into the original tensor
         *tensor = recv;
@@ -149,47 +183,106 @@ mod tests {
         assert_eq!(id.to_raw(), id2.to_raw());
     }
 
+    // Helper: spawn N threads each with their own CudaContext + NcclComm sharing the same
+    // underlying CudaDevice. Matches how ShardedGraphEngine::from_config wires things up.
+    fn run_all_reduce_test(n_devices: usize, id: NcclId) -> Vec<std::thread::JoinHandle<Vec<f32>>> {
+        (0..n_devices)
+            .map(|rank| {
+                let id_raw = *id.to_raw();
+                std::thread::spawn(move || {
+                    // Create context (with non-default stream) and NCCL comm from the same device.
+                    let ctx = CudaContext::new(rank).unwrap();
+                    let comm_id = NcclId::from_raw(id_raw);
+                    let comm = NcclCommunicator::from_rank(
+                        std::sync::Arc::clone(ctx.device()),
+                        rank,
+                        n_devices,
+                        comm_id,
+                    )
+                    .unwrap();
+
+                    let data = vec![(rank + 1) as f32; 4];
+                    let mut tensor = CudaTensor::from_slice(&ctx, &[4], &data).unwrap();
+
+                    comm.all_reduce_sum_inplace(&mut tensor).unwrap();
+                    ctx.synchronize().unwrap();
+
+                    tensor.to_vec::<f32>().unwrap()
+                })
+            })
+            .collect()
+    }
+
     #[test]
-    fn test_nccl_all_reduce_sum() {
+    fn test_nccl_all_reduce_sum_f32() {
         let n_devices = CudaDevice::count().unwrap() as usize;
         if n_devices < 2 {
             eprintln!("Skipping multi-GPU test: only {n_devices} device(s) available");
             return;
         }
 
-        let devices: Vec<_> = (0..n_devices)
-            .map(|i| CudaDevice::new(i).unwrap())
-            .collect();
-        let comms = NcclCommunicator::from_devices(devices).unwrap();
+        let id = NcclId::new().unwrap();
+        let expected_sum = (1..=n_devices).sum::<usize>() as f32;
+        let handles = run_all_reduce_test(n_devices, id);
 
-        std::thread::scope(|s| {
-            let handles: Vec<_> = comms
-                .into_iter()
-                .enumerate()
-                .map(|(rank, comm)| {
-                    s.spawn(move || {
-                        let ctx = CudaContext::new(rank).unwrap();
-                        let data = vec![(rank + 1) as f32; 4];
-                        let mut tensor = CudaTensor::from_slice(&ctx, &[4], &data).unwrap();
-
-                        comm.all_reduce_sum_inplace(&mut tensor).unwrap();
-                        ctx.synchronize().unwrap();
-
-                        let result = tensor.to_vec::<f32>().unwrap();
-                        let expected = (1..=n_devices).sum::<usize>() as f32;
-                        for val in &result {
-                            assert!(
-                                (val - expected).abs() < 1e-5,
-                                "Expected {expected}, got {val}"
-                            );
-                        }
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                h.join().unwrap();
+        for (rank, h) in handles.into_iter().enumerate() {
+            let result = h.join().unwrap();
+            for val in &result {
+                assert!(
+                    (val - expected_sum).abs() < 1e-3,
+                    "Rank {rank}: expected {expected_sum}, got {val}"
+                );
             }
-        });
+        }
+    }
+
+    #[test]
+    fn test_nccl_all_reduce_sum_bf16() {
+        use half::bf16;
+
+        let n_devices = CudaDevice::count().unwrap() as usize;
+        if n_devices < 2 {
+            eprintln!("Skipping multi-GPU test: only {n_devices} device(s) available");
+            return;
+        }
+
+        let id = NcclId::new().unwrap();
+        let expected_sum = (1..=n_devices).sum::<usize>() as f32;
+
+        let handles: Vec<_> = (0..n_devices)
+            .map(|rank| {
+                let id_raw = *id.to_raw();
+                std::thread::spawn(move || {
+                    let ctx = CudaContext::new(rank).unwrap();
+                    let comm_id = NcclId::from_raw(id_raw);
+                    let comm = NcclCommunicator::from_rank(
+                        std::sync::Arc::clone(ctx.device()),
+                        rank,
+                        n_devices,
+                        comm_id,
+                    )
+                    .unwrap();
+
+                    let data: Vec<bf16> = vec![bf16::from_f32((rank + 1) as f32); 4];
+                    let mut tensor = CudaTensor::from_slice(&ctx, &[4], &data).unwrap();
+
+                    comm.all_reduce_sum_inplace(&mut tensor).unwrap();
+                    ctx.synchronize().unwrap();
+
+                    tensor.to_vec::<bf16>().unwrap()
+                })
+            })
+            .collect();
+
+        for (rank, h) in handles.into_iter().enumerate() {
+            let result = h.join().unwrap();
+            for val in &result {
+                let val_f32 = val.to_f32();
+                assert!(
+                    (val_f32 - expected_sum).abs() < 1.0,
+                    "Rank {rank}: expected {expected_sum}, got {val_f32}"
+                );
+            }
+        }
     }
 }

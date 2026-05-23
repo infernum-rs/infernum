@@ -118,11 +118,11 @@ The comparison script only covers the Llama family today. Non-Llama families nee
 
 ### Overview
 
-Metal uses the GPU on Apple Silicon Macs. Unified memory eliminates explicit host-device transfer; bottlenecks are GPU bandwidth and Metal shader efficiency. The gap vs llama.cpp on Metal is currently large.
+Metal uses the GPU on Apple Silicon Macs. Unified memory eliminates explicit host-device transfer; bottlenecks are GPU bandwidth and Metal shader efficiency. The gap vs llama.cpp on Metal is currently large for decode but has closed significantly for prefill.
 
 The most interesting Metal use case is **large models on high-memory Apple Silicon** — Macs with M-series Ultra chips can run 70B parameter models in BF16 that require a 4-GPU server on CUDA. This is a real differentiator worth optimizing for specifically.
 
-**Current limitation:** `bench_metal` measures decode throughput only. Prefill measurement requires a Metal graph engine (not yet implemented).
+Both prefill and decode are measured. The Metal graph engine supports GGUF (Q4_0, Q8_0, Q4_1, Q6_K) and SafeTensors. Prefill uses a GPU dequantize → dense GEMM path; decode uses quantized GEMV kernels.
 
 ### Hardware Tiers
 
@@ -182,23 +182,29 @@ Llama-3.1-70B BF16 on an M3/M4 Ultra is the headline number — it represents a 
 # Build once
 cargo build --release --example bench_metal --features metal
 
-# Decode throughput
+# Decode throughput (256 tokens, 8-token warm-up prompt)
 cargo run --release --example bench_metal --features metal -- /path/to/model 256
+
+# Prefill throughput (512-token prompt, default)
+cargo run --release --example bench_metal --features metal -- /path/to/model --n-prompt 512
+
+# Decode + prefill together
+cargo run --release --example bench_metal --features metal -- /path/to/model 256 --n-prompt 512
 
 # With per-kernel profiling (separate run — ~10% slower, use only to diagnose bottlenecks)
 cargo run --release --example bench_metal --features metal -- --profile /path/to/model 256
 
-# Full comparison table vs llama.cpp (SmolLM2-360M, Llama only)
-./bench_metal_comparison.sh
-./bench_metal_comparison.sh --tests q4,q8
-./bench_metal_comparison.sh --n-gen 256
+# Full comparison table vs llama.cpp (all supported families)
+./bench_metal.sh
+./bench_metal.sh --n-gen 256
+./bench_metal.sh --llama-cpp ~/llama.cpp   # enable llama.cpp column
 
 # Manual run for non-Llama families
 cargo run --release --example bench_metal --features metal -- /path/to/qwen3-72b 256
 cargo run --release --example bench_metal --features metal -- /path/to/gemma-3-27b 256
 ```
 
-The comparison script covers Llama family only. Non-Llama families require manual runs.
+`bench_metal.sh` covers Llama (GGUF Q4_0, Q8_0, SafeTensors), Qwen (SafeTensors BF16), and Gemma (GGUF Q8_0) families. Non-Llama families can also be run manually for larger models.
 
 ### Checklist
 
@@ -207,7 +213,9 @@ The comparison script covers Llama family only. Non-Llama families require manua
 - [ ] For the Ultra tier: include 70B BF16 decode throughput — this is the headline metric
 - [ ] Use `--profile` only on a dedicated diagnostic run, not in reported results
 - [ ] Compare all formats against llama.cpp `-ngl 99`
-- [x] Prefill benchmarked — see results/metal.md. Note: GGUF prefill uses serial GEMV (0.001x llama.cpp); SafeTensors prefill uses GEMM and performs well.
+- [x] GGUF prefill implemented — GPU dequantize+GEMM path for Q4_0, Q8_0, Q4_1; Q6_K handled via GEMV after extract_last_row. See results/metal.md 2026-05-22 (GPU dequant+GEMM section).
+- [x] Llama 3.2 3B GGUF prefill at 0.61–0.62× llama.cpp (417–424 tok/s vs 683–687 tok/s at n=512). See results/metal.md.
+- [x] Llama 3.1 8B Q4_0 measured on M3 Pro 18 GB — 0.46x llama.cpp decode (trend: 360M=0.26x → 3B=0.36x → 8B=0.46x). See results/metal.md 2026-05-22 section.
 
 ---
 
@@ -245,27 +253,24 @@ Mixtral and large MoE models do not fit on a single L4 at any usable dtype.
 
 **Primary models for the L4:** Llama-3.1-8B BF16 (exercises full-size dense decode) and Qwen3-8B BF16 (exercises Qwen path). Llama-3.2-1B across all formats covers the quantization matrix.
 
-#### 8× H100 80 GB (640 GB total VRAM)
+#### 8× A100/H100 80 GB (640 GB total VRAM)
 
-The H100 cluster enables tensor-parallel inference over large models. All models below assume tensor parallelism with `--nccl` features.
+The multi-GPU node enables tensor-parallel inference over large models. All models below use `--features nccl` and `--gpus N`.
 
-| Family | Model | Format | VRAM (approx) | TP needed |
-|--------|-------|--------|--------------|-----------|
-| Llama | Llama-3.1-70B | BF16 | ~140 GB | TP=2 |
-| Llama | Llama-3.1-70B | GPTQ INT4 | ~35 GB | TP=1 |
-| Llama | Llama-3.1-405B | GPTQ INT4 | ~200 GB | TP=4 |
-| Qwen | Qwen3-72B | BF16 | ~144 GB | TP=2 |
-| Qwen | Qwen3-235B-A22B (MoE) | BF16 | ~470 GB | TP=8 |
-| Qwen | Qwen3-235B-A22B (MoE) | GPTQ INT4 | ~120 GB | TP=2 |
-| Mixtral | Mixtral-8x22B (MoE) | BF16 | ~282 GB | TP=4 |
+| Family | Model | Format | VRAM (approx) | TP recommended |
+|--------|-------|--------|--------------|----------------|
+| Llama | Llama-3.1-70B | GGUF Q4_0 | ~40 GB | TP=2 (fits on 1 GPU; TP=8 adds NCCL overhead) |
+| Qwen | Qwen3-72B | GGUF Q4_K_M | ~42 GB | TP=2 |
+| Qwen | Qwen3-235B-A22B (MoE) | GGUF Q4_K_M | ~133 GB | **TP=2 only** — model has 4 KV heads; TP=4+ gives 0 or 1 KV heads/rank |
 | Mixtral | Mixtral-8x7B (MoE) | BF16 | ~92 GB | TP=2 |
-| DeepSeek | DeepSeek-V3 (MoE) | GGUF Q4_0 | ~335 GB | TP=4–8 |
-| DeepSeek | DeepSeek-R1 (MoE) | GGUF Q4_0 | ~335 GB | TP=4–8 |
+| Mixtral | Mixtral-8x22B (MoE) | BF16 | ~282 GB | TP=4 |
+| DeepSeek | DeepSeek-V3 (MoE) | GGUF Q4_0 | ~335 GB | TP=2 and TP=8 |
+| DeepSeek | DeepSeek-R1 (MoE) | GGUF Q4_0 | ~335 GB | TP=2 and TP=8 |
 | Gemma | Gemma-3-27B | BF16 | ~54 GB | TP=1 |
 
-DeepSeek-V3/R1 BF16 does not fit on 8× H100 (~1.3 TB). GGUF Q4 (~335 GB) fits on TP=4-8 and is the recommended format for these models.
+DeepSeek-V3/R1 BF16 does not fit on 8× A100/H100 (~1.3 TB). GGUF Q4 (~335 GB) fits on TP=2–8 and is the recommended format.
 
-**Primary H100 targets:** Llama-3.1-70B BF16 (dense baseline), Qwen3-235B-A22B BF16 (MoE + Qwen path), DeepSeek-V3 Q4 (MLA + large MoE).
+**Primary multi-GPU targets:** Llama-3.1-70B Q4_0 (dense baseline), Qwen3-72B Q4_K_M, Qwen3-235B-A22B Q4_K_M (MoE, TP=2 only), DeepSeek-V3 Q4_0 (TP=2 and TP=8 once GGUF support lands).
 
 ### Dtypes (CUDA)
 
@@ -289,51 +294,68 @@ cargo build --release --example bench --features cuda
 # Build (multi-GPU with NCCL)
 cargo build --release --example bench --features nccl
 
-# Decode — production CUDA graph engine path
-cargo run --release --example bench --features cuda -- --cuda-graph-engine /path/to/model 256
+# Decode — production CUDA graph engine path (single GPU)
+cargo run --release --example bench --features cuda -- --cuda-graph-engine /path/to/model 200
 
 # Prefill — graph executor
-cargo run --release --example bench --features cuda -- --graph /path/to/model 256
+cargo run --release --example bench --features cuda -- --graph /path/to/model 512
 
 # Specific dtype for SafeTensors
-cargo run --release --example bench --features cuda -- --cuda-graph-engine --dtype bf16 /path/to/model 256
+cargo run --release --example bench --features cuda -- --cuda-graph-engine --dtype bf16 /path/to/model 200
 
-# Multi-GPU decode (use generate_parallel example for TP)
-cargo run --release --example generate_parallel --features nccl -- -m /path/to/model --gpus 8 "Hello"
+# Multi-GPU decode via tensor parallelism (--gpus N, requires nccl feature)
+cargo run --release --example bench --features nccl -- --cuda-graph-engine --gpus 2 /path/to/model 200
+cargo run --release --example bench --features nccl -- --cuda-graph-engine --gpus 8 /path/to/model 200
 
 # Full comparison table vs llama.cpp (Llama-3.2-1B, single GPU)
 ./bench_comparison.sh
 ./bench_comparison.sh --tests bf16,gptq-int4
 ./bench_comparison.sh --dry-run   # preview
 
-# Non-Llama families (manual, no comparison script yet)
-cargo run --release --example bench --features cuda -- --cuda-graph-engine /path/to/qwen3-8b 256
-cargo run --release --example bench --features cuda -- /path/to/gemma-2-9b 256
-cargo run --release --example bench --features cuda -- /path/to/deepseek-v3-q4.gguf 256
+# Multi-GPU large-model table (70B, 72B, 235B at TP=2 and TP=8)
+./bench_cuda_large.sh                    # 70B + 72B only (already cached)
+./bench_cuda_large.sh --download-large   # also download Qwen3-235B-A22B (~142 GB)
+./bench_cuda_large.sh --n-tokens 200     # override decode length
+./bench_cuda_large.sh --dry-run          # show plan without running
 ```
 
 The CUDA graph engine path warms up during the prefill phase. The reported tok/s covers only the decode steps.
 
 ### Family Coverage Matrix (CUDA)
 
-This is the minimum family coverage for a complete benchmark run. A ✓ means the family must be measured. Use the smallest model in the family that runs on the available hardware.
+This is the minimum family coverage for a complete benchmark run. Use the smallest model in the family that runs on the available hardware.
 
-| Family | L4 (representative model) | H100×8 (representative model) |
-|--------|--------------------------|-------------------------------|
-| Llama | Llama-3.1-8B BF16 | Llama-3.1-70B BF16 |
+| Family | L4 single-GPU | A100/H100 ×8 multi-GPU |
+|--------|--------------|------------------------|
+| Llama | Llama-3.1-8B BF16 | Llama-3.1-70B Q4_0 GGUF |
 | Mistral | Mistral-7B-v0.3 BF16 | — (covered by Llama path) |
-| Mixtral/MoE | — (doesn't fit) | Mixtral-8x22B BF16 |
-| Qwen | Qwen3-8B BF16 | Qwen3-235B-A22B BF16 |
-| DeepSeek | DeepSeek-V3-tiny (smoke test) | DeepSeek-V3 Q4 |
+| Mixtral/MoE | — (doesn't fit) | Mixtral-8x7B BF16 |
+| Qwen (dense) | Qwen3-8B BF16 | Qwen3-72B Q4_K_M GGUF |
+| Qwen (MoE) | — (doesn't fit) | Qwen3-235B-A22B Q4_K_M GGUF |
+| DeepSeek | DeepSeek-V3-tiny (smoke) | DeepSeek-V3 Q4 GGUF |
 | Gemma | Gemma-2-9B BF16 | Gemma-3-27B BF16 |
+
+### Multi-GPU results table format
+
+The multi-GPU results table in `results/cuda-multi.md` uses **one unified table** covering all models. Report TP=2 and TP=8 only — single-GPU numbers belong in `results/cuda-single.md`.
+
+```
+| Model | Format | 2 GPUs (tok/s) | 8 GPUs (tok/s) | llama.cpp 1GPU | ratio (2GPU) |
+| ----- | ------ | -------------: | -------------: | -------------: | -----------: |
+| Llama-3.1-70B       | Q4_0   |   10.4 | 3.8  | 30.1 | 0.35x |
+| Qwen3-72B           | Q4_K_M |    7.3 | ...  | 23.4 | 0.31x |
+| Qwen3-235B-A22B     | Q4_K_M |    ... | ...  |  ... |   ... |
+```
+
+llama.cpp single-GPU is the reference baseline for ratio. TP=8 numbers typically show overhead for models that fit on 2 GPUs.
 
 ### Checklist
 
 - [ ] Run `--cuda-graph-engine` for decode (not legacy `--graphs`)
-- [ ] Cover all six families (Llama, Mistral, Mixtral, Qwen, DeepSeek, Gemma)
-- [ ] Compare all families against llama.cpp — a family that is 2× slower than Llama in ratio terms indicates a family-specific kernel problem
+- [ ] Build with `--features nccl` for multi-GPU runs
 - [ ] Record `nvidia-smi` output: GPU model, VRAM total, driver version
-- [ ] For multi-GPU: record which TP degree was used
+- [ ] Report TP=2 and TP=8 for each large model (single-GPU in cuda-single.md)
+- [ ] One unified table — no separate TP-scaling table for a single model
 
 ---
 
@@ -367,4 +389,4 @@ a meaningful measurement is taken. Git history provides the full timeline.
 | CPU | [results/cpu.md](results/cpu.md) | ✓ baseline recorded |
 | Metal | [results/metal.md](results/metal.md) | ✓ baseline recorded |
 | CUDA — single GPU (L4) | [results/cuda-single.md](results/cuda-single.md) | ✓ L4 baseline + A100 baseline recorded |
-| CUDA — multi-GPU (8× A100) | [results/cuda-multi.md](results/cuda-multi.md) | ✓ llama.cpp GPU-scaling baseline recorded; infernum TP pending |
+| CUDA — multi-GPU (8× A100) | [results/cuda-multi.md](results/cuda-multi.md) | ✓ infernum TP=2 and TP=8 recorded for 70B/72B; Qwen3-235B pending |

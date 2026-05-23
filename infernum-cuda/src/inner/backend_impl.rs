@@ -834,22 +834,30 @@ impl infernum::backend::MlaAttentionOps for CudaBackend {
         let q_absorbed = q_absorbed_2d.reshape(&[1, num_heads, kv_lora_rank + qk_rope_head_dim]);
 
         // Broadcast single KV head to num_heads.
+        // repeat_kv_f32 kernel requires F32 input; cast from BF16 (the KV cache dtype)
+        // to avoid reading 2× past the buffer and causing CUDA_ERROR_ILLEGAL_ADDRESS.
         let kv_3d = full_kv.reshape(&[seq_len, 1, kv_lora_rank + qk_rope_head_dim]);
-        let kv_expanded = <CudaBackend as TensorOps>::repeat_kv(&kv_3d, num_heads)?;
-        // kv_expanded: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim]
+        let kv_3d_f32 = ops::cast_to_f32(&kv_3d)?;
+        let kv_expanded = <CudaBackend as TensorOps>::repeat_kv(&kv_3d_f32, num_heads)?;
+        // kv_expanded: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim] in F32
 
+        // Cast Q to F32 to match kv_expanded so fused_attention_decode uses a single dtype.
+        let q_absorbed_f32 = ops::cast_to_f32(&q_absorbed)?;
         let attn_out = <CudaBackend as AttentionOps>::fused_attention_decode(
-            &q_absorbed,
+            &q_absorbed_f32,
             &kv_expanded,
             &kv_expanded,
             Some(attn_scale),
             None,
             None,
         )?;
-        // attn_out: [1, num_heads, kv_lora_rank + qk_rope_head_dim]
+        // attn_out: [1, num_heads, kv_lora_rank + qk_rope_head_dim] in F32
 
         // --- V absorption: take only the kv_lora_rank portion, then decompress ---
         let attn_flat = attn_out.reshape(&[num_heads, kv_lora_rank + qk_rope_head_dim]);
+        // Cast back to the model's working dtype (BF16) for the subsequent matmuls
+        // with BF16 weights (kv_b_proj_v, o_proj).
+        let attn_flat = ops::cast_f32_to_bf16(&attn_flat)?;
         let (attn_nope, _) = ops::split_inner_dim(&attn_flat, kv_lora_rank, qk_rope_head_dim)?;
         // attn_nope: [num_heads, kv_lora_rank]
 

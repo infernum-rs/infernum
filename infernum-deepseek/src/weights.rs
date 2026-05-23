@@ -4,6 +4,7 @@
 //! the graph builder and the CUDA unit tests.
 
 use infernum::backend::{TensorDataOps, TensorFactory};
+use infernum::shard::ShardConfig;
 use infernum::tensor::Tensor;
 use infernum::Result;
 
@@ -100,4 +101,75 @@ pub fn split_kv_b_proj_dense<B: TensorFactory + TensorDataOps>(
     )?;
 
     Ok((k_tensor, v_tensor, k_t_tensor))
+}
+
+/// Split and shard `kv_b_proj` for one tensor-parallel rank.
+///
+/// Calls [`split_kv_b_proj_dense`] to get the full per-head tensors, then
+/// extracts the slice for rank `shard.rank` out of `shard.world_size`:
+/// - `k_shard`:   `(kv_lora_rank, num_heads_local * qk_nope_dim)`
+/// - `v_shard`:   `(num_heads_local, kv_lora_rank, v_head_dim)`
+/// - `k_t_shard`: `(num_heads_local, qk_nope_dim, kv_lora_rank)`
+///
+/// # Errors
+///
+/// Returns an error if tensor data extraction or construction fails.
+pub fn split_kv_b_proj_dense_sharded<B: TensorFactory + TensorDataOps>(
+    device: &B::DeviceHandle,
+    weight: &B::Tensor,
+    num_heads: usize,
+    qk_nope_dim: usize,
+    v_head_dim: usize,
+    shard: &ShardConfig,
+) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
+    let (k_full, v_full, k_t_full) =
+        split_kv_b_proj_dense::<B>(device, weight, num_heads, qk_nope_dim, v_head_dim)?;
+
+    let nh_local = num_heads / shard.world_size;
+    let rank = shard.rank;
+    let dtype = weight.dtype();
+    let elem = dtype.size_in_bytes();
+    let kv_lora = weight.shape()[0];
+
+    // k_full: [kv_lora, num_heads * qk_nope] — heads are consecutive column groups.
+    // Each row contributes non-contiguous columns, so extract row by row.
+    let k_data = B::to_raw_bytes(&k_full)?;
+    let k_cols_full = num_heads * qk_nope_dim;
+    let k_cols_local = nh_local * qk_nope_dim;
+    let mut k_shard_data = vec![0u8; kv_lora * k_cols_local * elem];
+    for row in 0..kv_lora {
+        let src = (row * k_cols_full + rank * k_cols_local) * elem;
+        let dst = row * k_cols_local * elem;
+        k_shard_data[dst..dst + k_cols_local * elem]
+            .copy_from_slice(&k_data[src..src + k_cols_local * elem]);
+    }
+
+    // v_full: [num_heads, kv_lora, v_head] — contiguous head block.
+    let v_data = B::to_raw_bytes(&v_full)?;
+    let v_inner = kv_lora * v_head_dim;
+    let v_shard_data =
+        v_data[rank * nh_local * v_inner * elem..(rank + 1) * nh_local * v_inner * elem].to_vec();
+
+    // k_t_full: [num_heads, qk_nope, kv_lora] — contiguous head block.
+    let k_t_data = B::to_raw_bytes(&k_t_full)?;
+    let k_t_inner = qk_nope_dim * kv_lora;
+    let k_t_shard_data = k_t_data
+        [rank * nh_local * k_t_inner * elem..(rank + 1) * nh_local * k_t_inner * elem]
+        .to_vec();
+
+    let k_shard = B::from_raw_bytes(device, &[kv_lora, k_cols_local], dtype, &k_shard_data)?;
+    let v_shard = B::from_raw_bytes(
+        device,
+        &[nh_local, kv_lora, v_head_dim],
+        dtype,
+        &v_shard_data,
+    )?;
+    let k_t_shard = B::from_raw_bytes(
+        device,
+        &[nh_local, qk_nope_dim, kv_lora],
+        dtype,
+        &k_t_shard_data,
+    )?;
+
+    Ok((k_shard, v_shard, k_t_shard))
 }

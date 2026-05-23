@@ -146,8 +146,8 @@ run_infernum() {
     local out
     out=$(cargo run --release --example bench_metal --features metal -q -- \
         "${model_path}" "${N_GEN}" --n-prompt "${N_PROMPT}" 2>/dev/null || true)
-    local pre; pre=$(echo "${out}" | grep "^prefill:" | sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1)
-    local dec; dec=$(echo "${out}" | grep "^decode:" | sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1)
+    local pre; pre=$(echo "${out}" | grep "^prefill:" | sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1 || true)
+    local dec; dec=$(echo "${out}" | grep "^decode:" | sed -n 's/.*= \([0-9.]*\) tok\/s.*/\1/p' | tail -1 || true)
     INFNUM_PRE="${pre:-ERR}"; INFNUM_DEC="${dec:-ERR}"
 }
 
@@ -155,8 +155,8 @@ run_infernum() {
 run_llama_bench() {
     local gguf="$1"
     LLAMA_PRE="—"; LLAMA_DEC="—"
-    $HAS_LLAMA_CPP || return
-    $DRY_RUN && return
+    $HAS_LLAMA_CPP || return 0
+    $DRY_RUN && return 0
     # One llama-bench invocation with both -p (prefill) and -n (decode) produces
     # two JSONL lines: prompt-processing first, then token-generation.
     local out
