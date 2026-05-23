@@ -125,9 +125,9 @@ impl<B> DeepSeekGraphOps for B where
 // GGUF name mapping and shard strategy
 // ---------------------------------------------------------------------------
 
-/// Map a `SafeTensors` weight name to its GGUF tensor name for DeepSeek models.
+/// Map a `SafeTensors` weight name to its GGUF tensor name for `DeepSeek` models.
 ///
-/// Virtual kv_b weights (`kv_b_proj_k/v/k_t`) all map to the same
+/// Virtual `kv_b` weights (`kv_b_proj_k/v/k_t`) all map to the same
 /// `blk.N.attn_kv_b.weight` on-disk tensor — the GGUF loader is responsible
 /// for splitting it after load.
 ///
@@ -190,7 +190,7 @@ pub fn safetensors_to_gguf_name(name: &str) -> String {
     }
 }
 
-/// Return the tensor-parallel shard strategy for a DeepSeek weight by its
+/// Return the tensor-parallel shard strategy for a `DeepSeek` weight by its
 /// `SafeTensors` name.
 ///
 /// MLA-specific rules:

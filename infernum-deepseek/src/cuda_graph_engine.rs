@@ -221,7 +221,7 @@ fn shard_bf16_slice(
 /// graph are `SafeTensors` names; [`safetensors_to_gguf_name`] converts them to
 /// GGUF tensor names for lookup.
 ///
-/// kv_b_proj split: the three virtual weights all map to `blk.N.attn_kv_b.weight`
+/// `kv_b_proj` split: the three virtual weights all map to `blk.N.attn_kv_b.weight`
 /// in GGUF. The on-disk tensor is loaded once per layer and split via
 /// [`split_kv_b_proj_dense`] (or the sharded variant).
 ///
