@@ -560,16 +560,17 @@ fn causal_attention(
         let k_t = transpose_kv_heads(k, kv_len, num_kv_heads, head_dim);
         let v_t = transpose_kv_heads(v, kv_len, num_kv_heads, head_dim);
         let parallel_units = seq_len * num_kv_heads;
-        let chunk_size = parallel_units.div_ceil(num_threads);
-        let num_tasks = parallel_units.div_ceil(chunk_size);
+        // Strided round-robin: each thread gets every num_tasks-th unit, interleaved.
+        // Causal attention work grows linearly with seq position (attend_len = s+1), so
+        // contiguous chunks create severe imbalance. Striding distributes early/late
+        // positions evenly across threads.
+        let num_tasks = num_threads.min(parallel_units);
         let out_addr = output.as_mut_ptr() as usize;
         let q_addr = q.as_ptr() as usize;
         let kt_addr = k_t.as_ptr() as usize;
         let vt_addr = v_t.as_ptr() as usize;
 
         pool.dispatch(num_tasks, |task_id, _| {
-            let unit_start = task_id * chunk_size;
-            let unit_end = (unit_start + chunk_size).min(parallel_units);
             // Safety: each task writes to disjoint (s, h_start..h_start+gqa_ratio) output slots.
             let out_s = unsafe {
                 std::slice::from_raw_parts_mut(out_addr as *mut f32, total_units * head_dim)
@@ -584,7 +585,7 @@ fn causal_attention(
             };
 
             let mut scores_buf: Vec<f32> = Vec::new();
-            for unit in unit_start..unit_end {
+            for unit in (task_id..parallel_units).step_by(num_tasks) {
                 let s = unit / num_kv_heads;
                 let kv_h = unit % num_kv_heads;
                 attention_gqa_group(
