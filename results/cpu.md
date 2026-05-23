@@ -175,3 +175,29 @@ Fix: before parallel dispatch, transpose K and V to `[num_kv_heads, kv_len, head
 - Prefill gains are large because the previous session was measured in powersave mode; also includes strided attention dispatch and target-cpu=native.
 - Decode benchmark methodology changed: now uses `--graph-decode` (pre-planned executor) which is 2× faster than the eager `Engine` for this model size. The old eager numbers were not a true measure of kernel performance.
 - Remaining gaps: Q8_0 decode 0.84x, Q4_0 decode 0.76x, Q8_0 prefill 0.87x, Q4_0 prefill 0.72x, Gemma decode 0.82x, Gemma prefill 0.71x.
+
+---
+
+## 2026-05-24 — Eliminate local_out scatter via n_stride (`perf/cpu-performance`)
+
+**Change:** Added `n_stride` parameter to `gemm_q8_tiled` so each thread writes directly into the strided global output matrix, eliminating the per-thread `local_out: Vec<f32>` allocation and scatter loop (512 `copy_from_slice` calls per GEMM dispatch). All 5 Q8_0 GEMM callsites in `matmul.rs` updated.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** `c0e1035`
+
+### vs previous best
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q4_0 prefill | 929.7 | 948.0 | **+2.0%** |
+| SmolLM2-360M Q4_0 decode | 155.0 | 158.4 | **+2.2%** |
+| SmolLM2-360M Q8_0 prefill | 973.5 | 980.0 | +0.7% |
+| SmolLM2-360M Q8_0 decode | 119.8 | 116.7 | −2.6% (noise) |
+| Gemma Q8_0 prefill | 154.3 | 154.1 | flat |
+| Gemma Q8_0 decode | 20.3 | 20.2 | flat |
+
+### Notes
+
+- Gains are modest because the scatter loop was not the dominant bottleneck (local_out was small enough to stay warm in cache).
+- Benefit is primarily in Q4_0 paths where the scatter cost relative to GEMM work was slightly higher.
+- Remaining gaps vs llama.cpp: Q4_0 prefill ~0.73x, Q8_0 prefill ~0.88x, Q4_0 decode ~0.78x, Q8_0 decode ~0.82x.
