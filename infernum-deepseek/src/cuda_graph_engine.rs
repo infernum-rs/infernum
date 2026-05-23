@@ -218,7 +218,7 @@ fn shard_bf16_slice(
 /// Load all graph weights from a GGUF file.
 ///
 /// Mirrors `load_weights_cuda` but reads from GGUF format. Weight names in the
-/// graph are SafeTensors names; [`safetensors_to_gguf_name`] converts them to
+/// graph are `SafeTensors` names; [`safetensors_to_gguf_name`] converts them to
 /// GGUF tensor names for lookup.
 ///
 /// kv_b_proj split: the three virtual weights all map to `blk.N.attn_kv_b.weight`
@@ -236,6 +236,7 @@ fn shard_bf16_slice(
 /// # Errors
 ///
 /// Returns an error if any weight cannot be found or uploaded to the GPU.
+#[allow(clippy::too_many_lines)]
 fn load_weights_gguf(
     dummy_graph: &Graph<CudaBackend>,
     ctx: &CudaContext,
@@ -359,24 +360,24 @@ fn load_weights_gguf(
 
         // MLA does not use interleaved RoPE on Q/K projections; no un-permutation needed.
         let supports_quant_sharding = match file_dtype {
-            DType::Q8_0 | DType::Q4_0 => shard.map_or(true, |s| {
+            DType::Q8_0 | DType::Q4_0 => shard.is_none_or(|s| {
                 strategy != ShardStrategy::Row
                     || loader
                         .get_shape(&effective_gguf_name)
                         .ok()
                         .and_then(|sh| sh.get(1).copied())
-                        .map_or(false, |n_cols| {
-                            (n_cols / QUANTIZATION_BLOCK_SIZE) % s.world_size == 0
+                        .is_some_and(|n_cols| {
+                            (n_cols / QUANTIZATION_BLOCK_SIZE).is_multiple_of(s.world_size)
                         })
             }),
-            DType::Q4_K | DType::Q5_K => shard.map_or(true, |s| {
+            DType::Q4_K | DType::Q5_K => shard.is_none_or(|s| {
                 strategy != ShardStrategy::Row
                     || loader
                         .get_shape(&effective_gguf_name)
                         .ok()
                         .and_then(|sh| sh.get(1).copied())
-                        .map_or(false, |n_cols| {
-                            (n_cols / Q4K_BLOCK_ELEMENTS) % s.world_size == 0
+                        .is_some_and(|n_cols| {
+                            (n_cols / Q4K_BLOCK_ELEMENTS).is_multiple_of(s.world_size)
                         })
             }),
             _ => false,
@@ -584,6 +585,7 @@ impl DeepSeekCudaEngine {
     }
 
     /// Allocate a fresh, empty MLA KV state.
+    #[must_use]
     pub fn fresh_kv(&self) -> MlaKvState {
         MlaKvState {
             kv: vec![Vec::new(); self.config.num_hidden_layers],
