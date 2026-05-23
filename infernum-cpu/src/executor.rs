@@ -47,7 +47,7 @@ pub fn print_op_profile() {
             return;
         }
         let mut entries: Vec<_> = map.iter().collect();
-        entries.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.1 .0));
         let total: Duration = entries.iter().map(|e| e.1 .0).sum();
         eprintln!("\n[INFERNUM_PROFILE] per-op timing breakdown:");
         eprintln!(

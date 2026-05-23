@@ -287,6 +287,121 @@ impl PagedKvCacheOps for CpuBackend {
 
 // ---- Attention ----
 
+/// Transpose K or V from [kv_len, num_kv_heads, head_dim] to [num_kv_heads, kv_len, head_dim].
+///
+/// The original layout forces a stride of `num_kv_heads * head_dim` between consecutive
+/// kv positions for a fixed head — the hardware prefetcher cannot stream this. After
+/// transposing, consecutive kv positions for the same head are contiguous.
+fn transpose_kv_heads(
+    src: &[f32],
+    kv_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let mut dst = vec![0.0f32; kv_len * num_kv_heads * head_dim];
+    for pos in 0..kv_len {
+        for kv_h in 0..num_kv_heads {
+            let src_off = (pos * num_kv_heads + kv_h) * head_dim;
+            let dst_off = (kv_h * kv_len + pos) * head_dim;
+            dst[dst_off..dst_off + head_dim].copy_from_slice(&src[src_off..src_off + head_dim]);
+        }
+    }
+    dst
+}
+
+/// Process one GQA group (all `gqa_ratio` query heads sharing one KV head) for one seq position.
+///
+/// `k_t` and `v_t` are in transposed layout [num_kv_heads, kv_len, head_dim] so iteration over
+/// kv_pos is a contiguous streaming read. Reads K and V once per kv_pos instead of once per
+/// (s,h) pair, reducing K/V bandwidth by `gqa_ratio` relative to the per-(s,h) approach.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+fn attention_gqa_group(
+    output: &mut [f32],
+    q: &[f32],
+    k_t: &[f32],
+    v_t: &[f32],
+    s: usize,
+    kv_h: usize,
+    kv_len: usize,
+    num_heads: usize,
+    _num_kv_heads: usize,
+    head_dim: usize,
+    gqa_ratio: usize,
+    offset: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
+    scores_buf: &mut Vec<f32>,
+) {
+    let h_start = kv_h * gqa_ratio;
+    let kv_base = kv_h * kv_len * head_dim;
+    let query_pos = offset + s;
+
+    let scores_len = gqa_ratio * kv_len;
+    if scores_buf.len() < scores_len {
+        scores_buf.resize(scores_len, 0.0);
+    }
+
+    // Phase 1: QK^T — stream K once, dot with all query heads in the group.
+    for kv_pos in 0..kv_len {
+        let k_off = kv_base + kv_pos * head_dim;
+        let k_vec = &k_t[k_off..k_off + head_dim];
+
+        for g in 0..gqa_ratio {
+            let h = h_start + g;
+            let q_off = (s * num_heads + h) * head_dim;
+            let mut dot = crate::simd::dot_f32(&q[q_off..q_off + head_dim], k_vec) * scale;
+            if let Some(cap) = softcap {
+                dot = cap * (dot / cap).tanh();
+            }
+            scores_buf[g * kv_len + kv_pos] = dot;
+        }
+    }
+
+    // Phase 2: causal mask + softmax, per head.
+    for g in 0..gqa_ratio {
+        let scores = &mut scores_buf[g * kv_len..(g + 1) * kv_len];
+        for score in scores.iter_mut().skip(query_pos + 1) {
+            *score = f32::NEG_INFINITY;
+        }
+        if let Some(window) = sliding_window {
+            if query_pos >= window {
+                for score in &mut scores[..=(query_pos - window)] {
+                    *score = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for score in scores.iter_mut() {
+            *score = (*score - max_score).exp();
+            sum += *score;
+        }
+        if sum > 0.0 {
+            let inv_sum = 1.0 / sum;
+            for score in scores.iter_mut() {
+                *score *= inv_sum;
+            }
+        }
+    }
+
+    // Phase 3: V accumulation — stream V once, accumulate into all heads in the group.
+    let attend_len = (query_pos + 1).min(kv_len);
+    for kv_pos in 0..attend_len {
+        let v_off = kv_base + kv_pos * head_dim;
+        let v_vec = &v_t[v_off..v_off + head_dim];
+
+        for g in 0..gqa_ratio {
+            let w = scores_buf[g * kv_len + kv_pos];
+            if w > 0.0 {
+                let h = h_start + g;
+                let o_off = (s * num_heads + h) * head_dim;
+                crate::simd::vec_fmadd(&mut output[o_off..o_off + head_dim], v_vec, w);
+            }
+        }
+    }
+}
+
 /// Process a single (seq_pos, head) attention unit: Q·K^T, mask, softmax, V weighted sum.
 ///
 /// Writes directly into `output` at the correct offset. Each (s, h) pair
@@ -386,9 +501,12 @@ fn attention_head_unit(
 
 /// Causal attention: Q @ K^T * scale, mask, softmax, @ V.
 ///
-/// Parallelized across the `(seq_pos, head)` dimension — each unit writes
-/// to a disjoint region of the output, so no synchronization is needed.
-#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+/// - **Prefill (seq_len > 1):** GQA-aware parallel dispatch. Transposes K/V to
+///   [num_kv_heads, kv_len, head_dim] for contiguous streaming, then parallelizes over
+///   (seq_pos, kv_head) GQA groups — reads K and V once per group instead of `gqa_ratio` times.
+/// - **Decode (seq_len = 1):** same per-(s,h) dispatch as before; K/V transposition overhead
+///   is not amortized for a single query position so the original layout is kept.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names, clippy::too_many_lines)]
 fn causal_attention(
     q: &[f32],
     k: &[f32],
@@ -436,6 +554,64 @@ fn causal_attention(
         return output;
     }
 
+    // Prefill: GQA-aware parallel dispatch with K/V transposition.
+    // For seq_len > 1 the transpose cost is amortized over many query positions and the
+    // contiguous K/V access pattern substantially reduces memory-bandwidth pressure.
+    if seq_len > 1 {
+        let k_t = transpose_kv_heads(k, kv_len, num_kv_heads, head_dim);
+        let v_t = transpose_kv_heads(v, kv_len, num_kv_heads, head_dim);
+        let parallel_units = seq_len * num_kv_heads;
+        let chunk_size = parallel_units.div_ceil(num_threads);
+        let num_tasks = parallel_units.div_ceil(chunk_size);
+        let out_addr = output.as_mut_ptr() as usize;
+        let q_addr = q.as_ptr() as usize;
+        let kt_addr = k_t.as_ptr() as usize;
+        let vt_addr = v_t.as_ptr() as usize;
+
+        pool.dispatch(num_tasks, |task_id, _| {
+            let unit_start = task_id * chunk_size;
+            let unit_end = (unit_start + chunk_size).min(parallel_units);
+            // Safety: each task writes to disjoint (s, h_start..h_start+gqa_ratio) output slots.
+            let out_s = unsafe {
+                std::slice::from_raw_parts_mut(out_addr as *mut f32, total_units * head_dim)
+            };
+            let q_s =
+                unsafe { std::slice::from_raw_parts(q_addr as *const f32, total_units * head_dim) };
+            let kt_s = unsafe {
+                std::slice::from_raw_parts(kt_addr as *const f32, kv_len * num_kv_heads * head_dim)
+            };
+            let vt_s = unsafe {
+                std::slice::from_raw_parts(vt_addr as *const f32, kv_len * num_kv_heads * head_dim)
+            };
+
+            let mut scores_buf: Vec<f32> = Vec::new();
+            for unit in unit_start..unit_end {
+                let s = unit / num_kv_heads;
+                let kv_h = unit % num_kv_heads;
+                attention_gqa_group(
+                    out_s,
+                    q_s,
+                    kt_s,
+                    vt_s,
+                    s,
+                    kv_h,
+                    kv_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gqa_ratio,
+                    offset,
+                    scale,
+                    softcap,
+                    sliding_window,
+                    &mut scores_buf,
+                );
+            }
+        });
+        return output;
+    }
+
+    // Decode: original per-(s,h) dispatch — no K/V transposition overhead.
     let chunk_size = total_units.div_ceil(num_threads);
     let num_tasks = total_units.div_ceil(chunk_size);
     let out_addr = output.as_mut_ptr() as usize;
