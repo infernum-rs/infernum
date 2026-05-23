@@ -1035,8 +1035,8 @@ fn quantized_linear_pair(
                     bpr,
                 );
             } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
+                let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
                 let out1_addr = ptr_to_usize(out1.as_mut_ptr());
                 let out2_addr = ptr_to_usize(out2.as_mut_ptr());
 
@@ -1115,8 +1115,8 @@ fn quantized_linear_pair(
                     bpr,
                 );
             } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
+                let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
                 let out1_addr = ptr_to_usize(out1.as_mut_ptr());
                 let out2_addr = ptr_to_usize(out2.as_mut_ptr());
 
@@ -1284,9 +1284,9 @@ fn quantized_linear_triple(
                     bpr,
                 );
             } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
+                let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
+                let chunk3 = (n3.div_ceil(num_threads).max(min_neurons).min(n3) + 1) & !1;
                 let out1_addr = ptr_to_usize(out1.as_mut_ptr());
                 let out2_addr = ptr_to_usize(out2.as_mut_ptr());
                 let out3_addr = ptr_to_usize(out3.as_mut_ptr());
@@ -1399,9 +1399,9 @@ fn quantized_linear_triple(
                     bpr,
                 );
             } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
+                let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
+                let chunk3 = (n3.div_ceil(num_threads).max(min_neurons).min(n3) + 1) & !1;
                 let out1_addr = ptr_to_usize(out1.as_mut_ptr());
                 let out2_addr = ptr_to_usize(out2.as_mut_ptr());
                 let out3_addr = ptr_to_usize(out3.as_mut_ptr());
