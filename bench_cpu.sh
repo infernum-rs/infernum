@@ -171,7 +171,7 @@ run_infernum_decode() {
     [[ -n "${THREADS}" ]] && thread_args=(-j "${THREADS}")
     local out
     out=$(timeout 600 cargo run --release --example bench_cpu --features cpu -q -- \
-        "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
+        --graph-decode "${model_path}" "${N_TOKENS}" "${thread_args[@]}" 2>/dev/null || true)
     local toks; toks=$(echo "${out}" | extract_toks)
     echo "${toks:-ERR}"
 }

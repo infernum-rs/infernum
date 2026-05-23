@@ -117,3 +117,61 @@ Fix: before parallel dispatch, transpose K and V to `[num_kv_heads, kv_len, head
 - Decode is unaffected (transposition skipped for seq_len=1).
 - The Q4_0 prefill gain (+13.9%) is larger than Q8_0 (+6.1%) because Q4_0 has more compute per GEMM step, so the relative cost of attention memory bandwidth was higher before the fix.
 - Cumulative prefill vs llama.cpp: Q8_0 ~0.82×, Q4_0 ~0.72×, Gemma Q8_0 ~0.74× (extrapolated from % gains applied to governor-normal baseline).
+
+---
+
+## 2026-05-23 — Strided dispatch + target-cpu=native + decode benchmark fix (`perf/cpu-performance`)
+
+**Changes:**
+
+1. **Attention strided dispatch** (`attention.rs`): Prefill GQA attention was dispatched in contiguous chunks of `(seq_pos, kv_head)` units. Causal work grows linearly with seq position, so contiguous chunks created severe load imbalance (early positions are cheap, late are expensive). Fixed with strided round-robin dispatch: thread `t` handles units `t, t+num_tasks, t+2*num_tasks, ...`. Load imbalance drops from ~22× to <1%.
+
+2. **`target-cpu=native`** (`.cargo/config.toml`): All non-`#[target_feature]` code was compiling for SSE2 baseline. Adding this flag lets LLVM use AVX2/AVX-512 for loops like Q4 expansion, softmax, RMSNorm scalar multiply, etc.
+
+3. **Parallelized `silu` and `logit_softcap`** (`arith.rs`): Were scalar single-threaded. Now dispatched across the thread pool.
+
+4. **Uninitialized GEMM output buffers** (`matmul.rs`): `local_out: Vec<f32>` and `expanded: Vec<u8>` in `q8_gemm_tiled` / `q4_gemm_tiled` were zero-initialized. Both the microkernel and `expand_q4_to_int8` write every element; replaced with `Vec::with_capacity + set_len` to skip the redundant memset.
+
+5. **Decode benchmark fixed** (`bench_cpu.sh`): `run_infernum_decode` was using the eager `Engine` wrapper which adds ~2× overhead vs direct graph execution. Switched to `--graph-decode` (pre-planned graph executor with KvCacheStore), giving a fair comparison with llama.cpp's decode path.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** `40a5f04`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, best of 3 reps)
+
+### Decode throughput (tok/s)
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / SmolLM2-360M | SafeTensors F32 | 43.9 | — | — |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 119.8 | 142.2 | 0.84x |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 155.0 | 203.7 | 0.76x |
+| Qwen / Qwen2.5-0.5B | SafeTensors F32 | 34.8 | — | — |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 20.3 | 24.8 | 0.82x |
+
+### Prefill throughput (tok/s)
+
+| Model | Format | infernum | llama.cpp | ratio |
+| ----- | ------ | -------: | --------: | ----: |
+| Llama / SmolLM2-360M | SafeTensors F32 | 540.1 | — | — |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 973.5 | 1118.4 | 0.87x |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 929.7 | 1295.1 | 0.72x |
+| Qwen / Qwen2.5-0.5B | SafeTensors F32 | 416.8 | — | — |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 154.3 | 217.1 | 0.71x |
+
+### vs previous best (GQA-aware attention session, governor-normal extrapolated)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2 Q8_0 decode (graph-decode) | ~108 | 119.8 | +11% |
+| SmolLM2 Q4_0 decode (graph-decode) | ~145 | 155.0 | +7% |
+| Gemma Q8_0 decode (graph-decode) | ~20 | 20.3 | ~flat |
+| SmolLM2 Q8_0 prefill | ~720 | 973.5 | +35% |
+| SmolLM2 Q4_0 prefill | ~679 | 929.7 | +37% |
+| Gemma Q8_0 prefill | ~129 | 154.3 | +20% |
+
+### Notes
+
+- Prefill gains are large because the previous session was measured in powersave mode; also includes strided attention dispatch and target-cpu=native.
+- Decode benchmark methodology changed: now uses `--graph-decode` (pre-planned executor) which is 2× faster than the eager `Engine` for this model size. The old eager numbers were not a true measure of kernel performance.
+- Remaining gaps: Q8_0 decode 0.84x, Q4_0 decode 0.76x, Q8_0 prefill 0.87x, Q4_0 prefill 0.72x, Gemma decode 0.82x, Gemma prefill 0.71x.
