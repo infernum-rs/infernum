@@ -261,17 +261,16 @@ The multi-GPU node enables tensor-parallel inference over large models. All mode
 |--------|-------|--------|--------------|----------------|
 | Llama | Llama-3.1-70B | GGUF Q4_0 | ~40 GB | TP=2 (fits on 1 GPU; TP=8 adds NCCL overhead) |
 | Qwen | Qwen3-72B | GGUF Q4_K_M | ~42 GB | TP=2 |
-| Qwen | Qwen3-235B-A22B (MoE) | GGUF Q4_K_M | ~142 GB | TP=2 or TP=8 |
-| Qwen | Qwen3-235B-A22B (MoE) | BF16 | ~470 GB | TP=8 only |
+| Qwen | Qwen3-235B-A22B (MoE) | GGUF Q4_K_M | ~133 GB | **TP=2 only** — model has 4 KV heads; TP=4+ gives 0 or 1 KV heads/rank |
 | Mixtral | Mixtral-8x7B (MoE) | BF16 | ~92 GB | TP=2 |
 | Mixtral | Mixtral-8x22B (MoE) | BF16 | ~282 GB | TP=4 |
-| DeepSeek | DeepSeek-V3 (MoE) | GGUF Q4_0 | ~335 GB | TP=4–8 |
-| DeepSeek | DeepSeek-R1 (MoE) | GGUF Q4_0 | ~335 GB | TP=4–8 |
+| DeepSeek | DeepSeek-V3 (MoE) | GGUF Q4_0 | ~335 GB | TP=2 and TP=8 |
+| DeepSeek | DeepSeek-R1 (MoE) | GGUF Q4_0 | ~335 GB | TP=2 and TP=8 |
 | Gemma | Gemma-3-27B | BF16 | ~54 GB | TP=1 |
 
-DeepSeek-V3/R1 BF16 does not fit on 8× A100/H100 (~1.3 TB). GGUF Q4 (~335 GB) fits on TP=4-8 and is the recommended format for these models.
+DeepSeek-V3/R1 BF16 does not fit on 8× A100/H100 (~1.3 TB). GGUF Q4 (~335 GB) fits on TP=2–8 and is the recommended format.
 
-**Primary multi-GPU targets:** Llama-3.1-70B Q4_0 (dense baseline), Qwen3-72B Q4_K_M, Qwen3-235B-A22B Q4_K_M (MoE + Qwen path).
+**Primary multi-GPU targets:** Llama-3.1-70B Q4_0 (dense baseline), Qwen3-72B Q4_K_M, Qwen3-235B-A22B Q4_K_M (MoE, TP=2 only), DeepSeek-V3 Q4_0 (TP=2 and TP=8 once GGUF support lands).
 
 ### Dtypes (CUDA)
 
