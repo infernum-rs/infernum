@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use infernum::block_allocator::{BlockConfig, BlockTable};
-use infernum::dtype::{Q4K_BLOCK_ELEMENTS, Q5K_BLOCK_ELEMENTS};
+use infernum::dtype::Q4K_BLOCK_ELEMENTS;
 use infernum::graph::{optimizer, plan, ExecutionPlan, Graph, NodeId, WeightId, WeightStore};
 use infernum::shard::{shard_strategy_for_weight, ShardConfig, ShardStrategy};
 use infernum::weights::QuantizationConfig;
@@ -118,10 +118,10 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
 
     /// Load all model weights from a GGUF file into CUDA memory.
     ///
-    /// Quantized weights (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) are kept in their quantized form
+    /// Quantized weights (`Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`) are kept in their quantized form
     /// on the GPU; non-quantized weights are dequantized to BF16. Q and K
-    /// projection weights are un-permuted from GGUF's interleaved RoPE layout
-    /// to the HuggingFace sequential layout before upload.
+    /// projection weights are un-permuted from GGUF's interleaved `RoPE` layout
+    /// to the `HuggingFace` sequential layout before upload.
     ///
     /// When `shard` is `Some`, each linear weight is sliced at block boundaries
     /// to this rank's portion before uploading (enabling GGUF tensor-parallel).
@@ -248,16 +248,16 @@ pub fn load_graph_weights_cuda(
 
 /// Load all graph weights from a GGUF file into CUDA memory.
 ///
-/// Quantized weights (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) are kept in quantized form on the GPU
+/// Quantized weights (`Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`) are kept in quantized form on the GPU
 /// so the existing quantized GEMV kernels can run decode at native quantized
 /// memory bandwidth. Non-quantized weights (BF16/F16/F32) are dequantized to
 /// BF16 on the host.
 ///
-/// Q and K projections are un-permuted from GGUF's interleaved RoPE layout
+/// Q and K projections are un-permuted from GGUF's interleaved `RoPE` layout
 /// before upload. When `shard` is `Some`, each linear weight is sliced at
 /// block boundaries to the rank's portion (enables GGUF tensor-parallelism).
 ///
-/// `name_mapper` converts SafeTensors weight names (as registered in the graph)
+/// `name_mapper` converts `SafeTensors` weight names (as registered in the graph)
 /// to GGUF key names. `n_heads` / `n_kv_heads` are used to compute the head
 /// dimension for the Q/K unpermutation. `is_qk` identifies which mapped GGUF
 /// names require unpermutation. When `lm_head_fallback` is `true`, a missing
@@ -271,7 +271,7 @@ pub fn load_graph_weights_cuda(
 /// # Panics
 ///
 /// Panics if the number of registered weights exceeds `u32::MAX`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn load_graph_weights_gguf_cuda(
     graph: &Graph<CudaBackend>,
     ctx: &CudaContext,
@@ -360,25 +360,25 @@ pub fn load_graph_weights_gguf_cuda(
         // Q4_K and Q5_K use 256-element super-blocks (same alignment check).
         // Misaligned shapes (e.g. Qwen3-72B at TP=8) fall through to BF16.
         let supports_quant_sharding = match file_dtype {
-            DType::Q8_0 | DType::Q4_0 => shard.map_or(true, |s| {
+            DType::Q8_0 | DType::Q4_0 => shard.is_none_or(|s| {
                 strategy != ShardStrategy::Row || {
                     loader
                         .get_shape(&effective_gguf_name)
                         .ok()
                         .and_then(|shape| shape.get(1).copied())
-                        .map_or(false, |n_cols| {
-                            (n_cols / QUANTIZATION_BLOCK_SIZE) % s.world_size == 0
+                        .is_some_and(|n_cols| {
+                            (n_cols / QUANTIZATION_BLOCK_SIZE).is_multiple_of(s.world_size)
                         })
                 }
             }),
-            DType::Q4_K | DType::Q5_K => shard.map_or(true, |s| {
+            DType::Q4_K | DType::Q5_K => shard.is_none_or(|s| {
                 strategy != ShardStrategy::Row || {
                     loader
                         .get_shape(&effective_gguf_name)
                         .ok()
                         .and_then(|shape| shape.get(1).copied())
-                        .map_or(false, |n_cols| {
-                            (n_cols / Q4K_BLOCK_ELEMENTS) % s.world_size == 0
+                        .is_some_and(|n_cols| {
+                            (n_cols / Q4K_BLOCK_ELEMENTS).is_multiple_of(s.world_size)
                         })
                 }
             }),
@@ -1011,8 +1011,8 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     /// Called by [`ShardedGraphEngine`] which downloads all rank-0 GPU tensors to host
     /// before spawning rank threads, preventing an NCCL collective-op deadlock: without
     /// this, some rank threads block in `cuStreamSynchronize(GPU-0 stream)` while other
-    /// threads have already submitted NCCL AllReduces to that stream, deadlocking the ring.
-    #[allow(clippy::too_many_arguments)]
+    /// threads have already submitted NCCL `AllReduce`s to that stream, deadlocking the ring.
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn forward_batch_decode_precomputed(
         &self,
         token_ids_host: &[u32],

@@ -24,7 +24,7 @@ use crate::cuda::ops::cast_to_f32;
 use crate::cuda::quantized::QuantizedTensor;
 use crate::cuda::CudaContext;
 use crate::cuda::CudaTensor;
-use infernum::dtype::{DType, Q4K_BLOCK_ELEMENTS, Q5K_BLOCK_ELEMENTS, Q6_K_BLOCK_ELEMENTS};
+use infernum::dtype::{DType, Q6_K_BLOCK_ELEMENTS};
 use infernum::tensor::Tensor;
 use infernum::Result;
 

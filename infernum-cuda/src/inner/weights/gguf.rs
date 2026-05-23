@@ -107,7 +107,7 @@ impl GgufLoader {
         // Detect pattern: something-NNNNN-of-MMMMM.gguf
         let shard_paths = detect_split_gguf_shards(path, name);
         if let Some(shards) = shard_paths {
-            let refs: Vec<&Path> = shards.iter().map(|p| p.as_path()).collect();
+            let refs: Vec<&Path> = shards.iter().map(std::path::PathBuf::as_path).collect();
             Self::from_split_files(&refs)
         } else {
             Self::from_split_files(&[path])
@@ -496,6 +496,10 @@ impl GgufLoader {
     ///
     /// Returns `(bytes, shape)`. Caller is responsible for uploading and transposing.
     /// Use this in the sharded load path to avoid redundant GPU round-trips.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not found or has an unsupported dtype.
     pub fn load_bf16_bytes(&self, name: &str) -> Result<(Vec<u8>, Vec<usize>)> {
         let info = self
             .tensors
@@ -525,6 +529,10 @@ impl GgufLoader {
     }
 
     /// Load a Q/K tensor as raw BF16 bytes on host, reversing the llama.cpp RoPE permutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not found or has an unsupported dtype.
     pub fn load_bf16_bytes_unpermute(
         &self,
         name: &str,
@@ -907,6 +915,10 @@ impl GgufLoader {
     /// (e.g. Q6_K with k=1536 and TP=8: 6 blocks not divisible by 8).
     ///
     /// Returns `(bf16_bytes, [expert_rows, k])`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not found or has an unsupported dtype.
     pub fn load_bf16_bytes_expert_slice(
         &self,
         name: &str,
@@ -962,6 +974,10 @@ impl GgufLoader {
     /// Supports Q4_K, Q5_K, Q6_K formats. Applies column or row sharding if requested.
     /// For Row sharding, returns an error if `k/block_elems` is not divisible by `world_size`;
     /// callers should fall back to `load_bf16_bytes_expert_slice` in that case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not found, has an unsupported dtype, or sharding alignment fails.
     pub fn load_quantized_expert_slice(
         &self,
         ctx: &CudaContext,
@@ -1005,7 +1021,7 @@ impl GgufLoader {
         let raw_expert = self.tensor_slice_range(info, expert_idx * expert_bytes, expert_bytes);
 
         let do_shard =
-            shard.map_or(false, |s| s.world_size > 1) && strategy != ShardStrategy::Replicate;
+            shard.is_some_and(|s| s.world_size > 1) && strategy != ShardStrategy::Replicate;
 
         if !do_shard {
             return QuantizedTensor::from_raw(ctx, &[expert_rows, k], dtype, raw_expert, &[]);
@@ -1474,10 +1490,7 @@ fn detect_split_gguf_shards(path: &Path, name: &str) -> Option<Vec<std::path::Pa
     // Reconstruct all shard paths in order
     let mut shards = Vec::with_capacity(total);
     for i in 1..=total {
-        let shard_name = format!(
-            "{prefix}-{i:0width$}-of-{total:0width$}.gguf",
-            width = digit_width
-        );
+        let shard_name = format!("{prefix}-{i:0digit_width$}-of-{total:0digit_width$}.gguf");
         shards.push(dir.join(shard_name));
     }
 
