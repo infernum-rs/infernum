@@ -563,7 +563,7 @@ impl DeepSeekCudaEngine {
         #[cfg(feature = "nccl")]
         let comm = self.comm.as_ref();
         #[cfg(not(feature = "nccl"))]
-        let comm: Option<&infernum_cuda::NcclCommunicator> = None;
+        let comm: Option<&()> = None;
 
         let (mut outputs, _) = execute(
             &self.ctx,
