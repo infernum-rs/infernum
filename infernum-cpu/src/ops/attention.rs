@@ -336,14 +336,17 @@ fn attention_gqa_group(
     let h_start = kv_h * gqa_ratio;
     let kv_base = kv_h * kv_len * head_dim;
     let query_pos = offset + s;
+    // Causal bound: only positions 0..attend_len are valid for this query.
+    // On average, attend_len = seq_len/2 for prefill, halving QK^T and AV work.
+    let attend_len = (query_pos + 1).min(kv_len);
 
-    let scores_len = gqa_ratio * kv_len;
+    let scores_len = gqa_ratio * attend_len;
     if scores_buf.len() < scores_len {
         scores_buf.resize(scores_len, 0.0);
     }
 
-    // Phase 1: QK^T — stream K once, dot with all query heads in the group.
-    for kv_pos in 0..kv_len {
+    // Phase 1: QK^T — stream K once up to the causal bound, dot with all query heads.
+    for kv_pos in 0..attend_len {
         let k_off = kv_base + kv_pos * head_dim;
         let k_vec = &k_t[k_off..k_off + head_dim];
 
@@ -354,16 +357,13 @@ fn attention_gqa_group(
             if let Some(cap) = softcap {
                 dot = cap * (dot / cap).tanh();
             }
-            scores_buf[g * kv_len + kv_pos] = dot;
+            scores_buf[g * attend_len + kv_pos] = dot;
         }
     }
 
-    // Phase 2: causal mask + softmax, per head.
+    // Phase 2: softmax per head. No causal mask needed (we only computed up to attend_len).
     for g in 0..gqa_ratio {
-        let scores = &mut scores_buf[g * kv_len..(g + 1) * kv_len];
-        for score in scores.iter_mut().skip(query_pos + 1) {
-            *score = f32::NEG_INFINITY;
-        }
+        let scores = &mut scores_buf[g * attend_len..(g + 1) * attend_len];
         if let Some(window) = sliding_window {
             if query_pos >= window {
                 for score in &mut scores[..=(query_pos - window)] {
@@ -385,14 +385,13 @@ fn attention_gqa_group(
         }
     }
 
-    // Phase 3: V accumulation — stream V once, accumulate into all heads in the group.
-    let attend_len = (query_pos + 1).min(kv_len);
+    // Phase 3: V accumulation — stream V once up to the causal bound.
     for kv_pos in 0..attend_len {
         let v_off = kv_base + kv_pos * head_dim;
         let v_vec = &v_t[v_off..v_off + head_dim];
 
         for g in 0..gqa_ratio {
-            let w = scores_buf[g * kv_len + kv_pos];
+            let w = scores_buf[g * attend_len + kv_pos];
             if w > 0.0 {
                 let h = h_start + g;
                 let o_off = (s * num_heads + h) * head_dim;
