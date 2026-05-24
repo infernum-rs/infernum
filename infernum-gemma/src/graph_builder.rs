@@ -281,9 +281,7 @@ where
 {
     let head_dim = config.head_dim;
 
-    let q = graph.add_linear(h_normed, ids.q_proj);
-    let k = graph.add_linear(h_normed, ids.k_proj);
-    let v = graph.add_linear(h_normed, ids.v_proj);
+    let (q, k, v) = graph.add_linear_triple(h_normed, ids.q_proj, ids.k_proj, ids.v_proj);
 
     // Reshape to 3D [seq_len, num_heads_local, head_dim] for QK-norm and RoPE.
     let q = graph.add_reshape(q, &[seq_len, num_heads_local, head_dim]);
@@ -338,9 +336,7 @@ where
 {
     let head_dim = config.head_dim;
 
-    let q = graph.add_linear(h_normed, ids.q_proj);
-    let k = graph.add_linear(h_normed, ids.k_proj);
-    let v = graph.add_linear(h_normed, ids.v_proj);
+    let (q, k, v) = graph.add_linear_triple(h_normed, ids.q_proj, ids.k_proj, ids.v_proj);
 
     // Reshape to 3D [1, num_heads_local, head_dim] for QK-norm and RoPE.
     let q = graph.add_reshape(q, &[1, num_heads_local, head_dim]);
@@ -458,8 +454,7 @@ where
             graph.add_rms_norm(h, layer_ids.pre_feedforward_layernorm, config.rms_norm_eps);
 
         // GeGLU FFN
-        let gate = graph.add_linear(normed_ffn, layer_ids.gate_proj);
-        let up = graph.add_linear(normed_ffn, layer_ids.up_proj);
+        let (gate, up) = graph.add_linear_pair(normed_ffn, layer_ids.gate_proj, layer_ids.up_proj);
         let activated = graph.add_geglu(gate, up);
         let down_raw = graph.add_linear(activated, layer_ids.down_proj);
         let down = if shard.is_some() {
@@ -606,8 +601,7 @@ where
             graph.add_rms_norm(h, layer_ids.pre_feedforward_layernorm, config.rms_norm_eps);
 
         // GeGLU FFN
-        let gate = graph.add_linear(normed_ffn, layer_ids.gate_proj);
-        let up = graph.add_linear(normed_ffn, layer_ids.up_proj);
+        let (gate, up) = graph.add_linear_pair(normed_ffn, layer_ids.gate_proj, layer_ids.up_proj);
         let activated = graph.add_geglu(gate, up);
         let down_raw = graph.add_linear(activated, layer_ids.down_proj);
         let down = if shard.is_some() {
@@ -721,9 +715,8 @@ where
         let normed = graph.add_rms_norm(h, layer_ids.input_layernorm, config.rms_norm_eps);
 
         // 2. QKV projections
-        let q = graph.add_linear(normed, layer_ids.q_proj);
-        let k = graph.add_linear(normed, layer_ids.k_proj);
-        let v = graph.add_linear(normed, layer_ids.v_proj);
+        let (q, k, v) =
+            graph.add_linear_triple(normed, layer_ids.q_proj, layer_ids.k_proj, layer_ids.v_proj);
 
         // 3. Reshape to 3D [batch_size, num_heads_local, head_dim]
         let q = graph.add_reshape(q, &[batch_size, num_heads_local, head_dim]);
