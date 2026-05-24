@@ -319,3 +319,31 @@ Fix: replaced the per-token `KvStore` (Vec-based) with `KvCacheStore` (Arc-based
 - Q4_0 gains are larger than Q8_0 because Q4_0 has higher nibble-unpack overhead relative to memory load, so the 4-concurrent-load improvement has greater relative impact.
 - Q8_0 prefill jump (+15%) is outside normal prefill variance (±10–15%); may be genuine or noise. The 4-row change does not affect the Q8_0 GEMM (tiled) path, so this is likely measurement variance.
 - Remaining gaps vs llama.cpp: Q4_0 decode ~0.76x, Q8_0 decode ~0.83x, Q4_0 prefill ~0.74x, Q8_0 prefill ~0.92x, Gemma 0.71–0.84x.
+
+---
+
+## 2026-05-24 — vpshufb LUT nibble expansion in Q4_0 GEMV kernels (`perf/cpu-performance`)
+
+**Change:** Replaced the cross-lane nibble expansion in `dot_q4_q8_row_inner`, `dot_q4_q8_2row_inner`, and `dot_q4_q8_4row_inner` with a within-lane `vpshufb` LUT approach (same technique used by llama.cpp's `gemv_q4_b32_8x8_q8_0_lut_avx`).
+
+Old approach: `_mm256_set_m128i(packed, packed)` + `_mm256_and_si256` + `_mm256_srli_epi16` + `_mm256_permute2x128_si256` + `_mm256_sub_epi8` — uses 2 cross-lane ops per row (`vinserti128` + `vperm2i128`, each latency 4 on Zen 4).
+
+New approach: `_mm_and_si128` + `_mm_srli_epi16` + 2× `_mm_shuffle_epi8(lut, ...)` + `_mm256_set_m128i` — 1 cross-lane op per row (`set_m128i`, latency 4) + 2 within-lane `vpshufb` (latency 1 each). LUT: `lut[i] = i - 8` maps unsigned nibble 0–15 → signed -8..7.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum branch:** `perf/cpu-performance`
+
+### vs previous best (4-row GEMV session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q4_0 decode | 157.2 | 158.8 | +1.0% |
+| SmolLM2-360M Q8_0 decode | 118.2 | 117.8 | flat |
+| SmolLM2-360M Q4_0 prefill | 942.0 | 939.1 | flat |
+| SmolLM2-360M Q8_0 prefill | 982.9 | 957.2 | flat (noise) |
+
+### Notes
+
+- The Q4_0 decode improvement (+1.0%) is within the ±2% noise band. The kernel is **memory-bandwidth-bound**: at 158.8 tok/s we use ~27 GB/s effective bandwidth vs llama.cpp's ~36 GB/s, both well below the theoretical DDR5 peak.
+- Since the bottleneck is bandwidth not instruction latency, the cross-lane → within-lane substitution gives minimal measured benefit. However, the change is the correct approach for this ISA (used by llama.cpp for the same reason) and is retained.
+- 8-row GEMV was attempted and rolled back: with 8 accumulators + 8 weight loads + 1 input = 17 YMM registers live simultaneously, the compiler spills to stack and decode regresses ~2–3%.

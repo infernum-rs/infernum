@@ -123,15 +123,17 @@ unsafe fn dot_q4_q8_row_inner(
     weight_scales: &[f32],
 ) -> f32 {
     use std::arch::x86_64::{
-        _mm256_and_si256, _mm256_permute2x128_si256, _mm256_set1_epi8, _mm256_set_m128i,
-        _mm256_srli_epi16, _mm256_sub_epi8, _mm_loadu_si128,
+        _mm256_set_m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_set_epi8,
+        _mm_shuffle_epi8, _mm_srli_epi16,
     };
 
     let num_blocks = weight_scales.len();
     let iq = input_quants.as_ptr();
     let wp = weight_packed.as_ptr();
-    let mask_0f = _mm256_set1_epi8(0x0F);
-    let bias_8 = _mm256_set1_epi8(8);
+    // LUT: lut[i] = i - 8 maps unsigned Q4_0 nibbles (0..15) to signed (-8..7).
+    // vpshufb within a 128-bit lane — no cross-lane permute needed.
+    let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
+    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
 
     let mut total = _mm256_setzero_ps();
 
@@ -141,13 +143,13 @@ unsafe fn dot_q4_q8_row_inner(
         let inp_offset = blk * 32;
         let wp_offset = blk * 16;
 
-        // Unpack 16 bytes → 32 int8
-        let packed_128 = _mm_loadu_si128(wp.add(wp_offset).cast());
-        let packed = _mm256_set_m128i(packed_128, packed_128);
-        let lo = _mm256_and_si256(packed, mask_0f);
-        let hi = _mm256_and_si256(_mm256_srli_epi16(packed, 4), mask_0f);
-        let unpacked = _mm256_permute2x128_si256(lo, hi, 0x20);
-        let weight_i8 = _mm256_sub_epi8(unpacked, bias_8);
+        // Unpack 16 packed nibbles → 32 signed int8 using vpshufb LUT.
+        // Eliminates the vperm2i128 cross-lane op present in the old set_m128i+permute approach.
+        let packed = _mm_loadu_si128(wp.add(wp_offset).cast());
+        let lo_128 = _mm_and_si128(packed, mask_0f);
+        let hi_128 = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_0f);
+        let weight_i8 =
+            _mm256_set_m128i(_mm_shuffle_epi8(lut, hi_128), _mm_shuffle_epi8(lut, lo_128));
 
         let input_i8 = _mm256_loadu_si256(iq.add(inp_offset).cast());
 
@@ -368,16 +370,17 @@ unsafe fn dot_q4_q8_2row_inner(
     weight_scales_1: &[f32],
 ) -> (f32, f32) {
     use std::arch::x86_64::{
-        _mm256_and_si256, _mm256_permute2x128_si256, _mm256_set1_epi8, _mm256_set_m128i,
-        _mm256_srli_epi16, _mm256_sub_epi8, _mm_loadu_si128,
+        _mm256_set_m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_set_epi8,
+        _mm_shuffle_epi8, _mm_srli_epi16,
     };
 
     let num_blocks = input_scales.len();
     let iq = input_quants.as_ptr();
     let wp0 = weight_packed_0.as_ptr();
     let wp1 = weight_packed_1.as_ptr();
-    let mask_0f = _mm256_set1_epi8(0x0F);
-    let bias_8 = _mm256_set1_epi8(8);
+    // vpshufb LUT: maps nibble i (0..15) → i-8 (-8..7), within-lane (latency 1).
+    let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
+    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
 
     let mut total0 = _mm256_setzero_ps();
     let mut total1 = _mm256_setzero_ps();
@@ -390,13 +393,11 @@ unsafe fn dot_q4_q8_2row_inner(
         // Load input once, reuse for both rows
         let input_i8 = _mm256_loadu_si256(iq.add(inp_offset).cast());
 
-        // Unpack row 0: 16 bytes → 32 int8
-        let packed0_128 = _mm_loadu_si128(wp0.add(wp_offset).cast());
-        let packed0 = _mm256_set_m128i(packed0_128, packed0_128);
-        let lo0 = _mm256_and_si256(packed0, mask_0f);
-        let hi0 = _mm256_and_si256(_mm256_srli_epi16(packed0, 4), mask_0f);
-        let unpacked0 = _mm256_permute2x128_si256(lo0, hi0, 0x20);
-        let weight0_i8 = _mm256_sub_epi8(unpacked0, bias_8);
+        // Unpack row 0: 16 packed nibbles → 32 signed int8 via vpshufb LUT.
+        let packed0 = _mm_loadu_si128(wp0.add(wp_offset).cast());
+        let lo0 = _mm_and_si128(packed0, mask_0f);
+        let hi0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), mask_0f);
+        let weight0_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi0), _mm_shuffle_epi8(lut, lo0));
 
         let w0_abs = _mm256_sign_epi8(weight0_i8, weight0_i8);
         let i0_signed = _mm256_sign_epi8(input_i8, weight0_i8);
@@ -404,13 +405,11 @@ unsafe fn dot_q4_q8_2row_inner(
         let scale0 = _mm256_set1_ps(inp_scale * *weight_scales_0.get_unchecked(blk));
         total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), scale0, total0);
 
-        // Unpack row 1: 16 bytes → 32 int8
-        let packed1_128 = _mm_loadu_si128(wp1.add(wp_offset).cast());
-        let packed1 = _mm256_set_m128i(packed1_128, packed1_128);
-        let lo1 = _mm256_and_si256(packed1, mask_0f);
-        let hi1 = _mm256_and_si256(_mm256_srli_epi16(packed1, 4), mask_0f);
-        let unpacked1 = _mm256_permute2x128_si256(lo1, hi1, 0x20);
-        let weight1_i8 = _mm256_sub_epi8(unpacked1, bias_8);
+        // Unpack row 1: 16 packed nibbles → 32 signed int8 via vpshufb LUT.
+        let packed1 = _mm_loadu_si128(wp1.add(wp_offset).cast());
+        let lo1 = _mm_and_si128(packed1, mask_0f);
+        let hi1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), mask_0f);
+        let weight1_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi1), _mm_shuffle_epi8(lut, lo1));
 
         let w1_abs = _mm256_sign_epi8(weight1_i8, weight1_i8);
         let i1_signed = _mm256_sign_epi8(input_i8, weight1_i8);
@@ -555,8 +554,8 @@ unsafe fn dot_q4_q8_4row_inner(
     weight_scales_4rows: &[f32],
 ) -> (f32, f32, f32, f32) {
     use std::arch::x86_64::{
-        _mm256_and_si256, _mm256_permute2x128_si256, _mm256_set1_epi8, _mm256_set_m128i,
-        _mm256_srli_epi16, _mm256_sub_epi8, _mm_loadu_si128,
+        _mm256_set_m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_set_epi8,
+        _mm_shuffle_epi8, _mm_srli_epi16,
     };
 
     let num_blocks = input_scales.len();
@@ -573,8 +572,9 @@ unsafe fn dot_q4_q8_4row_inner(
     let ws2 = ws1.add(num_blocks);
     let ws3 = ws2.add(num_blocks);
 
-    let mask_0f = _mm256_set1_epi8(0x0F);
-    let bias_8 = _mm256_set1_epi8(8);
+    // vpshufb LUT: maps nibble i (0..15) → i-8 (-8..7), within-lane (latency 1).
+    let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
+    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
 
     let mut total0 = _mm256_setzero_ps();
     let mut total1 = _mm256_setzero_ps();
@@ -594,11 +594,10 @@ unsafe fn dot_q4_q8_4row_inner(
         let packed2 = _mm_loadu_si128(wp2.add(wp_offset).cast());
         let packed3 = _mm_loadu_si128(wp3.add(wp_offset).cast());
 
-        // Unpack and process row 0
-        let p0 = _mm256_set_m128i(packed0, packed0);
-        let lo0 = _mm256_and_si256(p0, mask_0f);
-        let hi0 = _mm256_and_si256(_mm256_srli_epi16(p0, 4), mask_0f);
-        let w0_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo0, hi0, 0x20), bias_8);
+        // Unpack and process row 0: vpshufb LUT replaces set_m128i+permute2x128+sub.
+        let lo0 = _mm_and_si128(packed0, mask_0f);
+        let hi0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), mask_0f);
+        let w0_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi0), _mm_shuffle_epi8(lut, lo0));
         let w0_abs = _mm256_sign_epi8(w0_i8, w0_i8);
         let i0 = _mm256_sign_epi8(input_i8, w0_i8);
         let prod0 = dpbusd_256(_mm256_setzero_si256(), w0_abs, i0);
@@ -606,10 +605,9 @@ unsafe fn dot_q4_q8_4row_inner(
         total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), scale0, total0);
 
         // Unpack and process row 1
-        let p1 = _mm256_set_m128i(packed1, packed1);
-        let lo1 = _mm256_and_si256(p1, mask_0f);
-        let hi1 = _mm256_and_si256(_mm256_srli_epi16(p1, 4), mask_0f);
-        let w1_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo1, hi1, 0x20), bias_8);
+        let lo1 = _mm_and_si128(packed1, mask_0f);
+        let hi1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), mask_0f);
+        let w1_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi1), _mm_shuffle_epi8(lut, lo1));
         let w1_abs = _mm256_sign_epi8(w1_i8, w1_i8);
         let i1 = _mm256_sign_epi8(input_i8, w1_i8);
         let prod1 = dpbusd_256(_mm256_setzero_si256(), w1_abs, i1);
@@ -617,10 +615,9 @@ unsafe fn dot_q4_q8_4row_inner(
         total1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod1), scale1, total1);
 
         // Unpack and process row 2
-        let p2 = _mm256_set_m128i(packed2, packed2);
-        let lo2 = _mm256_and_si256(p2, mask_0f);
-        let hi2 = _mm256_and_si256(_mm256_srli_epi16(p2, 4), mask_0f);
-        let w2_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo2, hi2, 0x20), bias_8);
+        let lo2 = _mm_and_si128(packed2, mask_0f);
+        let hi2 = _mm_and_si128(_mm_srli_epi16(packed2, 4), mask_0f);
+        let w2_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi2), _mm_shuffle_epi8(lut, lo2));
         let w2_abs = _mm256_sign_epi8(w2_i8, w2_i8);
         let i2 = _mm256_sign_epi8(input_i8, w2_i8);
         let prod2 = dpbusd_256(_mm256_setzero_si256(), w2_abs, i2);
@@ -628,10 +625,9 @@ unsafe fn dot_q4_q8_4row_inner(
         total2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod2), scale2, total2);
 
         // Unpack and process row 3
-        let p3 = _mm256_set_m128i(packed3, packed3);
-        let lo3 = _mm256_and_si256(p3, mask_0f);
-        let hi3 = _mm256_and_si256(_mm256_srli_epi16(p3, 4), mask_0f);
-        let w3_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo3, hi3, 0x20), bias_8);
+        let lo3 = _mm_and_si128(packed3, mask_0f);
+        let hi3 = _mm_and_si128(_mm_srli_epi16(packed3, 4), mask_0f);
+        let w3_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi3), _mm_shuffle_epi8(lut, lo3));
         let w3_abs = _mm256_sign_epi8(w3_i8, w3_i8);
         let i3 = _mm256_sign_epi8(input_i8, w3_i8);
         let prod3 = dpbusd_256(_mm256_setzero_si256(), w3_abs, i3);
@@ -646,7 +642,6 @@ unsafe fn dot_q4_q8_4row_inner(
         hsum_256(total3),
     )
 }
-
 // ---- Dot-product F32 GEMM (AVX-512F + FMA) ----
 //
 // Modeled after llama.cpp's tinyBLAS: each accumulator holds a partial

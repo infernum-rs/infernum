@@ -124,7 +124,6 @@ pub trait GraphEngineConfig: Send + Sync + 'static {
 // Internal structures
 // ---------------------------------------------------------------------------
 
-
 /// Return the [`NodeId`]s of the KV cache input nodes and `concat_seq` nodes
 /// in a decode graph built with `kv_len = 0`.
 ///
