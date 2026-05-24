@@ -371,18 +371,7 @@ fn attention_gqa_group(
                 }
             }
         }
-        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for score in scores.iter_mut() {
-            *score = (*score - max_score).exp();
-            sum += *score;
-        }
-        if sum > 0.0 {
-            let inv_sum = 1.0 / sum;
-            for score in scores.iter_mut() {
-                *score *= inv_sum;
-            }
-        }
+        crate::simd::vec_softmax_inplace(scores);
     }
 
     // Phase 3: V accumulation — stream V once up to the causal bound.
@@ -472,18 +461,7 @@ fn attention_head_unit(
     }
 
     // Softmax
-    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for score in scores.iter_mut() {
-        *score = (*score - max_score).exp();
-        sum += *score;
-    }
-    if sum > 0.0 {
-        let inv_sum = 1.0 / sum;
-        for score in scores.iter_mut() {
-            *score *= inv_sum;
-        }
-    }
+    crate::simd::vec_softmax_inplace(scores);
 
     // Weighted sum of V using SIMD fused-multiply-add.
     let o_off = (s * num_heads + h) * head_dim;

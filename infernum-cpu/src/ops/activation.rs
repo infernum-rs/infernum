@@ -19,8 +19,12 @@ impl SwigluOps for CpuBackend {
         );
         let n = gate_data.len();
         // SAFETY: every element is written by vec_silu_mul before it is read.
-        let mut out: Vec<f32> = Vec::with_capacity(n);
-        unsafe { out.set_len(n) };
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<f32> = {
+            let mut v = Vec::with_capacity(n);
+            unsafe { v.set_len(n) };
+            v
+        };
 
         let pool = crate::thread_pool::global_pool();
         let num_threads = pool.num_threads();
@@ -37,7 +41,10 @@ impl SwigluOps for CpuBackend {
                 if start < n {
                     let end = (start + chunk).min(n);
                     let out_slice = unsafe {
-                        std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+                        std::slice::from_raw_parts_mut(
+                            (out_addr as *mut f32).add(start),
+                            end - start,
+                        )
                     };
                     simd::vec_silu_mul(&gate_data[start..end], &up_data[start..end], out_slice);
                 }
@@ -47,7 +54,6 @@ impl SwigluOps for CpuBackend {
         Ok(CpuTensor::from_f32_vec(gate.shape(), out))
     }
 }
-
 
 impl GegluOps for CpuBackend {
     fn geglu(gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
@@ -60,8 +66,12 @@ impl GegluOps for CpuBackend {
         );
         let n = gate_data.len();
         // SAFETY: every element is written by vec_gelu_mul before it is read.
-        let mut out: Vec<f32> = Vec::with_capacity(n);
-        unsafe { out.set_len(n) };
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<f32> = {
+            let mut v = Vec::with_capacity(n);
+            unsafe { v.set_len(n) };
+            v
+        };
 
         let pool = crate::thread_pool::global_pool();
         let num_threads = pool.num_threads();
@@ -76,7 +86,10 @@ impl GegluOps for CpuBackend {
                 if start < n {
                     let end = (start + chunk).min(n);
                     let out_slice = unsafe {
-                        std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+                        std::slice::from_raw_parts_mut(
+                            (out_addr as *mut f32).add(start),
+                            end - start,
+                        )
                     };
                     simd::vec_gelu_mul(&gate_data[start..end], &up_data[start..end], out_slice);
                 }

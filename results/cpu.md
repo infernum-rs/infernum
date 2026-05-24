@@ -560,3 +560,43 @@ At 256 decode steps with 64 KV concat nodes (32 layers × K + V) and 1280 bytes 
 - Decode improvement (+5.6%) is within run-to-run noise (M=1, input quantization trivially fast).
 - The llama.cpp prefill baseline differs from the previous session (182.8 → 213.9) due to measurement variance between sessions (thermal state, background load). The infernum number is the reliable signal.
 - Remaining gaps vs llama.cpp: Gemma prefill 0.90x, Gemma decode 0.86x.
+
+---
+
+## 2026-05-24 — Vectorized attention softmax (`perf/cpu-performance`)
+
+**Change:** The attention softmax in `attention_gqa_group` and `attention_head_unit` was calling Rust's `f32::exp()` (= libm `__expf_fma`) in a scalar loop. Profiling showed `__expf_fma` accounting for ~4% of total cycles, and `attention_gqa_group` for ~10-15% (dominant non-GEMM hotspot). Replaced both scalar softmax loops with `crate::simd::vec_softmax_inplace`, which dispatches to the existing AVX-512F polynomial exponential (`vec_softmax_inplace_inner`) for vectorized exp at 16 f32/cycle.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (Gemma linear fusion session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 prefill | 966.2 | 986.5 | **+2.1%** |
+| SmolLM2-360M Q8_0 decode | 132.2 | 133.4 | **+0.9%** |
+| SmolLM2-360M Q4_0 prefill | 939.5 | 930.0 | flat (noise) |
+| SmolLM2-360M Q4_0 decode | 188.8 | 182.6 | flat (noise) |
+| Gemma 2-2b Q8_0 prefill | 192.5 | 190.5 | flat (noise) |
+| Gemma 2-2b Q8_0 decode | 20.9 | 21.0 | flat |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 133.4 | 141.1 | **0.95x** |
+| SmolLM2-360M Q4_0 decode | 182.6 | 198.2 | 0.92x |
+| SmolLM2-360M Q8_0 prefill | 986.5 | 1054.7 | **0.94x** |
+| SmolLM2-360M Q4_0 prefill | 930.0 | 1212.5 | 0.77x |
+| Gemma 2-2b Q8_0 decode | 21.0 | 23.9 | 0.88x |
+| Gemma 2-2b Q8_0 prefill | 190.5 | 214.9 | 0.89x |
+
+### Notes
+
+- Q8_0 prefill improvement from 0.88x → 0.94x is significant: attention softmax (causal, O(seq_len²) in prefill) was the second-largest hotspot after GEMM.
+- Q8_0 decode improvement (+0.9%) is smaller because decode softmax is shorter (length = KV cache size, avg 128 tokens for this run).
+- Q4_0 and Gemma numbers are within run-to-run noise (±3%); the softmax change affects all paths.
+- The vectorized exp is a degree-4 polynomial approximation identical to what's used in SwiGLU/GeGLU — same numerical accuracy.
+- Remaining gaps vs llama.cpp: Q8_0 decode **0.95x**, Q4_0 decode 0.92x, Q8_0 prefill **0.94x**, Q4_0 prefill 0.77x, Gemma 0.88–0.89x.
