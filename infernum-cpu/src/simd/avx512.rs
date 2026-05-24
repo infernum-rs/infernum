@@ -422,6 +422,231 @@ unsafe fn dot_q4_q8_2row_inner(
     (hsum_256(total0), hsum_256(total1))
 }
 
+/// 4-row Q8×Q8 GEMV: computes dot products for four consecutive weight rows
+/// against the same input vector. Returns `(dot0, dot1, dot2, dot3)`.
+///
+/// Weight data for all four rows is passed as a single contiguous slice
+/// (4 × K bytes), reducing function-call argument count and allowing the
+/// compiler to emit all four weight loads before any VNNI computation,
+/// giving the CPU's OOO engine four concurrent DRAM requests per block.
+pub fn dot_q8_q8_4row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    unsafe {
+        dot_q8_q8_4row_inner(
+            input_quants,
+            input_scales,
+            weight_quants_4rows,
+            weight_scales_4rows,
+        )
+    }
+}
+
+#[allow(clippy::similar_names)]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512vnni",
+    enable = "avx512vl",
+    enable = "fma"
+)]
+unsafe fn dot_q8_q8_4row_inner(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    let num_blocks = input_scales.len();
+    let row_bytes = num_blocks * 32;
+
+    let iq = input_quants.as_ptr();
+    let wq0 = weight_quants_4rows.as_ptr();
+    let wq1 = wq0.add(row_bytes);
+    let wq2 = wq1.add(row_bytes);
+    let wq3 = wq2.add(row_bytes);
+
+    let ws0 = weight_scales_4rows.as_ptr();
+    let ws1 = ws0.add(num_blocks);
+    let ws2 = ws1.add(num_blocks);
+    let ws3 = ws2.add(num_blocks);
+
+    let mut total0 = _mm256_setzero_ps();
+    let mut total1 = _mm256_setzero_ps();
+    let mut total2 = _mm256_setzero_ps();
+    let mut total3 = _mm256_setzero_ps();
+
+    for blk in 0..num_blocks {
+        let blk_offset = blk * 32;
+        let inp_scale = *input_scales.get_unchecked(blk);
+
+        let input_i8 = _mm256_loadu_si256(iq.add(blk_offset).cast());
+
+        // Issue all 4 weight loads before any VNNI — four concurrent DRAM requests
+        let w0 = _mm256_loadu_si256(wq0.add(blk_offset).cast());
+        let w1 = _mm256_loadu_si256(wq1.add(blk_offset).cast());
+        let w2 = _mm256_loadu_si256(wq2.add(blk_offset).cast());
+        let w3 = _mm256_loadu_si256(wq3.add(blk_offset).cast());
+
+        let w0_abs = _mm256_sign_epi8(w0, w0);
+        let i0 = _mm256_sign_epi8(input_i8, w0);
+        let prod0 = dpbusd_256(_mm256_setzero_si256(), w0_abs, i0);
+        let scale0 = _mm256_set1_ps(inp_scale * *ws0.add(blk));
+        total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), scale0, total0);
+
+        let w1_abs = _mm256_sign_epi8(w1, w1);
+        let i1 = _mm256_sign_epi8(input_i8, w1);
+        let prod1 = dpbusd_256(_mm256_setzero_si256(), w1_abs, i1);
+        let scale1 = _mm256_set1_ps(inp_scale * *ws1.add(blk));
+        total1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod1), scale1, total1);
+
+        let w2_abs = _mm256_sign_epi8(w2, w2);
+        let i2 = _mm256_sign_epi8(input_i8, w2);
+        let prod2 = dpbusd_256(_mm256_setzero_si256(), w2_abs, i2);
+        let scale2 = _mm256_set1_ps(inp_scale * *ws2.add(blk));
+        total2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod2), scale2, total2);
+
+        let w3_abs = _mm256_sign_epi8(w3, w3);
+        let i3 = _mm256_sign_epi8(input_i8, w3);
+        let prod3 = dpbusd_256(_mm256_setzero_si256(), w3_abs, i3);
+        let scale3 = _mm256_set1_ps(inp_scale * *ws3.add(blk));
+        total3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod3), scale3, total3);
+    }
+
+    (
+        hsum_256(total0),
+        hsum_256(total1),
+        hsum_256(total2),
+        hsum_256(total3),
+    )
+}
+
+/// 4-row Q4×Q8 GEMV: computes dot products for four consecutive Q4_0 weight rows
+/// against the same Q8 input vector. Returns `(dot0, dot1, dot2, dot3)`.
+pub fn dot_q4_q8_4row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    unsafe {
+        dot_q4_q8_4row_inner(
+            input_quants,
+            input_scales,
+            weight_packed_4rows,
+            weight_scales_4rows,
+        )
+    }
+}
+
+#[allow(clippy::similar_names)]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512vnni",
+    enable = "avx512vl",
+    enable = "avx512bw",
+    enable = "fma"
+)]
+unsafe fn dot_q4_q8_4row_inner(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    use std::arch::x86_64::{
+        _mm256_and_si256, _mm256_permute2x128_si256, _mm256_set1_epi8, _mm256_set_m128i,
+        _mm256_srli_epi16, _mm256_sub_epi8, _mm_loadu_si128,
+    };
+
+    let num_blocks = input_scales.len();
+    let packed_row_bytes = num_blocks * 16;
+
+    let iq = input_quants.as_ptr();
+    let wp0 = weight_packed_4rows.as_ptr();
+    let wp1 = wp0.add(packed_row_bytes);
+    let wp2 = wp1.add(packed_row_bytes);
+    let wp3 = wp2.add(packed_row_bytes);
+
+    let ws0 = weight_scales_4rows.as_ptr();
+    let ws1 = ws0.add(num_blocks);
+    let ws2 = ws1.add(num_blocks);
+    let ws3 = ws2.add(num_blocks);
+
+    let mask_0f = _mm256_set1_epi8(0x0F);
+    let bias_8 = _mm256_set1_epi8(8);
+
+    let mut total0 = _mm256_setzero_ps();
+    let mut total1 = _mm256_setzero_ps();
+    let mut total2 = _mm256_setzero_ps();
+    let mut total3 = _mm256_setzero_ps();
+
+    for blk in 0..num_blocks {
+        let inp_offset = blk * 32;
+        let wp_offset = blk * 16;
+        let inp_scale = *input_scales.get_unchecked(blk);
+
+        let input_i8 = _mm256_loadu_si256(iq.add(inp_offset).cast());
+
+        // Issue all 4 packed weight loads before unpacking
+        let packed0 = _mm_loadu_si128(wp0.add(wp_offset).cast());
+        let packed1 = _mm_loadu_si128(wp1.add(wp_offset).cast());
+        let packed2 = _mm_loadu_si128(wp2.add(wp_offset).cast());
+        let packed3 = _mm_loadu_si128(wp3.add(wp_offset).cast());
+
+        // Unpack and process row 0
+        let p0 = _mm256_set_m128i(packed0, packed0);
+        let lo0 = _mm256_and_si256(p0, mask_0f);
+        let hi0 = _mm256_and_si256(_mm256_srli_epi16(p0, 4), mask_0f);
+        let w0_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo0, hi0, 0x20), bias_8);
+        let w0_abs = _mm256_sign_epi8(w0_i8, w0_i8);
+        let i0 = _mm256_sign_epi8(input_i8, w0_i8);
+        let prod0 = dpbusd_256(_mm256_setzero_si256(), w0_abs, i0);
+        let scale0 = _mm256_set1_ps(inp_scale * *ws0.add(blk));
+        total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), scale0, total0);
+
+        // Unpack and process row 1
+        let p1 = _mm256_set_m128i(packed1, packed1);
+        let lo1 = _mm256_and_si256(p1, mask_0f);
+        let hi1 = _mm256_and_si256(_mm256_srli_epi16(p1, 4), mask_0f);
+        let w1_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo1, hi1, 0x20), bias_8);
+        let w1_abs = _mm256_sign_epi8(w1_i8, w1_i8);
+        let i1 = _mm256_sign_epi8(input_i8, w1_i8);
+        let prod1 = dpbusd_256(_mm256_setzero_si256(), w1_abs, i1);
+        let scale1 = _mm256_set1_ps(inp_scale * *ws1.add(blk));
+        total1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod1), scale1, total1);
+
+        // Unpack and process row 2
+        let p2 = _mm256_set_m128i(packed2, packed2);
+        let lo2 = _mm256_and_si256(p2, mask_0f);
+        let hi2 = _mm256_and_si256(_mm256_srli_epi16(p2, 4), mask_0f);
+        let w2_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo2, hi2, 0x20), bias_8);
+        let w2_abs = _mm256_sign_epi8(w2_i8, w2_i8);
+        let i2 = _mm256_sign_epi8(input_i8, w2_i8);
+        let prod2 = dpbusd_256(_mm256_setzero_si256(), w2_abs, i2);
+        let scale2 = _mm256_set1_ps(inp_scale * *ws2.add(blk));
+        total2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod2), scale2, total2);
+
+        // Unpack and process row 3
+        let p3 = _mm256_set_m128i(packed3, packed3);
+        let lo3 = _mm256_and_si256(p3, mask_0f);
+        let hi3 = _mm256_and_si256(_mm256_srli_epi16(p3, 4), mask_0f);
+        let w3_i8 = _mm256_sub_epi8(_mm256_permute2x128_si256(lo3, hi3, 0x20), bias_8);
+        let w3_abs = _mm256_sign_epi8(w3_i8, w3_i8);
+        let i3 = _mm256_sign_epi8(input_i8, w3_i8);
+        let prod3 = dpbusd_256(_mm256_setzero_si256(), w3_abs, i3);
+        let scale3 = _mm256_set1_ps(inp_scale * *ws3.add(blk));
+        total3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod3), scale3, total3);
+    }
+
+    (
+        hsum_256(total0),
+        hsum_256(total1),
+        hsum_256(total2),
+        hsum_256(total3),
+    )
+}
+
 // ---- Dot-product F32 GEMM (AVX-512F + FMA) ----
 //
 // Modeled after llama.cpp's tinyBLAS: each accumulator holds a partial

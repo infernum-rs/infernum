@@ -655,6 +655,136 @@ pub fn dot_q4_q8_2row(
     }
 }
 
+/// 4-row Q8×Q8 GEMV: computes dot products for four consecutive Q8_0 weight rows
+/// against the same Q8 input vector. Returns `(dot0, dot1, dot2, dot3)`.
+#[inline]
+#[must_use]
+pub fn dot_q8_q8_4row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q8_q8_4row(
+                input_quants,
+                input_scales,
+                weight_quants_4rows,
+                weight_scales_4rows,
+            )
+        } else {
+            let num_blocks = input_scales.len();
+            let row_bytes = num_blocks * 32;
+            let (d0, d1) = dot_q8_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_quants_4rows[..row_bytes],
+                &weight_scales_4rows[..num_blocks],
+                &weight_quants_4rows[row_bytes..2 * row_bytes],
+                &weight_scales_4rows[num_blocks..2 * num_blocks],
+            );
+            let (d2, d3) = dot_q8_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_quants_4rows[2 * row_bytes..3 * row_bytes],
+                &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+                &weight_quants_4rows[3 * row_bytes..],
+                &weight_scales_4rows[3 * num_blocks..],
+            );
+            (d0, d1, d2, d3)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let num_blocks = input_scales.len();
+        let row_bytes = num_blocks * 32;
+        let (d0, d1) = dot_q8_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_quants_4rows[..row_bytes],
+            &weight_scales_4rows[..num_blocks],
+            &weight_quants_4rows[row_bytes..2 * row_bytes],
+            &weight_scales_4rows[num_blocks..2 * num_blocks],
+        );
+        let (d2, d3) = dot_q8_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_quants_4rows[2 * row_bytes..3 * row_bytes],
+            &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+            &weight_quants_4rows[3 * row_bytes..],
+            &weight_scales_4rows[3 * num_blocks..],
+        );
+        (d0, d1, d2, d3)
+    }
+}
+
+/// 4-row Q4×Q8 GEMV: computes dot products for four consecutive Q4_0 weight rows
+/// against the same Q8 input vector. Returns `(dot0, dot1, dot2, dot3)`.
+#[inline]
+#[must_use]
+pub fn dot_q4_q8_4row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q4_q8_4row(
+                input_quants,
+                input_scales,
+                weight_packed_4rows,
+                weight_scales_4rows,
+            )
+        } else {
+            let num_blocks = input_scales.len();
+            let packed_row_bytes = num_blocks * 16;
+            let (d0, d1) = dot_q4_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_packed_4rows[..packed_row_bytes],
+                &weight_scales_4rows[..num_blocks],
+                &weight_packed_4rows[packed_row_bytes..2 * packed_row_bytes],
+                &weight_scales_4rows[num_blocks..2 * num_blocks],
+            );
+            let (d2, d3) = dot_q4_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_packed_4rows[2 * packed_row_bytes..3 * packed_row_bytes],
+                &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+                &weight_packed_4rows[3 * packed_row_bytes..],
+                &weight_scales_4rows[3 * num_blocks..],
+            );
+            (d0, d1, d2, d3)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let num_blocks = input_scales.len();
+        let packed_row_bytes = num_blocks * 16;
+        let (d0, d1) = dot_q4_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_packed_4rows[..packed_row_bytes],
+            &weight_scales_4rows[..num_blocks],
+            &weight_packed_4rows[packed_row_bytes..2 * packed_row_bytes],
+            &weight_scales_4rows[num_blocks..2 * num_blocks],
+        );
+        let (d2, d3) = dot_q4_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_packed_4rows[2 * packed_row_bytes..3 * packed_row_bytes],
+            &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+            &weight_packed_4rows[3 * packed_row_bytes..],
+            &weight_scales_4rows[3 * num_blocks..],
+        );
+        (d0, d1, d2, d3)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

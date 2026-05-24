@@ -1474,16 +1474,33 @@ fn q4_gemv_body_inline(
     num_blocks_per_row: usize,
     packed_bytes_per_row: usize,
 ) {
-    let pairs = chunk_len / 2;
-    let remainder = chunk_len % 2;
+    let quads = chunk_len / 4;
+    let after_quads = quads * 4;
 
-    for p in 0..pairs {
-        let n0 = neuron_offset + p * 2;
-        let n1 = n0 + 1;
+    for q in 0..quads {
+        let n0 = neuron_offset + q * 4;
+        let p_start = n0 * packed_bytes_per_row;
+        let s_start = n0 * num_blocks_per_row;
+        let (d0, d1, d2, d3) = simd::dot_q4_q8_4row(
+            inp_quants,
+            inp_scales,
+            &weight_packed[p_start..p_start + 4 * packed_bytes_per_row],
+            &weight_scales[s_start..s_start + 4 * num_blocks_per_row],
+        );
+        chunk[q * 4] = d0;
+        chunk[q * 4 + 1] = d1;
+        chunk[q * 4 + 2] = d2;
+        chunk[q * 4 + 3] = d3;
+    }
+
+    // Remainder: up to 3 neurons (handle as pairs then single)
+    let rem = chunk_len - after_quads;
+    if rem >= 2 {
+        let n0 = neuron_offset + after_quads;
         let p0 = n0 * packed_bytes_per_row;
-        let p1 = n1 * packed_bytes_per_row;
+        let p1 = (n0 + 1) * packed_bytes_per_row;
         let s0 = n0 * num_blocks_per_row;
-        let s1 = n1 * num_blocks_per_row;
+        let s1 = (n0 + 1) * num_blocks_per_row;
         let (d0, d1) = simd::dot_q4_q8_2row(
             inp_quants,
             inp_scales,
@@ -1492,15 +1509,14 @@ fn q4_gemv_body_inline(
             &weight_packed[p1..p1 + packed_bytes_per_row],
             &weight_scales[s1..s1 + num_blocks_per_row],
         );
-        chunk[p * 2] = d0;
-        chunk[p * 2 + 1] = d1;
+        chunk[after_quads] = d0;
+        chunk[after_quads + 1] = d1;
     }
-
-    if remainder > 0 {
-        let neuron = neuron_offset + pairs * 2;
+    if rem % 2 == 1 {
+        let neuron = neuron_offset + chunk_len - 1;
         let p_start = neuron * packed_bytes_per_row;
         let s_start = neuron * num_blocks_per_row;
-        chunk[pairs * 2] = simd::dot_q4_q8_row(
+        chunk[chunk_len - 1] = simd::dot_q4_q8_row(
             inp_quants,
             inp_scales,
             &weight_packed[p_start..p_start + packed_bytes_per_row],
@@ -1523,16 +1539,33 @@ fn q8_gemv_body_inline(
     num_blocks_per_row: usize,
     quant_bytes_per_row: usize,
 ) {
-    let pairs = chunk_len / 2;
-    let remainder = chunk_len % 2;
+    let quads = chunk_len / 4;
+    let after_quads = quads * 4;
 
-    for p in 0..pairs {
-        let n0 = neuron_offset + p * 2;
-        let n1 = n0 + 1;
+    for q in 0..quads {
+        let n0 = neuron_offset + q * 4;
+        let qw_start = n0 * quant_bytes_per_row;
+        let s_start = n0 * num_blocks_per_row;
+        let (d0, d1, d2, d3) = simd::dot_q8_q8_4row(
+            inp_quants,
+            inp_scales,
+            &weight_quants[qw_start..qw_start + 4 * quant_bytes_per_row],
+            &weight_scales[s_start..s_start + 4 * num_blocks_per_row],
+        );
+        chunk[q * 4] = d0;
+        chunk[q * 4 + 1] = d1;
+        chunk[q * 4 + 2] = d2;
+        chunk[q * 4 + 3] = d3;
+    }
+
+    // Remainder: up to 3 neurons (handle as pair then single)
+    let rem = chunk_len - after_quads;
+    if rem >= 2 {
+        let n0 = neuron_offset + after_quads;
         let q0 = n0 * quant_bytes_per_row;
-        let q1 = n1 * quant_bytes_per_row;
+        let q1 = (n0 + 1) * quant_bytes_per_row;
         let s0 = n0 * num_blocks_per_row;
-        let s1 = n1 * num_blocks_per_row;
+        let s1 = (n0 + 1) * num_blocks_per_row;
         let (d0, d1) = simd::dot_q8_q8_2row(
             inp_quants,
             inp_scales,
@@ -1541,18 +1574,17 @@ fn q8_gemv_body_inline(
             &weight_quants[q1..q1 + quant_bytes_per_row],
             &weight_scales[s1..s1 + num_blocks_per_row],
         );
-        chunk[p * 2] = d0;
-        chunk[p * 2 + 1] = d1;
+        chunk[after_quads] = d0;
+        chunk[after_quads + 1] = d1;
     }
-
-    if remainder > 0 {
-        let neuron = neuron_offset + pairs * 2;
-        let q_start = neuron * quant_bytes_per_row;
+    if rem % 2 == 1 {
+        let neuron = neuron_offset + chunk_len - 1;
+        let qw_start = neuron * quant_bytes_per_row;
         let s_start = neuron * num_blocks_per_row;
-        chunk[pairs * 2] = simd::dot_q8_q8_row(
+        chunk[chunk_len - 1] = simd::dot_q8_q8_row(
             inp_quants,
             inp_scales,
-            &weight_quants[q_start..q_start + quant_bytes_per_row],
+            &weight_quants[qw_start..qw_start + quant_bytes_per_row],
             &weight_scales[s_start..s_start + num_blocks_per_row],
         );
     }

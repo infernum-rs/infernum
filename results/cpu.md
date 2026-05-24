@@ -280,3 +280,42 @@ Fix: replaced the per-token `KvStore` (Vec-based) with `KvCacheStore` (Arc-based
 - The bench_cpu.sh decode path already used `--graph-decode` (pre-compiled graph + KvCacheStore), so the ratios vs llama.cpp are roughly stable vs the previous session.
 - The primary beneficiary of this fix is the `Engine`/`Model` trait path (used by application code calling `engine.generate()`). This path was 65–85 tok/s; now 115–160 tok/s, matching graph-decode within 3%.
 - Remaining gaps vs llama.cpp: Q8_0 ~0.81x, Q4_0 decode 0.71x, Q4_0 prefill 0.73x, Q8_0 prefill 0.80x, Gemma 0.71–0.81x.
+
+---
+
+## 2026-05-24 — 4-row GEMV kernels for Q8_0 and Q4_0 (`perf/cpu-performance`)
+
+**Change:** The GEMV (decode) path previously processed 2 weight rows per loop iteration, issuing 2 concurrent DRAM requests per block. Implemented `dot_q8_q8_4row` and `dot_q4_q8_4row` in `avx512.rs` that process 4 consecutive weight rows simultaneously using a single contiguous-slice calling convention (avoids fat-pointer stack spills from having 10+ function arguments). All 4 weight loads are issued before any VNNI computation, allowing the CPU's OOO engine to dispatch 4 concurrent DRAM requests and improve effective memory bandwidth. Updated `q8_gemv_body_inline` and `q4_gemv_body_inline` in `matmul.rs` to step by 4 rows with 2-row and 1-row fallbacks for remainders.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum branch:** `perf/cpu-performance`
+- **Note:** llama.cpp not available for this run; ratios estimated using previous llama.cpp baseline
+
+### vs previous best
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q4_0 decode | 148.1 | 157.2 | **+6.1%** |
+| SmolLM2-360M Q8_0 decode | 114.2 | 118.2 | **+3.5%** |
+| SmolLM2-360M Q4_0 prefill | 921.8 | 942.0 | **+2.2%** |
+| SmolLM2-360M Q8_0 prefill | 854.2 | 982.9 | **+15%** (high variance) |
+| Gemma 2-2b Q8_0 decode | 19.4 | 20.1 | **+3.6%** |
+| Gemma 2-2b Q8_0 prefill | 151.5 | 153.9 | **+1.6%** |
+
+### Estimated ratios vs llama.cpp (using previous llama.cpp baseline)
+
+| Model | infernum | llama.cpp (ref) | ratio |
+| ----- | -------: | --------------: | ----: |
+| SmolLM2-360M Q4_0 decode | 157.2 | ~207 | ~0.76x |
+| SmolLM2-360M Q8_0 decode | 118.2 | ~142 | ~0.83x |
+| SmolLM2-360M Q4_0 prefill | 942.0 | ~1269 | ~0.74x |
+| SmolLM2-360M Q8_0 prefill | 982.9 | ~1070 | ~0.92x |
+| Gemma 2-2b Q8_0 decode | 20.1 | ~24 | ~0.84x |
+| Gemma 2-2b Q8_0 prefill | 153.9 | ~217 | ~0.71x |
+
+### Notes
+
+- Decode gains (+3.5–6.1%) are from 4-row GEMV directly — decode is GEMV (M=1).
+- Q4_0 gains are larger than Q8_0 because Q4_0 has higher nibble-unpack overhead relative to memory load, so the 4-concurrent-load improvement has greater relative impact.
+- Q8_0 prefill jump (+15%) is outside normal prefill variance (±10–15%); may be genuine or noise. The 4-row change does not affect the Q8_0 GEMM (tiled) path, so this is likely measurement variance.
+- Remaining gaps vs llama.cpp: Q4_0 decode ~0.76x, Q8_0 decode ~0.83x, Q4_0 prefill ~0.74x, Q8_0 prefill ~0.92x, Gemma 0.71–0.84x.
