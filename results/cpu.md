@@ -371,3 +371,43 @@ New approach: `_mm_and_si128` + `_mm_srli_epi16` + 2× `_mm_shuffle_epi8(lut, ..
 
 - **REVERTED in subsequent commit.** Register-pressure analysis showed the 4×6 kernel, with all ymm8–31 used as accumulators, has no space for pre-broadcast input scales. It reloads each of 4 input scales per row per col (24 loads/block vs the 4×4's 4 pre-broadcasts). At IPC ~2.5, this increases instructions per output from 7.81 (4×4) to 9.25 (4×6), yielding 15% fewer outputs per cycle. Empirical: absolute Q8_0 prefill dropped from ~957 to ~909 tok/s (-5%), consistent with the register pressure analysis.
 - The 4×4 microkernel with full pre-broadcast (is0–3 once per block, ws once per col) remains optimal for the 32-register constraint with 4-row M tiles.
+
+---
+
+## 2026-05-24 — Software prefetch in Q8_0 and Q4_0 GEMV kernels (`perf/cpu-performance`)
+
+**Change:** Added explicit `_mm_prefetch` (T0, into L1) calls to `dot_q8_q8_4row_inner` and `dot_q4_q8_4row_inner`. Each iteration prefetches all 4 weight rows' data 8 blocks ahead. Reasoning: the 4-row GEMV accesses 4 separate weight streams with stride ~960 bytes between rows. While the hardware prefetcher handles sequential access within each stream, Zen 5's DRAM latency (~150 ns) far exceeds one block's compute time (~17 ns), leaving 8–9 blocks of latency to hide. Software prefetch explicitly tells the memory controller to fetch all 4 rows' next block data ahead of time.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (4×6 revert session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 decode | 107.0 | 115.5 | **+8.0%** |
+| SmolLM2-360M Q4_0 decode | 140.7 | 156.6 | **+11.3%** |
+| Gemma 2-2b Q8_0 decode | 17.4 | 19.1 | **+9.8%** |
+| SmolLM2-360M Q8_0 prefill | 953.6 | 965.9 | +1.3% (noise) |
+| SmolLM2-360M Q4_0 prefill | 893.4 | 926.5 | +3.7% (noise) |
+| Gemma 2-2b Q8_0 prefill | 142.3 | 153.9 | +8.2% |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 115.5 | 146.5 | 0.79x |
+| SmolLM2-360M Q4_0 decode | 156.6 | 207.5 | 0.75x |
+| SmolLM2-360M Q8_0 prefill | 965.9 | 1128.1 | 0.86x |
+| SmolLM2-360M Q4_0 prefill | 926.5 | 1291.4 | 0.72x |
+| Gemma 2-2b Q8_0 decode | 19.1 | 24.3 | 0.79x |
+| Gemma 2-2b Q8_0 prefill | 153.9 | 216.5 | 0.71x |
+
+### Notes
+
+- Decode gains (+8–11%) are from the software prefetch directly — all decode paths are GEMV (M=1) and therefore memory-bandwidth-bound.
+- Profiling (perf stat) showed the DRAM latency was not fully hidden: with ~17 ns/block compute time and ~150 ns DRAM latency, 8 blocks of prefetch distance is the theoretical optimum for the 30-block K dimension of SmolLM2.
+- Gemma 2-2b prefill also improved (+8.2%) despite being partially compute-bound; large weight matrices benefit from prefetch hiding L3→L2 latency during the tiled GEMM.
+- `expand_q4_to_int8` was profiled at only 0.77% — the Q4_0 prefill gap (0.72x) is not from the expand step but from the GEMM kernel reading expanded weight data (32 bytes/block) vs llama.cpp reading Q4 directly (16 bytes/block).
+- Remaining gaps vs llama.cpp: Q8_0 decode 0.79x, Q4_0 decode 0.75x, Q8_0 prefill 0.86x, Q4_0 prefill 0.72x, Gemma 0.71–0.79x.

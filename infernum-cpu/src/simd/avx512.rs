@@ -12,7 +12,7 @@ use std::arch::x86_64::{
     __m256, __m256i, _mm256_add_ps, _mm256_castps256_ps128, _mm256_cvtepi32_ps,
     _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_set1_ps,
     _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_ps, _mm_add_ss,
-    _mm_cvtss_f32, _mm_movehdup_ps, _mm_movehl_ps,
+    _mm_cvtss_f32, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch, _MM_HINT_T0,
 };
 
 /// Horizontal sum of an __m256 register.
@@ -476,9 +476,20 @@ unsafe fn dot_q8_q8_4row_inner(
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
+    // Prefetch distance: DRAM latency (~150 ns) / block compute time (~17 ns) ≈ 9 blocks.
+    const PF: usize = 8;
     for blk in 0..num_blocks {
         let blk_offset = blk * 32;
         let inp_scale = *input_scales.get_unchecked(blk);
+
+        // Prefetch next-block weight data for all 4 rows to hide DRAM latency.
+        if blk + PF < num_blocks {
+            let pf = (blk + PF) * 32;
+            _mm_prefetch::<_MM_HINT_T0>(wq0.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wq1.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wq2.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wq3.add(pf).cast());
+        }
 
         let input_i8 = _mm256_loadu_si256(iq.add(blk_offset).cast());
 
@@ -581,10 +592,20 @@ unsafe fn dot_q4_q8_4row_inner(
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
+    const PF4: usize = 8; // prefetch distance in Q4 blocks (16 bytes each)
     for blk in 0..num_blocks {
         let inp_offset = blk * 32;
         let wp_offset = blk * 16;
         let inp_scale = *input_scales.get_unchecked(blk);
+
+        // Prefetch next-block packed weight data for all 4 rows.
+        if blk + PF4 < num_blocks {
+            let pf = (blk + PF4) * 16;
+            _mm_prefetch::<_MM_HINT_T0>(wp0.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wp1.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wp2.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wp3.add(pf).cast());
+        }
 
         let input_i8 = _mm256_loadu_si256(iq.add(inp_offset).cast());
 
