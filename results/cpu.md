@@ -369,7 +369,5 @@ New approach: `_mm_and_si128` + `_mm_srli_epi16` + 2× `_mm_shuffle_epi8(lut, ..
 
 ### Notes
 
-- Q8_0 prefill improvement is real: the 4×6 kernel does 50% more work per K-block iteration with the same number of loop passes, amortizing loop overhead and horizontal-reduction cost. Q4_0 prefill is unaffected (uses a separate code path).
-- All decode numbers (GEMV, M=1) are unaffected by GEMM tile changes — these are within measurement noise.
-- Elevated system load made absolute numbers unreliable; ratio improvement is the meaningful signal.
-- Remaining gaps vs llama.cpp: Q8_0 prefill ~0.90x, Q4_0 prefill ~0.73x, Q8_0 decode ~0.82x, Q4_0 decode ~0.76x, Gemma 0.72–0.81x.
+- **REVERTED in subsequent commit.** Register-pressure analysis showed the 4×6 kernel, with all ymm8–31 used as accumulators, has no space for pre-broadcast input scales. It reloads each of 4 input scales per row per col (24 loads/block vs the 4×4's 4 pre-broadcasts). At IPC ~2.5, this increases instructions per output from 7.81 (4×4) to 9.25 (4×6), yielding 15% fewer outputs per cycle. Empirical: absolute Q8_0 prefill dropped from ~957 to ~909 tok/s (-5%), consistent with the register pressure analysis.
+- The 4×4 microkernel with full pre-broadcast (is0–3 once per block, ws once per col) remains optimal for the 32-register constraint with 4-row M tiles.
