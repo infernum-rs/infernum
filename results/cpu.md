@@ -448,3 +448,45 @@ New approach: `_mm_and_si128` + `_mm_srli_epi16` + 2× `_mm_shuffle_epi8(lut, ..
 - Prefill unaffected — GEMM is compute-bound; prefetch adds unnecessary instruction overhead there.
 - PF=16 regresses because the 30-block K dimension doesn't leave enough remaining work after the prefetch window fills, causing cache thrash.
 - Remaining gaps vs llama.cpp: Q8_0 decode ~0.81x, Q4_0 decode ~0.78x, Q8_0 prefill ~0.85x, Q4_0 prefill ~0.71x, Gemma ~0.81x.
+
+---
+
+## 2026-05-24 — Fix O(t²) KV cache clone in graph-decode executor (`perf/cpu-performance`)
+
+**Change:** `KvCacheStore::finalize_step()` increments the sequence-length counter AND clears the step-scoped `overrides` HashMap. The executor was calling `kv.len += 1` directly, skipping the `overrides.clear()`. Without the clear, each `concat_seq` node's `try_append_kv()` inserts an Arc clone into `overrides`, bumping the refcount to 2. On the next step, `Arc::make_mut()` finds refcount > 1 and clones the entire KV cache buffer instead of appending in-place — O(t) work at step t, O(t²) total.
+
+At 256 decode steps with 64 KV concat nodes (32 layers × K + V) and 1280 bytes per row, this was ~2.7 GB of redundant copies per inference. Fix: call `kv.finalize_step()` at the end of each step.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** `c9ceec9`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (PF=12 session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 decode | 118.3 | 134.8 | **+13.9%** |
+| SmolLM2-360M Q4_0 decode | 161.5 | 175.0 | **+8.4%** |
+| Gemma 2-2b Q8_0 decode | 19.7 | 19.5 | flat (noise) |
+| SmolLM2-360M Q8_0 prefill | 960.7 | 965.3 | flat |
+| SmolLM2-360M Q4_0 prefill | 921.5 | 923.7 | flat |
+| Gemma 2-2b Q8_0 prefill | 153.9 | 153.1 | flat |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 134.8 | 147.7 | **0.91x** |
+| SmolLM2-360M Q4_0 decode | 175.0 | 199.2 | **0.88x** |
+| SmolLM2-360M Q8_0 prefill | 965.3 | 1135.3 | 0.85x |
+| SmolLM2-360M Q4_0 prefill | 923.7 | 1254.6 | 0.74x |
+| Gemma 2-2b Q8_0 decode | 19.5 | 24.7 | 0.79x |
+| Gemma 2-2b Q8_0 prefill | 153.1 | 218.9 | 0.70x |
+
+### Notes
+
+- `INFERNUM_PROFILE=1` confirmed: `concat_seq` dropped from 42ms (5.3%) → 9.37ms (1.2%) of token time after the fix.
+- Decode improvement is largest for Q8_0 (+13.9%) because Q8_0 GEMV is faster per token, making the O(t²) KV clone a higher fraction of total cost.
+- Q4_0 decode gain (+8.4%) is smaller: Q4_0 is faster still, so the ratio was lower; but the absolute clone cost was the same.
+- Prefill is unaffected — the prefill executor runs a different code path (single-step, no KV accumulation beyond the input).
+- Remaining gaps vs llama.cpp: Q8_0 decode **0.91x**, Q4_0 decode **0.88x**, Q8_0 prefill 0.85x, Q4_0 prefill 0.74x, Gemma 0.79x decode / 0.70x prefill.
