@@ -2261,6 +2261,53 @@ mod tests {
     }
 
     #[test]
+    fn test_quantized_linear_q8_gemm_tiled() {
+        // M=8, N=12, K=64: exercises exactly 2 M-tiles × 2 N-tiles of the 4×6 kernel.
+        let m = 8;
+        let n = 12;
+        let k = 64;
+        let weight_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 - 32.0) * 0.01).collect();
+        let input_f32: Vec<f32> = (0..m * k).map(|i| (i as f32 - 16.0) * 0.02).collect();
+
+        let mut expected = vec![0.0f32; m * n];
+        for row in 0..m {
+            for neuron in 0..n {
+                for j in 0..k {
+                    expected[row * n + neuron] +=
+                        input_f32[row * k + j] * weight_f32[neuron * k + j];
+                }
+            }
+        }
+
+        let (qdata, qscales) = manual_quantize_q8(&weight_f32);
+        let qweight = CpuQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales: qscales,
+            mins: None,
+        };
+
+        let input = CpuTensor::from_f32(&[m, k], &input_f32);
+        let out = quantized_linear(&input, &qweight).unwrap();
+        assert_eq!(out.shape(), &[m, n]);
+
+        let result = out.as_f32_slice();
+        for i in 0..m * n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.04,
+                "Q8 tiled GEMM element {i} (row={}, col={}): got {}, expected {}, rel_err {rel_err}",
+                i / n, i % n, result[i], expected[i]
+            );
+        }
+    }
+
+    #[test]
     fn test_quantize_to_q8_roundtrip() {
         let n = 2;
         let k = 64;
