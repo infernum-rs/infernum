@@ -643,3 +643,45 @@ Absolute infernum tok/s (llama.cpp varied between runs):
 - Prefill ratios appear lower than the previous session only because llama.cpp ran ~8% faster (thermal/governor variance between sessions). The infernum prefill code path is not affected by this change (`q8_gemv_body_inline` is only called in the `m == 1` branch; prefill uses `gemm_q8_tiled`).
 - The largest beneficiary is Gemma 2B (decode): stream count matters most for L3-bound access. SmolLM2 360M (L2-bound) also improved since 6 streams is still within the prefetcher's reliable range.
 - Remaining gaps vs llama.cpp (using absolute infernum numbers as signal): Q8_0 decode ~0.94x, Q4_0 decode ~0.92x, Gemma decode ~0.91x.
+
+---
+
+## 2026-05-24 — Exploration: 4×6 microkernel and inline Q4 expansion (negative results) (`perf/cpu-performance`)
+
+**What was tried and why it was reverted.**
+
+### Attempt 1: 4×6 GEMM microkernel
+
+The existing `microkernel_q8_4x6` (dead code, 24 YMM accumulators ymm8–31) was wired into `gemm_q8_tiled_inner` as the primary tile, with 4×4 as the remainder. Hypothesis: 50% more outputs per K-block inner loop iteration.
+
+**Result:** Q8_0 prefill −7.8%, Q4_0 prefill −6.4%. **Reverted.**
+
+**Root cause:** The 4×6 kernel uses all 32 YMM registers as accumulators (ymm8–31), leaving no room for pre-broadcast input scales. It reloads each input scale 4 times per column (once per row) vs the 4×4 kernel's single pre-broadcast per block (ymm24–27). Instructions per output: 4×6 ≈ 9.0, 4×4 ≈ 7.8. The 4×4's pre-broadcast approach is strictly better under the 32-register constraint.
+
+### Attempt 2: Inline Q4 expansion (from prior session, documented here for completeness)
+
+Q4 nibbles expanded inside the 4×4 microkernel instead of pre-expanding to a Q8 buffer. Hypothesis: smaller memory footprint (37.5 KB Q4 vs 75 KB Q8) → better L1/L2 utilization.
+
+**Result:** Q4_0 prefill −12%. **Reverted.**
+
+**Root cause:** Inline expansion adds 11 instructions per weight column per K block (mov q4_off, shr, vmovdqu xmm, vpand, vpsubb, vpsrlw, vpand, vpsubb, vinserti128, plus 2 for s_off restore). The 6-instruction expansion chain (vpand→vpsubb→vpsrlw→vpand→vpsubb→vinserti128) deepens the critical path from weight load to vpsignb by 6 cycles per column. The 3.3× instruction overhead outweighs the 2× bandwidth savings.
+
+### Root cause of the remaining Q4_0 prefill gap (0.74×)
+
+**Profiling (`perf stat`):**
+
+| Metric | Q4_0 prefill | Q8_0 prefill |
+| ------ | -----------: | -----------: |
+| Cycles | 90.3B | 86.7B |
+| IPC | 2.64 | 2.63 |
+| L1-dcache-load-misses | 4.48B | 4.31B |
+
+Q4_0 is only 4% more expensive than Q8_0 — the gap between Q4_0 (0.74×) and Q8_0 (0.89–0.94×) reflects the **same underlying GEMM kernel gap**, not expansion overhead.
+
+**Comparison with llama.cpp source (`ggml/src/ggml-cpu/arch/x86/repack.cpp`):**
+
+llama.cpp uses two architectural techniques we do not:
+1. **Interleaved weight format (`block_q8_0x4`):** 4 consecutive weight rows' K-block data packed contiguously. Loading one K block for 4 weight rows requires one 128-byte fetch (2 cache lines) instead of 4 scattered 32-byte loads at K·32-byte stride (4 separate cache-line accesses). This is the primary cause of the gap.
+2. **ZMM (512-bit) accumulators + 4×8 tiles:** llama.cpp computes 4 input rows × 8 output columns per microkernel invocation using `_mm512_inserti32x8` + 512-bit VNNI (`vpdpbusd zmm`). Each ZMM instruction processes 64 int8 pairs vs our 32 (YMM). Combined with the interleaved layout, this enables ~2× more work per instruction.
+
+**Next steps to close the gap:** Weight repacking to `block_q8_0x4` interleaved format (done once at model load), a new `microkernel_q8_4x8_zmm` using ZMM registers, and corresponding changes to `gemm_q8_tiled_inner`. This requires a separate planned effort as it touches weight loading and the microkernel simultaneously.
