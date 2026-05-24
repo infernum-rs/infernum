@@ -697,3 +697,94 @@ llama.cpp uses two architectural techniques we do not:
 **Root cause:** The repack pass reads the weight data once (scattered → sequential) and writes a packed copy. The microkernel then reads from the packed copy (sequential). Total weight reads = 2× original. The scattered reads in the repack pass have the same cache-miss cost as the scattered reads the old microkernel had — we're not eliminating the cache misses, just moving them. The extra repack write + extra sequential read costs more bandwidth than the improved prefetch behavior saves.
 
 **Conclusion:** Per-call interleaving is net negative. The format change only pays off if weights are stored permanently in interleaved format (repacked once at model load, amortized across all inference calls). That requires changing `CpuQuantizedWeight::data` layout and the weight loading path — a larger effort tracked in the next-steps note above.
+
+---
+
+## 2026-05-24 — Q4_0 tiled GEMM (`microkernel_q4_4x4`) — added then reverted (`perf/cpu-performance`)
+
+**What was tried:** Implemented a native Q4_0 4×4 tiled GEMM (`microkernel_q4_4x4`) mirroring the Q8_0 4×4 kernel. The inner loop unpacks Q4 nibbles inline (5 instructions per column: `vmovdqu xmm + vpsrlw + vinserti128 + vpandd + vpsubb`), avoiding the need to pre-expand to Q8. Correctness bug (wrong nibble interleaving) was found and fixed. Fused dispatch for `quantized_linear_pair_batched` / `quantized_linear_triple_batched` was also added.
+
+**Result:** Q4_0 prefill regressed from 959 tok/s → 896 tok/s (−7%). **Reverted (commit ed8073c).**
+
+**Root cause:** Each K-block iteration requires 5 nibble-unpack instructions per column (20 per 4-col block), roughly doubling the instruction count per output vs Q8_0. The existing 2-row GEMV path (`dot_q4_q8_2row_inner` with vpshufb LUT) already achieves 0.76× llama.cpp for prefill. The tiled GEMM overhead from inline nibble expansion outweighs the tile-reuse benefit at M=512, IPC=2.5 (compute-bound). The GEMV path remains the best approach until weight-interleaved storage is implemented.
+
+---
+
+## 2026-05-25 — Baseline after rollback (`perf/cpu-performance`)
+
+Post-rollback state with all changes from the 2026-05-24 sessions intact (softmax vectorization, Gemma fusion, GeGLU vectorization, O(t²) KV fix, prefetch tuning, 2-row GEMV, etc.), minus the Q4_0 tiled GEMM.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** `ed8073c`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 139.0 | 148.8 | 0.93x |
+| SmolLM2-360M Q4_0 decode  | 193.1 | 209.8 | 0.92x |
+| SmolLM2-360M Q8_0 prefill | 1029.9 | 1156.9 | 0.89x |
+| SmolLM2-360M Q4_0 prefill | 954.6 | 1249.9 | 0.76x |
+| Gemma 2-2b Q8_0 decode    | 21.8 | 25.3 | 0.86x |
+| Gemma 2-2b Q8_0 prefill   | 193.2 | 207.8 | 0.93x |
+
+### Remaining gaps
+
+| Workload | ratio | Notes |
+| -------- | -----: | ----- |
+| Q8_0 prefill | 0.89x | ~11% gap — GEMM compute-bound; ZMM (512-bit VNNI) is the next lever |
+| Q8_0 decode | 0.93x | ~7% gap — memory-bandwidth-bound |
+| Q4_0 prefill | 0.76x | ~24% gap — nibble unpack overhead; needs interleaved weight format |
+| Q4_0 decode | 0.92x | ~8% gap — memory-bandwidth-bound |
+| Gemma Q8_0 decode | 0.86x | ~14% gap — L3-bound (large weight matrices) |
+| Gemma Q8_0 prefill | 0.93x | ~7% gap — nearly at parity |
+
+---
+
+## 2026-05-25 — Zero-copy arena reads in graph executor (`perf/cpu-performance`)
+
+**Change:** `ctx_read` in the graph executor was calling `CpuTensor::from_f32()` to copy tensor data from the arena into a new heap allocation. Profiling (`perf record`) attributed `__memmove_avx512_unaligned_erms` (called by `from_f32`) to 12.16% of Q8_0 prefill cycles. Changed `ctx_read` to return a zero-copy `from_arc_at` view: an `Arc::clone` of the arena's `Arc<Vec<u8>>` at a byte offset, no memcpy.
+
+Supporting changes to keep `Arc::get_mut` exclusive access invariant:
+- Added `Arena::data_arc_raw_ptr()` and `CpuTensor::backing_arc_ptr()` for arena-view detection in `ctx_write`.
+- Added scope blocks `{ let input = ctx_read(...); compute(&input)? }` in 37 op execute bodies in `builtin_ops.rs` so Arc views are dropped before `ctx_write` calls `Arc::get_mut` on the arena.
+- `ctx_write` detects arena-view results (reshape, slice_view, extract_last_row, AllReduceSum no-op path) and copies via temp buffer before writing back.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs baseline (2026-05-25 post-rollback)
+
+Absolute infernum tok/s (llama.cpp numbers varied between sessions; absolute is the reliable signal):
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 prefill | 1029.9 | 1139.6 | **+10.7%** |
+| SmolLM2-360M Q4_0 prefill | 954.6 | 1118.1 | **+17.1%** |
+| SmolLM2-360M Q4_0 decode | 193.1 | 199.7 | +3.4% |
+| SmolLM2-360M Q8_0 decode | 139.0 | 140.9 | +1.4% |
+| Gemma 2-2b Q8_0 decode | 21.8 | 22.1 | +1.4% |
+| Gemma 2-2b Q8_0 prefill | 193.2 | 195.4 | +1.1% |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 140.9 | 137.4 | **1.03x** |
+| SmolLM2-360M Q4_0 decode | 199.7 | 210.0 | 0.95x |
+| SmolLM2-360M Q8_0 prefill | 1139.6 | 1167.5 | **0.98x** |
+| SmolLM2-360M Q4_0 prefill | 1118.1 | 1282.8 | **0.87x** |
+| Gemma 2-2b Q8_0 decode | 22.1 | 24.8 | 0.89x |
+| Gemma 2-2b Q8_0 prefill | 195.4 | 221.8 | 0.88x |
+
+### Notes
+
+- Prefill gains are large because prefill reads many tensors per layer (M=512 activations copied for each attention, FFN, and residual op). The zero-copy change eliminates one memcpy per `ctx_read`, reducing the memcpy overhead from ~12% to near-zero.
+- Q4_0 prefill gains more than Q8_0 (+17.1% vs +10.7%) because Q4_0 GEMM is slightly faster per layer (less compute), making `ctx_read` overhead proportionally larger.
+- Decode gains are smaller (+1–3%): decode is M=1, so tensors are tiny and the copy was cheap; the dominant cost is memory bandwidth for the GEMV.
+- Q8_0 decode ratio appears at 1.03x (beating llama.cpp) because llama.cpp's throughput dropped slightly in this run (run-to-run variance ±5%); infernum absolute improved only +1.4%.
+- Remaining gaps vs llama.cpp: Q8_0 decode ~0.93–1.03x (at parity), Q4_0 decode ~0.95x, Q8_0 prefill ~0.98x, Q4_0 prefill ~0.87x, Gemma ~0.88–0.89x.

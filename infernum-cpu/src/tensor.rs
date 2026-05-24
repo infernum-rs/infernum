@@ -148,6 +148,26 @@ impl CpuTensor {
         }
     }
 
+    /// Create a zero-copy tensor view into an `Arc<Vec<u8>>` at a byte offset.
+    ///
+    /// Used by the graph executor's `ctx_read` to return a view into the arena
+    /// buffer without copying data. The caller is responsible for dropping this
+    /// tensor before any mutable arena operation (`Arc::get_mut` must succeed).
+    #[must_use]
+    pub fn from_arc_at(
+        shape: &[usize],
+        dtype: DType,
+        data: Arc<Vec<u8>>,
+        byte_offset: usize,
+    ) -> Self {
+        Self {
+            data,
+            offset: byte_offset,
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
     /// Create a zero-filled f32 tensor.
     #[must_use]
     pub fn zeros_f32(shape: &[usize]) -> Self {
@@ -211,6 +231,16 @@ impl CpuTensor {
         let start = self.offset;
         let end = start + self.numel() * 4;
         bytemuck::cast_slice(&self.data[start..end])
+    }
+
+    /// Return the raw pointer to the Arc's backing Vec<u8> (without cloning).
+    ///
+    /// Used by `ctx_write` to detect whether this tensor is a zero-copy view
+    /// into the arena, so it can handle the write without requiring exclusive
+    /// Arc ownership at the point of the read.
+    #[must_use]
+    pub fn backing_arc_ptr(&self) -> *const Vec<u8> {
+        std::sync::Arc::as_ptr(&self.data)
     }
 
     /// Get the raw bytes.

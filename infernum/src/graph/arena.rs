@@ -6,6 +6,7 @@
 //! memory for all intermediate activations.
 
 use std::mem;
+use std::sync::Arc;
 
 /// A flat byte arena for graph execution.
 ///
@@ -13,15 +14,20 @@ use std::mem;
 /// this arena. The executor uses those offsets to obtain typed slices for
 /// reading inputs and writing outputs.
 ///
+/// The backing store is `Arc<Vec<u8>>` so that `ctx_read` can return zero-copy
+/// tensor views (sharing the Arc instead of copying bytes). Write methods
+/// require exclusive access via `Arc::get_mut`; callers must ensure all
+/// arena-backed tensor views (from `data_arc`) are dropped before calling any
+/// mutating method.
+///
 /// # Alignment
 ///
-/// The arena is backed by a `Vec<u8>`. Callers are responsible for ensuring
-/// that offsets passed to [`f32_slice`](Arena::f32_slice) and
-/// [`f32_slice_mut`](Arena::f32_slice_mut) are 4-byte aligned (the memory
-/// planner guarantees this because all `DType` sizes are powers of two and
-/// offsets are computed from cumulative byte sizes).
+/// Callers are responsible for ensuring that offsets passed to
+/// [`f32_slice`](Arena::f32_slice) and [`f32_slice_mut`](Arena::f32_slice_mut)
+/// are 4-byte aligned (the memory planner guarantees this because all `DType`
+/// sizes are powers of two and offsets are computed from cumulative byte sizes).
 pub struct Arena {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
 }
 
 impl Arena {
@@ -29,11 +35,41 @@ impl Arena {
     #[must_use]
     pub fn new(size: usize) -> Self {
         Self {
-            data: vec![0u8; size],
+            data: Arc::new(vec![0u8; size]),
         }
     }
 
+    /// Clone the arena's `Arc` for zero-copy tensor views.
+    ///
+    /// The returned Arc shares the same backing buffer. Any tensors created
+    /// from this Arc must be dropped before calling any mutating arena method
+    /// (`f32_slice_mut`, `u32_slice_mut`, etc.).
+    #[must_use]
+    pub fn data_arc(&self) -> Arc<Vec<u8>> {
+        Arc::clone(&self.data)
+    }
+
+    /// Expose the internal `Arc` mutably for write operations.
+    ///
+    /// Used by `ctx_write` to obtain `Arc::get_mut` exclusive access.
+    pub fn data_arc_mut(&mut self) -> &mut Arc<Vec<u8>> {
+        &mut self.data
+    }
+
+    /// Return the raw pointer to the backing Arc without cloning it.
+    ///
+    /// Used by `ctx_write` to compare against a tensor's backing pointer
+    /// to determine if the tensor is a zero-copy arena view.
+    #[must_use]
+    pub fn data_arc_raw_ptr(&self) -> *const Vec<u8> {
+        Arc::as_ptr(&self.data)
+    }
+
     /// Returns a raw mutable pointer to the start of the arena's byte buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are outstanding `Arc` clones (i.e., live tensor views).
     ///
     /// # Safety
     ///
@@ -41,16 +77,16 @@ impl Arena {
     /// disjoint and that alignment requirements are met.
     #[must_use]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
+        Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before as_mut_ptr")
+            .as_mut_ptr()
     }
 
     /// Get an immutable `f32` slice at the given byte offset and element count.
     ///
     /// # Panics
     ///
-    /// Panics if:
-    /// - `offset + len * 4` exceeds the arena size
-    /// - `offset` is not 4-byte aligned
+    /// Panics if `offset + len * 4` exceeds the arena size.
     #[must_use]
     pub fn f32_slice(&self, offset: usize, len: usize) -> &[f32] {
         let byte_len = len * mem::size_of::<f32>();
@@ -67,28 +103,27 @@ impl Arena {
     ///
     /// # Panics
     ///
-    /// Panics if:
-    /// - `offset + len * 4` exceeds the arena size
-    /// - `offset` is not 4-byte aligned
+    /// Panics if `offset + len * 4` exceeds the arena size, or if there are
+    /// outstanding `Arc` clones from `data_arc`.
     #[must_use]
     pub fn f32_slice_mut(&mut self, offset: usize, len: usize) -> &mut [f32] {
         let byte_len = len * mem::size_of::<f32>();
         let end = offset + byte_len;
+        let data = Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before f32_slice_mut");
         assert!(
-            end <= self.data.len(),
+            end <= data.len(),
             "slice [{offset}..{end}) exceeds arena size {}",
-            self.data.len()
+            data.len()
         );
-        bytemuck::cast_slice_mut(&mut self.data[offset..end])
+        bytemuck::cast_slice_mut(&mut data[offset..end])
     }
 
     /// Get an immutable `u32` slice at the given byte offset and element count.
     ///
     /// # Panics
     ///
-    /// Panics if:
-    /// - `offset + len * 4` exceeds the arena size
-    /// - `offset` is not 4-byte aligned
+    /// Panics if `offset + len * 4` exceeds the arena size.
     #[must_use]
     pub fn u32_slice(&self, offset: usize, len: usize) -> &[u32] {
         let byte_len = len * mem::size_of::<u32>();
@@ -105,19 +140,20 @@ impl Arena {
     ///
     /// # Panics
     ///
-    /// Panics if:
-    /// - `offset + len * 4` exceeds the arena size
-    /// - `offset` is not 4-byte aligned
+    /// Panics if `offset + len * 4` exceeds the arena size, or if there are
+    /// outstanding `Arc` clones from `data_arc`.
     #[must_use]
     pub fn u32_slice_mut(&mut self, offset: usize, len: usize) -> &mut [u32] {
         let byte_len = len * mem::size_of::<u32>();
         let end = offset + byte_len;
+        let data = Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before u32_slice_mut");
         assert!(
-            end <= self.data.len(),
+            end <= data.len(),
             "slice [{offset}..{end}) exceeds arena size {}",
-            self.data.len()
+            data.len()
         );
-        bytemuck::cast_slice_mut(&mut self.data[offset..end])
+        bytemuck::cast_slice_mut(&mut data[offset..end])
     }
 
     /// Total arena size in bytes.
@@ -169,8 +205,10 @@ impl Arena {
 
         // SAFETY: we verified the two byte ranges are non-overlapping and
         // within bounds. `bytemuck::cast_slice_mut` will verify alignment.
+        let data = Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before f32_slice_pair_mut");
         unsafe {
-            let ptr = self.data.as_mut_ptr();
+            let ptr = data.as_mut_ptr();
             let slice1 = std::slice::from_raw_parts_mut(ptr.add(offset1), byte_len1);
             let slice2 = std::slice::from_raw_parts_mut(ptr.add(offset2), byte_len2);
             (
@@ -236,8 +274,10 @@ impl Arena {
         // exclusive-access guarantee. `out` is the sole `*mut` region, and we
         // verified above that it does not overlap with either input.
         // All three ranges are within bounds.
+        let data = Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before two_slices_in_one_out");
         unsafe {
-            let ptr = self.data.as_mut_ptr();
+            let ptr = data.as_mut_ptr();
             let in1_raw = std::slice::from_raw_parts(ptr.add(in1_offset).cast_const(), in1_bytes);
             let in2_raw = std::slice::from_raw_parts(ptr.add(in2_offset).cast_const(), in2_bytes);
             let out_raw = std::slice::from_raw_parts_mut(ptr.add(out_offset), out_bytes);
@@ -311,8 +351,10 @@ impl Arena {
         // guarantee. `out1` and `out2` are separate `*mut` regions that we
         // verified are non-overlapping and non-aliasing with `in`.
         // All three ranges are within bounds.
+        let data = Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before one_slice_in_two_out");
         unsafe {
-            let ptr = self.data.as_mut_ptr();
+            let ptr = data.as_mut_ptr();
             let in_raw = std::slice::from_raw_parts(ptr.add(in_offset).cast_const(), in_bytes);
             let out1_raw = std::slice::from_raw_parts_mut(ptr.add(out1_offset), out1_bytes);
             let out2_raw = std::slice::from_raw_parts_mut(ptr.add(out2_offset), out2_bytes);
@@ -403,8 +445,10 @@ impl Arena {
         // exclusive-access guarantee. `out1` and `out2` are separate `*mut`
         // regions that we verified are non-overlapping with each other and with
         // both inputs. All four ranges are within bounds.
+        let data = Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before two_slices_in_two_out");
         unsafe {
-            let ptr = self.data.as_mut_ptr();
+            let ptr = data.as_mut_ptr();
             let in1_raw = std::slice::from_raw_parts(ptr.add(in1_offset).cast_const(), in1_bytes);
             let in2_raw = std::slice::from_raw_parts(ptr.add(in2_offset).cast_const(), in2_bytes);
             let out1_raw = std::slice::from_raw_parts_mut(ptr.add(out1_offset), out1_bytes);
@@ -463,8 +507,10 @@ impl Arena {
         // not overlap with the input. Both ranges are within bounds.
         // `u32` and `f32` have the same size (4 bytes) and alignment, and the
         // planner guarantees 4-byte aligned offsets.
+        let data = Arc::get_mut(&mut self.data)
+            .expect("arena has live Arc clones; drop all tensor views before u32_slice_in_f32_out");
         unsafe {
-            let ptr = self.data.as_mut_ptr();
+            let ptr = data.as_mut_ptr();
             let in_raw = std::slice::from_raw_parts(ptr.add(in_offset).cast_const(), in_bytes);
             let out_raw = std::slice::from_raw_parts_mut(ptr.add(out_offset), out_bytes);
             (
