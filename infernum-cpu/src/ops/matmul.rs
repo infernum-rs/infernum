@@ -718,12 +718,63 @@ fn quantized_linear_pair_batched(
             });
         }
         DType::Q4_0 => {
-            q4_gemm_tiled(
-                &mut out1, &all_rows, m, k, n1, num_blocks, &w1.data, &w1.scales,
-            );
-            q4_gemm_tiled(
-                &mut out2, &all_rows, m, k, n2, num_blocks, &w2.data, &w2.scales,
-            );
+            // Fused dispatch: compute both Q4_0 matrices in a single pool dispatch,
+            // matching the Q8_0 path to eliminate the sync barrier between them.
+            let wt_bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
+            let inp_bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
+            let pool = crate::thread_pool::global_pool();
+            let num_threads = pool.num_threads();
+            let cpt1 = n1.div_ceil(num_threads);
+            let cpt2 = n2.div_ceil(num_threads);
+            let num_tasks = num_threads
+                .min(n1.div_ceil(cpt1))
+                .max(num_threads.min(n2.div_ceil(cpt2)));
+            let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+            let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+            let w1d = w1.data.as_ptr() as usize;
+            let w1s = w1.scales.as_ptr() as usize;
+            let w2d = w2.data.as_ptr() as usize;
+            let w2s = w2.scales.as_ptr() as usize;
+            pool.dispatch(num_tasks, |task_id, _| {
+                macro_rules! q4_chunk {
+                    ($cs:expr, $n:expr, $cpt:expr, $wd:expr, $ws:expr, $out:expr) => {
+                        let cs = $cs;
+                        if cs < $n {
+                            let ce = (cs + $cpt).min($n);
+                            let cn = ce - cs;
+                            let wd = unsafe {
+                                std::slice::from_raw_parts(
+                                    ($wd as *const u8).add(cs * wt_bpr),
+                                    cn * wt_bpr,
+                                )
+                            };
+                            let ws = unsafe {
+                                std::slice::from_raw_parts(
+                                    ($ws as *const f32).add(cs * num_blocks),
+                                    cn * num_blocks,
+                                )
+                            };
+                            let out =
+                                unsafe { std::slice::from_raw_parts_mut($out as *mut f32, m * $n) };
+                            simd::gemm_q4_tiled(
+                                &mut out[cs..],
+                                &all_rows.quants,
+                                &all_rows.scales,
+                                wd,
+                                ws,
+                                m,
+                                cn,
+                                $n,
+                                num_blocks,
+                                inp_bpr,
+                                wt_bpr,
+                            );
+                        }
+                    };
+                }
+                q4_chunk!(task_id * cpt1, n1, cpt1, w1d, w1s, out1_addr);
+                q4_chunk!(task_id * cpt2, n2, cpt2, w2d, w2s, out2_addr);
+            });
         }
         _ => {
             let a = quantized_linear(input, w1)?;
@@ -833,15 +884,68 @@ fn quantized_linear_triple_batched(
             });
         }
         DType::Q4_0 => {
-            q4_gemm_tiled(
-                &mut out1, &all_rows, m, k, n1, num_blocks, &w1.data, &w1.scales,
-            );
-            q4_gemm_tiled(
-                &mut out2, &all_rows, m, k, n2, num_blocks, &w2.data, &w2.scales,
-            );
-            q4_gemm_tiled(
-                &mut out3, &all_rows, m, k, n3, num_blocks, &w3.data, &w3.scales,
-            );
+            // Fused dispatch: compute all three Q4_0 matrices in a single pool dispatch.
+            let wt_bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
+            let inp_bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
+            let pool = crate::thread_pool::global_pool();
+            let num_threads = pool.num_threads();
+            let cpt1 = n1.div_ceil(num_threads);
+            let cpt2 = n2.div_ceil(num_threads);
+            let cpt3 = n3.div_ceil(num_threads);
+            let num_tasks = num_threads
+                .min(n1.div_ceil(cpt1))
+                .max(num_threads.min(n2.div_ceil(cpt2)))
+                .max(num_threads.min(n3.div_ceil(cpt3)));
+            let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+            let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+            let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+            let w1d = w1.data.as_ptr() as usize;
+            let w1s = w1.scales.as_ptr() as usize;
+            let w2d = w2.data.as_ptr() as usize;
+            let w2s = w2.scales.as_ptr() as usize;
+            let w3d = w3.data.as_ptr() as usize;
+            let w3s = w3.scales.as_ptr() as usize;
+            pool.dispatch(num_tasks, |task_id, _| {
+                macro_rules! q4_chunk {
+                    ($cs:expr, $n:expr, $cpt:expr, $wd:expr, $ws:expr, $out:expr) => {
+                        let cs = $cs;
+                        if cs < $n {
+                            let ce = (cs + $cpt).min($n);
+                            let cn = ce - cs;
+                            let wd = unsafe {
+                                std::slice::from_raw_parts(
+                                    ($wd as *const u8).add(cs * wt_bpr),
+                                    cn * wt_bpr,
+                                )
+                            };
+                            let ws = unsafe {
+                                std::slice::from_raw_parts(
+                                    ($ws as *const f32).add(cs * num_blocks),
+                                    cn * num_blocks,
+                                )
+                            };
+                            let out =
+                                unsafe { std::slice::from_raw_parts_mut($out as *mut f32, m * $n) };
+                            simd::gemm_q4_tiled(
+                                &mut out[cs..],
+                                &all_rows.quants,
+                                &all_rows.scales,
+                                wd,
+                                ws,
+                                m,
+                                cn,
+                                $n,
+                                num_blocks,
+                                inp_bpr,
+                                wt_bpr,
+                            );
+                        }
+                    };
+                }
+                q4_chunk!(task_id * cpt1, n1, cpt1, w1d, w1s, out1_addr);
+                q4_chunk!(task_id * cpt2, n2, cpt2, w2d, w2s, out2_addr);
+                q4_chunk!(task_id * cpt3, n3, cpt3, w3d, w3s, out3_addr);
+            });
         }
         _ => {
             let a = quantized_linear(input, w1)?;
