@@ -1040,6 +1040,7 @@ dependencies = [
 name = "infernum-examples"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "clap",
  "cudarc",
  "infernum",
@@ -1052,6 +1053,7 @@ dependencies = [
  "infernum-qwen",
  "infernum-runtime",
  "infernum-serve",
+ "metal",
  "serde",
  "serde_json",
  "tokio",

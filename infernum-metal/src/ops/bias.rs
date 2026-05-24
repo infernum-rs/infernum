@@ -28,12 +28,14 @@ impl BiasOps for MetalBackend {
         } else {
             "bias_add_inplace_f32"
         };
-        ctx.dispatch_1d(
+        // buffer[0] (input) is written in-place.
+        ctx.dispatch_1d_with_outputs(
             kernel,
             &[
                 (input.metal_buffer(), input.buffer_offset()),
                 (bias.metal_buffer(), bias.buffer_offset()),
             ],
+            &[0],
             bytemuck::bytes_of(&cols_u32),
             n,
         );

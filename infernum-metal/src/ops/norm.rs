@@ -82,7 +82,8 @@ impl NormOps for MetalBackend {
         } else {
             "add_rmsnorm_f32"
         };
-        ctx.dispatch_threadgroups(
+        // buffers[3] (updated) and buffers[4] (normed) are the two outputs.
+        ctx.dispatch_threadgroups_with_outputs(
             kernel,
             &[
                 (residual.metal_buffer(), residual.buffer_offset()),
@@ -91,6 +92,7 @@ impl NormOps for MetalBackend {
                 (updated.metal_buffer(), updated.buffer_offset()),
                 (normed.metal_buffer(), normed.buffer_offset()),
             ],
+            &[3, 4],
             &params,
             MTLSize::new(rows as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),

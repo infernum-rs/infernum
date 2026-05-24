@@ -199,7 +199,8 @@ fn attention_prefill_gpu(
     let tg_size = reduction_threadgroup_size(kv_len.max(head_dim));
     let num_threadgroups = seq_len * n_heads;
 
-    ctx.dispatch_threadgroups(
+    // buffers[3] (out) and buffers[4] (lse) are the two outputs.
+    ctx.dispatch_threadgroups_with_outputs(
         "fused_attention_prefill_f32",
         &[
             (q.metal_buffer(), q.buffer_offset()),
@@ -208,6 +209,7 @@ fn attention_prefill_gpu(
             (out.metal_buffer(), out.buffer_offset()),
             (lse.metal_buffer(), lse.buffer_offset()),
         ],
+        &[3, 4],
         bytemuck::bytes_of(&params),
         MTLSize::new(num_threadgroups as u64, 1, 1),
         MTLSize::new(tg_size as u64, 1, 1),
@@ -398,7 +400,8 @@ impl PagedKvCacheOps for MetalBackend {
         } else {
             "append_kv_paged_batched_fused_f32"
         };
-        ctx.dispatch_3d(
+        // buffers[0] (k_pool) and buffers[1] (v_pool) are the outputs.
+        ctx.dispatch_3d_with_outputs(
             kernel,
             &[
                 (
@@ -414,6 +417,7 @@ impl PagedKvCacheOps for MetalBackend {
                 (block_tables.metal_buffer(), block_tables.buffer_offset()),
                 (positions.metal_buffer(), positions.buffer_offset()),
             ],
+            &[0, 1],
             bytemuck::bytes_of(&params),
             total_per_token,
             batch_size,
@@ -633,7 +637,8 @@ impl FusedDecodeOps for MetalBackend {
             "rope_kv_append_fused_f32"
         };
 
-        ctx.dispatch_1d(
+        // buffers[6]=q_out, buffers[7]=k_pool, buffers[8]=v_pool are the outputs.
+        ctx.dispatch_1d_with_outputs(
             kernel,
             &[
                 (q.metal_buffer(), q.buffer_offset()),
@@ -653,6 +658,7 @@ impl FusedDecodeOps for MetalBackend {
                 ),
                 (block_tables.metal_buffer(), block_tables.buffer_offset()),
             ],
+            &[6, 7, 8],
             bytemuck::bytes_of(&params),
             n,
         );

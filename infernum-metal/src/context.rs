@@ -62,6 +62,14 @@ struct ActiveEncoder {
     encoder: *mut metal::ComputeCommandEncoderRef,
     /// Number of dispatches encoded (for stats).
     dispatch_count: u32,
+    /// GPU addresses of buffers written by dispatches in this encoder.
+    ///
+    /// Used for read-after-write (RAW) dependency detection. Before each
+    /// dispatch we check if any of its buffer addresses appear here; if so
+    /// we insert a `memoryBarrierWithScope:` and clear this set so that
+    /// independent ops (Q/K/V projections, gate/up projections) can execute
+    /// concurrently between barriers.
+    written_addrs: Vec<u64>,
 }
 
 // SAFETY: Metal command buffers and encoders are accessed from a single
@@ -314,18 +322,19 @@ impl MetalContext {
         // work while we're still encoding subsequent dispatches.
         cmd_ref.enqueue();
 
-        // Serial dispatch type ensures kernels execute in recording order.
-        // This is required for correctness: the paged KV append (write) must
-        // complete before any paged attention decode (read) that follows it.
-        // Concurrent dispatch would allow the GPU to reorder these dependent
-        // operations, producing stale or garbage attention outputs.
+        // Concurrent dispatch: the GPU can execute independent kernels in
+        // parallel and prefetch weight data for upcoming dispatches while
+        // the current one runs.  Correctness is maintained by
+        // `maybe_barrier` which inserts `memoryBarrierWithScope:` only
+        // when a true read-after-write dependency is detected.
         let enc =
-            cmd_ref.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+            cmd_ref.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
         let encoder = std::ptr::from_ref(enc).cast_mut();
         *active = Some(ActiveEncoder {
             cmd,
             encoder,
             dispatch_count: 0,
+            written_addrs: Vec::new(),
         });
         encoder
     }
@@ -361,10 +370,76 @@ impl MetalContext {
     // Dispatch helpers
     // ------------------------------------------------------------------
 
+    /// Insert a buffer-scope memory barrier on the active concurrent encoder.
+    ///
+    /// `MTLBarrierScopeBuffers = 1`.  Only valid (and needed) with
+    /// `MTLDispatchTypeConcurrent`; call only when a RAW dependency is detected.
+    fn barrier_buffers(enc: &metal::ComputeCommandEncoderRef) {
+        unsafe {
+            let _: () = msg_send![enc, memoryBarrierWithScope: 1usize];
+        }
+    }
+
+    /// Insert a barrier if any buffer in `buffers` was written by a prior
+    /// dispatch in this encoder (read-after-write dependency).
+    ///
+    /// After the barrier the `written_addrs` set is cleared: all pending
+    /// writes are now visible, so subsequent ops can read any buffer safely.
+    fn maybe_barrier(
+        active: &mut Option<ActiveEncoder>,
+        enc: &metal::ComputeCommandEncoderRef,
+        buffers: &[(&metal::BufferRef, usize)],
+    ) {
+        let needs = {
+            let ae = active.as_ref().unwrap();
+            !ae.written_addrs.is_empty()
+                && buffers
+                    .iter()
+                    .any(|(buf, _)| ae.written_addrs.contains(&buf.gpu_address()))
+        };
+        if needs {
+            Self::barrier_buffers(enc);
+            active.as_mut().unwrap().written_addrs.clear();
+        }
+    }
+
+    /// Record that the dispatcher wrote to the buffers at `output_indices`.
+    fn mark_written(
+        active: &mut Option<ActiveEncoder>,
+        buffers: &[(&metal::BufferRef, usize)],
+        output_indices: &[usize],
+    ) {
+        let ae = active.as_mut().unwrap();
+        for &idx in output_indices {
+            ae.written_addrs.push(buffers[idx].0.gpu_address());
+        }
+    }
+
+    /// Shared buffer-binding helper used by all dispatch methods.
+    fn set_buffers_and_params(
+        enc: &metal::ComputeCommandEncoderRef,
+        buffers: &[(&metal::BufferRef, usize)],
+        params: &[u8],
+    ) {
+        for (idx, &(buf, offset)) in buffers.iter().enumerate() {
+            enc.set_buffer(idx as u64, Some(buf), offset as u64);
+        }
+        if !params.is_empty() {
+            enc.set_bytes(
+                buffers.len() as u64,
+                params.len() as u64,
+                params.as_ptr().cast(),
+            );
+        }
+    }
+
     /// Dispatch a 1-D compute kernel.
     ///
     /// Encodes onto the shared command buffer without committing.
     /// Call [`flush`](Self::flush) to submit all pending work.
+    ///
+    /// The **last** buffer in `buffers` is treated as the output (written).
+    /// For kernels with a different output layout use [`dispatch_1d_with_outputs`].
     #[allow(clippy::cast_possible_truncation)]
     pub fn dispatch_1d(
         &self,
@@ -373,33 +448,41 @@ impl MetalContext {
         params: &[u8],
         n: usize,
     ) {
+        let last = buffers.len().saturating_sub(1);
+        self.dispatch_1d_with_outputs(pipeline, buffers, &[last], params, n);
+    }
+
+    /// Like [`dispatch_1d`] but with explicit output buffer indices.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn dispatch_1d_with_outputs(
+        &self,
+        pipeline: &str,
+        buffers: &[(&metal::BufferRef, usize)],
+        output_indices: &[usize],
+        params: &[u8],
+        n: usize,
+    ) {
         let pso = self.pipeline(pipeline);
         let active = self.active_encoder_mut();
         let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
+        Self::maybe_barrier(active, enc, buffers);
+
         enc.set_compute_pipeline_state(pso);
-
-        for (idx, &(buf, offset)) in buffers.iter().enumerate() {
-            enc.set_buffer(idx as u64, Some(buf), offset as u64);
-        }
-
-        if !params.is_empty() {
-            let param_idx = buffers.len() as u64;
-            enc.set_bytes(param_idx, params.len() as u64, params.as_ptr().cast());
-        }
+        Self::set_buffers_and_params(enc, buffers, params);
 
         let tg = pso.thread_execution_width().min(DEFAULT_THREADGROUP_SIZE);
-        let grid = MTLSize::new(n as u64, 1, 1);
-        let group = MTLSize::new(tg, 1, 1);
-        enc.dispatch_threads(grid, group);
+        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
 
+        Self::mark_written(active, buffers, output_indices);
         self.finish_dispatch(active, pipeline);
     }
 
     /// Dispatch a 2-D compute kernel.
     ///
     /// Encodes onto the shared command buffer without committing.
+    /// The **last** buffer is treated as the output.
     #[allow(clippy::cast_possible_truncation)]
     pub fn dispatch_2d(
         &self,
@@ -409,36 +492,64 @@ impl MetalContext {
         width: usize,
         height: usize,
     ) {
+        let last = buffers.len().saturating_sub(1);
+        self.dispatch_2d_with_outputs(pipeline, buffers, &[last], params, width, height);
+    }
+
+    /// Like [`dispatch_2d`] but with explicit output buffer indices.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn dispatch_2d_with_outputs(
+        &self,
+        pipeline: &str,
+        buffers: &[(&metal::BufferRef, usize)],
+        output_indices: &[usize],
+        params: &[u8],
+        width: usize,
+        height: usize,
+    ) {
         let pso = self.pipeline(pipeline);
         let active = self.active_encoder_mut();
         let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
+        Self::maybe_barrier(active, enc, buffers);
+
         enc.set_compute_pipeline_state(pso);
-
-        for (idx, &(buf, offset)) in buffers.iter().enumerate() {
-            enc.set_buffer(idx as u64, Some(buf), offset as u64);
-        }
-
-        if !params.is_empty() {
-            let param_idx = buffers.len() as u64;
-            enc.set_bytes(param_idx, params.len() as u64, params.as_ptr().cast());
-        }
+        Self::set_buffers_and_params(enc, buffers, params);
 
         let max_w = pso.thread_execution_width();
         let max_h = pso.max_total_threads_per_threadgroup() / max_w;
-        let grid = MTLSize::new(width as u64, height as u64, 1);
-        let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), 1);
-        enc.dispatch_threads(grid, group);
+        enc.dispatch_threads(
+            MTLSize::new(width as u64, height as u64, 1),
+            MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), 1),
+        );
 
+        Self::mark_written(active, buffers, output_indices);
         self.finish_dispatch(active, pipeline);
     }
 
     /// Dispatch a compute kernel with a 3D thread grid.
+    /// The **last** buffer is treated as the output.
     pub fn dispatch_3d(
         &self,
         pipeline: &str,
         buffers: &[(&metal::BufferRef, usize)],
+        params: &[u8],
+        width: usize,
+        height: usize,
+        depth: usize,
+    ) {
+        let last = buffers.len().saturating_sub(1);
+        self.dispatch_3d_with_outputs(pipeline, buffers, &[last], params, width, height, depth);
+    }
+
+    /// Like [`dispatch_3d`] but with explicit output buffer indices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_3d_with_outputs(
+        &self,
+        pipeline: &str,
+        buffers: &[(&metal::BufferRef, usize)],
+        output_indices: &[usize],
         params: &[u8],
         width: usize,
         height: usize,
@@ -449,25 +560,21 @@ impl MetalContext {
         let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
+        Self::maybe_barrier(active, enc, buffers);
+
         enc.set_compute_pipeline_state(pso);
-
-        for (idx, &(buf, offset)) in buffers.iter().enumerate() {
-            enc.set_buffer(idx as u64, Some(buf), offset as u64);
-        }
-
-        if !params.is_empty() {
-            let param_idx = buffers.len() as u64;
-            enc.set_bytes(param_idx, params.len() as u64, params.as_ptr().cast());
-        }
+        Self::set_buffers_and_params(enc, buffers, params);
 
         let max_total = pso.max_total_threads_per_threadgroup();
         let max_w = pso.thread_execution_width();
         let max_h = (max_total / max_w).min(height as u64);
         let max_d = (max_total / (max_w * max_h)).max(1).min(depth as u64);
-        let grid = MTLSize::new(width as u64, height as u64, depth as u64);
-        let group = MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), max_d);
-        enc.dispatch_threads(grid, group);
+        enc.dispatch_threads(
+            MTLSize::new(width as u64, height as u64, depth as u64),
+            MTLSize::new(max_w.min(width as u64), max_h.min(height as u64), max_d),
+        );
 
+        Self::mark_written(active, buffers, output_indices);
         self.finish_dispatch(active, pipeline);
     }
 
@@ -475,6 +582,7 @@ impl MetalContext {
     ///
     /// Encodes onto the shared command buffer without committing.
     /// Supports threadgroup shared memory via `threadgroup_mem_len`.
+    /// The **last** buffer is treated as the output.
     #[allow(clippy::cast_possible_truncation)]
     pub fn dispatch_threadgroups(
         &self,
@@ -485,21 +593,39 @@ impl MetalContext {
         threads_per_group: MTLSize,
         threadgroup_mem_len: usize,
     ) {
+        let last = buffers.len().saturating_sub(1);
+        self.dispatch_threadgroups_with_outputs(
+            pipeline,
+            buffers,
+            &[last],
+            params,
+            threadgroups,
+            threads_per_group,
+            threadgroup_mem_len,
+        );
+    }
+
+    /// Like [`dispatch_threadgroups`] but with explicit output buffer indices.
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+    pub fn dispatch_threadgroups_with_outputs(
+        &self,
+        pipeline: &str,
+        buffers: &[(&metal::BufferRef, usize)],
+        output_indices: &[usize],
+        params: &[u8],
+        threadgroups: MTLSize,
+        threads_per_group: MTLSize,
+        threadgroup_mem_len: usize,
+    ) {
         let pso = self.pipeline(pipeline);
         let active = self.active_encoder_mut();
         let enc_ptr = Self::ensure_encoder(active, &self.inner.queue);
         let enc = unsafe { &*enc_ptr };
 
+        Self::maybe_barrier(active, enc, buffers);
+
         enc.set_compute_pipeline_state(pso);
-
-        for (idx, &(buf, offset)) in buffers.iter().enumerate() {
-            enc.set_buffer(idx as u64, Some(buf), offset as u64);
-        }
-
-        if !params.is_empty() {
-            let param_idx = buffers.len() as u64;
-            enc.set_bytes(param_idx, params.len() as u64, params.as_ptr().cast());
-        }
+        Self::set_buffers_and_params(enc, buffers, params);
 
         if threadgroup_mem_len > 0 {
             enc.set_threadgroup_memory_length(0, threadgroup_mem_len as u64);
@@ -507,6 +633,7 @@ impl MetalContext {
 
         enc.dispatch_thread_groups(threadgroups, threads_per_group);
 
+        Self::mark_written(active, buffers, output_indices);
         self.finish_dispatch(active, pipeline);
     }
 

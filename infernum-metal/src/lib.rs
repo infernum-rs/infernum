@@ -14,6 +14,9 @@
     clippy::module_name_repetitions
 )]
 
+#[macro_use]
+extern crate objc;
+
 pub mod context;
 pub mod execute_context;
 pub mod executor;

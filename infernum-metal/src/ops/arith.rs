@@ -41,12 +41,14 @@ impl ArithOps for MetalBackend {
         } else {
             "add_inplace_f32"
         };
-        ctx.dispatch_1d(
+        // buffer[0] (a) is both read and written in-place.
+        ctx.dispatch_1d_with_outputs(
             kernel,
             &[
                 (a.metal_buffer(), a.buffer_offset()),
                 (b.metal_buffer(), b.buffer_offset()),
             ],
+            &[0],
             &[],
             n,
         );
