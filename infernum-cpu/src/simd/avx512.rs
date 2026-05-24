@@ -1187,7 +1187,7 @@ unsafe fn microkernel_4x6(
 /// Micro-kernel row count for Q8 GEMM.
 const RM_Q8: usize = 4;
 /// Micro-kernel column count for Q8 GEMM.
-const RN_Q8: usize = 4;
+const RN_Q8: usize = 6;
 
 /// Tiled Q8×Q8 GEMM: `output[m, n_stride] = inp_quants[m, k] · wt_quants[n, k]`
 /// with per-block scales.
@@ -1201,7 +1201,7 @@ const RN_Q8: usize = 4;
 /// output buffer, or the global column count when writing directly into a
 /// column-striped slice of the global output matrix.
 ///
-/// Uses a 4×4 micro-kernel with AVX-512 VNNI for full tiles, falling back
+/// Uses a 4×6 micro-kernel with AVX-512 VNNI for full tiles, falling back
 /// to single-row `dot_q8_q8_row` for remainder rows/columns.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 pub fn gemm_q8_tiled(
@@ -1262,7 +1262,7 @@ unsafe fn gemm_q8_tiled_inner(
     // Full RM_Q8 × RN_Q8 tiles.
     for i in (0..m_full).step_by(RM_Q8) {
         for j in (0..n_full).step_by(RN_Q8) {
-            microkernel_q8_4x4(
+            microkernel_q8_4x6(
                 output,
                 inp_quants,
                 inp_scales,
@@ -1335,7 +1335,6 @@ unsafe fn gemm_q8_tiled_inner(
 /// - s_off (out): scale f32 offset = q_off >> 3, computed per block
 /// - tmp (out): scratch GPR for pointer loads from `ptrs[]`
 #[allow(
-    dead_code,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::similar_names,

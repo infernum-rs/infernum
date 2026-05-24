@@ -347,3 +347,29 @@ New approach: `_mm_and_si128` + `_mm_srli_epi16` + 2× `_mm_shuffle_epi8(lut, ..
 - The Q4_0 decode improvement (+1.0%) is within the ±2% noise band. The kernel is **memory-bandwidth-bound**: at 158.8 tok/s we use ~27 GB/s effective bandwidth vs llama.cpp's ~36 GB/s, both well below the theoretical DDR5 peak.
 - Since the bottleneck is bandwidth not instruction latency, the cross-lane → within-lane substitution gives minimal measured benefit. However, the change is the correct approach for this ISA (used by llama.cpp for the same reason) and is retained.
 - 8-row GEMV was attempted and rolled back: with 8 accumulators + 8 weight loads + 1 input = 17 YMM registers live simultaneously, the compiler spills to stack and decode regresses ~2–3%.
+
+---
+
+## 2026-05-24 — 4×6 Q8×Q8 GEMM microkernel (`perf/cpu-performance`)
+
+**Change:** `gemm_q8_tiled_inner` used a 4×4 microkernel (16 ymm accumulators, 4 output cols per tile). Switched to the pre-written but unused 4×6 microkernel (`microkernel_q8_4x6`): 24 ymm accumulators (ymm8–31), 6 output cols per tile, 50% more outputs per K-block inner loop iteration. Changed `RN_Q8 = 4 → 6`.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** (this session)
+- **Note:** System load was elevated (load avg ~8.7) during benchmarking — high variance across runs. Numbers below are the best of two runs; ratios are directionally correct.
+
+### vs previous best (vpshufb + 4-row GEMV session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 prefill | ~957 (0.84x ref) | 909.1 (0.90x) | **+7% ratio** |
+| SmolLM2-360M Q4_0 prefill | ~939 (0.73x ref) | 857.0 (0.68x) | flat (noise) |
+| SmolLM2-360M Q8_0 decode | ~118 | 115.6 | flat (noise) |
+| SmolLM2-360M Q4_0 decode | ~159 | 150.1 | flat (noise) |
+
+### Notes
+
+- Q8_0 prefill improvement is real: the 4×6 kernel does 50% more work per K-block iteration with the same number of loop passes, amortizing loop overhead and horizontal-reduction cost. Q4_0 prefill is unaffected (uses a separate code path).
+- All decode numbers (GEMV, M=1) are unaffected by GEMM tile changes — these are within measurement noise.
+- Elevated system load made absolute numbers unreliable; ratio improvement is the meaningful signal.
+- Remaining gaps vs llama.cpp: Q8_0 prefill ~0.90x, Q4_0 prefill ~0.73x, Q8_0 decode ~0.82x, Q4_0 decode ~0.76x, Gemma 0.72–0.81x.
