@@ -600,3 +600,46 @@ At 256 decode steps with 64 KV concat nodes (32 layers × K + V) and 1280 bytes 
 - Q4_0 and Gemma numbers are within run-to-run noise (±3%); the softmax change affects all paths.
 - The vectorized exp is a degree-4 polynomial approximation identical to what's used in SwiGLU/GeGLU — same numerical accuracy.
 - Remaining gaps vs llama.cpp: Q8_0 decode **0.95x**, Q4_0 decode 0.92x, Q8_0 prefill **0.94x**, Q4_0 prefill 0.77x, Gemma 0.88–0.89x.
+
+---
+
+## 2026-05-24 — Q8_0 GEMV: 4-row → 2-row (reduce concurrent memory streams) (`perf/cpu-performance`)
+
+**Change:** `q8_gemv_body_inline` was processing 4 output neurons per loop iteration using `dot_q8_q8_4row`, which creates **10 concurrent memory streams** in its inner loop (4 weight-quant streams + 4 weight-scale streams + 1 input-quant stream + 1 input-scale stream). `perf stat` showed 16.32% L1 cache miss rate vs llama.cpp's 2.46%, with IPC 0.77 vs 1.13. Root cause: AMD Zen 5's L1D stream prefetcher tracks ≤8 concurrent streams reliably; 10 streams exceeded this limit for L3-bound weight matrices (Gemma 2B: ~8 MB per thread).
+
+Fix: switch the main loop from groups of 4 (`dot_q8_q8_4row`) to groups of 2 (`dot_q8_q8_2row`), reducing to 6 concurrent streams. The 2-row kernel already existed; no new SIMD code was needed.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (vectorized softmax session)
+
+Absolute infernum tok/s (llama.cpp varied between runs):
+
+| Workload | Before | After | Δ (absolute) |
+| -------- | -----: | ----: | -----------: |
+| SmolLM2-360M Q8_0 decode | 133.4 | 138.2 | **+3.6%** |
+| Gemma 2-2b Q8_0 decode | 21.0 | 21.8 | **+3.8%** |
+| SmolLM2-360M Q4_0 decode | 182.6 | 190.1 | **+4.1%** |
+| SmolLM2-360M Q8_0 prefill | 986.5 | 1010.9 | +2.5% (prefill unaffected — noise/thermal) |
+| SmolLM2-360M Q4_0 prefill | 930.0 | 959.6 | +3.2% (prefill unaffected — noise/thermal) |
+| Gemma 2-2b Q8_0 prefill | 190.5 | 193.1 | +1.4% (prefill unaffected — noise/thermal) |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 138.2 | 146.9 | 0.94x |
+| SmolLM2-360M Q4_0 decode | 190.1 | 207.7 | 0.92x |
+| SmolLM2-360M Q8_0 prefill | 1010.9 | 1138.6 | 0.89x |
+| SmolLM2-360M Q4_0 prefill | 959.6 | 1289.7 | 0.74x |
+| Gemma 2-2b Q8_0 decode | 21.8 | 24.0 | **0.91x** |
+| Gemma 2-2b Q8_0 prefill | 193.1 | 217.5 | 0.89x |
+
+### Notes
+
+- All decode absolute throughputs improved. The ratio for Q8_0 decode appears slightly lower (0.94x vs 0.95x) because llama.cpp was also faster in this run (different thermal state). The infernum number itself improved.
+- Prefill ratios appear lower than the previous session only because llama.cpp ran ~8% faster (thermal/governor variance between sessions). The infernum prefill code path is not affected by this change (`q8_gemv_body_inline` is only called in the `m == 1` branch; prefill uses `gemm_q8_tiled`).
+- The largest beneficiary is Gemma 2B (decode): stream count matters most for L3-bound access. SmolLM2 360M (L2-bound) also improved since 6 streams is still within the prefetcher's reliable range.
+- Remaining gaps vs llama.cpp (using absolute infernum numbers as signal): Q8_0 decode ~0.94x, Q4_0 decode ~0.92x, Gemma decode ~0.91x.

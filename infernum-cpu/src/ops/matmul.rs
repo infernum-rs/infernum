@@ -1503,29 +1503,13 @@ fn q8_gemv_body_inline(
     num_blocks_per_row: usize,
     quant_bytes_per_row: usize,
 ) {
-    let quads = chunk_len / 4;
-    let after_quads = quads * 4;
+    // Process 2 rows at a time: 6 concurrent streams (2 wq + 2 ws + 1 iq + 1 is)
+    // vs 4-row's 10 streams — the prefetcher handles ≤8 streams reliably,
+    // so 4-row causes cache-miss storms on L3-bound (large) weight matrices.
+    let pairs = chunk_len / 2;
 
-    for q in 0..quads {
-        let n0 = neuron_offset + q * 4;
-        let qw_start = n0 * quant_bytes_per_row;
-        let s_start = n0 * num_blocks_per_row;
-        let (d0, d1, d2, d3) = simd::dot_q8_q8_4row(
-            inp_quants,
-            inp_scales,
-            &weight_quants[qw_start..qw_start + 4 * quant_bytes_per_row],
-            &weight_scales[s_start..s_start + 4 * num_blocks_per_row],
-        );
-        chunk[q * 4] = d0;
-        chunk[q * 4 + 1] = d1;
-        chunk[q * 4 + 2] = d2;
-        chunk[q * 4 + 3] = d3;
-    }
-
-    // Remainder: up to 3 neurons (handle as pair then single)
-    let rem = chunk_len - after_quads;
-    if rem >= 2 {
-        let n0 = neuron_offset + after_quads;
+    for p in 0..pairs {
+        let n0 = neuron_offset + p * 2;
         let q0 = n0 * quant_bytes_per_row;
         let q1 = (n0 + 1) * quant_bytes_per_row;
         let s0 = n0 * num_blocks_per_row;
@@ -1538,10 +1522,12 @@ fn q8_gemv_body_inline(
             &weight_quants[q1..q1 + quant_bytes_per_row],
             &weight_scales[s1..s1 + num_blocks_per_row],
         );
-        chunk[after_quads] = d0;
-        chunk[after_quads + 1] = d1;
+        chunk[p * 2] = d0;
+        chunk[p * 2 + 1] = d1;
     }
-    if rem % 2 == 1 {
+
+    // Remainder: 0 or 1 neuron
+    if chunk_len % 2 == 1 {
         let neuron = neuron_offset + chunk_len - 1;
         let qw_start = neuron * quant_bytes_per_row;
         let s_start = neuron * num_blocks_per_row;
