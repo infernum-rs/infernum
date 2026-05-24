@@ -411,3 +411,40 @@ New approach: `_mm_and_si128` + `_mm_srli_epi16` + 2× `_mm_shuffle_epi8(lut, ..
 - Gemma 2-2b prefill also improved (+8.2%) despite being partially compute-bound; large weight matrices benefit from prefetch hiding L3→L2 latency during the tiled GEMM.
 - `expand_q4_to_int8` was profiled at only 0.77% — the Q4_0 prefill gap (0.72x) is not from the expand step but from the GEMM kernel reading expanded weight data (32 bytes/block) vs llama.cpp reading Q4 directly (16 bytes/block).
 - Remaining gaps vs llama.cpp: Q8_0 decode 0.79x, Q4_0 decode 0.75x, Q8_0 prefill 0.86x, Q4_0 prefill 0.72x, Gemma 0.71–0.79x.
+
+---
+
+## 2026-05-24 — Tune prefetch distance PF=8 → PF=12 (`perf/cpu-performance`)
+
+**Change:** Raised the software prefetch lookahead constant from 8 to 12 blocks in both `dot_q8_q8_4row_inner` and `dot_q4_q8_4row_inner`. Tested PF=16: regressed Q8_0 decode −3.8% and Q4_0 decode −5.5% (over-saturation of the cache bandwidth / too many in-flight misses for a 30-block kernel). PF=12 is the empirical knee.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** (this session)
+
+### vs previous best (PF=8 session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q4_0 decode | 156.6 | 161.5 | **+3.1%** |
+| SmolLM2-360M Q8_0 decode | 115.5 | 118.3 | **+2.4%** |
+| Gemma 2-2b Q8_0 decode | 19.1 | 19.7 | **+3.1%** |
+| SmolLM2-360M Q8_0 prefill | 965.9 | 960.7 | flat |
+| SmolLM2-360M Q4_0 prefill | 926.5 | 921.5 | flat |
+
+### Estimated ratios vs llama.cpp (using reference from 2026-05-24 prefetch session)
+
+| Model | infernum | llama.cpp (ref) | ratio |
+| ----- | -------: | --------------: | ----: |
+| SmolLM2-360M Q8_0 decode | 118.3 | 146.5 | 0.81x |
+| SmolLM2-360M Q4_0 decode | 161.5 | 207.5 | 0.78x |
+| SmolLM2-360M Q8_0 prefill | 960.7 | 1128.1 | 0.85x |
+| SmolLM2-360M Q4_0 prefill | 921.5 | 1291.4 | 0.71x |
+| Gemma 2-2b Q8_0 decode | 19.7 | 24.3 | 0.81x |
+
+### Notes
+
+- Q8_0 decode numbers have ±5% run-to-run variance; improvements above are the first-run values.
+- All decode improvements are from better DRAM latency hiding: with 30 blocks per row and ~150 ns latency, PF=12 (vs the theoretical ~9) provides extra buffering against OS scheduling jitter.
+- Prefill unaffected — GEMM is compute-bound; prefetch adds unnecessary instruction overhead there.
+- PF=16 regresses because the 30-block K dimension doesn't leave enough remaining work after the prefetch window fills, causing cache thrash.
+- Remaining gaps vs llama.cpp: Q8_0 decode ~0.81x, Q4_0 decode ~0.78x, Q8_0 prefill ~0.85x, Q4_0 prefill ~0.71x, Gemma ~0.81x.

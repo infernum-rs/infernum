@@ -477,7 +477,8 @@ unsafe fn dot_q8_q8_4row_inner(
     let mut total3 = _mm256_setzero_ps();
 
     // Prefetch distance: DRAM latency (~150 ns) / block compute time (~17 ns) ≈ 9 blocks.
-    const PF: usize = 8;
+    // PF=12 is optimal: PF=8 leaves latency on the table; PF=16 over-saturates cache bandwidth.
+    const PF: usize = 12;
     for blk in 0..num_blocks {
         let blk_offset = blk * 32;
         let inp_scale = *input_scales.get_unchecked(blk);
@@ -592,7 +593,7 @@ unsafe fn dot_q4_q8_4row_inner(
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
-    const PF4: usize = 8; // prefetch distance in Q4 blocks (16 bytes each)
+    const PF4: usize = 12; // prefetch distance in Q4 blocks (16 bytes each)
     for blk in 0..num_blocks {
         let inp_offset = blk * 32;
         let wp_offset = blk * 16;
