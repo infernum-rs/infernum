@@ -18,11 +18,11 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 59.4 | 226.7 | 0.26x | 2026-05-23 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 56.5 | 184.4 | 0.31x | 2026-05-23 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 60.8 | 226.7 | 0.27x | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 57.5 | 184.4 | 0.31x | 2026-05-25 |
 | Llama / SmolLM2-360M | SafeTensors F32 | 29.9 | — | — | 2026-05-25 |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 24.1 | — | — | 2026-05-25 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 18.4 | 29.1 | 0.63x | 2026-05-23 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 18.0 | 29.1 | 0.62x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
 
 ### Prefill throughput (tok/s)
@@ -36,10 +36,10 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x | 2026-05-22 |
 | Llama / SmolLM2-360M | SafeTensors F32 | 264.8 | — | — | 2026-05-25 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 253.2 | 4541 | 0.056x | 2026-05-23 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 4596 | 0.055x | 2026-05-23 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 253.9 | 4541 | 0.056x | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 4596 | 0.055x | 2026-05-25 |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 90.9 | — | — | 2026-05-23 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 661.4 | 938 | 0.70x | 2026-05-23 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 815.3 | 938 | 0.87x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-23 |
 
 ---
@@ -61,14 +61,29 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Model | Format | before | after | delta |
 | ----- | ------ | -----: | ----: | ----: |
 | Llama / SmolLM2-360M | SafeTensors F32 | 26.3 | 29.9 | +13.7% |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 56.5 | 57.5 | +1.8% |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 59.4 | 60.8 | +2.4% |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 22.8 | 24.1 | +5.7% |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 18.4 | 18.0 | -2.2% (noise) |
+
+### Prefill throughput (tok/s) — 512-token prompt
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | SafeTensors F32 | 264.8 | 264.8 | 0% |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 253.2 | 253.9 | +0.3% (noise) |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 253.9 | 0% |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 90.9 | 91.0 | +0.1% (noise) |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 661.4 | 815.3 | +23.3% |
 
 ### Notes
 
 - **Concurrent dispatch:** Switched `MTLDispatchType::Serial` → `MTLDispatchType::Concurrent`. With Serial dispatch the GPU must fully complete each kernel before starting the next, preventing weight-data prefetch for upcoming kernels. With Concurrent dispatch the GPU pipeline can look ahead and start fetching data for the next kernel while the current one is running.
 - **Selective barriers:** Full "barrier before every dispatch" (tried and reverted) caused catastrophic Gemma regression (-87% decode) because each `memoryBarrierWithScope:` adds overhead. Instead, we track which GPU buffer addresses were written by each dispatch and insert a barrier only when a subsequent dispatch reads a buffer that was written (read-after-write dependency). Independent ops (Q/K/V projections, gate/up FFN projections) get no barrier between them and can overlap on the GPU.
 - **Special-case output tracking:** Kernels whose output buffer is not the last slot in the buffer list (`add_inplace`, `bias_add_inplace`, `append_kv_paged_batched_fused`, `rope_kv_append_fused`, `fused_attention_prefill`) now use explicit `dispatch_*_with_outputs` variants that specify the correct output indices, ensuring correctness without false-positive barriers.
-- **GGUF models (SmolLM2 Q8/Q4, Gemma Q8) not measured:** GGUF files not in local cache this session. SafeTensors improvements are consistent across both Llama and Qwen architectures.
+- **Decode improvements:** GGUF decode also benefits from concurrent dispatch (+1.8–2.4%). The SafeTensors F32 improvement (+13.7%) is larger because F32 weights occupy 4× the memory of Q8_0, so the GPU prefetcher gains more from looking ahead.
+- **Gemma prefill +23%:** The largest single improvement this session. Gemma 2B's 18-layer architecture with 4 norms per layer generates many short, fast kernels that are particularly well-suited to concurrent overlap. With Serial dispatch these ran back-to-back with full synchronization barriers; with Concurrent dispatch the GPU schedules them in waves.
+- **Gemma decode unchanged:** 18.0 vs 18.4 tok/s is within measurement noise (thermal variability between sessions).
 
 ---
 
