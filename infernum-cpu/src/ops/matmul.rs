@@ -541,38 +541,25 @@ fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) 
 /// Output layout: `chunk_n` rows × `num_blocks` blocks × 32 int8 bytes per block.
 ///
 /// `qs[k]` encodes element[k] in the low nibble and element[k+16] in the high nibble.
-fn expand_q4_to_int8(packed: &[u8], expanded: &mut [u8], chunk_n: usize, num_blocks: usize) {
-    let bpr = num_blocks * 16;
-    let ebpr = num_blocks * 32;
 
-    for row in 0..chunk_n {
-        let src = &packed[row * bpr..(row + 1) * bpr];
-        let dst = &mut expanded[row * ebpr..(row + 1) * ebpr];
-        for blk in 0..num_blocks {
-            let sb = &src[blk * 16..(blk + 1) * 16];
-            let db = &mut dst[blk * 32..(blk + 1) * 32];
-            for i in 0..16 {
-                db[i] = (sb[i] & 0x0F).wrapping_sub(8);
-                db[i + 16] = (sb[i] >> 4).wrapping_sub(8);
-            }
-        }
-    }
-}
-
-/// Q4_0 tiled GEMM: per-thread expand Q4 nibbles to int8, then reuse the Q8 GEMM.
+/// Q4_0 tiled GEMM: inline nibble unpacking, no expand-to-int8 step.
+///
+/// Each thread calls `gemm_q4_tiled` directly on the packed Q4 data.
+/// Nibbles are decoded inside the microkernel, keeping weight data 2×
+/// smaller in cache vs the old expand-first approach.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 fn q4_gemm_tiled(
     output: &mut [f32],
     all_rows: &QuantizedRows,
     m: usize,
-    k: usize,
+    _k: usize,
     n: usize,
     num_blocks: usize,
     weight_data: &[u8],
     weight_scales: &[f32],
 ) {
-    let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2); // 16 bytes/block packed
-    let ebpr = num_blocks * QUANTIZATION_BLOCK_SIZE; // 32 bytes/block expanded
+    let wt_bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2); // 16 bytes/block (packed Q4)
+    let inp_bpr = num_blocks * QUANTIZATION_BLOCK_SIZE; // 32 bytes/block (Q8 input)
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
@@ -590,22 +577,12 @@ fn q4_gemm_tiled(
         }
         let chunk_n = col_end - col_start;
 
-        // Expand Q4_0 → int8 for this thread's weight column chunk.
-        // expand_q4_to_int8 writes every element — skip zero-init.
-        #[allow(clippy::uninit_vec)]
-        let mut expanded: Vec<u8> = {
-            let mut v = Vec::with_capacity(chunk_n * k);
-            unsafe { v.set_len(chunk_n * k) };
-            v
-        };
         let q4_data = unsafe {
             std::slice::from_raw_parts(
-                (wt_data_addr as *const u8).add(col_start * bpr),
-                chunk_n * bpr,
+                (wt_data_addr as *const u8).add(col_start * wt_bpr),
+                chunk_n * wt_bpr,
             )
         };
-        expand_q4_to_int8(q4_data, &mut expanded, chunk_n, num_blocks);
-
         let wt_scales = unsafe {
             std::slice::from_raw_parts(
                 (wt_scales_addr as *const f32).add(col_start * num_blocks),
@@ -613,19 +590,19 @@ fn q4_gemm_tiled(
             )
         };
 
-        // Write directly into strided global output (stride = n).
         let out_global = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
-        simd::gemm_q8_tiled(
+        simd::gemm_q4_tiled(
             &mut out_global[col_start..],
             &all_rows.quants,
             &all_rows.scales,
-            &expanded,
+            q4_data,
             wt_scales,
             m,
             chunk_n,
             n,
             num_blocks,
-            ebpr,
+            inp_bpr,
+            wt_bpr,
         );
     });
 }
