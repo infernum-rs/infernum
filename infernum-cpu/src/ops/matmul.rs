@@ -133,53 +133,26 @@ fn q8_gemv_parallel(
 ) {
     let n = out.len();
 
-    let gemv_body = |chunk: &mut [f32], neuron_offset: usize| {
-        let chunk_len = chunk.len();
-        let pairs = chunk_len / 2;
-        let remainder = chunk_len % 2;
-
-        for p in 0..pairs {
-            let n0 = neuron_offset + p * 2;
-            let n1 = n0 + 1;
-            let q0 = n0 * quant_bytes_per_row;
-            let q1 = n1 * quant_bytes_per_row;
-            let s0 = n0 * num_blocks_per_row;
-            let s1 = n1 * num_blocks_per_row;
-            let (d0, d1) = simd::dot_q8_q8_2row(
-                inp_quants,
-                inp_scales,
-                &weight_quants[q0..q0 + quant_bytes_per_row],
-                &weight_scales[s0..s0 + num_blocks_per_row],
-                &weight_quants[q1..q1 + quant_bytes_per_row],
-                &weight_scales[s1..s1 + num_blocks_per_row],
-            );
-            chunk[p * 2] = d0;
-            chunk[p * 2 + 1] = d1;
-        }
-
-        if remainder > 0 {
-            let neuron = neuron_offset + pairs * 2;
-            let q_row_start = neuron * quant_bytes_per_row;
-            let s_row_start = neuron * num_blocks_per_row;
-            chunk[pairs * 2] = simd::dot_q8_q8_row(
-                inp_quants,
-                inp_scales,
-                &weight_quants[q_row_start..q_row_start + quant_bytes_per_row],
-                &weight_scales[s_row_start..s_row_start + num_blocks_per_row],
-            );
-        }
-    };
-
     // Only parallelize when there's enough work to amortize dispatch overhead.
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
     let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
-        gemv_body(out, 0);
+        q8_gemv_body_inline(
+            out,
+            0,
+            n,
+            inp_quants,
+            inp_scales,
+            weight_quants,
+            weight_scales,
+            num_blocks_per_row,
+            quant_bytes_per_row,
+        );
     } else {
-        // div_ceil so the last thread covers the tail; round up to even for 2-row kernel.
+        // Round up to multiple of 4 so chunks align with the 4-row kernel.
         let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
-        let chunk_size = (raw_chunk + 1) & !1; // round up to even
+        let chunk_size = (raw_chunk + 3) & !3;
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         // SAFETY: each task writes to a disjoint slice [start..end].
         // dispatch() blocks until all tasks complete, so out_addr is valid.
@@ -192,14 +165,22 @@ fn q8_gemv_parallel(
             let chunk = unsafe {
                 std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
             };
-            gemv_body(chunk, start);
+            q8_gemv_body_inline(
+                chunk,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_quants,
+                weight_scales,
+                num_blocks_per_row,
+                quant_bytes_per_row,
+            );
         });
     }
 }
 
 /// Parallel GEMV for Q4_0 using integer dot product (Q4×Q8).
-///
-/// Processes neurons in pairs using 2-row kernels to halve input memory reads.
 #[allow(clippy::too_many_arguments)]
 fn q4_gemv_parallel(
     out: &mut [f32],
@@ -212,52 +193,25 @@ fn q4_gemv_parallel(
 ) {
     let n = out.len();
 
-    let gemv_body = |chunk: &mut [f32], neuron_offset: usize| {
-        let chunk_len = chunk.len();
-        let pairs = chunk_len / 2;
-        let remainder = chunk_len % 2;
-
-        for p in 0..pairs {
-            let n0 = neuron_offset + p * 2;
-            let n1 = n0 + 1;
-            let p0 = n0 * packed_bytes_per_row;
-            let p1 = n1 * packed_bytes_per_row;
-            let s0 = n0 * num_blocks_per_row;
-            let s1 = n1 * num_blocks_per_row;
-            let (d0, d1) = simd::dot_q4_q8_2row(
-                inp_quants,
-                inp_scales,
-                &weight_packed[p0..p0 + packed_bytes_per_row],
-                &weight_scales[s0..s0 + num_blocks_per_row],
-                &weight_packed[p1..p1 + packed_bytes_per_row],
-                &weight_scales[s1..s1 + num_blocks_per_row],
-            );
-            chunk[p * 2] = d0;
-            chunk[p * 2 + 1] = d1;
-        }
-
-        if remainder > 0 {
-            let neuron = neuron_offset + pairs * 2;
-            let p_row_start = neuron * packed_bytes_per_row;
-            let s_row_start = neuron * num_blocks_per_row;
-            chunk[pairs * 2] = simd::dot_q4_q8_row(
-                inp_quants,
-                inp_scales,
-                &weight_packed[p_row_start..p_row_start + packed_bytes_per_row],
-                &weight_scales[s_row_start..s_row_start + num_blocks_per_row],
-            );
-        }
-    };
-
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
     let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
-        gemv_body(out, 0);
+        q4_gemv_body_inline(
+            out,
+            0,
+            n,
+            inp_quants,
+            inp_scales,
+            weight_packed,
+            weight_scales,
+            num_blocks_per_row,
+            packed_bytes_per_row,
+        );
     } else {
-        // div_ceil so the last chunk covers the tail; round up to even for 2-row kernel.
+        // Round up to multiple of 4 so chunks align with the 4-row kernel.
         let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
-        let chunk_size = (raw_chunk + 1) & !1; // round up to even
+        let chunk_size = (raw_chunk + 3) & !3;
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
             let start = task_id * chunk_size;
@@ -268,7 +222,17 @@ fn q4_gemv_parallel(
             let chunk = unsafe {
                 std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
             };
-            gemv_body(chunk, start);
+            q4_gemv_body_inline(
+                chunk,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_packed,
+                weight_scales,
+                num_blocks_per_row,
+                packed_bytes_per_row,
+            );
         });
     }
 }
