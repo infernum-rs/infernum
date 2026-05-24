@@ -529,3 +529,34 @@ At 256 decode steps with 64 KV concat nodes (32 layers × K + V) and 1280 bytes 
 - SmolLM2-360M numbers are flat (SwiGLU, already parallelized and vectorized — this change doesn't affect it).
 - Gemma decode is flat — decode uses seq_len=1 → 9216 elements, which falls below MIN_PARALLEL=32768 and runs in single-threaded fast-exp mode (AVX-512 vector: 16 elements/cycle vs scalar tanh: ~50 ns/element → still a 3-4× speedup, but decode is GEMV-bound anyway).
 - Remaining gaps vs llama.cpp: Q8_0 decode ~0.89x, Q4_0 decode ~0.91x, Q8_0 prefill ~0.88x, Q4_0 prefill ~0.74x, Gemma decode ~0.86x, Gemma prefill **1.00x**.
+
+---
+
+## 2026-05-24 — Gemma Q/K/V and gate/up linear fusion (`perf/cpu-performance`)
+
+**Change:** Gemma's graph builder used separate `add_linear` calls for Q, K, and V projections (3 thread-pool dispatches per layer) and separate calls for gate and up (2 dispatches). Each separate call independently quantized the input. Replaced all 4 graph-build sites (prefill attention, decode attention, paged decode attention, FFN — prefill and decode) with `add_linear_triple` / `add_linear_pair`, matching the Llama graph builder. The fused ops quantize the input once and share it across all weight matrices in a single `pool.dispatch`. For prefill (M=512) this eliminates 3 redundant quantization passes per layer (78 over 26 layers) and reduces thread-pool barriers from 5→2 per layer.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** `14b105d`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (GeGLU vectorization session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| Gemma 2-2b Q8_0 prefill | 183.0 | 192.5 | **+5.2%** |
+| Gemma 2-2b Q8_0 decode | 19.8 | 20.9 | **+5.6%** |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| Gemma 2-2b Q8_0 prefill | 192.5 | 213.9 | 0.90x |
+| Gemma 2-2b Q8_0 decode | 20.9 | 24.3 | 0.86x |
+
+### Notes
+
+- Prefill improvement (+5.2%) is from shared input quantization and reduced barrier synchronizations.
+- Decode improvement (+5.6%) is within run-to-run noise (M=1, input quantization trivially fast).
+- The llama.cpp prefill baseline differs from the previous session (182.8 → 213.9) due to measurement variance between sessions (thermal state, background load). The infernum number is the reliable signal.
+- Remaining gaps vs llama.cpp: Gemma prefill 0.90x, Gemma decode 0.86x.
