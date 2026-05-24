@@ -124,48 +124,6 @@ pub trait GraphEngineConfig: Send + Sync + 'static {
 // Internal structures
 // ---------------------------------------------------------------------------
 
-/// Flat, growable KV cache used by [`GraphKvCache`].
-///
-/// Each K/V entry stores the *full* accumulated sequence per layer, not just
-/// the latest token. The buffer is replaced wholesale each decode step because
-/// the decode graph's `concat_seq` output already contains the concatenated
-/// history up to the current position.
-struct KvStore {
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
-    num_kv_heads: usize,
-    head_dim: usize,
-}
-
-impl KvStore {
-    fn new(num_layers: usize, num_kv_heads: usize, head_dim: usize) -> Self {
-        Self {
-            k: vec![Vec::new(); num_layers],
-            v: vec![Vec::new(); num_layers],
-            num_kv_heads,
-            head_dim,
-        }
-    }
-
-    fn get_layer(&self, layer: usize, kv_len: usize) -> (CpuTensor, CpuTensor) {
-        let shape = [kv_len, self.num_kv_heads, self.head_dim];
-        let elem = self.num_kv_heads * self.head_dim;
-        let k = CpuTensor::from_f32(&shape, &self.k[layer][..kv_len * elem]);
-        let v = CpuTensor::from_f32(&shape, &self.v[layer][..kv_len * elem]);
-        (k, v)
-    }
-
-    /// Replace stored K/V with the full accumulated tensors from decode outputs.
-    ///
-    /// `outputs[1..=num_layers]` are the updated K tensors;
-    /// `outputs[1+num_layers..1+2*num_layers]` are the updated V tensors.
-    fn update_from_outputs(&mut self, outputs: &[CpuTensor], num_layers: usize) {
-        for layer in 0..num_layers {
-            self.k[layer] = outputs[1 + layer].to_f32_vec();
-            self.v[layer] = outputs[1 + num_layers + layer].to_f32_vec();
-        }
-    }
-}
 
 /// Return the [`NodeId`]s of the KV cache input nodes and `concat_seq` nodes
 /// in a decode graph built with `kv_len = 0`.
@@ -452,26 +410,17 @@ fn argmax(slice: &[f32]) -> u32 {
 
 /// A graph-mode KV cache that satisfies the `Model::KvCache` associated type.
 ///
-/// Wraps a [`KvStore`] behind a `Mutex` so it can be passed as `&mut Self::KvCache`
-/// across the `Model` trait boundary without requiring `GraphEngine` itself
-/// to be mutable. The mutex is always uncontested (single-threaded engine
-/// worker), so it adds negligible overhead.
+/// Holds a [`KvCacheStore`] (Arc-based, zero-copy per step) and a pre-allocated
+/// [`Arena`] reused across all decode steps. This avoids per-token graph
+/// rebuilds, arena allocations, and KV copies.
 pub struct GraphKvCache {
-    inner: std::sync::Mutex<KvStore>,
-    /// Tracks how many tokens have been committed to the cache (seq len so far).
-    committed: std::sync::atomic::AtomicUsize,
+    kv: KvCacheStore,
+    arena: Arena,
 }
 
 impl GraphKvCache {
-    fn new(num_layers: usize, num_kv_heads: usize, head_dim: usize) -> Self {
-        Self {
-            inner: std::sync::Mutex::new(KvStore::new(num_layers, num_kv_heads, head_dim)),
-            committed: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
     fn seq_len(&self) -> usize {
-        self.committed.load(std::sync::atomic::Ordering::Relaxed)
+        self.kv.len()
     }
 }
 
@@ -499,11 +448,18 @@ impl<C: GraphEngineConfig> infernum::Model for GraphEngine<C> {
         &self,
         _block_config: &infernum::block_allocator::BlockConfig,
     ) -> infernum::Result<GraphKvCache> {
-        Ok(GraphKvCache::new(
-            self.config.num_hidden_layers(),
-            self.config.num_kv_heads(),
-            self.config.head_dim(),
-        ))
+        let dc = &self.decode;
+        Ok(GraphKvCache {
+            kv: KvCacheStore::new(
+                self.config.num_hidden_layers(),
+                self.config.num_kv_heads(),
+                self.config.head_dim(),
+                self.config.max_position_embeddings(),
+                dc.cache_input_ids.clone(),
+                dc.concat_ids.clone(),
+            ),
+            arena: Arena::new(dc.plan.arena_size),
+        })
     }
 
     /// Full no-cache forward pass. Returns logits for all positions.
@@ -547,6 +503,10 @@ impl<C: GraphEngineConfig> infernum::Model for GraphEngine<C> {
     }
 
     /// Prefill: process the full prompt, write K/V into `kv_cache`, return last-position logits.
+    ///
+    /// Processes prompt tokens one at a time through the pre-compiled decode graph,
+    /// accumulating K/V in `kv_cache.kv` via [`KvCacheStore`] — no per-token graph
+    /// rebuild, arena re-allocation, or KV copy.
     fn forward_prefill(
         &self,
         input_ids: &[u32],
@@ -556,82 +516,42 @@ impl<C: GraphEngineConfig> infernum::Model for GraphEngine<C> {
         _start_pos: usize,
     ) -> infernum::Result<<CpuBackend as infernum::backend::Backend>::Logits> {
         use infernum::Backend as _;
-        // The prefill graph only outputs logits — it does not produce KV cache
-        // tensors. To correctly populate the KV cache for subsequent decode
-        // steps, we process prompt tokens sequentially through the decode graph
-        // (the same path as forward_batch_decode). This is O(n²) in prompt
-        // length but is functionally correct with the existing graph structure.
-        let config = &self.config;
-        let head_dim = config.head_dim();
-        let half_dim = head_dim / 2;
-        let num_layers = config.num_hidden_layers();
-        let vocab_size = config.vocab_size();
-        let seq_len = input_ids.len();
+        let dc = &self.decode;
+        let half_dim = dc.half_dim;
 
-        let (cos_data, sin_data) = precompute_rope_data(seq_len, head_dim, config.rope_theta());
-
-        let mut last_logits: Option<<CpuBackend as infernum::backend::Backend>::Logits> = None;
+        let mut last_logits_tensor: Option<CpuTensor> = None;
 
         for (pos, &token) in input_ids.iter().enumerate() {
-            let kv_len = kv_cache.seq_len();
+            let cos_start = pos * half_dim;
+            let inputs = vec![
+                CpuTensor::from_u32(&[1], &[token]),
+                CpuTensor::from_f32(&[1, half_dim], &dc.cos[cos_start..cos_start + half_dim]),
+                CpuTensor::from_f32(&[1, half_dim], &dc.sin[cos_start..cos_start + half_dim]),
+            ];
 
-            let mut graph = config.build_decode_graph(kv_len);
-            optimizer::optimize(&mut graph);
-            let ep = plan(&graph);
-
-            let cos_row = &cos_data[pos * half_dim..(pos + 1) * half_dim];
-            let sin_row = &sin_data[pos * half_dim..(pos + 1) * half_dim];
-
-            let input_id_t = CpuTensor::from_u32(&[1], &[token]);
-            let cos_t = CpuTensor::from_f32(&[1, half_dim], cos_row);
-            let sin_t = CpuTensor::from_f32(&[1, half_dim], sin_row);
-
-            let mut inputs = vec![input_id_t, cos_t, sin_t];
-            {
-                // When kv_len == 0, get_layer returns empty [0, num_kv_heads, head_dim] tensors,
-                // which is exactly what the decode graph expects for an empty cache.
-                let store = kv_cache.inner.lock().expect("GraphKvCache mutex poisoned");
-                for layer in 0..num_layers {
-                    let (k, v) = store.get_layer(layer, kv_len);
-                    inputs.push(k);
-                    inputs.push(v);
-                }
-            }
-
-            let mut arena = Arena::new(ep.arena_size.max(self.decode.plan.arena_size));
-            let output_nodes = graph.output_ids().to_vec();
-            let outputs = execute(
-                &ep,
-                graph.nodes(),
-                &mut arena,
+            let mut outputs = execute(
+                &dc.plan,
+                dc.graph.nodes(),
+                &mut kv_cache.arena,
                 &self.weights,
                 &inputs,
-                &output_nodes,
-                None,
+                &[dc.logits_id],
+                Some(&mut kv_cache.kv),
             )?;
 
-            {
-                let mut store = kv_cache.inner.lock().expect("GraphKvCache mutex poisoned");
-                store.update_from_outputs(&outputs, num_layers);
-            }
-            kv_cache
-                .committed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            let logits_vec = outputs[0].to_f32_vec();
-            let logit_tensor = CpuTensor::from_f32(&[1, vocab_size], &logits_vec[..vocab_size]);
-            last_logits = Some(CpuBackend::logits_from_tensor(logit_tensor));
+            last_logits_tensor = Some(outputs.remove(0));
         }
 
-        last_logits.ok_or_else(|| {
+        let logits_tensor = last_logits_tensor.ok_or_else(|| {
             infernum::Error::InvalidShape("forward_prefill called with empty input_ids".into())
-        })
+        })?;
+        Ok(CpuBackend::logits_from_tensor(logits_tensor))
     }
 
     /// Batched decode. Only `batch_size=1` is supported on the graph CPU path.
     ///
-    /// The block table inputs are ignored — the graph engine tracks sequence
-    /// length via the K/V cache length.
+    /// Uses the pre-compiled decode graph and a persistent [`KvCacheStore`] + [`Arena`]
+    /// from `kv_cache` — no per-token graph rebuild, arena re-allocation, or KV copy.
     #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode(
         &self,
@@ -652,73 +572,30 @@ impl<C: GraphEngineConfig> infernum::Model for GraphEngine<C> {
             )));
         }
 
-        let config = &self.config;
-        let head_dim = config.head_dim();
-        let half_dim = head_dim / 2;
-        let num_layers = config.num_hidden_layers();
-        let num_kv_heads = config.num_kv_heads();
-        let vocab_size = config.vocab_size();
+        let dc = &self.decode;
+        let pos = kv_cache.seq_len();
+        let half_dim = dc.half_dim;
 
-        let kv_len = kv_cache.seq_len();
+        let cos_start = pos * half_dim;
+        let last_token = token_ids.as_u32_slice()[0];
 
-        let mut graph = config.build_decode_graph(kv_len);
-        optimizer::optimize(&mut graph);
-        let ep = plan(&graph);
+        let inputs = vec![
+            CpuTensor::from_u32(&[1], &[last_token]),
+            CpuTensor::from_f32(&[1, half_dim], &dc.cos[cos_start..cos_start + half_dim]),
+            CpuTensor::from_f32(&[1, half_dim], &dc.sin[cos_start..cos_start + half_dim]),
+        ];
 
-        let pos = kv_len;
-        let (cos_data, sin_data) = precompute_rope_data(pos + 1, head_dim, config.rope_theta());
-        let cos_row = &cos_data[pos * half_dim..(pos + 1) * half_dim];
-        let sin_row = &sin_data[pos * half_dim..(pos + 1) * half_dim];
-
-        let token_data = token_ids.as_u32_slice();
-        let last_token = token_data[0];
-
-        let input_id_t = CpuTensor::from_u32(&[1], &[last_token]);
-        let cos_t = CpuTensor::from_f32(&[1, half_dim], cos_row);
-        let sin_t = CpuTensor::from_f32(&[1, half_dim], sin_row);
-
-        let mut inputs = vec![input_id_t, cos_t, sin_t];
-        {
-            let store = kv_cache.inner.lock().expect("GraphKvCache mutex poisoned");
-            for layer in 0..num_layers {
-                let (k, v) = store.get_layer(layer, kv_len);
-                inputs.push(k);
-                inputs.push(v);
-            }
-        }
-
-        // Placeholder inputs for empty cache (first decode step after prefill).
-        if kv_len == 0 {
-            for _ in 0..num_layers {
-                inputs.push(CpuTensor::from_f32(&[0, num_kv_heads, head_dim], &[]));
-                inputs.push(CpuTensor::from_f32(&[0, num_kv_heads, head_dim], &[]));
-            }
-        }
-
-        let mut arena = Arena::new(ep.arena_size.max(self.decode.plan.arena_size));
-        let output_nodes = graph.output_ids().to_vec();
-        let outputs = execute(
-            &ep,
-            graph.nodes(),
-            &mut arena,
+        let mut outputs = execute(
+            &dc.plan,
+            dc.graph.nodes(),
+            &mut kv_cache.arena,
             &self.weights,
             &inputs,
-            &output_nodes,
-            None,
+            &[dc.logits_id],
+            Some(&mut kv_cache.kv),
         )?;
 
-        // Update K/V cache.
-        {
-            let mut store = kv_cache.inner.lock().expect("GraphKvCache mutex poisoned");
-            store.update_from_outputs(&outputs, num_layers);
-        }
-        kv_cache
-            .committed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Return logits (outputs[0], shape [1, vocab_size]).
-        let logits_vec = outputs[0].to_f32_vec();
-        let logit_tensor = CpuTensor::from_f32(&[1, vocab_size], &logits_vec[..vocab_size]);
-        Ok(CpuBackend::logits_from_tensor(logit_tensor))
+        let logits_tensor = outputs.remove(0);
+        Ok(CpuBackend::logits_from_tensor(logits_tensor))
     }
 }

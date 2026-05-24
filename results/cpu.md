@@ -243,3 +243,40 @@ Fix: before parallel dispatch, transpose K and V to `[num_kv_heads, kv_len, head
 - Q8_0 decode improvement (+4.9%) comes primarily from eliminating RoPE thread-pool dispatch overhead for the decode path.
 - Prefill is unaffected (both changes are decode-only optimizations).
 - Remaining gaps vs llama.cpp: Q8_0 decode 0.82x, Q4_0 decode 0.75x, Q8_0 prefill 0.84x, Q4_0 prefill 0.73x, Gemma 0.72–0.81x.
+
+---
+
+## 2026-05-24 — Eliminate per-token graph rebuild in `Model::forward_batch_decode` (`perf/cpu-performance`)
+
+**Change:** The `Model` trait's `forward_batch_decode` and `forward_prefill` implementations in `GraphEngine` were rebuilding the decode graph, re-running the optimizer, re-running the planner, allocating a new arena, and copying the full KV cache (via `update_from_outputs` → 64 `to_f32_vec()` calls) on **every single token**. Meanwhile `GraphEngine::generate()` (used by `bench_graph_decode`) already pre-compiled the graph once and reused it with `KvCacheStore`.
+
+Fix: replaced the per-token `KvStore` (Vec-based) with `KvCacheStore` (Arc-based) embedded in `GraphKvCache`, plus a persistent `Arena`. `forward_batch_decode` and `forward_prefill` now use `self.decode.plan` (pre-compiled graph) and `kv_cache.arena` (pre-allocated, reused) — no per-token graph rebuild, optimize, plan, arena alloc, or KV copy.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (RoPE + Arc session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 decode (Engine path) | ~85 | ~119 | **+40%** |
+| SmolLM2-360M Q4_0 decode (Engine path) | ~100 | ~160 | **+60%** |
+| Engine path now within 3% of graph-decode path | | | ✓ |
+
+### Full results (bench_cpu.sh, uses `--graph-decode` for decode)
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 114.2 | 141.5 | 0.81x |
+| SmolLM2-360M Q4_0 decode | 148.1 | 207.3 | 0.71x |
+| SmolLM2-360M Q8_0 prefill | 854.2 | 1069.6 | 0.80x |
+| SmolLM2-360M Q4_0 prefill | 921.8 | 1269.1 | 0.73x |
+| Gemma 2-2b Q8_0 decode | 19.4 | 23.9 | 0.81x |
+| Gemma 2-2b Q8_0 prefill | 151.5 | 214.4 | 0.71x |
+
+### Notes
+
+- The bench_cpu.sh decode path already used `--graph-decode` (pre-compiled graph + KvCacheStore), so the ratios vs llama.cpp are roughly stable vs the previous session.
+- The primary beneficiary of this fix is the `Engine`/`Model` trait path (used by application code calling `engine.generate()`). This path was 65–85 tok/s; now 115–160 tok/s, matching graph-decode within 3%.
+- Remaining gaps vs llama.cpp: Q8_0 ~0.81x, Q4_0 decode 0.71x, Q4_0 prefill 0.73x, Q8_0 prefill 0.80x, Gemma 0.71–0.81x.
