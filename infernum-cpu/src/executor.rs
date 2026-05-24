@@ -334,9 +334,11 @@ pub fn execute(
         }
     }
 
-    // Update persistent KV cache length after all layers have appended.
+    // Advance the KV cache: increments the sequence-length counter and clears
+    // step-scoped overrides so that Arc::make_mut gets exclusive access on the
+    // next step (refcount drops to 1, enabling O(1) in-place append).
     if let Some(kv) = kv_cache {
-        kv.len += 1;
+        kv.finalize_step();
     }
 
     // Collect output tensors from the arena.
