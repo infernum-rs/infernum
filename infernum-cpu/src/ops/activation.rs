@@ -17,8 +17,33 @@ impl SwigluOps for CpuBackend {
             up_data.len(),
             "swiglu: gate and up sizes differ"
         );
-        let mut out = vec![0.0f32; gate_data.len()];
-        simd::vec_silu_mul(gate_data, up_data, &mut out);
+        let n = gate_data.len();
+        // SAFETY: every element is written by vec_silu_mul before it is read.
+        let mut out: Vec<f32> = Vec::with_capacity(n);
+        unsafe { out.set_len(n) };
+
+        let pool = crate::thread_pool::global_pool();
+        let num_threads = pool.num_threads();
+        // For decode (n ≈ 2560) the dispatch overhead exceeds the compute; only
+        // parallelize for prefill-sized tensors where n is large enough to amortize.
+        const MIN_PARALLEL: usize = 32_768;
+        if n < MIN_PARALLEL {
+            simd::vec_silu_mul(gate_data, up_data, &mut out);
+        } else {
+            let chunk = n.div_ceil(num_threads);
+            let out_addr = out.as_mut_ptr() as usize;
+            pool.dispatch(num_threads, |task_id, _| {
+                let start = task_id * chunk;
+                if start < n {
+                    let end = (start + chunk).min(n);
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+                    };
+                    simd::vec_silu_mul(&gate_data[start..end], &up_data[start..end], out_slice);
+                }
+            });
+        }
+
         Ok(CpuTensor::from_f32_vec(gate.shape(), out))
     }
 }
