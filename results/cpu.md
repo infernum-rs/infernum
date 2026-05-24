@@ -685,3 +685,15 @@ llama.cpp uses two architectural techniques we do not:
 2. **ZMM (512-bit) accumulators + 4×8 tiles:** llama.cpp computes 4 input rows × 8 output columns per microkernel invocation using `_mm512_inserti32x8` + 512-bit VNNI (`vpdpbusd zmm`). Each ZMM instruction processes 64 int8 pairs vs our 32 (YMM). Combined with the interleaved layout, this enables ~2× more work per instruction.
 
 **Next steps to close the gap:** Weight repacking to `block_q8_0x4` interleaved format (done once at model load), a new `microkernel_q8_4x8_zmm` using ZMM registers, and corresponding changes to `gemm_q8_tiled_inner`. This requires a separate planned effort as it touches weight loading and the microkernel simultaneously.
+
+---
+
+## 2026-05-24 — Attempt: per-call weight interleaving + sequential-load microkernel (negative result) (`perf/cpu-performance`)
+
+**What was tried:** Added `repack_q8_interleaved` (Rust, groups 4 weight columns' K-block data contiguously) + `microkernel_q8_4x4_il` (new ASM kernel using sequential `[wt_ptr + c*32]` loads and pre-broadcasting all 8 per-block scales into ymm24–31). Weights were repacked per-call into thread-local buffers, then the IL microkernel replaced `microkernel_q8_4x4`.
+
+**Result:** Q8_0 prefill −0.03x (0.86x vs 0.89x), Q4_0 prefill −0.03x (0.71x vs 0.74x), decode −0.01–0.04x. **Reverted.**
+
+**Root cause:** The repack pass reads the weight data once (scattered → sequential) and writes a packed copy. The microkernel then reads from the packed copy (sequential). Total weight reads = 2× original. The scattered reads in the repack pass have the same cache-miss cost as the scattered reads the old microkernel had — we're not eliminating the cache misses, just moving them. The extra repack write + extra sequential read costs more bandwidth than the improved prefetch behavior saves.
+
+**Conclusion:** Per-call interleaving is net negative. The format change only pays off if weights are stored permanently in interleaved format (repacked once at model load, amortized across all inference calls). That requires changing `CpuQuantizedWeight::data` layout and the weight loading path — a larger effort tracked in the next-steps note above.
