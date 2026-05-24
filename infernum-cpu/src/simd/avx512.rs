@@ -2539,6 +2539,95 @@ unsafe fn vec_silu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+// ---- Vectorized GeGLU ----
+
+/// Fused GeGLU: `out[i] = gelu_approx(gate[i]) * up[i]`.
+///
+/// Uses the identity `gelu(x) = x * sigmoid(2·sqrt(2/π)·(x + 0.044715·x³))`,
+/// computed with the same fast polynomial exp as `vec_silu_mul`.
+pub fn vec_gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    unsafe { vec_gelu_mul_inner(gate, up, out) }
+}
+
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::many_single_char_names)]
+unsafe fn vec_gelu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::{
+        __m512, __m512i, _mm512_add_epi32, _mm512_add_ps, _mm512_castps_si512, _mm512_castsi512_ps,
+        _mm512_cvtepi32_ps, _mm512_cvtps_epi32, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_max_ps,
+        _mm512_min_ps, _mm512_mul_ps, _mm512_set1_ps, _mm512_slli_epi32, _mm512_storeu_ps,
+        _mm512_sub_ps,
+    };
+
+    let n = gate.len();
+    let chunks = n / 16;
+    let remainder = n % 16;
+
+    // 2 * sqrt(2/π) — used to convert tanh form to sigmoid form.
+    let two_c: __m512 = _mm512_set1_ps(1.595_769_1_f32);
+    let cubic: __m512 = _mm512_set1_ps(0.044_715_f32);
+
+    let log2e: __m512 = _mm512_set1_ps(std::f32::consts::LOG2_E);
+    let one: __m512 = _mm512_set1_ps(1.0);
+    let c0: __m512 = _mm512_set1_ps(1.0);
+    #[allow(clippy::approx_constant)]
+    let c1: __m512 = _mm512_set1_ps(0.693_147_2_f32);
+    let c2: __m512 = _mm512_set1_ps(0.240_226_5_f32);
+    let c3: __m512 = _mm512_set1_ps(5.550_357e-2_f32);
+    let c4: __m512 = _mm512_set1_ps(9.675_54e-3_f32);
+    let exp_lo: __m512 = _mm512_set1_ps(-87.332_54_f32);
+    let exp_hi: __m512 = _mm512_set1_ps(88.722_84_f32);
+    let zero: __m512 = _mm512_set1_ps(0.0);
+
+    let gate_ptr = gate.as_ptr();
+    let up_ptr = up.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+
+    for i in 0..chunks {
+        let offset = i * 16;
+        let g: __m512 = _mm512_loadu_ps(gate_ptr.add(offset));
+        let u: __m512 = _mm512_loadu_ps(up_ptr.add(offset));
+
+        // inner = 2·sqrt(2/π)·(g + 0.044715·g³)
+        let g3: __m512 = _mm512_mul_ps(_mm512_mul_ps(g, g), g);
+        let inner: __m512 = _mm512_mul_ps(two_c, _mm512_fmadd_ps(cubic, g3, g));
+
+        // Fast exp(-inner) for sigmoid(inner) = 1/(1+exp(-inner)).
+        let neg_inner: __m512 = _mm512_sub_ps(zero, inner);
+        let x: __m512 = _mm512_max_ps(_mm512_min_ps(neg_inner, exp_hi), exp_lo);
+        let t: __m512 = _mm512_mul_ps(x, log2e);
+        let n_f: __m512 = _mm512_cvtepi32_ps(_mm512_cvtps_epi32(t));
+        let f: __m512 = _mm512_sub_ps(t, n_f);
+        let poly: __m512 = _mm512_fmadd_ps(c4, f, c3);
+        let poly: __m512 = _mm512_fmadd_ps(poly, f, c2);
+        let poly: __m512 = _mm512_fmadd_ps(poly, f, c1);
+        let poly: __m512 = _mm512_fmadd_ps(poly, f, c0);
+        let n_i: __m512i = _mm512_cvtps_epi32(n_f);
+        let shift: __m512i = _mm512_slli_epi32(n_i, 23);
+        let exp_val: __m512 =
+            _mm512_castsi512_ps(_mm512_add_epi32(_mm512_castps_si512(poly), shift));
+
+        // gelu(g) * u = g * u / (1 + exp(-inner))
+        let denom: __m512 = _mm512_add_ps(one, exp_val);
+        let result: __m512 = {
+            use std::arch::x86_64::_mm512_div_ps;
+            _mm512_div_ps(_mm512_mul_ps(g, u), denom)
+        };
+
+        _mm512_storeu_ps(out_ptr.add(offset), result);
+    }
+
+    // Scalar tail.
+    let tail = chunks * 16;
+    for i in 0..remainder {
+        let g = *gate.get_unchecked(tail + i);
+        let u = *up.get_unchecked(tail + i);
+        let inner = 1.595_769_1_f32 * (g + 0.044_715 * g * g * g);
+        let sigmoid = 1.0 / (1.0 + (-inner).exp());
+        *out.get_unchecked_mut(tail + i) = g * sigmoid * u;
+    }
+}
+
 // ---- Vectorized Softmax ----
 
 /// In-place softmax using AVX-512F fast polynomial exp.

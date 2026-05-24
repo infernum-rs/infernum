@@ -201,6 +201,29 @@ pub fn vec_silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Approximate GELU fused with element-wise multiply: `out[i] = gelu_approx(gate[i]) * up[i]`.
+///
+/// Dispatches to AVX-512F vectorized path (degree-4 polynomial exp) when available,
+/// otherwise falls back to scalar `tanh`-based approximation.
+#[inline]
+pub fn vec_gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            avx512::vec_gelu_mul(gate, up, out);
+            return;
+        }
+    }
+    // Scalar fallback.
+    for ((g, u), o) in gate.iter().zip(up.iter()).zip(out.iter_mut()) {
+        let inner = 1.595_769_1_f32 * (g + 0.044_715 * g * g * g);
+        let sigmoid = 1.0 / (1.0 + (-inner).exp());
+        *o = g * sigmoid * u;
+    }
+}
+
 /// In-place softmax: subtract max, exp, normalize by 1/sum.
 ///
 /// Dispatches to AVX-512 vectorized exp when available.

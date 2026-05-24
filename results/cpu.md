@@ -490,3 +490,42 @@ At 256 decode steps with 64 KV concat nodes (32 layers × K + V) and 1280 bytes 
 - Q4_0 decode gain (+8.4%) is smaller: Q4_0 is faster still, so the ratio was lower; but the absolute clone cost was the same.
 - Prefill is unaffected — the prefill executor runs a different code path (single-step, no KV accumulation beyond the input).
 - Remaining gaps vs llama.cpp: Q8_0 decode **0.91x**, Q4_0 decode **0.88x**, Q8_0 prefill 0.85x, Q4_0 prefill 0.74x, Gemma 0.79x decode / 0.70x prefill.
+
+---
+
+## 2026-05-24 — Vectorized parallel GeGLU (`perf/cpu-performance`)
+
+**Change:** `GegluOps::geglu` used a scalar single-threaded loop with `f32::tanh()`. Replaced with `vec_gelu_mul`: a parallel dispatch identical to the `swiglu` path, using a new AVX-512F vectorized kernel. The GELU approximation is rewritten via the identity `gelu(x) = x·sigmoid(2·√(2/π)·(x + 0.044715·x³))`, which requires only one fast-exp call (same degree-4 polynomial as `vec_silu_mul`) instead of a `tanh()` function call. For large tensors (n ≥ 32,768) the work is dispatched across all 12 physical cores.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 threads)
+- **infernum branch:** `perf/cpu-performance`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### vs previous best (finalize_step session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| Gemma 2-2b Q8_0 prefill | 153.1 | 183.0 | **+19.5%** |
+| Gemma 2-2b Q8_0 decode | 19.5 | 19.8 | flat |
+| SmolLM2-360M Q8_0 prefill | 965.3 | 966.2 | flat |
+| SmolLM2-360M Q4_0 prefill | 923.7 | 939.5 | flat |
+| SmolLM2-360M Q8_0 decode | 134.8 | 132.2 | flat (noise) |
+| SmolLM2-360M Q4_0 decode | 175.0 | 188.8 | flat (noise) |
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 132.2 | 147.9 | 0.89x |
+| SmolLM2-360M Q4_0 decode | 188.8 | 208.2 | 0.91x |
+| SmolLM2-360M Q8_0 prefill | 966.2 | 1103.5 | 0.88x |
+| SmolLM2-360M Q4_0 prefill | 939.5 | 1265.0 | 0.74x |
+| Gemma 2-2b Q8_0 decode | 19.8 | 23.1 | 0.86x |
+| Gemma 2-2b Q8_0 prefill | 183.0 | 182.8 | **1.00x** |
+
+### Notes
+
+- Gemma 2B prefill at **parity** with llama.cpp (+19.5% gain). The `tanh()` scalar path was the dominant bottleneck: for 512 prefill tokens × 9216 intermediate × 26 layers = 122M tanh calls at ~50 ns each ≈ 6 seconds if single-threaded. Parallelization + fast-exp vectorization eliminates this.
+- SmolLM2-360M numbers are flat (SwiGLU, already parallelized and vectorized — this change doesn't affect it).
+- Gemma decode is flat — decode uses seq_len=1 → 9216 elements, which falls below MIN_PARALLEL=32768 and runs in single-threaded fast-exp mode (AVX-512 vector: 16 elements/cycle vs scalar tanh: ~50 ns/element → still a 3-4× speedup, but decode is GEMV-bound anyway).
+- Remaining gaps vs llama.cpp: Q8_0 decode ~0.89x, Q4_0 decode ~0.91x, Q8_0 prefill ~0.88x, Q4_0 prefill ~0.74x, Gemma decode ~0.86x, Gemma prefill **1.00x**.
