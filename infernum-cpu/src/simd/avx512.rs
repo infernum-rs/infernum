@@ -2678,23 +2678,15 @@ unsafe fn microkernel_q4_4x4(
             "vbroadcastss ymm27, dword ptr [{is3} + {s_off}]",
 
             // ---- Col 0: unpack Q4 nibbles to 32 signed int8, then VNNI ----
+            // GGUF Q4_0 layout: qs[i] = elem[i] (lo nibble) | elem[i+16] (hi nibble).
+            // So correct ymm4 layout after unpack = [elem[0..15] | elem[16..31]],
+            // which lines up directly with the sequential Q8_0 input for VNNI.
             "mov {tmp}, [{arr_ptr} + 0*8]",
-            // Load 16 Q4 packed bytes into xmm4 (zero-extends upper 128 of ymm4).
-            "vmovdqu xmm4, [{tmp} + {q_off}]",
-            // lo nibbles: vpandd uses EVEX so ymm29 (ymm16+) is valid as source.
-            "vpandd ymm6, ymm4, ymm29",
-            // hi nibbles = (ymm4 >> 4) & 0x0F:
-            "vpsrlw ymm7, ymm4, 4",
-            "vpandd ymm7, ymm7, ymm29",
-            // Subtract bias 8 to get signed values (-8..7). EVEX auto-selected for ymm30.
-            "vpsubb ymm6, ymm6, ymm30",
-            "vpsubb ymm7, ymm7, ymm30",
-            // Interleave even (lo) and odd (hi) elements into sequential order.
-            // xmm5, xmm6, xmm7 are in ymm0-15 range — VEX form is valid.
-            "vpunpcklbw xmm5, xmm6, xmm7",
-            "vpunpckhbw xmm4,  xmm6, xmm7",
-            // Combine: ymm4[127:0]=xmm5 (elements 0-15), ymm4[255:128]=xmm4 (16-31).
-            "vinserti128 ymm4, ymm5, xmm4, 1",
+            "vmovdqu xmm4, [{tmp} + {q_off}]",  // 16 packed bytes into xmm4
+            "vpsrlw xmm5, xmm4, 4",              // shift hi nibbles to lo position
+            "vinserti128 ymm4, ymm4, xmm5, 1",  // ymm4 = [original 16B | shifted 16B]
+            "vpandd ymm4, ymm4, ymm29",          // mask: [lo_nibbles[0..15] | hi_nibbles[0..15]]
+            "vpsubb ymm4, ymm4, ymm30",          // subtract 8 → signed [-8..7]
             // Load weight scale and compute vpsignb trick.
             "mov {tmp}, [{arr_ptr} + 4*8]",
             "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
@@ -2731,14 +2723,10 @@ unsafe fn microkernel_q4_4x4(
 
             // ---- Col 1 ----
             "vmovdqu xmm4, [{tmp} + {q_off}]",
-            "vpandd ymm6, ymm4, ymm29",
-            "vpsrlw ymm7, ymm4, 4",
-            "vpandd ymm7, ymm7, ymm29",
-            "vpsubb ymm6, ymm6, ymm30",
-            "vpsubb ymm7, ymm7, ymm30",
-            "vpunpcklbw xmm5, xmm6, xmm7",
-            "vpunpckhbw xmm4,  xmm6, xmm7",
-            "vinserti128 ymm4, ymm5, xmm4, 1",
+            "vpsrlw xmm5, xmm4, 4",
+            "vinserti128 ymm4, ymm4, xmm5, 1",
+            "vpandd ymm4, ymm4, ymm29",
+            "vpsubb ymm4, ymm4, ymm30",
             "mov {tmp}, [{arr_ptr} + 5*8]",
             "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
             "vpsignb ymm5, ymm4, ymm4",
@@ -2774,14 +2762,10 @@ unsafe fn microkernel_q4_4x4(
 
             // ---- Col 2 ----
             "vmovdqu xmm4, [{tmp} + {q_off}]",
-            "vpandd ymm6, ymm4, ymm29",
-            "vpsrlw ymm7, ymm4, 4",
-            "vpandd ymm7, ymm7, ymm29",
-            "vpsubb ymm6, ymm6, ymm30",
-            "vpsubb ymm7, ymm7, ymm30",
-            "vpunpcklbw xmm5, xmm6, xmm7",
-            "vpunpckhbw xmm4,  xmm6, xmm7",
-            "vinserti128 ymm4, ymm5, xmm4, 1",
+            "vpsrlw xmm5, xmm4, 4",
+            "vinserti128 ymm4, ymm4, xmm5, 1",
+            "vpandd ymm4, ymm4, ymm29",
+            "vpsubb ymm4, ymm4, ymm30",
             "mov {tmp}, [{arr_ptr} + 6*8]",
             "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
             "vpsignb ymm5, ymm4, ymm4",
@@ -2817,14 +2801,10 @@ unsafe fn microkernel_q4_4x4(
 
             // ---- Col 3 ----
             "vmovdqu xmm4, [{tmp} + {q_off}]",
-            "vpandd ymm6, ymm4, ymm29",
-            "vpsrlw ymm7, ymm4, 4",
-            "vpandd ymm7, ymm7, ymm29",
-            "vpsubb ymm6, ymm6, ymm30",
-            "vpsubb ymm7, ymm7, ymm30",
-            "vpunpcklbw xmm5, xmm6, xmm7",
-            "vpunpckhbw xmm4,  xmm6, xmm7",
-            "vinserti128 ymm4, ymm5, xmm4, 1",
+            "vpsrlw xmm5, xmm4, 4",
+            "vinserti128 ymm4, ymm4, xmm5, 1",
+            "vpandd ymm4, ymm4, ymm29",
+            "vpsubb ymm4, ymm4, ymm30",
             "mov {tmp}, [{arr_ptr} + 7*8]",
             "vbroadcastss ymm28, dword ptr [{tmp} + {s_off}]",
             "vpsignb ymm5, ymm4, ymm4",
