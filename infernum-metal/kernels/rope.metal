@@ -198,6 +198,72 @@ kernel void apply_rope_qk_batched_f16(
     dst[base + half_dim + p_idx] = half(b * cv + a * sv);
 }
 
+/// Non-batched fused Q+K RoPE: apply RoPE to both Q and K in a single dispatch.
+///
+/// Used by FusedRopePairOp when both tensors share the same cos/sin cache
+/// and position offset (the common case in every transformer layer).
+///
+/// Thread grid: seq_len * (q_heads + k_heads) * half_dim, 1D.
+/// Threads in [0, seq_len*q_heads*half_dim) operate on Q.
+/// Remaining threads operate on K.
+struct RopeQkNonBatchedParams {
+    uint q_heads;
+    uint k_heads;
+    uint head_dim;
+    uint half_dim;
+    uint seq_len;
+    uint pos_offset;
+};
+
+kernel void apply_rope_qk_f32(
+    device const float* q_input     [[buffer(0)]],
+    device const float* k_input     [[buffer(1)]],
+    device const float* cos_cache   [[buffer(2)]],
+    device const float* sin_cache   [[buffer(3)]],
+    device float* q_output          [[buffer(4)]],
+    device float* k_output          [[buffer(5)]],
+    constant RopeQkNonBatchedParams& params [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    const uint q_heads   = params.q_heads;
+    const uint k_heads   = params.k_heads;
+    const uint head_dim  = params.head_dim;
+    const uint half_dim  = params.half_dim;
+    const uint seq_len   = params.seq_len;
+    const uint pos_offset = params.pos_offset;
+
+    const uint q_total = seq_len * q_heads * half_dim;
+    const uint k_total = seq_len * k_heads * half_dim;
+
+    device const float* src;
+    device float* dst;
+    uint n_heads, local_idx;
+
+    if (tid < q_total) {
+        src = q_input; dst = q_output;
+        n_heads = q_heads; local_idx = tid;
+    } else if (tid < q_total + k_total) {
+        src = k_input; dst = k_output;
+        n_heads = k_heads; local_idx = tid - q_total;
+    } else {
+        return;
+    }
+
+    const uint pair_idx = local_idx % half_dim;
+    const uint head     = (local_idx / half_dim) % n_heads;
+    const uint seq_pos  = local_idx / (half_dim * n_heads);
+    const uint pos      = seq_pos + pos_offset;
+    const uint base     = (seq_pos * n_heads + head) * head_dim;
+
+    float cv = cos_cache[pos * half_dim + pair_idx];
+    float sv = sin_cache[pos * half_dim + pair_idx];
+    float x0 = src[base + pair_idx];
+    float x1 = src[base + half_dim + pair_idx];
+
+    dst[base + pair_idx]            = x0 * cv - x1 * sv;
+    dst[base + half_dim + pair_idx] = x1 * cv + x0 * sv;
+}
+
 /// Standard RoPE f16.
 kernel void apply_rope_f16(
     device const half* input        [[buffer(0)]],

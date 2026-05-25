@@ -18,6 +18,18 @@ struct RopeParams {
     pos_offset: u32,
 }
 
+/// Packed params for MSL `apply_rope_qk_f32` (non-batched fused Q+K RoPE).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeQkNonBatchedParams {
+    q_heads: u32,
+    k_heads: u32,
+    head_dim: u32,
+    half_dim: u32,
+    seq_len: u32,
+    pos_offset: u32,
+}
+
 /// Packed params struct matching MSL `RopeInterleavedParams`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -71,6 +83,65 @@ impl RopeOps for MetalBackend {
         );
 
         Ok(out)
+    }
+
+    /// Fused Q+K RoPE in a single GPU dispatch, saving one kernel launch per layer.
+    #[allow(clippy::cast_possible_truncation)]
+    fn apply_rope_pair(
+        input_a: &MetalTensor,
+        input_b: &MetalTensor,
+        cos_cache: &MetalTensor,
+        sin_cache: &MetalTensor,
+        offset_a: usize,
+        offset_b: usize,
+    ) -> Result<(MetalTensor, MetalTensor)> {
+        let shape_a = input_a.shape();
+        let shape_b = input_b.shape();
+        let seq_len_a = shape_a[0];
+        let q_heads = shape_a[1];
+        let head_dim = shape_a[2];
+        let half_dim = head_dim / 2;
+        let seq_len_b = shape_b[0];
+        let k_heads = shape_b[1];
+
+        // Both offsets must agree on the sequence dimension for a non-batched kernel.
+        // In practice offset_a == offset_b == 0 (cos/sin are pre-indexed by the caller).
+        // Use offset_a; if they differ fall back to two separate dispatches.
+        if offset_a != offset_b || seq_len_a != seq_len_b {
+            let a = Self::apply_rope(input_a, cos_cache, sin_cache, offset_a)?;
+            let b = Self::apply_rope(input_b, cos_cache, sin_cache, offset_b)?;
+            return Ok((a, b));
+        }
+
+        let ctx = input_a.context();
+        let out_a = MetalTensor::zeros(ctx, shape_a, input_a.dtype());
+        let out_b = MetalTensor::zeros(ctx, shape_b, input_b.dtype());
+
+        let n = seq_len_a * (q_heads + k_heads) * half_dim;
+        let params = RopeQkNonBatchedParams {
+            q_heads: q_heads as u32,
+            k_heads: k_heads as u32,
+            head_dim: head_dim as u32,
+            half_dim: half_dim as u32,
+            seq_len: seq_len_a as u32,
+            pos_offset: offset_a as u32,
+        };
+
+        ctx.dispatch_1d(
+            "apply_rope_qk_f32",
+            &[
+                (input_a.metal_buffer(), input_a.buffer_offset()),
+                (input_b.metal_buffer(), input_b.buffer_offset()),
+                (cos_cache.metal_buffer(), cos_cache.buffer_offset()),
+                (sin_cache.metal_buffer(), sin_cache.buffer_offset()),
+                (out_a.metal_buffer(), out_a.buffer_offset()),
+                (out_b.metal_buffer(), out_b.buffer_offset()),
+            ],
+            bytemuck::bytes_of(&params),
+            n,
+        );
+
+        Ok((out_a, out_b))
     }
 
     #[allow(clippy::cast_possible_truncation)]

@@ -18,9 +18,9 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 100.0 | 226.7 | 0.44x | 2026-05-25 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 91.2 | 184.4 | 0.49x | 2026-05-25 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 39.2 | — | — | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 100.3 | 226.7 | 0.44x | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 92.1 | 184.4 | 0.50x | 2026-05-25 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 39.0 | — | — | 2026-05-25 |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.9 | — | — | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q8_0 | 20.9 | 29.1 | 0.72x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
@@ -45,6 +45,30 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 ---
 
 ## History
+
+---
+
+## 2026-05-25 — Fused Q+K RoPE dispatch (`apply_rope_qk_f32`)
+
+- **Chip:** Apple M3 Pro (18 GB unified memory)
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **Prefill tokens:** 512
+- **infernum commit:** (this PR)
+- **Date:** 2026-05-25
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 91.2 | 92.1 | +1.0% |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 100.0 | 100.3 | +0.3% |
+| Llama / SmolLM2-360M | SafeTensors F32 | 39.2 | 39.0 | ~0% (noise) |
+
+### Notes
+
+- **Root cause:** The graph optimizer creates `FusedRopePairOp` for every Q+K RoPE pair (32 per SmolLM2 decode step), but `MetalBackend::apply_rope_pair` had no override and fell back to two separate `apply_rope_f32` dispatches. This meant 64 RoPE dispatches per token instead of 32.
+- **Fix:** Added `apply_rope_qk_f32` Metal kernel (new `RopeQkNonBatchedParams` struct) and implemented `RopeOps::apply_rope_pair` override for `MetalBackend`. The kernel partitions the thread grid: first `seq_len * q_heads * half_dim` threads process Q, remaining `seq_len * k_heads * half_dim` threads process K. Falls back to two separate dispatches when offsets or seq_lens differ.
+- **Small gain:** Saves 32 dispatches per decode step (64 → 32 RoPE dispatches). At ~10μs per dispatch this is ~320μs per token, which translates to ~1% throughput on Q8_0. The small absolute gain reflects that RoPE is a tiny fraction of total per-token time; GEMV dominates.
 
 ---
 
