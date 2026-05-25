@@ -788,3 +788,24 @@ Absolute infernum tok/s (llama.cpp numbers varied between sessions; absolute is 
 - Decode gains are smaller (+1–3%): decode is M=1, so tensors are tiny and the copy was cheap; the dominant cost is memory bandwidth for the GEMV.
 - Q8_0 decode ratio appears at 1.03x (beating llama.cpp) because llama.cpp's throughput dropped slightly in this run (run-to-run variance ±5%); infernum absolute improved only +1.4%.
 - Remaining gaps vs llama.cpp: Q8_0 decode ~0.93–1.03x (at parity), Q4_0 decode ~0.95x, Q8_0 prefill ~0.98x, Q4_0 prefill ~0.87x, Gemma ~0.88–0.89x.
+
+---
+
+## 2026-05-25 — Q4_1 M>1 batch dispatch fix (`perf/cpu-performance`)
+
+**Change:** The Q4_1 M>1 GEMM path fired one `pool.dispatch` per input row (512 dispatches for seq_len=512) instead of one dispatch covering all M rows across a column chunk — the same pattern Q8_0 and Q4_0 use. Replaced the row-by-row loop with a single dispatch where each thread iterates over all M rows for its column slice, accessing the already-quantized `all_quants` buffer and the original f32 input (needed for Q4_1 min correction) via raw pointer.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **infernum commit:** `33d6357`
+
+### Impact
+
+No measurable improvement: SmolLM2 Q4_0 GGUF contains only 4 Q4_1 tensors out of ~290 total. Even eliminating all 2048 redundant dispatches per forward pass (512 dispatches × 4 tensors) moves the needle less than benchmark noise (±3%).
+
+**Rationale for keeping:** The fix is architecturally correct and removes the only remaining O(M)-dispatch pattern in the codebase. The existing profiling showed `q4_1_gemv_parallel::{{closure}}` at 0.06% — dispatch overhead was negligible — but the consolidation is the right pattern regardless.
+
+### Notes
+
+- Confirmed no regression across all benchmarks (ratios within ±3% noise of the zero-copy baseline).
+- The 4×6 microkernel fix was also attempted in this session: buffer overflow bug corrected (out buffer was 16 elements, ASM wrote 24), scatter fixed to 6 columns. Benchmark confirmed the same result as the prior 4×6 attempt: Q8_0 prefill −14%, Q4_0 prefill −25%. Root cause validated: 24 YMM accumulators leave no space for pre-broadcast input scales → 3.75× more scale broadcasts per K block → slower. Reverted.
+- Remaining gaps vs llama.cpp: Q8_0 decode ~0.93–1.03x (at parity), Q4_0 decode ~0.94–0.95x, Q8_0 prefill ~0.87–0.98x, Q4_0 prefill ~0.82–0.87x, Gemma decode ~0.85–0.90x, Gemma prefill ~0.88–0.96x.
