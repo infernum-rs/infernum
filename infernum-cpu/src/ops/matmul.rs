@@ -386,12 +386,10 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                 let bpr = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
                 let pool = crate::thread_pool::global_pool();
                 let num_threads = pool.num_threads();
+                let out_addr = ptr_to_usize(output.as_mut_ptr());
 
-                // Split across N columns: all threads share input rows (hot in L3),
-                // each reads a subset of weight columns (fits in L2).
                 let cols_per_thread = n.div_ceil(num_threads);
                 let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
-                let out_addr = ptr_to_usize(output.as_mut_ptr());
                 let wt_data_addr = weight.data.as_ptr() as usize;
                 let wt_scales_addr = weight.scales.as_ptr() as usize;
 
@@ -403,7 +401,6 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                     }
                     let chunk_n = col_end - col_start;
 
-                    // Weight slices for columns [col_start..col_end].
                     let wt_data = unsafe {
                         std::slice::from_raw_parts(
                             (wt_data_addr as *const u8).add(col_start * bpr),
@@ -412,14 +409,14 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                     };
                     let wt_scales = unsafe {
                         std::slice::from_raw_parts(
-                            (wt_scales_addr as *const f32).add(col_start * num_blocks_per_row),
+                            (wt_scales_addr as *const f32)
+                                .add(col_start * num_blocks_per_row),
                             chunk_n * num_blocks_per_row,
                         )
                     };
-
-                    // Write directly into strided global output (stride = n).
-                    let out_global =
-                        unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
+                    let out_global = unsafe {
+                        std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n)
+                    };
                     simd::gemm_q8_tiled(
                         &mut out_global[col_start..],
                         &all_quants.quants,
@@ -1703,6 +1700,7 @@ impl MatmulOps for CpuBackend {
             data: qdata,
             scales,
             mins: None,
+            interleaved: false,
         }))
     }
 
@@ -1736,12 +1734,24 @@ impl MatmulOps for CpuBackend {
                 )))
             }
             HostLinearWeight::Quantized(hq) => match hq.dtype {
-                DType::Q8_0 | DType::Q4_0 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
+                DType::Q8_0 => {
+                    let scales = crate::tensor::decode_f16_scales(&hq.scales);
+                    Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
+                        shape: hq.shape.clone(),
+                        dtype: DType::Q8_0,
+                        data: hq.data.clone(),
+                        scales,
+                        mins: None,
+                        interleaved: false,
+                    }))
+                }
+                DType::Q4_0 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
                     shape: hq.shape.clone(),
                     dtype: hq.dtype,
                     data: hq.data.clone(),
                     scales: crate::tensor::decode_f16_scales(&hq.scales),
                     mins: None,
+                    interleaved: false,
                 })),
                 DType::Q4_1 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
                     shape: hq.shape.clone(),
@@ -1749,6 +1759,7 @@ impl MatmulOps for CpuBackend {
                     data: hq.data.clone(),
                     scales: crate::tensor::decode_f16_scales(&hq.scales),
                     mins: hq.qzeros.as_deref().map(crate::tensor::decode_f16_scales),
+                    interleaved: false,
                 })),
                 other => Err(infernum::Error::UnsupportedDtype(format!(
                     "CPU backend does not support {other} quantized weights"
@@ -2022,6 +2033,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2067,6 +2079,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2147,6 +2160,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: Some(qmins),
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2199,6 +2213,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         });
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2237,6 +2252,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[2, k], &input_f32);
@@ -2285,6 +2301,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[m, k], &input_f32);

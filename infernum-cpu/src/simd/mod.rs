@@ -478,6 +478,70 @@ pub fn gemm_q8_tiled(
     }
 }
 
+/// Tiled Q8×Q8 GEMM using 4-row-interleaved weight format.
+///
+/// `wt_quants_il` and `wt_scales_il` are the full interleaved weight matrix.
+/// `col_start` must be a multiple of 4.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_q8_tiled_il(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants_il: &[u8],
+    wt_scales_il: &[f32],
+    m: usize,
+    n: usize,
+    n_stride: usize,
+    num_blocks: usize,
+    bytes_per_row: usize,
+    col_start: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::gemm_q8_tiled_il(
+                output,
+                inp_quants,
+                inp_scales,
+                wt_quants_il,
+                wt_scales_il,
+                m,
+                n,
+                n_stride,
+                num_blocks,
+                bytes_per_row,
+                col_start,
+            );
+            return;
+        }
+    }
+
+    // Scalar fallback (non-VNNI CPUs): row-by-row dot products using IL layout.
+    let nb = num_blocks;
+    for row in 0..m {
+        let iq = &inp_quants[row * bytes_per_row..(row + 1) * bytes_per_row];
+        let is_ = &inp_scales[row * nb..(row + 1) * nb];
+        for col in 0..n {
+            let global_col = col_start + col;
+            let group = global_col / 4;
+            let row_in_group = global_col % 4;
+            let mut acc = 0.0f32;
+            for blk in 0..nb {
+                let wq_off = group * nb * 128 + blk * 128 + row_in_group * 32;
+                let ws_off = group * nb * 4 + blk * 4 + row_in_group;
+                let wq = &wt_quants_il[wq_off..wq_off + 32];
+                let iq_blk = &iq[blk * 32..(blk + 1) * 32];
+                let mut dot = 0i32;
+                for (w, a) in wq.iter().zip(iq_blk.iter()) {
+                    dot += (*w as i32) * (*a as i8 as i32);
+                }
+                acc += (dot as f32) * is_[blk] * wt_scales_il[ws_off];
+            }
+            output[row * n_stride + col] = acc;
+        }
+    }
+}
+
 // ---- Integer dot product dispatch (Q8×Q8, Q4×Q8) ----
 
 /// Quantize a row of f32 values to Q8_0 format (on-the-fly, for integer GEMV).
@@ -741,6 +805,50 @@ pub fn dot_q8_q8_4row(
         );
         (d0, d1, d2, d3)
     }
+}
+
+/// 4-row Q8×Q8 GEMV using 4-row-interleaved weight format.
+///
+/// `il_quants`: `nb * 128` bytes (4 rows × 32 bytes × nb blocks, contiguous per block).
+/// `il_scales`: `nb * 4` f32s  (4 rows × nb blocks, interleaved per block).
+#[inline]
+#[must_use]
+pub fn dot_q8_q8_4row_il(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants: &[u8],
+    il_scales: &[f32],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            return avx512::dot_q8_q8_4row_il(
+                input_quants,
+                input_scales,
+                il_quants,
+                il_scales,
+            );
+        }
+    }
+
+    // Scalar fallback.
+    let nb = input_scales.len();
+    let mut acc = [0.0f32; 4];
+    for blk in 0..nb {
+        let inp_off = blk * 32;
+        let wq_off = blk * 128;
+        let inp_scale = input_scales[blk];
+        for r in 0..4 {
+            let mut dot = 0i32;
+            let iq = &input_quants[inp_off..inp_off + 32];
+            let wq = &il_quants[wq_off + r * 32..wq_off + r * 32 + 32];
+            for (a, w) in iq.iter().zip(wq.iter()) {
+                dot += (*a as i8 as i32) * (*w as i32);
+            }
+            acc[r] += (dot as f32) * inp_scale * il_scales[blk * 4 + r];
+        }
+    }
+    (acc[0], acc[1], acc[2], acc[3])
 }
 
 /// 4-row Q4×Q8 GEMV: computes dot products for four consecutive Q4_0 weight rows

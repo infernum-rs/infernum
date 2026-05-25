@@ -533,6 +533,104 @@ unsafe fn dot_q8_q8_4row_inner(
     )
 }
 
+/// 4-row Q8×Q8 GEMV with 4-row-interleaved weight format.
+///
+/// Weight data layout (passed as `il_quants`, `il_scales`):
+/// - `il_quants[b * 128 + r * 32 .. +32]` = quants for row r, block b  (4 rows packed per block)
+/// - `il_scales[b * 4 + r]`               = scale  for row r, block b
+///
+/// Sequential memory access pattern means the hardware prefetcher covers all
+/// 4 weight row loads per block from the same 2 cache lines, vs 4 scattered
+/// cache lines with the row-major layout.
+pub fn dot_q8_q8_4row_il(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants: &[u8],
+    il_scales: &[f32],
+) -> (f32, f32, f32, f32) {
+    unsafe { dot_q8_q8_4row_il_inner(input_quants, input_scales, il_quants, il_scales) }
+}
+
+#[allow(clippy::similar_names)]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512vnni",
+    enable = "avx512vl",
+    enable = "fma"
+)]
+unsafe fn dot_q8_q8_4row_il_inner(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants: &[u8],
+    il_scales: &[f32],
+) -> (f32, f32, f32, f32) {
+    let nb = input_scales.len();
+
+    let iq = input_quants.as_ptr();
+    let wq = il_quants.as_ptr();
+    let ws = il_scales.as_ptr();
+
+    let mut total0 = _mm256_setzero_ps();
+    let mut total1 = _mm256_setzero_ps();
+    let mut total2 = _mm256_setzero_ps();
+    let mut total3 = _mm256_setzero_ps();
+
+    // Prefetch 12 blocks ahead (same distance as the non-IL 4-row kernel).
+    // Each block is 128 bytes = 2 cache lines; prefetch both lines.
+    const PF: usize = 12;
+    for blk in 0..nb {
+        let inp_off = blk * 32;
+        let wq_off = blk * 128;
+        let ws_off = blk * 4;
+
+        if blk + PF < nb {
+            let pf = (blk + PF) * 128;
+            _mm_prefetch::<_MM_HINT_T0>(wq.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wq.add(pf + 64).cast());
+        }
+
+        let inp_scale = *input_scales.get_unchecked(blk);
+        let input_i8 = _mm256_loadu_si256(iq.add(inp_off).cast());
+
+        // All 4 weight loads are sequential: same 2 cache lines per block.
+        let w0 = _mm256_loadu_si256(wq.add(wq_off).cast());
+        let w1 = _mm256_loadu_si256(wq.add(wq_off + 32).cast());
+        let w2 = _mm256_loadu_si256(wq.add(wq_off + 64).cast());
+        let w3 = _mm256_loadu_si256(wq.add(wq_off + 96).cast());
+
+        let w0_abs = _mm256_sign_epi8(w0, w0);
+        let i0 = _mm256_sign_epi8(input_i8, w0);
+        let prod0 = dpbusd_256(_mm256_setzero_si256(), w0_abs, i0);
+        let scale0 = _mm256_set1_ps(inp_scale * *ws.add(ws_off));
+        total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), scale0, total0);
+
+        let w1_abs = _mm256_sign_epi8(w1, w1);
+        let i1 = _mm256_sign_epi8(input_i8, w1);
+        let prod1 = dpbusd_256(_mm256_setzero_si256(), w1_abs, i1);
+        let scale1 = _mm256_set1_ps(inp_scale * *ws.add(ws_off + 1));
+        total1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod1), scale1, total1);
+
+        let w2_abs = _mm256_sign_epi8(w2, w2);
+        let i2 = _mm256_sign_epi8(input_i8, w2);
+        let prod2 = dpbusd_256(_mm256_setzero_si256(), w2_abs, i2);
+        let scale2 = _mm256_set1_ps(inp_scale * *ws.add(ws_off + 2));
+        total2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod2), scale2, total2);
+
+        let w3_abs = _mm256_sign_epi8(w3, w3);
+        let i3 = _mm256_sign_epi8(input_i8, w3);
+        let prod3 = dpbusd_256(_mm256_setzero_si256(), w3_abs, i3);
+        let scale3 = _mm256_set1_ps(inp_scale * *ws.add(ws_off + 3));
+        total3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod3), scale3, total3);
+    }
+
+    (
+        hsum_256(total0),
+        hsum_256(total1),
+        hsum_256(total2),
+        hsum_256(total3),
+    )
+}
+
 /// 4-row Q4×Q8 GEMV: computes dot products for four consecutive Q4_0 weight rows
 /// against the same Q8 input vector. Returns `(dot0, dot1, dot2, dot3)`.
 pub fn dot_q4_q8_4row(
@@ -2424,6 +2522,572 @@ unsafe fn microkernel_q8_4x4(
 
     // Write results to output matrix.
     // out layout: [col * 4 + row], output layout: row-major [row * n + col].
+    let out_ptr = output.as_mut_ptr();
+    for row in 0..4 {
+        for col in 0..4 {
+            *out_ptr.add((i + row) * n + (j + col)) = out[col * 4 + row];
+        }
+    }
+}
+
+// ---- Interleaved Q8×Q8 GEMM (4-row-interleaved weight format) ----
+//
+// Weight data is pre-packed into 4-row groups so each K-block's data for
+// 4 consecutive weight rows is contiguous in memory (2 cache lines vs 4).
+// This eliminates the ptrs[] indirection table and the `tmp` GPR, and
+// replaces 8 pointer-load instructions per block with direct SIB addressing.
+//
+// Key addressing trick:
+//   q_off advances by 32 per block (same as non-IL kernel, input unchanged).
+//   Weight quant col k at block b: [{wt_base} + {q_off} * 4 + k*32]
+//     (q_off*4 = b*128, k*32 = column offset within 128-byte group)
+//   Weight scale col k at block b: [{ws_base} + {s_off} * 4 + k*4]
+//     (s_off = q_off/8 = b*4 bytes for input scales; s_off*4 = b*16 bytes for 4 IL scales)
+//
+// GPR count: 12 in (iq0-3, is0-3, wt_base, ws_base, q_limit, out_ptr)
+//          +  2 out (q_off, s_off) = 14 total (fits x86-64 exactly).
+
+/// Tiled Q8×Q8 GEMM using 4-row-interleaved weight format.
+///
+/// `wt_quants_il` and `wt_scales_il` contain the full interleaved weight matrix.
+/// Layout: for group g = j/4, block b, row r:
+///   `wt_quants_il[g * nb * 128 + b * 128 + r * 32 .. +32]`
+///   `wt_scales_il[g * nb * 4 + b * 4 + r]`
+///
+/// `col_start` must be a multiple of 4. `n` is the number of columns to process.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+pub fn gemm_q8_tiled_il(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants_il: &[u8],
+    wt_scales_il: &[f32],
+    m: usize,
+    n: usize,
+    n_stride: usize,
+    num_blocks: usize,
+    bytes_per_row: usize,
+    col_start: usize,
+) {
+    unsafe {
+        gemm_q8_tiled_inner_il(
+            output,
+            inp_quants,
+            inp_scales,
+            wt_quants_il,
+            wt_scales_il,
+            m,
+            n,
+            n_stride,
+            num_blocks,
+            bytes_per_row,
+            col_start,
+        );
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512vnni",
+    enable = "avx512vl",
+    enable = "avx512bw",
+    enable = "fma"
+)]
+unsafe fn gemm_q8_tiled_inner_il(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants_il: &[u8],
+    wt_scales_il: &[f32],
+    m: usize,
+    n: usize,
+    n_stride: usize,
+    num_blocks: usize,
+    bytes_per_row: usize,
+    col_start: usize,
+) {
+    let m_full = m - m % RM_Q8;
+    let n_full = n - n % RN_Q8;
+
+    for i in (0..m_full).step_by(RM_Q8) {
+        for j in (0..n_full).step_by(RN_Q8) {
+            let global_col = col_start + j;
+            let group = global_col / 4;
+            let wt_base = wt_quants_il.as_ptr().add(group * num_blocks * 128);
+            let ws_base = wt_scales_il.as_ptr().add(group * num_blocks * 4).cast::<u8>();
+            microkernel_q8_4x4_il(
+                output,
+                inp_quants,
+                inp_scales,
+                wt_base,
+                ws_base,
+                n_stride,
+                num_blocks,
+                bytes_per_row,
+                i,
+                j,
+            );
+        }
+        // N remainder: scalar fallback using non-IL row access.
+        for jj in n_full..n {
+            let global_col = col_start + jj;
+            let group = global_col / 4;
+            let row_in_group = global_col % 4;
+            for ii in i..i + RM_Q8 {
+                let mut acc = 0.0f32;
+                for blk in 0..num_blocks {
+                    let wq_off = group * num_blocks * 128 + blk * 128 + row_in_group * 32;
+                    let ws_off = group * num_blocks * 4 + blk * 4 + row_in_group;
+                    let inp_off = ii * bytes_per_row + blk * 32;
+                    let wq = &wt_quants_il[wq_off..wq_off + 32];
+                    let iq = &inp_quants[inp_off..inp_off + 32];
+                    let mut dot = 0i32;
+                    for (w, a) in wq.iter().zip(iq.iter()) {
+                        dot += (*w as i32) * (*a as i8 as i32);
+                    }
+                    acc += (dot as f32)
+                        * inp_scales[ii * num_blocks + blk]
+                        * wt_scales_il[ws_off];
+                }
+                output[ii * n_stride + jj] = acc;
+            }
+        }
+    }
+
+    // M remainder: scalar fallback.
+    for ii in m_full..m {
+        for jj in 0..n {
+            let global_col = col_start + jj;
+            let group = global_col / 4;
+            let row_in_group = global_col % 4;
+            let mut acc = 0.0f32;
+            for blk in 0..num_blocks {
+                let wq_off = group * num_blocks * 128 + blk * 128 + row_in_group * 32;
+                let ws_off = group * num_blocks * 4 + blk * 4 + row_in_group;
+                let inp_off = ii * bytes_per_row + blk * 32;
+                let wq = &wt_quants_il[wq_off..wq_off + 32];
+                let iq = &inp_quants[inp_off..inp_off + 32];
+                let mut dot = 0i32;
+                for (w, a) in wq.iter().zip(iq.iter()) {
+                    dot += (*w as i32) * (*a as i8 as i32);
+                }
+                acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * wt_scales_il[ws_off];
+            }
+            output[ii * n_stride + jj] = acc;
+        }
+    }
+}
+
+/// 4×4 Q8×Q8 microkernel using interleaved weight format (no ptrs[] table).
+///
+/// `wt_base`: pointer to the start of the 4-row group's interleaved quant data.
+///   At block b: col k quants = `wt_base + b*128 + k*32`.
+///   Addressed as: `[{wt_base} + {q_off} * 4 + k*32]` where q_off = b*32.
+///
+/// `ws_base`: byte pointer to the start of the 4-row group's interleaved scales.
+///   At block b: col k scale = `ws_base + b*16 + k*4`.
+///   Addressed as: `[{ws_base} + {s_off} * 4 + k*4]` where s_off = q_off/8.
+///
+/// GPR map (14 total):
+///   iq0-3: input quant row ptrs (4)
+///   is0-3: input scale row ptrs as bytes (4)
+///   wt_base, ws_base: IL weight ptrs (2)
+///   q_limit, out_ptr: loop bound + output (2)
+///   q_off, s_off: loop counters (2, clobbered outputs)
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::many_single_char_names
+)]
+#[inline]
+unsafe fn microkernel_q8_4x4_il(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_base: *const u8,
+    ws_base: *const u8,
+    n: usize,
+    num_blocks: usize,
+    bytes_per_row: usize,
+    i: usize,
+    j: usize,
+) {
+    let iq0 = inp_quants.as_ptr().add(i * bytes_per_row);
+    let iq1 = inp_quants.as_ptr().add((i + 1) * bytes_per_row);
+    let iq2 = inp_quants.as_ptr().add((i + 2) * bytes_per_row);
+    let iq3 = inp_quants.as_ptr().add((i + 3) * bytes_per_row);
+
+    let is0 = inp_scales.as_ptr().add(i * num_blocks).cast::<u8>();
+    let is1 = inp_scales.as_ptr().add((i + 1) * num_blocks).cast::<u8>();
+    let is2 = inp_scales.as_ptr().add((i + 2) * num_blocks).cast::<u8>();
+    let is3 = inp_scales.as_ptr().add((i + 3) * num_blocks).cast::<u8>();
+
+    let q_limit = num_blocks * 32;
+
+    let mut out = [0.0f32; 4 * 4];
+
+    if num_blocks > 0 {
+        std::arch::asm!(
+            "vpxord ymm8, ymm8, ymm8",
+            "vpxord ymm9, ymm9, ymm9",
+            "vpxord ymm10, ymm10, ymm10",
+            "vpxord ymm11, ymm11, ymm11",
+            "vpxord ymm12, ymm12, ymm12",
+            "vpxord ymm13, ymm13, ymm13",
+            "vpxord ymm14, ymm14, ymm14",
+            "vpxord ymm15, ymm15, ymm15",
+            "vpxord ymm16, ymm16, ymm16",
+            "vpxord ymm17, ymm17, ymm17",
+            "vpxord ymm18, ymm18, ymm18",
+            "vpxord ymm19, ymm19, ymm19",
+            "vpxord ymm20, ymm20, ymm20",
+            "vpxord ymm21, ymm21, ymm21",
+            "vpxord ymm22, ymm22, ymm22",
+            "vpxord ymm23, ymm23, ymm23",
+
+            "xor {q_off:e}, {q_off:e}",
+
+            "2:",
+            "mov {s_off}, {q_off}",
+            "shr {s_off}, 3",
+
+            // Load 4 input quant blocks.
+            "vmovdqu ymm0, [{iq0} + {q_off}]",
+            "vmovdqu ymm1, [{iq1} + {q_off}]",
+            "vmovdqu ymm2, [{iq2} + {q_off}]",
+            "vmovdqu ymm3, [{iq3} + {q_off}]",
+
+            // Pre-broadcast 4 input scales (s_off = b*4 bytes into input scale array).
+            "vbroadcastss ymm24, dword ptr [{is0} + {s_off}]",
+            "vbroadcastss ymm25, dword ptr [{is1} + {s_off}]",
+            "vbroadcastss ymm26, dword ptr [{is2} + {s_off}]",
+            "vbroadcastss ymm27, dword ptr [{is3} + {s_off}]",
+
+            // ---- Col 0 ----
+            // Weight: [wt_base + q_off*4 + 0]  (q_off*4 = b*128, col 0 at +0)
+            // Scale:  [ws_base + s_off*4 + 0]  (s_off*4 = b*16, col 0 at +0)
+            "vmovdqu ymm4, [{wt_base} + {q_off} * 4]",
+            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm8, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm9, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm10, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm11, ymm6, ymm7",
+
+            // ---- Col 1 ----
+            // Weight: [wt_base + q_off*4 + 32]
+            // Scale:  [ws_base + s_off*4 + 4]
+            "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 32]",
+            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4 + 4]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm12, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm13, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm14, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm15, ymm6, ymm7",
+
+            // ---- Col 2 ----
+            // Weight: [wt_base + q_off*4 + 64]
+            // Scale:  [ws_base + s_off*4 + 8]
+            "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 64]",
+            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4 + 8]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm16, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm17, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm18, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm19, ymm6, ymm7",
+
+            // ---- Col 3 ----
+            // Weight: [wt_base + q_off*4 + 96]
+            // Scale:  [ws_base + s_off*4 + 12]
+            "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 96]",
+            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4 + 12]",
+            "vpsignb ymm5, ymm4, ymm4",
+            // row 0
+            "vpsignb ymm7, ymm0, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm24, ymm28",
+            "vfmadd231ps ymm20, ymm6, ymm7",
+            // row 1
+            "vpsignb ymm7, ymm1, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm25, ymm28",
+            "vfmadd231ps ymm21, ymm6, ymm7",
+            // row 2
+            "vpsignb ymm7, ymm2, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm26, ymm28",
+            "vfmadd231ps ymm22, ymm6, ymm7",
+            // row 3
+            "vpsignb ymm7, ymm3, ymm4",
+            "vpxord  ymm6, ymm6, ymm6",
+            "vpdpbusd ymm6, ymm5, ymm7",
+            "vcvtdq2ps ymm6, ymm6",
+            "vmulps ymm7, ymm27, ymm28",
+            "vfmadd231ps ymm23, ymm6, ymm7",
+
+            "add {q_off}, 32",
+            "cmp {q_off}, {q_limit}",
+            "jb 2b",
+
+            // ---- Horizontal reduction (identical to microkernel_q8_4x4) ----
+            // Col 0: ymm8 → out[0], ymm9 → out[1], ymm10 → out[2], ymm11 → out[3]
+            "vextractf128 xmm7, ymm8, 1",
+            "vextractf128 xmm6, ymm8, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr}], xmm7",
+
+            "vextractf128 xmm7, ymm9, 1",
+            "vextractf128 xmm6, ymm9, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 4], xmm7",
+
+            "vextractf128 xmm7, ymm10, 1",
+            "vextractf128 xmm6, ymm10, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 8], xmm7",
+
+            "vextractf128 xmm7, ymm11, 1",
+            "vextractf128 xmm6, ymm11, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 12], xmm7",
+
+            // Col 1: ymm12 → out[4..7]
+            "vextractf128 xmm7, ymm12, 1",
+            "vextractf128 xmm6, ymm12, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 16], xmm7",
+
+            "vextractf128 xmm7, ymm13, 1",
+            "vextractf128 xmm6, ymm13, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 20], xmm7",
+
+            "vextractf128 xmm7, ymm14, 1",
+            "vextractf128 xmm6, ymm14, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 24], xmm7",
+
+            "vextractf128 xmm7, ymm15, 1",
+            "vextractf128 xmm6, ymm15, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 28], xmm7",
+
+            // Col 2 uses EVEX vextractf32x4 (ymm16+)
+            "vextractf32x4 xmm7, ymm16, 1",
+            "vextractf32x4 xmm6, ymm16, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 32], xmm7",
+
+            "vextractf32x4 xmm7, ymm17, 1",
+            "vextractf32x4 xmm6, ymm17, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 36], xmm7",
+
+            "vextractf32x4 xmm7, ymm18, 1",
+            "vextractf32x4 xmm6, ymm18, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 40], xmm7",
+
+            "vextractf32x4 xmm7, ymm19, 1",
+            "vextractf32x4 xmm6, ymm19, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 44], xmm7",
+
+            // Col 3: ymm20 → out[12..15]
+            "vextractf32x4 xmm7, ymm20, 1",
+            "vextractf32x4 xmm6, ymm20, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 48], xmm7",
+
+            "vextractf32x4 xmm7, ymm21, 1",
+            "vextractf32x4 xmm6, ymm21, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 52], xmm7",
+
+            "vextractf32x4 xmm7, ymm22, 1",
+            "vextractf32x4 xmm6, ymm22, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 56], xmm7",
+
+            "vextractf32x4 xmm7, ymm23, 1",
+            "vextractf32x4 xmm6, ymm23, 0",
+            "vaddps xmm7, xmm7, xmm6",
+            "vmovshdup xmm6, xmm7",
+            "vaddps xmm7, xmm7, xmm6",
+            "vpermilps xmm6, xmm7, 0x4E",
+            "vaddss xmm7, xmm7, xmm6",
+            "vmovss [{out_ptr} + 60], xmm7",
+
+            iq0 = in(reg) iq0,
+            iq1 = in(reg) iq1,
+            iq2 = in(reg) iq2,
+            iq3 = in(reg) iq3,
+            is0 = in(reg) is0,
+            is1 = in(reg) is1,
+            is2 = in(reg) is2,
+            is3 = in(reg) is3,
+            wt_base = in(reg) wt_base,
+            ws_base = in(reg) ws_base,
+            q_limit = in(reg) q_limit,
+            out_ptr = in(reg) out.as_mut_ptr(),
+            q_off = out(reg) _,
+            s_off = out(reg) _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
+            out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
+            out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _,
+            out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
+            out("ymm16") _, out("ymm17") _, out("ymm18") _, out("ymm19") _,
+            out("ymm20") _, out("ymm21") _, out("ymm22") _, out("ymm23") _,
+            out("ymm24") _, out("ymm25") _, out("ymm26") _, out("ymm27") _,
+            out("ymm28") _,
+            options(nostack),
+        );
+    }
+
     let out_ptr = output.as_mut_ptr();
     for row in 0..4 {
         for col in 0..4 {
