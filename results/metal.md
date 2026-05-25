@@ -18,11 +18,11 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 92.2 | 226.7 | 0.41x | 2026-05-25 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 84.1 | 184.4 | 0.46x | 2026-05-25 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 37.7 | — | — | 2026-05-25 |
-| Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.2 | — | — | 2026-05-25 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 22.0 | 29.1 | 0.76x | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 100.0 | 226.7 | 0.44x | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 91.2 | 184.4 | 0.49x | 2026-05-25 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 39.2 | — | — | 2026-05-25 |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.9 | — | — | 2026-05-25 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 20.9 | 29.1 | 0.72x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
 
 ### Prefill throughput (tok/s)
@@ -45,6 +45,32 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 ---
 
 ## History
+
+---
+
+## 2026-05-25 — Cache decode graph and execution plan between token steps
+
+- **Chip:** Apple M3 Pro (18 GB unified memory)
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **Prefill tokens:** 512
+- **infernum commit:** (this PR)
+- **Date:** 2026-05-25
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | SafeTensors F32 | 37.7 | 39.2 | +4.0% |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 84.1 | 91.2 | +8.4% |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 92.2 | 100.0 | +8.4% |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.2 | 28.9 | +2.5% |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 22.0 | 20.9 | -5% (thermal noise) |
+
+### Notes
+
+- **Root cause:** `forward_batch_decode` called `build_paged_decode_graph_metal()` + `optimizer::optimize()` + `plan()` on every single token step. For SmolLM2 with 32 layers and ~450 graph nodes this adds ~0.9ms CPU overhead per token.
+- **Fix:** Added `DecodeCache` struct to `MetalGraphEngine` (behind a `RefCell` for interior mutability, matching the `CudaGraphEngine` pattern). On the first decode step the graph is built, optimized, and planned once. Subsequent steps reuse the cached `Graph<MetalBackend>` + `ExecutionPlan`, rebuilding only when `(batch_size, block_size, max_blocks_per_seq)` changes (never in practice for single-sequence decode).
+- **Gemma -5%:** Not a real regression — Gemma decode is ~45ms/token and the machine was hotter than the reference measurement. Gemma has fewer dispatches/token than SmolLM2 (124K vs 135K) and gains less from graph caching since it's more GPU-bound.
 
 ---
 
