@@ -2619,7 +2619,10 @@ unsafe fn gemm_q8_tiled_inner_il(
             let global_col = col_start + j;
             let group = global_col / 4;
             let wt_base = wt_quants_il.as_ptr().add(group * num_blocks * 128);
-            let ws_base = wt_scales_il.as_ptr().add(group * num_blocks * 4).cast::<u8>();
+            let ws_base = wt_scales_il
+                .as_ptr()
+                .add(group * num_blocks * 4)
+                .cast::<u8>();
             microkernel_q8_4x4_il(
                 output,
                 inp_quants,
@@ -2648,11 +2651,9 @@ unsafe fn gemm_q8_tiled_inner_il(
                     let iq = &inp_quants[inp_off..inp_off + 32];
                     let mut dot = 0i32;
                     for (w, a) in wq.iter().zip(iq.iter()) {
-                        dot += (*w as i32) * (*a as i8 as i32);
+                        dot += (*w as i8 as i32) * (*a as i8 as i32);
                     }
-                    acc += (dot as f32)
-                        * inp_scales[ii * num_blocks + blk]
-                        * wt_scales_il[ws_off];
+                    acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * wt_scales_il[ws_off];
                 }
                 output[ii * n_stride + jj] = acc;
             }
@@ -2674,7 +2675,7 @@ unsafe fn gemm_q8_tiled_inner_il(
                 let iq = &inp_quants[inp_off..inp_off + 32];
                 let mut dot = 0i32;
                 for (w, a) in wq.iter().zip(iq.iter()) {
-                    dot += (*w as i32) * (*a as i8 as i32);
+                    dot += (*w as i8 as i32) * (*a as i8 as i32);
                 }
                 acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * wt_scales_il[ws_off];
             }

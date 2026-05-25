@@ -303,6 +303,14 @@ pub struct CpuQuantizedWeight {
     pub scales: Vec<f32>,
     /// Per-block minimums decoded to f32 (one per block, Q4_1 only)
     pub mins: Option<Vec<f32>>,
+    /// Whether `data` and `scales` are in 4-row-interleaved format (Q8_0 only).
+    ///
+    /// When true, 4 consecutive weight rows' K-block data is packed contiguously:
+    /// - `data[g * nb * 128 + b * 128 + r * 32 .. +32]` = row (4g+r), block b
+    /// - `scales[g * nb * 4 + b * 4 + r]` = scale for row (4g+r), block b
+    /// This reduces weight load cache pressure from 4 scattered cache lines to
+    /// 2 sequential cache lines per K-block.
+    pub interleaved: bool,
 }
 
 /// Decode a buffer of f16 values stored as raw little-endian bytes into f32.

@@ -274,8 +274,9 @@ impl Arena {
         // exclusive-access guarantee. `out` is the sole `*mut` region, and we
         // verified above that it does not overlap with either input.
         // All three ranges are within bounds.
-        let data = Arc::get_mut(&mut self.data)
-            .expect("arena has live Arc clones; drop all tensor views before two_slices_in_one_out");
+        let data = Arc::get_mut(&mut self.data).expect(
+            "arena has live Arc clones; drop all tensor views before two_slices_in_one_out",
+        );
         unsafe {
             let ptr = data.as_mut_ptr();
             let in1_raw = std::slice::from_raw_parts(ptr.add(in1_offset).cast_const(), in1_bytes);
@@ -445,8 +446,9 @@ impl Arena {
         // exclusive-access guarantee. `out1` and `out2` are separate `*mut`
         // regions that we verified are non-overlapping with each other and with
         // both inputs. All four ranges are within bounds.
-        let data = Arc::get_mut(&mut self.data)
-            .expect("arena has live Arc clones; drop all tensor views before two_slices_in_two_out");
+        let data = Arc::get_mut(&mut self.data).expect(
+            "arena has live Arc clones; drop all tensor views before two_slices_in_two_out",
+        );
         unsafe {
             let ptr = data.as_mut_ptr();
             let in1_raw = std::slice::from_raw_parts(ptr.add(in1_offset).cast_const(), in1_bytes);

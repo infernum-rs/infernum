@@ -809,3 +809,47 @@ No measurable improvement: SmolLM2 Q4_0 GGUF contains only 4 Q4_1 tensors out of
 - Confirmed no regression across all benchmarks (ratios within ±3% noise of the zero-copy baseline).
 - The 4×6 microkernel fix was also attempted in this session: buffer overflow bug corrected (out buffer was 16 elements, ASM wrote 24), scatter fixed to 6 columns. Benchmark confirmed the same result as the prior 4×6 attempt: Q8_0 prefill −14%, Q4_0 prefill −25%. Root cause validated: 24 YMM accumulators leave no space for pre-broadcast input scales → 3.75× more scale broadcasts per K block → slower. Reverted.
 - Remaining gaps vs llama.cpp: Q8_0 decode ~0.93–1.03x (at parity), Q4_0 decode ~0.94–0.95x, Q8_0 prefill ~0.87–0.98x, Q4_0 prefill ~0.82–0.87x, Gemma decode ~0.85–0.90x, Gemma prefill ~0.88–0.96x.
+
+---
+
+## 2026-05-25 — Load-time Q8_0 weight interleaving (`perf/cpu-performance`)
+
+**Change:** Implemented load-time repacking of Q8_0 weights from row-major to 4-row-interleaved (IL) format. Previously, `dot_q8_q8_4row` fetched 4 consecutive weight rows from scattered memory locations (stride = `bytes_per_row`). With IL layout, each K-block's data for 4 consecutive weight rows is packed contiguously (128 bytes sequential), so the CPU fetches 2 cache lines instead of 4 scattered cache lines per block.
+
+Repacking happens once in `upload_host_linear` and `quantize_to_q8` (model load, amortized over all inference). All Q8_0 GEMV paths (`quantized_linear`, `quantized_linear_pair`, `quantized_linear_triple`) now use `q8_gemv_parallel_il`. All Q8_0 GEMM paths use `gemm_q8_tiled_il`. Q4_0 remains unchanged.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 142.0 | 144.8 | **0.98x** |
+| SmolLM2-360M Q4_0 decode | 195.3 | 196.3 | **0.99x** |
+| SmolLM2-360M Q8_0 prefill | 1155.0 | 1161.5 | **0.99x** |
+| SmolLM2-360M Q4_0 prefill | 1120.2 | 1303.4 | 0.86x |
+| Gemma 2-2b Q8_0 decode | 22.1 | 25.0 | 0.88x |
+| Gemma 2-2b Q8_0 prefill | 186.4 | 207.3 | 0.90x |
+
+### vs previous best (Q4_1 batch dispatch session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q8_0 decode | 140.9 | 142.0 | +0.8% |
+| SmolLM2-360M Q4_0 decode | 199.7 | 195.3 | −2.2% (noise) |
+| SmolLM2-360M Q8_0 prefill | 1139.6 | 1155.0 | +1.4% |
+| SmolLM2-360M Q4_0 prefill | 1118.1 | 1120.2 | +0.2% |
+| Gemma 2-2b Q8_0 decode | 22.1 | 22.1 | flat |
+| Gemma 2-2b Q8_0 prefill | 195.4 | 186.4 | −4.6% (llama.cpp also dropped −6.5%; ratio improved 0.88→0.90) |
+
+### Notes
+
+- SmolLM2 Q8_0 prefill and decode are now effectively at **parity** with llama.cpp (0.98–0.99x).
+- SmolLM2 Q4_0 decode is also at parity (0.99x); prefill is 0.86x.
+- Gemma Q8_0 decode 0.88x, prefill 0.90x — the apparent absolute regression is measurement noise (llama.cpp dropped 6.5% in the same run; ratio improved).
+- IL changes provide small but positive gains for Q8_0 paths (sequential weight access = better hardware prefetch for the GEMM microkernel).
+- Q4_0 paths unchanged; the Q4_0 prefill gap (0.86x) remains due to the per-dispatch expand step.
+- Remaining gaps: Q4_0 prefill 0.86x, Gemma decode 0.88x, Gemma prefill 0.90x.
