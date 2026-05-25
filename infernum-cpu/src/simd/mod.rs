@@ -543,6 +543,109 @@ pub fn gemm_q8_tiled_il(
     }
 }
 
+/// Expand Q4_0 IL → Q8_0 IL in-place using AVX-512 when available, otherwise scalar.
+///
+/// `q4_il`: source slice starting at the group-aligned offset (already trimmed to `chunk_groups`).
+/// `q8`: destination scratch buffer of length `chunk_groups * nb * 128`.
+pub fn expand_q4_il_to_q8_il_into(q4_il: &[u8], chunk_groups: usize, nb: usize, q8: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            unsafe {
+                avx512::expand_q4_il_to_q8_il_avx512(q4_il, chunk_groups, nb, q8);
+            }
+            return;
+        }
+        // AVX2 scalar fallback.
+        expand_q4_il_scalar(q4_il, chunk_groups, nb, q8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        expand_q4_il_scalar(q4_il, chunk_groups, nb, q8);
+    }
+}
+
+fn expand_q4_il_scalar(q4_il: &[u8], chunk_groups: usize, nb: usize, q8: &mut [u8]) {
+    let total_blocks = chunk_groups * nb;
+    for blk in 0..total_blocks {
+        let src_base = blk * 64;
+        let dst_base = blk * 128;
+        for r in 0..4 {
+            let packed = &q4_il[src_base + r * 16..src_base + r * 16 + 16];
+            let dst = &mut q8[dst_base + r * 32..dst_base + r * 32 + 32];
+            for i in 0..16 {
+                dst[i] = (packed[i] & 0x0F).wrapping_sub(8);
+                dst[i + 16] = (packed[i] >> 4).wrapping_sub(8);
+            }
+        }
+    }
+}
+
+/// Q4_0 IL tiled GEMM: reads Q4_0 IL directly (no expand buffer).
+/// Weight layout: `wt_quants_il[group * nb * 64 + blk * 64 + row * 16 .. +16]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_q4_tiled_il(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants_il: &[u8],
+    wt_scales_il_f16: &[u16],
+    m: usize,
+    n: usize,
+    n_stride: usize,
+    num_blocks: usize,
+    col_start: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::gemm_q4_tiled_il(
+                output,
+                inp_quants,
+                inp_scales,
+                wt_quants_il,
+                wt_scales_il_f16,
+                m,
+                n,
+                n_stride,
+                num_blocks,
+                col_start,
+            );
+            return;
+        }
+    }
+
+    // Scalar fallback: unpack Q4_0 nibbles and dot inline.
+    let nb = num_blocks;
+    let bpr = nb * 32;
+    for row in 0..m {
+        let iq = &inp_quants[row * bpr..(row + 1) * bpr];
+        let is_ = &inp_scales[row * nb..(row + 1) * nb];
+        for col in 0..n {
+            let global_col = col_start + col;
+            let group = global_col / 4;
+            let row_in_group = global_col % 4;
+            let mut acc = 0.0f32;
+            for blk in 0..nb {
+                let wq_off = group * nb * 64 + blk * 64 + row_in_group * 16;
+                let ws_off = group * nb * 4 + blk * 4 + row_in_group;
+                let packed = &wt_quants_il[wq_off..wq_off + 16];
+                let iq_blk = &iq[blk * 32..(blk + 1) * 32];
+                let mut dot = 0i32;
+                for k in 0..16 {
+                    dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32)
+                        * (iq_blk[k] as i8 as i32);
+                    dot += ((packed[k] >> 4).wrapping_sub(8) as i8 as i32)
+                        * (iq_blk[k + 16] as i8 as i32);
+                }
+                let ws = half::f16::from_bits(wt_scales_il_f16[ws_off]).to_f32();
+                acc += (dot as f32) * is_[blk] * ws;
+            }
+            output[row * n_stride + col] = acc;
+        }
+    }
+}
+
 // ---- Integer dot product dispatch (Q8×Q8, Q4×Q8) ----
 
 /// Quantize a row of f32 values to Q8_0 format (on-the-fly, for integer GEMV).
@@ -863,7 +966,12 @@ pub fn dot_q4_q8_4row_il(
     #[cfg(target_arch = "x86_64")]
     {
         if has_vnni() {
-            return avx512::dot_q4_q8_4row_il(input_quants, input_scales, il_quants_q4, il_scales_f16);
+            return avx512::dot_q4_q8_4row_il(
+                input_quants,
+                input_scales,
+                il_quants_q4,
+                il_scales_f16,
+            );
         }
     }
 
