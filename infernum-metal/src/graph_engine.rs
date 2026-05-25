@@ -18,13 +18,16 @@
 //! - No MLA KV cache support.
 //! - No quantisation probing (Phase 1: dense weights only).
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
 use infernum::backend::PagedKvCacheOps;
 use infernum::block_allocator::{BlockConfig, BlockTable};
 use infernum::graph::{optimizer, plan, Graph, WeightId, WeightStore};
-use infernum::{precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result};
+use infernum::{
+    precompute_rope_data, precompute_rope_row, DType, ExecutionPlan, ModelConfig, Result,
+};
 
 use crate::context::MetalContext;
 use crate::executor::execute;
@@ -176,6 +179,15 @@ pub fn load_graph_weights_metal(
 // MetalGraphEngine
 // ---------------------------------------------------------------------------
 
+/// Cached paged-decode graph and execution plan for one (batch, block, max_blocks) shape.
+struct DecodeCache {
+    graph: Graph<MetalBackend>,
+    plan: ExecutionPlan,
+    batch_size: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+}
+
 /// Metal graph-mode engine for any model family implementing [`MetalGraphEngineConfig`].
 ///
 /// Loads weights once and satisfies [`infernum::Model`], allowing it to be used
@@ -189,6 +201,9 @@ pub struct MetalGraphEngine<C: MetalGraphEngineConfig> {
     weights: Arc<WeightStore<MetalTensor, MetalLinearWeight>>,
     /// Cached `head_dim / 2` for RoPE slice arithmetic.
     half_dim: usize,
+    /// Cached decode graph for the most recent (batch_size, block_size, max_blocks_per_seq).
+    /// Rebuilt only when those parameters change (in practice, once per session).
+    decode_cache: RefCell<Option<DecodeCache>>,
 }
 
 impl<C: MetalGraphEngineConfig> MetalGraphEngine<C> {
@@ -207,6 +222,7 @@ impl<C: MetalGraphEngineConfig> MetalGraphEngine<C> {
             ctx,
             weights: Arc::new(weights),
             half_dim,
+            decode_cache: RefCell::new(None),
         })
     }
 
@@ -227,6 +243,7 @@ impl<C: MetalGraphEngineConfig> MetalGraphEngine<C> {
             ctx,
             weights: Arc::new(weights),
             half_dim,
+            decode_cache: RefCell::new(None),
         }
     }
 
@@ -458,12 +475,32 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
             .max()
             .unwrap_or(1);
 
-        // Build the paged decode graph.
-        let mut graph =
-            self.config
-                .build_paged_decode_graph_metal(batch_size, block_size, max_blocks_per_seq);
-        optimizer::optimize(&mut graph);
-        let ep = plan(&graph);
+        // Get or build the decode graph. The graph structure is identical for all
+        // steps with the same (batch_size, block_size, max_blocks_per_seq), so we
+        // build it once and reuse the Graph + ExecutionPlan across tokens.
+        let mut cache_borrow = self.decode_cache.borrow_mut();
+        let needs_rebuild = cache_borrow.as_ref().is_none_or(|c| {
+            c.batch_size != batch_size
+                || c.block_size != block_size
+                || c.max_blocks_per_seq != max_blocks_per_seq
+        });
+        if needs_rebuild {
+            let mut graph = self.config.build_paged_decode_graph_metal(
+                batch_size,
+                block_size,
+                max_blocks_per_seq,
+            );
+            optimizer::optimize(&mut graph);
+            let ep = plan(&graph);
+            *cache_borrow = Some(DecodeCache {
+                graph,
+                plan: ep,
+                batch_size,
+                block_size,
+                max_blocks_per_seq,
+            });
+        }
+        let cached = cache_borrow.as_ref().unwrap();
 
         let cos_t = MetalTensor::from_f32(&self.ctx, &[batch_size, half_dim], &cos_data);
         let sin_t = MetalTensor::from_f32(&self.ctx, &[batch_size, half_dim], &sin_data);
@@ -494,11 +531,11 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
             positions_t,
             seq_lens_t,
         ];
-        let output_nodes = graph.output_ids().to_vec();
+        let output_nodes = cached.graph.output_ids().to_vec();
         let outputs = execute(
             &self.ctx,
-            &ep,
-            graph.nodes(),
+            &cached.plan,
+            cached.graph.nodes(),
             &self.weights,
             &inputs,
             &output_nodes,
