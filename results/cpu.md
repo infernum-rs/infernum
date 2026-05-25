@@ -853,3 +853,63 @@ Repacking happens once in `upload_host_linear` and `quantize_to_q8` (model load,
 - IL changes provide small but positive gains for Q8_0 paths (sequential weight access = better hardware prefetch for the GEMM microkernel).
 - Q4_0 paths unchanged; the Q4_0 prefill gap (0.86x) remains due to the per-dispatch expand step.
 - Remaining gaps: Q4_0 prefill 0.86x, Gemma decode 0.88x, Gemma prefill 0.90x.
+
+---
+
+## 2026-05-25 — Q8_0 IL scales f16 (144 → 136 bytes/block) (`perf/cpu-performance`)
+
+**Change:** Q8_0 interleaved-format weight scales stored as f16 (`Vec<u16>`) instead of f32 (`Vec<f32>`). Each 4-row IL block stores 4 scale values: previously 16 bytes (4×f32), now 8 bytes (4×f16). Total per-block bytes: 144 → 136 (5.6% less). This matches llama.cpp's layout (34 bytes/row/block × 4 rows = 136 bytes).
+
+GEMM microkernel: `vcvtph2ps xmm, qword ptr [addr]` loads all 4 f16 scales in one 8-byte fetch; `vpermilps` + `vbroadcastss` broadcasts each. GEMV: `_mm_cvtph_ps` converts the 4-scale bundle; `_mm_shuffle_ps` extracts each lane. Both kernels require `+f16c` target feature.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **infernum commit:** `d09f45d`
+
+### Controlled back-to-back comparison (Q4_0 as thermal control)
+
+| Workload | Without f16 | With f16 | Δ raw | Q4_0 ctrl (+5%) | Δ adj |
+| -------- | ----------: | -------: | ----: | --------------: | ----: |
+| Q8_0 decode | 134.3 | 144.2 | +7.4% | +5.0% | **+2.4%** |
+| Q8_0 prefill | 959.7 | 1124.3 | +17.1% | +5.0% | **+12%** |
+
+Q4_0 control (+5%) is the thermal lift from machine performance state differing between the two measurements. Adjusted gains are the net f16 effect.
+
+### Notes
+
+- Q8_0 GEMM (prefill) gains most (+12% adj) — the microkernel's scale-load section reads 8 bytes vs 16 bytes per block; for K=960 blocks × 4 rows × all layers, the bandwidth reduction is significant even for L2-bound workloads.
+- Q8_0 decode (+2.4% adj) — GEMV reads scales once per block per 4 rows; 8-byte load vs 16-byte load reduces pressure on memory bandwidth.
+- Q4_0 paths are unaffected (no IL format for Q4_0 weights).
+- Remaining gaps (from best-effort estimates): Q4_0 prefill ~0.85x, Q8_0/Q4_0 decode ~0.95–1.02x (at parity), Gemma Q8_0 ~0.90–0.96x.
+
+---
+
+## 2026-05-25 — Q4_0 expand: IL format → plain Q8_0 row-major (`perf/cpu-performance`)
+
+**Change:** `q4_gemm_tiled` previously expanded Q4_0 nibbles into a 4-row interleaved (IL) Q8 buffer and called `gemm_q8_tiled_il`. Replaced with `expand_q4_to_q8`: plain row-major Q8_0 output (32 bytes/block, f32 scales), then `gemm_q8_tiled` (the non-IL kernel that achieves parity on Q8_0). Also:
+- Uninit buffers for both `q8_data` and `q8_scales` (`Vec::with_capacity + set_len`) — skips zero-init of 81 KB per thread call.
+- `cols_per_thread` rounded up to multiples of 4 to align with the 4×4 microkernel tile.
+- Eliminated f16 scale conversion (plain f32 copies from Q4 weight scales).
+
+**Negative result (reverted):** Tried `gemm_q4_noli` — a 4×4 VNNI microkernel with inline nibble expansion (vpandq, vpsubb, vpsrlw, vpandq, vpsubb, vinserti32x4). Result: Q4_0 prefill 0.86x → **0.79x** (−8%). Root cause: 6 extra instructions per weight column per K block deepen the critical path from weight load to VNNI by 6 cycles; 28% instruction overhead outweighs the 2× weight bandwidth reduction.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1`
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode | 138.0 | 146.7 | 0.94x |
+| SmolLM2-360M Q4_0 decode | 200.9 | 207.8 | **0.97x** |
+| Gemma 2-2b Q8_0 decode | 23.7 | 25.0 | 0.95x |
+| SmolLM2-360M Q8_0 prefill | 1149.3 | 1163.2 | **0.99x** |
+| SmolLM2-360M Q4_0 prefill | 1116.6 | 1273.9 | 0.88x |
+| Gemma 2-2b Q8_0 prefill | 196.2 | 221.0 | 0.89x |
+
+### Notes
+
+- Q4_0 prefill: 0.86x → **0.88x** (+2%). The IL format overhead (f16 scale conversion + IL buffer layout) was costing ~2%; plain row-major Q8 expansion + the non-IL microkernel is cheaper.
+- Q8_0 prefill now at **0.99x** (effectively parity). Q4_0 decode at **0.97x** (within noise of parity).
+- The Q4_0 prefill gap (0.88x) is structural: our expand-then-GEMM reads 1.5× more bytes (write Q8 + read Q8) vs llama.cpp reading Q4 directly. Inline expansion regresses due to instruction overhead; further gains require either pre-expand at load time or a 5-instruction expansion chain.
+- Remaining gaps: Q4_0 prefill 0.88x, Q8_0 decode 0.94x, Gemma 0.89–0.95x.

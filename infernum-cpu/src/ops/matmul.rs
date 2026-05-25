@@ -437,9 +437,9 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                 let num_threads = pool.num_threads();
                 let out_addr = ptr_to_usize(output.as_mut_ptr());
                 let wt_data_addr = weight.data.as_ptr() as usize;
-                let wt_scales_addr = weight.il_scales_f16.as_ptr() as usize;
 
                 if weight.interleaved {
+                    let wt_scales_addr = weight.il_scales_f16.as_ptr() as usize;
                     let cols_per_thread = (n.div_ceil(num_threads) + 3) & !3;
                     let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
                     let wt_data_len = weight.data.len();
@@ -474,6 +474,7 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                         );
                     });
                 } else {
+                    let wt_scales_addr = weight.scales.as_ptr() as usize;
                     let cols_per_thread = n.div_ceil(num_threads);
                     let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
                     pool.dispatch(num_tasks, |task_id, _| {
@@ -655,48 +656,64 @@ fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) 
     QuantizedRows { quants, scales }
 }
 
-/// Expand packed Q4_0 nibbles to int8 values in [-8, 7].
-///
 /// Input layout: `chunk_n` rows × `num_blocks` blocks × 16 packed bytes per block.
 /// Output layout: `chunk_n` rows × `num_blocks` blocks × 32 int8 bytes per block.
 ///
 /// `qs[k]` encodes element[k] in the low nibble and element[k+16] in the high nibble.
-fn expand_q4_to_int8(packed: &[u8], expanded: &mut [u8], chunk_n: usize, num_blocks: usize) {
-    let bpr = num_blocks * 16;
-    let ebpr = num_blocks * 32;
-
-    for row in 0..chunk_n {
-        let src = &packed[row * bpr..(row + 1) * bpr];
-        let dst = &mut expanded[row * ebpr..(row + 1) * ebpr];
+/// Expand Q4_0 packed nibbles into 4-row-interleaved (IL) Q8 format for one weight chunk.
+///
+/// Each group of 4 rows is packed into the IL layout: for group g, block b, row r:
+///   `il_data[g * nb * 128 + b * 128 + r * 32 .. +32]` = expanded int8 block b of row 4g+r
+///   `il_scales[g * nb * 4 + b * 4 + r]` = f16 scale for block b of row 4g+r
+///
+/// chunk_n may not be a multiple of 4; the last partial group is expanded for only the
+/// rows that exist (remaining slots are left uninitialized — not accessed by gemm_q8_tiled_il).
+fn expand_q4_to_q8(
+    q4_data: &[u8],
+    q4_scales: &[f32],
+    q8_data: &mut [u8],
+    q8_scales: &mut [f32],
+    chunk_n: usize,
+    num_blocks: usize,
+) {
+    let bpr_q4 = num_blocks * 16;
+    let bpr_q8 = num_blocks * 32;
+    for col in 0..chunk_n {
+        let q4_row = &q4_data[col * bpr_q4..];
+        let q8_row = &mut q8_data[col * bpr_q8..];
         for blk in 0..num_blocks {
-            let sb = &src[blk * 16..(blk + 1) * 16];
-            let db = &mut dst[blk * 32..(blk + 1) * 32];
+            let src = &q4_row[blk * 16..(blk + 1) * 16];
+            let dst = &mut q8_row[blk * 32..blk * 32 + 32];
             for i in 0..16 {
-                db[i] = (sb[i] & 0x0F).wrapping_sub(8);
-                db[i + 16] = (sb[i] >> 4).wrapping_sub(8);
+                dst[i] = (src[i] & 0x0F).wrapping_sub(8);
+                dst[i + 16] = (src[i] >> 4).wrapping_sub(8);
             }
         }
+        q8_scales[col * num_blocks..(col + 1) * num_blocks]
+            .copy_from_slice(&q4_scales[col * num_blocks..(col + 1) * num_blocks]);
     }
 }
 
-/// Q4_0 tiled GEMM: per-thread expand Q4 nibbles to int8, then reuse the Q8 GEMM.
+/// Q4_0 tiled GEMM: expand Q4 nibbles to plain row-major Q8_0, then call the
+/// standard Q8_0 GEMM kernel. This reuses the same high-performance non-IL
+/// microkernel that achieves parity on Q8_0 prefill without f16 scale conversion.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 fn q4_gemm_tiled(
     output: &mut [f32],
     all_rows: &QuantizedRows,
     m: usize,
-    k: usize,
+    _k: usize,
     n: usize,
     num_blocks: usize,
     weight_data: &[u8],
     weight_scales: &[f32],
 ) {
-    let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2); // 16 bytes/block packed
-    let ebpr = num_blocks * QUANTIZATION_BLOCK_SIZE; // 32 bytes/block expanded
+    let bpr_q4 = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
+    let bpr_q8 = num_blocks * QUANTIZATION_BLOCK_SIZE;
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let cols_per_thread = n.div_ceil(num_threads);
+    let cols_per_thread = (n.div_ceil(num_threads) + 3) & !3;
     let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
     let out_addr = ptr_to_usize(output.as_mut_ptr());
     let wt_data_addr = weight_data.as_ptr() as usize;
@@ -704,48 +721,53 @@ fn q4_gemm_tiled(
 
     pool.dispatch(num_tasks, |task_id, _| {
         let col_start = task_id * cols_per_thread;
-        let col_end = (col_start + cols_per_thread).min(n);
         if col_start >= n {
             return;
         }
+        let col_end = (col_start + cols_per_thread).min(n);
         let chunk_n = col_end - col_start;
 
-        // Expand Q4_0 → int8 for this thread's weight column chunk.
-        // expand_q4_to_int8 writes every element — skip zero-init.
+        // Allocate uninit — fully overwritten by expand_q4_to_q8 before GEMM.
         #[allow(clippy::uninit_vec)]
-        let mut expanded: Vec<u8> = {
-            let mut v = Vec::with_capacity(chunk_n * k);
-            unsafe { v.set_len(chunk_n * k) };
+        let mut q8_data: Vec<u8> = {
+            let mut v = Vec::with_capacity(chunk_n * bpr_q8);
+            unsafe { v.set_len(chunk_n * bpr_q8) };
             v
         };
+        #[allow(clippy::uninit_vec)]
+        let mut q8_scales: Vec<f32> = {
+            let mut v = Vec::with_capacity(chunk_n * num_blocks);
+            unsafe { v.set_len(chunk_n * num_blocks) };
+            v
+        };
+
         let q4_data = unsafe {
             std::slice::from_raw_parts(
-                (wt_data_addr as *const u8).add(col_start * bpr),
-                chunk_n * bpr,
+                (wt_data_addr as *const u8).add(col_start * bpr_q4),
+                chunk_n * bpr_q4,
             )
         };
-        expand_q4_to_int8(q4_data, &mut expanded, chunk_n, num_blocks);
-
-        let wt_scales = unsafe {
+        let q4_scales_src = unsafe {
             std::slice::from_raw_parts(
                 (wt_scales_addr as *const f32).add(col_start * num_blocks),
                 chunk_n * num_blocks,
             )
         };
+        expand_q4_to_q8(q4_data, q4_scales_src, &mut q8_data, &mut q8_scales, chunk_n, num_blocks);
 
-        // Write directly into strided global output (stride = n).
         let out_global = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
+
         simd::gemm_q8_tiled(
             &mut out_global[col_start..],
             &all_rows.quants,
             &all_rows.scales,
-            &expanded,
-            wt_scales,
+            &q8_data,
+            &q8_scales,
             m,
             chunk_n,
             n,
             num_blocks,
-            ebpr,
+            bpr_q8,
         );
     });
 }
