@@ -9,10 +9,11 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m256, __m256i, _mm256_add_ps, _mm256_castps256_ps128, _mm256_cvtepi32_ps,
+    __m128i, __m256, __m256i, _mm256_add_ps, _mm256_castps256_ps128, _mm256_cvtepi32_ps,
     _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_set1_ps,
     _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_ps, _mm_add_ss,
-    _mm_cvtss_f32, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch, _MM_HINT_T0,
+    _mm_cvtph_ps, _mm_cvtss_f32, _mm_loadl_epi64, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch,
+    _mm_shuffle_ps, _MM_HINT_T0,
 };
 
 /// Horizontal sum of an __m256 register.
@@ -535,9 +536,9 @@ unsafe fn dot_q8_q8_4row_inner(
 
 /// 4-row Q8×Q8 GEMV with 4-row-interleaved weight format.
 ///
-/// Weight data layout (passed as `il_quants`, `il_scales`):
-/// - `il_quants[b * 128 + r * 32 .. +32]` = quants for row r, block b  (4 rows packed per block)
-/// - `il_scales[b * 4 + r]`               = scale  for row r, block b
+/// Weight data layout (passed as `il_quants`, `il_scales_f16`):
+/// - `il_quants[b * 128 + r * 32 .. +32]`   = quants for row r, block b (4 rows per block)
+/// - `il_scales_f16[b * 4 + r]`             = f16 scale (as u16 bits) for row r, block b
 ///
 /// Sequential memory access pattern means the hardware prefetcher covers all
 /// 4 weight row loads per block from the same 2 cache lines, vs 4 scattered
@@ -546,9 +547,9 @@ pub fn dot_q8_q8_4row_il(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants: &[u8],
-    il_scales: &[f32],
+    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
-    unsafe { dot_q8_q8_4row_il_inner(input_quants, input_scales, il_quants, il_scales) }
+    unsafe { dot_q8_q8_4row_il_inner(input_quants, input_scales, il_quants, il_scales_f16) }
 }
 
 #[allow(clippy::similar_names)]
@@ -556,19 +557,20 @@ pub fn dot_q8_q8_4row_il(
     enable = "avx512f",
     enable = "avx512vnni",
     enable = "avx512vl",
-    enable = "fma"
+    enable = "fma",
+    enable = "f16c"
 )]
 unsafe fn dot_q8_q8_4row_il_inner(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants: &[u8],
-    il_scales: &[f32],
+    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
     let nb = input_scales.len();
 
     let iq = input_quants.as_ptr();
     let wq = il_quants.as_ptr();
-    let ws = il_scales.as_ptr();
+    let ws = il_scales_f16.as_ptr();
 
     let mut total0 = _mm256_setzero_ps();
     let mut total1 = _mm256_setzero_ps();
@@ -598,28 +600,36 @@ unsafe fn dot_q8_q8_4row_il_inner(
         let w2 = _mm256_loadu_si256(wq.add(wq_off + 64).cast());
         let w3 = _mm256_loadu_si256(wq.add(wq_off + 96).cast());
 
+        // Load 4 f16 scales (8 bytes) and convert to 4 f32 via vcvtph2ps.
+        let scales_raw = _mm_loadl_epi64(ws.add(ws_off).cast::<__m128i>());
+        let scales_f32 = _mm_cvtph_ps(scales_raw);
+        let s0 = _mm_cvtss_f32(scales_f32);
+        let s1 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0x55));
+        let s2 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0xAA));
+        let s3 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0xFF));
+
         let w0_abs = _mm256_sign_epi8(w0, w0);
         let i0 = _mm256_sign_epi8(input_i8, w0);
         let prod0 = dpbusd_256(_mm256_setzero_si256(), w0_abs, i0);
-        let scale0 = _mm256_set1_ps(inp_scale * *ws.add(ws_off));
+        let scale0 = _mm256_set1_ps(inp_scale * s0);
         total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), scale0, total0);
 
         let w1_abs = _mm256_sign_epi8(w1, w1);
         let i1 = _mm256_sign_epi8(input_i8, w1);
         let prod1 = dpbusd_256(_mm256_setzero_si256(), w1_abs, i1);
-        let scale1 = _mm256_set1_ps(inp_scale * *ws.add(ws_off + 1));
+        let scale1 = _mm256_set1_ps(inp_scale * s1);
         total1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod1), scale1, total1);
 
         let w2_abs = _mm256_sign_epi8(w2, w2);
         let i2 = _mm256_sign_epi8(input_i8, w2);
         let prod2 = dpbusd_256(_mm256_setzero_si256(), w2_abs, i2);
-        let scale2 = _mm256_set1_ps(inp_scale * *ws.add(ws_off + 2));
+        let scale2 = _mm256_set1_ps(inp_scale * s2);
         total2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod2), scale2, total2);
 
         let w3_abs = _mm256_sign_epi8(w3, w3);
         let i3 = _mm256_sign_epi8(input_i8, w3);
         let prod3 = dpbusd_256(_mm256_setzero_si256(), w3_abs, i3);
-        let scale3 = _mm256_set1_ps(inp_scale * *ws.add(ws_off + 3));
+        let scale3 = _mm256_set1_ps(inp_scale * s3);
         total3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod3), scale3, total3);
     }
 
@@ -2541,18 +2551,18 @@ unsafe fn microkernel_q8_4x4(
 //   q_off advances by 32 per block (same as non-IL kernel, input unchanged).
 //   Weight quant col k at block b: [{wt_base} + {q_off} * 4 + k*32]
 //     (q_off*4 = b*128, k*32 = column offset within 128-byte group)
-//   Weight scale col k at block b: [{ws_base} + {s_off} * 4 + k*4]
-//     (s_off = q_off/8 = b*4 bytes for input scales; s_off*4 = b*16 bytes for 4 IL scales)
+//   Weight scale col k at block b: [{ws_base} + {s_off} * 2 + k*2]
+//     (s_off = q_off/8 = b*4; s_off*2 = b*8 bytes for 4 f16 IL scales)
 //
 // GPR count: 12 in (iq0-3, is0-3, wt_base, ws_base, q_limit, out_ptr)
 //          +  2 out (q_off, s_off) = 14 total (fits x86-64 exactly).
 
 /// Tiled Q8×Q8 GEMM using 4-row-interleaved weight format.
 ///
-/// `wt_quants_il` and `wt_scales_il` contain the full interleaved weight matrix.
+/// `wt_quants_il` and `wt_scales_il_f16` contain the full interleaved weight matrix.
 /// Layout: for group g = j/4, block b, row r:
 ///   `wt_quants_il[g * nb * 128 + b * 128 + r * 32 .. +32]`
-///   `wt_scales_il[g * nb * 4 + b * 4 + r]`
+///   `wt_scales_il_f16[g * nb * 4 + b * 4 + r]` = f16 scale as u16
 ///
 /// `col_start` must be a multiple of 4. `n` is the number of columns to process.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
@@ -2561,7 +2571,7 @@ pub fn gemm_q8_tiled_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il: &[f32],
+    wt_scales_il: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -2596,14 +2606,15 @@ pub fn gemm_q8_tiled_il(
     enable = "avx512vnni",
     enable = "avx512vl",
     enable = "avx512bw",
-    enable = "fma"
+    enable = "fma",
+    enable = "f16c"
 )]
 unsafe fn gemm_q8_tiled_inner_il(
     output: &mut [f32],
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il: &[f32],
+    wt_scales_il: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -2653,7 +2664,8 @@ unsafe fn gemm_q8_tiled_inner_il(
                     for (w, a) in wq.iter().zip(iq.iter()) {
                         dot += (*w as i8 as i32) * (*a as i8 as i32);
                     }
-                    acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * wt_scales_il[ws_off];
+                    let ws = half::f16::from_bits(wt_scales_il[ws_off]).to_f32();
+                    acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * ws;
                 }
                 output[ii * n_stride + jj] = acc;
             }
@@ -2677,7 +2689,8 @@ unsafe fn gemm_q8_tiled_inner_il(
                 for (w, a) in wq.iter().zip(iq.iter()) {
                     dot += (*w as i8 as i32) * (*a as i8 as i32);
                 }
-                acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * wt_scales_il[ws_off];
+                let ws = half::f16::from_bits(wt_scales_il[ws_off]).to_f32();
+                acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * ws;
             }
             output[ii * n_stride + jj] = acc;
         }
@@ -2690,9 +2703,9 @@ unsafe fn gemm_q8_tiled_inner_il(
 ///   At block b: col k quants = `wt_base + b*128 + k*32`.
 ///   Addressed as: `[{wt_base} + {q_off} * 4 + k*32]` where q_off = b*32.
 ///
-/// `ws_base`: byte pointer to the start of the 4-row group's interleaved scales.
-///   At block b: col k scale = `ws_base + b*16 + k*4`.
-///   Addressed as: `[{ws_base} + {s_off} * 4 + k*4]` where s_off = q_off/8.
+/// `ws_base`: byte pointer to the start of the 4-row group's interleaved f16 scales.
+///   At block b: col k scale = `ws_base + b*8 + k*2` (f16, 2 bytes each).
+///   Addressed as: `[{ws_base} + {s_off} * 2 + k*2]` where s_off = q_off/8.
 ///
 /// GPR map (14 total):
 ///   iq0-3: input quant row ptrs (4)
@@ -2770,11 +2783,15 @@ unsafe fn microkernel_q8_4x4_il(
             "vbroadcastss ymm26, dword ptr [{is2} + {s_off}]",
             "vbroadcastss ymm27, dword ptr [{is3} + {s_off}]",
 
+            // Load all 4 f16 scales for this block (8 bytes) and convert to 4 f32.
+            // ws_base + s_off*2 = b*8 bytes into the f16 scale array.
+            "vcvtph2ps xmm29, qword ptr [{ws_base} + {s_off} * 2]",
+
             // ---- Col 0 ----
             // Weight: [wt_base + q_off*4 + 0]  (q_off*4 = b*128, col 0 at +0)
-            // Scale:  [ws_base + s_off*4 + 0]  (s_off*4 = b*16, col 0 at +0)
+            // Scale:  xmm29[0] = s0 for col 0
             "vmovdqu ymm4, [{wt_base} + {q_off} * 4]",
-            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4]",
+            "vbroadcastss ymm28, xmm29",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
@@ -2807,9 +2824,10 @@ unsafe fn microkernel_q8_4x4_il(
 
             // ---- Col 1 ----
             // Weight: [wt_base + q_off*4 + 32]
-            // Scale:  [ws_base + s_off*4 + 4]
+            // Scale:  xmm29[1] = s1, permute to lane 0 then broadcast
             "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 32]",
-            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4 + 4]",
+            "vpermilps xmm30, xmm29, 0xe1",
+            "vbroadcastss ymm28, xmm30",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
@@ -2842,9 +2860,10 @@ unsafe fn microkernel_q8_4x4_il(
 
             // ---- Col 2 ----
             // Weight: [wt_base + q_off*4 + 64]
-            // Scale:  [ws_base + s_off*4 + 8]
+            // Scale:  xmm29[2] = s2, permute to lane 0 then broadcast
             "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 64]",
-            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4 + 8]",
+            "vpermilps xmm30, xmm29, 0xe2",
+            "vbroadcastss ymm28, xmm30",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
@@ -2877,9 +2896,10 @@ unsafe fn microkernel_q8_4x4_il(
 
             // ---- Col 3 ----
             // Weight: [wt_base + q_off*4 + 96]
-            // Scale:  [ws_base + s_off*4 + 12]
+            // Scale:  xmm29[3] = s3, permute to lane 0 then broadcast
             "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 96]",
-            "vbroadcastss ymm28, dword ptr [{ws_base} + {s_off} * 4 + 12]",
+            "vpermilps xmm30, xmm29, 0xe3",
+            "vbroadcastss ymm28, xmm30",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
@@ -3084,7 +3104,7 @@ unsafe fn microkernel_q8_4x4_il(
             out("ymm16") _, out("ymm17") _, out("ymm18") _, out("ymm19") _,
             out("ymm20") _, out("ymm21") _, out("ymm22") _, out("ymm23") _,
             out("ymm24") _, out("ymm25") _, out("ymm26") _, out("ymm27") _,
-            out("ymm28") _,
+            out("ymm28") _, out("ymm29") _, out("ymm30") _,
             options(nostack),
         );
     }

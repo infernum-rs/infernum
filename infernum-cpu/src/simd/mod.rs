@@ -488,7 +488,7 @@ pub fn gemm_q8_tiled_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il: &[f32],
+    wt_scales_il_f16: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -504,7 +504,7 @@ pub fn gemm_q8_tiled_il(
                 inp_quants,
                 inp_scales,
                 wt_quants_il,
-                wt_scales_il,
+                wt_scales_il_f16,
                 m,
                 n,
                 n_stride,
@@ -535,7 +535,8 @@ pub fn gemm_q8_tiled_il(
                 for (w, a) in wq.iter().zip(iq_blk.iter()) {
                     dot += (*w as i32) * (*a as i8 as i32);
                 }
-                acc += (dot as f32) * is_[blk] * wt_scales_il[ws_off];
+                let ws = half::f16::from_bits(wt_scales_il_f16[ws_off]).to_f32();
+                acc += (dot as f32) * is_[blk] * ws;
             }
             output[row * n_stride + col] = acc;
         }
@@ -817,12 +818,17 @@ pub fn dot_q8_q8_4row_il(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants: &[u8],
-    il_scales: &[f32],
+    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if has_vnni() {
-            return avx512::dot_q8_q8_4row_il(input_quants, input_scales, il_quants, il_scales);
+            return avx512::dot_q8_q8_4row_il(
+                input_quants,
+                input_scales,
+                il_quants,
+                il_scales_f16,
+            );
         }
     }
 
@@ -840,7 +846,8 @@ pub fn dot_q8_q8_4row_il(
             for (a, w) in iq.iter().zip(wq.iter()) {
                 dot += (*a as i8 as i32) * (*w as i32);
             }
-            acc[r] += (dot as f32) * inp_scale * il_scales[blk * 4 + r];
+            let ws = half::f16::from_bits(il_scales_f16[blk * 4 + r]).to_f32();
+            acc[r] += (dot as f32) * inp_scale * ws;
         }
     }
     (acc[0], acc[1], acc[2], acc[3])
