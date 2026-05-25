@@ -823,12 +823,7 @@ pub fn dot_q8_q8_4row_il(
     #[cfg(target_arch = "x86_64")]
     {
         if has_vnni() {
-            return avx512::dot_q8_q8_4row_il(
-                input_quants,
-                input_scales,
-                il_quants,
-                il_scales_f16,
-            );
+            return avx512::dot_q8_q8_4row_il(input_quants, input_scales, il_quants, il_scales_f16);
         }
     }
 
