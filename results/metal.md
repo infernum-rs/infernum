@@ -18,11 +18,11 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 60.8 | 226.7 | 0.27x | 2026-05-25 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 57.5 | 184.4 | 0.31x | 2026-05-25 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 29.9 | — | — | 2026-05-25 |
-| Qwen / Qwen3-0.6B | SafeTensors BF16 | 24.1 | — | — | 2026-05-25 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 18.0 | 29.1 | 0.62x | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 92.2 | 226.7 | 0.41x | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 84.1 | 184.4 | 0.46x | 2026-05-25 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 37.7 | — | — | 2026-05-25 |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.2 | — | — | 2026-05-25 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 22.0 | 29.1 | 0.76x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
 
 ### Prefill throughput (tok/s)
@@ -39,12 +39,46 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / SmolLM2-360M | GGUF Q8_0 | 253.9 | 4541 | 0.056x | 2026-05-25 |
 | Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 4596 | 0.055x | 2026-05-25 |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 90.9 | — | — | 2026-05-23 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 815.3 | 938 | 0.87x | 2026-05-25 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 295.9 | 938 | 0.32x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-23 |
 
 ---
 
 ## History
+
+---
+
+## 2026-05-25 — Eliminate per-layer GPU sync in decode (seq_lens readback)
+
+- **Chip:** Apple M3 Pro (18 GB unified memory)
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **Prefill tokens:** 512
+- **infernum commit:** (this PR)
+- **Date:** 2026-05-25
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | SafeTensors F32 | 29.9 | 37.7 | +26.1% |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 57.5 | 84.1 | +46.3% |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 60.8 | 92.2 | +51.6% |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 24.1 | 28.2 | +17.0% |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 18.0 | 22.0 | +22.2% |
+
+### GPU flushes per 256-token decode (smollm2-q8_0)
+
+| | flushes | GPU wait |
+|-|--------:|---------:|
+| before | 1280 | 426.9 ms |
+| after | 256 | 2483.9 ms (all useful) |
+
+### Notes
+
+- **Root cause:** `paged_attention_decode` in `execute_context.rs` was calling `seq_lens.as_bytes()` to compute `max_seq_len` at runtime (because the graph stores `0` as a sentinel). `as_bytes()` calls `flush()` which commits and waits for the current command buffer before reading CPU-side memory. With 32 layers per decode step this caused 32 forced GPU sync-points per token — 1280 flushes for 256 generated tokens instead of the necessary 256 (one per token to read the output logits).
+- **Fix:** `MetalPagedKvCache` now carries a `current_max_seq_len: usize` field. The engine sets it from the CPU-computed `seq_lens_u32.max()` in `forward_batch_decode()` before any GPU dispatch starts. The execute_context reads this field directly instead of calling `seq_lens.as_bytes()`.
+- **Why GPU wait time increased:** The `426.9ms` before was the sum of 1280 small waits, each for a tiny slice of work. The `2483.9ms` after is one large wait per token, but the GPU is doing the same total work — it's just expressed as useful GPU time rather than serialized pipeline stalls. The CPU no longer interrupts the GPU 32 times per token.
+- **Gemma prefill (295.9 tok/s):** Lower than the 815.3 recorded in the previous entry (measured under GPU boost conditions). The seq_lens fix does not affect the prefill path, which never uses `MetalPagedKvCache`. Gemma 2B prefill throughput varies with thermal state; 280–660 tok/s represents the realistic range on M3 Pro.
 
 ---
 

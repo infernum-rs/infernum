@@ -46,6 +46,9 @@ pub struct MetalPagedKvCache {
     pub(crate) block_size: usize,
     pub(crate) num_kv_heads: usize,
     pub(crate) head_dim: usize,
+    /// Set by the engine before each decode step so the executor can read it
+    /// without a GPU sync. Eliminates one `seq_lens.as_bytes()` flush per layer.
+    pub current_max_seq_len: usize,
 }
 
 // SAFETY: MetalTensor is Send+Sync; Metal shared-mode buffers are thread-safe.

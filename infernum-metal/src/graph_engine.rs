@@ -449,6 +449,15 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
         // seq_lens_u32: K/V length for attention = positions + 1 (after appending).
         let seq_lens_u32: Vec<u32> = positions_data.iter().map(|&p| p + 1).collect();
 
+        // Pre-compute max_seq_len on the CPU so the graph executor can use it
+        // without reading back from the GPU (which would force a per-layer sync).
+        kv_cache.current_max_seq_len = seq_lens_u32
+            .iter()
+            .copied()
+            .map(|x| x as usize)
+            .max()
+            .unwrap_or(1);
+
         // Build the paged decode graph.
         let mut graph =
             self.config

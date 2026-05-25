@@ -132,18 +132,12 @@ impl KvCacheAccess<MetalBackend> for MetalPagedKvCacheAccess<'_> {
         softcap: Option<f32>,
         sliding_window: Option<usize>,
     ) -> Result<MetalTensor> {
-        // Resolve max_seq_len: if 0, read from the GPU tensor (eager path).
+        // Use the max_seq_len pre-computed by the engine on the CPU side before
+        // this decode step began — avoids a GPU flush per layer per token.
         let resolved = if max_seq_len != 0 {
             max_seq_len
         } else {
-            let seq_lens_bytes = seq_lens.as_bytes();
-            let seq_lens_u32: &[u32] = bytemuck::cast_slice(seq_lens_bytes);
-            seq_lens_u32
-                .iter()
-                .copied()
-                .map(|x| x as usize)
-                .max()
-                .unwrap_or(1)
+            self.cache.current_max_seq_len.max(1)
         };
         let (k_pool, v_pool) = MetalBackend::get_pools(self.cache, layer_idx);
         MetalBackend::paged_attention_decode(

@@ -310,6 +310,7 @@ impl PagedKvCacheOps for MetalBackend {
             block_size,
             num_kv_heads,
             head_dim,
+            current_max_seq_len: 0,
         })
     }
 
