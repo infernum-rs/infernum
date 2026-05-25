@@ -447,33 +447,82 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                 );
             }
             DType::Q4_1 => {
-                let packed = &weight.data;
-                let scales = &weight.scales;
-                let mins = weight
+                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+                let pool = crate::thread_pool::global_pool();
+                let num_threads = pool.num_threads();
+
+                let cols_per_thread = n.div_ceil(num_threads);
+                let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
+                let out_addr = ptr_to_usize(output.as_mut_ptr());
+                let wt_data_addr = weight.data.as_ptr() as usize;
+                let wt_scales_addr = weight.scales.as_ptr() as usize;
+                let wt_mins_addr = weight
                     .mins
                     .as_ref()
-                    .expect("Q4_1 weight missing mins buffer");
-                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+                    .expect("Q4_1 weight missing mins buffer")
+                    .as_ptr() as usize;
+                let inp_f32_addr = input_data.as_ptr() as usize;
 
-                // Q4_1 needs original f32 input, so fall back to row-by-row
-                // (Q4_1 is rare enough that this path is acceptable)
-                let mut inp_quants = vec![0u8; k];
-                let mut inp_scales = vec![0.0f32; num_blocks_per_row];
-                for row in 0..m {
-                    let inp = &input_data[row * k..(row + 1) * k];
-                    simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
-                    q4_1_gemv_parallel(
-                        &mut output[row * n..(row + 1) * n],
-                        &inp_quants,
-                        &inp_scales,
-                        inp,
-                        packed,
-                        scales,
-                        mins,
-                        num_blocks_per_row,
-                        bpr,
-                    );
-                }
+                pool.dispatch(num_tasks, |task_id, _| {
+                    let col_start = task_id * cols_per_thread;
+                    let col_end = (col_start + cols_per_thread).min(n);
+                    if col_start >= n {
+                        return;
+                    }
+                    let chunk_n = col_end - col_start;
+
+                    let wt_packed = unsafe {
+                        std::slice::from_raw_parts(
+                            (wt_data_addr as *const u8).add(col_start * bpr),
+                            chunk_n * bpr,
+                        )
+                    };
+                    let wt_scales = unsafe {
+                        std::slice::from_raw_parts(
+                            (wt_scales_addr as *const f32)
+                                .add(col_start * num_blocks_per_row),
+                            chunk_n * num_blocks_per_row,
+                        )
+                    };
+                    let wt_mins = unsafe {
+                        std::slice::from_raw_parts(
+                            (wt_mins_addr as *const f32).add(col_start * num_blocks_per_row),
+                            chunk_n * num_blocks_per_row,
+                        )
+                    };
+
+                    for row in 0..m {
+                        let inp_quants =
+                            &all_quants.quants[row * k..(row + 1) * k];
+                        let inp_scales = &all_quants.scales
+                            [row * num_blocks_per_row..(row + 1) * num_blocks_per_row];
+                        let inp_f32 = unsafe {
+                            std::slice::from_raw_parts(
+                                (inp_f32_addr as *const f32).add(row * k),
+                                k,
+                            )
+                        };
+                        let out_row = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out_addr as *mut f32).add(row * n + col_start),
+                                chunk_n,
+                            )
+                        };
+
+                        for (i, out_val) in out_row.iter_mut().enumerate() {
+                            *out_val = simd::dot_q4_1_q8_row(
+                                inp_quants,
+                                inp_scales,
+                                inp_f32,
+                                &wt_packed[i * bpr..(i + 1) * bpr],
+                                &wt_scales[i * num_blocks_per_row
+                                    ..(i + 1) * num_blocks_per_row],
+                                &wt_mins[i * num_blocks_per_row
+                                    ..(i + 1) * num_blocks_per_row],
+                            );
+                        }
+                    }
+                });
             }
             other => {
                 return Err(infernum::Error::UnsupportedDtype(format!(
