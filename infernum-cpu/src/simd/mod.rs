@@ -848,6 +848,48 @@ pub fn dot_q8_q8_4row_il(
     (acc[0], acc[1], acc[2], acc[3])
 }
 
+/// 4-row Q4×Q8 GEMV in IL format: weight data is 4-row-interleaved Q4_0 (64 bytes/block).
+///
+/// Block layout: `[row0: 16 bytes][row1: 16 bytes][row2: 16 bytes][row3: 16 bytes]` × nb.
+/// Scale layout: same IL f16 format as Q8_0 IL.  Returns `(dot0, dot1, dot2, dot3)`.
+#[inline]
+#[must_use]
+pub fn dot_q4_q8_4row_il(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants_q4: &[u8],
+    il_scales_f16: &[u16],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            return avx512::dot_q4_q8_4row_il(input_quants, input_scales, il_quants_q4, il_scales_f16);
+        }
+    }
+
+    // Scalar fallback: unpack nibbles and dot.
+    let nb = input_scales.len();
+    let mut acc = [0.0f32; 4];
+    for blk in 0..nb {
+        let inp_off = blk * 32;
+        let wq_off = blk * 64;
+        let inp_scale = input_scales[blk];
+        for r in 0..4 {
+            let iq = &input_quants[inp_off..inp_off + 32];
+            let packed = &il_quants_q4[wq_off + r * 16..wq_off + r * 16 + 16];
+            let mut dot = 0i32;
+            for i in 0..16 {
+                let lo = ((packed[i] & 0x0F).wrapping_sub(8)) as i8 as i32;
+                let hi = ((packed[i] >> 4).wrapping_sub(8)) as i8 as i32;
+                dot += lo * (iq[i] as i8 as i32) + hi * (iq[i + 16] as i8 as i32);
+            }
+            let ws = half::f16::from_bits(il_scales_f16[blk * 4 + r]).to_f32();
+            acc[r] += (dot as f32) * inp_scale * ws;
+        }
+    }
+    (acc[0], acc[1], acc[2], acc[3])
+}
+
 /// 4-row Q4×Q8 GEMV: computes dot products for four consecutive Q4_0 weight rows
 /// against the same Q8 input vector. Returns `(dot0, dot1, dot2, dot3)`.
 #[inline]

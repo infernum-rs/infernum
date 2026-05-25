@@ -772,6 +772,124 @@ unsafe fn dot_q4_q8_4row_inner(
         hsum_256(total3),
     )
 }
+/// 4-row Q4_0 GEMV in 4-row-interleaved (IL) format.
+///
+/// IL layout: `il_quants_q4[blk * 64 + row * 16 .. +16]` = 16 packed Q4_0 bytes for
+/// `row` in 0..4 at block `blk`.  All four rows are within the same 64-byte cache line.
+/// Scale layout: same as Q8_0 IL — `il_scales_f16[blk * 4 + row]` = f16.
+///
+/// Returns `(dot0, dot1, dot2, dot3)`.
+pub fn dot_q4_q8_4row_il(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants_q4: &[u8],
+    il_scales_f16: &[u16],
+) -> (f32, f32, f32, f32) {
+    unsafe { dot_q4_q8_4row_il_inner(input_quants, input_scales, il_quants_q4, il_scales_f16) }
+}
+
+#[allow(clippy::similar_names)]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512vnni",
+    enable = "avx512vl",
+    enable = "avx512bw",
+    enable = "fma",
+    enable = "f16c"
+)]
+unsafe fn dot_q4_q8_4row_il_inner(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants_q4: &[u8],
+    il_scales_f16: &[u16],
+) -> (f32, f32, f32, f32) {
+    use std::arch::x86_64::{
+        _mm256_set_m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_set_epi8,
+        _mm_shuffle_epi8, _mm_srli_epi16,
+    };
+
+    let nb = input_scales.len();
+    let iq = input_quants.as_ptr();
+    let wq = il_quants_q4.as_ptr();
+    let ws = il_scales_f16.as_ptr();
+
+    // vpshufb LUT: nibble i → i-8, within-lane.
+    let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
+    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
+
+    let mut total0 = _mm256_setzero_ps();
+    let mut total1 = _mm256_setzero_ps();
+    let mut total2 = _mm256_setzero_ps();
+    let mut total3 = _mm256_setzero_ps();
+
+    // Each block occupies 64 bytes (4 rows × 16 bytes), fitting one cache line.
+    const PF: usize = 12;
+    for blk in 0..nb {
+        let inp_off = blk * 32;
+        let wq_off = blk * 64;
+        let ws_off = blk * 4;
+
+        if blk + PF < nb {
+            _mm_prefetch::<_MM_HINT_T0>(wq.add((blk + PF) * 64).cast());
+        }
+
+        let inp_scale = *input_scales.get_unchecked(blk);
+        let input_i8 = _mm256_loadu_si256(iq.add(inp_off).cast());
+
+        // Four sequential 16-byte reads — all within the same 64-byte cache line.
+        let p0 = _mm_loadu_si128(wq.add(wq_off).cast());
+        let p1 = _mm_loadu_si128(wq.add(wq_off + 16).cast());
+        let p2 = _mm_loadu_si128(wq.add(wq_off + 32).cast());
+        let p3 = _mm_loadu_si128(wq.add(wq_off + 48).cast());
+
+        // Load 4 f16 scales and convert to f32 in one vcvtph2ps.
+        let scales_raw = _mm_loadl_epi64(ws.add(ws_off).cast::<__m128i>());
+        let scales_f32 = _mm_cvtph_ps(scales_raw);
+        let s0 = _mm_cvtss_f32(scales_f32);
+        let s1 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0x55));
+        let s2 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0xAA));
+        let s3 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0xFF));
+
+        // Row 0: unpack nibbles → int8, sign-based VNNI dot.
+        let lo0 = _mm_and_si128(p0, mask_0f);
+        let hi0 = _mm_and_si128(_mm_srli_epi16(p0, 4), mask_0f);
+        let w0_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi0), _mm_shuffle_epi8(lut, lo0));
+        let w0_abs = _mm256_sign_epi8(w0_i8, w0_i8);
+        let i0 = _mm256_sign_epi8(input_i8, w0_i8);
+        let prod0 = dpbusd_256(_mm256_setzero_si256(), w0_abs, i0);
+        total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), _mm256_set1_ps(inp_scale * s0), total0);
+
+        // Row 1
+        let lo1 = _mm_and_si128(p1, mask_0f);
+        let hi1 = _mm_and_si128(_mm_srli_epi16(p1, 4), mask_0f);
+        let w1_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi1), _mm_shuffle_epi8(lut, lo1));
+        let w1_abs = _mm256_sign_epi8(w1_i8, w1_i8);
+        let i1 = _mm256_sign_epi8(input_i8, w1_i8);
+        let prod1 = dpbusd_256(_mm256_setzero_si256(), w1_abs, i1);
+        total1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod1), _mm256_set1_ps(inp_scale * s1), total1);
+
+        // Row 2
+        let lo2 = _mm_and_si128(p2, mask_0f);
+        let hi2 = _mm_and_si128(_mm_srli_epi16(p2, 4), mask_0f);
+        let w2_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi2), _mm_shuffle_epi8(lut, lo2));
+        let w2_abs = _mm256_sign_epi8(w2_i8, w2_i8);
+        let i2 = _mm256_sign_epi8(input_i8, w2_i8);
+        let prod2 = dpbusd_256(_mm256_setzero_si256(), w2_abs, i2);
+        total2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod2), _mm256_set1_ps(inp_scale * s2), total2);
+
+        // Row 3
+        let lo3 = _mm_and_si128(p3, mask_0f);
+        let hi3 = _mm_and_si128(_mm_srli_epi16(p3, 4), mask_0f);
+        let w3_i8 = _mm256_set_m128i(_mm_shuffle_epi8(lut, hi3), _mm_shuffle_epi8(lut, lo3));
+        let w3_abs = _mm256_sign_epi8(w3_i8, w3_i8);
+        let i3 = _mm256_sign_epi8(input_i8, w3_i8);
+        let prod3 = dpbusd_256(_mm256_setzero_si256(), w3_abs, i3);
+        total3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod3), _mm256_set1_ps(inp_scale * s3), total3);
+    }
+
+    (hsum_256(total0), hsum_256(total1), hsum_256(total2), hsum_256(total3))
+}
+
 // ---- Dot-product F32 GEMM (AVX-512F + FMA) ----
 //
 // Modeled after llama.cpp's tinyBLAS: each accumulator holds a partial
