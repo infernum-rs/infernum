@@ -1164,3 +1164,50 @@ Estimated savings: ~6 fewer instructions per K block (47 → 41).
 - Q4_0 decode (0.95x) and prefill (0.87x) are unchanged — these paths do not use the IL kernel.
 - The instruction savings are confirmed correct by llama.cpp's source; thermal throttling makes per-run variance ±3–5%, so the Gemma improvement signal is directionally real but within the noise band.
 - Remaining gaps vs llama.cpp: Q4_0 decode ~0.95x, Q4_0 prefill ~0.87x, Gemma decode ~0.94x, Gemma prefill ~0.95x.
+
+---
+
+## 2026-05-26 — Prefetch and stream experiments (negative results) (`perf/cpu-performance`)
+
+**Experiments attempted after `dot_q8_q8_4row_il_inner` abs(input) optimization:**
+
+### Attempt 1: Explicit scale stream prefetch
+
+Added `_mm_prefetch(ws.add((blk + PF) * 4))` to `dot_q8_q8_4row_il_inner` alongside the existing 2 quant-stream prefetches.
+
+**perf stat (PF=12, with scale prefetch):** 310M cache misses, 121.9B cycles vs 323M/123.5B without.
+**Benchmark:** Inconclusive — thermal throttling masked the effect. Multiple runs showed Gemma decode at 0.94–0.96x both with and without scale prefetch; no consistent signal.
+**Status:** Reverted. The hardware prefetcher appears to handle the sequential 8-byte scale stream without explicit hints. The apparent improvement in perf stat was an artifact of the machine running at a lower clock (throttled → slower compute, more time for hardware prefetch to work → fewer apparent misses).
+
+### Attempt 2: Increased prefetch distance PF=12 → PF=20
+
+Hypothesis: Gemma FFN (288 K-blocks) benefits from more look-ahead than SmolLM2 (64 blocks).
+
+**perf stat (PF=20):** 349M cache misses vs 323M (PF=12) — WORSE. PF=20 over-prefetches, evicting useful data from L1/L2 before it is needed.
+**Status:** Reverted. PF=12 remains optimal.
+
+### perf stat comparison: current vs llama.cpp (64 decode tokens, Gemma 2-2B)
+
+| Metric | infernum | llama.cpp | ratio |
+| ------ | -------: | --------: | ----: |
+| Instructions | 103.8B | 112.6B | **0.92x** (infernum has fewer!) |
+| Cycles | 123.5B | 97.4B | 1.27x (more cycles) |
+| IPC | 0.84 | 1.16 | 0.72x |
+| Cache misses (L1D) | 323M | 197M | 1.64x |
+
+Infernum now has **fewer instructions** than llama.cpp. The remaining throughput gap is entirely IPC: 64% more L1D cache misses stall the pipeline. Root cause: our IL format stores scales in a separate allocation (`il_scales_f16: Vec<u16>`) while llama.cpp's Q8_0 block format has scale bytes adjacent to quant bytes (34 bytes per block = 32Q + 2f16_scale). Our GEMV therefore touches 2 separate memory regions vs llama.cpp's 1.
+
+### Path to closing the remaining gap
+
+To match llama.cpp's memory layout, the IL format would need unified 136-byte blocks (128 quant + 8 scale), eliminating the scale stream as a separate allocation. This requires changes to `CpuQuantizedWeight`, the repacking code, `dot_q8_q8_4row_il_inner` (load scale at byte offset 128 within the block), and the GEMM microkernel ASM. Not implemented in this session; estimated 2-4% improvement for DRAM-bound layers (Gemma FFN, lm_head).
+
+### Current ceiling
+
+| Workload | ratio | Notes |
+| -------- | ----: | ----- |
+| Q8_0 decode | ~0.98–1.03x | At parity |
+| Q4_0 decode | ~0.95–0.97x | Close to parity |
+| Q8_0 prefill | ~0.99–1.07x | At or above parity |
+| Q4_0 prefill | ~0.87x | Structural: expand-then-GEMM vs llama.cpp's inline ZMM+8-row |
+| Gemma Q8_0 decode | ~0.94–0.96x | IPC-limited by L1D cache misses from 2-stream IL format |
+| Gemma Q8_0 prefill | ~0.93–1.00x | Noisy; same root cause |
