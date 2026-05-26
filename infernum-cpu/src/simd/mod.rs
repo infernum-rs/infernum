@@ -228,6 +228,21 @@ pub fn vec_gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
 ///
 /// Dispatches to AVX-512 vectorized exp when available.
 #[inline]
+pub fn vec_softcap_inplace(data: &mut [f32], cap: f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            avx512::vec_softcap_inplace(data, cap);
+            return;
+        }
+    }
+    // Scalar fallback.
+    let inv_cap = 1.0 / cap;
+    for x in data.iter_mut() {
+        *x = cap * (*x * inv_cap).tanh();
+    }
+}
+
 pub fn vec_softmax_inplace(data: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {

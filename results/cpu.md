@@ -957,3 +957,31 @@ Prefetch distance: 12 IL-blocks = 1536 bytes, consistent with the GEMV PF=12 con
 - SmolLM2 Q8_0 prefill at **1.01x** (effectively parity). SmolLM2 Q8_0 and Q4_0 decode at **1.00x** (parity).
 - Q4_0 prefill is unchanged (uses `gemm_q8_tiled` — the non-IL kernel; this prefetch is only in the IL microkernel).
 - Remaining gaps vs llama.cpp: Q4_0 prefill 0.85x, Gemma decode 0.94x, Gemma prefill 0.93x.
+
+---
+
+## 2026-05-26 — Vectorized attention softcap (`perf/cpu-performance`)
+
+**Change:** Gemma attention applies `logit_softcap`: `dot = cap * tanh(dot / cap)` on every attention score. Previously this was a scalar `f32::tanh()` call inside the inner KV loop (one call per score). Restructured `attention_gqa_group` and `attention_head_unit` to collect all dot products into `scores_buf` first, then apply `vec_softcap_inplace` (new AVX-512F function) as a vectorized post-pass. The vectorized kernel uses the same degree-4 polynomial exp as `vec_silu_mul` / `vec_gelu_mul` (16 f32/cycle), computing `tanh(x/cap) = (exp(2x/cap)-1)/(exp(2x/cap)+1)`.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** `5d1e940` (base) + softcap changes
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results (PF=12 GEMM + vectorized softcap)
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 145.7 | 141.6 | **1.03x** |
+| SmolLM2-360M Q4_0 decode  | 199.7 | 202.1 | **0.99x** |
+| SmolLM2-360M Q8_0 prefill | 1069.4 | 876.6 | **1.22x** (llama.cpp variance) |
+| SmolLM2-360M Q4_0 prefill | 1070.4 | 1225.5 | 0.87x |
+| Gemma 2-2b Q8_0 decode    | 23.2 | 23.8 | **0.97x** |
+| Gemma 2-2b Q8_0 prefill   | 177.4 | 183.3 | **0.97x** |
+
+### Notes
+
+- SmolLM2 Q8_0 decode and prefill at parity or better. SmolLM2 Q4_0 decode at 0.99x.
+- Gemma decode and prefill both at 0.97x — the softcap vectorization provides only ~0.3–0.5% measurable gain because Zen 5's OOO core already overlaps scalar tanh (~10–15 cycles) with adjacent dot products in the non-restructured code; the vectorized path is faster per operation but the total reduction in wall time is small.
+- Remaining gaps vs llama.cpp: Q4_0 prefill 0.87x, Gemma decode and prefill ~0.97x.

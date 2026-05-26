@@ -4178,3 +4178,80 @@ unsafe fn vec_softmax_inplace_inner(data: &mut [f32]) {
         }
     }
 }
+
+// ---- Vectorized softcap ----
+
+/// Applies `x → cap * tanh(x / cap)` in-place using AVX-512 polynomial exp.
+///
+/// Used by Gemma attention logit softcapping. Applied to all scores in a slice
+/// at once, turning O(n) scalar tanh calls into O(n/16) vectorized iterations.
+pub fn vec_softcap_inplace(data: &mut [f32], cap: f32) {
+    unsafe { vec_softcap_inplace_inner(data, cap) }
+}
+
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::many_single_char_names)]
+unsafe fn vec_softcap_inplace_inner(data: &mut [f32], cap: f32) {
+    use std::arch::x86_64::{
+        __m512, __m512i, _mm512_add_epi32, _mm512_add_ps, _mm512_castps_si512,
+        _mm512_castsi512_ps, _mm512_cvtepi32_ps, _mm512_cvtps_epi32, _mm512_div_ps,
+        _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_max_ps, _mm512_min_ps, _mm512_mul_ps,
+        _mm512_set1_ps, _mm512_slli_epi32, _mm512_storeu_ps, _mm512_sub_ps,
+    };
+
+    let n = data.len();
+    let chunks = n / 16;
+    let remainder = n % 16;
+
+    // tanh(x / cap) = (exp(2x/cap) - 1) / (exp(2x/cap) + 1)
+    let two_inv_cap: __m512 = _mm512_set1_ps(2.0 / cap);
+    let cap_vec: __m512 = _mm512_set1_ps(cap);
+    let one: __m512 = _mm512_set1_ps(1.0);
+
+    // exp polynomial constants (same as vec_silu_mul_inner).
+    let log2e: __m512 = _mm512_set1_ps(std::f32::consts::LOG2_E);
+    let c0: __m512 = _mm512_set1_ps(1.0);
+    #[allow(clippy::approx_constant)]
+    let c1: __m512 = _mm512_set1_ps(0.693_147_2_f32);
+    let c2: __m512 = _mm512_set1_ps(0.240_226_5_f32);
+    let c3: __m512 = _mm512_set1_ps(5.550_357e-2_f32);
+    let c4: __m512 = _mm512_set1_ps(9.675_54e-3_f32);
+    let exp_lo: __m512 = _mm512_set1_ps(-87.332_54_f32);
+    let exp_hi: __m512 = _mm512_set1_ps(88.722_84_f32);
+
+    let ptr = data.as_mut_ptr();
+    for i in 0..chunks {
+        let offset = i * 16;
+        let x: __m512 = _mm512_loadu_ps(ptr.add(offset));
+
+        // Compute exp(2x/cap) via degree-4 polynomial: exp(v) = 2^(v * log2e).
+        let v: __m512 = _mm512_mul_ps(x, two_inv_cap);
+        let v_c: __m512 = _mm512_max_ps(_mm512_min_ps(v, exp_hi), exp_lo);
+        let t: __m512 = _mm512_mul_ps(v_c, log2e);
+        let n_f: __m512 = _mm512_cvtepi32_ps(_mm512_cvtps_epi32(t));
+        let f: __m512 = _mm512_sub_ps(t, n_f);
+        let poly: __m512 = _mm512_fmadd_ps(c4, f, c3);
+        let poly: __m512 = _mm512_fmadd_ps(poly, f, c2);
+        let poly: __m512 = _mm512_fmadd_ps(poly, f, c1);
+        let poly: __m512 = _mm512_fmadd_ps(poly, f, c0);
+        let n_i: __m512i = _mm512_cvtps_epi32(n_f);
+        let shift: __m512i = _mm512_slli_epi32(n_i, 23);
+        let exp_v: __m512 =
+            _mm512_castsi512_ps(_mm512_add_epi32(_mm512_castps_si512(poly), shift));
+
+        // tanh(x/cap) = (exp_v - 1) / (exp_v + 1); result = cap * tanh(x/cap).
+        let numer: __m512 = _mm512_sub_ps(exp_v, one);
+        let denom: __m512 = _mm512_add_ps(exp_v, one);
+        let tanh_val: __m512 = _mm512_div_ps(numer, denom);
+        let result: __m512 = _mm512_mul_ps(cap_vec, tanh_val);
+        _mm512_storeu_ps(ptr.add(offset), result);
+    }
+
+    // Scalar tail.
+    let tail = chunks * 16;
+    let inv_cap = 1.0 / cap;
+    for i in 0..remainder {
+        let x = *data.get_unchecked(tail + i);
+        *data.get_unchecked_mut(tail + i) = cap * (x * inv_cap).tanh();
+    }
+}

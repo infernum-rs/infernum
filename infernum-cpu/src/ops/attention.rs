@@ -353,12 +353,15 @@ fn attention_gqa_group(
         for g in 0..gqa_ratio {
             let h = h_start + g;
             let q_off = (s * num_heads + h) * head_dim;
-            let mut dot = crate::simd::dot_f32(&q[q_off..q_off + head_dim], k_vec) * scale;
-            if let Some(cap) = softcap {
-                dot = cap * (dot / cap).tanh();
-            }
+            let dot = crate::simd::dot_f32(&q[q_off..q_off + head_dim], k_vec) * scale;
             scores_buf[g * attend_len + kv_pos] = dot;
         }
+    }
+
+    // Apply attention logit softcap vectorized (e.g. Gemma): cap * tanh(dot / cap).
+    // Vectorizing across the entire scores slice avoids per-element scalar tanh.
+    if let Some(cap) = softcap {
+        crate::simd::vec_softcap_inplace(&mut scores_buf[..scores_len], cap);
     }
 
     // Phase 2: softmax per head. No causal mask needed (we only computed up to attend_len).
@@ -437,13 +440,11 @@ fn attention_head_unit(
     for kv_pos in 0..kv_len {
         let k_off = (kv_pos * num_kv_heads + kv_h) * head_dim;
         let k_vec = &k[k_off..k_off + head_dim];
-        let mut dot = crate::simd::dot_f32(q_vec, k_vec) * scale;
+        scores[kv_pos] = crate::simd::dot_f32(q_vec, k_vec) * scale;
+    }
 
-        if let Some(cap) = softcap {
-            dot = cap * (dot / cap).tanh();
-        }
-
-        scores[kv_pos] = dot;
+    if let Some(cap) = softcap {
+        crate::simd::vec_softcap_inplace(&mut scores[..kv_len], cap);
     }
 
     // Causal mask + sliding window
@@ -915,13 +916,10 @@ impl PagedAttentionOps for CpuBackend {
                 #[allow(clippy::cast_sign_loss)]
                 let phys_block = bt_row[block_idx] as usize;
                 let k_off = (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
-
-                let mut dot = crate::simd::dot_f32(q_vec, &k_data[k_off..k_off + head_dim]);
-                dot *= scale;
-                if let Some(cap) = softcap {
-                    dot = cap * (dot / cap).tanh();
-                }
-                scores[pos] = dot;
+                scores[pos] = crate::simd::dot_f32(q_vec, &k_data[k_off..k_off + head_dim]) * scale;
+            }
+            if let Some(cap) = softcap {
+                crate::simd::vec_softcap_inplace(scores, cap);
             }
 
             // Apply sliding window mask
