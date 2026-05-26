@@ -1027,3 +1027,71 @@ Also removed the now-dead `transpose_kv_heads` helper function.
 - SmolLM2 prefill numbers above 1.00x are within run-to-run variance (±5–10%); the reliable signal is the infernum absolute number (+5% for Q8_0 is plausible since SmolLM2 also transposes KV, but the smaller matrices mean less absolute gain).
 - Gemma decode is unchanged (decode path skips the KV transpose — it's only done for seq_len > 1).
 - Remaining gaps vs llama.cpp: Q4_0 prefill 0.88x. All Q8_0 paths and Gemma are now at parity or above.
+
+---
+
+## 2026-05-26 — Q4_0 prefill ceiling analysis (`perf/cpu-performance`)
+
+**No code change — root cause analysis of the 0.88x Q4_0 prefill ceiling.**
+
+### Current state
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 146.2 | 143.4 | **1.02x** |
+| SmolLM2-360M Q4_0 decode  | 200.6 | 200.9 | **1.00x** |
+| SmolLM2-360M Q8_0 prefill | 1123.0 | 1047.3 | **1.07x** |
+| SmolLM2-360M Q4_0 prefill | 1067.6 | 1218.2 | 0.88x |
+| Gemma 2-2b Q8_0 decode    | 23.4 | 23.8 | **0.98x** |
+| Gemma 2-2b Q8_0 prefill   | 200.8 | 179.8 | **1.12x** |
+
+### Root cause of the 0.88x Q4_0 prefill gap
+
+**perf stat (SmolLM2-360M, M=512 prefill):**
+
+| Metric | Q4_0 | Q8_0 | delta |
+| ------ | ---: | ---: | ----: |
+| Cycles | 76.9B | 74.1B | +3.8% |
+| Instructions | 217.2B | 207.4B | +4.7% |
+| IPC | 2.83 | 2.80 | — |
+
+Both are **compute-bound** (IPC ~2.8). The extra 9.8B instructions come from the Q4→Q8 expand pass (~3.5% of GEMM work). This makes our Q4_0 3.8% *slower* than our Q8_0.
+
+llama.cpp's Q4_0 is ~16% *faster* than their Q8_0 (1218.2 vs ~1049 tok/s). Their Q4_0 reads 2× less weight data per K-block; at their IPC level they're partially bandwidth-limited, so smaller data translates to real speedup.
+
+Net gap composition:
+- Our Q4_0 vs our Q8_0: −5%
+- llama.cpp Q4_0 vs llama.cpp Q8_0: +16%
+- Total structural gap: ~21% (we observe ~14% because our Q8_0 is above parity)
+
+### Why all inline-expansion attempts regress
+
+Every attempt to eliminate the separate expand pass (so the GEMM reads Q4 nibbles directly) regresses 7–12%:
+
+| Attempt | Result |
+| ------- | ------ |
+| `microkernel_q4_4x4` (YMM inline expansion, 7 instr/col) | −7% |
+| `microkernel_q4_4x4_il` (YMM vpand/vpsubb chain) | −8% |
+| `gemm_q4_noli` (ZMM vpandq + vpsubb chain) | −8% |
+
+Root cause of all regressions: inline expansion runs once per (M/4) × K-block = 128× more iterations than the separate expand pass. Even 5 instructions per K-block of inline expansion adds 5 × 128 × (M/4 tile iterations) = ~640× the cost of the amortized expand. This outweighs any weight-bandwidth savings.
+
+### Why the separate expand is at its ceiling
+
+The `expand_q4_il_to_q8_il_avx512` kernel (18 ZMM instructions per 64-byte block) is already near-optimal for the format. Reducing it to ~12 instructions via 2-ZMM-store rearrangement would save <2% of total runtime (expand is 3.5% of GEMM work, saving 33% of 3.5% = 1.1%).
+
+### Path to parity (not implemented here)
+
+llama.cpp's Q4_0 GEMM uses:
+1. **`block_q4_0x8` weight format**: 8-row interleaved nibbles so one ZMM load covers 8 weight rows × one K-block.
+2. **`vpdpbusd zmm`**: ZMM VNNI processes 64 int8 pairs/instruction vs our 32 (YMM).
+3. **`vpshufb zmm` LUT expansion**: 2 ZMM instructions to expand 64 nibbles inline.
+4. **8×8 tile**: 64 outputs per K-block inner loop vs our 16.
+
+With a 8×8 ZMM tile, inline expansion (5 ZMM instructions) is amortized over 64 outputs vs our 16, cutting inline overhead from ~48% to ~8% — tolerable. Combined with 2× smaller weight reads, this makes llama.cpp's Q4_0 faster than Q8_0.
+
+Implementing this requires: new weight format at load time, updated GEMV kernels (decode path), and a new ZMM 8×4 or 8×8 microkernel. It is a separate planned effort.
+
+### Summary
+
+All Q8_0, decode, and Gemma paths are at parity or above. The Q4_0 prefill gap (0.88x) is a structural artifact of the 4×4 YMM architecture — it cannot be closed with incremental changes to the current kernel. The implementation ceiling has been reached for this architecture.
