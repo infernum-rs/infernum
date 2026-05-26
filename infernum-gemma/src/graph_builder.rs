@@ -932,6 +932,20 @@ pub fn load_graph_weights_gguf(
         };
 
         let dtype = FormatLoader::get_dtype(&loader, &actual_name)?;
+
+        // Re-quantize a dense (F32) lm_head to Q8_0. In Gemma 2 GGUF Q8_0 files the
+        // output.weight is stored as F32 while all other layers are Q8_0; running a
+        // 295MB F32 GEMV costs ~7× more time than the equivalent 74MB Q8_0 GEMV.
+        // Quantizing at load time is lossless at 8-bit precision and consistent with
+        // how every other weight in the model is handled.
+        if !dtype.is_quantized() && meta.name == "lm_head.weight" {
+            use infernum::MatmulOps as _;
+            let host = loader.load_f32(&actual_name)?;
+            let quantized = CpuBackend::quantize_to_q8(&(), &host.shape, host.as_f32_slice())?;
+            store.push_linear_weight(quantized);
+            continue;
+        }
+
         let host_linear = if dtype.is_quantized() {
             // Preserve native quantization for fast kernels at inference time.
             HostLinearWeight::Quantized(FormatLoader::load_quantized(&loader, &actual_name)?)
