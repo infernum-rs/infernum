@@ -12,8 +12,8 @@ use std::arch::x86_64::{
     __m128i, __m256, __m256i, _mm256_add_ps, _mm256_castps256_ps128, _mm256_cvtepi32_ps,
     _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_set1_ps,
     _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_ps, _mm_add_ss,
-    _mm_cvtph_ps, _mm_cvtss_f32, _mm_loadl_epi64, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch,
-    _mm_shuffle_ps, _MM_HINT_T0,
+    _mm_cvtph_ps, _mm_cvtss_f32, _mm_loadl_epi64, _mm_movehdup_ps, _mm_movehl_ps, _mm_mul_ps,
+    _mm_prefetch, _mm_set1_ps, _mm_shuffle_ps, _MM_HINT_T0,
 };
 
 /// Horizontal sum of an __m256 register.
@@ -603,33 +603,30 @@ unsafe fn dot_q8_q8_4row_il_inner(
         // Load 4 f16 scales (8 bytes) and convert to 4 f32 via vcvtph2ps.
         let scales_raw = _mm_loadl_epi64(ws.add(ws_off).cast::<__m128i>());
         let scales_f32 = _mm_cvtph_ps(scales_raw);
-        let s0 = _mm_cvtss_f32(scales_f32);
-        let s1 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0x55));
-        let s2 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0xAA));
-        let s3 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0xFF));
 
-        let w0_abs = _mm256_sign_epi8(w0, w0);
-        let i0 = _mm256_sign_epi8(input_i8, w0);
-        let prod0 = dpbusd_256(_mm256_setzero_si256(), w0_abs, i0);
-        let scale0 = _mm256_set1_ps(inp_scale * s0);
+        // Compute abs(input) once — reused for all 4 output rows (saves 3 vpsignb vs weight-side abs).
+        let inp_abs = _mm256_sign_epi8(input_i8, input_i8);
+        // Multiply all 4 weight scales by inp_scale in a single SIMD op.
+        let combined = _mm_mul_ps(scales_f32, _mm_set1_ps(inp_scale));
+
+        let i0 = _mm256_sign_epi8(w0, input_i8);
+        let prod0 = dpbusd_256(_mm256_setzero_si256(), inp_abs, i0);
+        let scale0 = _mm256_set1_ps(_mm_cvtss_f32(combined));
         total0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod0), scale0, total0);
 
-        let w1_abs = _mm256_sign_epi8(w1, w1);
-        let i1 = _mm256_sign_epi8(input_i8, w1);
-        let prod1 = dpbusd_256(_mm256_setzero_si256(), w1_abs, i1);
-        let scale1 = _mm256_set1_ps(inp_scale * s1);
+        let i1 = _mm256_sign_epi8(w1, input_i8);
+        let prod1 = dpbusd_256(_mm256_setzero_si256(), inp_abs, i1);
+        let scale1 = _mm256_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(combined, combined, 0x55)));
         total1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod1), scale1, total1);
 
-        let w2_abs = _mm256_sign_epi8(w2, w2);
-        let i2 = _mm256_sign_epi8(input_i8, w2);
-        let prod2 = dpbusd_256(_mm256_setzero_si256(), w2_abs, i2);
-        let scale2 = _mm256_set1_ps(inp_scale * s2);
+        let i2 = _mm256_sign_epi8(w2, input_i8);
+        let prod2 = dpbusd_256(_mm256_setzero_si256(), inp_abs, i2);
+        let scale2 = _mm256_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(combined, combined, 0xAA)));
         total2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod2), scale2, total2);
 
-        let w3_abs = _mm256_sign_epi8(w3, w3);
-        let i3 = _mm256_sign_epi8(input_i8, w3);
-        let prod3 = dpbusd_256(_mm256_setzero_si256(), w3_abs, i3);
-        let scale3 = _mm256_set1_ps(inp_scale * s3);
+        let i3 = _mm256_sign_epi8(w3, input_i8);
+        let prod3 = dpbusd_256(_mm256_setzero_si256(), inp_abs, i3);
+        let scale3 = _mm256_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(combined, combined, 0xFF)));
         total3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(prod3), scale3, total3);
     }
 
