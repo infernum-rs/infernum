@@ -2907,6 +2907,9 @@ unsafe fn microkernel_q8_4x4_il(
             "xor {q_off:e}, {q_off:e}",
 
             "2:",
+            // Prefetch weight data 12 IL-blocks ahead (12 * 128 = 1536 bytes, two cache lines).
+            "prefetcht0 [{wt_base} + {q_off} * 4 + 1536]",
+            "prefetcht0 [{wt_base} + {q_off} * 4 + 1600]",
             "mov {s_off}, {q_off}",
             "shr {s_off}, 3",
 

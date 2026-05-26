@@ -913,3 +913,47 @@ Q4_0 control (+5%) is the thermal lift from machine performance state differing 
 - Q8_0 prefill now at **0.99x** (effectively parity). Q4_0 decode at **0.97x** (within noise of parity).
 - The Q4_0 prefill gap (0.88x) is structural: our expand-then-GEMM reads 1.5× more bytes (write Q8 + read Q8) vs llama.cpp reading Q4 directly. Inline expansion regresses due to instruction overhead; further gains require either pre-expand at load time or a 5-instruction expansion chain.
 - Remaining gaps: Q4_0 prefill 0.88x, Q8_0 decode 0.94x, Gemma 0.89–0.95x.
+
+---
+
+## 2026-05-26 — Software prefetch in Q8_0 IL GEMM microkernel (`perf/cpu-performance`)
+
+**Change:** `microkernel_q8_4x4_il` (the IL-format Q8_0 4×4 tiled GEMM kernel) had no software prefetch in its inner K-block loop. The GEMV kernels had `_mm_prefetch` at PF=12 blocks (1536 bytes ahead), but the GEMM microkernel relied solely on hardware prefetch for weight data. Added two `prefetcht0` instructions at the top of each K-block iteration:
+
+```asm
+"prefetcht0 [{wt_base} + {q_off} * 4 + 1536]",  // first cache line of block+12
+"prefetcht0 [{wt_base} + {q_off} * 4 + 1600]",  // second cache line of block+12
+```
+
+Prefetch distance: 12 IL-blocks = 1536 bytes, consistent with the GEMV PF=12 constant. Large K dimensions (Gemma 2-2B FFN: K=9216 = 288 blocks) have enough in-flight work to amortize DRAM latency of ~150 ns.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** `02b1b7b`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 148.5 | 148.9 | **1.00x** |
+| SmolLM2-360M Q4_0 decode  | 211.5 | 211.5 | **1.00x** |
+| SmolLM2-360M Q8_0 prefill | 1160.9 | 1150.6 | **1.01x** |
+| SmolLM2-360M Q4_0 prefill | 1107.6 | 1299.4 | 0.85x |
+| Gemma 2-2b Q8_0 decode    | 23.9 | 25.4 | 0.94x |
+| Gemma 2-2b Q8_0 prefill   | 206.5 | 221.3 | 0.93x |
+
+### vs previous best (Q4_0 expand session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| Gemma 2-2b Q8_0 prefill | 196.2 | 206.5 | **+5.2%** |
+| SmolLM2-360M Q8_0 prefill | 1149.3 | 1160.9 | +1.0% |
+| Gemma 2-2b Q8_0 decode | 23.7 | 23.9 | +0.8% |
+
+### Notes
+
+- Gemma prefill is the primary beneficiary (+5.2%): FFN K=9216 = 288 blocks per tile; at ~10–12 cycles per block, DRAM latency of ~150 ns = ~14 blocks of compute. PF=12 hides nearly all of this.
+- SmolLM2 Q8_0 prefill at **1.01x** (effectively parity). SmolLM2 Q8_0 and Q4_0 decode at **1.00x** (parity).
+- Q4_0 prefill is unchanged (uses `gemm_q8_tiled` — the non-IL kernel; this prefetch is only in the IL microkernel).
+- Remaining gaps vs llama.cpp: Q4_0 prefill 0.85x, Gemma decode 0.94x, Gemma prefill 0.93x.
