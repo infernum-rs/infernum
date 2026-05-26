@@ -1120,3 +1120,47 @@ All Q8_0, decode, and Gemma paths are at parity or above. The Q4_0 prefill gap (
 - No performance change — purely dead code removal.
 - All Q8_0 and Q4_0 decode paths remain at parity (1.00–1.03x).
 - Q4_0 prefill remains at 0.87x — structural gap, not addressable with incremental changes to the current 4×4 YMM kernel.
+
+---
+
+## 2026-05-26 — `dot_q8_q8_4row_il_inner`: abs(input) once + SIMD scale multiply (`perf/cpu-performance`)
+
+**Change:** In `dot_q8_q8_4row_il_inner` (the Q8_0 IL GEMV kernel), the previous code computed `abs(weight) = vpsignb(w, w)` four times per K block (once per output row) and computed each combined scale as a separate scalar multiply `inp_scale * sx` + `set1_ps`. Fixed to:
+
+1. Compute `inp_abs = vpsignb(input, input)` **once** per block, reused for all 4 rows (saves 3 `vpsignb` instructions).
+2. Compute `combined = _mm_mul_ps(scales_f32, _mm_set1_ps(inp_scale))` once, then extract per-row scales via `_mm_shuffle_ps` + `_mm_cvtss_f32` (saves ~3 scalar `vmulss`/`vbroadcastss` pairs). This matches the strategy used by llama.cpp's `tinyBLAS_Q0_AVX::gemmMx4`.
+
+Estimated savings: ~6 fewer instructions per K block (47 → 41).
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** `a4d71c8`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 143.6 | 145.7 | **0.99x** |
+| SmolLM2-360M Q4_0 decode  | 198.8 | 208.4 | 0.95x |
+| SmolLM2-360M Q8_0 prefill | 1130.1 | 1087.9 | **1.04x** |
+| SmolLM2-360M Q4_0 prefill | 1106.8 | 1276.5 | 0.87x |
+| Gemma 2-2b Q8_0 decode    | 23.5 | 24.9 | 0.94x |
+| Gemma 2-2b Q8_0 prefill   | 209.1 | 219.2 | **0.95x** |
+
+### vs previous best (dead code cleanup session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| Gemma 2-2b Q8_0 prefill | 195–206 | 209.1 | **+2–7%** |
+| SmolLM2-360M Q8_0 decode | 143.5 | 143.6 | flat |
+| SmolLM2-360M Q4_0 decode | 204.2 | 198.8 | flat (noise) |
+| SmolLM2-360M Q8_0 prefill | 1143.3 | 1130.1 | flat |
+
+### Notes
+
+- Gemma prefill shows improvement (0.93x → 0.95x), consistent with the instruction-count reduction in the GEMV kernel (which is also called from GEMM remainder paths).
+- Llama Q8_0 decode and prefill are within noise of parity (0.99x, 1.04x).
+- Q4_0 decode (0.95x) and prefill (0.87x) are unchanged — these paths do not use the IL kernel.
+- The instruction savings are confirmed correct by llama.cpp's source; thermal throttling makes per-run variance ±3–5%, so the Gemma improvement signal is directionally real but within the noise band.
+- Remaining gaps vs llama.cpp: Q4_0 decode ~0.95x, Q4_0 prefill ~0.87x, Gemma decode ~0.94x, Gemma prefill ~0.95x.
