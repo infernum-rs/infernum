@@ -287,28 +287,6 @@ impl PagedKvCacheOps for CpuBackend {
 
 // ---- Attention ----
 
-/// Transpose K or V from [kv_len, num_kv_heads, head_dim] to [num_kv_heads, kv_len, head_dim].
-///
-/// The original layout forces a stride of `num_kv_heads * head_dim` between consecutive
-/// kv positions for a fixed head — the hardware prefetcher cannot stream this. After
-/// transposing, consecutive kv positions for the same head are contiguous.
-fn transpose_kv_heads(
-    src: &[f32],
-    kv_len: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> Vec<f32> {
-    let mut dst = vec![0.0f32; kv_len * num_kv_heads * head_dim];
-    for pos in 0..kv_len {
-        for kv_h in 0..num_kv_heads {
-            let src_off = (pos * num_kv_heads + kv_h) * head_dim;
-            let dst_off = (kv_h * kv_len + pos) * head_dim;
-            dst[dst_off..dst_off + head_dim].copy_from_slice(&src[src_off..src_off + head_dim]);
-        }
-    }
-    dst
-}
-
 /// Process one GQA group (all `gqa_ratio` query heads sharing one KV head) for one seq position.
 ///
 /// `k_t` and `v_t` are in transposed layout [num_kv_heads, kv_len, head_dim] so iteration over
@@ -539,8 +517,41 @@ fn causal_attention(
     // For seq_len > 1 the transpose cost is amortized over many query positions and the
     // contiguous K/V access pattern substantially reduces memory-bandwidth pressure.
     if seq_len > 1 {
-        let k_t = transpose_kv_heads(k, kv_len, num_kv_heads, head_dim);
-        let v_t = transpose_kv_heads(v, kv_len, num_kv_heads, head_dim);
+        let n_kv = kv_len * num_kv_heads * head_dim;
+        // Safety: both output buffers are written entirely before any read.
+        let mut k_t = Vec::<f32>::with_capacity(n_kv);
+        let mut v_t = Vec::<f32>::with_capacity(n_kv);
+        unsafe {
+            k_t.set_len(n_kv);
+            v_t.set_len(n_kv);
+        }
+        // Transpose K and V in a single parallel dispatch over kv_len positions.
+        // Each thread handles a contiguous range of positions; writes are non-overlapping
+        // (dst_off for different pos values land in different head-row slots).
+        let chunk_pos = kv_len.div_ceil(num_threads);
+        let n_trans_tasks = kv_len.div_ceil(chunk_pos);
+        let k_src_addr = k.as_ptr() as usize;
+        let v_src_addr = v.as_ptr() as usize;
+        let kt_dst_addr = k_t.as_mut_ptr() as usize;
+        let vt_dst_addr = v_t.as_mut_ptr() as usize;
+        pool.dispatch(n_trans_tasks, |task_id, _| {
+            let pos_start = task_id * chunk_pos;
+            let pos_end = (pos_start + chunk_pos).min(kv_len);
+            let k_src = unsafe { std::slice::from_raw_parts(k_src_addr as *const f32, n_kv) };
+            let v_src = unsafe { std::slice::from_raw_parts(v_src_addr as *const f32, n_kv) };
+            let k_dst = unsafe { std::slice::from_raw_parts_mut(kt_dst_addr as *mut f32, n_kv) };
+            let v_dst = unsafe { std::slice::from_raw_parts_mut(vt_dst_addr as *mut f32, n_kv) };
+            for pos in pos_start..pos_end {
+                for kv_h in 0..num_kv_heads {
+                    let src_off = (pos * num_kv_heads + kv_h) * head_dim;
+                    let dst_off = (kv_h * kv_len + pos) * head_dim;
+                    k_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&k_src[src_off..src_off + head_dim]);
+                    v_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&v_src[src_off..src_off + head_dim]);
+                }
+            }
+        });
         let parallel_units = seq_len * num_kv_heads;
         // Strided round-robin: each thread gets every num_tasks-th unit, interleaved.
         // Causal attention work grows linearly with seq position (attend_len = s+1), so
