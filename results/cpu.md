@@ -1095,3 +1095,28 @@ Implementing this requires: new weight format at load time, updated GEMV kernels
 ### Summary
 
 All Q8_0, decode, and Gemma paths are at parity or above. The Q4_0 prefill gap (0.88x) is a structural artifact of the 4×4 YMM architecture — it cannot be closed with incremental changes to the current kernel. The implementation ceiling has been reached for this architecture.
+
+---
+
+## 2026-05-26 — Dead code cleanup (`perf/cpu-performance`)
+
+**Change:** Removed `microkernel_q8_4x4_il_zmm` (400 lines of inline assembly) from `infernum-cpu/src/simd/avx512.rs`. This was a failed experiment: the ZMM pair variant processed 2 input rows per VNNI instruction, but AVX-512BW sign correction requires 4 instructions (vpabsb + vpcmpb + vpsubb + vpblendmb) vs YMM's 1 (vpsignb), negating the throughput gain. Benchmarked, regressed Q8_0 prefill 1.07x→0.84x; reverted at the time but the dead function was left in the file, generating a compiler warning.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results (no change from ceiling analysis)
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 143.5 | 142.3 | **1.01x** |
+| SmolLM2-360M Q4_0 decode  | 204.2 | 205.2 | **1.00x** |
+| SmolLM2-360M Q8_0 prefill | 1143.3 | 1105.8 | **1.03x** |
+| SmolLM2-360M Q4_0 prefill | 1082.8 | 1248.1 | 0.87x |
+
+### Notes
+
+- No performance change — purely dead code removal.
+- All Q8_0 and Q4_0 decode paths remain at parity (1.00–1.03x).
+- Q4_0 prefill remains at 0.87x — structural gap, not addressable with incremental changes to the current 4×4 YMM kernel.
