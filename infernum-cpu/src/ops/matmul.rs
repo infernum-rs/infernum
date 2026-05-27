@@ -24,9 +24,8 @@ use crate::tensor::{CpuLinearWeight, CpuQuantizedWeight, CpuTensor};
 use crate::CpuBackend;
 
 thread_local! {
-    // Reusable scratch buffer for per-chunk Q4_0 IL → Q8_0 IL expansion.
-    // Grows to the largest chunk seen, then stays at that size — eliminating
-    // per-call mmap/munmap overhead from large allocations.
+    // Per-thread scratch buffer for Q4_0 IL → Q8_0 IL expansion during prefill.
+    // Sized to the largest chunk seen; grows but never shrinks.
     static Q4_EXPAND_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
 
@@ -544,14 +543,59 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
             }
             DType::Q4_0 => {
                 if weight.interleaved {
-                    q4_gemm_tiled_il(
-                        &mut output,
-                        &all_quants,
-                        m,
-                        n,
-                        num_blocks_per_row,
-                        &weight.data,
-                    );
+                    // Expand Q4_0 IL → Q8_0 IL per chunk, then run the optimised Q8_0 GEMM.
+                    // `bpr_inp` is the INPUT row stride (Q8_0 format: nb*32 bytes/row); NOT
+                    // the weight block size.  The old code incorrectly used nb*136 here.
+                    let bpr_inp = num_blocks_per_row * 32;
+                    let pool = crate::thread_pool::global_pool();
+                    let num_threads = pool.num_threads();
+                    let out_addr = ptr_to_usize(output.as_mut_ptr());
+                    let wt_data_addr = weight.data.as_ptr() as usize;
+                    let wt_data_len = weight.data.len();
+                    let cols_per_thread = (n.div_ceil(num_threads) + 3) & !3;
+                    let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
+                    pool.dispatch(num_tasks, |task_id, _| {
+                        let col_start = task_id * cols_per_thread;
+                        let col_end = (col_start + cols_per_thread).min(n);
+                        if col_start >= n {
+                            return;
+                        }
+                        let chunk_n = col_end - col_start;
+                        let chunk_groups = chunk_n / 4;
+                        let group_start = col_start / 4;
+                        let wt_il = unsafe {
+                            std::slice::from_raw_parts(wt_data_addr as *const u8, wt_data_len)
+                        };
+                        let q4_chunk = &wt_il[group_start * num_blocks_per_row * 72..];
+                        let needed = chunk_groups * num_blocks_per_row * 136;
+                        Q4_EXPAND_SCRATCH.with(|scratch| {
+                            let mut s = scratch.borrow_mut();
+                            if s.len() < needed {
+                                s.resize(needed, 0);
+                            }
+                            simd::expand_q4_il_to_q8_il_into(
+                                q4_chunk,
+                                chunk_groups,
+                                num_blocks_per_row,
+                                &mut s[..needed],
+                            );
+                            let out_global = unsafe {
+                                std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n)
+                            };
+                            simd::gemm_q8_tiled_il(
+                                &mut out_global[col_start..],
+                                &all_quants.quants,
+                                &all_quants.scales,
+                                &s[..needed],
+                                m,
+                                chunk_n,
+                                n,
+                                num_blocks_per_row,
+                                bpr_inp,
+                                0,
+                            );
+                        });
+                    });
                 } else {
                     q4_gemm_tiled(
                         &mut output,
@@ -992,7 +1036,7 @@ fn quantized_linear_pair_batched(
                     .max(num_threads.min(n2.div_ceil(cpt2)));
                 let w1_data_len = w1.data.len();
                 let w2_data_len = w2.data.len();
-                let bpr_q8_il = num_blocks * 136;
+                let bpr_inp = num_blocks * 32;
                 pool.dispatch(num_tasks, |task_id, _| {
                     macro_rules! q4_il_expand_chunk {
                         ($task_id:expr, $cpt:expr, $n:expr, $wd:expr, $wdl:expr, $out_addr:expr) => {
@@ -1032,7 +1076,7 @@ fn quantized_linear_pair_batched(
                                         chunk_n,
                                         $n,
                                         num_blocks,
-                                        bpr_q8_il,
+                                        bpr_inp,
                                         0,
                                     );
                                 });
@@ -1220,7 +1264,7 @@ fn quantized_linear_triple_batched(
                 let w1dl = w1.data.len();
                 let w2dl = w2.data.len();
                 let w3dl = w3.data.len();
-                let bpr_q8_il = num_blocks * 136;
+                let bpr_inp = num_blocks * 32;
                 pool.dispatch(num_tasks, |task_id, _| {
                     macro_rules! q4_il_expand_chunk {
                         ($task_id:expr, $cpt:expr, $n:expr, $wd:expr, $wdl:expr, $out_addr:expr) => {
@@ -1260,7 +1304,7 @@ fn quantized_linear_triple_batched(
                                         chunk_n,
                                         $n,
                                         num_blocks,
-                                        bpr_q8_il,
+                                        bpr_inp,
                                         0,
                                     );
                                 });
@@ -2351,67 +2395,6 @@ fn q4_gemv_parallel_il(
             );
         });
     }
-}
-
-/// Q4_0 IL tiled GEMM: per-chunk expand IL-Q4 → IL-Q8, then use the IL GEMM kernel.
-#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
-fn q4_gemm_tiled_il(
-    output: &mut [f32],
-    all_rows: &QuantizedRows,
-    m: usize,
-    n: usize,
-    num_blocks: usize,
-    weight_il: &[u8],
-) {
-    let bpr_q8_il = num_blocks * 136;
-
-    let pool = crate::thread_pool::global_pool();
-    let num_threads = pool.num_threads();
-    let cols_per_thread = (n.div_ceil(num_threads) + 3) & !3;
-    let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
-    let out_addr = ptr_to_usize(output.as_mut_ptr());
-    let wt_il_addr = weight_il.as_ptr() as usize;
-    let wt_il_len = weight_il.len();
-
-    pool.dispatch(num_tasks, |task_id, _| {
-        let col_start = task_id * cols_per_thread;
-        if col_start >= n {
-            return;
-        }
-        let col_end = (col_start + cols_per_thread).min(n);
-        let chunk_n = col_end - col_start;
-        let chunk_groups = chunk_n / 4;
-        let group_start = col_start / 4;
-
-        let wt_il = unsafe { std::slice::from_raw_parts(wt_il_addr as *const u8, wt_il_len) };
-
-        // Expand this chunk's Q4_0 IL → Q8_0 IL, then use the optimized Q8 GEMM.
-        let q4_chunk = &wt_il[group_start * num_blocks * 72..];
-        let needed = chunk_groups * num_blocks * 136;
-
-        Q4_EXPAND_SCRATCH.with(|scratch| {
-            let mut s = scratch.borrow_mut();
-            if s.len() < needed {
-                s.resize(needed, 0);
-            }
-            simd::expand_q4_il_to_q8_il_into(q4_chunk, chunk_groups, num_blocks, &mut s[..needed]);
-
-            let out_global = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
-            // col_start=0 because q8_chunk is already offset to group_start.
-            simd::gemm_q8_tiled_il(
-                &mut out_global[col_start..],
-                &all_rows.quants,
-                &all_rows.scales,
-                &s[..needed],
-                m,
-                chunk_n,
-                n,
-                num_blocks,
-                bpr_q8_il,
-                0,
-            );
-        });
-    });
 }
 
 /// Q4_0 GEMV body: process `chunk_len` neurons starting at `neuron_offset`.

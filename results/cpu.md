@@ -1342,3 +1342,32 @@ Also cleaned up dead code: removed `Q4_S8_CONSTS`, `gemm_q4_tiled_il_s8`, `gemm_
 - The shift-by-8 direct Q4 kernel (`microkernel_q4_2x4_il_s8`) was explored first: 2×4 tile with `vpdpbusd` on unsigned nibbles and `8×sum(input)` correction. Regressed to 0.81x because it read 72-byte Q4 blocks from L3 vs the expand path reading 136-byte Q8 blocks from L2 (L2 latency ~12 cycles vs L3 ~40 cycles). The expand approach wins as long as L2 is large enough for the scratch buffer.
 - All Q8_0 paths remain at or above parity. Q4_0 decode is stable at ~0.97x.
 - Remaining gaps vs llama.cpp: Q4_0 prefill **0.85x** (structural — ZMM 8-row format required to close), Gemma decode ~0.97x, Gemma prefill ~0.93x.
+
+---
+
+## 2026-05-27 — Q4_0 prefill correctness fix (`perf/cpu-performance`)
+
+**Bug fix:** The Q4_0 IL prefill path (`quantized_linear`, `quantized_linear_pair_batched`, `quantized_linear_triple_batched`) was calling `gemm_q8_tiled_il` with `bpr = num_blocks * 136` as the input row stride. This is the Q8_0 IL block size (weight stride), not the input data stride. The correct stride for Q8_0-format input quants is `num_blocks * 32` (32 bytes per K-block). With the wrong stride, each input row read was jumping 4.25× too far, reading garbage data from beyond the quantized input buffer.
+
+Also attempted native Q4_0 GEMM without expand (routing to `simd::gemm_q4_tiled_il` which uses `microkernel_q4_4x4_il`): 0.87x → **0.70x** (-19%). Root cause: `microkernel_q4_4x4_il` has 6 extra instructions per weight column for nibble expansion (vpand, vpaddb, vpsrlw × 2 + vinserti128), creating a dependency chain that serializes all 4 weight columns — the same reason all inline-expansion attempts have regressed. Reverted.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** (this session)
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 136.5 | 138.3 | **0.99x** |
+| SmolLM2-360M Q4_0 decode  | 188.3 | 197.4 | 0.95x |
+| SmolLM2-360M Q8_0 prefill | 1103.5 | 967.0 | **1.14x** |
+| SmolLM2-360M Q4_0 prefill | 1067.4 | 1230.9 | **0.87x** |
+
+### Notes
+
+- Q4_0 prefill outputs are now **correct**. Previous outputs were garbage (wrong input row addresses). The measured throughput was similar (0.85–0.87x) because the CPU still executed the same number of VNNI instructions regardless of which memory it read.
+- Performance unchanged from the correctness fix: Q4_0 prefill 0.87x, within noise of prior 0.85x.
+- Removed `q4_gemm_tiled_il` (dead code — the inline expand version with wrong bpr). The `Q4_0` IL prefill path now dispatches directly without the intermediate function.
+- Remaining gaps: Q4_0 decode ~0.95x, Q4_0 prefill ~0.87x (structural), Gemma ~0.95–0.97x (not benchmarked this run).
