@@ -1304,3 +1304,41 @@ Added the missing prefetch in all three kernels. For Q8_0 IL blocks: 3 prefetche
 - Q4_0 decode (0.97x) and prefill (0.84x) ratios are within run-to-run variance (±3–5%); absolute infernum numbers are flat.
 - Q8_0 decode and prefill ratios improved despite lower absolute numbers — the llama.cpp numbers also dropped proportionally (thermal/governor state between sessions).
 - Remaining gaps vs llama.cpp: Q4_0 prefill ~0.84x (structural), Gemma decode **0.97x**, Gemma prefill **0.93x**.
+
+---
+
+## 2026-05-27 — Software prefetch in Q4_0 IL expand pass (`perf/cpu-performance`)
+
+**Change:** Added 20-block ahead `_mm_prefetch(T0)` in `expand_q4_il_to_q8_il_avx512`. The expand pass sequentially streams 72-byte Q4_0 IL blocks from DRAM/L3 and writes 136-byte Q8_0 IL blocks to L2 scratch. Without prefetch, each 72-byte block fetch incurred ~100-cycle DRAM latency before the 2-ZMM-instruction load could proceed. With `PF=20` (1440 bytes = 20 cache lines), the memory controller can issue fetches far enough ahead to overlap latency with the AVX-512 nibble-expand work.
+
+Also cleaned up dead code: removed `Q4_S8_CONSTS`, `gemm_q4_tiled_il_s8`, `gemm_q4_tiled_inner_il_s8`, and `microkernel_q4_2x4_il_s8` from `avx512.rs` and `mod.rs`. These were a shift-by-8 direct Q4 GEMM experiment that regressed (0.81x) because it read 72-byte blocks from L3 vs the expand-then-Q8 path reading 136-byte blocks from L2.
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum commit:** `1dfc222`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 148.5 | 138.4 | **1.07x** (llama.cpp variance) |
+| SmolLM2-360M Q4_0 decode  | 201.5 | 206.9 | **0.97x** |
+| SmolLM2-360M Q8_0 prefill | 1167.9 | 1137.7 | **1.03x** |
+| SmolLM2-360M Q4_0 prefill | 1088.8 | 1274.6 | **0.85x** |
+
+### vs previous best (scale prefetch session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q4_0 prefill | 1078.2 | 1088.8 | **+1.0%** |
+| SmolLM2-360M Q8_0 prefill | 1163.4 | 1167.9 | flat |
+| SmolLM2-360M Q8_0 decode | 140.2 | 148.5 | flat (llama.cpp variance) |
+| SmolLM2-360M Q4_0 decode | 201.5 | 201.5 | flat |
+
+### Notes
+
+- Q4_0 prefill: 0.83x → **0.85x** (+1.0% absolute). Prefetch distance PF=20 hides DRAM latency during sequential Q4_0 IL block reads.
+- The shift-by-8 direct Q4 kernel (`microkernel_q4_2x4_il_s8`) was explored first: 2×4 tile with `vpdpbusd` on unsigned nibbles and `8×sum(input)` correction. Regressed to 0.81x because it read 72-byte Q4 blocks from L3 vs the expand path reading 136-byte Q8 blocks from L2 (L2 latency ~12 cycles vs L3 ~40 cycles). The expand approach wins as long as L2 is large enough for the scratch buffer.
+- All Q8_0 paths remain at or above parity. Q4_0 decode is stable at ~0.97x.
+- Remaining gaps vs llama.cpp: Q4_0 prefill **0.85x** (structural — ZMM 8-row format required to close), Gemma decode ~0.97x, Gemma prefill ~0.93x.
