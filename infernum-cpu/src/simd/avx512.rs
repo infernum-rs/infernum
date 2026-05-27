@@ -3508,7 +3508,18 @@ unsafe fn microkernel_q4_4x4_il(
             "xor {wt_off:e}, {wt_off:e}",
             "xor {iq_off:e}, {iq_off:e}",
 
+            // Load Q4 unpack constants into registers once — avoids 16 memory operand loads
+            // per K-block that saturate load ports when constants are kept in memory.
+            // xmm31 (low 128 of ymm31) = 0x0F mask; xmm30 = high 128 extracted = -8 (0xF8).
+            // Use EVEX-capable `vextracti32x4` (xmm16-31 require EVEX; `vextracti128` is VEX-only).
+            "vmovdqu32 ymm31, [{q4_consts}]",
+            "vextracti32x4 xmm30, ymm31, 1",
+
             "2:",
+            // Prefetch weight data 12 Q4_0 IL blocks ahead (12 × 72 = 864 bytes, 2 cache lines).
+            "prefetcht0 [{wt_base} + {wt_off} + 864]",
+            "prefetcht0 [{wt_base} + {wt_off} + 928]",
+
             "mov {s_off}, {iq_off}",
             "shr {s_off}, 3",           // s_off = blk*4 (iq_off/8 = byte offset into f32 array)
 
@@ -3530,20 +3541,20 @@ unsafe fn microkernel_q4_4x4_il(
             // ---- Col 0 (row 0 of weight group) ----
             // 16 Q4_0 bytes at wt_base + wt_off + 0*16.
             "vmovdqu xmm4, [{wt_base} + {wt_off}]",
-            // lo nibbles: byte & mask_0f.
-            "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
-            // Center lo nibbles: lo + (-8).
-            "vpaddb xmm6, xmm6, xmmword ptr [{q4_consts} + 16]",
-            // hi nibbles: (byte >> 4) & mask_0f (vpsrlw shifts 16-bit words, mask cleans overflow).
+            // Broadcast scale[0] early (independent of expand — overlap with expand chain).
+            "vbroadcastss ymm28, xmm29",
+            // lo nibbles: byte & mask_0f (xmm31 = register constant, no load micro-op).
+            "vpandd xmm6, xmm4, xmm31",
+            // Center lo nibbles: lo + (-8) (xmm30 = register constant).
+            "vpaddb xmm6, xmm6, xmm30",
+            // hi nibbles: (byte >> 4) & mask_0f.
             "vpsrlw xmm7, xmm4, 4",
-            "vpand xmm7, xmm7, xmmword ptr [{q4_consts}]",
+            "vpandd xmm7, xmm7, xmm31",
             // Center hi nibbles.
-            "vpaddb xmm7, xmm7, xmmword ptr [{q4_consts} + 16]",
+            "vpaddb xmm7, xmm7, xmm30",
             // Combine: ymm4 = [lo_centered(0..15) | hi_centered(0..15)] = Q8_0 expanded.
             "vinserti128 ymm4, ymm6, xmm7, 1",
             "vpsignb ymm5, ymm4, ymm4",            // ymm5 = abs(weight)
-            // Broadcast scale[0].
-            "vbroadcastss ymm28, xmm29",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
             "vpxord  ymm6, ymm6, ymm6",
@@ -3575,15 +3586,16 @@ unsafe fn microkernel_q4_4x4_il(
 
             // ---- Col 1 (row 1 of weight group) ----
             "vmovdqu xmm4, [{wt_base} + {wt_off} + 16]",
-            "vpermilps xmm30, xmm29, 0xe1",        // scale[1] → lane 0
-            "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
-            "vpaddb xmm6, xmm6, xmmword ptr [{q4_consts} + 16]",
+            // Permute scale[1] into xmm6 temp, broadcast early, then reuse xmm6 for expand.
+            "vpermilps xmm6, xmm29, 0xe1",
+            "vbroadcastss ymm28, xmm6",
+            "vpandd xmm6, xmm4, xmm31",
+            "vpaddb xmm6, xmm6, xmm30",
             "vpsrlw xmm7, xmm4, 4",
-            "vpand xmm7, xmm7, xmmword ptr [{q4_consts}]",
-            "vpaddb xmm7, xmm7, xmmword ptr [{q4_consts} + 16]",
+            "vpandd xmm7, xmm7, xmm31",
+            "vpaddb xmm7, xmm7, xmm30",
             "vinserti128 ymm4, ymm6, xmm7, 1",
             "vpsignb ymm5, ymm4, ymm4",
-            "vbroadcastss ymm28, xmm30",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
             "vpxord  ymm6, ymm6, ymm6",
@@ -3615,15 +3627,15 @@ unsafe fn microkernel_q4_4x4_il(
 
             // ---- Col 2 (row 2 of weight group) ----
             "vmovdqu xmm4, [{wt_base} + {wt_off} + 32]",
-            "vpermilps xmm30, xmm29, 0xe2",        // scale[2] → lane 0
-            "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
-            "vpaddb xmm6, xmm6, xmmword ptr [{q4_consts} + 16]",
+            "vpermilps xmm6, xmm29, 0xe2",
+            "vbroadcastss ymm28, xmm6",
+            "vpandd xmm6, xmm4, xmm31",
+            "vpaddb xmm6, xmm6, xmm30",
             "vpsrlw xmm7, xmm4, 4",
-            "vpand xmm7, xmm7, xmmword ptr [{q4_consts}]",
-            "vpaddb xmm7, xmm7, xmmword ptr [{q4_consts} + 16]",
+            "vpandd xmm7, xmm7, xmm31",
+            "vpaddb xmm7, xmm7, xmm30",
             "vinserti128 ymm4, ymm6, xmm7, 1",
             "vpsignb ymm5, ymm4, ymm4",
-            "vbroadcastss ymm28, xmm30",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
             "vpxord  ymm6, ymm6, ymm6",
@@ -3655,15 +3667,15 @@ unsafe fn microkernel_q4_4x4_il(
 
             // ---- Col 3 (row 3 of weight group) ----
             "vmovdqu xmm4, [{wt_base} + {wt_off} + 48]",
-            "vpermilps xmm30, xmm29, 0xe3",        // scale[3] → lane 0
-            "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
-            "vpaddb xmm6, xmm6, xmmword ptr [{q4_consts} + 16]",
+            "vpermilps xmm6, xmm29, 0xe3",
+            "vbroadcastss ymm28, xmm6",
+            "vpandd xmm6, xmm4, xmm31",
+            "vpaddb xmm6, xmm6, xmm30",
             "vpsrlw xmm7, xmm4, 4",
-            "vpand xmm7, xmm7, xmmword ptr [{q4_consts}]",
-            "vpaddb xmm7, xmm7, xmmword ptr [{q4_consts} + 16]",
+            "vpandd xmm7, xmm7, xmm31",
+            "vpaddb xmm7, xmm7, xmm30",
             "vinserti128 ymm4, ymm6, xmm7, 1",
             "vpsignb ymm5, ymm4, ymm4",
-            "vbroadcastss ymm28, xmm30",
             // row 0
             "vpsignb ymm7, ymm0, ymm4",
             "vpxord  ymm6, ymm6, ymm6",
@@ -3869,7 +3881,7 @@ unsafe fn microkernel_q4_4x4_il(
             out("ymm16") _, out("ymm17") _, out("ymm18") _, out("ymm19") _,
             out("ymm20") _, out("ymm21") _, out("ymm22") _, out("ymm23") _,
             out("ymm24") _, out("ymm25") _, out("ymm26") _, out("ymm27") _,
-            out("ymm28") _, out("ymm29") _, out("ymm30") _,
+            out("ymm28") _, out("ymm29") _, out("ymm30") _, out("ymm31") _,
             options(nostack),
         );
     }

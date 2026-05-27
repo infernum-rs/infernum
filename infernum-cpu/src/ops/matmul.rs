@@ -543,9 +543,6 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
             }
             DType::Q4_0 => {
                 if weight.interleaved {
-                    // Expand Q4_0 IL → Q8_0 IL per chunk, then run the optimised Q8_0 GEMM.
-                    // `bpr_inp` is the INPUT row stride (Q8_0 format: nb*32 bytes/row); NOT
-                    // the weight block size.  The old code incorrectly used nb*136 here.
                     let bpr_inp = num_blocks_per_row * 32;
                     let pool = crate::thread_pool::global_pool();
                     let num_threads = pool.num_threads();
@@ -561,13 +558,16 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                             return;
                         }
                         let chunk_n = col_end - col_start;
-                        let chunk_groups = chunk_n / 4;
+                        let chunk_groups = chunk_n.div_ceil(4);
                         let group_start = col_start / 4;
                         let wt_il = unsafe {
                             std::slice::from_raw_parts(wt_data_addr as *const u8, wt_data_len)
                         };
                         let q4_chunk = &wt_il[group_start * num_blocks_per_row * 72..];
                         let needed = chunk_groups * num_blocks_per_row * 136;
+                        let out_global = unsafe {
+                            std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n)
+                        };
                         Q4_EXPAND_SCRATCH.with(|scratch| {
                             let mut s = scratch.borrow_mut();
                             if s.len() < needed {
@@ -579,9 +579,6 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                                 num_blocks_per_row,
                                 &mut s[..needed],
                             );
-                            let out_global = unsafe {
-                                std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n)
-                            };
                             simd::gemm_q8_tiled_il(
                                 &mut out_global[col_start..],
                                 &all_quants.quants,
@@ -1044,12 +1041,18 @@ fn quantized_linear_pair_batched(
                             if col_start < $n {
                                 let col_end = (col_start + $cpt).min($n);
                                 let chunk_n = col_end - col_start;
-                                let chunk_groups = chunk_n / 4;
+                                let chunk_groups = chunk_n.div_ceil(4);
                                 let group_start = col_start / 4;
                                 let wt_il =
                                     unsafe { std::slice::from_raw_parts($wd as *const u8, $wdl) };
                                 let q4_chunk = &wt_il[group_start * num_blocks * 72..];
                                 let needed = chunk_groups * num_blocks * 136;
+                                let out_global = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        $out_addr as *mut f32,
+                                        m * $n,
+                                    )
+                                };
                                 Q4_EXPAND_SCRATCH.with(|scratch| {
                                     let mut s = scratch.borrow_mut();
                                     if s.len() < needed {
@@ -1061,12 +1064,6 @@ fn quantized_linear_pair_batched(
                                         num_blocks,
                                         &mut s[..needed],
                                     );
-                                    let out_global = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            $out_addr as *mut f32,
-                                            m * $n,
-                                        )
-                                    };
                                     simd::gemm_q8_tiled_il(
                                         &mut out_global[col_start..],
                                         &all_rows.quants,
@@ -1272,12 +1269,18 @@ fn quantized_linear_triple_batched(
                             if col_start < $n {
                                 let col_end = (col_start + $cpt).min($n);
                                 let chunk_n = col_end - col_start;
-                                let chunk_groups = chunk_n / 4;
+                                let chunk_groups = chunk_n.div_ceil(4);
                                 let group_start = col_start / 4;
                                 let wt_il =
                                     unsafe { std::slice::from_raw_parts($wd as *const u8, $wdl) };
                                 let q4_chunk = &wt_il[group_start * num_blocks * 72..];
                                 let needed = chunk_groups * num_blocks * 136;
+                                let out_global = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        $out_addr as *mut f32,
+                                        m * $n,
+                                    )
+                                };
                                 Q4_EXPAND_SCRATCH.with(|scratch| {
                                     let mut s = scratch.borrow_mut();
                                     if s.len() < needed {
@@ -1289,12 +1292,6 @@ fn quantized_linear_triple_batched(
                                         num_blocks,
                                         &mut s[..needed],
                                     );
-                                    let out_global = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            $out_addr as *mut f32,
-                                            m * $n,
-                                        )
-                                    };
                                     simd::gemm_q8_tiled_il(
                                         &mut out_global[col_start..],
                                         &all_rows.quants,
