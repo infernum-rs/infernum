@@ -297,26 +297,25 @@ pub struct CpuQuantizedWeight {
     pub shape: Vec<usize>,
     /// Quantization format (`Q8_0`, `Q4_0`, or `Q4_1`)
     pub dtype: DType,
-    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
+    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1).
+    ///
+    /// When `interleaved == true` the layout is a unified block per 4-row group:
+    /// - Q8_0: 136 bytes/block = `[128 bytes quants (4×32)][8 bytes f16 scales (4×u16 LE)]`
+    ///   - Quant for row r, block b: `data[g*nb*136 + b*136 + r*32 .. +32]`
+    ///   - Scale for row r, block b: `data[g*nb*136 + b*136 + 128 + r*2 .. +2]` (LE f16)
+    /// - Q4_0: 72 bytes/block = `[64 bytes quants (4×16)][8 bytes f16 scales (4×u16 LE)]`
+    ///   - Quant for row r, block b: `data[g*nb*72 + b*72 + r*16 .. +16]`
+    ///   - Scale for row r, block b: `data[g*nb*72 + b*72 + 64 + r*2 .. +2]` (LE f16)
     pub data: Vec<u8>,
     /// Per-block scales decoded to f32 (one per block)
     pub scales: Vec<f32>,
     /// Per-block minimums decoded to f32 (one per block, Q4_1 only)
     pub mins: Option<Vec<f32>>,
-    /// f16 scales for interleaved Q8_0 weights (stored as u16 bit-repr).
+    /// Whether `data` is in 4-row-interleaved (IL) unified-block format.
     ///
-    /// When `interleaved == true`, this holds the IL-format scales as f16 bits:
-    /// - `il_scales_f16[g * nb * 4 + b * 4 + r]` = f16 bits of scale for row (4g+r), block b
-    /// This matches llama.cpp's 34 bytes/row/block (32 Q8 + 2 f16) vs 36 bytes with f32.
-    /// Empty when `interleaved == false`.
-    pub il_scales_f16: Vec<u16>,
-    /// Whether `data` and `il_scales_f16` are in 4-row-interleaved format (Q8_0 only).
-    ///
-    /// When true, 4 consecutive weight rows' K-block data is packed contiguously:
-    /// - `data[g * nb * 128 + b * 128 + r * 32 .. +32]` = row (4g+r), block b
-    /// - `il_scales_f16[g * nb * 4 + b * 4 + r]` = f16 scale for row (4g+r), block b
-    /// This reduces weight load cache pressure from 4 scattered cache lines to
-    /// 2 sequential cache lines per K-block.
+    /// When true, quants and f16 scales for each 4-row group's block are stored
+    /// contiguously in `data` (see doc above). This matches llama.cpp's `block_q8_0x4`
+    /// layout and eliminates a second memory stream vs the old split-Vec approach.
     pub interleaved: bool,
 }
 

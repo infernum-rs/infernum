@@ -493,9 +493,9 @@ pub fn gemm_q8_tiled(
     }
 }
 
-/// Tiled Q8×Q8 GEMM using 4-row-interleaved weight format.
+/// Tiled Q8×Q8 GEMM using 4-row-interleaved weight format (unified 136-byte blocks).
 ///
-/// `wt_quants_il` and `wt_scales_il` are the full interleaved weight matrix.
+/// `wt_quants_il` is the full interleaved weight matrix with inline f16 scales.
 /// `col_start` must be a multiple of 4.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_q8_tiled_il(
@@ -503,7 +503,6 @@ pub fn gemm_q8_tiled_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il_f16: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -519,7 +518,6 @@ pub fn gemm_q8_tiled_il(
                 inp_quants,
                 inp_scales,
                 wt_quants_il,
-                wt_scales_il_f16,
                 m,
                 n,
                 n_stride,
@@ -542,15 +540,19 @@ pub fn gemm_q8_tiled_il(
             let row_in_group = global_col % 4;
             let mut acc = 0.0f32;
             for blk in 0..nb {
-                let wq_off = group * nb * 128 + blk * 128 + row_in_group * 32;
-                let ws_off = group * nb * 4 + blk * 4 + row_in_group;
+                let wq_off = group * nb * 136 + blk * 136 + row_in_group * 32;
+                let scale_off = group * nb * 136 + blk * 136 + 128 + row_in_group * 2;
                 let wq = &wt_quants_il[wq_off..wq_off + 32];
                 let iq_blk = &iq[blk * 32..(blk + 1) * 32];
                 let mut dot = 0i32;
                 for (w, a) in wq.iter().zip(iq_blk.iter()) {
                     dot += (*w as i32) * (*a as i8 as i32);
                 }
-                let ws = half::f16::from_bits(wt_scales_il_f16[ws_off]).to_f32();
+                let ws = half::f16::from_le_bytes([
+                    wt_quants_il[scale_off],
+                    wt_quants_il[scale_off + 1],
+                ])
+                .to_f32();
                 acc += (dot as f32) * is_[blk] * ws;
             }
             output[row * n_stride + col] = acc;
@@ -583,8 +585,8 @@ pub fn expand_q4_il_to_q8_il_into(q4_il: &[u8], chunk_groups: usize, nb: usize, 
 fn expand_q4_il_scalar(q4_il: &[u8], chunk_groups: usize, nb: usize, q8: &mut [u8]) {
     let total_blocks = chunk_groups * nb;
     for blk in 0..total_blocks {
-        let src_base = blk * 64;
-        let dst_base = blk * 128;
+        let src_base = blk * 72;
+        let dst_base = blk * 136;
         for r in 0..4 {
             let packed = &q4_il[src_base + r * 16..src_base + r * 16 + 16];
             let dst = &mut q8[dst_base + r * 32..dst_base + r * 32 + 32];
@@ -593,18 +595,19 @@ fn expand_q4_il_scalar(q4_il: &[u8], chunk_groups: usize, nb: usize, q8: &mut [u
                 dst[i + 16] = (packed[i] >> 4).wrapping_sub(8);
             }
         }
+        // Copy 8-byte inline f16 scales from Q4 block (+64) into Q8 block (+128).
+        q8[dst_base + 128..dst_base + 136].copy_from_slice(&q4_il[src_base + 64..src_base + 72]);
     }
 }
 
-/// Q4_0 IL tiled GEMM: reads Q4_0 IL directly (no expand buffer).
-/// Weight layout: `wt_quants_il[group * nb * 64 + blk * 64 + row * 16 .. +16]`.
+/// Q4_0 IL tiled GEMM: reads Q4_0 IL directly (unified 72-byte blocks: 64 quant + 8 f16).
+/// Weight layout: `wt_quants_il[group * nb * 72 + blk * 72 + row * 16 .. +16]`.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_q4_tiled_il(
     output: &mut [f32],
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il_f16: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -619,7 +622,6 @@ pub fn gemm_q4_tiled_il(
                 inp_quants,
                 inp_scales,
                 wt_quants_il,
-                wt_scales_il_f16,
                 m,
                 n,
                 n_stride,
@@ -642,8 +644,8 @@ pub fn gemm_q4_tiled_il(
             let row_in_group = global_col % 4;
             let mut acc = 0.0f32;
             for blk in 0..nb {
-                let wq_off = group * nb * 64 + blk * 64 + row_in_group * 16;
-                let ws_off = group * nb * 4 + blk * 4 + row_in_group;
+                let wq_off = group * nb * 72 + blk * 72 + row_in_group * 16;
+                let scale_off = group * nb * 72 + blk * 72 + 64 + row_in_group * 2;
                 let packed = &wt_quants_il[wq_off..wq_off + 16];
                 let iq_blk = &iq[blk * 32..(blk + 1) * 32];
                 let mut dot = 0i32;
@@ -653,7 +655,11 @@ pub fn gemm_q4_tiled_il(
                     dot += ((packed[k] >> 4).wrapping_sub(8) as i8 as i32)
                         * (iq_blk[k + 16] as i8 as i32);
                 }
-                let ws = half::f16::from_bits(wt_scales_il_f16[ws_off]).to_f32();
+                let ws = half::f16::from_le_bytes([
+                    wt_quants_il[scale_off],
+                    wt_quants_il[scale_off + 1],
+                ])
+                .to_f32();
                 acc += (dot as f32) * is_[blk] * ws;
             }
             output[row * n_stride + col] = acc;
@@ -926,22 +932,20 @@ pub fn dot_q8_q8_4row(
     }
 }
 
-/// 4-row Q8×Q8 GEMV using 4-row-interleaved weight format.
+/// 4-row Q8×Q8 GEMV using unified 4-row-interleaved weight format (136 bytes/block).
 ///
-/// `il_quants`: `nb * 128` bytes (4 rows × 32 bytes × nb blocks, contiguous per block).
-/// `il_scales`: `nb * 4` f32s  (4 rows × nb blocks, interleaved per block).
+/// `il_quants`: `nb * 136` bytes (4 rows × 32 bytes quant + 8 bytes f16 scales per block).
 #[inline]
 #[must_use]
 pub fn dot_q8_q8_4row_il(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants: &[u8],
-    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if has_vnni() {
-            return avx512::dot_q8_q8_4row_il(input_quants, input_scales, il_quants, il_scales_f16);
+            return avx512::dot_q8_q8_4row_il(input_quants, input_scales, il_quants);
         }
     }
 
@@ -950,7 +954,7 @@ pub fn dot_q8_q8_4row_il(
     let mut acc = [0.0f32; 4];
     for blk in 0..nb {
         let inp_off = blk * 32;
-        let wq_off = blk * 128;
+        let wq_off = blk * 136;
         let inp_scale = input_scales[blk];
         for r in 0..4 {
             let mut dot = 0i32;
@@ -959,34 +963,29 @@ pub fn dot_q8_q8_4row_il(
             for (a, w) in iq.iter().zip(wq.iter()) {
                 dot += (*a as i8 as i32) * (*w as i32);
             }
-            let ws = half::f16::from_bits(il_scales_f16[blk * 4 + r]).to_f32();
+            let scale_off = wq_off + 128 + r * 2;
+            let ws = half::f16::from_le_bytes([il_quants[scale_off], il_quants[scale_off + 1]])
+                .to_f32();
             acc[r] += (dot as f32) * inp_scale * ws;
         }
     }
     (acc[0], acc[1], acc[2], acc[3])
 }
 
-/// 4-row Q4×Q8 GEMV in IL format: weight data is 4-row-interleaved Q4_0 (64 bytes/block).
+/// 4-row Q4×Q8 GEMV using unified IL format (72 bytes/block: 64 quant + 8 f16 scales).
 ///
-/// Block layout: `[row0: 16 bytes][row1: 16 bytes][row2: 16 bytes][row3: 16 bytes]` × nb.
-/// Scale layout: same IL f16 format as Q8_0 IL.  Returns `(dot0, dot1, dot2, dot3)`.
+/// Block layout: `[row0: 16b][row1: 16b][row2: 16b][row3: 16b][4×f16 scales: 8b]` × nb.
 #[inline]
 #[must_use]
 pub fn dot_q4_q8_4row_il(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants_q4: &[u8],
-    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if has_vnni() {
-            return avx512::dot_q4_q8_4row_il(
-                input_quants,
-                input_scales,
-                il_quants_q4,
-                il_scales_f16,
-            );
+            return avx512::dot_q4_q8_4row_il(input_quants, input_scales, il_quants_q4);
         }
     }
 
@@ -995,7 +994,7 @@ pub fn dot_q4_q8_4row_il(
     let mut acc = [0.0f32; 4];
     for blk in 0..nb {
         let inp_off = blk * 32;
-        let wq_off = blk * 64;
+        let wq_off = blk * 72;
         let inp_scale = input_scales[blk];
         for r in 0..4 {
             let iq = &input_quants[inp_off..inp_off + 32];
@@ -1006,7 +1005,10 @@ pub fn dot_q4_q8_4row_il(
                 let hi = ((packed[i] >> 4).wrapping_sub(8)) as i8 as i32;
                 dot += lo * (iq[i] as i8 as i32) + hi * (iq[i + 16] as i8 as i32);
             }
-            let ws = half::f16::from_bits(il_scales_f16[blk * 4 + r]).to_f32();
+            let scale_off = wq_off + 64 + r * 2;
+            let ws =
+                half::f16::from_le_bytes([il_quants_q4[scale_off], il_quants_q4[scale_off + 1]])
+                    .to_f32();
             acc[r] += (dot as f32) * inp_scale * ws;
         }
     }

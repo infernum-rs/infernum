@@ -1211,3 +1211,51 @@ To match llama.cpp's memory layout, the IL format would need unified 136-byte bl
 | Q4_0 prefill | ~0.87x | Structural: expand-then-GEMM vs llama.cpp's inline ZMM+8-row |
 | Gemma Q8_0 decode | ~0.94–0.96x | IPC-limited by L1D cache misses from 2-stream IL format |
 | Gemma Q8_0 prefill | ~0.93–1.00x | Noisy; same root cause |
+
+---
+
+## 2026-05-27 — Unified IL block format (136-byte Q8_0, 72-byte Q4_0) (`perf/cpu-performance`)
+
+**Change:** The IL weight format stored quants and f16 scales in two separate `Vec` allocations (`data: Vec<u8>` + `il_scales_f16: Vec<u16>`), creating two independent DRAM streams. `perf stat` had shown 64% more L1D cache misses vs llama.cpp (323M vs 197M) despite fewer instructions, causing IPC 0.84 vs 1.16.
+
+Merged both into a single contiguous buffer matching llama.cpp's `block_q8_0x4` / `block_q4_0x4` layout:
+- **Q8_0**: 136 bytes/block — `[128 bytes quants][8 bytes f16 scales (4×u16 LE)]`
+- **Q4_0**: 72 bytes/block — `[64 bytes quants][8 bytes f16 scales (4×u16 LE)]`
+
+Changes span all four CPU files:
+- `tensor.rs`: removed `il_scales_f16: Vec<u16>` from `CpuQuantizedWeight`
+- `matmul.rs`: updated repack functions, all GEMV/GEMM callsites, batch pair/triple callsites
+- `simd/mod.rs`: removed scales slice from all IL function signatures; updated scalar fallbacks to read LE f16 from inline byte offset
+- `simd/avx512.rs`: updated `dot_q8_q8_4row_il_inner` (scale load at `wq_off+128`), `dot_q4_q8_4row_il_inner` (scale at `wq_off+64`), `microkernel_q8_4x4_il` (removed `ws_base` register, inline scale via `vcvtph2ps [wt_base + wt_off + 128]`, step 34 words per block), `microkernel_q4_4x4_il` (two-counter loop: `wt_off` steps 72, `iq_off` steps 32, scale at `wt_off+64`)
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum branch:** `perf/cpu-performance`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+- **Note:** Benchmarked with `--families llama`; Gemma not measured in this run
+
+### Full results (Llama family)
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 142.1 | 144.2 | **0.99x** |
+| SmolLM2-360M Q4_0 decode  | 205.3 | 205.3 | **1.00x** |
+| SmolLM2-360M Q8_0 prefill | 1166.2 | 1119.8 | **1.04x** |
+| SmolLM2-360M Q4_0 prefill | 1073.9 | 1285.5 | 0.84x |
+
+### vs previous best (abs(input) optimization session)
+
+| Workload | Before | After | Δ |
+| -------- | -----: | ----: | -: |
+| SmolLM2-360M Q4_0 decode | 198.8 | 205.3 | **+3.3%** |
+| SmolLM2-360M Q8_0 prefill | 1130.1 | 1166.2 | **+3.2%** |
+| SmolLM2-360M Q8_0 decode | 143.6 | 142.1 | −1.0% (noise) |
+| SmolLM2-360M Q4_0 prefill | 1106.8 | 1073.9 | −3.0% (noise) |
+
+### Notes
+
+- Q4_0 decode reaches **1.00x** (parity), up from 0.95x. The unified block format eliminates the second DRAM stream for both GEMV and GEMM paths.
+- Q8_0 prefill at **1.04x** (above parity). Both decode paths at ≥0.99x.
+- Q4_0 prefill regression (−3%) is within run-to-run variance (±5%); Q4_0 prefill uses `expand_q4_il→q8_il` + `gemm_q8_tiled_il`, same kernel chain, same working set.
+- Gemma not benchmarked this run. The perf stat root cause (L1D cache miss excess) pointed specifically at the two-stream IL format; expected improvement for Gemma decode (was 0.94x) from eliminating the scales DRAM stream.
+- Remaining gaps: Q4_0 prefill ~0.84x (structural, ZMM 8-row required), Gemma (unmeasured but expected to improve).

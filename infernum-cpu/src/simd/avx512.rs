@@ -537,19 +537,16 @@ unsafe fn dot_q8_q8_4row_inner(
 /// 4-row Q8×Q8 GEMV with 4-row-interleaved weight format.
 ///
 /// Weight data layout (passed as `il_quants`, `il_scales_f16`):
-/// - `il_quants[b * 128 + r * 32 .. +32]`   = quants for row r, block b (4 rows per block)
-/// - `il_scales_f16[b * 4 + r]`             = f16 scale (as u16 bits) for row r, block b
+/// - `il_quants[b * 136 + r * 32 .. +32]`       = quants for row r, block b (4 rows per block)
+/// - `il_quants[b * 136 + 128 + r * 2 .. +2]`   = LE f16 scale for row r, block b
 ///
-/// Sequential memory access pattern means the hardware prefetcher covers all
-/// 4 weight row loads per block from the same 2 cache lines, vs 4 scattered
-/// cache lines with the row-major layout.
+/// Unified layout: quants and scales are in one contiguous 136-byte block per 4-row group.
 pub fn dot_q8_q8_4row_il(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants: &[u8],
-    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
-    unsafe { dot_q8_q8_4row_il_inner(input_quants, input_scales, il_quants, il_scales_f16) }
+    unsafe { dot_q8_q8_4row_il_inner(input_quants, input_scales, il_quants) }
 }
 
 #[allow(clippy::similar_names)]
@@ -564,29 +561,27 @@ unsafe fn dot_q8_q8_4row_il_inner(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants: &[u8],
-    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
     let nb = input_scales.len();
 
     let iq = input_quants.as_ptr();
     let wq = il_quants.as_ptr();
-    let ws = il_scales_f16.as_ptr();
 
     let mut total0 = _mm256_setzero_ps();
     let mut total1 = _mm256_setzero_ps();
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
-    // Prefetch 12 blocks ahead (same distance as the non-IL 4-row kernel).
-    // Each block is 128 bytes = 2 cache lines; prefetch both lines.
+    // Prefetch 12 blocks ahead. Each block is 136 bytes = 3 partial cache lines;
+    // the quant data spans bytes 0..127 (2 cache lines) and scale 128..135 (in third).
+    // Prefetch the first two cache lines (0 and 64); the third shares a line with wq_off+64.
     const PF: usize = 12;
     for blk in 0..nb {
         let inp_off = blk * 32;
-        let wq_off = blk * 128;
-        let ws_off = blk * 4;
+        let wq_off = blk * 136;
 
         if blk + PF < nb {
-            let pf = (blk + PF) * 128;
+            let pf = (blk + PF) * 136;
             _mm_prefetch::<_MM_HINT_T0>(wq.add(pf).cast());
             _mm_prefetch::<_MM_HINT_T0>(wq.add(pf + 64).cast());
         }
@@ -594,14 +589,14 @@ unsafe fn dot_q8_q8_4row_il_inner(
         let inp_scale = *input_scales.get_unchecked(blk);
         let input_i8 = _mm256_loadu_si256(iq.add(inp_off).cast());
 
-        // All 4 weight loads are sequential: same 2 cache lines per block.
+        // All 4 weight loads are sequential within the unified block.
         let w0 = _mm256_loadu_si256(wq.add(wq_off).cast());
         let w1 = _mm256_loadu_si256(wq.add(wq_off + 32).cast());
         let w2 = _mm256_loadu_si256(wq.add(wq_off + 64).cast());
         let w3 = _mm256_loadu_si256(wq.add(wq_off + 96).cast());
 
-        // Load 4 f16 scales (8 bytes) and convert to 4 f32 via vcvtph2ps.
-        let scales_raw = _mm_loadl_epi64(ws.add(ws_off).cast::<__m128i>());
+        // Load 4 f16 scales (8 bytes at offset +128 within the unified block) → 4 f32.
+        let scales_raw = _mm_loadl_epi64(wq.add(wq_off + 128).cast::<__m128i>());
         let scales_f32 = _mm_cvtph_ps(scales_raw);
 
         // Compute abs(input) once — reused for all 4 output rows (saves 3 vpsignb vs weight-side abs).
@@ -769,20 +764,19 @@ unsafe fn dot_q4_q8_4row_inner(
         hsum_256(total3),
     )
 }
-/// 4-row Q4_0 GEMV in 4-row-interleaved (IL) format.
+/// 4-row Q4_0 GEMV in unified 4-row-interleaved (IL) format.
 ///
-/// IL layout: `il_quants_q4[blk * 64 + row * 16 .. +16]` = 16 packed Q4_0 bytes for
-/// `row` in 0..4 at block `blk`.  All four rows are within the same 64-byte cache line.
-/// Scale layout: same as Q8_0 IL — `il_scales_f16[blk * 4 + row]` = f16.
+/// IL layout: 72 bytes/block = `[64 bytes Q4_0 quants (4×16)][8 bytes f16 scales (4×u16 LE)]`.
+/// - `il_quants_q4[blk * 72 + row * 16 .. +16]` = 16 packed Q4_0 bytes for row at block blk
+/// - `il_quants_q4[blk * 72 + 64 .. +8]`        = 4 f16 scales (row 0..3) at block blk
 ///
 /// Returns `(dot0, dot1, dot2, dot3)`.
 pub fn dot_q4_q8_4row_il(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants_q4: &[u8],
-    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
-    unsafe { dot_q4_q8_4row_il_inner(input_quants, input_scales, il_quants_q4, il_scales_f16) }
+    unsafe { dot_q4_q8_4row_il_inner(input_quants, input_scales, il_quants_q4) }
 }
 
 #[allow(clippy::similar_names)]
@@ -798,7 +792,6 @@ unsafe fn dot_q4_q8_4row_il_inner(
     input_quants: &[u8],
     input_scales: &[f32],
     il_quants_q4: &[u8],
-    il_scales_f16: &[u16],
 ) -> (f32, f32, f32, f32) {
     use std::arch::x86_64::{
         _mm256_set_m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_set_epi8,
@@ -808,7 +801,6 @@ unsafe fn dot_q4_q8_4row_il_inner(
     let nb = input_scales.len();
     let iq = input_quants.as_ptr();
     let wq = il_quants_q4.as_ptr();
-    let ws = il_scales_f16.as_ptr();
 
     // vpshufb LUT: nibble i → i-8, within-lane.
     let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
@@ -819,28 +811,29 @@ unsafe fn dot_q4_q8_4row_il_inner(
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
-    // Each block occupies 64 bytes (4 rows × 16 bytes), fitting one cache line.
+    // Each block occupies 72 bytes (64 bytes quants + 8 bytes f16 scales).
+    // Bytes 0..63: quants (4 rows × 16 bytes); bytes 64..71: 4 f16 scales.
+    // Fits in two 64-byte cache lines: first covers quants 0..63, second covers quants+scales.
     const PF: usize = 12;
     for blk in 0..nb {
         let inp_off = blk * 32;
-        let wq_off = blk * 64;
-        let ws_off = blk * 4;
+        let wq_off = blk * 72;
 
         if blk + PF < nb {
-            _mm_prefetch::<_MM_HINT_T0>(wq.add((blk + PF) * 64).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wq.add((blk + PF) * 72).cast());
         }
 
         let inp_scale = *input_scales.get_unchecked(blk);
         let input_i8 = _mm256_loadu_si256(iq.add(inp_off).cast());
 
-        // Four sequential 16-byte reads — all within the same 64-byte cache line.
+        // Four sequential 16-byte reads — quants within the same 64-byte section.
         let p0 = _mm_loadu_si128(wq.add(wq_off).cast());
         let p1 = _mm_loadu_si128(wq.add(wq_off + 16).cast());
         let p2 = _mm_loadu_si128(wq.add(wq_off + 32).cast());
         let p3 = _mm_loadu_si128(wq.add(wq_off + 48).cast());
 
-        // Load 4 f16 scales and convert to f32 in one vcvtph2ps.
-        let scales_raw = _mm_loadl_epi64(ws.add(ws_off).cast::<__m128i>());
+        // Load 4 f16 scales (8 bytes at offset +64 within the unified block) → 4 f32.
+        let scales_raw = _mm_loadl_epi64(wq.add(wq_off + 64).cast::<__m128i>());
         let scales_f32 = _mm_cvtph_ps(scales_raw);
         let s0 = _mm_cvtss_f32(scales_f32);
         let s1 = _mm_cvtss_f32(_mm_shuffle_ps(scales_f32, scales_f32, 0x55));
@@ -2693,12 +2686,11 @@ unsafe fn microkernel_q8_4x4(
 // GPR count: 12 in (iq0-3, is0-3, wt_base, ws_base, q_limit, out_ptr)
 //          +  2 out (q_off, s_off) = 14 total (fits x86-64 exactly).
 
-/// Tiled Q8×Q8 GEMM using 4-row-interleaved weight format.
+/// Tiled Q8×Q8 GEMM using unified 4-row-interleaved weight format (136 bytes/block).
 ///
-/// `wt_quants_il` and `wt_scales_il_f16` contain the full interleaved weight matrix.
-/// Layout: for group g = j/4, block b, row r:
-///   `wt_quants_il[g * nb * 128 + b * 128 + r * 32 .. +32]`
-///   `wt_scales_il_f16[g * nb * 4 + b * 4 + r]` = f16 scale as u16
+/// `wt_quants_il` contains quants and inline f16 scales. For group g = j/4, block b, row r:
+///   `wt_quants_il[g * nb * 136 + b * 136 + r * 32 .. +32]` = quants
+///   `wt_quants_il[g * nb * 136 + b * 136 + 128 + r * 2 .. +2]` = LE f16 scale
 ///
 /// `col_start` must be a multiple of 4. `n` is the number of columns to process.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
@@ -2707,7 +2699,6 @@ pub fn gemm_q8_tiled_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -2721,7 +2712,6 @@ pub fn gemm_q8_tiled_il(
             inp_quants,
             inp_scales,
             wt_quants_il,
-            wt_scales_il,
             m,
             n,
             n_stride,
@@ -2750,7 +2740,6 @@ unsafe fn gemm_q8_tiled_inner_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -2765,17 +2754,12 @@ unsafe fn gemm_q8_tiled_inner_il(
         for j in (0..n_full).step_by(RN_Q8) {
             let global_col = col_start + j;
             let group = global_col / 4;
-            let wt_base = wt_quants_il.as_ptr().add(group * num_blocks * 128);
-            let ws_base = wt_scales_il
-                .as_ptr()
-                .add(group * num_blocks * 4)
-                .cast::<u8>();
+            let wt_base = wt_quants_il.as_ptr().add(group * num_blocks * 136);
             microkernel_q8_4x4_il(
                 output,
                 inp_quants,
                 inp_scales,
                 wt_base,
-                ws_base,
                 n_stride,
                 num_blocks,
                 bytes_per_row,
@@ -2783,7 +2767,7 @@ unsafe fn gemm_q8_tiled_inner_il(
                 j,
             );
         }
-        // N remainder: scalar fallback using non-IL row access.
+        // N remainder: scalar fallback.
         for jj in n_full..n {
             let global_col = col_start + jj;
             let group = global_col / 4;
@@ -2791,8 +2775,8 @@ unsafe fn gemm_q8_tiled_inner_il(
             for ii in i..i + RM_Q8 {
                 let mut acc = 0.0f32;
                 for blk in 0..num_blocks {
-                    let wq_off = group * num_blocks * 128 + blk * 128 + row_in_group * 32;
-                    let ws_off = group * num_blocks * 4 + blk * 4 + row_in_group;
+                    let wq_off = group * num_blocks * 136 + blk * 136 + row_in_group * 32;
+                    let scale_off = group * num_blocks * 136 + blk * 136 + 128 + row_in_group * 2;
                     let inp_off = ii * bytes_per_row + blk * 32;
                     let wq = &wt_quants_il[wq_off..wq_off + 32];
                     let iq = &inp_quants[inp_off..inp_off + 32];
@@ -2800,7 +2784,11 @@ unsafe fn gemm_q8_tiled_inner_il(
                     for (w, a) in wq.iter().zip(iq.iter()) {
                         dot += (*w as i8 as i32) * (*a as i8 as i32);
                     }
-                    let ws = half::f16::from_bits(wt_scales_il[ws_off]).to_f32();
+                    let ws = half::f16::from_le_bytes([
+                        wt_quants_il[scale_off],
+                        wt_quants_il[scale_off + 1],
+                    ])
+                    .to_f32();
                     acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * ws;
                 }
                 output[ii * n_stride + jj] = acc;
@@ -2816,8 +2804,8 @@ unsafe fn gemm_q8_tiled_inner_il(
             let row_in_group = global_col % 4;
             let mut acc = 0.0f32;
             for blk in 0..num_blocks {
-                let wq_off = group * num_blocks * 128 + blk * 128 + row_in_group * 32;
-                let ws_off = group * num_blocks * 4 + blk * 4 + row_in_group;
+                let wq_off = group * num_blocks * 136 + blk * 136 + row_in_group * 32;
+                let scale_off = group * num_blocks * 136 + blk * 136 + 128 + row_in_group * 2;
                 let inp_off = ii * bytes_per_row + blk * 32;
                 let wq = &wt_quants_il[wq_off..wq_off + 32];
                 let iq = &inp_quants[inp_off..inp_off + 32];
@@ -2825,7 +2813,11 @@ unsafe fn gemm_q8_tiled_inner_il(
                 for (w, a) in wq.iter().zip(iq.iter()) {
                     dot += (*w as i8 as i32) * (*a as i8 as i32);
                 }
-                let ws = half::f16::from_bits(wt_scales_il[ws_off]).to_f32();
+                let ws = half::f16::from_le_bytes([
+                    wt_quants_il[scale_off],
+                    wt_quants_il[scale_off + 1],
+                ])
+                .to_f32();
                 acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * ws;
             }
             output[ii * n_stride + jj] = acc;
@@ -2861,7 +2853,6 @@ unsafe fn microkernel_q8_4x4_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_base: *const u8,
-    ws_base: *const u8,
     n: usize,
     num_blocks: usize,
     bytes_per_row: usize,
@@ -2878,6 +2869,7 @@ unsafe fn microkernel_q8_4x4_il(
     let is2 = inp_scales.as_ptr().add((i + 2) * num_blocks).cast::<u8>();
     let is3 = inp_scales.as_ptr().add((i + 3) * num_blocks).cast::<u8>();
 
+    // iq_off steps by 32 (input byte stride); wt_off steps by 136 (unified block size).
     let q_limit = num_blocks * 32;
 
     let mut out = [0.0f32; 4 * 4];
@@ -2901,35 +2893,37 @@ unsafe fn microkernel_q8_4x4_il(
             "vpxord ymm22, ymm22, ymm22",
             "vpxord ymm23, ymm23, ymm23",
 
-            "xor {q_off:e}, {q_off:e}",
+            // wt_off: byte offset into weight data (steps by 136 per block).
+            // iq_off: byte offset into input quant data (steps by 32 per block).
+            "xor {wt_off:e}, {wt_off:e}",
+            "xor {iq_off:e}, {iq_off:e}",
 
             "2:",
-            // Prefetch weight data 12 IL-blocks ahead (12 * 128 = 1536 bytes, two cache lines).
-            "prefetcht0 [{wt_base} + {q_off} * 4 + 1536]",
-            "prefetcht0 [{wt_base} + {q_off} * 4 + 1600]",
-            "mov {s_off}, {q_off}",
+            // Prefetch weight data 12 IL-blocks ahead (12 * 136 = 1632 bytes).
+            "prefetcht0 [{wt_base} + {wt_off} + 1632]",
+            "prefetcht0 [{wt_base} + {wt_off} + 1696]",
+
+            // Load 4 input quant blocks (32 bytes each, iq_off = blk * 32).
+            "vmovdqu ymm0, [{iq0} + {iq_off}]",
+            "vmovdqu ymm1, [{iq1} + {iq_off}]",
+            "vmovdqu ymm2, [{iq2} + {iq_off}]",
+            "vmovdqu ymm3, [{iq3} + {iq_off}]",
+
+            // Input scale byte offset: blk * 4 bytes = iq_off / 8 (f32 is 4 bytes, blk = iq_off/32).
+            "mov {s_off}, {iq_off}",
             "shr {s_off}, 3",
 
-            // Load 4 input quant blocks.
-            "vmovdqu ymm0, [{iq0} + {q_off}]",
-            "vmovdqu ymm1, [{iq1} + {q_off}]",
-            "vmovdqu ymm2, [{iq2} + {q_off}]",
-            "vmovdqu ymm3, [{iq3} + {q_off}]",
-
-            // Pre-broadcast 4 input scales (s_off = b*4 bytes into input scale array).
+            // Pre-broadcast 4 input scales.
             "vbroadcastss ymm24, dword ptr [{is0} + {s_off}]",
             "vbroadcastss ymm25, dword ptr [{is1} + {s_off}]",
             "vbroadcastss ymm26, dword ptr [{is2} + {s_off}]",
             "vbroadcastss ymm27, dword ptr [{is3} + {s_off}]",
 
-            // Load all 4 f16 scales for this block (8 bytes) and convert to 4 f32.
-            // ws_base + s_off*2 = b*8 bytes into the f16 scale array.
-            "vcvtph2ps xmm29, qword ptr [{ws_base} + {s_off} * 2]",
+            // Load 4 f16 weight scales (8 bytes at offset +128 within the unified 136-byte block).
+            "vcvtph2ps xmm29, qword ptr [{wt_base} + {wt_off} + 128]",
 
-            // ---- Col 0 ----
-            // Weight: [wt_base + q_off*4 + 0]  (q_off*4 = b*128, col 0 at +0)
-            // Scale:  xmm29[0] = s0 for col 0
-            "vmovdqu ymm4, [{wt_base} + {q_off} * 4]",
+            // ---- Col 0 (row 0 of weight group) ----
+            "vmovdqu ymm4, [{wt_base} + {wt_off}]",
             "vbroadcastss ymm28, xmm29",
             "vpsignb ymm5, ymm4, ymm4",
             // row 0
@@ -2962,9 +2956,7 @@ unsafe fn microkernel_q8_4x4_il(
             "vfmadd231ps ymm11, ymm6, ymm7",
 
             // ---- Col 1 ----
-            // Weight: [wt_base + q_off*4 + 32]
-            // Scale:  xmm29[1] = s1, permute to lane 0 then broadcast
-            "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 32]",
+            "vmovdqu ymm4, [{wt_base} + {wt_off} + 32]",
             "vpermilps xmm30, xmm29, 0xe1",
             "vbroadcastss ymm28, xmm30",
             "vpsignb ymm5, ymm4, ymm4",
@@ -2998,9 +2990,7 @@ unsafe fn microkernel_q8_4x4_il(
             "vfmadd231ps ymm15, ymm6, ymm7",
 
             // ---- Col 2 ----
-            // Weight: [wt_base + q_off*4 + 64]
-            // Scale:  xmm29[2] = s2, permute to lane 0 then broadcast
-            "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 64]",
+            "vmovdqu ymm4, [{wt_base} + {wt_off} + 64]",
             "vpermilps xmm30, xmm29, 0xe2",
             "vbroadcastss ymm28, xmm30",
             "vpsignb ymm5, ymm4, ymm4",
@@ -3034,9 +3024,7 @@ unsafe fn microkernel_q8_4x4_il(
             "vfmadd231ps ymm19, ymm6, ymm7",
 
             // ---- Col 3 ----
-            // Weight: [wt_base + q_off*4 + 96]
-            // Scale:  xmm29[3] = s3, permute to lane 0 then broadcast
-            "vmovdqu ymm4, [{wt_base} + {q_off} * 4 + 96]",
+            "vmovdqu ymm4, [{wt_base} + {wt_off} + 96]",
             "vpermilps xmm30, xmm29, 0xe3",
             "vbroadcastss ymm28, xmm30",
             "vpsignb ymm5, ymm4, ymm4",
@@ -3069,11 +3057,12 @@ unsafe fn microkernel_q8_4x4_il(
             "vmulps ymm7, ymm27, ymm28",
             "vfmadd231ps ymm23, ymm6, ymm7",
 
-            "add {q_off}, 32",
-            "cmp {q_off}, {q_limit}",
+            "add {wt_off}, 136",
+            "add {iq_off}, 32",
+            "cmp {iq_off}, {q_limit}",
             "jb 2b",
 
-            // ---- Horizontal reduction (identical to microkernel_q8_4x4) ----
+            // ---- Horizontal reduction ----
             // Col 0: ymm8 → out[0], ymm9 → out[1], ymm10 → out[2], ymm11 → out[3]
             "vextractf128 xmm7, ymm8, 1",
             "vextractf128 xmm6, ymm8, 0",
@@ -3231,10 +3220,10 @@ unsafe fn microkernel_q8_4x4_il(
             is2 = in(reg) is2,
             is3 = in(reg) is3,
             wt_base = in(reg) wt_base,
-            ws_base = in(reg) ws_base,
             q_limit = in(reg) q_limit,
             out_ptr = in(reg) out.as_mut_ptr(),
-            q_off = out(reg) _,
+            wt_off = out(reg) _,
+            iq_off = out(reg) _,
             s_off = out(reg) _,
             out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
             out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
@@ -3258,12 +3247,12 @@ unsafe fn microkernel_q8_4x4_il(
 
 // ---- Q4_0 IL expand (Q4_0 IL → Q8_0 IL) ----
 
-/// Expand Q4_0 IL blocks → Q8_0 IL blocks using AVX-512 SIMD.
+/// Expand unified Q4_0 IL blocks → unified Q8_0 IL blocks using AVX-512 SIMD.
 ///
-/// Each Q4_0 IL block: 64 bytes (4 rows × 16 Q4 bytes).
-/// Each Q8_0 IL block: 128 bytes (4 rows × 32 Q8 bytes: lo nibbles first, then hi).
+/// Each Q4_0 IL block (input): 72 bytes = 64 bytes Q4 quants + 8 bytes f16 scales.
+/// Each Q8_0 IL block (output): 136 bytes = 128 bytes Q8 quants + 8 bytes f16 scales.
 ///
-/// Input layout: `q4_il[g * nb * 64 + blk * 64 .. + 64]`
+/// Input layout: `q4_il[g * nb * 72 + blk * 72 .. +72]`
 /// Output layout: `q8[g * nb * 128 + blk * 128 .. + 128]`
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
@@ -3277,16 +3266,14 @@ pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
     let minus8 = _mm512_set1_epi8(-8_i8);
     let total_blocks = chunk_groups * nb;
     for blk in 0..total_blocks {
-        let src = q4_il.as_ptr().add(blk * 64) as *const __m512i;
-        let dst = q8.as_mut_ptr().add(blk * 128);
+        let src = q4_il.as_ptr().add(blk * 72) as *const __m512i;
+        let dst = q8.as_mut_ptr().add(blk * 136);
+        // Load 64 bytes of Q4 quants (first 64 bytes of the 72-byte unified Q4 block).
         let q4 = _mm512_loadu_si512(src);
-        // Extract lo nibbles (byte & 0x0F) and center (subtract 8).
+        // Extract and center nibbles.
         let lo = _mm512_add_epi8(_mm512_and_si512(q4, mask0f), minus8);
-        // Extract hi nibbles (VPSRLW shifts each 16-bit word right 4; AND clears bleed).
         let hi = _mm512_add_epi8(_mm512_and_si512(_mm512_srli_epi16(q4, 4), mask0f), minus8);
-        // lo = [row0_lo(16b) | row1_lo(16b) | row2_lo(16b) | row3_lo(16b)]
-        // hi = [row0_hi(16b) | row1_hi(16b) | row2_hi(16b) | row3_hi(16b)]
-        // Write each row as [lo(16b) | hi(16b)] = 32 bytes.
+        // Write 4 rows of Q8 quants into the unified Q8 block (128 bytes at offset 0).
         macro_rules! store_row {
             ($r:literal, $off:expr) => {
                 let lo_r = _mm512_extracti32x4_epi32(lo, $r);
@@ -3299,6 +3286,10 @@ pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
         store_row!(1, 32);
         store_row!(2, 64);
         store_row!(3, 96);
+        // Copy 8 bytes of f16 scales from Q4 block offset +64 to Q8 block offset +128.
+        let scales_src = q4_il.as_ptr().add(blk * 72 + 64) as *const u64;
+        let scales_dst = dst.add(128) as *mut u64;
+        scales_dst.write_unaligned(scales_src.read_unaligned());
     }
 }
 
@@ -3320,7 +3311,6 @@ pub fn gemm_q4_tiled_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -3333,7 +3323,6 @@ pub fn gemm_q4_tiled_il(
             inp_quants,
             inp_scales,
             wt_quants_il,
-            wt_scales_il,
             m,
             n,
             n_stride,
@@ -3361,7 +3350,6 @@ unsafe fn gemm_q4_tiled_inner_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_quants_il: &[u8],
-    wt_scales_il: &[u16],
     m: usize,
     n: usize,
     n_stride: usize,
@@ -3370,7 +3358,7 @@ unsafe fn gemm_q4_tiled_inner_il(
 ) {
     const RM: usize = 4;
     const RN: usize = 4;
-    let bpr = num_blocks * 32; // input bytes per row (Q8_0, 32 bytes per block)
+    let bpr = num_blocks * 32;
 
     let m_full = m - m % RM;
     let n_full = n - n % RN;
@@ -3379,13 +3367,9 @@ unsafe fn gemm_q4_tiled_inner_il(
         for j in (0..n_full).step_by(RN) {
             let global_col = col_start + j;
             let group = global_col / 4;
-            let wt_base = wt_quants_il.as_ptr().add(group * num_blocks * 64);
-            let ws_base = wt_scales_il
-                .as_ptr()
-                .add(group * num_blocks * 4)
-                .cast::<u8>();
+            let wt_base = wt_quants_il.as_ptr().add(group * num_blocks * 72);
             microkernel_q4_4x4_il(
-                output, inp_quants, inp_scales, wt_base, ws_base, n_stride, num_blocks, bpr, i, j,
+                output, inp_quants, inp_scales, wt_base, n_stride, num_blocks, bpr, i, j,
             );
         }
         // N remainder: scalar fallback.
@@ -3396,8 +3380,8 @@ unsafe fn gemm_q4_tiled_inner_il(
             for ii in i..i + RM {
                 let mut acc = 0.0f32;
                 for blk in 0..num_blocks {
-                    let wq_off = group * num_blocks * 64 + blk * 64 + row_in_group * 16;
-                    let ws_off = group * num_blocks * 4 + blk * 4 + row_in_group;
+                    let wq_off = group * num_blocks * 72 + blk * 72 + row_in_group * 16;
+                    let scale_off = group * num_blocks * 72 + blk * 72 + 64 + row_in_group * 2;
                     let inp_off = ii * bpr + blk * 32;
                     let packed = &wt_quants_il[wq_off..wq_off + 16];
                     let iq = &inp_quants[inp_off..inp_off + 32];
@@ -3408,7 +3392,11 @@ unsafe fn gemm_q4_tiled_inner_il(
                         dot += ((packed[k] >> 4).wrapping_sub(8) as i8 as i32)
                             * (iq[k + 16] as i8 as i32);
                     }
-                    let ws = half::f16::from_bits(wt_scales_il[ws_off]).to_f32();
+                    let ws = half::f16::from_le_bytes([
+                        wt_quants_il[scale_off],
+                        wt_quants_il[scale_off + 1],
+                    ])
+                    .to_f32();
                     acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * ws;
                 }
                 output[ii * n_stride + jj] = acc;
@@ -3424,18 +3412,23 @@ unsafe fn gemm_q4_tiled_inner_il(
             let row_in_group = global_col % 4;
             let mut acc = 0.0f32;
             for blk in 0..num_blocks {
-                let wq_off = group * num_blocks * 64 + blk * 64 + row_in_group * 16;
-                let ws_off = group * num_blocks * 4 + blk * 4 + row_in_group;
+                let wq_off = group * num_blocks * 72 + blk * 72 + row_in_group * 16;
+                let scale_off = group * num_blocks * 72 + blk * 72 + 64 + row_in_group * 2;
                 let inp_off = ii * bpr + blk * 32;
                 let packed = &wt_quants_il[wq_off..wq_off + 16];
                 let iq = &inp_quants[inp_off..inp_off + 32];
                 let mut dot = 0i32;
                 for k in 0..16 {
-                    dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32) * (iq[k] as i8 as i32);
-                    dot +=
-                        ((packed[k] >> 4).wrapping_sub(8) as i8 as i32) * (iq[k + 16] as i8 as i32);
+                    dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32)
+                        * (iq[k] as i8 as i32);
+                    dot += ((packed[k] >> 4).wrapping_sub(8) as i8 as i32)
+                        * (iq[k + 16] as i8 as i32);
                 }
-                let ws = half::f16::from_bits(wt_scales_il[ws_off]).to_f32();
+                let ws = half::f16::from_le_bytes([
+                    wt_quants_il[scale_off],
+                    wt_quants_il[scale_off + 1],
+                ])
+                .to_f32();
                 acc += (dot as f32) * inp_scales[ii * num_blocks + blk] * ws;
             }
             output[ii * n_stride + jj] = acc;
@@ -3443,14 +3436,11 @@ unsafe fn gemm_q4_tiled_inner_il(
     }
 }
 
-/// 4×4 Q4_0×Q8_0 microkernel using compact Q4_0 IL format.
+/// 4×4 Q4_0×Q8_0 microkernel using unified Q4_0 IL format (72 bytes/block: 64 quant + 8 f16).
 ///
-/// `wt_base`: pointer to `il[group * nb * 64]`. At block b, col k (row k within group):
-///   16 Q4_0 bytes at `wt_base + b*64 + k*16`. Addressed as `[{wt_base} + {q_off}*4 + k*16]`
-///   where `q_off` = b*16 (advances by 16 per block, vs 32 for Q8_0).
-///
-/// `ws_base`: same f16 scale format as Q8_0 IL: `ws_base + b*8 + k*2`.
-///   Addressed as `[{ws_base} + {s_off}*2]` where `s_off = q_off/4` (shr 2, vs shr 3).
+/// `wt_base`: pointer to `il[group * nb * 72]`. At block b, col k (row k within group):
+///   16 Q4_0 bytes at `wt_base + b*72 + k*16`; 4 f16 scales at `wt_base + b*72 + 64`.
+///   Uses two counters: `wt_off` (steps by 72) and `iq_off` (steps by 32).
 ///
 /// `ymm31`: packed constant (loaded from `Q4_IL_UNPACK_CONSTS`):
 ///   xmm31 (low 128 bits) = 0x0F mask (for nibble extraction).
@@ -3467,7 +3457,6 @@ unsafe fn microkernel_q4_4x4_il(
     inp_quants: &[u8],
     inp_scales: &[f32],
     wt_base: *const u8,
-    ws_base: *const u8,
     n: usize,
     num_blocks: usize,
     bytes_per_row: usize,
@@ -3484,7 +3473,7 @@ unsafe fn microkernel_q4_4x4_il(
     let is2 = inp_scales.as_ptr().add((i + 2) * num_blocks).cast::<u8>();
     let is3 = inp_scales.as_ptr().add((i + 3) * num_blocks).cast::<u8>();
 
-    let q_limit = num_blocks * 16;
+    let q_limit = num_blocks * 32;
 
     let mut out = [0.0f32; 4 * 4];
 
@@ -3507,17 +3496,18 @@ unsafe fn microkernel_q4_4x4_il(
             "vpxord ymm22, ymm22, ymm22",
             "vpxord ymm23, ymm23, ymm23",
 
-            "xor {q_off:e}, {q_off:e}",
+            "xor {wt_off:e}, {wt_off:e}",
+            "xor {iq_off:e}, {iq_off:e}",
 
             "2:",
-            "mov {s_off}, {q_off}",
-            "shr {s_off}, 2",           // s_off = blk*4 (q_off/4, since q_off=blk*16)
+            "mov {s_off}, {iq_off}",
+            "shr {s_off}, 3",           // s_off = blk*4 (iq_off/8 = byte offset into f32 array)
 
             // Load 4 input quant blocks (32 bytes each = one Q8_0 block per row).
-            "vmovdqu ymm0, [{iq0} + {q_off} * 2]",  // q_off*2 = blk*32
-            "vmovdqu ymm1, [{iq1} + {q_off} * 2]",
-            "vmovdqu ymm2, [{iq2} + {q_off} * 2]",
-            "vmovdqu ymm3, [{iq3} + {q_off} * 2]",
+            "vmovdqu ymm0, [{iq0} + {iq_off}]",
+            "vmovdqu ymm1, [{iq1} + {iq_off}]",
+            "vmovdqu ymm2, [{iq2} + {iq_off}]",
+            "vmovdqu ymm3, [{iq3} + {iq_off}]",
 
             // Input scales: s_off = blk*4 = byte offset into f32 array (4 bytes per f32).
             "vbroadcastss ymm24, dword ptr [{is0} + {s_off}]",
@@ -3525,12 +3515,12 @@ unsafe fn microkernel_q4_4x4_il(
             "vbroadcastss ymm26, dword ptr [{is2} + {s_off}]",
             "vbroadcastss ymm27, dword ptr [{is3} + {s_off}]",
 
-            // Weight scales: s_off*2 = blk*8 = byte offset into f16 array (4 f16 = 8 bytes).
-            "vcvtph2ps xmm29, qword ptr [{ws_base} + {s_off} * 2]",
+            // Weight scales: 4 f16 inline at wt_off+64 in the unified 72-byte block.
+            "vcvtph2ps xmm29, qword ptr [{wt_base} + {wt_off} + 64]",
 
             // ---- Col 0 (row 0 of weight group) ----
-            // 16 Q4_0 bytes at wt_base + q_off*4 + 0*16.
-            "vmovdqu xmm4, [{wt_base} + {q_off} * 4]",
+            // 16 Q4_0 bytes at wt_base + wt_off + 0*16.
+            "vmovdqu xmm4, [{wt_base} + {wt_off}]",
             // lo nibbles: byte & mask_0f.
             "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
             // Center lo nibbles: lo + (-8).
@@ -3575,7 +3565,7 @@ unsafe fn microkernel_q4_4x4_il(
             "vfmadd231ps ymm11, ymm6, ymm7",
 
             // ---- Col 1 (row 1 of weight group) ----
-            "vmovdqu xmm4, [{wt_base} + {q_off} * 4 + 16]",
+            "vmovdqu xmm4, [{wt_base} + {wt_off} + 16]",
             "vpermilps xmm30, xmm29, 0xe1",        // scale[1] → lane 0
             "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
             "vpaddb xmm6, xmm6, xmmword ptr [{q4_consts} + 16]",
@@ -3615,7 +3605,7 @@ unsafe fn microkernel_q4_4x4_il(
             "vfmadd231ps ymm15, ymm6, ymm7",
 
             // ---- Col 2 (row 2 of weight group) ----
-            "vmovdqu xmm4, [{wt_base} + {q_off} * 4 + 32]",
+            "vmovdqu xmm4, [{wt_base} + {wt_off} + 32]",
             "vpermilps xmm30, xmm29, 0xe2",        // scale[2] → lane 0
             "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
             "vpaddb xmm6, xmm6, xmmword ptr [{q4_consts} + 16]",
@@ -3655,7 +3645,7 @@ unsafe fn microkernel_q4_4x4_il(
             "vfmadd231ps ymm19, ymm6, ymm7",
 
             // ---- Col 3 (row 3 of weight group) ----
-            "vmovdqu xmm4, [{wt_base} + {q_off} * 4 + 48]",
+            "vmovdqu xmm4, [{wt_base} + {wt_off} + 48]",
             "vpermilps xmm30, xmm29, 0xe3",        // scale[3] → lane 0
             "vpand xmm6, xmm4, xmmword ptr [{q4_consts}]",
             "vpaddb xmm6, xmm6, xmmword ptr [{q4_consts} + 16]",
@@ -3694,8 +3684,9 @@ unsafe fn microkernel_q4_4x4_il(
             "vmulps ymm7, ymm27, ymm28",
             "vfmadd231ps ymm23, ymm6, ymm7",
 
-            "add {q_off}, 16",
-            "cmp {q_off}, {q_limit}",
+            "add {wt_off}, 72",
+            "add {iq_off}, 32",
+            "cmp {iq_off}, {q_limit}",
             "jb 2b",
 
             // ---- Horizontal reduction (identical to microkernel_q8_4x4_il) ----
@@ -3857,10 +3848,10 @@ unsafe fn microkernel_q4_4x4_il(
             is2 = in(reg) is2,
             is3 = in(reg) is3,
             wt_base = in(reg) wt_base,
-            ws_base = in(reg) ws_base,
             q_limit = in(reg) q_limit,
             out_ptr = in(reg) out.as_mut_ptr(),
-            q_off = out(reg) _,
+            iq_off = out(reg) _,
+            wt_off = out(reg) _,
             s_off = out(reg) _,
             out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
             out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
