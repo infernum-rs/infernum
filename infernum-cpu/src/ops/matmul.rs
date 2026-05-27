@@ -2213,8 +2213,8 @@ fn q8_gemv_body_il(
                 .zip(iq.iter())
                 .map(|(&w, &a)| (w as i8 as i32) * (a as i8 as i32))
                 .sum();
-            let ws = half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]])
-                .to_f32();
+            let ws =
+                half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]]).to_f32();
             acc += (dot as f32) * inp_scales[blk] * ws;
         }
         chunk[i] = acc;
@@ -2248,7 +2248,15 @@ fn q8_gemv_parallel_il(
             let ch = unsafe {
                 std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
             };
-            q8_gemv_body_il(ch, start, end - start, inp_quants, inp_scales, weight_il, nb);
+            q8_gemv_body_il(
+                ch,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_il,
+                nb,
+            );
         });
     }
 }
@@ -2297,8 +2305,8 @@ fn q4_gemv_body_il(
                 })
                 .sum();
             let scale_off = blk * 72 + 64 + r * 2;
-            let ws = half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]])
-                .to_f32();
+            let ws =
+                half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]]).to_f32();
             acc += (dot as f32) * inp_scales[blk] * ws;
         }
         chunk[i] = acc;
@@ -2332,7 +2340,15 @@ fn q4_gemv_parallel_il(
             let ch = unsafe {
                 std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
             };
-            q4_gemv_body_il(ch, start, end - start, inp_quants, inp_scales, weight_il, nb);
+            q4_gemv_body_il(
+                ch,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_il,
+                nb,
+            );
         });
     }
 }

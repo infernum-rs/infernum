@@ -3270,9 +3270,14 @@ pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
     let mask0f = _mm512_set1_epi8(0x0F_u8 as i8);
     let minus8 = _mm512_set1_epi8(-8_i8);
     let total_blocks = chunk_groups * nb;
+    // Prefetch distance: 20 blocks × 72 bytes = 1440 bytes ≈ 23 cache lines.
+    // Hides ~100-cycle DRAM latency at ~5 cycles/block in the expand loop.
+    const PF: usize = 20;
     for blk in 0..total_blocks {
         let src = q4_il.as_ptr().add(blk * 72) as *const __m512i;
         let dst = q8.as_mut_ptr().add(blk * 136);
+        // Prefetch next Q4 blocks from DRAM/L3 into L1.
+        _mm_prefetch(q4_il.as_ptr().add((blk + PF) * 72).cast(), _MM_HINT_T0);
         // Load 64 bytes of Q4 quants (first 64 bytes of the 72-byte unified Q4 block).
         let q4 = _mm512_loadu_si512(src);
         // Extract and center nibbles.
@@ -3424,10 +3429,9 @@ unsafe fn gemm_q4_tiled_inner_il(
                 let iq = &inp_quants[inp_off..inp_off + 32];
                 let mut dot = 0i32;
                 for k in 0..16 {
-                    dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32)
-                        * (iq[k] as i8 as i32);
-                    dot += ((packed[k] >> 4).wrapping_sub(8) as i8 as i32)
-                        * (iq[k + 16] as i8 as i32);
+                    dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32) * (iq[k] as i8 as i32);
+                    dot +=
+                        ((packed[k] >> 4).wrapping_sub(8) as i8 as i32) * (iq[k + 16] as i8 as i32);
                 }
                 let ws = half::f16::from_le_bytes([
                     wt_quants_il[scale_off],
@@ -4186,10 +4190,10 @@ pub fn vec_softcap_inplace(data: &mut [f32], cap: f32) {
 #[allow(clippy::many_single_char_names)]
 unsafe fn vec_softcap_inplace_inner(data: &mut [f32], cap: f32) {
     use std::arch::x86_64::{
-        __m512, __m512i, _mm512_add_epi32, _mm512_add_ps, _mm512_castps_si512,
-        _mm512_castsi512_ps, _mm512_cvtepi32_ps, _mm512_cvtps_epi32, _mm512_div_ps,
-        _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_max_ps, _mm512_min_ps, _mm512_mul_ps,
-        _mm512_set1_ps, _mm512_slli_epi32, _mm512_storeu_ps, _mm512_sub_ps,
+        __m512, __m512i, _mm512_add_epi32, _mm512_add_ps, _mm512_castps_si512, _mm512_castsi512_ps,
+        _mm512_cvtepi32_ps, _mm512_cvtps_epi32, _mm512_div_ps, _mm512_fmadd_ps, _mm512_loadu_ps,
+        _mm512_max_ps, _mm512_min_ps, _mm512_mul_ps, _mm512_set1_ps, _mm512_slli_epi32,
+        _mm512_storeu_ps, _mm512_sub_ps,
     };
 
     let n = data.len();
@@ -4229,8 +4233,7 @@ unsafe fn vec_softcap_inplace_inner(data: &mut [f32], cap: f32) {
         let poly: __m512 = _mm512_fmadd_ps(poly, f, c0);
         let n_i: __m512i = _mm512_cvtps_epi32(n_f);
         let shift: __m512i = _mm512_slli_epi32(n_i, 23);
-        let exp_v: __m512 =
-            _mm512_castsi512_ps(_mm512_add_epi32(_mm512_castps_si512(poly), shift));
+        let exp_v: __m512 = _mm512_castsi512_ps(_mm512_add_epi32(_mm512_castps_si512(poly), shift));
 
         // tanh(x/cap) = (exp_v - 1) / (exp_v + 1); result = cap * tanh(x/cap).
         let numer: __m512 = _mm512_sub_ps(exp_v, one);

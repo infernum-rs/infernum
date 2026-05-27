@@ -964,8 +964,8 @@ pub fn dot_q8_q8_4row_il(
                 dot += (*a as i8 as i32) * (*w as i32);
             }
             let scale_off = wq_off + 128 + r * 2;
-            let ws = half::f16::from_le_bytes([il_quants[scale_off], il_quants[scale_off + 1]])
-                .to_f32();
+            let ws =
+                half::f16::from_le_bytes([il_quants[scale_off], il_quants[scale_off + 1]]).to_f32();
             acc[r] += (dot as f32) * inp_scale * ws;
         }
     }
