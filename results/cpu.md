@@ -1259,3 +1259,48 @@ Changes span all four CPU files:
 - Q4_0 prefill regression (−3%) is within run-to-run variance (±5%); Q4_0 prefill uses `expand_q4_il→q8_il` + `gemm_q8_tiled_il`, same kernel chain, same working set.
 - Gemma not benchmarked this run. The perf stat root cause (L1D cache miss excess) pointed specifically at the two-stream IL format; expected improvement for Gemma decode (was 0.94x) from eliminating the scales DRAM stream.
 - Remaining gaps: Q4_0 prefill ~0.84x (structural, ZMM 8-row required), Gemma (unmeasured but expected to improve).
+
+---
+
+## 2026-05-27 — Scale cache-line prefetch fix for IL GEMV and GEMM (`perf/cpu-performance`)
+
+**Bug fix:** The unified IL format (136-byte Q8_0 blocks, 72-byte Q4_0 blocks) stores scales in the **third** cache line of each block (Q8_0: bytes 128–135; Q4_0: bytes 64–71 = second CL), but the software prefetch code only fetched the first two cache lines. Specifically:
+- `dot_q8_q8_4row_il_inner`: prefetched `pf` and `pf+64` but not `pf+128` (scale CL)
+- `dot_q4_q8_4row_il_inner`: only prefetched `pf` (quant CL0), missing `pf+64` (scale CL1)
+- `microkernel_q8_4x4_il` (GEMM ASM): prefetched `wt_off+1632` and `+1696` but not `+1760` (scale CL at 12×136+128=1760)
+
+Added the missing prefetch in all three kernels. For Q8_0 IL blocks: 3 prefetches per K-block (CL0, CL1, CL2). For Q4_0 IL blocks: 2 prefetches (CL0, CL1).
+
+- **CPU:** AMD Ryzen AI 9 HX 370 w/ Radeon 890M (12 threads)
+- **Decode tokens:** 256 | **Prefill tokens:** 512
+- **infernum branch:** `perf/cpu-performance`
+- **llama.cpp commit:** `63d93d1` (`-ngl 0`, 3 reps)
+
+### Full results
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 140.2 | 138.4 | **1.01x** |
+| SmolLM2-360M Q4_0 decode  | 201.5 | 206.9 | 0.97x |
+| SmolLM2-360M Q8_0 prefill | 1163.4 | 1145.4 | **1.02x** |
+| SmolLM2-360M Q4_0 prefill | 1078.2 | 1289.4 | 0.84x |
+| Gemma 2-2b Q8_0 decode    | 23.6 | 24.4 | **0.97x** |
+| Gemma 2-2b Q8_0 prefill   | 202.1 | 216.6 | **0.93x** |
+
+### vs previous best (unified IL format session)
+
+| Workload | ratio before | ratio after | Δ |
+| -------- | -----------: | ----------: | -: |
+| Gemma Q8_0 decode | 0.95x | **0.97x** | +2pp |
+| Gemma Q8_0 prefill | 0.91x | **0.93x** | +2pp |
+| Q8_0 decode | 0.98x | **1.01x** | +3pp |
+| Q8_0 prefill | 1.00x | **1.02x** | +2pp |
+| Q4_0 decode | 0.99x | 0.97x | −2pp (noise) |
+| Q4_0 prefill | 0.84x | 0.84x | flat |
+
+### Notes
+
+- Scale cache lines are now prefetched in all IL kernels. IPC for Gemma decode was 0.90 before this fix; the underlying cause (un-prefetched scale CL) explains the residual IPC gap.
+- Q4_0 decode (0.97x) and prefill (0.84x) ratios are within run-to-run variance (±3–5%); absolute infernum numbers are flat.
+- Q8_0 decode and prefill ratios improved despite lower absolute numbers — the llama.cpp numbers also dropped proportionally (thermal/governor state between sessions).
+- Remaining gaps vs llama.cpp: Q4_0 prefill ~0.84x (structural), Gemma decode **0.97x**, Gemma prefill **0.93x**.

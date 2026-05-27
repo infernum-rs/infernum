@@ -573,8 +573,8 @@ unsafe fn dot_q8_q8_4row_il_inner(
     let mut total3 = _mm256_setzero_ps();
 
     // Prefetch 12 blocks ahead. Each block is 136 bytes = 3 partial cache lines;
-    // the quant data spans bytes 0..127 (2 cache lines) and scale 128..135 (in third).
-    // Prefetch the first two cache lines (0 and 64); the third shares a line with wq_off+64.
+    // Quant data: bytes 0..127 (CL0 = 0..63, CL1 = 64..127). Scale: bytes 128..135 (CL2).
+    // All three cache lines must be prefetched; hardware prefetcher cannot bridge CL2.
     const PF: usize = 12;
     for blk in 0..nb {
         let inp_off = blk * 32;
@@ -584,6 +584,7 @@ unsafe fn dot_q8_q8_4row_il_inner(
             let pf = (blk + PF) * 136;
             _mm_prefetch::<_MM_HINT_T0>(wq.add(pf).cast());
             _mm_prefetch::<_MM_HINT_T0>(wq.add(pf + 64).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wq.add(pf + 128).cast()); // scale at CL2
         }
 
         let inp_scale = *input_scales.get_unchecked(blk);
@@ -812,15 +813,17 @@ unsafe fn dot_q4_q8_4row_il_inner(
     let mut total3 = _mm256_setzero_ps();
 
     // Each block occupies 72 bytes (64 bytes quants + 8 bytes f16 scales).
-    // Bytes 0..63: quants (4 rows × 16 bytes); bytes 64..71: 4 f16 scales.
-    // Fits in two 64-byte cache lines: first covers quants 0..63, second covers quants+scales.
+    // Bytes 0..63: quants (4 rows × 16 bytes, CL0); bytes 64..71: 4 f16 scales (CL1).
+    // Two cache lines per block: prefetch both CL0 (quants) and CL1 (scales).
     const PF: usize = 12;
     for blk in 0..nb {
         let inp_off = blk * 32;
         let wq_off = blk * 72;
 
         if blk + PF < nb {
-            _mm_prefetch::<_MM_HINT_T0>(wq.add((blk + PF) * 72).cast());
+            let pf = (blk + PF) * 72;
+            _mm_prefetch::<_MM_HINT_T0>(wq.add(pf).cast());
+            _mm_prefetch::<_MM_HINT_T0>(wq.add(pf + 64).cast()); // scale CL1
         }
 
         let inp_scale = *input_scales.get_unchecked(blk);
@@ -2900,8 +2903,10 @@ unsafe fn microkernel_q8_4x4_il(
 
             "2:",
             // Prefetch weight data 12 IL-blocks ahead (12 * 136 = 1632 bytes).
+            // Three cache lines per block: CL0=0..63, CL1=64..127, CL2=128..135 (scales).
             "prefetcht0 [{wt_base} + {wt_off} + 1632]",
             "prefetcht0 [{wt_base} + {wt_off} + 1696]",
+            "prefetcht0 [{wt_base} + {wt_off} + 1760]",
 
             // Load 4 input quant blocks (32 bytes each, iq_off = blk * 32).
             "vmovdqu ymm0, [{iq0} + {iq_off}]",
