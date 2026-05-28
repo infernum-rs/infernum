@@ -41,7 +41,16 @@ const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
     "paged_decode_attention_f32",
     "paged_decode_attention_f16",
     "paged_decode_attention_bf16",
+    "paged_decode_attn_part_bf16",
+    "paged_decode_attn_reduce_bf16",
 ];
+
+/// Minimum sequence length to use the partitioned kernel.
+///
+/// Below this threshold the standard kernel (15 blocks for SmolLM2) has
+/// lower launch overhead and the partitioned overhead (extra allocs +
+/// reduction kernel) is not worth it.
+const PARTITIONED_ATTN_MIN_ACTIVE_LEN: usize = 32;
 
 fn kernel_suffix(dtype: DType) -> &'static str {
     match dtype {
@@ -227,10 +236,13 @@ fn launch_paged_decode(
         .get_func("paged_decode_attention", &kernel_name)
         .unwrap();
 
-    let threads = 256_usize.min(max_active_len.next_power_of_two()).max(1);
+    // Allocate for the full KV-cache capacity so the same config is safe for
+    // all replay steps when captured inside a CUDA graph.
+    let max_capacity = max_blocks_per_seq * block_size;
+    let threads = 256_usize.min(max_capacity.next_power_of_two()).max(32);
 
-    // Shared memory: s_q (head_dim) + s_weights (max_active_len) + s_scratch (threads)
-    let shared_mem = (head_dim + max_active_len + threads) * std::mem::size_of::<f32>();
+    // Shared memory: s_q (head_dim) + s_weights (max_capacity) + s_scratch (threads)
+    let shared_mem = (head_dim + max_capacity + threads) * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
         grid_dim: (num_heads as u32, batch_size as u32, 1),
@@ -455,8 +467,22 @@ pub fn paged_attention_decode_from_tensor(
         .get_func("paged_decode_attention", &kernel_name)
         .unwrap();
 
-    let threads = 256_usize.min(max_active_len.next_power_of_two()).max(1);
-    let shared_mem = (head_dim + max_active_len + threads) * std::mem::size_of::<f32>();
+    // Use KV-cache capacity (max_blocks_per_seq × block_size) for thread count and
+    // shared-memory allocation, NOT the current max_active_len.
+    //
+    // When this kernel is captured inside a CUDA graph the current seq_len is small
+    // (often just a few tokens), but on every subsequent replay seq_len grows as the
+    // sequence gets longer.  If shared memory is sized only for the capture-time
+    // seq_len, any replay with a longer sequence silently overflows shared memory,
+    // producing wrong attention outputs and eventual GPU faults (the pre-existing
+    // 1024-token crash).
+    //
+    // Sizing for the full KV-cache capacity fixes the correctness bug and also gives
+    // more thread-level parallelism (256 threads ÷ ~264 active tokens ≈ 1 token per
+    // thread vs. 16 threads → 16 tokens per thread with the old sizing).
+    let max_capacity = max_blocks_per_seq * block_size;
+    let threads = 256_usize.min(max_capacity.next_power_of_two()).max(32);
+    let shared_mem = (head_dim + max_capacity + threads) * std::mem::size_of::<f32>();
 
     let cfg = LaunchConfig {
         grid_dim: (num_heads as u32, batch_size as u32, 1),
