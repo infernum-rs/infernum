@@ -68,11 +68,11 @@ Both infernum and llama.cpp now use batch GEMM (`pp512`, M=512, tensor-core elig
 
 | Model | Format | infernum | llama.cpp | ratio |
 | ----- | ------ | -------: | --------: | ----: |
-| SmolLM2-360M-Instruct | Q8_0 GGUF | 8 787 | 20 032 | **0.44x** |
-| SmolLM2-360M-Instruct | Q4_0 GGUF | 8 879 | 21 904 | **0.41x** |
+| SmolLM2-360M-Instruct | Q8_0 GGUF | 9 221 | 20 032 | **0.46x** |
+| SmolLM2-360M-Instruct | Q4_0 GGUF | 9 118 | 21 904 | **0.42x** |
 | SmolLM2-360M | BF16 SafeTensors | 9 256 | — | — |
-| Llama-3.2-1B-Instruct | Q8_0 GGUF | 6 496 | 12 964 | **0.50x** |
-| Llama-3.2-1B-Instruct | Q4_0 GGUF | 6 564 | 13 450 | **0.49x** |
+| Llama-3.2-1B-Instruct | Q8_0 GGUF | 7 141 | 12 964 | **0.55x** |
+| Llama-3.2-1B-Instruct | Q4_0 GGUF | 7 187 | 13 450 | **0.53x** |
 | Llama-3.2-1B | BF16 SafeTensors | — | — | — |
 
 ---
@@ -85,6 +85,8 @@ Both infernum and llama.cpp now use batch GEMM (`pp512`, M=512, tensor-core elig
 - **Q4_0 input-quantisation deduplication (commit `0f3d156`)**: extended Q8_0 deduplication to Q4_0.
 - **Native quantised CONCAT + GGUF QKV fusion (commit `9002f38`)**: Q,K,V weights concatenated, fused into one GEMV per layer. Q8_0: +3.4%, Q4_0: +5.2%.
 - **Batch GEMM prefill**: `build_prefill_graph_with_kv_cuda` builds a single seq_len=512 graph, executes all projections as M=512 GEMMs, then scatters K/V into paged cache via `append_paged`.
+- **BF16 cuBLAS GEMM (commit `c9830c0`)**: Q8_0/Q4_0 weights dequantized to BF16 (cached), activations passed as BF16 directly; eliminates BF16→F16 and F32→BF16 casts. +5% prefill vs prior F16 path.
+- **Remaining prefill gap**: cuBLAS achieves ~6-7% of L4 BF16 peak for M=512 due to few blocks per SM (32–120 blocks for 58 SMs). Closing further would require cuBLASLt with cached per-shape algorithm or custom CUTLASS/chunked-prefill.
 - **Q4_0 GGUF works** (was crashing with `UnsupportedDtype: GGML type 3`).
 - **BF16 decode:** no same-format llama.cpp number.
 
