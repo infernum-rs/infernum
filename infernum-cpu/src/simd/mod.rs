@@ -201,10 +201,48 @@ pub fn vec_silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Approximate GELU fused with element-wise multiply: `out[i] = gelu_approx(gate[i]) * up[i]`.
+///
+/// Dispatches to AVX-512F vectorized path (degree-4 polynomial exp) when available,
+/// otherwise falls back to scalar `tanh`-based approximation.
+#[inline]
+pub fn vec_gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            avx512::vec_gelu_mul(gate, up, out);
+            return;
+        }
+    }
+    // Scalar fallback.
+    for ((g, u), o) in gate.iter().zip(up.iter()).zip(out.iter_mut()) {
+        let inner = 1.595_769_f32 * (g + 0.044_715 * g * g * g);
+        let sigmoid = 1.0 / (1.0 + (-inner).exp());
+        *o = g * sigmoid * u;
+    }
+}
+
 /// In-place softmax: subtract max, exp, normalize by 1/sum.
 ///
 /// Dispatches to AVX-512 vectorized exp when available.
 #[inline]
+pub fn vec_softcap_inplace(data: &mut [f32], cap: f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            avx512::vec_softcap_inplace(data, cap);
+            return;
+        }
+    }
+    // Scalar fallback.
+    let inv_cap = 1.0 / cap;
+    for x in data.iter_mut() {
+        *x = cap * (*x * inv_cap).tanh();
+    }
+}
+
 pub fn vec_softmax_inplace(data: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -420,6 +458,7 @@ pub fn gemm_q8_tiled(
     wt_scales: &[f32],
     m: usize,
     n: usize,
+    n_stride: usize,
     num_blocks: usize,
     bytes_per_row: usize,
 ) {
@@ -434,6 +473,7 @@ pub fn gemm_q8_tiled(
                 wt_scales,
                 m,
                 n,
+                n_stride,
                 num_blocks,
                 bytes_per_row,
             );
@@ -448,7 +488,181 @@ pub fn gemm_q8_tiled(
         for col in 0..n {
             let wq = &wt_quants[col * bytes_per_row..(col + 1) * bytes_per_row];
             let ws = &wt_scales[col * num_blocks..(col + 1) * num_blocks];
-            output[row * n + col] = dot_q8_q8_row(iq, is, wq, ws);
+            output[row * n_stride + col] = dot_q8_q8_row(iq, is, wq, ws);
+        }
+    }
+}
+
+/// Tiled Q8×Q8 GEMM using 4-row-interleaved weight format (unified 136-byte blocks).
+///
+/// `wt_quants_il` is the full interleaved weight matrix with inline f16 scales.
+/// `col_start` must be a multiple of 4.
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+pub fn gemm_q8_tiled_il(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants_il: &[u8],
+    m: usize,
+    n: usize,
+    n_stride: usize,
+    num_blocks: usize,
+    bytes_per_row: usize,
+    col_start: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::gemm_q8_tiled_il(
+                output,
+                inp_quants,
+                inp_scales,
+                wt_quants_il,
+                m,
+                n,
+                n_stride,
+                num_blocks,
+                bytes_per_row,
+                col_start,
+            );
+            return;
+        }
+    }
+
+    // Scalar fallback (non-VNNI CPUs): row-by-row dot products using IL layout.
+    let nb = num_blocks;
+    for row in 0..m {
+        let iq = &inp_quants[row * bytes_per_row..(row + 1) * bytes_per_row];
+        let is_ = &inp_scales[row * nb..(row + 1) * nb];
+        for col in 0..n {
+            let global_col = col_start + col;
+            let group = global_col / 4;
+            let row_in_group = global_col % 4;
+            let mut acc = 0.0f32;
+            for blk in 0..nb {
+                let wq_off = group * nb * 136 + blk * 136 + row_in_group * 32;
+                let scale_off = group * nb * 136 + blk * 136 + 128 + row_in_group * 2;
+                let wq = &wt_quants_il[wq_off..wq_off + 32];
+                let iq_blk = &iq[blk * 32..(blk + 1) * 32];
+                let mut dot = 0i32;
+                for (w, a) in wq.iter().zip(iq_blk.iter()) {
+                    dot += i32::from(i8::from_ne_bytes([*w])) * i32::from(i8::from_ne_bytes([*a]));
+                }
+                let ws = half::f16::from_le_bytes([
+                    wt_quants_il[scale_off],
+                    wt_quants_il[scale_off + 1],
+                ])
+                .to_f32();
+                acc += (dot as f32) * is_[blk] * ws;
+            }
+            output[row * n_stride + col] = acc;
+        }
+    }
+}
+
+/// Expand Q4_0 IL → Q8_0 IL in-place using AVX-512 when available, otherwise scalar.
+///
+/// `q4_il`: source slice starting at the group-aligned offset (already trimmed to `chunk_groups`).
+/// `q8`: destination scratch buffer of length `chunk_groups * nb * 128`.
+pub fn expand_q4_il_to_q8_il_into(q4_il: &[u8], chunk_groups: usize, nb: usize, q8: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            unsafe {
+                avx512::expand_q4_il_to_q8_il_avx512(q4_il, chunk_groups, nb, q8);
+            }
+            return;
+        }
+        // AVX2 scalar fallback.
+        expand_q4_il_scalar(q4_il, chunk_groups, nb, q8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        expand_q4_il_scalar(q4_il, chunk_groups, nb, q8);
+    }
+}
+
+fn expand_q4_il_scalar(q4_il: &[u8], chunk_groups: usize, nb: usize, q8: &mut [u8]) {
+    let total_blocks = chunk_groups * nb;
+    for blk in 0..total_blocks {
+        let src_base = blk * 72;
+        let dst_base = blk * 136;
+        for r in 0..4 {
+            let packed = &q4_il[src_base + r * 16..src_base + r * 16 + 16];
+            let dst = &mut q8[dst_base + r * 32..dst_base + r * 32 + 32];
+            for i in 0..16 {
+                dst[i] = (packed[i] & 0x0F).wrapping_sub(8);
+                dst[i + 16] = (packed[i] >> 4).wrapping_sub(8);
+            }
+        }
+        // Copy 8-byte inline f16 scales from Q4 block (+64) into Q8 block (+128).
+        q8[dst_base + 128..dst_base + 136].copy_from_slice(&q4_il[src_base + 64..src_base + 72]);
+    }
+}
+
+/// Q4_0 IL tiled GEMM: reads Q4_0 IL directly (unified 72-byte blocks: 64 quant + 8 f16).
+/// Weight layout: `wt_quants_il[group * nb * 72 + blk * 72 + row * 16 .. +16]`.
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+pub fn gemm_q4_tiled_il(
+    output: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    wt_quants_il: &[u8],
+    m: usize,
+    n: usize,
+    n_stride: usize,
+    num_blocks: usize,
+    col_start: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::gemm_q4_tiled_il(
+                output,
+                inp_quants,
+                inp_scales,
+                wt_quants_il,
+                m,
+                n,
+                n_stride,
+                num_blocks,
+                col_start,
+            );
+            return;
+        }
+    }
+
+    // Scalar fallback: unpack Q4_0 nibbles and dot inline.
+    let nb = num_blocks;
+    let bpr = nb * 32;
+    for row in 0..m {
+        let iq = &inp_quants[row * bpr..(row + 1) * bpr];
+        let is_ = &inp_scales[row * nb..(row + 1) * nb];
+        for col in 0..n {
+            let global_col = col_start + col;
+            let group = global_col / 4;
+            let row_in_group = global_col % 4;
+            let mut acc = 0.0f32;
+            for blk in 0..nb {
+                let wq_off = group * nb * 72 + blk * 72 + row_in_group * 16;
+                let scale_off = group * nb * 72 + blk * 72 + 64 + row_in_group * 2;
+                let packed = &wt_quants_il[wq_off..wq_off + 16];
+                let iq_blk = &iq[blk * 32..(blk + 1) * 32];
+                let mut dot = 0i32;
+                for k in 0..16 {
+                    dot += i32::from(i8::from_ne_bytes([(packed[k] & 0x0F).wrapping_sub(8)]))
+                        * i32::from(i8::from_ne_bytes([iq_blk[k]]));
+                    dot += i32::from(i8::from_ne_bytes([(packed[k] >> 4).wrapping_sub(8)]))
+                        * i32::from(i8::from_ne_bytes([iq_blk[k + 16]]));
+                }
+                let ws = half::f16::from_le_bytes([
+                    wt_quants_il[scale_off],
+                    wt_quants_il[scale_off + 1],
+                ])
+                .to_f32();
+                acc += (dot as f32) * is_[blk] * ws;
+            }
+            output[row * n_stride + col] = acc;
         }
     }
 }
@@ -650,6 +864,218 @@ pub fn dot_q4_q8_2row(
         let d0 = neon::dot_q4_q8_row(input_quants, input_scales, weight_packed_0, weight_scales_0);
         let d1 = neon::dot_q4_q8_row(input_quants, input_scales, weight_packed_1, weight_scales_1);
         (d0, d1)
+    }
+}
+
+/// 4-row Q8×Q8 GEMV: computes dot products for four consecutive Q8_0 weight rows
+/// against the same Q8 input vector. Returns `(dot0, dot1, dot2, dot3)`.
+#[inline]
+#[must_use]
+pub fn dot_q8_q8_4row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_quants_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q8_q8_4row(
+                input_quants,
+                input_scales,
+                weight_quants_4rows,
+                weight_scales_4rows,
+            )
+        } else {
+            let num_blocks = input_scales.len();
+            let row_bytes = num_blocks * 32;
+            let (d0, d1) = dot_q8_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_quants_4rows[..row_bytes],
+                &weight_scales_4rows[..num_blocks],
+                &weight_quants_4rows[row_bytes..2 * row_bytes],
+                &weight_scales_4rows[num_blocks..2 * num_blocks],
+            );
+            let (d2, d3) = dot_q8_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_quants_4rows[2 * row_bytes..3 * row_bytes],
+                &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+                &weight_quants_4rows[3 * row_bytes..],
+                &weight_scales_4rows[3 * num_blocks..],
+            );
+            (d0, d1, d2, d3)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let num_blocks = input_scales.len();
+        let row_bytes = num_blocks * 32;
+        let (d0, d1) = dot_q8_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_quants_4rows[..row_bytes],
+            &weight_scales_4rows[..num_blocks],
+            &weight_quants_4rows[row_bytes..2 * row_bytes],
+            &weight_scales_4rows[num_blocks..2 * num_blocks],
+        );
+        let (d2, d3) = dot_q8_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_quants_4rows[2 * row_bytes..3 * row_bytes],
+            &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+            &weight_quants_4rows[3 * row_bytes..],
+            &weight_scales_4rows[3 * num_blocks..],
+        );
+        (d0, d1, d2, d3)
+    }
+}
+
+/// 4-row Q8×Q8 GEMV using unified 4-row-interleaved weight format (136 bytes/block).
+///
+/// `il_quants`: `nb * 136` bytes (4 rows × 32 bytes quant + 8 bytes f16 scales per block).
+#[inline]
+#[must_use]
+pub fn dot_q8_q8_4row_il(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants: &[u8],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            return avx512::dot_q8_q8_4row_il(input_quants, input_scales, il_quants);
+        }
+    }
+
+    // Scalar fallback.
+    let mut acc = [0.0f32; 4];
+    #[allow(clippy::cast_precision_loss)]
+    for (blk, &inp_scale) in input_scales.iter().enumerate() {
+        let inp_off = blk * 32;
+        let wq_off = blk * 136;
+        for r in 0..4 {
+            let mut dot = 0i32;
+            let iq = &input_quants[inp_off..inp_off + 32];
+            let wq = &il_quants[wq_off + r * 32..wq_off + r * 32 + 32];
+            for (a, w) in iq.iter().zip(wq.iter()) {
+                dot += i32::from(i8::from_ne_bytes([*a])) * i32::from(i8::from_ne_bytes([*w]));
+            }
+            let scale_off = wq_off + 128 + r * 2;
+            let ws =
+                half::f16::from_le_bytes([il_quants[scale_off], il_quants[scale_off + 1]]).to_f32();
+            acc[r] += (dot as f32) * inp_scale * ws;
+        }
+    }
+    (acc[0], acc[1], acc[2], acc[3])
+}
+
+/// 4-row Q4×Q8 GEMV using unified IL format (72 bytes/block: 64 quant + 8 f16 scales).
+///
+/// Block layout: `[row0: 16b][row1: 16b][row2: 16b][row3: 16b][4×f16 scales: 8b]` × nb.
+#[inline]
+#[must_use]
+pub fn dot_q4_q8_4row_il(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    il_quants_q4: &[u8],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            return avx512::dot_q4_q8_4row_il(input_quants, input_scales, il_quants_q4);
+        }
+    }
+
+    // Scalar fallback: unpack nibbles and dot.
+    let mut acc = [0.0f32; 4];
+    #[allow(clippy::cast_precision_loss)]
+    for (blk, &inp_scale) in input_scales.iter().enumerate() {
+        let inp_off = blk * 32;
+        let wq_off = blk * 72;
+        for r in 0..4 {
+            let iq = &input_quants[inp_off..inp_off + 32];
+            let packed = &il_quants_q4[wq_off + r * 16..wq_off + r * 16 + 16];
+            let mut dot = 0i32;
+            for i in 0..16 {
+                let lo = i32::from(i8::from_ne_bytes([(packed[i] & 0x0F).wrapping_sub(8)]));
+                let hi = i32::from(i8::from_ne_bytes([(packed[i] >> 4).wrapping_sub(8)]));
+                dot += lo * i32::from(i8::from_ne_bytes([iq[i]]))
+                    + hi * i32::from(i8::from_ne_bytes([iq[i + 16]]));
+            }
+            let scale_off = wq_off + 64 + r * 2;
+            let ws =
+                half::f16::from_le_bytes([il_quants_q4[scale_off], il_quants_q4[scale_off + 1]])
+                    .to_f32();
+            acc[r] += (dot as f32) * inp_scale * ws;
+        }
+    }
+    (acc[0], acc[1], acc[2], acc[3])
+}
+
+/// 4-row Q4×Q8 GEMV: computes dot products for four consecutive Q4_0 weight rows
+/// against the same Q8 input vector. Returns `(dot0, dot1, dot2, dot3)`.
+#[inline]
+#[must_use]
+pub fn dot_q4_q8_4row(
+    input_quants: &[u8],
+    input_scales: &[f32],
+    weight_packed_4rows: &[u8],
+    weight_scales_4rows: &[f32],
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vnni() {
+            avx512::dot_q4_q8_4row(
+                input_quants,
+                input_scales,
+                weight_packed_4rows,
+                weight_scales_4rows,
+            )
+        } else {
+            let num_blocks = input_scales.len();
+            let packed_row_bytes = num_blocks * 16;
+            let (d0, d1) = dot_q4_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_packed_4rows[..packed_row_bytes],
+                &weight_scales_4rows[..num_blocks],
+                &weight_packed_4rows[packed_row_bytes..2 * packed_row_bytes],
+                &weight_scales_4rows[num_blocks..2 * num_blocks],
+            );
+            let (d2, d3) = dot_q4_q8_2row(
+                input_quants,
+                input_scales,
+                &weight_packed_4rows[2 * packed_row_bytes..3 * packed_row_bytes],
+                &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+                &weight_packed_4rows[3 * packed_row_bytes..],
+                &weight_scales_4rows[3 * num_blocks..],
+            );
+            (d0, d1, d2, d3)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let num_blocks = input_scales.len();
+        let packed_row_bytes = num_blocks * 16;
+        let (d0, d1) = dot_q4_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_packed_4rows[..packed_row_bytes],
+            &weight_scales_4rows[..num_blocks],
+            &weight_packed_4rows[packed_row_bytes..2 * packed_row_bytes],
+            &weight_scales_4rows[num_blocks..2 * num_blocks],
+        );
+        let (d2, d3) = dot_q4_q8_2row(
+            input_quants,
+            input_scales,
+            &weight_packed_4rows[2 * packed_row_bytes..3 * packed_row_bytes],
+            &weight_scales_4rows[2 * num_blocks..3 * num_blocks],
+            &weight_packed_4rows[3 * packed_row_bytes..],
+            &weight_scales_4rows[3 * num_blocks..],
+        );
+        (d0, d1, d2, d3)
     }
 }
 

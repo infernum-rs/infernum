@@ -287,6 +287,90 @@ impl PagedKvCacheOps for CpuBackend {
 
 // ---- Attention ----
 
+/// Process one GQA group (all `gqa_ratio` query heads sharing one KV head) for one seq position.
+///
+/// `k_t` and `v_t` are in transposed layout [num_kv_heads, kv_len, head_dim] so iteration over
+/// kv_pos is a contiguous streaming read. Reads K and V once per kv_pos instead of once per
+/// (s,h) pair, reducing K/V bandwidth by `gqa_ratio` relative to the per-(s,h) approach.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+fn attention_gqa_group(
+    output: &mut [f32],
+    q: &[f32],
+    k_t: &[f32],
+    v_t: &[f32],
+    s: usize,
+    kv_h: usize,
+    kv_len: usize,
+    num_heads: usize,
+    _num_kv_heads: usize,
+    head_dim: usize,
+    gqa_ratio: usize,
+    offset: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    sliding_window: Option<usize>,
+    scores_buf: &mut Vec<f32>,
+) {
+    let h_start = kv_h * gqa_ratio;
+    let kv_base = kv_h * kv_len * head_dim;
+    let query_pos = offset + s;
+    // Causal bound: only positions 0..attend_len are valid for this query.
+    // On average, attend_len = seq_len/2 for prefill, halving QK^T and AV work.
+    let attend_len = (query_pos + 1).min(kv_len);
+
+    let scores_len = gqa_ratio * attend_len;
+    if scores_buf.len() < scores_len {
+        scores_buf.resize(scores_len, 0.0);
+    }
+
+    // Phase 1: QK^T — stream K once up to the causal bound, dot with all query heads.
+    for kv_pos in 0..attend_len {
+        let k_off = kv_base + kv_pos * head_dim;
+        let k_vec = &k_t[k_off..k_off + head_dim];
+
+        for g in 0..gqa_ratio {
+            let h = h_start + g;
+            let q_off = (s * num_heads + h) * head_dim;
+            let dot = crate::simd::dot_f32(&q[q_off..q_off + head_dim], k_vec) * scale;
+            scores_buf[g * attend_len + kv_pos] = dot;
+        }
+    }
+
+    // Apply attention logit softcap vectorized (e.g. Gemma): cap * tanh(dot / cap).
+    // Vectorizing across the entire scores slice avoids per-element scalar tanh.
+    if let Some(cap) = softcap {
+        crate::simd::vec_softcap_inplace(&mut scores_buf[..scores_len], cap);
+    }
+
+    // Phase 2: softmax per head. No causal mask needed (we only computed up to attend_len).
+    for g in 0..gqa_ratio {
+        let scores = &mut scores_buf[g * attend_len..(g + 1) * attend_len];
+        if let Some(window) = sliding_window {
+            if query_pos >= window {
+                for score in &mut scores[..=(query_pos - window)] {
+                    *score = f32::NEG_INFINITY;
+                }
+            }
+        }
+        crate::simd::vec_softmax_inplace(scores);
+    }
+
+    // Phase 3: V accumulation — stream V once up to the causal bound.
+    for kv_pos in 0..attend_len {
+        let v_off = kv_base + kv_pos * head_dim;
+        let v_vec = &v_t[v_off..v_off + head_dim];
+
+        for g in 0..gqa_ratio {
+            let w = scores_buf[g * attend_len + kv_pos];
+            if w > 0.0 {
+                let h = h_start + g;
+                let o_off = (s * num_heads + h) * head_dim;
+                crate::simd::vec_fmadd(&mut output[o_off..o_off + head_dim], v_vec, w);
+            }
+        }
+    }
+}
+
 /// Process a single (seq_pos, head) attention unit: Q·K^T, mask, softmax, V weighted sum.
 ///
 /// Writes directly into `output` at the correct offset. Each (s, h) pair
@@ -334,13 +418,11 @@ fn attention_head_unit(
     for kv_pos in 0..kv_len {
         let k_off = (kv_pos * num_kv_heads + kv_h) * head_dim;
         let k_vec = &k[k_off..k_off + head_dim];
-        let mut dot = crate::simd::dot_f32(q_vec, k_vec) * scale;
+        scores[kv_pos] = crate::simd::dot_f32(q_vec, k_vec) * scale;
+    }
 
-        if let Some(cap) = softcap {
-            dot = cap * (dot / cap).tanh();
-        }
-
-        scores[kv_pos] = dot;
+    if let Some(cap) = softcap {
+        crate::simd::vec_softcap_inplace(&mut scores[..kv_len], cap);
     }
 
     // Causal mask + sliding window
@@ -358,18 +440,7 @@ fn attention_head_unit(
     }
 
     // Softmax
-    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for score in scores.iter_mut() {
-        *score = (*score - max_score).exp();
-        sum += *score;
-    }
-    if sum > 0.0 {
-        let inv_sum = 1.0 / sum;
-        for score in scores.iter_mut() {
-            *score *= inv_sum;
-        }
-    }
+    crate::simd::vec_softmax_inplace(scores);
 
     // Weighted sum of V using SIMD fused-multiply-add.
     let o_off = (s * num_heads + h) * head_dim;
@@ -386,9 +457,16 @@ fn attention_head_unit(
 
 /// Causal attention: Q @ K^T * scale, mask, softmax, @ V.
 ///
-/// Parallelized across the `(seq_pos, head)` dimension — each unit writes
-/// to a disjoint region of the output, so no synchronization is needed.
-#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+/// - **Prefill (seq_len > 1):** GQA-aware parallel dispatch. Transposes K/V to
+///   [num_kv_heads, kv_len, head_dim] for contiguous streaming, then parallelizes over
+///   (seq_pos, kv_head) GQA groups — reads K and V once per group instead of `gqa_ratio` times.
+/// - **Decode (seq_len = 1):** same per-(s,h) dispatch as before; K/V transposition overhead
+///   is not amortized for a single query position so the original layout is kept.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::many_single_char_names,
+    clippy::too_many_lines
+)]
 fn causal_attention(
     q: &[f32],
     k: &[f32],
@@ -410,7 +488,6 @@ fn causal_attention(
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
 
-    // For very small workloads (decode with few heads), skip dispatch overhead.
     if total_units <= num_threads {
         for s in 0..seq_len {
             for h in 0..num_heads {
@@ -436,6 +513,98 @@ fn causal_attention(
         return output;
     }
 
+    // Prefill: GQA-aware parallel dispatch with K/V transposition.
+    // For seq_len > 1 the transpose cost is amortized over many query positions and the
+    // contiguous K/V access pattern substantially reduces memory-bandwidth pressure.
+    if seq_len > 1 {
+        let n_kv = kv_len * num_kv_heads * head_dim;
+        // Safety: both output buffers are written entirely before any read.
+        let mut k_t = Vec::<f32>::with_capacity(n_kv);
+        let mut v_t = Vec::<f32>::with_capacity(n_kv);
+        unsafe {
+            k_t.set_len(n_kv);
+            v_t.set_len(n_kv);
+        }
+        // Transpose K and V in a single parallel dispatch over kv_len positions.
+        // Each thread handles a contiguous range of positions; writes are non-overlapping
+        // (dst_off for different pos values land in different head-row slots).
+        let chunk_pos = kv_len.div_ceil(num_threads);
+        let n_trans_tasks = kv_len.div_ceil(chunk_pos);
+        let k_src_addr = k.as_ptr() as usize;
+        let v_src_addr = v.as_ptr() as usize;
+        let kt_dst_addr = k_t.as_mut_ptr() as usize;
+        let vt_dst_addr = v_t.as_mut_ptr() as usize;
+        pool.dispatch(n_trans_tasks, |task_id, _| {
+            let pos_start = task_id * chunk_pos;
+            let pos_end = (pos_start + chunk_pos).min(kv_len);
+            let k_src = unsafe { std::slice::from_raw_parts(k_src_addr as *const f32, n_kv) };
+            let v_src = unsafe { std::slice::from_raw_parts(v_src_addr as *const f32, n_kv) };
+            let k_dst = unsafe { std::slice::from_raw_parts_mut(kt_dst_addr as *mut f32, n_kv) };
+            let v_dst = unsafe { std::slice::from_raw_parts_mut(vt_dst_addr as *mut f32, n_kv) };
+            for pos in pos_start..pos_end {
+                for kv_h in 0..num_kv_heads {
+                    let src_off = (pos * num_kv_heads + kv_h) * head_dim;
+                    let dst_off = (kv_h * kv_len + pos) * head_dim;
+                    k_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&k_src[src_off..src_off + head_dim]);
+                    v_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&v_src[src_off..src_off + head_dim]);
+                }
+            }
+        });
+        let parallel_units = seq_len * num_kv_heads;
+        // Strided round-robin: each thread gets every num_tasks-th unit, interleaved.
+        // Causal attention work grows linearly with seq position (attend_len = s+1), so
+        // contiguous chunks create severe imbalance. Striding distributes early/late
+        // positions evenly across threads.
+        let num_tasks = num_threads.min(parallel_units);
+        let out_addr = output.as_mut_ptr() as usize;
+        let q_addr = q.as_ptr() as usize;
+        let kt_addr = k_t.as_ptr() as usize;
+        let vt_addr = v_t.as_ptr() as usize;
+
+        pool.dispatch(num_tasks, |task_id, _| {
+            // Safety: each task writes to disjoint (s, h_start..h_start+gqa_ratio) output slots.
+            let out_s = unsafe {
+                std::slice::from_raw_parts_mut(out_addr as *mut f32, total_units * head_dim)
+            };
+            let q_s =
+                unsafe { std::slice::from_raw_parts(q_addr as *const f32, total_units * head_dim) };
+            let kt_s = unsafe {
+                std::slice::from_raw_parts(kt_addr as *const f32, kv_len * num_kv_heads * head_dim)
+            };
+            let vt_s = unsafe {
+                std::slice::from_raw_parts(vt_addr as *const f32, kv_len * num_kv_heads * head_dim)
+            };
+
+            let mut scores_buf: Vec<f32> = Vec::new();
+            for unit in (task_id..parallel_units).step_by(num_tasks) {
+                let s = unit / num_kv_heads;
+                let kv_h = unit % num_kv_heads;
+                attention_gqa_group(
+                    out_s,
+                    q_s,
+                    kt_s,
+                    vt_s,
+                    s,
+                    kv_h,
+                    kv_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gqa_ratio,
+                    offset,
+                    scale,
+                    softcap,
+                    sliding_window,
+                    &mut scores_buf,
+                );
+            }
+        });
+        return output;
+    }
+
+    // Decode: original per-(s,h) dispatch — no K/V transposition overhead.
     let chunk_size = total_units.div_ceil(num_threads);
     let num_tasks = total_units.div_ceil(chunk_size);
     let out_addr = output.as_mut_ptr() as usize;
@@ -758,13 +927,10 @@ impl PagedAttentionOps for CpuBackend {
                 #[allow(clippy::cast_sign_loss)]
                 let phys_block = bt_row[block_idx] as usize;
                 let k_off = (phys_block * block_size + block_offset) * kv_stride + kv_h * head_dim;
-
-                let mut dot = crate::simd::dot_f32(q_vec, &k_data[k_off..k_off + head_dim]);
-                dot *= scale;
-                if let Some(cap) = softcap {
-                    dot = cap * (dot / cap).tanh();
-                }
-                scores[pos] = dot;
+                scores[pos] = crate::simd::dot_f32(q_vec, &k_data[k_off..k_off + head_dim]) * scale;
+            }
+            if let Some(cap) = softcap {
+                crate::simd::vec_softcap_inplace(scores, cap);
             }
 
             // Apply sliding window mask
