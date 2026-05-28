@@ -1350,10 +1350,6 @@ fn dequant_cublas_matmul_bf16(
     n: usize,
     k: usize,
 ) -> Result<CudaTensor> {
-    use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
-    use cudarc::cublas::{result, sys};
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
-
     let ctx = input.context();
     let device = ctx.device();
     let total_w = n * k;
@@ -1416,11 +1412,12 @@ fn dequant_cublas_matmul_bf16(
     });
 
     // 2. BF16 activations — pass directly (no cast needed).
-    let a_bf16_ptr = *input.cuda_slice().device_ptr() as *const u8;
+    // 3. cuBLAS BF16×BF16→BF16 GEMM (F32 compute internally for accuracy).
+    use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    use cudarc::cublas::{result, sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-    // 3. cuBLAS BF16×BF16→BF16 GEMM (compute in F32 internally for accuracy).
     let mut output = unsafe { CudaTensor::uninit(ctx, &[m, n], DType::BF16)? };
-
     let bf16_type = sys::cudaDataType_t::CUDA_R_16BF;
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
@@ -1437,7 +1434,7 @@ fn dequant_cublas_matmul_bf16(
             *w_bf16.device_ptr() as *const _,
             bf16_type,
             k as i32,
-            a_bf16_ptr.cast(),
+            *input.cuda_slice().device_ptr() as *const _,
             bf16_type,
             k as i32,
             (&raw const beta).cast(),
