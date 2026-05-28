@@ -2786,8 +2786,8 @@ unsafe fn gemm_q8_tiled_inner_il(
                     let iq = &inp_quants[inp_off..inp_off + 32];
                     let mut dot = 0i32;
                     for (w, a) in wq.iter().zip(iq.iter()) {
-                        dot += i32::from(i8::from_ne_bytes([*w]))
-                            * i32::from(i8::from_ne_bytes([*a]));
+                        dot +=
+                            i32::from(i8::from_ne_bytes([*w])) * i32::from(i8::from_ne_bytes([*a]));
                     }
                     let ws = half::f16::from_le_bytes([
                         wt_quants_il[scale_off],
@@ -2817,8 +2817,7 @@ unsafe fn gemm_q8_tiled_inner_il(
                 let iq = &inp_quants[inp_off..inp_off + 32];
                 let mut dot = 0i32;
                 for (w, a) in wq.iter().zip(iq.iter()) {
-                    dot += i32::from(i8::from_ne_bytes([*w]))
-                        * i32::from(i8::from_ne_bytes([*a]));
+                    dot += i32::from(i8::from_ne_bytes([*w])) * i32::from(i8::from_ne_bytes([*a]));
                 }
                 let ws = half::f16::from_le_bytes([
                     wt_quants_il[scale_off],
@@ -3272,9 +3271,9 @@ pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
     q8: &mut [u8],
 ) {
     use std::arch::x86_64::{
-        __m256i, __m512i, _mm256_castsi128_si256, _mm256_inserti128_si256,
-        _mm256_storeu_si256, _mm512_add_epi8, _mm512_and_si512, _mm512_loadu_si512,
-        _mm512_set1_epi8, _mm512_srli_epi16, _mm512_extracti32x4_epi32,
+        __m256i, __m512i, _mm256_castsi128_si256, _mm256_inserti128_si256, _mm256_storeu_si256,
+        _mm512_add_epi8, _mm512_and_si512, _mm512_extracti32x4_epi32, _mm512_loadu_si512,
+        _mm512_set1_epi8, _mm512_srli_epi16,
     };
     // Prefetch distance: 20 blocks × 72 bytes = 1440 bytes ≈ 23 cache lines.
     // Hides ~100-cycle DRAM latency at ~5 cycles/block in the expand loop.

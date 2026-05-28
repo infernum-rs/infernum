@@ -70,7 +70,9 @@ fn repack_q8_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize
             let dst = g * nb * 136 + blk * 136 + r * 32;
             il[dst..dst + 32].copy_from_slice(&data[src..src + 32]);
             let scale_dst = g * nb * 136 + blk * 136 + 128 + r * 2;
-            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk]).to_bits().to_le_bytes();
+            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk])
+                .to_bits()
+                .to_le_bytes();
             il[scale_dst] = lo;
             il[scale_dst + 1] = hi;
         }
@@ -97,7 +99,9 @@ fn repack_q4_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize
             let dst = g * nb * 72 + blk * 72 + r * 16;
             il[dst..dst + 16].copy_from_slice(&data[src..src + 16]);
             let scale_dst = g * nb * 72 + blk * 72 + 64 + r * 2;
-            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk]).to_bits().to_le_bytes();
+            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk])
+                .to_bits()
+                .to_le_bytes();
             il[scale_dst] = lo;
             il[scale_dst + 1] = hi;
         }
@@ -564,9 +568,8 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                         };
                         let q4_chunk = &wt_il[group_start * num_blocks_per_row * 72..];
                         let needed = chunk_groups * num_blocks_per_row * 136;
-                        let out_global = unsafe {
-                            std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n)
-                        };
+                        let out_global =
+                            unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
                         Q4_EXPAND_SCRATCH.with(|scratch| {
                             let mut s = scratch.borrow_mut();
                             if s.len() < needed {
