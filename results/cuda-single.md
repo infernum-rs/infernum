@@ -39,152 +39,68 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
-## 2026-05-28 — L4 Final Results (same-format comparison)
+## 2026-05-28 — L4 GPU (final, commit `2477f76`)
 
 - **GPU:** NVIDIA L4 (23034 MiB VRAM)
 - **Driver:** 595.71.05 | CUDA 12.6
 - **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
-- **infernum commit:** `189538d` | **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
-- **Model:** `bartowski/SmolLM2-360M-Instruct-GGUF` (same GGUF file for both engines)
+- **infernum commit:** `2477f76` | **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
+- **Note:** The 2026-05-21 llama.cpp baseline of 250 tok/s (SmolLM2-360M Q8_0) was measured on a different GGUF file or machine state. Re-measuring on the same Instruct GGUF gives 350 tok/s.
 
-### Decode throughput (tok/s) — same GGUF file, same GPU
-
-| Format | infernum | llama.cpp | ratio |
-| ------ | -------: | --------: | ----: |
-| Q8_0 GGUF | 309.7 | 355.7 | 0.87x |
-| Q4_0 GGUF | 351.5 | 450.0 | 0.78x |
-
-### BF16 SafeTensors decode (different format — no fair llama.cpp comparison)
-
-| Model | infernum | llama.cpp Q8_0 | note |
-| ----- | -------: | --------: | ---- |
-| SmolLM2-360M BF16 | 234.6 | 355.7 | BF16 uses 2× more bandwidth than Q8_0 |
-| Llama-3.2-1B BF16 | 115.2 | 355.7¹ | different model — no fair comparison |
-
-¹ llama.cpp number is SmolLM2-360M Q8_0; Llama-3.2-1B llama.cpp number is 97.2 tok/s Q8_0 (from 2026-05-21 baseline).
-
-### Notes
-
-- **Q8_0 at 0.87× and Q4_0 at 0.78×**: llama.cpp's quantised GEMV kernels are highly optimised. Our kernels use standard cuBLAS for dense weights and custom dp4a kernels for quantised — both have room to improve. The gap is approximately explained by cuBLAS kernel launch overhead and lower bandwidth utilisation on the quantised path.
-- **The old 250 tok/s Q8_0 baseline (2026-05-21) was stale**: re-measuring on the same machine with the same commit gives 355.7 tok/s, not 250. The earlier number may have been measured on a different GGUF file or under different machine conditions.
-- **Q4_0 GGUF was previously crashing** (`UnsupportedDtype: Unsupported GGML tensor type: 3`). Fixed in commit `189538d` by adding Q4_1 dequantisation support (many Q4_0 GGUF files store some tensors in Q4_1 format).
-
----
-
-## 2026-05-28 — L4 Performance Optimization (up to +176% decode, beats llama.cpp)
-
-- **GPU:** NVIDIA L4 (23034 MiB VRAM)
-- **Driver:** 595.71.05 | CUDA 12.6
-- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
-- **infernum commit:** `cc368be`
-- **llama.cpp commit:** `d8794ee` (Q8_0 GGUF, best of 3 reps from 2026-05-21 baseline)
-
-### Decode throughput (tok/s)
-
-| Model | infernum format | Engine | infernum | llama.cpp format | llama.cpp | ratio |
-| ----- | --------------- | ------ | -------: | ---------------- | --------: | ----: |
-| Llama / SmolLM2-360M | BF16 SafeTensors | cuda-graph-engine | 221.7 | Q8_0 GGUF | 250.0 | **0.89x** |
-| Llama / SmolLM2-360M | Q8_0 GGUF | cuda-graph-engine | 309.5 | Q8_0 GGUF | 250.0 | **1.24x** |
-| Llama / Llama-3.2-1B | BF16 SafeTensors | cuda-graph-engine | 113.4 | Q8_0 GGUF | 97.2 | **1.17x** |
-| Qwen / Qwen3-0.6B | BF16 SafeTensors | cuda-graph-engine | 153.3 | Q8_0 GGUF | 171.0 | **0.90x** |
-| Qwen / Qwen2.5-0.5B | BF16 SafeTensors | cuda-graph-engine | 181.0 | Q8_0 GGUF | 204.0 | **0.89x** |
-
-### Notes
-
-- **Multiple models beat llama.cpp Q8_0:** Llama-3.2-1B (1.17x), SmolLM2-360M Q8_0 (1.24x). This is a same-architecture comparison — BF16 uses 2× more bytes than Q8_0, so infernum's BF16 run beating llama.cpp's Q8_0 run is a meaningful win.
-- **Root cause of improvements:** Two categories of bugs fixed and optimized — (1) `CudaTensor::clone()` deep-copy causing 24 GB/5s of unnecessary D→D traffic, and (2) paged-attention shared memory sized for the CAPTURE-time seq_len (typically 9–10 tokens / 16 threads) instead of the full KV-cache capacity (816 tokens / 256 threads). The second bug also caused `CUDA_ERROR_ILLEGAL_ADDRESS` crashes at 1024+ tokens.
-- **1024-token decode now works** (was crashing on all commits before `cc368be`).
-- **Key optimizations** (see PR #77 for full breakdown):
-  1. Shallow `CudaTensor::clone()` — eliminates D→D copies (+51% decode)
-  2. `forward_prefill` graph rebuilt once per call (not per token)
-  3. BF16 cos/sin graph inputs — eliminates 120 cast kernels/step
-  4. Q8_0 `linear_pair`/`linear_triple` deduplication — shared input quantization
-  5. Prefill DtoH elimination via `eager_max_seq_len` (+9% prefill)
-  6. Async prefill pipeline via stable HtoD buffers (+2.8% prefill)
-  7. **Paged-attention shared-memory fix** — correctly sized for KV-cache capacity, giving 256 threads instead of 16 (+12–69% decode)
-
----
-
-## 2026-05-28 — L4 Performance Optimization (+51–82% decode)
-
-- **GPU:** NVIDIA L4 (23034 MiB VRAM)
-- **Driver:** 595.71.05 | CUDA 12.6
-- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
-- **infernum commit:** `b92aeee`
-- **llama.cpp commit:** `d8794ee` (Q8_0 GGUF, best of 3 reps from 2026-05-21 baseline)
-
-### Decode throughput (tok/s)
-
-| Model | infernum format | Engine | infernum | llama.cpp format | llama.cpp | ratio |
-| ----- | --------------- | ------ | -------: | ---------------- | --------: | ----: |
-| Llama / SmolLM2-360M | BF16 SafeTensors | cuda-graph-engine | 172.9 | Q8_0 GGUF | 250.0 | 0.69x |
-| Llama / SmolLM2-360M | Q8_0 GGUF | cuda-graph-engine | 178.4 | Q8_0 GGUF | 250.0 | **0.71x** |
-| Llama / Llama-3.2-1B | BF16 SafeTensors | cuda-graph-engine | 101.7 | Q8_0 GGUF | 97.2 | **1.05x** |
-| Qwen / Qwen3-0.6B | BF16 SafeTensors | cuda-graph-engine | 110.8 | Q8_0 GGUF | 171.0 | 0.65x |
-| Qwen / Qwen2.5-0.5B | BF16 SafeTensors | cuda-graph-engine | 155.2 | Q8_0 GGUF | 204.0 | 0.76x |
-
-### Prefill throughput (tok/s, 512-token prompt, paged-decode token-by-token)
-
-| Model | infernum format | infernum |
-| ----- | --------------- | -------: |
-| Llama / SmolLM2-360M | BF16 SafeTensors | 175.3 |
-| Llama / Llama-3.2-1B | BF16 SafeTensors | 104.2 |
-| Qwen / Qwen3-0.6B | BF16 SafeTensors | 127.0 |
-| Qwen / Qwen2.5-0.5B | BF16 SafeTensors | 153.6 |
-
-### Notes
-
-- **Llama-3.2-1B now beats llama.cpp:** 101.7 vs 97.2 tok/s (1.05×). This is a same-architecture comparison (BF16 vs Q8_0 — Q8_0 halves weight bytes, so a fair same-format comparison would be even stronger in our favor).
-- **SmolLM2-360M gap is mainly format:** BF16 (720 MB) vs Q8_0 (360 MB) — 2× more weight bytes to read per step. At the same format, our bandwidth utilization is already competitive.
-- **Q8_0 GGUF now supported on CUDA:** `gemv_q8_q8_dp4a_bf16` kernel handles dequantization on-the-fly. SmolLM2-360M Q8_0 reaches 178.4 tok/s (0.71× vs llama.cpp Q8_0).
-- **Qwen now uses cuda-graph-engine:** Previously returned `UnsupportedModel: "qwen3"`. Now fully supported with +52–82% speedup vs prior eager path.
-- **Key optimizations in this release (commit `b92aeee`, see PR for full diff):**
-  - `CudaTensor::clone()` changed from deep copy (D→D) to shallow (Arc increment) — eliminates 24 GB/5s of D→D copies, primarily the 94 MB embedding table clone per step
-  - Explicit `.clone()` removed from `EmbeddingGatherOp`, `RmsNormOp`, `AddRmsNormOp`, `QkNormOp` weight accesses
-  - `forward_prefill` builds graph once (not per token) — eliminates O(n) CPU overhead per prefill step
-  - cos/sin inputs changed from F32 to BF16 in all graph builders — eliminates 120 `cast_f32_to_bf16` GPU kernels per step from inside the CUDA graph
-- **llama.cpp prefill (batch) not re-measured:** Batch prefill (`--graph` mode) numbers unchanged from 2026-05-21 baseline. The prefill numbers in this table are from the paged-decode token-by-token path (`forward_prefill`), not the batch prefill graph; the comparison would be unfair.
-
----
-
-## 2026-05-21 — Baseline
-
-- **GPU:** NVIDIA L4 (23034 MiB VRAM)
-- **Driver:** 595.71.05 | CUDA 12.6
-- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
-- **infernum commit:** `07d7e57`
-- **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
-- **Note:** llama.cpp prefill numbers have high variance (GPU frequency scaling on L4); decode numbers are stable within ~1%.
-
-### Decode throughput (tok/s)
-
-| Model | Format | Engine | infernum | llama.cpp | ratio |
-| ----- | ------ | ------ | -------: | --------: | ----: |
-| Llama / SmolLM2-360M | BF16 | cuda-graph-engine | 112.1 | 250.0 | 0.45x |
-| Llama / Llama-3.2-1B | BF16 | cuda-graph-engine | 67.2 | 97.2 | 0.69x |
-| Llama / Llama-3.2-1B GPTQ INT4 | BF16 (dequant on load) | cuda-graph-engine | 87.2 | — | — |
-| Qwen / Qwen3-0.6B | BF16 | eager | 72.9 | 171.0 | 0.43x |
-| Qwen / Qwen2.5-0.5B | BF16 | eager | 85.1 | 204.0 | 0.42x |
-
-### Prefill throughput (tok/s)
+### Decode throughput (tok/s) — GGUF, same-format comparison
 
 | Model | Format | infernum | llama.cpp | ratio |
 | ----- | ------ | -------: | --------: | ----: |
-| Llama / SmolLM2-360M | BF16 | 8931 | 20657 | 0.43x |
-| Llama / Llama-3.2-1B | BF16 | 5957 | 11106 | 0.54x |
-| Llama / Llama-3.2-1B GPTQ INT4 | BF16 (dequant on load) | 5487 | — | — |
-| Qwen / Qwen3-0.6B | BF16 | 4685 | 14940 | 0.31x |
-| Qwen / Qwen2.5-0.5B | BF16 | 9772 | 21489 | 0.45x |
+| Llama / SmolLM2-360M-Instruct | Q8_0 GGUF | 308.5 | 350.4 | 0.88x |
+| Llama / SmolLM2-360M-Instruct | Q4_0 GGUF | 351.7 | 450.0 | 0.78x |
+
+### Decode throughput (tok/s) — BF16 SafeTensors (no same-format llama.cpp number)
+
+| Model | Format | Engine | infernum | llama.cpp (Q8_0 for ref) |
+| ----- | ------ | ------ | -------: | -------: |
+| Llama / SmolLM2-360M | BF16 SafeTensors | cuda-graph-engine | 233.9 | — |
+| Llama / Llama-3.2-1B | BF16 SafeTensors | cuda-graph-engine | 114.8 | (97.2, Llama-3.2-1B Q8_0) |
+| Qwen / Qwen3-0.6B | BF16 SafeTensors | cuda-graph-engine | 155.4 | — |
+| Qwen / Qwen2.5-0.5B | BF16 SafeTensors | cuda-graph-engine | 182.2 | — |
+
+### Prefill throughput (tok/s, 512 tokens, paged-decode token-by-token path)
+
+| Model | Format | infernum | llama.cpp |
+| ----- | ------ | -------: | --------: |
+| SmolLM2-360M-Instruct | Q8_0 GGUF | 240.2 | 20195 (batch) |
+| SmolLM2-360M-Instruct | Q4_0 GGUF | 261.1 | 21196 (batch) |
+| SmolLM2-360M | BF16 SafeTensors | 206.2 | — |
+| Llama-3.2-1B | BF16 SafeTensors | 109.9 | — |
 
 ### Notes
 
-- **infernum is ~0.42–0.69× llama.cpp** across all measured combinations. The smaller models (SmolLM2-360M, Qwen 0.5–0.6B) show a larger gap (~2.3× slower) than the 1B models (~1.4–1.9× slower) on decode. Both are far from parity.
-- **Quantized formats (FP8, GPTQ) run as BF16:** Both FP8 and GPTQ INT4 models are dequantized on load. No quantized matmul kernels are implemented yet. The GPTQ decode number (87.2 tok/s) is higher than the BF16 1B number (67.2 tok/s) because `shuyuej/Llama-3.2-1B-GPTQ` loads fewer parameter bytes in the SafeTensors header, not because quantized math is being used. No llama.cpp comparison for GPTQ since a GPTQ GGUF was not available.
-- **Qwen decode uses the eager path:** `--cuda-graph-engine` does not yet support Qwen; Qwen decode numbers are from the eager (non-graph) path. This accounts for a significant portion of the decode gap vs llama.cpp. Graph-engine Qwen decode support is a near-term target.
-- **Qwen prefill now measured:** `--graph` prefill mode extended to Qwen in commit `07d7e57`. Qwen3-0.6B prefill is slower relative to llama.cpp (0.31x) than SmolLM2-360M (0.43x), suggesting Qwen3-specific ops (QK-norm, larger head_dim) have more room for kernel optimization.
-- **GGUF not supported on CUDA:** The bench example errors on GGUF in all CUDA modes. SafeTensors-only for now.
-- **DeepSeek:** CUDA support not yet implemented. No numbers.
-- **Mixtral/MoE:** `bench` panics on MoE warm-up (`build_prefill_graph does not support MoE models`). No numbers.
-- **Gemma:** Only tiny random-weight models available (2L/8H). Numbers are not meaningful for throughput comparison.
-- **Missing large models:** Llama-3.1-8B and Qwen3-8B (primary L4 targets per performance.md) require HuggingFace auth. This baseline covers 1B-scale and sub-1B models only.
-- **llama.cpp Llama-3.2-1B GGUF** was converted from the FP8 instruct model (`RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic`) to GGUF BF16 — same architecture and effective weights as infernum's BF16 run, so the comparison is valid.
+- **Q8_0 at 0.88×, Q4_0 at 0.78×**: llama.cpp uses highly optimised fused quantised GEMV kernels (custom CUDA, purpose-built for each quant format). Infernum uses cuBLAS for dense weights and generic dp4a kernels for Q8_0/Q4_0. Closing this gap requires a custom BF16 GEMV kernel.
+- **Q4_0 now works**: was previously crashing (`UnsupportedDtype: type 3`). Fixed by adding Q4_1 block dequantisation — many Q4_0 GGUF files store some tensors (e.g. down_proj) in Q4_1 format.
+- **Prefill is not comparable**: infernum's prefill uses a token-by-token paged-decode loop; llama.cpp uses a batched matmul. The llama.cpp prefill numbers (20k tok/s) reflect batch GEMM with tensor-core utilisation and are a different operation.
+- **Key optimisations in this cycle (PR #77):** shallow `CudaTensor::clone()` (eliminated 24 GB/5 s of D→D copies); paged-attention shared-memory correctness fix (+12–69% decode, fixed crash at 1024 tokens); QKV fused GEMV (+5.4%); Q8_0 linear_pair/triple input-quantisation deduplication; BF16 cos/sin inputs; async prefill pipeline.
+
+---
+
+## 2026-05-21 — Baseline (infernum commit `07d7e57`)
+
+- **GPU:** NVIDIA L4 (23034 MiB VRAM)
+- **Driver:** 595.71.05 | CUDA 12.6
+- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
+- **infernum commit:** `07d7e57` | **llama.cpp commit:** `d8794ee`
+- **⚠️ Note on llama.cpp numbers:** The 250 tok/s SmolLM2-360M Q8_0 number below was measured on a different GGUF file or machine state. Re-measuring the Instruct GGUF on the same machine gives 350.4 tok/s. Ratios in this section are misleading — treat them as infernum-only historical snapshots.
+
+### Decode throughput (tok/s) — infernum only (llama.cpp numbers unreliable for this file)
+
+| Model | Format | Engine | infernum |
+| ----- | ------ | ------ | -------: |
+| Llama / SmolLM2-360M | BF16 | cuda-graph-engine | 112.1 |
+| Llama / Llama-3.2-1B | BF16 | cuda-graph-engine | 67.2 |
+| Llama / Llama-3.2-1B GPTQ INT4 | BF16 (dequant on load) | cuda-graph-engine | 87.2 |
+| Qwen / Qwen3-0.6B | BF16 | eager (no graph engine yet) | 72.9 |
+| Qwen / Qwen2.5-0.5B | BF16 | eager (no graph engine yet) | 85.1 |
+
+### Notes
+
+- **GGUF not yet supported on CUDA** at this commit; SafeTensors only.
+- **Qwen uses eager path:** `--cuda-graph-engine` returned `UnsupportedModel` for Qwen at this commit.
+- **GPTQ/FP8 dequantized on load:** no quantized matmul kernels at this point.
