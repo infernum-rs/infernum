@@ -68,11 +68,11 @@ Both infernum and llama.cpp now use batch GEMM (`pp512`, M=512, tensor-core elig
 
 | Model | Format | infernum | llama.cpp | ratio |
 | ----- | ------ | -------: | --------: | ----: |
-| SmolLM2-360M-Instruct | Q8_0 GGUF | 9 221 | 20 032 | **0.46x** |
-| SmolLM2-360M-Instruct | Q4_0 GGUF | 9 118 | 21 904 | **0.42x** |
-| SmolLM2-360M | BF16 SafeTensors | 9 256 | — | — |
-| Llama-3.2-1B-Instruct | Q8_0 GGUF | 7 141 | 12 964 | **0.55x** |
-| Llama-3.2-1B-Instruct | Q4_0 GGUF | 7 187 | 13 450 | **0.53x** |
+| SmolLM2-360M-Instruct | Q8_0 GGUF | **21 476** | 20 032 | **1.07x** |
+| SmolLM2-360M-Instruct | Q4_0 GGUF | **22 146** | 21 904 | **1.01x** |
+| SmolLM2-360M | BF16 SafeTensors | **22 616** | — | — |
+| Llama-3.2-1B-Instruct | Q8_0 GGUF | **13 092** | 12 964 | **1.01x** |
+| Llama-3.2-1B-Instruct | Q4_0 GGUF | **13 146** | 13 450 | **0.98x** |
 | Llama-3.2-1B | BF16 SafeTensors | — | — | — |
 
 ---
@@ -86,7 +86,7 @@ Both infernum and llama.cpp now use batch GEMM (`pp512`, M=512, tensor-core elig
 - **Native quantised CONCAT + GGUF QKV fusion (commit `9002f38`)**: Q,K,V weights concatenated, fused into one GEMV per layer. Q8_0: +3.4%, Q4_0: +5.2%.
 - **Batch GEMM prefill**: `build_prefill_graph_with_kv_cuda` builds a single seq_len=512 graph, executes all projections as M=512 GEMMs, then scatters K/V into paged cache via `append_paged`.
 - **BF16 cuBLAS GEMM (commit `c9830c0`)**: Q8_0/Q4_0 weights dequantized to BF16 (cached), activations passed as BF16 directly; eliminates BF16→F16 and F32→BF16 casts. +5% prefill vs prior F16 path.
-- **Remaining prefill gap**: cuBLAS achieves ~6-7% of L4 BF16 peak for M=512 due to few blocks per SM (32–120 blocks for 58 SMs). Closing further would require cuBLASLt with cached per-shape algorithm or custom CUTLASS/chunked-prefill.
+- **cuBLAS batched attention for prefill**: Flash attention (BR=4) was reading K/V 128× redundantly per head — 1.35ms/layer × 32 layers = 43ms (87% of total prefill time). Replaced with cuBLAS per-head Q×K^T + warp-level causal softmax + Attn×V scatter. Now ~0.6ms/layer = 19ms total. Prefill jumped from 9,221 → **21,476 tok/s** (Q8_0) = **+133%**.
 - **Q4_0 GGUF works** (was crashing with `UnsupportedDtype: GGML type 3`).
 - **BF16 decode:** no same-format llama.cpp number.
 
