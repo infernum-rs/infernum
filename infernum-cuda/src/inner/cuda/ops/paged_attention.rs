@@ -35,6 +35,7 @@ const GATHER_PAGED_KV_KERNEL_NAMES: &[&str] = &[
     "gather_paged_kv_f32",
     "gather_paged_kv_f16",
     "gather_paged_kv_bf16",
+    "gather_kv_for_attn_bf16",
 ];
 
 const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
@@ -43,6 +44,7 @@ const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
     "paged_decode_attention_bf16",
     "paged_decode_attn_part_bf16",
     "paged_decode_attn_reduce_bf16",
+    "contiguous_decode_attn_bf16",
 ];
 
 /// Minimum sequence length to use the partitioned kernel.
@@ -392,6 +394,144 @@ pub(crate) fn paged_attention_decode_indirect(
     Ok(output)
 }
 
+/// Gather K/V from paged pool into contiguous buffers, then run fast streaming attention.
+///
+/// Two-kernel approach that eliminates the scattered-page cache misses dominating
+/// the paged attention kernel for short-to-medium sequences:
+/// 1. `gather_kv_for_attn_bf16`: copies K and V from scattered paged blocks into
+///    contiguous pre-allocated output tensors, using seq_len from a GPU buffer.
+/// 2. `contiguous_decode_attn_bf16`: runs attention with sequential K/V reads from
+///    the gathered buffers (fits in L2 cache → near-peak bandwidth).
+///
+/// Only supported for BF16 and batch_size==1.  Returns `None` for other dtypes/
+/// batch sizes (caller falls back to the paged kernel).
+///
+/// # Errors
+/// Returns an error if kernel launch or allocation fails.
+#[allow(clippy::too_many_arguments)]
+fn gather_and_attend_bf16(
+    ctx: &CudaContext,
+    q: &CudaTensor,
+    k_pool: &CudaTensor,
+    v_pool: &CudaTensor,
+    block_tables: &CudaTensor,
+    seq_lens: &CudaTensor,
+    max_blocks_per_seq: usize,
+    block_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    window_size: i32,
+) -> Result<CudaTensor> {
+    let max_capacity = max_blocks_per_seq * block_size;
+    let device = ctx.device();
+    ensure_gather_kernel(device)?;
+    ensure_paged_decode_kernel(device)?;
+
+    // ---- Step 1: gather K and V from scattered pages → contiguous buffers ----
+    let kv_shape = [max_capacity, num_kv_heads, head_dim];
+    let mut k_cont = unsafe { CudaTensor::uninit(ctx, &kv_shape, DType::BF16)? };
+    let mut v_cont = unsafe { CudaTensor::uninit(ctx, &kv_shape, DType::BF16)? };
+
+    let gather_total = max_capacity * num_kv_heads * head_dim;
+    let gather_threads = 256_usize;
+    let gather_blocks = gather_total.div_ceil(gather_threads);
+    let gather_cfg = LaunchConfig {
+        grid_dim: (gather_blocks as u32, 1, 1),
+        block_dim: (gather_threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let gather_func = device
+        .get_func("gather_paged_kv", "gather_kv_for_attn_bf16")
+        .unwrap();
+    let mut mbps = max_blocks_per_seq as i32;
+    let mut mc = max_capacity as i32;
+    let mut bs = block_size as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let k_pool_slice = k_pool.cuda_slice();
+    let v_pool_slice = v_pool.cuda_slice();
+    let bt_slice = block_tables.cuda_slice();
+    let sl_slice = seq_lens.cuda_slice();
+
+    let mut gather_args: Vec<*mut c_void> = vec![
+        std::ptr::from_mut(k_cont.cuda_slice_mut().device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_mut(v_cont.cuda_slice_mut().device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_ref(k_pool_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(v_pool_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(bt_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(sl_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        (&raw mut bs).cast::<c_void>(),
+        (&raw mut nkv).cast::<c_void>(),
+        (&raw mut hd).cast::<c_void>(),
+        (&raw mut mbps).cast::<c_void>(),
+        (&raw mut mc).cast::<c_void>(),
+    ];
+    unsafe {
+        gather_func.launch(gather_cfg, &mut gather_args)?;
+    }
+
+    // ---- Step 2: contiguous attention (sequential reads, L2-resident after gather) ----
+    let threads = 256_usize.min(max_capacity.next_power_of_two()).max(32);
+    let shared_mem = (head_dim + max_capacity + threads) * std::mem::size_of::<f32>();
+    let attn_cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[1, num_heads, head_dim], DType::BF16)? };
+    let attn_func = device
+        .get_func("paged_decode_attention", "contiguous_decode_attn_bf16")
+        .unwrap();
+    let q_slice = q.cuda_slice();
+    let k_slice = k_cont.cuda_slice();
+    let v_slice = v_cont.cuda_slice();
+    let mut nh = num_heads as i32;
+    let mut sc = scale;
+    let mut scp = softcap;
+    let mut ws = window_size;
+
+    let mut attn_args: Vec<*mut c_void> = vec![
+        std::ptr::from_mut(output.cuda_slice_mut().device_ptr_mut()).cast::<c_void>(),
+        std::ptr::from_ref(q_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(k_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(v_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        std::ptr::from_ref(sl_slice.device_ptr())
+            .cast_mut()
+            .cast::<c_void>(),
+        (&raw mut sc).cast::<c_void>(),
+        (&raw mut scp).cast::<c_void>(),
+        (&raw mut nh).cast::<c_void>(),
+        (&raw mut nkv).cast::<c_void>(),
+        (&raw mut hd).cast::<c_void>(),
+        (&raw mut mc).cast::<c_void>(),
+        (&raw mut ws).cast::<c_void>(),
+    ];
+    unsafe {
+        attn_func.launch(attn_cfg, &mut attn_args)?;
+    }
+
+    Ok(output)
+}
+
 /// Paged attention decode with block tables and seq lens as `CudaTensor`s.
 ///
 /// Same as [`paged_attention_decode_indirect`] but accepts `CudaTensor`
@@ -457,6 +597,30 @@ pub fn paged_attention_decode_from_tensor(
     } else {
         max_seq_len
     };
+
+    // Fast path: BF16 + batch_size=1 → gather K/V from pages once, then run
+    // fast streaming attention on L2-resident contiguous buffers.
+    // This eliminates the scattered-page cache misses that dominate the paged
+    // kernel for short-to-medium sequences (40% of Q8_0 step time).
+    if dtype == DType::BF16 && batch_size == 1 {
+        // `scale` and `softcap_val` are already unwrapped f32 values here.
+        return gather_and_attend_bf16(
+            ctx,
+            q,
+            k_pool,
+            v_pool,
+            block_tables,
+            seq_lens,
+            max_blocks_per_seq,
+            block_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            softcap_val,
+            window_size,
+        );
+    }
 
     let output_shape = [batch_size, num_heads, head_dim];
     let mut output = unsafe { CudaTensor::uninit(ctx, &output_shape, dtype)? };

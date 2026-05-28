@@ -10,6 +10,113 @@
     if (softcap > 0.0f) { dot = tanhf(dot / softcap) * softcap; }
 
 // ---------------------------------------------------------------------------
+// Contiguous-KV decode attention (BF16) — gather-then-attend fast path
+//
+// Same algorithm as paged_decode_attention_bf16 but K and V are in a
+// contiguous pre-allocated buffer (filled by gather_kv_for_attn_bf16 first).
+// Sequential memory access eliminates the scattered-page cache misses that
+// dominate the paged kernel's runtime.
+//
+// Grid: (num_heads, batch_size=1)
+// Block: 256 threads (same as paged kernel after the shared-mem fix)
+// Shared memory: head_dim + max_capacity + blockDim.x (f32 each)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void contiguous_decode_attn_bf16(
+    __nv_bfloat16* __restrict__ output,       // (1, num_heads, head_dim)
+    const __nv_bfloat16* __restrict__ q,      // (1, num_heads, head_dim)
+    const __nv_bfloat16* __restrict__ k_cont, // (max_capacity, num_kv_heads, head_dim)
+    const __nv_bfloat16* __restrict__ v_cont, // (max_capacity, num_kv_heads, head_dim)
+    const int* __restrict__ seq_lens,         // (1,) — reads current seq_len from GPU
+    const float scale,
+    const float softcap,
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_dim,
+    const int max_capacity,   // allocated size of k_cont/v_cont (max_blocks * block_size)
+    const int window_size
+) {
+    const int head = blockIdx.x;
+    const int req  = blockIdx.y;
+    const int tid  = threadIdx.x;
+
+    const int seq_len = seq_lens[req];
+    if (seq_len == 0) return;
+
+    const int kv_head   = head * num_kv_heads / num_heads;
+    const int win_start = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    const int active_len = seq_len - win_start;
+
+    extern __shared__ float shared[];
+    float* s_q       = shared;                                  // head_dim floats
+    float* s_weights = shared + head_dim;                       // max_capacity floats
+    float* s_scratch = shared + head_dim + max_capacity;        // blockDim.x floats
+
+    // Load Q
+    const int q_base = (req * num_heads + head) * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        s_q[d] = __bfloat162float(q[q_base + d]);
+    __syncthreads();
+
+    // ---- Pass 1: Q·K scores (sequential reads from k_cont) ----
+    const int kv_stride = num_kv_heads * head_dim;
+    float local_max = -1e30f;
+
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        const int t      = win_start + i;
+        const int k_base = (t * num_kv_heads + kv_head) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += s_q[d] * __bfloat162float(k_cont[k_base + d]);
+        dot *= scale;
+        MAYBE_SOFTCAP(dot, softcap);
+        s_weights[i] = dot;
+        local_max = fmaxf(local_max, dot);
+    }
+
+    // Reduce local_max across block
+    s_scratch[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_scratch[tid] = fmaxf(s_scratch[tid], s_scratch[tid + stride]);
+        __syncthreads();
+    }
+    const float max_val = s_scratch[0];
+    __syncthreads();
+
+    // Softmax weights + sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < active_len; i += blockDim.x) {
+        float w = expf(s_weights[i] - max_val);
+        s_weights[i] = w;
+        local_sum += w;
+    }
+    s_scratch[tid] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_scratch[tid] += s_scratch[tid + stride];
+        __syncthreads();
+    }
+    const float inv_sum = 1.0f / s_scratch[0];
+    __syncthreads();
+
+    for (int i = tid; i < active_len; i += blockDim.x)
+        s_weights[i] *= inv_sum;
+    __syncthreads();
+
+    // ---- Pass 2: V accumulation (sequential reads from v_cont) ----
+    const int out_base = (req * num_heads + head) * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < active_len; i++) {
+            const int t      = win_start + i;
+            const int v_base = (t * num_kv_heads + kv_head) * head_dim + d;
+            acc += s_weights[i] * __bfloat162float(v_cont[v_base]);
+        }
+        output[out_base + d] = __float2bfloat16(acc);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Partitioned paged decode attention (BF16)
 //
 // Splits the KV sequence across multiple thread blocks to maximize SM
