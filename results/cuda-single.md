@@ -39,6 +39,31 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
+## 2026-05-28 — L4 Performance Optimization (up to +209% decode, beats llama.cpp)
+
+- **GPU:** NVIDIA L4 (23034 MiB VRAM)
+- **Driver:** 595.71.05 | CUDA 12.6
+- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
+- **infernum commit:** `26514de`
+- **llama.cpp commit:** `d8794ee` (Q8_0 GGUF, best of 3 reps from 2026-05-21 baseline)
+
+### Decode throughput (tok/s)
+
+| Model | infernum format | Engine | infernum | llama.cpp format | llama.cpp | ratio |
+| ----- | --------------- | ------ | -------: | ---------------- | --------: | ----: |
+| Llama / SmolLM2-360M | BF16 SafeTensors | cuda-graph-engine | 234.6 | Q8_0 GGUF | 250.0 | **0.94x** |
+| Llama / SmolLM2-360M | Q8_0 GGUF | cuda-graph-engine | 309.6 | Q8_0 GGUF | 250.0 | **1.24x** |
+| Llama / Llama-3.2-1B | BF16 SafeTensors | cuda-graph-engine | 115.2 | Q8_0 GGUF | 97.2 | **1.18x** |
+| Qwen / Qwen3-0.6B | BF16 SafeTensors | cuda-graph-engine | 156.7 | Q8_0 GGUF | 171.0 | **0.92x** |
+
+### Notes
+
+- **SmolLM2-360M BF16 decode reaches 234.6 tok/s = 0.94× llama.cpp Q8_0** — within 6% despite using 2× more bandwidth (BF16 vs Q8_0).
+- **Key optimizations in this release** (same as below, plus):
+  - QKV fused single GEMV: Q+K+V weights concatenated at load time (`"CONCAT:"` convention in `CudaWeightLoader`), single cuBLAS call with `SliceViewOp` splits. Saves 2 kernel launches per layer × 32 layers ≈ 500 µs/step. (+5.4% decode)
+
+---
+
 ## 2026-05-28 — L4 Performance Optimization (up to +176% decode, beats llama.cpp)
 
 - **GPU:** NVIDIA L4 (23034 MiB VRAM)
