@@ -309,14 +309,50 @@ pub fn load_graph_weights_gguf_cuda(
         ));
         let safetensors_name = &meta.name;
 
-        // CONCAT weights (for QKV fusion) are not present in GGUF files as a single
-        // tensor.  Load each component separately, dequantise to BF16, concatenate
-        // on-host, then upload as a Dense weight.
+        // CONCAT weights (for QKV fusion): concatenate multiple GGUF tensors.
+        // For Q4_0 and Q8_0, preserve the quantised format by concatenating the raw
+        // per-block data + scales bytes (rows stack independently, K is shared).
+        // For other dtypes, dequantise to BF16 and concatenate.
         if let Some(names_str) = safetensors_name.strip_prefix("CONCAT:") {
             let gguf_names: Vec<String> = names_str
                 .split(',')
                 .map(|n| name_mapper(n.trim()))
                 .collect();
+
+            // Detect the on-disk dtype from the first component.
+            let first_dtype = loader.get_dtype(&gguf_names[0])?;
+
+            if matches!(
+                first_dtype,
+                infernum::dtype::DType::Q4_0 | infernum::dtype::DType::Q8_0
+            ) {
+                // Native quantised CONCAT: concatenate block data + scales on host,
+                // then upload as a single QuantizedTensor.  No dequantisation needed.
+                let mut all_data: Vec<u8> = Vec::new();
+                let mut all_scales: Vec<u8> = Vec::new();
+                let mut total_rows = 0usize;
+                let mut cols = 0usize;
+                for gname in &gguf_names {
+                    let qt = loader.load_quantized(ctx, gname)?;
+                    let data = ctx.device().dtoh_sync_copy(&qt.data_slice().slice(..))?;
+                    let scales = ctx.device().dtoh_sync_copy(&qt.scales_slice().slice(..))?;
+                    total_rows += qt.shape()[0];
+                    cols = qt.shape()[1];
+                    all_data.extend_from_slice(&data);
+                    all_scales.extend_from_slice(&scales);
+                }
+                let qt_cat = crate::cuda::QuantizedTensor::from_raw(
+                    ctx,
+                    &[total_rows, cols],
+                    first_dtype,
+                    &all_data,
+                    &all_scales,
+                )?;
+                store.push_linear_weight(LinearWeight::Quantized(qt_cat));
+                continue;
+            }
+
+            // BF16 / other dtypes: dequantise each component, concatenate, upload Dense.
             let mut total_rows = 0usize;
             let mut all_bytes: Vec<Vec<u8>> = Vec::new();
             let mut cols = 0usize;
@@ -329,8 +365,7 @@ pub fn load_graph_weights_gguf_cuda(
             let elem = 2usize; // BF16
             let mut cat_bytes = vec![0u8; total_rows * cols * elem];
             let mut offset = 0;
-            for (bytes, gname) in all_bytes.iter().zip(gguf_names.iter()) {
-                let _ = gname;
+            for bytes in &all_bytes {
                 cat_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
                 offset += bytes.len();
             }

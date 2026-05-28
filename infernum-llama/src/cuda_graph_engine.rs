@@ -185,8 +185,11 @@ impl LlamaCudaGraphEngineExt for LlamaCudaGraphEngine {
     fn from_gguf(ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
         let loader =
             infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
-        let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
-        // use_qkv_fusion defaults to false for GGUF (quantized formats)
+        let mut config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+        // Enable QKV fusion for GGUF — the GGUF weight loader handles the "CONCAT:" prefix
+        // natively for Q4_0 and Q8_0 (raw block concatenation, no dequantisation),
+        // and falls back to BF16 for other formats.
+        config.use_qkv_fusion = config.quantization_config.is_none();
         infernum_cuda::CudaGraphEngine::from_config_gguf(config, ctx, gguf_path)
     }
 }
