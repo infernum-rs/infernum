@@ -109,7 +109,7 @@ fn matmul_2d(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
             data_type,
             n as i32,
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
         )?;
     }
 
@@ -166,7 +166,7 @@ fn matmul_batched(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
             stride_c,
             batch as i32,
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
         )?;
     }
 
@@ -245,7 +245,7 @@ fn matmul_bf16_f32_2d(a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
             sys::cudaDataType_t::CUDA_R_32F,
             n as i32,
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
         )?;
     }
 

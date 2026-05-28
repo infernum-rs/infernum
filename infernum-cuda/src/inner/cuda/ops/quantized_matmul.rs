@@ -959,14 +959,17 @@ pub fn quantized_matmul(input: &CudaTensor, weight: &QuantizedTensor) -> Result<
 // the full dequant-to-F16 step and keeps data in int8 throughout.
 
 /// Ensure MMQ Q8 kernels are loaded.
-#[allow(dead_code)]
 fn ensure_mmq_q8_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module = "mmq_q8";
     if !device.has_func(module, "mmq_q8_f32") {
         device.load_ptx(
             cudarc::nvrtc::Ptx::from_src(MMQ_Q8_PTX),
             module,
-            &["mmq_q8_f32", "quantize_activations_q8"],
+            &[
+                "mmq_q8_f32",
+                "quantize_activations_q8",
+                "quantize_activations_q8_bf16",
+            ],
         )?;
     }
     Ok(())
@@ -974,10 +977,9 @@ fn ensure_mmq_q8_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) ->
 
 /// `Q8_0` MMQ matmul using WMMA int8 tensor cores.
 ///
-/// `input`: f32 tensor (M, K)
+/// `input`: F32 or BF16 tensor (M, K)
 /// `weight`: `Q8_0` quantized tensor (N, K)
-/// output: f32 tensor (M, N) = input @ dequant(weight)^T
-#[allow(dead_code)]
+/// output: BF16 tensor (M, N) = input @ dequant(weight)^T
 fn mmq_matmul_q8(
     input: &CudaTensor,
     weight: &QuantizedTensor,
@@ -987,19 +989,24 @@ fn mmq_matmul_q8(
 ) -> Result<CudaTensor> {
     let ctx = input.context();
     let device = ctx.device();
+    let output_dtype = input.dtype();
 
     ensure_mmq_q8_kernels(device)?;
 
-    // 1. Quantize f32 activations to int8 + scales
+    // 1. Quantize activations to int8 + per-block-32 f32 scales.
+    //    Supports F32 and BF16 inputs via separate CUDA kernels.
     let total_a = m * k;
     let num_a_blocks = m * (k / 32);
-    let mut a_q8: CudaSlice<u8> = unsafe { device.alloc::<u8>(total_a)? }; // int8
+    let mut a_q8: CudaSlice<u8> = unsafe { device.alloc::<u8>(total_a)? };
     let mut a_scales: CudaSlice<f32> = unsafe { device.alloc::<f32>(num_a_blocks)? };
 
     {
-        let func = device
-            .get_func("mmq_q8", "quantize_activations_q8")
-            .unwrap();
+        let kernel_name = if input.dtype() == DType::BF16 {
+            "quantize_activations_q8_bf16"
+        } else {
+            "quantize_activations_q8"
+        };
+        let func = device.get_func("mmq_q8", kernel_name).unwrap();
         let block_size = 256_u32;
         let grid_size = (num_a_blocks as u32 + block_size - 1) / block_size;
         let cfg = LaunchConfig {
@@ -1021,18 +1028,17 @@ fn mmq_matmul_q8(
         }
     }
 
-    // 2. Launch MMQ kernel
+    // 2. Launch MMQ kernel — outputs F32 accumulation.
     let mut output = unsafe { CudaTensor::uninit(ctx, &[m, n], DType::F32)? };
 
     let block_m = 64_usize;
     let block_n = 64_usize;
     let grid_x = (n + block_n - 1) / block_n;
     let grid_y = (m + block_m - 1) / block_m;
-    let nwarps = 16_u32; // WARPS_M * WARPS_N = 4 * 4
 
     let cfg = LaunchConfig {
         grid_dim: (grid_x as u32, grid_y as u32, 1),
-        block_dim: (32, nwarps, 1),
+        block_dim: (32, 16, 1), // 32 threads × 16 warps
         shared_mem_bytes: 0,
     };
 
@@ -1053,7 +1059,12 @@ fn mmq_matmul_q8(
         )?;
     }
 
-    Ok(output)
+    // 3. Cast F32 output to the activation dtype (BF16 for most models).
+    if output_dtype == DType::BF16 {
+        cast_f32_to_bf16(&output)
+    } else {
+        Ok(output)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1094,8 @@ fn ensure_dequant_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -
                 "dequant_q4k_f16",
                 "dequant_q5k_f16",
                 "dequant_gptq_f16",
+                "dequant_q8_bf16",
+                "dequant_q4_bf16",
             ],
         )?;
     }
@@ -1318,7 +1331,121 @@ fn dequant_cublas_matmul(
             f32_type,
             n as i32, // ldc = N
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )?;
+    }
+
+    Ok(output)
+}
+
+/// Dequantize weight to BF16, use BF16 input directly, cuBLAS BF16×BF16→BF16 GEMM.
+///
+/// Eliminates two cast kernels vs `dequant_cublas_matmul` (BF16→F16 for input,
+/// F32→BF16 for output) and reduces output write bandwidth by 2×. Only for Q8_0
+/// and Q4_0 when the input activation is already BF16.
+fn dequant_cublas_matmul_bf16(
+    input: &CudaTensor,
+    weight: &QuantizedTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaTensor> {
+    use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    use cudarc::cublas::{result, sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    let ctx = input.context();
+    let device = ctx.device();
+    let total_w = n * k;
+
+    ensure_dequant_kernels(device)?;
+
+    // 1. Dequantize weight (N, K) → BF16 buffer (cached across calls)
+    let w_bf16 = weight.dequant_bf16().get_or_init(|| {
+        let mut buf: CudaSlice<u8> = unsafe {
+            device
+                .alloc::<u8>(total_w * 2)
+                .expect("GPU alloc for bf16 dequant cache")
+        };
+
+        let block_size = 256_u32;
+        let grid_size = ((total_w as u32) + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        match weight.dtype() {
+            DType::Q8_0 => {
+                let func = device.get_func("dequantize", "dequant_q8_bf16").unwrap();
+                unsafe {
+                    func.launch(
+                        cfg,
+                        (
+                            &mut buf,
+                            weight.data_slice(),
+                            weight.scales_slice(),
+                            n as i32,
+                            k as i32,
+                        ),
+                    )
+                    .expect("dequant Q8 bf16 kernel launch");
+                }
+            }
+            DType::Q4_0 => {
+                let func = device.get_func("dequantize", "dequant_q4_bf16").unwrap();
+                unsafe {
+                    func.launch(
+                        cfg,
+                        (
+                            &mut buf,
+                            weight.data_slice(),
+                            weight.scales_slice(),
+                            n as i32,
+                            k as i32,
+                        ),
+                    )
+                    .expect("dequant Q4 bf16 kernel launch");
+                }
+            }
+            other => panic!("dequant_cublas_matmul_bf16: unsupported dtype {other}"),
+        }
+
+        buf
+    });
+
+    // 2. BF16 activations — pass directly (no cast needed).
+    let a_bf16_ptr = *input.cuda_slice().device_ptr() as *const u8;
+
+    // 3. cuBLAS BF16×BF16→BF16 GEMM (compute in F32 internally for accuracy).
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[m, n], DType::BF16)? };
+
+    let bf16_type = sys::cudaDataType_t::CUDA_R_16BF;
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+
+    unsafe {
+        result::gemm_ex(
+            *ctx.blas().handle(),
+            sys::cublasOperation_t::CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            (&raw const alpha).cast(),
+            *w_bf16.device_ptr() as *const _,
+            bf16_type,
+            k as i32,
+            a_bf16_ptr.cast(),
+            bf16_type,
+            k as i32,
+            (&raw const beta).cast(),
+            *output.cuda_slice_mut().device_ptr_mut() as *mut _,
+            bf16_type,
+            n as i32,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
         )?;
     }
 
@@ -1389,7 +1516,12 @@ fn quantized_matmul_2d(
     // Tensor-core paths for M > 1 (prefill)
     if m > 1 {
         match weight.dtype() {
-            // Dequant + cuBLAS: dequant to F16, then cuBLAS GEMM with tensor cores
+            // BF16 native path (Q8_0/Q4_0 + BF16 input): dequant weights to BF16,
+            // use BF16×BF16→BF16 cuBLAS. Eliminates BF16→F16 and F32→BF16 casts.
+            DType::Q8_0 | DType::Q4_0 if input.dtype() == DType::BF16 => {
+                return dequant_cublas_matmul_bf16(input, weight, m, n, k);
+            }
+            // F16 fallback: dequant to F16, cuBLAS, output F32.
             DType::Q8_0
             | DType::Q4_0
             | DType::Q6_K

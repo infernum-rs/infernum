@@ -87,6 +87,9 @@ pub struct QuantizedTensor {
     /// Cached dequantized F16 weight buffer for prefill (lazily populated on first use).
     /// Contains the full N×K weight matrix dequantized to F16 (2 bytes per element).
     dequant_f16_cache: OnceLock<CudaSlice<u8>>,
+    /// Cached dequantized BF16 weight buffer for prefill (lazily populated on first use).
+    /// Eliminates BF16→F16 and F32→BF16 casts when activations are already BF16.
+    dequant_bf16_cache: OnceLock<CudaSlice<u8>>,
 }
 
 impl QuantizedTensor {
@@ -169,6 +172,7 @@ impl QuantizedTensor {
             d_weight_scale: None,
             d_channel_scales: None,
             dequant_f16_cache: OnceLock::new(),
+            dequant_bf16_cache: OnceLock::new(),
         })
     }
 
@@ -200,6 +204,7 @@ impl QuantizedTensor {
             d_weight_scale: None,
             d_channel_scales: None,
             dequant_f16_cache: OnceLock::new(),
+            dequant_bf16_cache: OnceLock::new(),
         }
     }
 
@@ -273,10 +278,16 @@ impl QuantizedTensor {
     }
 
     /// Get or lazily create the cached F16 dequantized weight buffer.
-    /// Returns `None` for FP8 (which doesn't use dequant+cuBLAS).
     #[must_use]
     pub fn dequant_f16(&self) -> &OnceLock<CudaSlice<u8>> {
         &self.dequant_f16_cache
+    }
+
+    /// Get or lazily create the cached BF16 dequantized weight buffer.
+    /// Used by the BF16 cuBLAS path to avoid BF16→F16 and F32→BF16 casts.
+    #[must_use]
+    pub fn dequant_bf16(&self) -> &OnceLock<CudaSlice<u8>> {
+        &self.dequant_bf16_cache
     }
 
     /// Total number of logical elements
@@ -428,6 +439,7 @@ impl QuantizedTensor {
             d_weight_scale: None,
             d_channel_scales: None,
             dequant_f16_cache: OnceLock::new(),
+            dequant_bf16_cache: OnceLock::new(),
         })
     }
 
