@@ -39,10 +39,10 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
-## 2026-05-28 — L4 GPU — current numbers (commit `9002f38`)
+## 2026-05-28 — L4 GPU — current numbers (commit `3ab23c0`)
 
 - **GPU:** NVIDIA L4 (23034 MiB VRAM) · **Driver:** 595.71.05 · **CUDA 12.6**
-- **infernum commit:** `fe51737` · **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
+- **infernum commit:** `3ab23c0` · **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
 - **Same GGUF file used for both engines.** BF16 has no llama.cpp same-format reference.
 
 ---
@@ -79,8 +79,8 @@ Both infernum and llama.cpp now use batch GEMM (`pp512`, M=512, tensor-core elig
 
 ### Notes
 
-- **Q8_0 at 1.02×, Q4_0 at 0.99×**: infernum matches or beats llama.cpp on all measured GGUF decode formats.
-- **Prefill at 0.44–0.50×**: infernum now uses batch GEMM (M=512) for prefill — 29–40× speedup vs the old token-by-token approach. Gap vs llama.cpp is from dequant overhead (infernum dequantizes Q8_0/Q4_0 weights to F16 each call using `dequant_cublas_matmul`; llama.cpp uses native GGML kernels). Next step: cache dequantized weights between prefill calls.
+- **Decode at parity**: Q8_0 1.01–1.04×, Q4_0 0.96–0.98× llama.cpp across all measured models.
+- **Prefill at parity or above**: 1.07× (SmolLM2 Q8_0) → 0.98× (Llama-3.2-1B Q4_0). All models within ±7%.
 - **Gather+attend (commit `5bc281a`)**: replaced paged attention (scattered K/V reads, 40% of Q8_0 step time) with a gather-then-attend approach.
 - **Q4_0 input-quantisation deduplication (commit `0f3d156`)**: extended Q8_0 deduplication to Q4_0.
 - **Native quantised CONCAT + GGUF QKV fusion (commit `9002f38`)**: Q,K,V weights concatenated, fused into one GEMV per layer. Q8_0: +3.4%, Q4_0: +5.2%.
