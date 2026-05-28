@@ -943,7 +943,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     /// Run one decode step via CUDA graph replay (stabilised) or capture (warm-up).
     ///
     /// Returns `(logits_tensor, Some(argmax_token))` in the stabilised fast
-    /// path — the argmax is computed via a GPU reduction + async DToH inside
+    /// path — the argmax is computed via a GPU reduction + async `DToH` inside
     /// the event-sync window, so the caller can skip a second GPU round-trip.
     /// Returns `(logits_tensor, None)` during the non-stabilised capture phase.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1283,11 +1283,12 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
     /// Fast path (when the model supports it): runs a single batch-GEMM forward
     /// pass over all `input_ids` at once, then scatters the K/V tensors for
     /// every layer into the paged pool with `append_paged`. This turns
-    /// `seq_len` serial M=1 GEMVs into one M=seq_len GEMM, unlocking
+    /// `seq_len` serial M=1 GEMVs into one `M=seq_len` GEMM, unlocking
     /// tensor-core throughput and giving 10–50× prefill speedup for large prompts.
     ///
     /// Slow path fallback: iterates token-by-token using the paged decode graph.
     /// Used for models that do not implement `build_prefill_graph_with_kv_cuda`.
+    #[allow(clippy::too_many_lines)]
     fn forward_prefill(
         &self,
         input_ids: &[u32],

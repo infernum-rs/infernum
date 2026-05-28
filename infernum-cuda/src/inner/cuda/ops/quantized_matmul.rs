@@ -609,18 +609,19 @@ fn quantized_gemv(
 // Quantized GEMV with pre-quantized input (shared quantization)
 // ---------------------------------------------------------------------------
 
-/// Run the Q8_0 GEMV kernel with already-quantized Q8_1 activations.
+/// Run the `Q8_0` GEMV kernel with already-quantized `Q8_1` activations.
 ///
-/// Skips the `quantize_activations_to_q8_1` step, enabling multiple Q8_0 GEMVs
+/// Skips the `quantize_activations_to_q8_1` step, enabling multiple `Q8_0` GEMVs
 /// to share a single quantization pass (e.g. Q, K, V projections from the same
 /// hidden state, or gate + up projections from the same norm output).
 ///
-/// Requires M=1 (decode GEMV path). Panics if weight is not Q8_0.
-/// GEMV with pre-quantized Q8_1 activations, for Q8_0 or Q4_0 weight matrices.
+/// Requires M=1 (decode GEMV path). Panics if weight is not `Q8_0`.
+/// GEMV with pre-quantized `Q8_1` activations, for `Q8_0` or `Q4_0` weight matrices.
 ///
 /// Skips the `quantize_bf16_to_q8_1` step so multiple GEMVs sharing the same
 /// input (Q+K+V, gate+up) can reuse one quantised activation buffer.
-/// `act_sums` is required for Q4_0 (zero-point correction) but not Q8_0.
+/// `act_sums` is required for `Q4_0` (zero-point correction) but not `Q8_0`.
+#[allow(clippy::too_many_arguments, clippy::items_after_statements)]
 fn quantized_gemv_preq(
     ctx: &crate::cuda::CudaContext,
     act_data: &crate::cuda::buffer_pool::PooledSlice<i8>,
@@ -658,12 +659,12 @@ fn quantized_gemv_q8_0_preq(
     k: usize,
     output_dtype: DType,
 ) -> Result<CudaTensor> {
+    const NWARPS: u32 = 4;
     assert_eq!(
         weight.dtype(),
         DType::Q8_0,
         "quantized_gemv_q8_0_preq: weight must be Q8_0"
     );
-    const NWARPS: u32 = 4;
     let device = ctx.device();
 
     let use_bf16_output = output_dtype == DType::BF16;
@@ -704,6 +705,7 @@ fn quantized_gemv_q8_0_preq(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments, clippy::items_after_statements)]
 fn quantized_gemv_q4_0_preq(
     ctx: &crate::cuda::CudaContext,
     act_data: &crate::cuda::buffer_pool::PooledSlice<i8>,
@@ -714,12 +716,12 @@ fn quantized_gemv_q4_0_preq(
     k: usize,
     output_dtype: DType,
 ) -> Result<CudaTensor> {
+    const NWARPS: u32 = 4;
     assert_eq!(
         weight.dtype(),
         DType::Q4_0,
         "quantized_gemv_q4_0_preq: weight must be Q4_0"
     );
-    const NWARPS: u32 = 4;
     let device = ctx.device();
     let use_bf16_output = output_dtype == DType::BF16;
     let out_dtype = if use_bf16_output {
@@ -760,7 +762,7 @@ fn quantized_gemv_q4_0_preq(
 
 /// Two quantised GEMVs from the same input, quantising the input only once.
 ///
-/// Supports Q8_0 and Q4_0 weights. Reduces `quantize_bf16_to_q8_1` count from 2 to 1.
+/// Supports `Q8_0` and `Q4_0` weights. Reduces `quantize_bf16_to_q8_1` count from 2 to 1.
 ///
 /// # Errors
 /// Returns an error if kernel launch or allocation fails.
@@ -819,7 +821,7 @@ pub fn quantized_linear_pair(
     }
 }
 
-/// Three Q8_0 GEMVs from the same input, quantizing only once.
+/// Three `Q8_0` GEMVs from the same input, quantizing only once.
 ///
 /// Used for Q + K + V projections. Reduces input quantizations from 3 to 1.
 ///
@@ -1343,8 +1345,9 @@ fn dequant_cublas_matmul(
 /// Dequantize weight to BF16, use BF16 input directly, cuBLAS BF16×BF16→BF16 GEMM.
 ///
 /// Eliminates two cast kernels vs `dequant_cublas_matmul` (BF16→F16 for input,
-/// F32→BF16 for output) and reduces output write bandwidth by 2×. Only for Q8_0
-/// and Q4_0 when the input activation is already BF16.
+/// F32→BF16 for output) and reduces output write bandwidth by 2×. Only for `Q8_0`
+/// and `Q4_0` when the input activation is already BF16.
+#[allow(clippy::items_after_statements)]
 fn dequant_cublas_matmul_bf16(
     input: &CudaTensor,
     weight: &QuantizedTensor,

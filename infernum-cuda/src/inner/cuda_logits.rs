@@ -52,8 +52,8 @@ impl CudaLogits {
     /// Wrap logits with a pre-computed argmax result.
     ///
     /// Used by the CUDA-graph stabilized decode fast path: the argmax is
-    /// obtained from `pinned_token` (async DToH inside the event-sync window)
-    /// without an extra GPU kernel + synchronous DToH on the critical path.
+    /// obtained from `pinned_token` (async `DToH` inside the event-sync window)
+    /// without an extra GPU kernel + synchronous `DToH` on the critical path.
     ///
     /// `argmax(0)` returns the precomputed value; `sample_top_p` and all
     /// other methods use the underlying `tensor` normally.

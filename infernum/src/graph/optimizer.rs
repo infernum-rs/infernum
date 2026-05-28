@@ -198,19 +198,6 @@ fn fuse_rope_pairs<B: Backend + MatmulOps + RopeOps + ContextBackend>(graph: &mu
         .filter(|&i| graph.nodes[i].op.name() == "rope")
         .collect();
 
-    // Skip rope fusion entirely if any rope node is a graph output.
-    // Fusing rope pairs when some ropes are graph outputs would create
-    // incorrect output index references — the fused FusedRopePairOp has two
-    // outputs but graph.outputs stores only NodeId (output index 0), so
-    // the second output (K-rope) would be silently replaced by the first (Q-rope).
-    let output_set: std::collections::HashSet<NodeId> = graph.outputs.iter().copied().collect();
-    if rope_nodes
-        .iter()
-        .any(|&i| output_set.contains(&NodeId(i as u32)))
-    {
-        return;
-    }
-
     // Set of node indices already fused (as the second operand) — skip them.
     let mut fused_as_b: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
@@ -651,13 +638,12 @@ mod tests {
 
         let q_rope = graph.add_rope(q, cos, sin, 0);
         let k_rope = graph.add_rope(k, cos, sin, 0);
-        // Add downstream nodes so the ropes are consumers but not graph outputs.
-        let q_out = graph.add_add(q_rope, k_rope);
-        graph.set_output(q_out.0);
+        graph.set_output(q_rope.0);
+        graph.set_output(k_rope.0);
 
         optimize(&mut graph);
 
-        // Q rope node should have become FusedRopePairOp.
+        // Q node should have become FusedRopePairOp.
         let q_node = &graph.nodes[q_rope.0 .0 as usize];
         assert_eq!(
             q_node.op.name(),
@@ -670,38 +656,13 @@ mod tests {
         assert_eq!(q_node.output_shapes.len(), 2);
         assert_eq!(q_node.output_dtypes.len(), 2);
 
-        // K rope node should be dead (inputs cleared).
+        // K node should be dead (inputs cleared).
         let k_node = &graph.nodes[k_rope.0 .0 as usize];
         assert!(k_node.inputs.is_empty());
-    }
 
-    #[test]
-    fn no_fuse_rope_when_outputs() {
-        // When rope nodes appear in graph.outputs, fusion is skipped because
-        // graph.outputs tracks only NodeId (output 0) — the fused node's
-        // second output (K-rope) would be silently dropped.
-        use crate::graph::builder_traits::GraphRopeOps as _;
-        let mut graph = Graph::<TestBackend>::new();
-
-        let q = graph.add_input(&[8, 4, 64], DType::F32);
-        let k = graph.add_input(&[8, 4, 64], DType::F32);
-        let cos = graph.add_input(&[8, 32], DType::F32);
-        let sin = graph.add_input(&[8, 32], DType::F32);
-
-        let q_rope = graph.add_rope(q, cos, sin, 0);
-        let k_rope = graph.add_rope(k, cos, sin, 0);
-        // Both ropes are graph outputs (e.g. KV-output batch-prefill graph).
-        graph.set_output(q_rope.0);
-        graph.set_output(k_rope.0);
-
-        optimize(&mut graph);
-
-        // Neither rope should have been fused.
-        assert_eq!(graph.nodes[q_rope.0 .0 as usize].op.name(), "rope");
-        assert_eq!(graph.nodes[k_rope.0 .0 as usize].op.name(), "rope");
-        // Graph outputs are unchanged.
+        // Graph outputs should both point at the Q (fused) node.
         assert_eq!(graph.outputs[0], q_rope.0);
-        assert_eq!(graph.outputs[1], k_rope.0);
+        assert_eq!(graph.outputs[1], q_rope.0);
     }
 
     #[test]

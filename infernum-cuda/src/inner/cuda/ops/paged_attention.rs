@@ -49,7 +49,7 @@ const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
 
 /// Minimum sequence length to use the partitioned kernel.
 ///
-/// Below this threshold the standard kernel (15 blocks for SmolLM2) has
+/// Below this threshold the standard kernel (15 blocks for `SmolLM2`) has
 /// lower launch overhead and the partitioned overhead (extra allocs +
 /// reduction kernel) is not worth it.
 #[allow(dead_code)]
@@ -164,7 +164,7 @@ pub fn paged_attention_decode(
 
     // Active length accounts for sliding window
     #[allow(clippy::cast_sign_loss)]
-    let _max_active_len = if window_size > 0 {
+    let max_active_len = if window_size > 0 {
         max_seq_len.min(window_size as usize)
     } else {
         max_seq_len
@@ -244,7 +244,7 @@ fn launch_paged_decode(
     let max_capacity = max_blocks_per_seq * block_size;
     // Use head_dim threads for 100% V-phase utilisation; active_len/head_dim
     // tokens per thread in Q·K (typically 1-4 for most decode steps).
-    let threads = head_dim.min(256).max(32);
+    let threads = head_dim.clamp(32, 256);
 
     // Shared memory: s_q (head_dim) + s_weights (max_capacity) + s_scratch (threads)
     let shared_mem = (head_dim + max_capacity + threads) * std::mem::size_of::<f32>();
@@ -363,7 +363,7 @@ pub(crate) fn paged_attention_decode_indirect(
 
     // Active length accounts for sliding window
     #[allow(clippy::cast_sign_loss)]
-    let _max_active_len = if window_size > 0 {
+    let max_active_len = if window_size > 0 {
         max_seq_len.min(window_size as usize)
     } else {
         max_seq_len
@@ -400,11 +400,11 @@ pub(crate) fn paged_attention_decode_indirect(
 /// Two-kernel approach that eliminates the scattered-page cache misses dominating
 /// the paged attention kernel for short-to-medium sequences:
 /// 1. `gather_kv_for_attn_bf16`: copies K and V from scattered paged blocks into
-///    contiguous pre-allocated output tensors, using seq_len from a GPU buffer.
+///    contiguous pre-allocated output tensors, using `seq_len` from a GPU buffer.
 /// 2. `contiguous_decode_attn_bf16`: runs attention with sequential K/V reads from
 ///    the gathered buffers (fits in L2 cache → near-peak bandwidth).
 ///
-/// Only supported for BF16 and batch_size==1.  Returns `None` for other dtypes/
+/// Only supported for BF16 and `batch_size==1`.  Returns `None` for other dtypes/
 /// batch sizes (caller falls back to the paged kernel).
 ///
 /// # Errors
@@ -541,7 +541,7 @@ fn gather_and_attend_bf16(
 ///
 /// # Errors
 /// Returns an error if kernel launch or allocation fails.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn paged_attention_decode_from_tensor(
     ctx: &CudaContext,
     q: &CudaTensor,

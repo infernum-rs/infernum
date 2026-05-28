@@ -465,8 +465,14 @@ where
         let k_rope = graph.add_rope(k_3d, cos_input, sin_input, 0);
 
         // Collect K (post-RoPE) and V for KV-cache population if requested.
+        // Wrap in reshape (no-op same shape) so that k_rope and v_3d are never
+        // registered as direct graph outputs — this avoids blocking the
+        // fuse_rope_pairs optimizer which would otherwise skip all rope fusions
+        // when it sees a rope node in graph.outputs (causing CPU inference regression).
         if output_kv {
-            kv_outputs.push((k_rope, v_3d));
+            let k_out = graph.add_reshape(k_rope, &[seq_len, num_kv_heads_local, head_dim]);
+            let v_out = graph.add_reshape(v_3d, &[seq_len, num_kv_heads_local, head_dim]);
+            kv_outputs.push((k_out, v_out));
         }
 
         // 5. Fused causal attention (full, no sliding window)
