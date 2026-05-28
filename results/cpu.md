@@ -1371,3 +1371,40 @@ Also attempted native Q4_0 GEMM without expand (routing to `simd::gemm_q4_tiled_
 - Performance unchanged from the correctness fix: Q4_0 prefill 0.87x, within noise of prior 0.85x.
 - Removed `q4_gemm_tiled_il` (dead code — the inline expand version with wrong bpr). The `Q4_0` IL prefill path now dispatches directly without the intermediate function.
 - Remaining gaps: Q4_0 decode ~0.95x, Q4_0 prefill ~0.87x (structural), Gemma ~0.95–0.97x (not benchmarked this run).
+
+---
+
+## 2026-05-27 — Q4_0 8-row IL GEMM investigation (negative result, rolled back) (`perf/cpu-performance`)
+
+**What was tried:** Implemented a new `block_q4_0x8` 8-row interleaved format (144 bytes/block: 64 bytes lo-nibble sections for 8 rows + 64 bytes hi-nibble sections + 16 bytes f16 scales) and a corresponding `microkernel_q4_4x8_il` GEMM kernel. The goal was to halve Q4_0 weight bandwidth in the GEMM kernel by eliminating the separate expand pass: reading Q4 nibbles directly at 18 bytes/row/block vs the current expand-then-Q8 path at 17 bytes/row/block (Q4 read) + 17 bytes/row/block (Q8 write + Q8 read) = 34 bytes/row/block total.
+
+Changes implemented across all 4 CPU files:
+- `matmul.rs`: 8-row dispatch, `bpr_il = nb * 144`, groups of 8 neurons, scalar remainder
+- `simd/mod.rs`: `dot_q4_q8_8row_il` (8-tuple return), `gemm_q4_8row_tiled_il` public API
+- `simd/avx512.rs`: `dot_q4_q8_8row_il_inner` (8 `__m256` accumulators), `microkernel_q4_4x8_il` (32 named `__m256` accumulators a00..a37 using `proc_col!` macro)
+- `matmul.rs`: removed Q4 expand scratch (`Q4_EXPAND_SCRATCH` thread-local)
+
+**Result:** Q4_0 prefill regressed from **0.88x → 0.69x** (−21%). All changes rolled back via `git checkout HEAD`.
+
+**Root cause: register spilling.** The `microkernel_q4_4x8_il` kernel uses 32 named `__m256` accumulators (a00..a37) plus ~10 temporary registers (mask_0f, neg8, scale vectors, lo/hi nibble expansion temps, input registers). Total: ~42 YMM registers needed, only 32 available. LLVM spills approximately 16 accumulators to the L1 stack — generating ~1KB of stack traffic per K-block on top of 144 bytes of weight data. This is ~7× the per-block "cost" of the expand pass it was supposed to eliminate.
+
+Specifically: for M=512, K=960 blocks, tiles=128×240, LLVM generates ~16 spill+reload pairs per block. At 64 bytes/YMM × 32 cycles/L1 spill, that is ~32KB × 32 = ~1M cycles of spill traffic per tile, vs ~144B × (L3 latency ≈ 40 cycles) ≈ 5760 cycles of weight read latency with prefetch. The spill cost dominates by ~170×.
+
+The 4-row Q8_0 microkernel does not have this problem: 16 accumulators (ymm8–23) + 4 pre-broadcast input scales (ymm24–27) + ~4 temps = 24 registers, comfortably fitting in 32 YMM regs.
+
+**Conclusion:** The 8-row Q4 approach cannot work in Rust intrinsics under the 32-register constraint. Any kernel with RM×RN > 16 will cause LLVM to spill. The only viable path is hand-written inline ASM (like `microkernel_q8_4x4_il`) where registers are assigned explicitly — but even then, an 8×4 or 8×8 tile requires 32–64 accumulators, requiring ZMM (512-bit) registers to keep the accumulator count below 16 (each ZMM holds 2× the outputs of a YMM). This is the ZMM 8-row effort documented in the Q4_0 prefill ceiling analysis.
+
+### Post-rollback baseline
+
+| Model | infernum | llama.cpp | ratio |
+| ----- | -------: | --------: | ----: |
+| SmolLM2-360M Q8_0 decode  | 143.5 | 144.0 | **1.00x** |
+| SmolLM2-360M Q4_0 decode  | 204.8 | 203.3 | **1.01x** |
+| SmolLM2-360M Q8_0 prefill | 1151.0 | 1171.7 | **0.98x** |
+| SmolLM2-360M Q4_0 prefill | 1072.8 | 1278.4 | 0.84x |
+
+### Notes
+
+- Post-rollback numbers are consistent with the prior session; all Q8_0 paths and Q4_0 decode remain at or near parity.
+- The Q4_0 prefill gap (0.84x) is unchanged and remains structural.
+- Remaining gaps vs llama.cpp: Q4_0 prefill ~0.84–0.87x (structural — requires ZMM 8-row kernel), Gemma decode ~0.97x, Gemma prefill ~0.93x.
