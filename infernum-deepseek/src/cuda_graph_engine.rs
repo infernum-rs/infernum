@@ -578,6 +578,7 @@ impl DeepSeekCudaEngine {
             kv.seq_pos,
             None, // no CUDA graph capture
             comm,
+            0, // no paged KV cache, no eager_max_seq_len needed
         )?;
         kv.seq_pos += 1;
 

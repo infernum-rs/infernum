@@ -70,6 +70,9 @@ pub fn execute(
     mla_seq_pos: usize,
     mut graph_inputs: Option<crate::inner::execute_context::GraphInputs>,
     comm: Option<&'_ <CudaBackend as Backend>::Comm>,
+    // Pre-computed max(seq_lens) for eager (non-graph-capture) paths.
+    // When >0, CudaPagedKvCacheAccess uses this directly instead of a D→H copy.
+    eager_max_seq_len: usize,
 ) -> Result<(
     Vec<CudaTensor>,
     Option<crate::inner::execute_context::GraphInputs>,
@@ -107,11 +110,15 @@ pub fn execute(
             };
             let mut input_idx_local = input_idx;
             {
-                // Pass max_seq_len from GraphInputs when in capture mode so that
+                // Pass max_seq_len from GraphInputs (CUDA-graph path) or from the
+                // eager_max_seq_len caller argument (eager path), so that
                 // CudaPagedKvCacheAccess::paged_attention_decode can skip the
-                // synchronous D→H copy of seq_lens (which invalidates stream capture).
-                let captured_max_seq_len =
-                    state.graph_inputs.as_ref().map_or(0, |gi| gi.max_seq_len);
+                // synchronous D→H copy of seq_lens (which is illegal inside stream
+                // capture and expensive in the eager prefill path).
+                let captured_max_seq_len = state
+                    .graph_inputs
+                    .as_ref()
+                    .map_or(eager_max_seq_len, |gi| gi.max_seq_len);
                 let mut paged_acc =
                     paged_kv_cache
                         .as_deref_mut()

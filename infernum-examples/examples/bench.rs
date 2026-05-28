@@ -485,6 +485,7 @@ fn bench_graph(
             0,
             None,
             None,
+            0,
         )?;
         ctx.synchronize()?;
         assert_eq!(outputs[0].shape()[0], n_tokens);
@@ -510,6 +511,7 @@ fn bench_graph(
             0,
             None,
             None,
+            0,
         )?;
         ctx.synchronize()?;
         let elapsed = start.elapsed();
@@ -670,6 +672,7 @@ fn bench_graph_decode(
             0,
             None,
             None,
+            0,
         )?;
 
         // Outputs: [logits, k_0, k_1, ..., k_{n-1}, v_0, v_1, ..., v_{n-1}]

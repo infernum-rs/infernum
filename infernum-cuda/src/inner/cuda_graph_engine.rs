@@ -830,6 +830,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             0,
             None,
             self.comm_ref(),
+            0, // no paged KV cache in prefill-graph mode
         )?;
         Ok(outputs)
     }
@@ -972,6 +973,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 0,                 // mla_seq_pos
                 Some(real_inputs), // stable GPU input buffers
                 self.comm_ref(),
+                0, // graph_inputs carries max_seq_len; no eager fallback needed
             )?;
 
             if !state.capture_unsafe {
@@ -1099,6 +1101,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             seq_lens_t,
         ];
         let output_nodes = graph.output_ids().to_vec();
+        let eager_max = seq_lens_u32
+            .iter()
+            .copied()
+            .map(|s| s as usize)
+            .max()
+            .unwrap_or(0);
         let (outputs, _) = execute(
             &self.ctx,
             &ep,
@@ -1111,6 +1119,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             0,
             None,
             self.comm_ref(),
+            eager_max,
         )?;
 
         let logits_bf16 = outputs.into_iter().next().expect("no outputs");
@@ -1246,6 +1255,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 0,
                 None,
                 self.comm_ref(),
+                pos + 1, // seq_len at this prefill step
             )?;
             last_logits = Some(outputs.into_iter().next().expect("no outputs"));
         }
@@ -1371,6 +1381,12 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             seq_lens_t,
         ];
         let output_nodes = graph.output_ids().to_vec();
+        let eager_max_fbd = seq_lens_u32
+            .iter()
+            .copied()
+            .map(|s| s as usize)
+            .max()
+            .unwrap_or(0);
         let (outputs, _) = execute(
             &self.ctx,
             &ep,
@@ -1383,6 +1399,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             0,
             None,
             self.comm_ref(),
+            eager_max_fbd,
         )?;
 
         let logits_bf16 = outputs.into_iter().next().expect("no outputs");
