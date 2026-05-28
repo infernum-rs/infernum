@@ -616,6 +616,39 @@ fn quantized_gemv(
 /// hidden state, or gate + up projections from the same norm output).
 ///
 /// Requires M=1 (decode GEMV path). Panics if weight is not Q8_0.
+/// GEMV with pre-quantized Q8_1 activations, for Q8_0 or Q4_0 weight matrices.
+///
+/// Skips the `quantize_bf16_to_q8_1` step so multiple GEMVs sharing the same
+/// input (Q+K+V, gate+up) can reuse one quantised activation buffer.
+/// `act_sums` is required for Q4_0 (zero-point correction) but not Q8_0.
+fn quantized_gemv_preq(
+    ctx: &crate::cuda::CudaContext,
+    act_data: &crate::cuda::buffer_pool::PooledSlice<i8>,
+    act_scales: &crate::cuda::buffer_pool::PooledSlice<f32>,
+    act_sums: &crate::cuda::buffer_pool::PooledSlice<f32>,
+    weight: &QuantizedTensor,
+    n: usize,
+    k: usize,
+    output_dtype: DType,
+) -> Result<CudaTensor> {
+    match weight.dtype() {
+        DType::Q8_0 => {
+            quantized_gemv_q8_0_preq(ctx, act_data, act_scales, weight, n, k, output_dtype)
+        }
+        DType::Q4_0 => quantized_gemv_q4_0_preq(
+            ctx,
+            act_data,
+            act_scales,
+            act_sums,
+            weight,
+            n,
+            k,
+            output_dtype,
+        ),
+        other => panic!("quantized_gemv_preq: unsupported dtype {other}"),
+    }
+}
+
 fn quantized_gemv_q8_0_preq(
     ctx: &crate::cuda::CudaContext,
     act_data: &crate::cuda::buffer_pool::PooledSlice<i8>,
@@ -671,12 +704,63 @@ fn quantized_gemv_q8_0_preq(
     Ok(output)
 }
 
-/// Two Q8_0 GEMVs from the same input, quantizing the input only once.
+fn quantized_gemv_q4_0_preq(
+    ctx: &crate::cuda::CudaContext,
+    act_data: &crate::cuda::buffer_pool::PooledSlice<i8>,
+    act_scales: &crate::cuda::buffer_pool::PooledSlice<f32>,
+    act_sums: &crate::cuda::buffer_pool::PooledSlice<f32>,
+    weight: &QuantizedTensor,
+    n: usize,
+    k: usize,
+    output_dtype: DType,
+) -> Result<CudaTensor> {
+    assert_eq!(
+        weight.dtype(),
+        DType::Q4_0,
+        "quantized_gemv_q4_0_preq: weight must be Q4_0"
+    );
+    const NWARPS: u32 = 4;
+    let device = ctx.device();
+    let use_bf16_output = output_dtype == DType::BF16;
+    let out_dtype = if use_bf16_output {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[1, n], out_dtype)? };
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (32, NWARPS, 1),
+        shared_mem_bytes: NWARPS * 4,
+    };
+    let module_name = "quantized_matmul";
+    let kernel = if use_bf16_output {
+        "gemv_q4_q8_dp4a_bf16"
+    } else {
+        "gemv_q4_q8_dp4a"
+    };
+    let func = device.get_func(module_name, kernel).unwrap();
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &**act_data,
+                &**act_scales,
+                &**act_sums,
+                weight.data_slice(),
+                weight.scales_slice(),
+                n as i32,
+                k as i32,
+            ),
+        )?;
+    }
+    Ok(output)
+}
+
+/// Two quantised GEMVs from the same input, quantising the input only once.
 ///
-/// Used for gate + up projections (and any other pair sharing the same
-/// input tensor). Reduces the `quantize_bf16_to_q8_1` kernel count from 2 to 1.
-/// Falls back to two independent `quantized_matmul` calls for M > 1 or
-/// non-Q8_0 weights.
+/// Supports Q8_0 and Q4_0 weights. Reduces `quantize_bf16_to_q8_1` count from 2 to 1.
 ///
 /// # Errors
 /// Returns an error if kernel launch or allocation fails.
@@ -690,25 +774,27 @@ pub fn quantized_linear_pair(
     let m = in_shape[in_shape.len() - 2];
     let k = in_shape[in_shape.len() - 1];
 
-    // Shared quantization only helps for M=1 and Q8_0 weights.
-    if m == 1 && w1.dtype() == DType::Q8_0 && w2.dtype() == DType::Q8_0 && k == w1.shape()[1] {
+    let can_fuse = matches!(w1.dtype(), DType::Q8_0 | DType::Q4_0);
+    if m == 1 && can_fuse && w1.dtype() == w2.dtype() && k == w1.shape()[1] {
         let n1 = w1.shape()[0];
         let n2 = w2.shape()[0];
-        let (act_data, act_scales, _act_sums) =
+        let (act_data, act_scales, act_sums) =
             quantize_activations_to_q8_1(input.context(), input, k)?;
-        let out1 = quantized_gemv_q8_0_preq(
+        let out1 = quantized_gemv_preq(
             input.context(),
             &act_data,
             &act_scales,
+            &act_sums,
             w1,
             n1,
             k,
             output_dtype,
         )?;
-        let out2 = quantized_gemv_q8_0_preq(
+        let out2 = quantized_gemv_preq(
             input.context(),
             &act_data,
             &act_scales,
+            &act_sums,
             w2,
             n2,
             k,
@@ -737,39 +823,43 @@ pub fn quantized_linear_triple(
     let m = in_shape[in_shape.len() - 2];
     let k = in_shape[in_shape.len() - 1];
 
+    let can_fuse = matches!(w1.dtype(), DType::Q8_0 | DType::Q4_0);
     if m == 1
-        && w1.dtype() == DType::Q8_0
-        && w2.dtype() == DType::Q8_0
-        && w3.dtype() == DType::Q8_0
+        && can_fuse
+        && w1.dtype() == w2.dtype()
+        && w1.dtype() == w3.dtype()
         && k == w1.shape()[1]
     {
         let n1 = w1.shape()[0];
         let n2 = w2.shape()[0];
         let n3 = w3.shape()[0];
-        let (act_data, act_scales, _act_sums) =
+        let (act_data, act_scales, act_sums) =
             quantize_activations_to_q8_1(input.context(), input, k)?;
-        let out1 = quantized_gemv_q8_0_preq(
+        let out1 = quantized_gemv_preq(
             input.context(),
             &act_data,
             &act_scales,
+            &act_sums,
             w1,
             n1,
             k,
             output_dtype,
         )?;
-        let out2 = quantized_gemv_q8_0_preq(
+        let out2 = quantized_gemv_preq(
             input.context(),
             &act_data,
             &act_scales,
+            &act_sums,
             w2,
             n2,
             k,
             output_dtype,
         )?;
-        let out3 = quantized_gemv_q8_0_preq(
+        let out3 = quantized_gemv_preq(
             input.context(),
             &act_data,
             &act_scales,
+            &act_sums,
             w3,
             n3,
             k,
