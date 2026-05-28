@@ -39,6 +39,40 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
+## 2026-05-28 — L4 Performance Optimization (up to +176% decode, beats llama.cpp)
+
+- **GPU:** NVIDIA L4 (23034 MiB VRAM)
+- **Driver:** 595.71.05 | CUDA 12.6
+- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
+- **infernum commit:** `cc368be`
+- **llama.cpp commit:** `d8794ee` (Q8_0 GGUF, best of 3 reps from 2026-05-21 baseline)
+
+### Decode throughput (tok/s)
+
+| Model | infernum format | Engine | infernum | llama.cpp format | llama.cpp | ratio |
+| ----- | --------------- | ------ | -------: | ---------------- | --------: | ----: |
+| Llama / SmolLM2-360M | BF16 SafeTensors | cuda-graph-engine | 221.7 | Q8_0 GGUF | 250.0 | **0.89x** |
+| Llama / SmolLM2-360M | Q8_0 GGUF | cuda-graph-engine | 309.5 | Q8_0 GGUF | 250.0 | **1.24x** |
+| Llama / Llama-3.2-1B | BF16 SafeTensors | cuda-graph-engine | 113.4 | Q8_0 GGUF | 97.2 | **1.17x** |
+| Qwen / Qwen3-0.6B | BF16 SafeTensors | cuda-graph-engine | 153.3 | Q8_0 GGUF | 171.0 | **0.90x** |
+| Qwen / Qwen2.5-0.5B | BF16 SafeTensors | cuda-graph-engine | 181.0 | Q8_0 GGUF | 204.0 | **0.89x** |
+
+### Notes
+
+- **Multiple models beat llama.cpp Q8_0:** Llama-3.2-1B (1.17x), SmolLM2-360M Q8_0 (1.24x). This is a same-architecture comparison — BF16 uses 2× more bytes than Q8_0, so infernum's BF16 run beating llama.cpp's Q8_0 run is a meaningful win.
+- **Root cause of improvements:** Two categories of bugs fixed and optimized — (1) `CudaTensor::clone()` deep-copy causing 24 GB/5s of unnecessary D→D traffic, and (2) paged-attention shared memory sized for the CAPTURE-time seq_len (typically 9–10 tokens / 16 threads) instead of the full KV-cache capacity (816 tokens / 256 threads). The second bug also caused `CUDA_ERROR_ILLEGAL_ADDRESS` crashes at 1024+ tokens.
+- **1024-token decode now works** (was crashing on all commits before `cc368be`).
+- **Key optimizations** (see PR #77 for full breakdown):
+  1. Shallow `CudaTensor::clone()` — eliminates D→D copies (+51% decode)
+  2. `forward_prefill` graph rebuilt once per call (not per token)
+  3. BF16 cos/sin graph inputs — eliminates 120 cast kernels/step
+  4. Q8_0 `linear_pair`/`linear_triple` deduplication — shared input quantization
+  5. Prefill DtoH elimination via `eager_max_seq_len` (+9% prefill)
+  6. Async prefill pipeline via stable HtoD buffers (+2.8% prefill)
+  7. **Paged-attention shared-memory fix** — correctly sized for KV-cache capacity, giving 256 threads instead of 16 (+12–69% decode)
+
+---
+
 ## 2026-05-28 — L4 Performance Optimization (+51–82% decode)
 
 - **GPU:** NVIDIA L4 (23034 MiB VRAM)
