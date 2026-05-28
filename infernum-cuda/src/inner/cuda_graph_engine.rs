@@ -705,7 +705,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     ///
     /// Each rank loads only its slice of the column-parallel and row-parallel
     /// weights. The provided `comm` is used for all-reduce synchronisation
-    /// at the AllReduceSumOp nodes injected by the graph builder.
+    /// at the `AllReduceSumOp` nodes injected by the graph builder.
     ///
     /// # Errors
     ///
@@ -738,7 +738,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     /// Each rank loads only its slice of the column-parallel and row-parallel
     /// weights (sliced at block boundaries in the GGUF loader). Quantized
     /// weights stay quantized on GPU; non-quantized weights are dequantized
-    /// to BF16. The provided `comm` is used for all-reduce at AllReduceSumOp
+    /// to BF16. The provided `comm` is used for all-reduce at `AllReduceSumOp`
     /// nodes injected by the graph builder.
     ///
     /// # Errors

@@ -61,6 +61,7 @@ mod inner {
         /// # Panics
         ///
         /// Panics if a device thread panics.
+        #[allow(clippy::needless_pass_by_value)]
         pub fn from_config(config: C, num_devices: usize, model_dir: &Path) -> Result<Self> {
             let comm_id = CudaBackend::create_comm_id()?;
             let comm_id_raw = *comm_id.to_raw();
@@ -108,6 +109,7 @@ mod inner {
         /// # Panics
         ///
         /// Panics if a device thread panics.
+        #[allow(clippy::needless_pass_by_value)]
         pub fn from_config_gguf(config: C, num_devices: usize, gguf_path: &Path) -> Result<Self> {
             let comm_id = CudaBackend::create_comm_id()?;
             let comm_id_raw = *comm_id.to_raw();
