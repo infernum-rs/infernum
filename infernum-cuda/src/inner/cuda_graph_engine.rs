@@ -1215,8 +1215,6 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
 
         // Build the paged decode graph once — the structure is constant across all
         // prefill tokens (batch_size=1, block_size, max_blocks are all fixed).
-        // Previously this was rebuilt on every token, causing O(n) graph-build
-        // overhead for an n-token prefill.
         let mut graph = self.config.build_paged_decode_graph_cuda(
             1,
             block_size,
@@ -1227,21 +1225,45 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         let ep = plan(&graph);
         let output_nodes = graph.output_ids().to_vec();
 
+        // Pre-allocate stable GPU input buffers shared across all prefill tokens.
+        // Each step updates them via async htod_copy_into (stream-ordered) instead
+        // of allocating fresh tensors with htod_sync_copy. This pipelines CPU input
+        // preparation with GPU execution: the CPU never stalls waiting for the GPU
+        // between tokens — the stream serialises HtoD→kernel automatically.
+        let device = self.ctx.device();
+        let mut buf_token = device.alloc_zeros::<u32>(1)?;
+        let mut buf_cos = device.alloc_zeros::<bf16>(half_dim)?;
+        let mut buf_sin = device.alloc_zeros::<bf16>(half_dim)?;
+        let mut buf_block = device.alloc_zeros::<u32>(max_blocks)?;
+        let mut buf_pos = device.alloc_zeros::<u32>(1)?;
+        let mut buf_seq = device.alloc_zeros::<u32>(1)?;
+
         let mut last_logits: Option<CudaTensor> = None;
 
         for (pos, &token) in input_ids.iter().enumerate() {
             let (cos_row, sin_row) = precompute_rope_row(pos, head_dim, self.config.rope_theta());
             let cos_bf16: Vec<bf16> = cos_row.iter().map(|&x| bf16::from_f32(x)).collect();
             let sin_bf16: Vec<bf16> = sin_row.iter().map(|&x| bf16::from_f32(x)).collect();
-
-            let input_id_t = CudaTensor::from_slice(&self.ctx, &[1], &[token])?;
-            let cos_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &cos_bf16)?;
-            let sin_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &sin_bf16)?;
-            let block_table_t =
-                CudaTensor::from_slice(&self.ctx, &[1, max_blocks], &block_ids_u32)?;
             let pos_u32 = u32::try_from(pos).expect("position fits u32");
-            let positions_t = CudaTensor::from_slice(&self.ctx, &[1], &[pos_u32])?;
-            let seq_len_t = CudaTensor::from_slice(&self.ctx, &[1], &[pos_u32 + 1])?;
+
+            // Async HtoD into stable buffers — stream-ordered, no CPU sync.
+            device.htod_copy_into(vec![token], &mut buf_token)?;
+            device.htod_copy_into(cos_bf16, &mut buf_cos)?;
+            device.htod_copy_into(sin_bf16, &mut buf_sin)?;
+            device.htod_copy_into(block_ids_u32.clone(), &mut buf_block)?;
+            device.htod_copy_into(vec![pos_u32], &mut buf_pos)?;
+            device.htod_copy_into(vec![pos_u32 + 1], &mut buf_seq)?;
+
+            // Non-owning views over the stable buffers.  The PoolableBuffer is
+            // marked non_owning so it never frees the underlying slice on drop;
+            // the CudaSlice in buf_* remains the sole owner.
+            let input_id_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_token);
+            let cos_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1, half_dim], &buf_cos);
+            let sin_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1, half_dim], &buf_sin);
+            let block_table_t =
+                CudaTensor::from_cuda_slice_view(&self.ctx, &[1, max_blocks], &buf_block);
+            let positions_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_pos);
+            let seq_len_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_seq);
 
             let inputs = vec![
                 input_id_t,
@@ -1267,6 +1289,9 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             )?;
             last_logits = Some(outputs.into_iter().next().expect("no outputs"));
         }
+
+        // Single synchronise after all pipelined steps complete.
+        self.ctx.synchronize()?;
 
         let logits_tensor = last_logits.expect("input_ids must not be empty");
         let logits_f32 = cast_to_f32(&logits_tensor)?;
