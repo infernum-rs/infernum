@@ -39,7 +39,7 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
-## 2026-05-28 — L4 GPU — current numbers (commit `0f3d156`)
+## 2026-05-28 — L4 GPU — current numbers (commit `9002f38`)
 
 - **GPU:** NVIDIA L4 (23034 MiB VRAM) · **Driver:** 595.71.05 · **CUDA 12.6**
 - **infernum commit:** `fe51737` · **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
@@ -53,12 +53,12 @@ This is the steady-state generation speed. Both engines run greedy decode from a
 
 | Model | Format | infernum | llama.cpp | ratio |
 | ----- | ------ | -------: | --------: | ----: |
-| SmolLM2-360M-Instruct | Q8_0 GGUF | 350 | 354 | **0.99x** |
-| SmolLM2-360M-Instruct | Q4_0 GGUF | 424 | 449 | **0.94x** |
+| SmolLM2-360M-Instruct | Q8_0 GGUF | 362 | 354 | **1.02x** |
+| SmolLM2-360M-Instruct | Q4_0 GGUF | 446 | 449 | **0.99x** |
 | SmolLM2-360M | BF16 SafeTensors | 240 | — | — |
-| Llama-3.2-1B-Instruct | Q8_0 GGUF | 171 | 166 | **1.03x** |
-| Llama-3.2-1B-Instruct | Q4_0 GGUF | 247 | 256 | **0.96x** |
-| Llama-3.2-1B | BF16 SafeTensors | 116 | — | — |
+| Llama-3.2-1B-Instruct | Q8_0 GGUF | 174 | 166 | **1.05x** |
+| Llama-3.2-1B-Instruct | Q4_0 GGUF | 251 | 256 | **0.98x** |
+| Llama-3.2-1B | BF16 SafeTensors | 117 | — | — |
 
 ---
 
@@ -69,7 +69,7 @@ This is the steady-state generation speed. Both engines run greedy decode from a
 | Model | Format | infernum (token-by-token) | llama.cpp (batch GEMM) |
 | ----- | ------ | -------------------------: | ---------------------: |
 | SmolLM2-360M-Instruct | Q8_0 GGUF | 294 | 20 032 |
-| SmolLM2-360M-Instruct | Q4_0 GGUF | 339 | 21 904 |
+| SmolLM2-360M-Instruct | Q4_0 GGUF | 362 | 21 904 |
 | SmolLM2-360M | BF16 SafeTensors | 220 | — |
 | Llama-3.2-1B-Instruct | Q8_0 GGUF | 166 | 12 964 |
 | Llama-3.2-1B-Instruct | Q4_0 GGUF | 231 | 13 450 |
@@ -79,9 +79,10 @@ This is the steady-state generation speed. Both engines run greedy decode from a
 
 ### Notes
 
-- **SmolLM2-360M Q8_0 at 0.99×, Q4_0 at 0.94×**: both near parity with llama.cpp.
-- **Gather+attend (commit `5bc281a`)**: replaced paged attention (scattered K/V reads, 40% of Q8_0 step time) with a gather-then-attend approach — one scattered gather pass populates L2-resident contiguous buffers; attention runs at near-peak streaming bandwidth.
-- **Q4_0 input-quantisation deduplication (commit `0f3d156`)**: extended Q8_0 deduplication to Q4_0; saves one `quantize_bf16_to_q8_1` kernel per GEMV pair/triple per layer (+5% Q4_0).
+- **Q8_0 at 1.02×, Q4_0 at 0.99×**: infernum now matches or beats llama.cpp on all measured GGUF formats.
+- **Gather+attend (commit `5bc281a`)**: replaced paged attention (scattered K/V reads, 40% of Q8_0 step time) with a gather-then-attend approach.
+- **Q4_0 input-quantisation deduplication (commit `0f3d156`)**: extended Q8_0 deduplication to Q4_0; saves one quantise kernel per GEMV pair/triple.
+- **Native quantised CONCAT + GGUF QKV fusion (commit `9002f38`)**: Q,K,V weights concatenated on-host (raw Q4_0/Q8_0 blocks, no dequantisation), fused into one GEMV per layer with better SM occupancy. Q8_0: +3.4%, Q4_0: +5.2%.
 - **Prefill status:** infernum prefill is sequential (identical to decode speed × token count). Batch prefill (single batched GEMM over all prompt tokens) is the next major feature.
 - **Q4_0 GGUF works** (was crashing with `UnsupportedDtype: GGML type 3` — fixed by Q4_1 dequantisation support).
 - **BF16 decode:** no same-format llama.cpp number. BF16 uses 2× more bandwidth than Q8_0.
