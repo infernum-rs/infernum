@@ -606,6 +606,186 @@ fn quantized_gemv(
 }
 
 // ---------------------------------------------------------------------------
+// Quantized GEMV with pre-quantized input (shared quantization)
+// ---------------------------------------------------------------------------
+
+/// Run the Q8_0 GEMV kernel with already-quantized Q8_1 activations.
+///
+/// Skips the `quantize_activations_to_q8_1` step, enabling multiple Q8_0 GEMVs
+/// to share a single quantization pass (e.g. Q, K, V projections from the same
+/// hidden state, or gate + up projections from the same norm output).
+///
+/// Requires M=1 (decode GEMV path). Panics if weight is not Q8_0.
+fn quantized_gemv_q8_0_preq(
+    ctx: &crate::cuda::CudaContext,
+    act_data: &crate::cuda::buffer_pool::PooledSlice<i8>,
+    act_scales: &crate::cuda::buffer_pool::PooledSlice<f32>,
+    weight: &QuantizedTensor,
+    n: usize,
+    k: usize,
+    output_dtype: DType,
+) -> Result<CudaTensor> {
+    assert_eq!(
+        weight.dtype(),
+        DType::Q8_0,
+        "quantized_gemv_q8_0_preq: weight must be Q8_0"
+    );
+    const NWARPS: u32 = 4;
+    let device = ctx.device();
+
+    let use_bf16_output = output_dtype == DType::BF16;
+    let out_dtype = if use_bf16_output {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let mut output = unsafe { CudaTensor::uninit(ctx, &[1, n], out_dtype)? };
+
+    let module_name = "quantized_matmul";
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (32, NWARPS, 1),
+        shared_mem_bytes: NWARPS * 4,
+    };
+
+    let kernel = if use_bf16_output {
+        "gemv_q8_q8_dp4a_bf16"
+    } else {
+        "gemv_q8_q8_dp4a"
+    };
+    let func = device.get_func(module_name, kernel).unwrap();
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                output.cuda_slice_mut(),
+                &**act_data,
+                &**act_scales,
+                weight.data_slice(),
+                weight.scales_slice(),
+                n as i32,
+                k as i32,
+            ),
+        )?;
+    }
+    Ok(output)
+}
+
+/// Two Q8_0 GEMVs from the same input, quantizing the input only once.
+///
+/// Used for gate + up projections (and any other pair sharing the same
+/// input tensor). Reduces the `quantize_bf16_to_q8_1` kernel count from 2 to 1.
+/// Falls back to two independent `quantized_matmul` calls for M > 1 or
+/// non-Q8_0 weights.
+///
+/// # Errors
+/// Returns an error if kernel launch or allocation fails.
+pub fn quantized_linear_pair(
+    input: &CudaTensor,
+    w1: &QuantizedTensor,
+    w2: &QuantizedTensor,
+    output_dtype: DType,
+) -> Result<(CudaTensor, CudaTensor)> {
+    let in_shape = input.shape();
+    let m = in_shape[in_shape.len() - 2];
+    let k = in_shape[in_shape.len() - 1];
+
+    // Shared quantization only helps for M=1 and Q8_0 weights.
+    if m == 1 && w1.dtype() == DType::Q8_0 && w2.dtype() == DType::Q8_0 && k == w1.shape()[1] {
+        let n1 = w1.shape()[0];
+        let n2 = w2.shape()[0];
+        let (act_data, act_scales, _act_sums) =
+            quantize_activations_to_q8_1(input.context(), input, k)?;
+        let out1 = quantized_gemv_q8_0_preq(
+            input.context(),
+            &act_data,
+            &act_scales,
+            w1,
+            n1,
+            k,
+            output_dtype,
+        )?;
+        let out2 = quantized_gemv_q8_0_preq(
+            input.context(),
+            &act_data,
+            &act_scales,
+            w2,
+            n2,
+            k,
+            output_dtype,
+        )?;
+        Ok((out1, out2))
+    } else {
+        Ok((quantized_matmul(input, w1)?, quantized_matmul(input, w2)?))
+    }
+}
+
+/// Three Q8_0 GEMVs from the same input, quantizing only once.
+///
+/// Used for Q + K + V projections. Reduces input quantizations from 3 to 1.
+///
+/// # Errors
+/// Returns an error if kernel launch or allocation fails.
+pub fn quantized_linear_triple(
+    input: &CudaTensor,
+    w1: &QuantizedTensor,
+    w2: &QuantizedTensor,
+    w3: &QuantizedTensor,
+    output_dtype: DType,
+) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+    let in_shape = input.shape();
+    let m = in_shape[in_shape.len() - 2];
+    let k = in_shape[in_shape.len() - 1];
+
+    if m == 1
+        && w1.dtype() == DType::Q8_0
+        && w2.dtype() == DType::Q8_0
+        && w3.dtype() == DType::Q8_0
+        && k == w1.shape()[1]
+    {
+        let n1 = w1.shape()[0];
+        let n2 = w2.shape()[0];
+        let n3 = w3.shape()[0];
+        let (act_data, act_scales, _act_sums) =
+            quantize_activations_to_q8_1(input.context(), input, k)?;
+        let out1 = quantized_gemv_q8_0_preq(
+            input.context(),
+            &act_data,
+            &act_scales,
+            w1,
+            n1,
+            k,
+            output_dtype,
+        )?;
+        let out2 = quantized_gemv_q8_0_preq(
+            input.context(),
+            &act_data,
+            &act_scales,
+            w2,
+            n2,
+            k,
+            output_dtype,
+        )?;
+        let out3 = quantized_gemv_q8_0_preq(
+            input.context(),
+            &act_data,
+            &act_scales,
+            w3,
+            n3,
+            k,
+            output_dtype,
+        )?;
+        Ok((out1, out2, out3))
+    } else {
+        Ok((
+            quantized_matmul(input, w1)?,
+            quantized_matmul(input, w2)?,
+            quantized_matmul(input, w3)?,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
