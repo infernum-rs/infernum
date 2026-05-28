@@ -344,40 +344,9 @@ impl CudaEvent {
     /// Much cheaper than `device.synchronize()` — only waits for the specific
     /// stream work up to the record point, not all GPU activity.
     ///
-    /// Uses a spin-wait (`cuEventQuery`) rather than `cuEventSynchronize` to
-    /// avoid the Linux scheduler sleep overhead (typically 1 ms) that
-    /// `cuEventSynchronize` incurs when the wait takes longer than a few µs.
-    /// The spin loop yields with `std::hint::spin_loop()` so it is friendly to
-    /// SMT / out-of-order pipelines without burning the full core.
-    ///
-    /// # Errors
-    /// Returns an error if `cuEventQuery` returns an unexpected error (not
-    /// `CUDA_ERROR_NOT_READY`).
-    pub fn synchronize(&self) -> Result<()> {
-        let lib = unsafe { sys::lib() };
-        loop {
-            let result = unsafe { lib.cuEventQuery(self.event) };
-            match result {
-                cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS => return Ok(()),
-                cudarc::driver::sys::cudaError_enum::CUDA_ERROR_NOT_READY => {
-                    std::hint::spin_loop();
-                }
-                err => {
-                    return Err(infernum::Error::Cuda(format!("cuEventQuery: {err:?}")));
-                }
-            }
-        }
-    }
-
-    /// Block using `cuEventSynchronize` (OS-scheduler-based wait).
-    ///
-    /// Prefer `synchronize()` for the decode hot path; use this only when
-    /// spinning would waste energy (e.g., long background operations).
-    ///
     /// # Errors
     /// Returns an error if `cuEventSynchronize` fails.
-    #[allow(dead_code)]
-    pub fn synchronize_blocking(&self) -> Result<()> {
+    pub fn synchronize(&self) -> Result<()> {
         let lib = unsafe { sys::lib() };
         check(
             unsafe { lib.cuEventSynchronize(self.event) },
