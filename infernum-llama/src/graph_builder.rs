@@ -612,8 +612,8 @@ where
 
     // -- Graph inputs --
     let input_id = graph.add_input(&[1], DType::U32);
-    let cos_input = graph.add_input(&[1, head_dim / 2], DType::BF16);
-    let sin_input = graph.add_input(&[1, head_dim / 2], DType::BF16);
+    let cos_input = graph.add_input(&[1, head_dim / 2], DType::F32);
+    let sin_input = graph.add_input(&[1, head_dim / 2], DType::F32);
 
     // KV cache inputs: per-layer k and v (num_kv_heads_local when sharded)
     let num_layers = config.num_hidden_layers;
