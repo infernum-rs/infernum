@@ -435,8 +435,8 @@ where
 
     // -- Graph inputs --
     let input_ids = graph.add_input(&[seq_len], DType::U32);
-    let cos_input = graph.add_input(&[seq_len, head_dim / 2], DType::BF16);
-    let sin_input = graph.add_input(&[seq_len, head_dim / 2], DType::BF16);
+    let cos_input = graph.add_input(&[seq_len, head_dim / 2], DType::F32);
+    let sin_input = graph.add_input(&[seq_len, head_dim / 2], DType::F32);
 
     // -- Embedding --
     let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_ids);
