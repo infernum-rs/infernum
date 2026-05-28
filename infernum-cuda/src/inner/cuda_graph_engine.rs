@@ -36,7 +36,7 @@ use infernum::{
 use half::bf16;
 
 use super::executor::execute;
-use crate::cuda::ops::{cast_to_f32, LinearWeight};
+use crate::cuda::ops::{argmax_last_tensor, cast_to_f32, LinearWeight};
 use crate::cuda::{CudaContext, CudaEvent, CudaGraph, CudaTensor, PinnedBuffer};
 use crate::cuda_logits::CudaLogits;
 use crate::inner::execute_context::GraphInputs;
@@ -849,6 +849,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     ///
     /// Returns an error if buffer writes, kernel launches, or CUDA API calls
     /// fail.
+    /// Run one decode step via CUDA graph replay (stabilised) or capture (warm-up).
+    ///
+    /// Returns `(logits_tensor, Some(argmax_token))` in the stabilised fast
+    /// path — the argmax is computed via a GPU reduction + async DToH inside
+    /// the event-sync window, so the caller can skip a second GPU round-trip.
+    /// Returns `(logits_tensor, None)` during the non-stabilised capture phase.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn run_decode_captured(
         &self,
@@ -860,7 +866,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         cos_data: &[f32],
         sin_data: &[f32],
         max_blocks_per_seq: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<(CudaTensor, Option<u32>)> {
         let mut borrow = self.decode_state.borrow_mut();
 
         // (Re-)build DecodeState when absent or when max_blocks changed.
@@ -911,32 +917,31 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             .unwrap_or(1);
 
         if state.stabilized {
-            // Fast path: graph is stable — replay with a single launch, then
-            // use a targeted event sync instead of a full device sync.
-            let token_device_ptr = state
-                .saved_token
-                .as_ref()
-                .expect("saved_token must be set before stabilization")
-                .device_ptr();
-
+            // Fast path: graph is stable — replay with a single launch, compute
+            // argmax on the logit output, DMA the 4-byte result to the pinned
+            // buffer, then wait only for that event rather than the whole device.
             state.cuda_graph.launch()?;
 
-            // Async copy the argmax result to the pinned buffer, then wait
-            // only for that DMA rather than the whole device.
-            state
-                .pinned_token
-                .async_copy_from_device(token_device_ptr)?;
-            state.completion_event.record()?;
-            state.completion_event.synchronize()?;
-
-            // Return the saved_token tensor (contains the raw logit output for
-            // this step; the argmax is already in the pinned buffer, but
-            // callers expect the logit CudaTensor here).
-            Ok(state
+            // Kick off the argmax kernel right after the graph launch so it
+            // runs as soon as the graph finishes on the GPU stream.
+            // Keep `argmax_out` alive past event.synchronize() — the DMA reads
+            // from its device address and must complete before the buffer drops.
+            let saved = state
                 .saved_token
                 .as_ref()
-                .expect("saved_token must be set")
-                .clone())
+                .expect("saved_token must be set before stabilization");
+            let argmax_out = argmax_last_tensor(saved)?;
+
+            state
+                .pinned_token
+                .async_copy_from_device(argmax_out.device_ptr())?;
+            state.completion_event.record()?;
+            state.completion_event.synchronize()?;
+            // `argmax_out` drops here — after the DMA completes.
+
+            let token = state.pinned_token.read();
+            let logits = saved.clone();
+            Ok((logits, Some(token)))
         } else {
             // Stabilisation path: wrap execute() in begin/end capture so the
             // CUDA buffer-pool allocates the right sizes and the graph exe is
@@ -1012,7 +1017,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 }
             }
 
-            Ok(token_tensor)
+            Ok((token_tensor, None))
         }
     }
 
@@ -1055,7 +1060,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             .collect();
 
         if batch_size == 1 {
-            let logits_tensor = self.run_decode_captured(
+            let (logits_tensor, precomputed) = self.run_decode_captured(
                 token_ids_host,
                 kv_cache,
                 block_table_u32,
@@ -1066,7 +1071,10 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 max_blocks_per_seq,
             )?;
             let logits_f32 = cast_to_f32(&logits_tensor)?;
-            return Ok(CudaLogits::new(logits_f32));
+            return Ok(match precomputed {
+                Some(token) => CudaLogits::new_with_precomputed_argmax(logits_f32, token),
+                None => CudaLogits::new(logits_f32),
+            });
         }
 
         // Batch > 1: create GPU tensors on this rank's own device from host data.
@@ -1336,7 +1344,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             // Single-sequence fast path: use CUDA graph capture/replay.
             // Download token_ids from our own rank's GPU (no cross-rank stream sync).
             let token_ids_host = token_ids.to_vec::<u32>()?;
-            let logits_tensor = self.run_decode_captured(
+            let (logits_tensor, precomputed) = self.run_decode_captured(
                 &token_ids_host,
                 kv_cache,
                 &block_table_u32,
@@ -1347,7 +1355,10 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 max_blocks_per_seq,
             )?;
             let logits_f32 = cast_to_f32(&logits_tensor)?;
-            return Ok(CudaLogits::new(logits_f32));
+            return Ok(match precomputed {
+                Some(token) => CudaLogits::new_with_precomputed_argmax(logits_f32, token),
+                None => CudaLogits::new(logits_f32),
+            });
         }
 
         // Batch size > 1: eager path (builds a fresh graph each call).
