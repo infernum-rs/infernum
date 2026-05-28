@@ -449,7 +449,7 @@ fn run_graph_generation(model_path: &str, tokenizer: &Tokenizer, cli: &Cli) -> R
     let half_dim = head_dim / 2;
 
     // Load weights once (use a dummy seq_len=1 graph to discover weight metadata)
-    let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32, None);
+    let (dummy_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32, None, false);
     let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
     eprint!("Loading weights...");
     if is_gguf {
@@ -478,7 +478,7 @@ fn run_graph_generation(model_path: &str, tokenizer: &Tokenizer, cli: &Cli) -> R
         let seq_len = token_ids.len();
 
         // Build graph for current sequence length
-        let (mut graph, _) = build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32, None);
+        let (mut graph, _) = build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32, None, false);
         infernum::graph::optimizer::optimize(&mut graph);
         let exec_plan = plan(&graph);
 
