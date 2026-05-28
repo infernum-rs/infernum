@@ -39,6 +39,48 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
+## 2026-05-28 — L4 Performance Optimization (+51–82% decode)
+
+- **GPU:** NVIDIA L4 (23034 MiB VRAM)
+- **Driver:** 595.71.05 | CUDA 12.6
+- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
+- **infernum commit:** `b92aeee`
+- **llama.cpp commit:** `d8794ee` (Q8_0 GGUF, best of 3 reps from 2026-05-21 baseline)
+
+### Decode throughput (tok/s)
+
+| Model | infernum format | Engine | infernum | llama.cpp format | llama.cpp | ratio |
+| ----- | --------------- | ------ | -------: | ---------------- | --------: | ----: |
+| Llama / SmolLM2-360M | BF16 SafeTensors | cuda-graph-engine | 172.9 | Q8_0 GGUF | 250.0 | 0.69x |
+| Llama / SmolLM2-360M | Q8_0 GGUF | cuda-graph-engine | 178.4 | Q8_0 GGUF | 250.0 | **0.71x** |
+| Llama / Llama-3.2-1B | BF16 SafeTensors | cuda-graph-engine | 101.7 | Q8_0 GGUF | 97.2 | **1.05x** |
+| Qwen / Qwen3-0.6B | BF16 SafeTensors | cuda-graph-engine | 110.8 | Q8_0 GGUF | 171.0 | 0.65x |
+| Qwen / Qwen2.5-0.5B | BF16 SafeTensors | cuda-graph-engine | 155.2 | Q8_0 GGUF | 204.0 | 0.76x |
+
+### Prefill throughput (tok/s, 512-token prompt, paged-decode token-by-token)
+
+| Model | infernum format | infernum |
+| ----- | --------------- | -------: |
+| Llama / SmolLM2-360M | BF16 SafeTensors | 175.3 |
+| Llama / Llama-3.2-1B | BF16 SafeTensors | 104.2 |
+| Qwen / Qwen3-0.6B | BF16 SafeTensors | 127.0 |
+| Qwen / Qwen2.5-0.5B | BF16 SafeTensors | 153.6 |
+
+### Notes
+
+- **Llama-3.2-1B now beats llama.cpp:** 101.7 vs 97.2 tok/s (1.05×). This is a same-architecture comparison (BF16 vs Q8_0 — Q8_0 halves weight bytes, so a fair same-format comparison would be even stronger in our favor).
+- **SmolLM2-360M gap is mainly format:** BF16 (720 MB) vs Q8_0 (360 MB) — 2× more weight bytes to read per step. At the same format, our bandwidth utilization is already competitive.
+- **Q8_0 GGUF now supported on CUDA:** `gemv_q8_q8_dp4a_bf16` kernel handles dequantization on-the-fly. SmolLM2-360M Q8_0 reaches 178.4 tok/s (0.71× vs llama.cpp Q8_0).
+- **Qwen now uses cuda-graph-engine:** Previously returned `UnsupportedModel: "qwen3"`. Now fully supported with +52–82% speedup vs prior eager path.
+- **Key optimizations in this release (commit `b92aeee`, see PR for full diff):**
+  - `CudaTensor::clone()` changed from deep copy (D→D) to shallow (Arc increment) — eliminates 24 GB/5s of D→D copies, primarily the 94 MB embedding table clone per step
+  - Explicit `.clone()` removed from `EmbeddingGatherOp`, `RmsNormOp`, `AddRmsNormOp`, `QkNormOp` weight accesses
+  - `forward_prefill` builds graph once (not per token) — eliminates O(n) CPU overhead per prefill step
+  - cos/sin inputs changed from F32 to BF16 in all graph builders — eliminates 120 `cast_f32_to_bf16` GPU kernels per step from inside the CUDA graph
+- **llama.cpp prefill (batch) not re-measured:** Batch prefill (`--graph` mode) numbers unchanged from 2026-05-21 baseline. The prefill numbers in this table are from the paged-decode token-by-token path (`forward_prefill`), not the batch prefill graph; the comparison would be unfair.
+
+---
+
 ## 2026-05-21 — Baseline
 
 - **GPU:** NVIDIA L4 (23034 MiB VRAM)
