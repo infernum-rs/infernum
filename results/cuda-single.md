@@ -47,7 +47,7 @@ See [performance.md](../performance.md) for methodology.
 - **infernum commit:** `e791b03` | **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
 - **Same model, same GGUF file for both engines.**
 
-### Decode throughput (tok/s) — same model, same GGUF
+### Decode throughput (tok/s, `tg256`) — same model, same GGUF, greedy one-token-at-a-time
 
 | Model | Format | infernum | llama.cpp | ratio |
 | ----- | ------ | -------: | --------: | ----: |
@@ -56,7 +56,7 @@ See [performance.md](../performance.md) for methodology.
 | Llama-3.2-1B-Instruct | Q8_0 GGUF | 166.7 | 165.7 | **1.01x** |
 | Llama-3.2-1B-Instruct | Q4_0 GGUF | 231.7 | 254.9 | 0.91x |
 
-### Decode throughput (tok/s) — BF16 SafeTensors (no llama.cpp same-format reference)
+### Decode throughput (tok/s, `tg256`) — BF16 SafeTensors (no llama.cpp same-format reference)
 
 | Model | Format | infernum |
 | ----- | ------ | -------: |
