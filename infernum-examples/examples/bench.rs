@@ -422,7 +422,7 @@ fn bench_graph(
             };
             let head_dim = config.head_dim();
             let (graph, _) =
-                build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None);
+                build_prefill_graph::<CudaBackend>(&config, n_tokens, weight_dtype, None, false);
             (
                 graph,
                 config.num_hidden_layers,
@@ -584,7 +584,8 @@ fn bench_graph_decode(
     let mut weights = WeightStore::<CudaTensor, LinearWeight>::new();
     eprintln!("Loading weights...");
     {
-        let (tmp_graph, _) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None);
+        let (tmp_graph, _) =
+            build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None, false);
         if is_gguf {
             load_graph_weights_gguf(
                 ctx,
@@ -777,7 +778,8 @@ fn bench_cuda_graphs_decode(
     let model_weight_ids;
     eprintln!("Loading weights...");
     {
-        let (tmp_graph, ids) = build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None);
+        let (tmp_graph, ids) =
+            build_prefill_graph::<CudaBackend>(&config, 1, weight_dtype, None, false);
         model_weight_ids = ids;
         load_graph_weights(ctx, &tmp_graph, model_path, &mut weights)?;
     }

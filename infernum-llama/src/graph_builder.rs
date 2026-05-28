@@ -386,12 +386,22 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 ///
 /// # Panics
 ///
+/// Build the Llama prefill graph.
+///
+/// When `output_kv` is `true`, the graph also registers K (after RoPE) and V
+/// for every layer as additional outputs, in order:
+/// `[logits, k_0, v_0, k_1, v_1, ..., k_{n-1}, v_{n-1}]`.
+///
+/// This is used by the CUDA engine for batch-GEMM prefill with paged KV cache
+/// population — one pass computes all projections at full tensor-core throughput
+/// then scatters the K/V tensors into the paged pool.
 #[must_use]
 pub fn build_prefill_graph<B: LlamaGraphOps>(
     config: &LlamaConfig,
     seq_len: usize,
     weight_dtype: DType,
     shard: Option<&ShardConfig>,
+    output_kv: bool,
 ) -> (Graph<B>, ModelWeightIds)
 where
     Graph<B>: GraphMoeOps + GraphCommOps,
@@ -434,6 +444,10 @@ where
     let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
 
     // -- Transformer layers --
+    // Collect KV outputs per layer when requested (for batch-prefill KV cache population).
+    let mut kv_outputs: Vec<(infernum::graph::OutputRef, infernum::graph::OutputRef)> =
+        Vec::with_capacity(model_weights.layers.len());
+
     for lw in &model_weights.layers {
         // 1. Pre-attention RMS norm
         let normed = graph.add_rms_norm(h, lw.input_layernorm(), eps);
@@ -449,6 +463,11 @@ where
         // 4. RoPE (offset = 0 for prefill)
         let q_rope = graph.add_rope(q_3d, cos_input, sin_input, 0);
         let k_rope = graph.add_rope(k_3d, cos_input, sin_input, 0);
+
+        // Collect K (post-RoPE) and V for KV-cache population if requested.
+        if output_kv {
+            kv_outputs.push((k_rope, v_3d));
+        }
 
         // 5. Fused causal attention (full, no sliding window)
         let attn_out = graph.add_fused_attention_prefill(q_rope, k_rope, v_3d, 0, None, None, None);
@@ -510,6 +529,12 @@ where
     // -- LM head --
     let logits = graph.add_lm_head(last_hidden, model_weights.lm_head, weight_dtype);
     graph.set_output(logits.0);
+
+    // Register KV outputs: [k_0, v_0, k_1, v_1, ..., k_{n-1}, v_{n-1}]
+    for (k_ref, v_ref) in kv_outputs {
+        graph.set_output(k_ref.0);
+        graph.set_output(v_ref.0);
+    }
 
     // -- Optimize: fuse primitives into efficient compound ops --
     infernum::graph::optimizer::optimize(&mut graph);
@@ -1380,7 +1405,7 @@ mod tests {
         let config = test_config();
         let seq_len = 16;
         let (graph, _weights) =
-            build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
+            build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None, false);
 
         assert_eq!(graph.output_ids().len(), 1);
         let logits_id = graph.output_ids()[0];
@@ -1392,7 +1417,8 @@ mod tests {
     #[test]
     fn prefill_graph_has_correct_input_count() {
         let config = test_config();
-        let (graph, _weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
+        let (graph, _weights) =
+            build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None, false);
 
         // Should have exactly 3 Input nodes: input_ids, cos_cache, sin_cache
         let input_count = graph
@@ -1406,7 +1432,8 @@ mod tests {
     #[test]
     fn prefill_graph_weight_names_match_convention() {
         let config = test_config();
-        let (graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
+        let (graph, weights) =
+            build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None, false);
 
         // Verify embed weight name
         assert_eq!(
@@ -1470,7 +1497,8 @@ mod tests {
     #[test]
     fn prefill_graph_layer_count_matches_config() {
         let config = test_config();
-        let (_graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
+        let (_graph, weights) =
+            build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None, false);
 
         assert_eq!(weights.layers.len(), config.num_hidden_layers);
     }
@@ -1492,7 +1520,8 @@ mod tests {
         )
         .unwrap();
 
-        let (graph, weights) = build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None);
+        let (graph, weights) =
+            build_prefill_graph::<TestBackend>(&config, 8, DType::BF16, None, false);
         assert_eq!(weights.layers.len(), config.num_hidden_layers);
         // Each layer should be MoE with 8 experts
         for lw in &weights.layers {
@@ -1521,7 +1550,7 @@ mod tests {
 
         let seq_len = 4;
         let (graph, _weights) =
-            build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None);
+            build_prefill_graph::<TestBackend>(&config, seq_len, DType::BF16, None, false);
 
         let logits_id = graph.output_ids()[0];
         assert_eq!(graph.node_shape((logits_id, 0)), &[1, 32000]);

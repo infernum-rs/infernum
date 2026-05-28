@@ -65,9 +65,29 @@ impl CudaGraphEngineConfig for LlamaConfig {
         seq_len: usize,
         shard: Option<&ShardConfig>,
     ) -> Graph<infernum_cuda::CudaBackend> {
-        let (graph, _) =
-            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16, shard);
+        let (graph, _) = build_prefill_graph::<infernum_cuda::CudaBackend>(
+            self,
+            seq_len,
+            DType::BF16,
+            shard,
+            false,
+        );
         graph
+    }
+
+    fn build_prefill_graph_with_kv_cuda(
+        &self,
+        seq_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Option<Graph<infernum_cuda::CudaBackend>> {
+        let (graph, _) = build_prefill_graph::<infernum_cuda::CudaBackend>(
+            self,
+            seq_len,
+            DType::BF16,
+            shard,
+            true,
+        );
+        Some(graph)
     }
 
     fn build_decode_graph_cuda(

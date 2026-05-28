@@ -20,7 +20,7 @@ use cudarc::cublaslt::MatmulShared;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice, LaunchAsync, LaunchConfig};
 
 use crate::cuda::buffer_pool::PooledSlice;
-use crate::cuda::ops::cast_to_f32;
+use crate::cuda::ops::{cast_f32_to_bf16, cast_f32_to_f16, cast_to_f32};
 use crate::cuda::quantized::QuantizedTensor;
 use crate::cuda::CudaContext;
 use crate::cuda::CudaTensor;
@@ -802,7 +802,20 @@ pub fn quantized_linear_pair(
         )?;
         Ok((out1, out2))
     } else {
-        Ok((quantized_matmul(input, w1)?, quantized_matmul(input, w2)?))
+        let cast = |t: CudaTensor| -> Result<CudaTensor> {
+            if t.dtype() == output_dtype {
+                return Ok(t);
+            }
+            match output_dtype {
+                DType::BF16 => cast_f32_to_bf16(&t),
+                DType::F16 => cast_f32_to_f16(&t),
+                _ => Ok(t),
+            }
+        };
+        Ok((
+            cast(quantized_matmul(input, w1)?)?,
+            cast(quantized_matmul(input, w2)?)?,
+        ))
     }
 }
 
@@ -867,10 +880,23 @@ pub fn quantized_linear_triple(
         )?;
         Ok((out1, out2, out3))
     } else {
+        // M > 1 (prefill): dequant_cublas_matmul outputs F32.  Cast to the
+        // requested output_dtype so downstream ops (RoPE, attention) see a
+        // consistent dtype regardless of whether M == 1 or M > 1.
+        let cast = |t: CudaTensor| -> Result<CudaTensor> {
+            if t.dtype() == output_dtype {
+                return Ok(t);
+            }
+            match output_dtype {
+                DType::BF16 => cast_f32_to_bf16(&t),
+                DType::F16 => cast_f32_to_f16(&t),
+                _ => Ok(t),
+            }
+        };
         Ok((
-            quantized_matmul(input, w1)?,
-            quantized_matmul(input, w2)?,
-            quantized_matmul(input, w3)?,
+            cast(quantized_matmul(input, w1)?)?,
+            cast(quantized_matmul(input, w2)?)?,
+            cast(quantized_matmul(input, w3)?)?,
         ))
     }
 }

@@ -66,7 +66,7 @@ impl GraphEngineConfig for LlamaConfig {
     }
 
     fn build_prefill_graph(&self, seq_len: usize) -> Graph<CpuBackend> {
-        let (graph, _) = build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32, None);
+        let (graph, _) = build_prefill_graph::<CpuBackend>(self, seq_len, DType::F32, None, false);
         graph
     }
 
