@@ -1318,8 +1318,6 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             let inputs = vec![input_ids_t, cos_t, sin_t];
 
             let output_nodes = graph.output_ids().to_vec();
-
-            let t0 = std::time::Instant::now();
             let (outputs, _) = execute(
                 &self.ctx,
                 &ep,
@@ -1334,7 +1332,6 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 self.comm_ref(),
                 0,
             )?;
-            let cpu_dispatch_ms = t0.elapsed().as_secs_f64() * 1000.0;
             // outputs[0] = logits (last-token)
             // outputs[1 + layer*2]     = k  [seq_len, num_kv_heads_local, head_dim]
             // outputs[1 + layer*2 + 1] = v  [seq_len, num_kv_heads_local, head_dim]
@@ -1346,10 +1343,6 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             }
 
             self.ctx.synchronize()?;
-            let gpu_plus_sync_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "[prefill] CPU dispatch: {cpu_dispatch_ms:.1}ms | GPU+sync: {gpu_plus_sync_ms:.1}ms | seq={seq_len}"
-            );
 
             let logits_f32 = cast_to_f32(&outputs[0])?;
             return Ok(CudaLogits::new(logits_f32));
