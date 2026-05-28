@@ -52,6 +52,7 @@ const PAGED_DECODE_KERNEL_NAMES: &[&str] = &[
 /// Below this threshold the standard kernel (15 blocks for SmolLM2) has
 /// lower launch overhead and the partitioned overhead (extra allocs +
 /// reduction kernel) is not worth it.
+#[allow(dead_code)]
 const PARTITIONED_ATTN_MIN_ACTIVE_LEN: usize = 32;
 
 fn kernel_suffix(dtype: DType) -> &'static str {
@@ -163,7 +164,7 @@ pub fn paged_attention_decode(
 
     // Active length accounts for sliding window
     #[allow(clippy::cast_sign_loss)]
-    let max_active_len = if window_size > 0 {
+    let _max_active_len = if window_size > 0 {
         max_seq_len.min(window_size as usize)
     } else {
         max_seq_len
@@ -227,7 +228,7 @@ fn launch_paged_decode(
     head_dim: usize,
     max_blocks_per_seq: usize,
     window_size: i32,
-    max_active_len: usize,
+    _max_active_len: usize,
     batch_size: usize,
 ) -> Result<()> {
     ensure_paged_decode_kernel(device)?;
@@ -362,7 +363,7 @@ pub(crate) fn paged_attention_decode_indirect(
 
     // Active length accounts for sliding window
     #[allow(clippy::cast_sign_loss)]
-    let max_active_len = if window_size > 0 {
+    let _max_active_len = if window_size > 0 {
         max_seq_len.min(window_size as usize)
     } else {
         max_seq_len
@@ -592,7 +593,7 @@ pub fn paged_attention_decode_from_tensor(
     let window_size = sliding_window.map_or(0, |w| w as i32);
 
     #[allow(clippy::cast_sign_loss)]
-    let max_active_len = if window_size > 0 {
+    let _max_active_len = if window_size > 0 {
         max_seq_len.min(window_size as usize)
     } else {
         max_seq_len

@@ -959,6 +959,7 @@ pub fn quantized_matmul(input: &CudaTensor, weight: &QuantizedTensor) -> Result<
 // the full dequant-to-F16 step and keeps data in int8 throughout.
 
 /// Ensure MMQ Q8 kernels are loaded.
+#[allow(dead_code)]
 fn ensure_mmq_q8_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<()> {
     let module = "mmq_q8";
     if !device.has_func(module, "mmq_q8_f32") {
@@ -980,6 +981,7 @@ fn ensure_mmq_q8_kernels(device: &std::sync::Arc<cudarc::driver::CudaDevice>) ->
 /// `input`: F32 or BF16 tensor (M, K)
 /// `weight`: `Q8_0` quantized tensor (N, K)
 /// output: BF16 tensor (M, N) = input @ dequant(weight)^T
+#[allow(dead_code)]
 fn mmq_matmul_q8(
     input: &CudaTensor,
     weight: &QuantizedTensor,

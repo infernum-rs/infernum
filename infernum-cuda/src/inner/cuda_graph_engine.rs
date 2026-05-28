@@ -1381,7 +1381,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         let mut buf_cos = device.alloc_zeros::<bf16>(half_dim)?;
         let mut buf_sin = device.alloc_zeros::<bf16>(half_dim)?;
         let mut buf_block = device.alloc_zeros::<u32>(max_blocks)?;
-        let mut buf_pos = device.alloc_zeros::<u32>(1)?;
+        let mut buf_position = device.alloc_zeros::<u32>(1)?;
         let mut buf_seq = device.alloc_zeros::<u32>(1)?;
 
         let mut last_logits: Option<CudaTensor> = None;
@@ -1397,7 +1397,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             device.htod_copy_into(cos_bf16, &mut buf_cos)?;
             device.htod_copy_into(sin_bf16, &mut buf_sin)?;
             device.htod_copy_into(block_ids_u32.clone(), &mut buf_block)?;
-            device.htod_copy_into(vec![pos_u32], &mut buf_pos)?;
+            device.htod_copy_into(vec![pos_u32], &mut buf_position)?;
             device.htod_copy_into(vec![pos_u32 + 1], &mut buf_seq)?;
 
             // Non-owning views over the stable buffers.  The PoolableBuffer is
@@ -1408,7 +1408,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             let sin_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1, half_dim], &buf_sin);
             let block_table_t =
                 CudaTensor::from_cuda_slice_view(&self.ctx, &[1, max_blocks], &buf_block);
-            let positions_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_pos);
+            let positions_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_position);
             let seq_len_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_seq);
 
             let inputs = vec![

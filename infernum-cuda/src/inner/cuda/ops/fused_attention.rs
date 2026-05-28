@@ -394,7 +394,7 @@ fn fused_attention_prefill_batched_gemm(
         let mut seq_i = seqq_i32;
         let mut scale_f = scale;
         // Bind slice to variable so device_ptr_mut borrows a live object.
-        let mut attn_slice = attn.cuda_slice_mut();
+        let attn_slice = attn.cuda_slice_mut();
         let mut args: Vec<*mut c_void> = vec![
             std::ptr::from_mut(attn_slice.device_ptr_mut()).cast::<c_void>(),
             (&raw mut nh_i).cast::<c_void>(),
@@ -454,7 +454,7 @@ fn fused_attention_prefill_batched_gemm(
         let mut hd_i = hd_i32;
         let mut seq_i = seqq_i32;
         let mut h_i = h as i32;
-        let mut out_slice = out.cuda_slice_mut();
+        let out_slice = out.cuda_slice_mut();
         let tmp_slice = tmp.cuda_slice();
         let mut args: Vec<*mut c_void> = vec![
             std::ptr::from_mut(out_slice.device_ptr_mut()).cast::<c_void>(),
@@ -492,6 +492,7 @@ fn fused_attention_prefill_batched_gemm(
 ///
 /// # Errors
 /// Returns an error if the kernel launch fails
+#[allow(clippy::too_many_lines)]
 pub fn fused_attention_prefill(
     q: &CudaTensor,
     k: &CudaTensor,

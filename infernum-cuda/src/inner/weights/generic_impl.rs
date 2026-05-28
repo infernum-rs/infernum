@@ -16,7 +16,6 @@ use crate::cuda::{CudaContext, CudaTensor};
 use crate::inner::backend_impl::CudaBackend;
 use crate::inner::weights::loader::WeightLoader as FormatLoader;
 
-use cudarc::driver::DeviceSlice;
 use infernum::dtype::DType;
 use infernum::shard::{ShardConfig, ShardStrategy};
 use infernum::tensor::Tensor;

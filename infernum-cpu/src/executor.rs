@@ -513,7 +513,7 @@ mod tests {
         let half_dim = head_dim / 2;
 
         let (mut graph, _model_weights) =
-            build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32, None);
+            build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32, None, false);
         infernum::graph::optimizer::optimize(&mut graph);
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);
