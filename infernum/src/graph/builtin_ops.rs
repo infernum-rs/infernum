@@ -132,9 +132,12 @@ impl<B: ContextBackend + EmbedOps> OpNode<B> for EmbeddingGatherOp {
     ) -> Result<()> {
         let result = {
             let token_ids = B::ctx_read(ctx, inputs[0]);
-            let table_w = ctx.weights.tensor_weight(self.table).clone();
             let seq_len = token_ids.shape()[0];
-            <B as EmbedOps>::embedding_gather_tensor(&table_w, &token_ids, seq_len)?
+            <B as EmbedOps>::embedding_gather_tensor(
+                ctx.weights.tensor_weight(self.table),
+                &token_ids,
+                seq_len,
+            )?
         };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
@@ -184,8 +187,7 @@ impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormOp {
     ) -> Result<()> {
         let result = {
             let input = B::ctx_read(ctx, inputs[0]);
-            let weight = ctx.weights.tensor_weight(self.weight).clone();
-            <B as NormOps>::rms_norm(&input, &weight, self.eps)?
+            <B as NormOps>::rms_norm(&input, ctx.weights.tensor_weight(self.weight), self.eps)?
         };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
@@ -236,8 +238,12 @@ impl<B: ContextBackend + NormOps> OpNode<B> for AddRmsNormOp {
         let (updated, normed) = {
             let residual = B::ctx_read(ctx, inputs[0]);
             let delta = B::ctx_read(ctx, inputs[1]);
-            let weight = ctx.weights.tensor_weight(self.weight).clone();
-            <B as NormOps>::add_rmsnorm(&residual, &delta, &weight, self.eps)?
+            <B as NormOps>::add_rmsnorm(
+                &residual,
+                &delta,
+                ctx.weights.tensor_weight(self.weight),
+                self.eps,
+            )?
         };
         B::ctx_write(ctx, node_id, 0, updated);
         B::ctx_write(ctx, node_id, 1, normed);
@@ -2386,10 +2392,10 @@ impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormQkOp {
         let (q_normed, k_normed) = {
             let q = B::ctx_read(ctx, inputs[0]);
             let k = B::ctx_read(ctx, inputs[1]);
-            let q_weight = ctx.weights.tensor_weight(self.q_weight).clone();
-            let k_weight = ctx.weights.tensor_weight(self.k_weight).clone();
-            let q_normed = <B as NormOps>::rms_norm(&q, &q_weight, self.eps)?;
-            let k_normed = <B as NormOps>::rms_norm(&k, &k_weight, self.eps)?;
+            let q_normed =
+                <B as NormOps>::rms_norm(&q, ctx.weights.tensor_weight(self.q_weight), self.eps)?;
+            let k_normed =
+                <B as NormOps>::rms_norm(&k, ctx.weights.tensor_weight(self.k_weight), self.eps)?;
             (q_normed, k_normed)
         };
         B::ctx_write(ctx, node_id, 0, q_normed);

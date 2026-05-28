@@ -1186,18 +1186,23 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             .map(|&b| u32::try_from(b).expect("block ID fits u32"))
             .collect();
 
+        // Build the paged decode graph once — the structure is constant across all
+        // prefill tokens (batch_size=1, block_size, max_blocks are all fixed).
+        // Previously this was rebuilt on every token, causing O(n) graph-build
+        // overhead for an n-token prefill.
+        let mut graph = self.config.build_paged_decode_graph_cuda(
+            1,
+            block_size,
+            max_blocks,
+            self.shard.as_ref(),
+        );
+        optimizer::optimize(&mut graph);
+        let ep = plan(&graph);
+        let output_nodes = graph.output_ids().to_vec();
+
         let mut last_logits: Option<CudaTensor> = None;
 
         for (pos, &token) in input_ids.iter().enumerate() {
-            let mut graph = self.config.build_paged_decode_graph_cuda(
-                1,
-                block_size,
-                max_blocks,
-                self.shard.as_ref(),
-            );
-            optimizer::optimize(&mut graph);
-            let ep = plan(&graph);
-
             let (cos_row, sin_row) = precompute_rope_row(pos, head_dim, self.config.rope_theta());
 
             let input_id_t = CudaTensor::from_slice(&self.ctx, &[1], &[token])?;
@@ -1217,7 +1222,6 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 positions_t,
                 seq_len_t,
             ];
-            let output_nodes = graph.output_ids().to_vec();
             let (outputs, _) = execute(
                 &self.ctx,
                 &ep,
