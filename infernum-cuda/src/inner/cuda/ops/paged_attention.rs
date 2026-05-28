@@ -239,7 +239,9 @@ fn launch_paged_decode(
     // Allocate for the full KV-cache capacity so the same config is safe for
     // all replay steps when captured inside a CUDA graph.
     let max_capacity = max_blocks_per_seq * block_size;
-    let threads = 256_usize.min(max_capacity.next_power_of_two()).max(32);
+    // Use head_dim threads for 100% V-phase utilisation; active_len/head_dim
+    // tokens per thread in Q·K (typically 1-4 for most decode steps).
+    let threads = head_dim.min(256).max(32);
 
     // Shared memory: s_q (head_dim) + s_weights (max_capacity) + s_scratch (threads)
     let shared_mem = (head_dim + max_capacity + threads) * std::mem::size_of::<f32>();
@@ -481,6 +483,10 @@ pub fn paged_attention_decode_from_tensor(
     // more thread-level parallelism (256 threads ÷ ~264 active tokens ≈ 1 token per
     // thread vs. 16 threads → 16 tokens per thread with the old sizing).
     let max_capacity = max_blocks_per_seq * block_size;
+    // 256 threads maximises Q·K parallelism (≤1 token per thread for typical
+    // decode lengths) and warp-level latency hiding.  The V accumulation loop
+    // only uses min(blockDim.x, head_dim) threads, so 64 threads are idle when
+    // head_dim=64, but the Q·K benefit outweighs the V waste.
     let threads = 256_usize.min(max_capacity.next_power_of_two()).max(32);
     let shared_mem = (head_dim + max_capacity + threads) * std::mem::size_of::<f32>();
 
