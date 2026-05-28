@@ -26,7 +26,7 @@ use crate::CpuBackend;
 thread_local! {
     // Per-thread scratch buffer for Q4_0 IL → Q8_0 IL expansion during prefill.
     // Sized to the largest chunk seen; grows but never shrinks.
-    static Q4_EXPAND_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static Q4_EXPAND_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Cast a `*mut T` to `usize` for safe capture in closures.
@@ -54,8 +54,10 @@ fn transpose(b: &[f32], k: usize, n: usize) -> Vec<f32> {
 /// Repack Q8_0 weight data + scales into the unified 4-row-interleaved (IL) format.
 ///
 /// Each block in the output is 136 bytes: `[128 bytes quants (4×32)][8 bytes f16 scales (4×u16 LE)]`.
+///
 /// - Quant for row r, block b: `il[g*nb*136 + b*136 + r*32 .. +32]`
 /// - Scale for row r, block b: `il[g*nb*136 + b*136 + 128 + r*2 .. +2]` (LE f16 bits)
+///
 /// Rows not a multiple of 4 are padded with zeros.
 fn repack_q8_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize) -> Vec<u8> {
     let n_groups = n_rows.div_ceil(4);
@@ -68,9 +70,9 @@ fn repack_q8_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize
             let dst = g * nb * 136 + blk * 136 + r * 32;
             il[dst..dst + 32].copy_from_slice(&data[src..src + 32]);
             let scale_dst = g * nb * 136 + blk * 136 + 128 + r * 2;
-            let bits = half::f16::from_f32(scales[row * nb + blk]).to_bits();
-            il[scale_dst] = bits as u8;
-            il[scale_dst + 1] = (bits >> 8) as u8;
+            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk]).to_bits().to_le_bytes();
+            il[scale_dst] = lo;
+            il[scale_dst + 1] = hi;
         }
     }
     il
@@ -79,8 +81,10 @@ fn repack_q8_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize
 /// Repack Q4_0 weight data + scales into the unified 4-row-interleaved (IL) format.
 ///
 /// Each block in the output is 72 bytes: `[64 bytes quants (4×16)][8 bytes f16 scales (4×u16 LE)]`.
+///
 /// - Quant for row r, block b: `il[g*nb*72 + b*72 + r*16 .. +16]`
 /// - Scale for row r, block b: `il[g*nb*72 + b*72 + 64 + r*2 .. +2]` (LE f16 bits)
+///
 /// Rows not a multiple of 4 are padded with zeros.
 fn repack_q4_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize) -> Vec<u8> {
     let n_groups = n_rows.div_ceil(4);
@@ -93,20 +97,15 @@ fn repack_q4_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize
             let dst = g * nb * 72 + blk * 72 + r * 16;
             il[dst..dst + 16].copy_from_slice(&data[src..src + 16]);
             let scale_dst = g * nb * 72 + blk * 72 + 64 + r * 2;
-            let bits = half::f16::from_f32(scales[row * nb + blk]).to_bits();
-            il[scale_dst] = bits as u8;
-            il[scale_dst + 1] = (bits >> 8) as u8;
+            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk]).to_bits().to_le_bytes();
+            il[scale_dst] = lo;
+            il[scale_dst + 1] = hi;
         }
     }
     il
 }
 
-/// Expand Q4_0 packed nibbles to row-major Q8_0 for an entire weight matrix.
-///
-/// Input: `n_rows × nb` blocks × 16 packed bytes (low nibble = elem[0..16], high = elem[16..32]).
-/// Output: `n_rows × nb` blocks × 32 int8 bytes, centered: `x - 8`.
-
-/// Standard gemm: `A (M,K) × B (K,N) → C (M,N)`.
+/// Standard GEMM: `A (M,K) × B (K,N) → C (M,N)`.
 ///
 /// Transposes B once, then delegates to `gemm_with_bt`.
 #[allow(clippy::many_single_char_names)]
@@ -2238,7 +2237,9 @@ fn q8_gemv_body_il(
         chunk[g * 4 + 3] = d3;
     }
     let after_quads = quads * 4;
-    for i in after_quads..chunk_len {
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    for (offset, out) in chunk[after_quads..chunk_len].iter_mut().enumerate() {
+        let i = after_quads + offset;
         let neuron = neuron_offset + i;
         let gg = neuron / 4;
         let r = neuron % 4;
@@ -2252,13 +2253,15 @@ fn q8_gemv_body_il(
             let dot: i32 = wq
                 .iter()
                 .zip(iq.iter())
-                .map(|(&w, &a)| (w as i8 as i32) * (a as i8 as i32))
+                .map(|(&w, &a)| {
+                    i32::from(i8::from_ne_bytes([w])) * i32::from(i8::from_ne_bytes([a]))
+                })
                 .sum();
             let ws =
                 half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]]).to_f32();
             acc += (dot as f32) * inp_scales[blk] * ws;
         }
-        chunk[i] = acc;
+        *out = acc;
     }
 }
 
@@ -2329,7 +2332,9 @@ fn q4_gemv_body_il(
     }
     // Remainder: scalar fallback for the last 0-3 neurons.
     let after_quads = quads * 4;
-    for i in after_quads..chunk_len {
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    for (offset, out) in chunk[after_quads..chunk_len].iter_mut().enumerate() {
+        let i = after_quads + offset;
         let neuron = neuron_offset + i;
         let gg = neuron / 4;
         let r = neuron % 4;
@@ -2339,10 +2344,11 @@ fn q4_gemv_body_il(
             let packed = &il_data[blk * 72 + r * 16..blk * 72 + r * 16 + 16];
             let iq = &inp_quants[blk * 32..(blk + 1) * 32];
             let dot: i32 = (0..16)
-                .map(|i| {
-                    let lo = ((packed[i] & 0x0F).wrapping_sub(8)) as i8 as i32;
-                    let hi = ((packed[i] >> 4).wrapping_sub(8)) as i8 as i32;
-                    lo * (iq[i] as i8 as i32) + hi * (iq[i + 16] as i8 as i32)
+                .map(|k| {
+                    let lo = i32::from(i8::from_ne_bytes([(packed[k] & 0x0F).wrapping_sub(8)]));
+                    let hi = i32::from(i8::from_ne_bytes([(packed[k] >> 4).wrapping_sub(8)]));
+                    lo * i32::from(i8::from_ne_bytes([iq[k]]))
+                        + hi * i32::from(i8::from_ne_bytes([iq[k + 16]]))
                 })
                 .sum();
             let scale_off = blk * 72 + 64 + r * 2;
@@ -2350,7 +2356,7 @@ fn q4_gemv_body_il(
                 half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]]).to_f32();
             acc += (dot as f32) * inp_scales[blk] * ws;
         }
-        chunk[i] = acc;
+        *out = acc;
     }
 }
 

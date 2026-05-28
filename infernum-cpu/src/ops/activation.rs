@@ -10,6 +10,9 @@ use crate::CpuBackend;
 
 impl SwigluOps for CpuBackend {
     fn swiglu(gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
+        // For decode (n ≈ 2560) the dispatch overhead exceeds the compute; only
+        // parallelize for prefill-sized tensors where n is large enough to amortize.
+        const MIN_PARALLEL: usize = 32_768;
         let gate_data = gate.as_f32_slice();
         let up_data = up.as_f32_slice();
         assert_eq!(
@@ -28,9 +31,6 @@ impl SwigluOps for CpuBackend {
 
         let pool = crate::thread_pool::global_pool();
         let num_threads = pool.num_threads();
-        // For decode (n ≈ 2560) the dispatch overhead exceeds the compute; only
-        // parallelize for prefill-sized tensors where n is large enough to amortize.
-        const MIN_PARALLEL: usize = 32_768;
         if n < MIN_PARALLEL {
             simd::vec_silu_mul(gate_data, up_data, &mut out);
         } else {
@@ -57,6 +57,7 @@ impl SwigluOps for CpuBackend {
 
 impl GegluOps for CpuBackend {
     fn geglu(gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
+        const MIN_PARALLEL: usize = 32_768;
         let gate_data = gate.as_f32_slice();
         let up_data = up.as_f32_slice();
         assert_eq!(
@@ -75,7 +76,6 @@ impl GegluOps for CpuBackend {
 
         let pool = crate::thread_pool::global_pool();
         let num_threads = pool.num_threads();
-        const MIN_PARALLEL: usize = 32_768;
         if n < MIN_PARALLEL {
             simd::vec_gelu_mul(gate_data, up_data, &mut out);
         } else {

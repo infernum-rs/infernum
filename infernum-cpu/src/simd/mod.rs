@@ -218,7 +218,7 @@ pub fn vec_gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
     // Scalar fallback.
     for ((g, u), o) in gate.iter().zip(up.iter()).zip(out.iter_mut()) {
-        let inner = 1.595_769_1_f32 * (g + 0.044_715 * g * g * g);
+        let inner = 1.595_769_f32 * (g + 0.044_715 * g * g * g);
         let sigmoid = 1.0 / (1.0 + (-inner).exp());
         *o = g * sigmoid * u;
     }
@@ -497,7 +497,7 @@ pub fn gemm_q8_tiled(
 ///
 /// `wt_quants_il` is the full interleaved weight matrix with inline f16 scales.
 /// `col_start` must be a multiple of 4.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
 pub fn gemm_q8_tiled_il(
     output: &mut [f32],
     inp_quants: &[u8],
@@ -546,7 +546,7 @@ pub fn gemm_q8_tiled_il(
                 let iq_blk = &iq[blk * 32..(blk + 1) * 32];
                 let mut dot = 0i32;
                 for (w, a) in wq.iter().zip(iq_blk.iter()) {
-                    dot += (*w as i32) * (*a as i8 as i32);
+                    dot += i32::from(i8::from_ne_bytes([*w])) * i32::from(i8::from_ne_bytes([*a]));
                 }
                 let ws = half::f16::from_le_bytes([
                     wt_quants_il[scale_off],
@@ -602,7 +602,7 @@ fn expand_q4_il_scalar(q4_il: &[u8], chunk_groups: usize, nb: usize, q8: &mut [u
 
 /// Q4_0 IL tiled GEMM: reads Q4_0 IL directly (unified 72-byte blocks: 64 quant + 8 f16).
 /// Weight layout: `wt_quants_il[group * nb * 72 + blk * 72 + row * 16 .. +16]`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
 pub fn gemm_q4_tiled_il(
     output: &mut [f32],
     inp_quants: &[u8],
@@ -650,10 +650,10 @@ pub fn gemm_q4_tiled_il(
                 let iq_blk = &iq[blk * 32..(blk + 1) * 32];
                 let mut dot = 0i32;
                 for k in 0..16 {
-                    dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32)
-                        * (iq_blk[k] as i8 as i32);
-                    dot += ((packed[k] >> 4).wrapping_sub(8) as i8 as i32)
-                        * (iq_blk[k + 16] as i8 as i32);
+                    dot += i32::from(i8::from_ne_bytes([(packed[k] & 0x0F).wrapping_sub(8)]))
+                        * i32::from(i8::from_ne_bytes([iq_blk[k]]));
+                    dot += i32::from(i8::from_ne_bytes([(packed[k] >> 4).wrapping_sub(8)]))
+                        * i32::from(i8::from_ne_bytes([iq_blk[k + 16]]));
                 }
                 let ws = half::f16::from_le_bytes([
                     wt_quants_il[scale_off],
@@ -950,18 +950,17 @@ pub fn dot_q8_q8_4row_il(
     }
 
     // Scalar fallback.
-    let nb = input_scales.len();
     let mut acc = [0.0f32; 4];
-    for blk in 0..nb {
+    #[allow(clippy::cast_precision_loss)]
+    for (blk, &inp_scale) in input_scales.iter().enumerate() {
         let inp_off = blk * 32;
         let wq_off = blk * 136;
-        let inp_scale = input_scales[blk];
         for r in 0..4 {
             let mut dot = 0i32;
             let iq = &input_quants[inp_off..inp_off + 32];
             let wq = &il_quants[wq_off + r * 32..wq_off + r * 32 + 32];
             for (a, w) in iq.iter().zip(wq.iter()) {
-                dot += (*a as i8 as i32) * (*w as i32);
+                dot += i32::from(i8::from_ne_bytes([*a])) * i32::from(i8::from_ne_bytes([*w]));
             }
             let scale_off = wq_off + 128 + r * 2;
             let ws =
@@ -990,20 +989,20 @@ pub fn dot_q4_q8_4row_il(
     }
 
     // Scalar fallback: unpack nibbles and dot.
-    let nb = input_scales.len();
     let mut acc = [0.0f32; 4];
-    for blk in 0..nb {
+    #[allow(clippy::cast_precision_loss)]
+    for (blk, &inp_scale) in input_scales.iter().enumerate() {
         let inp_off = blk * 32;
         let wq_off = blk * 72;
-        let inp_scale = input_scales[blk];
         for r in 0..4 {
             let iq = &input_quants[inp_off..inp_off + 32];
             let packed = &il_quants_q4[wq_off + r * 16..wq_off + r * 16 + 16];
             let mut dot = 0i32;
             for i in 0..16 {
-                let lo = ((packed[i] & 0x0F).wrapping_sub(8)) as i8 as i32;
-                let hi = ((packed[i] >> 4).wrapping_sub(8)) as i8 as i32;
-                dot += lo * (iq[i] as i8 as i32) + hi * (iq[i + 16] as i8 as i32);
+                let lo = i32::from(i8::from_ne_bytes([(packed[i] & 0x0F).wrapping_sub(8)]));
+                let hi = i32::from(i8::from_ne_bytes([(packed[i] >> 4).wrapping_sub(8)]));
+                dot += lo * i32::from(i8::from_ne_bytes([iq[i]]))
+                    + hi * i32::from(i8::from_ne_bytes([iq[i + 16]]));
             }
             let scale_off = wq_off + 64 + r * 2;
             let ws =

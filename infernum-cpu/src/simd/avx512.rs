@@ -134,7 +134,7 @@ unsafe fn dot_q4_q8_row_inner(
     // LUT: lut[i] = i - 8 maps unsigned Q4_0 nibbles (0..15) to signed (-8..7).
     // vpshufb within a 128-bit lane — no cross-lane permute needed.
     let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
-    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
+    let mask_0f = _mm_set1_epi8(0x0F_i8);
 
     let mut total = _mm256_setzero_ps();
 
@@ -381,7 +381,7 @@ unsafe fn dot_q4_q8_2row_inner(
     let wp1 = weight_packed_1.as_ptr();
     // vpshufb LUT: maps nibble i (0..15) → i-8 (-8..7), within-lane (latency 1).
     let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
-    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
+    let mask_0f = _mm_set1_epi8(0x0F_i8);
 
     let mut total0 = _mm256_setzero_ps();
     let mut total1 = _mm256_setzero_ps();
@@ -458,6 +458,9 @@ unsafe fn dot_q8_q8_4row_inner(
     weight_quants_4rows: &[u8],
     weight_scales_4rows: &[f32],
 ) -> (f32, f32, f32, f32) {
+    // Prefetch distance: DRAM latency (~150 ns) / block compute time (~17 ns) ≈ 9 blocks.
+    // PF=12 is optimal: PF=8 leaves latency on the table; PF=16 over-saturates cache bandwidth.
+    const PF: usize = 12;
     let num_blocks = input_scales.len();
     let row_bytes = num_blocks * 32;
 
@@ -477,9 +480,6 @@ unsafe fn dot_q8_q8_4row_inner(
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
-    // Prefetch distance: DRAM latency (~150 ns) / block compute time (~17 ns) ≈ 9 blocks.
-    // PF=12 is optimal: PF=8 leaves latency on the table; PF=16 over-saturates cache bandwidth.
-    const PF: usize = 12;
     for blk in 0..num_blocks {
         let blk_offset = blk * 32;
         let inp_scale = *input_scales.get_unchecked(blk);
@@ -549,7 +549,7 @@ pub fn dot_q8_q8_4row_il(
     unsafe { dot_q8_q8_4row_il_inner(input_quants, input_scales, il_quants) }
 }
 
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::cast_ptr_alignment)]
 #[target_feature(
     enable = "avx512f",
     enable = "avx512vnni",
@@ -562,6 +562,10 @@ unsafe fn dot_q8_q8_4row_il_inner(
     input_scales: &[f32],
     il_quants: &[u8],
 ) -> (f32, f32, f32, f32) {
+    // Prefetch 12 blocks ahead. Each block is 136 bytes = 3 partial cache lines;
+    // Quant data: bytes 0..127 (CL0 = 0..63, CL1 = 64..127). Scale: bytes 128..135 (CL2).
+    // All three cache lines must be prefetched; hardware prefetcher cannot bridge CL2.
+    const PF: usize = 12;
     let nb = input_scales.len();
 
     let iq = input_quants.as_ptr();
@@ -572,10 +576,6 @@ unsafe fn dot_q8_q8_4row_il_inner(
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
-    // Prefetch 12 blocks ahead. Each block is 136 bytes = 3 partial cache lines;
-    // Quant data: bytes 0..127 (CL0 = 0..63, CL1 = 64..127). Scale: bytes 128..135 (CL2).
-    // All three cache lines must be prefetched; hardware prefetcher cannot bridge CL2.
-    const PF: usize = 12;
     for blk in 0..nb {
         let inp_off = blk * 32;
         let wq_off = blk * 136;
@@ -671,6 +671,7 @@ unsafe fn dot_q4_q8_4row_inner(
         _mm_shuffle_epi8, _mm_srli_epi16,
     };
 
+    const PF4: usize = 12; // prefetch distance in Q4 blocks (16 bytes each)
     let num_blocks = input_scales.len();
     let packed_row_bytes = num_blocks * 16;
 
@@ -687,14 +688,13 @@ unsafe fn dot_q4_q8_4row_inner(
 
     // vpshufb LUT: maps nibble i (0..15) → i-8 (-8..7), within-lane (latency 1).
     let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
-    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
+    let mask_0f = _mm_set1_epi8(0x0F_i8);
 
     let mut total0 = _mm256_setzero_ps();
     let mut total1 = _mm256_setzero_ps();
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
-    const PF4: usize = 12; // prefetch distance in Q4 blocks (16 bytes each)
     for blk in 0..num_blocks {
         let inp_offset = blk * 32;
         let wp_offset = blk * 16;
@@ -780,7 +780,7 @@ pub fn dot_q4_q8_4row_il(
     unsafe { dot_q4_q8_4row_il_inner(input_quants, input_scales, il_quants_q4) }
 }
 
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::cast_ptr_alignment)]
 #[target_feature(
     enable = "avx512f",
     enable = "avx512vnni",
@@ -799,23 +799,23 @@ unsafe fn dot_q4_q8_4row_il_inner(
         _mm_shuffle_epi8, _mm_srli_epi16,
     };
 
+    // Each block occupies 72 bytes (64 bytes quants + 8 bytes f16 scales).
+    // Bytes 0..63: quants (4 rows × 16 bytes, CL0); bytes 64..71: 4 f16 scales (CL1).
+    // Two cache lines per block: prefetch both CL0 (quants) and CL1 (scales).
+    const PF: usize = 12;
     let nb = input_scales.len();
     let iq = input_quants.as_ptr();
     let wq = il_quants_q4.as_ptr();
 
     // vpshufb LUT: nibble i → i-8, within-lane.
     let lut = _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8);
-    let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
+    let mask_0f = _mm_set1_epi8(0x0F_i8);
 
     let mut total0 = _mm256_setzero_ps();
     let mut total1 = _mm256_setzero_ps();
     let mut total2 = _mm256_setzero_ps();
     let mut total3 = _mm256_setzero_ps();
 
-    // Each block occupies 72 bytes (64 bytes quants + 8 bytes f16 scales).
-    // Bytes 0..63: quants (4 rows × 16 bytes, CL0); bytes 64..71: 4 f16 scales (CL1).
-    // Two cache lines per block: prefetch both CL0 (quants) and CL1 (scales).
-    const PF: usize = 12;
     for blk in 0..nb {
         let inp_off = blk * 32;
         let wq_off = blk * 72;
@@ -2771,6 +2771,7 @@ unsafe fn gemm_q8_tiled_inner_il(
             );
         }
         // N remainder: scalar fallback.
+        #[allow(clippy::cast_precision_loss)]
         for jj in n_full..n {
             let global_col = col_start + jj;
             let group = global_col / 4;
@@ -2785,7 +2786,8 @@ unsafe fn gemm_q8_tiled_inner_il(
                     let iq = &inp_quants[inp_off..inp_off + 32];
                     let mut dot = 0i32;
                     for (w, a) in wq.iter().zip(iq.iter()) {
-                        dot += (*w as i8 as i32) * (*a as i8 as i32);
+                        dot += i32::from(i8::from_ne_bytes([*w]))
+                            * i32::from(i8::from_ne_bytes([*a]));
                     }
                     let ws = half::f16::from_le_bytes([
                         wt_quants_il[scale_off],
@@ -2800,6 +2802,7 @@ unsafe fn gemm_q8_tiled_inner_il(
     }
 
     // M remainder: scalar fallback.
+    #[allow(clippy::cast_precision_loss)]
     for ii in m_full..m {
         for jj in 0..n {
             let global_col = col_start + jj;
@@ -2814,7 +2817,8 @@ unsafe fn gemm_q8_tiled_inner_il(
                 let iq = &inp_quants[inp_off..inp_off + 32];
                 let mut dot = 0i32;
                 for (w, a) in wq.iter().zip(iq.iter()) {
-                    dot += (*w as i8 as i32) * (*a as i8 as i32);
+                    dot += i32::from(i8::from_ne_bytes([*w]))
+                        * i32::from(i8::from_ne_bytes([*a]));
                 }
                 let ws = half::f16::from_le_bytes([
                     wt_quants_il[scale_off],
@@ -3259,6 +3263,7 @@ unsafe fn microkernel_q8_4x4_il(
 ///
 /// Input layout: `q4_il[g * nb * 72 + blk * 72 .. +72]`
 /// Output layout: `q8[g * nb * 128 + blk * 128 .. + 128]`
+#[allow(clippy::cast_ptr_alignment)]
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
     q4_il: &[u8],
@@ -3266,15 +3271,19 @@ pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
     nb: usize,
     q8: &mut [u8],
 ) {
-    use std::arch::x86_64::*;
-    let mask0f = _mm512_set1_epi8(0x0F_u8 as i8);
-    let minus8 = _mm512_set1_epi8(-8_i8);
-    let total_blocks = chunk_groups * nb;
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_castsi128_si256, _mm256_inserti128_si256,
+        _mm256_storeu_si256, _mm512_add_epi8, _mm512_and_si512, _mm512_loadu_si512,
+        _mm512_set1_epi8, _mm512_srli_epi16, _mm512_extracti32x4_epi32,
+    };
     // Prefetch distance: 20 blocks × 72 bytes = 1440 bytes ≈ 23 cache lines.
     // Hides ~100-cycle DRAM latency at ~5 cycles/block in the expand loop.
     const PF: usize = 20;
+    let mask0f = _mm512_set1_epi8(0x0F_i8);
+    let minus8 = _mm512_set1_epi8(-8_i8);
+    let total_blocks = chunk_groups * nb;
     for blk in 0..total_blocks {
-        let src = q4_il.as_ptr().add(blk * 72) as *const __m512i;
+        let src = q4_il.as_ptr().add(blk * 72).cast::<__m512i>();
         let dst = q8.as_mut_ptr().add(blk * 136);
         // Prefetch next Q4 blocks from DRAM/L3 into L1.
         _mm_prefetch(q4_il.as_ptr().add((blk + PF) * 72).cast(), _MM_HINT_T0);
@@ -3289,7 +3298,7 @@ pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
                 let lo_r = _mm512_extracti32x4_epi32(lo, $r);
                 let hi_r = _mm512_extracti32x4_epi32(hi, $r);
                 let row = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_r), hi_r, 1);
-                _mm256_storeu_si256(dst.add($off) as *mut __m256i, row);
+                _mm256_storeu_si256(dst.add($off).cast::<__m256i>(), row);
             };
         }
         store_row!(0, 0);
@@ -3297,8 +3306,8 @@ pub(super) unsafe fn expand_q4_il_to_q8_il_avx512(
         store_row!(2, 64);
         store_row!(3, 96);
         // Copy 8 bytes of f16 scales from Q4 block offset +64 to Q8 block offset +128.
-        let scales_src = q4_il.as_ptr().add(blk * 72 + 64) as *const u64;
-        let scales_dst = dst.add(128) as *mut u64;
+        let scales_src = q4_il.as_ptr().add(blk * 72 + 64).cast::<u64>();
+        let scales_dst = dst.add(128).cast::<u64>();
         scales_dst.write_unaligned(scales_src.read_unaligned());
     }
 }
@@ -3345,7 +3354,8 @@ pub fn gemm_q4_tiled_il(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    clippy::cast_precision_loss
 )]
 #[target_feature(
     enable = "avx512f",
@@ -3397,10 +3407,10 @@ unsafe fn gemm_q4_tiled_inner_il(
                     let iq = &inp_quants[inp_off..inp_off + 32];
                     let mut dot = 0i32;
                     for k in 0..16 {
-                        dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32)
-                            * (iq[k] as i8 as i32);
-                        dot += ((packed[k] >> 4).wrapping_sub(8) as i8 as i32)
-                            * (iq[k + 16] as i8 as i32);
+                        dot += i32::from(i8::from_ne_bytes([(packed[k] & 0x0F).wrapping_sub(8)]))
+                            * i32::from(i8::from_ne_bytes([iq[k]]));
+                        dot += i32::from(i8::from_ne_bytes([(packed[k] >> 4).wrapping_sub(8)]))
+                            * i32::from(i8::from_ne_bytes([iq[k + 16]]));
                     }
                     let ws = half::f16::from_le_bytes([
                         wt_quants_il[scale_off],
@@ -3429,9 +3439,10 @@ unsafe fn gemm_q4_tiled_inner_il(
                 let iq = &inp_quants[inp_off..inp_off + 32];
                 let mut dot = 0i32;
                 for k in 0..16 {
-                    dot += ((packed[k] & 0x0F).wrapping_sub(8) as i8 as i32) * (iq[k] as i8 as i32);
-                    dot +=
-                        ((packed[k] >> 4).wrapping_sub(8) as i8 as i32) * (iq[k + 16] as i8 as i32);
+                    dot += i32::from(i8::from_ne_bytes([(packed[k] & 0x0F).wrapping_sub(8)]))
+                        * i32::from(i8::from_ne_bytes([iq[k]]));
+                    dot += i32::from(i8::from_ne_bytes([(packed[k] >> 4).wrapping_sub(8)]))
+                        * i32::from(i8::from_ne_bytes([iq[k + 16]]));
                 }
                 let ws = half::f16::from_le_bytes([
                     wt_quants_il[scale_off],
@@ -4026,7 +4037,7 @@ unsafe fn vec_gelu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
     let remainder = n % 16;
 
     // 2 * sqrt(2/π) — used to convert tanh form to sigmoid form.
-    let two_c: __m512 = _mm512_set1_ps(1.595_769_1_f32);
+    let two_c: __m512 = _mm512_set1_ps(1.595_769_f32);
     let cubic: __m512 = _mm512_set1_ps(0.044_715_f32);
 
     let log2e: __m512 = _mm512_set1_ps(std::f32::consts::LOG2_E);
@@ -4084,7 +4095,7 @@ unsafe fn vec_gelu_mul_inner(gate: &[f32], up: &[f32], out: &mut [f32]) {
     for i in 0..remainder {
         let g = *gate.get_unchecked(tail + i);
         let u = *up.get_unchecked(tail + i);
-        let inner = 1.595_769_1_f32 * (g + 0.044_715 * g * g * g);
+        let inner = 1.595_769_f32 * (g + 0.044_715 * g * g * g);
         let sigmoid = 1.0 / (1.0 + (-inner).exp());
         *out.get_unchecked_mut(tail + i) = g * sigmoid * u;
     }
