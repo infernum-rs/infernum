@@ -16,11 +16,33 @@ use crate::cuda::{CudaContext, CudaTensor};
 use crate::inner::backend_impl::CudaBackend;
 use crate::inner::weights::loader::WeightLoader as FormatLoader;
 
+use cudarc::driver::DeviceSlice;
 use infernum::dtype::DType;
 use infernum::shard::{ShardConfig, ShardStrategy};
 use infernum::tensor::Tensor;
 use infernum::weights::{QuantizationConfig, WeightLoader};
 use infernum::Result;
+
+/// Row-concatenate a list of 2D GPU tensors: `[n1,k], [n2,k], ...` → `[n1+n2+..., k]`.
+fn concat_gpu_rows(ctx: &CudaContext, parts: &[CudaTensor]) -> Result<CudaTensor> {
+    assert!(!parts.is_empty(), "concat_gpu_rows: empty input");
+    let dtype = parts[0].dtype();
+    let cols: usize = parts[0].shape()[1];
+    let elem = dtype.size_in_bytes();
+    let total_rows: usize = parts.iter().map(|p| p.shape()[0]).sum();
+    let mut out = unsafe { CudaTensor::uninit(ctx, &[total_rows, cols], dtype)? };
+    let stride = cols * elem;
+    let out_slice = out.cuda_slice_mut();
+    let mut offset = 0;
+    for part in parts {
+        let row_bytes = part.shape()[0] * stride;
+        let src = part.cuda_slice().slice(..row_bytes);
+        let mut dst = out_slice.slice_mut(offset..offset + row_bytes);
+        ctx.device().dtod_copy(&src, &mut dst)?;
+        offset += row_bytes;
+    }
+    Ok(out)
+}
 
 /// Wraps a format-specific loader (SafeTensors or GGUF) and a `CudaContext`
 /// to implement `infernum::WeightLoader<CudaBackend>`.
@@ -121,6 +143,43 @@ impl<F: FormatLoader> WeightLoader<CudaBackend> for CudaWeightLoader<F> {
         model_dtype: DType,
         quant_config: Option<&QuantizationConfig>,
     ) -> Result<LinearWeight> {
+        // CONCAT: load and row-concatenate multiple weights into one.
+        //
+        // Naming convention: "CONCAT:name1,name2,name3" triggers loading of each
+        // component weight independently, then concatenating along dim-0 (output
+        // features).  The result is a single Dense weight `[total_out, in]`.
+        //
+        // Used for QKV fusion: registers Q+K+V as one weight so the graph runs a
+        // single GEMV with N = n_q+n_k+n_v instead of three separate GEMVs.
+        if let Some(names_str) = name.strip_prefix("CONCAT:") {
+            // Only fuse when all components are native-dtype (Dense BF16/F32).
+            // For quantized models (FP8, GPTQ, AWQ) the file dtype is quantized
+            // and load_typed would fail — fall back to loading only the first
+            // component so the weight store has a valid (if wrong-shaped) entry.
+            // The graph builder's fallback path uses individual Q/K/V GEMVs for
+            // these model families.
+            let component_names: Vec<&str> = names_str.split(',').collect();
+            if let Some(first) = component_names.first() {
+                let file_dtype = self.inner.get_dtype(first.trim()).unwrap_or(model_dtype);
+                if file_dtype.is_quantized() || file_dtype == infernum::dtype::DType::F8E4M3 {
+                    // Quantised / FP8 — load first component as a stand-in so the
+                    // WeightStore index is populated. The CONCAT weight won't be
+                    // used at inference time because `lw.qkv_proj()` only returns
+                    // Some for Dense layers.
+                    return self.load_linear(first.trim(), model_dtype, quant_config);
+                }
+            }
+            let parts: Result<Vec<_>> = component_names
+                .iter()
+                .map(|n| self.load_typed(n.trim(), model_dtype))
+                .collect();
+            let parts = parts?;
+            // Concatenate along dim-0 (output features) using D→D copies.
+            // This happens once at load time, not per inference step.
+            let cat = concat_gpu_rows(&self.ctx, &parts)?;
+            return self.host_transpose_to_linear(&cat, model_dtype);
+        }
+
         // GPTQ/AWQ: load via dedicated loader (errors for formats that don't support it)
         if let Some(qc) = quant_config {
             let prefix = name

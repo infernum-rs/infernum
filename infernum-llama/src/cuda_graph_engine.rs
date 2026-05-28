@@ -176,7 +176,9 @@ pub trait LlamaCudaGraphEngineExt: Sized {
 
 impl LlamaCudaGraphEngineExt for LlamaCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
-        let config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        let mut config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        // Enable QKV fusion for Dense BF16 SafeTensors models (not FP8/GPTQ/AWQ).
+        config.use_qkv_fusion = config.quantization_config.is_none();
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
     }
 
@@ -184,6 +186,7 @@ impl LlamaCudaGraphEngineExt for LlamaCudaGraphEngine {
         let loader =
             infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
         let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+        // use_qkv_fusion defaults to false for GGUF (quantized formats)
         infernum_cuda::CudaGraphEngine::from_config_gguf(config, ctx, gguf_path)
     }
 }

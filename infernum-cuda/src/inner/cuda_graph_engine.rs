@@ -308,6 +308,44 @@ pub fn load_graph_weights_gguf_cuda(
             u32::try_from(i).expect("weight count exceeds u32"),
         ));
         let safetensors_name = &meta.name;
+
+        // CONCAT weights (for QKV fusion) are not present in GGUF files as a single
+        // tensor.  Load each component separately, dequantise to BF16, concatenate
+        // on-host, then upload as a Dense weight.
+        if let Some(names_str) = safetensors_name.strip_prefix("CONCAT:") {
+            let gguf_names: Vec<String> = names_str
+                .split(',')
+                .map(|n| name_mapper(n.trim()))
+                .collect();
+            let mut total_rows = 0usize;
+            let mut all_bytes: Vec<Vec<u8>> = Vec::new();
+            let mut cols = 0usize;
+            for gname in &gguf_names {
+                let (bytes, shape) = loader.load_bf16_bytes(gname)?;
+                total_rows += shape[0];
+                cols = shape[1];
+                all_bytes.push(bytes);
+            }
+            let elem = 2usize; // BF16
+            let mut cat_bytes = vec![0u8; total_rows * cols * elem];
+            let mut offset = 0;
+            for (bytes, gname) in all_bytes.iter().zip(gguf_names.iter()) {
+                let _ = gname;
+                cat_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+                offset += bytes.len();
+            }
+            let tensor = CudaTensor::from_raw_bytes(
+                ctx,
+                &[total_rows, cols],
+                infernum::dtype::DType::BF16,
+                &cat_bytes,
+            )?;
+            store.push_linear_weight(LinearWeight::Dense(crate::cuda::ops::transpose_2d(
+                &tensor,
+            )?));
+            continue;
+        }
+
         let gguf_name = name_mapper(safetensors_name);
 
         // lm_head fallback: GGUF may not have output.weight for tied-embedding models.
