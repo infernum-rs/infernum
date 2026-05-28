@@ -39,50 +39,50 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
-## 2026-05-28 — L4 GPU (final, commit `e791b03`)
+## 2026-05-28 — L4 GPU — current numbers (commit `fe51737`)
 
-- **GPU:** NVIDIA L4 (23034 MiB VRAM)
-- **Driver:** 595.71.05 | CUDA 12.6
-- **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
-- **infernum commit:** `e791b03` | **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
-- **Same model, same GGUF file for both engines.**
+- **GPU:** NVIDIA L4 (23034 MiB VRAM) · **Driver:** 595.71.05 · **CUDA 12.6**
+- **infernum commit:** `fe51737` · **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
+- **Same GGUF file used for both engines.** BF16 has no llama.cpp same-format reference.
 
-### Decode throughput (tok/s, `tg256`) — same model, same GGUF, greedy one-token-at-a-time
+---
+
+### DECODE — throughput (tok/s, 256 new tokens, one at a time = `tg256`)
+
+This is the steady-state generation speed. Both engines run greedy decode from an 8-token KV cache.
 
 | Model | Format | infernum | llama.cpp | ratio |
 | ----- | ------ | -------: | --------: | ----: |
-| SmolLM2-360M-Instruct | Q8_0 GGUF | 308.5 | 350.4 | 0.88x |
-| SmolLM2-360M-Instruct | Q4_0 GGUF | 351.7 | 450.0 | 0.78x |
-| Llama-3.2-1B-Instruct | Q8_0 GGUF | 166.7 | 165.7 | **1.01x** |
-| Llama-3.2-1B-Instruct | Q4_0 GGUF | 231.7 | 254.9 | 0.91x |
+| SmolLM2-360M-Instruct | Q8_0 GGUF | 309.4 | 354.0 | 0.87x |
+| SmolLM2-360M-Instruct | Q4_0 GGUF | 351.7 | 448.8 | 0.78x |
+| SmolLM2-360M | BF16 SafeTensors | 234.1 | — | — |
+| Llama-3.2-1B-Instruct | Q8_0 GGUF | 167.0 | 165.9 | **1.01x** |
+| Llama-3.2-1B-Instruct | Q4_0 GGUF | 232.5 | 255.6 | 0.91x |
+| Llama-3.2-1B | BF16 SafeTensors | 114.7 | — | — |
 
-### Decode throughput (tok/s, `tg256`) — BF16 SafeTensors (no llama.cpp same-format reference)
+---
 
-| Model | Format | infernum |
-| ----- | ------ | -------: |
-| SmolLM2-360M | BF16 SafeTensors | 233.9 |
-| Llama-3.2-1B | BF16 SafeTensors | 114.8 |
-| Qwen3-0.6B | BF16 SafeTensors | 155.4 |
-| Qwen2.5-0.5B | BF16 SafeTensors | 182.2 |
+### PREFILL — throughput (tok/s, 512 tokens processed before the first decode step)
 
-### Prefill throughput (tok/s, 512 tokens, paged-decode token-by-token path)
+**⚠️ Not an apples-to-apples comparison.** infernum currently prefills token-by-token (sequential M=1 GEMVs through the paged KV cache). llama.cpp uses batched GEMM (`pp512`, M=512, tensor-core eligible). The two numbers reflect different algorithms; the llama.cpp column shows the target we are working towards.
 
-| Model | Format | infernum | llama.cpp (batch) |
-| ----- | ------ | -------: | ----------------: |
-| SmolLM2-360M-Instruct | Q8_0 GGUF | 240.2 | 20195 |
-| SmolLM2-360M-Instruct | Q4_0 GGUF | 261.1 | 21196 |
-| Llama-3.2-1B-Instruct | Q8_0 GGUF | 156.4 | 12861 |
-| Llama-3.2-1B-Instruct | Q4_0 GGUF | 211.3 | 12953 |
-| SmolLM2-360M | BF16 SafeTensors | 206.2 | — |
-| Llama-3.2-1B | BF16 SafeTensors | 109.9 | — |
+| Model | Format | infernum (token-by-token) | llama.cpp (batch GEMM) |
+| ----- | ------ | -------------------------: | ---------------------: |
+| SmolLM2-360M-Instruct | Q8_0 GGUF | 241 | 20 032 |
+| SmolLM2-360M-Instruct | Q4_0 GGUF | 261 | 21 904 |
+| SmolLM2-360M | BF16 SafeTensors | 206 | — |
+| Llama-3.2-1B-Instruct | Q8_0 GGUF | 157 | 12 964 |
+| Llama-3.2-1B-Instruct | Q4_0 GGUF | 212 | 13 450 |
+| Llama-3.2-1B | BF16 SafeTensors | 110 | — |
+
+---
 
 ### Notes
 
-- **Llama-3.2-1B Q8_0 at 1.01×**: infernum matches llama.cpp for this model/format combination. Llama-3.2-1B is a 16-layer model with a larger intermediate-to-hidden ratio — the quantised GEMV profile is different from SmolLM2-360M (32 layers).
-- **SmolLM2-360M gap (0.78–0.88×)**: llama.cpp uses heavily tuned custom CUDA kernels for each quantisation format. The gap is larger for Q4_0 than Q8_0 because Q4_0 has smaller blocks (18 bytes vs 34 bytes for Q8_0), so kernel launch overhead is a larger fraction of total time — llama.cpp amortises this better.
-- **Q4_0 now works**: was previously crashing (`UnsupportedDtype: GGML type 3`). Fixed by adding Q4_1 block dequantisation (commit `189538d`) — many Q4_0 GGUF files store some tensors in Q4_1 format.
-- **Prefill is not comparable**: infernum uses a token-by-token paged-decode loop; llama.cpp uses batched GEMM with tensor cores. llama.cpp's 12–20k tok/s prefill reflects a fundamentally different code path.
-- **Key optimisations in this cycle (PR #77):** shallow `CudaTensor::clone()` (eliminated 24 GB/5 s of D→D copies); paged-attention shared-memory correctness fix (+12–69% decode, fixed 1024-token crash); QKV fused GEMV (+5.4%); Q8_0 linear_pair/triple input-quantisation deduplication; BF16 cos/sin inputs; async prefill pipeline.
+- **Decode status:** Llama-3.2-1B Q8_0 matches llama.cpp (1.01×). SmolLM2-360M lags (0.78–0.87×) — it has 32 layers vs 16, so per-step kernel-launch overhead is doubled. Closing the SmolLM2 decode gap is the current focus.
+- **Prefill status:** infernum prefill is sequential (identical to decode speed × token count). Batch prefill (single batched GEMM over all prompt tokens) is the next major feature — it would bring infernum prefill to the same order of magnitude as llama.cpp.
+- **Q4_0 GGUF now works** (was crashing with `UnsupportedDtype: GGML type 3`). Fixed by adding Q4_1 block dequantisation — many Q4_0 GGUF files store some tensors in Q4_1 format.
+- **BF16 decode:** no same-format llama.cpp number available (llama.cpp doesn't run BF16 on GGUF). BF16 uses 2× more bandwidth than Q8_0, so the decode speed is proportionally lower.
 
 ---
 
