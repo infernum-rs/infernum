@@ -388,8 +388,8 @@ where
 
     // -- Graph inputs --
     let input_ids = graph.add_input(&[seq_len], DType::U32);
-    let cos_input = graph.add_input(&[seq_len, head_dim / 2], DType::F32);
-    let sin_input = graph.add_input(&[seq_len, head_dim / 2], DType::F32);
+    let cos_input = graph.add_input(&[seq_len, head_dim / 2], DType::BF16);
+    let sin_input = graph.add_input(&[seq_len, head_dim / 2], DType::BF16);
 
     // -- Embedding --
     let mut h = graph.add_embedding_gather(model_weights.embed_tokens, input_ids);
@@ -544,8 +544,8 @@ where
 
     // -- Graph inputs --
     let input_id = graph.add_input(&[1], DType::U32);
-    let cos_input = graph.add_input(&[1, head_dim / 2], DType::F32);
-    let sin_input = graph.add_input(&[1, head_dim / 2], DType::F32);
+    let cos_input = graph.add_input(&[1, head_dim / 2], DType::BF16);
+    let sin_input = graph.add_input(&[1, head_dim / 2], DType::BF16);
 
     // KV cache inputs: per-layer k and v (num_kv_heads_local when sharded)
     let num_layers = config.num_hidden_layers;
@@ -726,8 +726,8 @@ where
 
     // -- Graph inputs --
     let input_ids = graph.add_input(&[batch_size], DType::U32);
-    let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
-    let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
+    let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::BF16);
+    let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::BF16);
     let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
     let positions = graph.add_input(&[batch_size], DType::U32);
     let seq_lens = graph.add_input(&[batch_size], DType::U32);

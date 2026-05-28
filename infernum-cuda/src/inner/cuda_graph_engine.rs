@@ -33,6 +33,8 @@ use infernum::{
     precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, QUANTIZATION_BLOCK_SIZE,
 };
 
+use half::bf16;
+
 use super::executor::execute;
 use crate::cuda::ops::{cast_to_f32, LinearWeight};
 use crate::cuda::{CudaContext, CudaEvent, CudaGraph, CudaTensor, PinnedBuffer};
@@ -808,9 +810,11 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
 
         let (cos_data, sin_data) =
             precompute_rope_data(seq_len, head_dim, self.config.rope_theta());
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
         let input_ids_t = CudaTensor::from_slice(&self.ctx, &[seq_len], input_ids)?;
-        let cos_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &cos_data)?;
-        let sin_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &sin_data)?;
+        let cos_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &cos_bf16)?;
+        let sin_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &sin_bf16)?;
         let inputs = vec![input_ids_t, cos_t, sin_t];
 
         let output_nodes = graph.output_ids().to_vec();
@@ -884,8 +888,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let device = self.ctx.device();
         // token_ids: re-upload the pre-downloaded host values into the stable GPU buffer.
         device.htod_copy_into(token_ids_host.to_vec(), &mut state.graph_inputs.token_ids)?;
-        device.htod_copy_into(cos_data.to_vec(), &mut state.graph_inputs.cos)?;
-        device.htod_copy_into(sin_data.to_vec(), &mut state.graph_inputs.sin)?;
+        // Convert cos/sin to BF16 before upload — the graph inputs are BF16 so that
+        // `apply_rope` can use them directly without a per-layer F32→BF16 cast kernel.
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        device.htod_copy_into(cos_bf16, &mut state.graph_inputs.cos)?;
+        device.htod_copy_into(sin_bf16, &mut state.graph_inputs.sin)?;
         device.htod_copy_into(
             block_table_u32.to_vec(),
             &mut state.graph_inputs.block_table,
@@ -1070,8 +1078,10 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
-        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_data)?;
-        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_data)?;
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_bf16)?;
+        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_bf16)?;
         let block_table_t = CudaTensor::from_slice(
             &self.ctx,
             &[batch_size, max_blocks_per_seq],
@@ -1204,10 +1214,12 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
 
         for (pos, &token) in input_ids.iter().enumerate() {
             let (cos_row, sin_row) = precompute_rope_row(pos, head_dim, self.config.rope_theta());
+            let cos_bf16: Vec<bf16> = cos_row.iter().map(|&x| bf16::from_f32(x)).collect();
+            let sin_bf16: Vec<bf16> = sin_row.iter().map(|&x| bf16::from_f32(x)).collect();
 
             let input_id_t = CudaTensor::from_slice(&self.ctx, &[1], &[token])?;
-            let cos_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &cos_row)?;
-            let sin_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &sin_row)?;
+            let cos_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &cos_bf16)?;
+            let sin_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &sin_bf16)?;
             let block_table_t =
                 CudaTensor::from_slice(&self.ctx, &[1, max_blocks], &block_ids_u32)?;
             let pos_u32 = u32::try_from(pos).expect("position fits u32");
@@ -1338,8 +1350,10 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
-        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_data)?;
-        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_data)?;
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_bf16)?;
+        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_bf16)?;
         let block_table_t = CudaTensor::from_slice(
             &self.ctx,
             &[batch_size, max_blocks_per_seq],
