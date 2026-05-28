@@ -39,28 +39,35 @@ See [performance.md](../performance.md) for methodology.
 
 ---
 
-## 2026-05-28 — L4 Performance Optimization (up to +209% decode, beats llama.cpp)
+## 2026-05-28 — L4 Final Results (same-format comparison)
 
 - **GPU:** NVIDIA L4 (23034 MiB VRAM)
 - **Driver:** 595.71.05 | CUDA 12.6
 - **Decode tokens:** 256 | **Prefill tokens:** 512 (8-token warm-up prompt)
-- **infernum commit:** `26514de`
-- **llama.cpp commit:** `d8794ee` (Q8_0 GGUF, best of 3 reps from 2026-05-21 baseline)
+- **infernum commit:** `189538d` | **llama.cpp commit:** `d8794ee` (`-ngl 99`, best of 3 reps)
+- **Model:** `bartowski/SmolLM2-360M-Instruct-GGUF` (same GGUF file for both engines)
 
-### Decode throughput (tok/s)
+### Decode throughput (tok/s) — same GGUF file, same GPU
 
-| Model | infernum format | Engine | infernum | llama.cpp format | llama.cpp | ratio |
-| ----- | --------------- | ------ | -------: | ---------------- | --------: | ----: |
-| Llama / SmolLM2-360M | BF16 SafeTensors | cuda-graph-engine | 234.6 | Q8_0 GGUF | 250.0 | **0.94x** |
-| Llama / SmolLM2-360M | Q8_0 GGUF | cuda-graph-engine | 309.6 | Q8_0 GGUF | 250.0 | **1.24x** |
-| Llama / Llama-3.2-1B | BF16 SafeTensors | cuda-graph-engine | 115.2 | Q8_0 GGUF | 97.2 | **1.18x** |
-| Qwen / Qwen3-0.6B | BF16 SafeTensors | cuda-graph-engine | 156.7 | Q8_0 GGUF | 171.0 | **0.92x** |
+| Format | infernum | llama.cpp | ratio |
+| ------ | -------: | --------: | ----: |
+| Q8_0 GGUF | 309.7 | 355.7 | 0.87x |
+| Q4_0 GGUF | 351.5 | 450.0 | 0.78x |
+
+### BF16 SafeTensors decode (different format — no fair llama.cpp comparison)
+
+| Model | infernum | llama.cpp Q8_0 | note |
+| ----- | -------: | --------: | ---- |
+| SmolLM2-360M BF16 | 234.6 | 355.7 | BF16 uses 2× more bandwidth than Q8_0 |
+| Llama-3.2-1B BF16 | 115.2 | 355.7¹ | different model — no fair comparison |
+
+¹ llama.cpp number is SmolLM2-360M Q8_0; Llama-3.2-1B llama.cpp number is 97.2 tok/s Q8_0 (from 2026-05-21 baseline).
 
 ### Notes
 
-- **SmolLM2-360M BF16 decode reaches 234.6 tok/s = 0.94× llama.cpp Q8_0** — within 6% despite using 2× more bandwidth (BF16 vs Q8_0).
-- **Key optimizations in this release** (same as below, plus):
-  - QKV fused single GEMV: Q+K+V weights concatenated at load time (`"CONCAT:"` convention in `CudaWeightLoader`), single cuBLAS call with `SliceViewOp` splits. Saves 2 kernel launches per layer × 32 layers ≈ 500 µs/step. (+5.4% decode)
+- **Q8_0 at 0.87× and Q4_0 at 0.78×**: llama.cpp's quantised GEMV kernels are highly optimised. Our kernels use standard cuBLAS for dense weights and custom dp4a kernels for quantised — both have room to improve. The gap is approximately explained by cuBLAS kernel launch overhead and lower bandwidth utilisation on the quantised path.
+- **The old 250 tok/s Q8_0 baseline (2026-05-21) was stale**: re-measuring on the same machine with the same commit gives 355.7 tok/s, not 250. The earlier number may have been measured on a different GGUF file or under different machine conditions.
+- **Q4_0 GGUF was previously crashing** (`UnsupportedDtype: Unsupported GGML tensor type: 3`). Fixed in commit `189538d` by adding Q4_1 dequantisation support (many Q4_0 GGUF files store some tensors in Q4_1 format).
 
 ---
 
