@@ -73,7 +73,7 @@ pub struct LlamaConfig {
 
     /// Enable QKV fusion in the paged-decode graph (single concatenated GEMV).
     ///
-    /// Set to `true` only when loading Dense BF16 weights from SafeTensors;
+    /// Set to `true` only when loading Dense BF16 weights from `SafeTensors`;
     /// GGUF / FP8 / GPTQ / AWQ models leave this `false` and use separate GEMVs.
     #[serde(skip)]
     pub use_qkv_fusion: bool,

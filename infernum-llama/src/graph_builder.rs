@@ -109,7 +109,7 @@ impl LayerWeightIds {
 
     /// Pre-concatenated Q+K+V weight for fused single-GEMV decode.
     ///
-    /// Returns `None` for MoE layers or quantized (FP8/GPTQ/AWQ) models.
+    /// Returns `None` for `MoE` layers or quantized (FP8/GPTQ/AWQ) models.
     #[must_use]
     pub fn qkv_proj(&self) -> Option<WeightId> {
         match self {
@@ -388,7 +388,7 @@ fn register_weights<B: Backend + MatmulOps + ContextBackend>(
 ///
 /// Build the Llama prefill graph.
 ///
-/// When `output_kv` is `true`, the graph also registers K (after RoPE) and V
+/// When `output_kv` is `true`, the graph also registers K (after `RoPE`) and V
 /// for every layer as additional outputs, in order:
 /// `[logits, k_0, v_0, k_1, v_1, ..., k_{n-1}, v_{n-1}]`.
 ///
@@ -746,7 +746,7 @@ where
 /// # Panics
 ///
 #[must_use]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn build_paged_decode_graph<B>(
     config: &LlamaConfig,
     batch_size: usize,
