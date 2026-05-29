@@ -133,6 +133,51 @@ impl MatmulOps for CudaBackend {
         ops::linear(input, weight)
     }
 
+    fn linear_pair(
+        input: &CudaTensor,
+        w1: &LinearWeight,
+        w2: &LinearWeight,
+    ) -> Result<(CudaTensor, CudaTensor)> {
+        use infernum::dtype::DType;
+        // Deduplicate input quantisation for Q8_0 and Q4_0 weight pairs.
+        // Both formats use Q8_1 activation quantisation; quantising once and
+        // sharing the result across both GEMVs saves one quantise_bf16_to_q8_1
+        // kernel launch per pair per layer.
+        let can_fuse = |d: DType| matches!(d, DType::Q8_0 | DType::Q4_0);
+        match (w1, w2) {
+            (LinearWeight::Quantized(q1), LinearWeight::Quantized(q2))
+                if can_fuse(q1.dtype()) && q1.dtype() == q2.dtype() =>
+            {
+                ops::quantized_linear_pair(input, q1, q2, input.dtype())
+            }
+            _ => Ok((ops::linear(input, w1)?, ops::linear(input, w2)?)),
+        }
+    }
+
+    fn linear_triple(
+        input: &CudaTensor,
+        w1: &LinearWeight,
+        w2: &LinearWeight,
+        w3: &LinearWeight,
+    ) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+        use infernum::dtype::DType;
+        let can_fuse = |d: DType| matches!(d, DType::Q8_0 | DType::Q4_0);
+        match (w1, w2, w3) {
+            (
+                LinearWeight::Quantized(q1),
+                LinearWeight::Quantized(q2),
+                LinearWeight::Quantized(q3),
+            ) if can_fuse(q1.dtype()) && q1.dtype() == q2.dtype() && q1.dtype() == q3.dtype() => {
+                ops::quantized_linear_triple(input, q1, q2, q3, input.dtype())
+            }
+            _ => {
+                let a = ops::linear(input, w1)?;
+                let (b, c) = Self::linear_pair(input, w2, w3)?;
+                Ok((a, b, c))
+            }
+        }
+    }
+
     fn as_dense_weight(weight: &LinearWeight) -> Option<&CudaTensor> {
         match weight {
             LinearWeight::Dense(t) => Some(t),

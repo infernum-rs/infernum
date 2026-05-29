@@ -19,9 +19,16 @@ use infernum::Result;
 /// CUDA-backed logits: a 2D tensor of shape `(batch_size, vocab_size)`.
 ///
 /// - `argmax` runs the GPU reduction kernel, transferring only 4 bytes.
+///   In the CUDA-graph stabilized decode fast path the argmax is precomputed
+///   during the event-sync window and `argmax` returns it without GPU work.
 /// - `sample_top_p` copies one vocab-row to CPU and does sort/cumsum there.
 pub struct CudaLogits {
     tensor: CudaTensor,
+    /// Pre-computed argmax token for the CUDA-graph stabilized decode path.
+    ///
+    /// When `Some`, `argmax(0)` returns this value directly without launching
+    /// a GPU reduction kernel.  `None` uses the standard GPU-reduction path.
+    precomputed_argmax: Option<u32>,
 }
 
 impl CudaLogits {
@@ -36,7 +43,34 @@ impl CudaLogits {
             "CudaLogits expects 2D tensor, got shape {:?}",
             tensor.shape()
         );
-        Self { tensor }
+        Self {
+            tensor,
+            precomputed_argmax: None,
+        }
+    }
+
+    /// Wrap logits with a pre-computed argmax result.
+    ///
+    /// Used by the CUDA-graph stabilized decode fast path: the argmax is
+    /// obtained from `pinned_token` (async `DToH` inside the event-sync window)
+    /// without an extra GPU kernel + synchronous `DToH` on the critical path.
+    ///
+    /// `argmax(0)` returns the precomputed value; `sample_top_p` and all
+    /// other methods use the underlying `tensor` normally.
+    ///
+    /// # Panics
+    /// Panics if `tensor` is not 2D.
+    #[must_use]
+    pub fn new_with_precomputed_argmax(tensor: CudaTensor, token: u32) -> Self {
+        assert!(
+            tensor.shape().len() == 2,
+            "CudaLogits expects 2D tensor, got shape {:?}",
+            tensor.shape()
+        );
+        Self {
+            tensor,
+            precomputed_argmax: Some(token),
+        }
     }
 
     /// Access the underlying `CudaTensor`.
@@ -56,6 +90,13 @@ impl Logits for CudaLogits {
     }
 
     fn argmax(&self, batch_index: usize) -> Result<u32> {
+        if let Some(token) = self.precomputed_argmax {
+            assert_eq!(
+                batch_index, 0,
+                "precomputed argmax only available for batch_index=0"
+            );
+            return Ok(token);
+        }
         let vocab = self.vocab_size();
         let seq_logits = self.tensor.slice_view(batch_index * vocab, &[1, vocab]);
         argmax_last_scalar(&seq_logits)

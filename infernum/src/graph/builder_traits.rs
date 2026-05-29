@@ -740,6 +740,20 @@ pub trait GraphTensorOps {
 
     /// 2D transpose. `(M, N)` → `(N, M)`.
     fn add_transpose_2d(&mut self, input: OutputRef) -> OutputRef;
+
+    /// Zero-copy sub-slice view of a flat tensor region.
+    ///
+    /// `elem_offset` is the element index into the source tensor's flat storage.
+    /// `shape` is the desired output shape (its product must equal the slice length).
+    ///
+    /// Used to split a fused QKV output `[1, n_q+n_k+n_v]` into three
+    /// separate views without any memory copies.
+    fn add_slice_view(
+        &mut self,
+        input: OutputRef,
+        elem_offset: usize,
+        shape: &[usize],
+    ) -> OutputRef;
 }
 
 impl<B: Backend + MatmulOps + TensorOps + ContextBackend> GraphTensorOps for Graph<B> {
@@ -784,6 +798,23 @@ impl<B: Backend + MatmulOps + TensorOps + ContextBackend> GraphTensorOps for Gra
 
     fn add_transpose_2d(&mut self, input: OutputRef) -> OutputRef {
         let node_id = self.add_node(Box::new(Transpose2dOp), &[input]);
+        (node_id, 0)
+    }
+
+    fn add_slice_view(
+        &mut self,
+        input: OutputRef,
+        elem_offset: usize,
+        shape: &[usize],
+    ) -> OutputRef {
+        use super::builtin_ops::SliceViewOp;
+        let node_id = self.add_node(
+            Box::new(SliceViewOp {
+                offset: elem_offset,
+                shape: shape.to_vec(),
+            }),
+            &[input],
+        );
         (node_id, 0)
     }
 }

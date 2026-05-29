@@ -133,15 +133,11 @@ impl DType {
     /// because no on-device kernel exists for them yet.
     #[must_use]
     pub const fn has_gpu_quant_kernel(self) -> bool {
+        // Q4_1 is intentionally excluded: we have no GPU gemv_q4_1 kernel.
+        // Q4_1 tensors are dequantised to BF16 at load time instead.
         matches!(
             self,
-            Self::Q8_0
-                | Self::Q4_0
-                | Self::Q4_1
-                | Self::Q6_K
-                | Self::Q4_K
-                | Self::Q5_K
-                | Self::F8E4M3
+            Self::Q8_0 | Self::Q4_0 | Self::Q6_K | Self::Q4_K | Self::Q5_K | Self::F8E4M3
         )
     }
 

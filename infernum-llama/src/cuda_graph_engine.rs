@@ -65,9 +65,29 @@ impl CudaGraphEngineConfig for LlamaConfig {
         seq_len: usize,
         shard: Option<&ShardConfig>,
     ) -> Graph<infernum_cuda::CudaBackend> {
-        let (graph, _) =
-            build_prefill_graph::<infernum_cuda::CudaBackend>(self, seq_len, DType::BF16, shard);
+        let (graph, _) = build_prefill_graph::<infernum_cuda::CudaBackend>(
+            self,
+            seq_len,
+            DType::BF16,
+            shard,
+            false,
+        );
         graph
+    }
+
+    fn build_prefill_graph_with_kv_cuda(
+        &self,
+        seq_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Option<Graph<infernum_cuda::CudaBackend>> {
+        let (graph, _) = build_prefill_graph::<infernum_cuda::CudaBackend>(
+            self,
+            seq_len,
+            DType::BF16,
+            shard,
+            true,
+        );
+        Some(graph)
     }
 
     fn build_decode_graph_cuda(
@@ -176,14 +196,20 @@ pub trait LlamaCudaGraphEngineExt: Sized {
 
 impl LlamaCudaGraphEngineExt for LlamaCudaGraphEngine {
     fn from_pretrained(ctx: CudaContext, model_dir: &Path) -> Result<Self> {
-        let config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        let mut config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        // Enable QKV fusion for Dense BF16 SafeTensors models (not FP8/GPTQ/AWQ).
+        config.use_qkv_fusion = config.quantization_config.is_none();
         infernum_cuda::CudaGraphEngine::from_config_and_dir(config, ctx, model_dir)
     }
 
     fn from_gguf(ctx: CudaContext, gguf_path: &Path) -> Result<Self> {
         let loader =
             infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
-        let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+        let mut config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
+        // Enable QKV fusion for GGUF — the GGUF weight loader handles the "CONCAT:" prefix
+        // natively for Q4_0 and Q8_0 (raw block concatenation, no dequantisation),
+        // and falls back to BF16 for other formats.
+        config.use_qkv_fusion = config.quantization_config.is_none();
         infernum_cuda::CudaGraphEngine::from_config_gguf(config, ctx, gguf_path)
     }
 }

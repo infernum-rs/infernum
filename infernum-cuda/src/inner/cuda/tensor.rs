@@ -466,35 +466,55 @@ impl CudaTensor {
         let is_partial = my_bytes < backing_bytes;
 
         if is_shared || has_offset || is_partial {
+            let alloc_size = my_bytes.max(1);
             let slice: &CudaSlice<u8> = &self.data;
             let view = slice.slice(self.offset_bytes..self.offset_bytes + my_bytes);
-            let mut new_data = unsafe { self.ctx.device().alloc::<u8>(my_bytes) }
-                .expect("GPU allocation failed during copy-on-write");
-            self.ctx
-                .device()
-                .dtod_copy(&view, &mut new_data)
-                .expect("dtod_copy failed during copy-on-write");
-            self.data = Arc::new(PoolableBuffer::unpooled(new_data));
+
+            // Allocate through the buffer pool when available so that CoW
+            // allocations during CUDA graph capture are pool-managed and
+            // participate in virtual-address aliasing on replay.
+            let buffer = if let Some(pool) = self.ctx.buffer_pool() {
+                // SAFETY: acquired slice has alloc_size bytes; contents are
+                // overwritten by dtod_copy before any read.
+                let mut new_data = unsafe { pool.acquire::<u8>(alloc_size, alloc_size) }
+                    .unwrap_or_else(|| {
+                        unsafe { self.ctx.device().alloc::<u8>(alloc_size) }
+                            .expect("GPU allocation failed during copy-on-write")
+                    });
+                self.ctx
+                    .device()
+                    .dtod_copy(&view, &mut new_data)
+                    .expect("dtod_copy failed during copy-on-write");
+                PoolableBuffer::pooled(new_data, pool.clone(), alloc_size)
+            } else {
+                let mut new_data = unsafe { self.ctx.device().alloc::<u8>(alloc_size) }
+                    .expect("GPU allocation failed during copy-on-write");
+                self.ctx
+                    .device()
+                    .dtod_copy(&view, &mut new_data)
+                    .expect("dtod_copy failed during copy-on-write");
+                PoolableBuffer::unpooled(new_data)
+            };
+            self.data = Arc::new(buffer);
             self.offset_bytes = 0;
         }
     }
 }
 
 impl Clone for CudaTensor {
+    /// Shallow clone: shares the underlying GPU allocation via `Arc`.
+    ///
+    /// Zero-copy — the clone and original point to the same device memory.
+    /// Mutable access (`cuda_slice_mut`, `device_ptr_mut`) uses copy-on-write
+    /// via `ensure_exclusive_ownership`, which D→D copies into a fresh private
+    /// allocation only when the buffer is actually written to.
+    ///
+    /// This avoids deep-copying weight tensors and executor intermediate
+    /// tensors on every decode step (the embedding table alone is ~94 MB).
     fn clone(&self) -> Self {
-        // Clone creates a new allocation with copied data (real GPU copy)
-        let my_bytes = self.size_in_bytes();
-        let slice: &CudaSlice<u8> = &self.data;
-        let view = slice.slice(self.offset_bytes..self.offset_bytes + my_bytes);
-        let mut new_data = unsafe { self.ctx.device().alloc::<u8>(my_bytes) }
-            .expect("GPU allocation failed during clone");
-        self.ctx
-            .device()
-            .dtod_copy(&view, &mut new_data)
-            .expect("dtod_copy failed during clone");
         Self {
-            data: Arc::new(PoolableBuffer::unpooled(new_data)),
-            offset_bytes: 0,
+            data: Arc::clone(&self.data),
+            offset_bytes: self.offset_bytes,
             shape: self.shape.clone(),
             dtype: self.dtype,
             ctx: self.ctx.clone(),

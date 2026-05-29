@@ -179,3 +179,43 @@ extern "C" __global__ void quantize_activations_q8(
 
     q_scales[block_idx] = scale;
 }
+
+// ---------------------------------------------------------------------------
+// Activation quantization: bf16 → Q8 (symmetric per-block quantization)
+// ---------------------------------------------------------------------------
+#include <cuda_bf16.h>
+extern "C" __global__ void quantize_activations_q8_bf16(
+    signed char*  __restrict__ q_data,
+    float*        __restrict__ q_scales,
+    const __nv_bfloat16* __restrict__ input,
+    const int M,
+    const int K
+) {
+    const int blocks_per_row = K / 32;
+    const int total_blocks = M * blocks_per_row;
+    const int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_idx >= total_blocks) return;
+
+    const int m = block_idx / blocks_per_row;
+    const int b = block_idx % blocks_per_row;
+    const int base = m * K + b * 32;
+
+    float amax = 0.0f;
+    float vals[32];
+    for (int i = 0; i < 32; ++i) {
+        vals[i] = __bfloat162float(input[base + i]);
+        float a = fabsf(vals[i]);
+        if (a > amax) amax = a;
+    }
+
+    float scale = amax / 127.0f;
+    float inv_scale = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+
+    for (int i = 0; i < 32; ++i) {
+        int q = (int)roundf(vals[i] * inv_scale);
+        q = max(-128, min(127, q));
+        q_data[base + i] = (signed char)q;
+    }
+
+    q_scales[block_idx] = scale;
+}

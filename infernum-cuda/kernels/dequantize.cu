@@ -1,12 +1,15 @@
-// Dequantize kernels: expand quantized weights to f16 for cuBLAS GEMM
+// Dequantize kernels: expand quantized weights to f16/bf16 for cuBLAS GEMM
 //
 // Used for prefill (M > 1) where cuBLAS with tensor cores is much faster
 // than the custom tiled matmul kernels. The M=1 decode path still uses
 // the dedicated GEMV kernels.
 //
-// Each kernel writes to a __half output buffer of shape (N, K) in row-major order.
+// f16 variants: __half output, used when input activations are f16.
+// bf16 variants: __nv_bfloat16 output, used when input activations are bf16
+//   (avoids bf16→f16 cast for activations and f32→bf16 cast for output).
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 // ---------------------------------------------------------------------------
 // Q8_0 → f16
@@ -313,4 +316,49 @@ extern "C" __global__ void dequant_gptq_f16(
 
     float w = (float)(q - qzero) * __half2float(scale);
     output[idx] = __float2half(w);
+}
+
+// ---------------------------------------------------------------------------
+// Q8_0 → bf16
+// ---------------------------------------------------------------------------
+extern "C" __global__ void dequant_q8_bf16(
+    __nv_bfloat16*       __restrict__ output,
+    const signed char*   __restrict__ data,
+    const unsigned short* __restrict__ scales,  // f16 stored as u16
+    const int N,
+    const int K
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * K) return;
+    const int n = idx / K;
+    const int k = idx % K;
+    const int blocks_per_row = K / 32;
+    __half scale = *reinterpret_cast<const __half*>(&scales[n * blocks_per_row + k / 32]);
+    float w = (float)data[idx] * __half2float(scale);
+    output[idx] = __float2bfloat16(w);
+}
+
+// ---------------------------------------------------------------------------
+// Q4_0 → bf16
+// ---------------------------------------------------------------------------
+extern "C" __global__ void dequant_q4_bf16(
+    __nv_bfloat16*       __restrict__ output,
+    const unsigned char* __restrict__ data,
+    const unsigned short* __restrict__ scales,
+    const int N,
+    const int K
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * K) return;
+    const int n = idx / K;
+    const int k = idx % K;
+    const int block_idx = k / 32;
+    const int blocks_per_row = K / 32;
+    __half scale = *reinterpret_cast<const __half*>(&scales[n * blocks_per_row + block_idx]);
+    int k_in_block = k % 32;
+    int byte_offset = n * (K / 2) + block_idx * 16 + (k_in_block % 16);
+    unsigned char packed = data[byte_offset];
+    int q = (k_in_block < 16) ? ((packed & 0xF) - 8) : (((packed >> 4) & 0xF) - 8);
+    float w = (float)q * __half2float(scale);
+    output[idx] = __float2bfloat16(w);
 }
