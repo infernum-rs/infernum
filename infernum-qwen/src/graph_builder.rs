@@ -966,8 +966,8 @@ where
 
     // -- Graph inputs --
     let input_ids = graph.add_input(&[batch_size], DType::U32);
-    let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
-    let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::F32);
+    let cos_input = graph.add_input(&[batch_size, head_dim / 2], DType::BF16);
+    let sin_input = graph.add_input(&[batch_size, head_dim / 2], DType::BF16);
     let block_tables = graph.add_input(&[batch_size, max_blocks_per_seq], DType::U32);
     let positions = graph.add_input(&[batch_size], DType::U32);
     let seq_lens = graph.add_input(&[batch_size], DType::U32);

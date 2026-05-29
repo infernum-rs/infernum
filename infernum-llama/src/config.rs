@@ -71,6 +71,13 @@ pub struct LlamaConfig {
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
 
+    /// Enable QKV fusion in the paged-decode graph (single concatenated GEMV).
+    ///
+    /// Set to `true` only when loading Dense BF16 weights from `SafeTensors`;
+    /// GGUF / FP8 / GPTQ / AWQ models leave this `false` and use separate GEMVs.
+    #[serde(skip)]
+    pub use_qkv_fusion: bool,
+
     /// Number of experts per `MoE` layer (e.g. 8 for Mixtral). `None` = dense model.
     #[serde(default)]
     pub num_local_experts: Option<usize>,
@@ -225,6 +232,7 @@ impl LlamaConfig {
                 .and_then(GgufValue::as_usize)
                 .unwrap_or(2) as u32,
             quantization_config: None,
+            use_qkv_fusion: false, // GGUF models don't use QKV fusion
             num_local_experts: metadata
                 .get("llama.expert_count")
                 .and_then(GgufValue::as_usize),

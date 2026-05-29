@@ -148,6 +148,26 @@ impl CpuTensor {
         }
     }
 
+    /// Create a zero-copy tensor view into an `Arc<Vec<u8>>` at a byte offset.
+    ///
+    /// Used by the graph executor's `ctx_read` to return a view into the arena
+    /// buffer without copying data. The caller is responsible for dropping this
+    /// tensor before any mutable arena operation (`Arc::get_mut` must succeed).
+    #[must_use]
+    pub fn from_arc_at(
+        shape: &[usize],
+        dtype: DType,
+        data: Arc<Vec<u8>>,
+        byte_offset: usize,
+    ) -> Self {
+        Self {
+            data,
+            offset: byte_offset,
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
     /// Create a zero-filled f32 tensor.
     #[must_use]
     pub fn zeros_f32(shape: &[usize]) -> Self {
@@ -213,6 +233,16 @@ impl CpuTensor {
         bytemuck::cast_slice(&self.data[start..end])
     }
 
+    /// Return the raw pointer to the Arc's backing Vec<u8> (without cloning).
+    ///
+    /// Used by `ctx_write` to detect whether this tensor is a zero-copy view
+    /// into the arena, so it can handle the write without requiring exclusive
+    /// Arc ownership at the point of the read.
+    #[must_use]
+    pub fn backing_arc_ptr(&self) -> *const Vec<u8> {
+        std::sync::Arc::as_ptr(&self.data)
+    }
+
     /// Get the raw bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -267,12 +297,26 @@ pub struct CpuQuantizedWeight {
     pub shape: Vec<usize>,
     /// Quantization format (`Q8_0`, `Q4_0`, or `Q4_1`)
     pub dtype: DType,
-    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1)
+    /// Raw quantized data — int8 bytes (Q8_0) or packed nibbles (Q4_0/Q4_1).
+    ///
+    /// When `interleaved == true` the layout is a unified block per 4-row group:
+    /// - Q8_0: 136 bytes/block = `[128 bytes quants (4×32)][8 bytes f16 scales (4×u16 LE)]`
+    ///   - Quant for row r, block b: `data[g*nb*136 + b*136 + r*32 .. +32]`
+    ///   - Scale for row r, block b: `data[g*nb*136 + b*136 + 128 + r*2 .. +2]` (LE f16)
+    /// - Q4_0: 72 bytes/block = `[64 bytes quants (4×16)][8 bytes f16 scales (4×u16 LE)]`
+    ///   - Quant for row r, block b: `data[g*nb*72 + b*72 + r*16 .. +16]`
+    ///   - Scale for row r, block b: `data[g*nb*72 + b*72 + 64 + r*2 .. +2]` (LE f16)
     pub data: Vec<u8>,
     /// Per-block scales decoded to f32 (one per block)
     pub scales: Vec<f32>,
     /// Per-block minimums decoded to f32 (one per block, Q4_1 only)
     pub mins: Option<Vec<f32>>,
+    /// Whether `data` is in 4-row-interleaved (IL) unified-block format.
+    ///
+    /// When true, quants and f16 scales for each 4-row group's block are stored
+    /// contiguously in `data` (see doc above). This matches llama.cpp's `block_q8_0x4`
+    /// layout and eliminates a second memory stream vs the old split-Vec approach.
+    pub interleaved: bool,
 }
 
 /// Decode a buffer of f16 values stored as raw little-endian bytes into f32.

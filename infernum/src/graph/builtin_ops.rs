@@ -130,10 +130,15 @@ impl<B: ContextBackend + EmbedOps> OpNode<B> for EmbeddingGatherOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let token_ids = B::ctx_read(ctx, inputs[0]);
-        let table_w = ctx.weights.tensor_weight(self.table).clone();
-        let seq_len = token_ids.shape()[0];
-        let result = <B as EmbedOps>::embedding_gather_tensor(&table_w, &token_ids, seq_len)?;
+        let result = {
+            let token_ids = B::ctx_read(ctx, inputs[0]);
+            let seq_len = token_ids.shape()[0];
+            <B as EmbedOps>::embedding_gather_tensor(
+                ctx.weights.tensor_weight(self.table),
+                &token_ids,
+                seq_len,
+            )?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -180,9 +185,10 @@ impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let weight = ctx.weights.tensor_weight(self.weight).clone();
-        let result = <B as NormOps>::rms_norm(&input, &weight, self.eps)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            <B as NormOps>::rms_norm(&input, ctx.weights.tensor_weight(self.weight), self.eps)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -229,10 +235,16 @@ impl<B: ContextBackend + NormOps> OpNode<B> for AddRmsNormOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let residual = B::ctx_read(ctx, inputs[0]);
-        let delta = B::ctx_read(ctx, inputs[1]);
-        let weight = ctx.weights.tensor_weight(self.weight).clone();
-        let (updated, normed) = <B as NormOps>::add_rmsnorm(&residual, &delta, &weight, self.eps)?;
+        let (updated, normed) = {
+            let residual = B::ctx_read(ctx, inputs[0]);
+            let delta = B::ctx_read(ctx, inputs[1]);
+            <B as NormOps>::add_rmsnorm(
+                &residual,
+                &delta,
+                ctx.weights.tensor_weight(self.weight),
+                self.eps,
+            )?
+        };
         B::ctx_write(ctx, node_id, 0, updated);
         B::ctx_write(ctx, node_id, 1, normed);
         Ok(())
@@ -282,9 +294,11 @@ impl<B: ContextBackend> OpNode<B> for LinearOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let weight = ctx.weights.linear_weight(self.weight);
-        let result = <B as MatmulOps>::linear(&input, weight)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let weight = ctx.weights.linear_weight(self.weight);
+            <B as MatmulOps>::linear(&input, weight)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -339,10 +353,12 @@ impl<B: ContextBackend> OpNode<B> for LinearPairOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let lw1 = ctx.weights.linear_weight(self.w1);
-        let lw2 = ctx.weights.linear_weight(self.w2);
-        let (out1, out2) = <B as MatmulOps>::linear_pair(&input, lw1, lw2)?;
+        let (out1, out2) = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let lw1 = ctx.weights.linear_weight(self.w1);
+            let lw2 = ctx.weights.linear_weight(self.w2);
+            <B as MatmulOps>::linear_pair(&input, lw1, lw2)?
+        };
         B::ctx_write(ctx, node_id, 0, out1);
         B::ctx_write(ctx, node_id, 1, out2);
         Ok(())
@@ -405,11 +421,13 @@ impl<B: ContextBackend> OpNode<B> for LinearTripleOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let lw1 = ctx.weights.linear_weight(self.w1);
-        let lw2 = ctx.weights.linear_weight(self.w2);
-        let lw3 = ctx.weights.linear_weight(self.w3);
-        let (out1, out2, out3) = <B as MatmulOps>::linear_triple(&input, lw1, lw2, lw3)?;
+        let (out1, out2, out3) = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let lw1 = ctx.weights.linear_weight(self.w1);
+            let lw2 = ctx.weights.linear_weight(self.w2);
+            let lw3 = ctx.weights.linear_weight(self.w3);
+            <B as MatmulOps>::linear_triple(&input, lw1, lw2, lw3)?
+        };
         B::ctx_write(ctx, node_id, 0, out1);
         B::ctx_write(ctx, node_id, 1, out2);
         B::ctx_write(ctx, node_id, 2, out3);
@@ -452,9 +470,11 @@ impl<B: ContextBackend> OpNode<B> for MatmulOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let a = B::ctx_read(ctx, inputs[0]);
-        let b = B::ctx_read(ctx, inputs[1]);
-        let result = <B as MatmulOps>::matmul(&a, &b)?;
+        let result = {
+            let a = B::ctx_read(ctx, inputs[0]);
+            let b = B::ctx_read(ctx, inputs[1]);
+            <B as MatmulOps>::matmul(&a, &b)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -496,9 +516,11 @@ impl<B: ContextBackend + MatmulExtOps> OpNode<B> for MatmulBf16F32Op {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let a = B::ctx_read(ctx, inputs[0]);
-        let b = B::ctx_read(ctx, inputs[1]);
-        let result = <B as MatmulExtOps>::matmul_bf16_f32(&a, &b)?;
+        let result = {
+            let a = B::ctx_read(ctx, inputs[0]);
+            let b = B::ctx_read(ctx, inputs[1]);
+            <B as MatmulExtOps>::matmul_bf16_f32(&a, &b)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -539,9 +561,11 @@ impl<B: ContextBackend + SwigluOps> OpNode<B> for SwigluOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let gate = B::ctx_read(ctx, inputs[0]);
-        let up = B::ctx_read(ctx, inputs[1]);
-        let result = <B as SwigluOps>::swiglu(&gate, &up)?;
+        let result = {
+            let gate = B::ctx_read(ctx, inputs[0]);
+            let up = B::ctx_read(ctx, inputs[1]);
+            <B as SwigluOps>::swiglu(&gate, &up)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -582,9 +606,11 @@ impl<B: ContextBackend + GegluOps> OpNode<B> for GegluOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let gate = B::ctx_read(ctx, inputs[0]);
-        let up = B::ctx_read(ctx, inputs[1]);
-        let result = <B as GegluOps>::geglu(&gate, &up)?;
+        let result = {
+            let gate = B::ctx_read(ctx, inputs[0]);
+            let up = B::ctx_read(ctx, inputs[1]);
+            <B as GegluOps>::geglu(&gate, &up)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -626,8 +652,10 @@ impl<B: ContextBackend> OpNode<B> for SiluOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = <B as ArithOps>::silu(&input)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            <B as ArithOps>::silu(&input)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -666,9 +694,11 @@ impl<B: ContextBackend + ArithOps> OpNode<B> for AddOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let a = B::ctx_read(ctx, inputs[0]);
-        let b = B::ctx_read(ctx, inputs[1]);
-        let result = <B as ArithOps>::add(&a, &b)?;
+        let result = {
+            let a = B::ctx_read(ctx, inputs[0]);
+            let b = B::ctx_read(ctx, inputs[1]);
+            <B as ArithOps>::add(&a, &b)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -711,9 +741,11 @@ impl<B: ContextBackend + ArithOps> OpNode<B> for AddInplaceOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let a = B::ctx_read(ctx, inputs[0]);
-        let b = B::ctx_read(ctx, inputs[1]);
-        let result = <B as ArithOps>::add(&a, &b)?;
+        let result = {
+            let a = B::ctx_read(ctx, inputs[0]);
+            let b = B::ctx_read(ctx, inputs[1]);
+            <B as ArithOps>::add(&a, &b)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -752,9 +784,11 @@ impl<B: ContextBackend + ArithOps> OpNode<B> for MulOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let a = B::ctx_read(ctx, inputs[0]);
-        let b = B::ctx_read(ctx, inputs[1]);
-        let result = <B as ArithOps>::mul(&a, &b)?;
+        let result = {
+            let a = B::ctx_read(ctx, inputs[0]);
+            let b = B::ctx_read(ctx, inputs[1]);
+            <B as ArithOps>::mul(&a, &b)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -903,10 +937,12 @@ impl<B: ContextBackend + RopeOps> OpNode<B> for RopeOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let cos = B::ctx_read(ctx, inputs[1]);
-        let sin = B::ctx_read(ctx, inputs[2]);
-        let result = <B as RopeOps>::apply_rope(&input, &cos, &sin, self.offset)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let cos = B::ctx_read(ctx, inputs[1]);
+            let sin = B::ctx_read(ctx, inputs[2]);
+            <B as RopeOps>::apply_rope(&input, &cos, &sin, self.offset)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -951,12 +987,13 @@ impl<B: ContextBackend + RopeOps> OpNode<B> for RopeBatchedOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let cos = B::ctx_read(ctx, inputs[1]);
-        let sin = B::ctx_read(ctx, inputs[2]);
-        let positions = B::ctx_read(ctx, inputs[3]);
-        let result =
-            <B as RopeOps>::apply_rope_batched(&input, &cos, &sin, &positions, self.batch_size)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let cos = B::ctx_read(ctx, inputs[1]);
+            let sin = B::ctx_read(ctx, inputs[2]);
+            let positions = B::ctx_read(ctx, inputs[3]);
+            <B as RopeOps>::apply_rope_batched(&input, &cos, &sin, &positions, self.batch_size)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1012,18 +1049,20 @@ impl<B: ContextBackend + RopeOps> OpNode<B> for FusedRopePairOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input_a = B::ctx_read(ctx, inputs[0]);
-        let input_b = B::ctx_read(ctx, inputs[1]);
-        let cos = B::ctx_read(ctx, inputs[2]);
-        let sin = B::ctx_read(ctx, inputs[3]);
-        let (out_a, out_b) = <B as RopeOps>::apply_rope_pair(
-            &input_a,
-            &input_b,
-            &cos,
-            &sin,
-            self.offset_a,
-            self.offset_b,
-        )?;
+        let (out_a, out_b) = {
+            let input_a = B::ctx_read(ctx, inputs[0]);
+            let input_b = B::ctx_read(ctx, inputs[1]);
+            let cos = B::ctx_read(ctx, inputs[2]);
+            let sin = B::ctx_read(ctx, inputs[3]);
+            <B as RopeOps>::apply_rope_pair(
+                &input_a,
+                &input_b,
+                &cos,
+                &sin,
+                self.offset_a,
+                self.offset_b,
+            )?
+        };
         B::ctx_write(ctx, node_id, 0, out_a);
         B::ctx_write(ctx, node_id, 1, out_b);
         Ok(())
@@ -1069,11 +1108,12 @@ impl<B: ContextBackend + RopeInterleavedOps> OpNode<B> for RopeInterleavedOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let cos = B::ctx_read(ctx, inputs[1]);
-        let sin = B::ctx_read(ctx, inputs[2]);
-        let result =
-            <B as RopeInterleavedOps>::apply_rope_interleaved(&input, &cos, &sin, self.offset)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let cos = B::ctx_read(ctx, inputs[1]);
+            let sin = B::ctx_read(ctx, inputs[2]);
+            <B as RopeInterleavedOps>::apply_rope_interleaved(&input, &cos, &sin, self.offset)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1124,18 +1164,20 @@ impl<B: ContextBackend + AttentionOps> OpNode<B> for FusedAttentionPrefillOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let q = B::ctx_read(ctx, inputs[0]);
-        let k = B::ctx_read(ctx, inputs[1]);
-        let v = B::ctx_read(ctx, inputs[2]);
-        let result = <B as AttentionOps>::fused_attention_prefill(
-            &q,
-            &k,
-            &v,
-            self.offset,
-            self.scale,
-            self.softcap,
-            self.sliding_window,
-        )?;
+        let result = {
+            let q = B::ctx_read(ctx, inputs[0]);
+            let k = B::ctx_read(ctx, inputs[1]);
+            let v = B::ctx_read(ctx, inputs[2]);
+            <B as AttentionOps>::fused_attention_prefill(
+                &q,
+                &k,
+                &v,
+                self.offset,
+                self.scale,
+                self.softcap,
+                self.sliding_window,
+            )?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1180,11 +1222,12 @@ impl<B: ContextBackend + AttentionOps> OpNode<B> for FusedAttentionDecodeOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let q = B::ctx_read(ctx, inputs[0]);
-        let k = B::ctx_read(ctx, inputs[1]);
-        let v = B::ctx_read(ctx, inputs[2]);
-        let result =
-            <B as AttentionOps>::fused_attention_decode(&q, &k, &v, None, self.softcap, None)?;
+        let result = {
+            let q = B::ctx_read(ctx, inputs[0]);
+            let k = B::ctx_read(ctx, inputs[1]);
+            let v = B::ctx_read(ctx, inputs[2]);
+            <B as AttentionOps>::fused_attention_decode(&q, &k, &v, None, self.softcap, None)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1247,28 +1290,29 @@ impl<B: ContextBackend> OpNode<B> for PagedAttentionDecodeOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let q = B::ctx_read(ctx, inputs[0]);
-        let block_tables = B::ctx_read(ctx, inputs[1]);
-        let seq_lens = B::ctx_read(ctx, inputs[2]);
-        let max_blocks_per_seq = block_tables.shape()[1];
-        // max_seq_len is passed as 0 — the KvCacheAccess impl computes the
-        // real value from the seq_lens tensor, which requires backend-specific
-        // host data access (e.g. CudaTensor::to_vec).
-        let attn_out = ctx
-            .kv_cache
-            .as_mut()
-            .expect("paged_attention_decode requires a paged KV cache")
-            .paged_attention_decode(
-                self.layer_idx,
-                &q,
-                &block_tables,
-                &seq_lens,
-                self.block_size,
-                max_blocks_per_seq,
-                0, // sentinel: backend impl computes from seq_lens
-                self.softcap,
-                self.sliding_window,
-            )?;
+        let attn_out = {
+            let q = B::ctx_read(ctx, inputs[0]);
+            let block_tables = B::ctx_read(ctx, inputs[1]);
+            let seq_lens = B::ctx_read(ctx, inputs[2]);
+            let max_blocks_per_seq = block_tables.shape()[1];
+            // max_seq_len is passed as 0 — the KvCacheAccess impl computes the
+            // real value from the seq_lens tensor, which requires backend-specific
+            // host data access (e.g. CudaTensor::to_vec).
+            ctx.kv_cache
+                .as_mut()
+                .expect("paged_attention_decode requires a paged KV cache")
+                .paged_attention_decode(
+                    self.layer_idx,
+                    &q,
+                    &block_tables,
+                    &seq_lens,
+                    self.block_size,
+                    max_blocks_per_seq,
+                    0, // sentinel: backend impl computes from seq_lens
+                    self.softcap,
+                    self.sliding_window,
+                )?
+        };
         B::ctx_write(ctx, node_id, 0, attn_out);
         Ok(())
     }
@@ -1371,27 +1415,28 @@ impl<B: ContextBackend> OpNode<B> for AppendPagedBatchedOp {
         inputs: &[OutputRef],
     ) -> Result<()> {
         let k = B::ctx_read(ctx, inputs[0]);
-        let v = B::ctx_read(ctx, inputs[1]);
-        let block_tables = B::ctx_read(ctx, inputs[2]);
-        let positions = B::ctx_read(ctx, inputs[3]);
-        let batch_size = k.shape()[0];
-        let max_blocks_per_seq = block_tables.shape()[1];
-        ctx.kv_cache
-            .as_mut()
-            .expect("append_paged_batched requires a paged KV cache")
-            .append_paged_batched(
-                self.layer_idx,
-                &k,
-                &v,
-                &block_tables,
-                &positions,
-                batch_size,
-                max_blocks_per_seq,
-            )?;
-        // Side-effect op: write a dummy tensor to keep the buffer slot non-None.
-        // The executor allocates a slot for every node output via `.max(1)`, and
-        // the subsequent `paged_attention_decode` node takes a scheduling edge
-        // on `(node_id, 0)` — the slot must be filled, but the value is ignored.
+        {
+            let v = B::ctx_read(ctx, inputs[1]);
+            let block_tables = B::ctx_read(ctx, inputs[2]);
+            let positions = B::ctx_read(ctx, inputs[3]);
+            let batch_size = k.shape()[0];
+            let max_blocks_per_seq = block_tables.shape()[1];
+            ctx.kv_cache
+                .as_mut()
+                .expect("append_paged_batched requires a paged KV cache")
+                .append_paged_batched(
+                    self.layer_idx,
+                    &k,
+                    &v,
+                    &block_tables,
+                    &positions,
+                    batch_size,
+                    max_blocks_per_seq,
+                )?;
+        }
+        // Side-effect op: write k to the slot so the scheduling edge consumer
+        // has a valid buffer reference. v, block_tables, and positions are
+        // dropped above; the arena-view detection in ctx_write handles k.
         B::ctx_write(ctx, node_id, 0, k);
         Ok(())
     }
@@ -1492,8 +1537,10 @@ impl<B: ContextBackend> OpNode<B> for ReshapeOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = input.reshape(&self.shape);
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            input.reshape(&self.shape)
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1540,8 +1587,10 @@ impl<B: ContextBackend> OpNode<B> for SliceViewOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = input.slice_view(self.offset, &self.shape);
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            input.slice_view(self.offset, &self.shape)
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1582,8 +1631,10 @@ impl<B: ContextBackend + TensorOps> OpNode<B> for Transpose2dOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = <B as TensorOps>::transpose_2d(&input)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            <B as TensorOps>::transpose_2d(&input)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1634,10 +1685,12 @@ impl<B: ContextBackend + TensorOps> OpNode<B> for SplitInnerDimOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let total = *input.shape().last().unwrap();
-        let right_size = total - self.left_size;
-        let (left, right) = <B as TensorOps>::split_inner_dim(&input, self.left_size, right_size)?;
+        let (left, right) = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let total = *input.shape().last().unwrap();
+            let right_size = total - self.left_size;
+            <B as TensorOps>::split_inner_dim(&input, self.left_size, right_size)?
+        };
         B::ctx_write(ctx, node_id, 0, left);
         B::ctx_write(ctx, node_id, 1, right);
         Ok(())
@@ -1682,9 +1735,11 @@ impl<B: ContextBackend + TensorOps> OpNode<B> for ConcatInnerDimOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let a = B::ctx_read(ctx, inputs[0]);
-        let b = B::ctx_read(ctx, inputs[1]);
-        let result = <B as TensorOps>::concat_inner_dim(&a, &b)?;
+        let result = {
+            let a = B::ctx_read(ctx, inputs[0]);
+            let b = B::ctx_read(ctx, inputs[1]);
+            <B as TensorOps>::concat_inner_dim(&a, &b)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1798,8 +1853,10 @@ impl<B: ContextBackend + TensorOps> OpNode<B> for RepeatKvOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = <B as TensorOps>::repeat_kv(&input, self.num_repeats)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            <B as TensorOps>::repeat_kv(&input, self.num_repeats)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1844,11 +1901,13 @@ impl<B: ContextBackend> OpNode<B> for ExtractLastRowOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let cols = input.shape()[1];
-        let offset = (self.seq_len - 1) * cols;
-        let out_shape = vec![1, cols];
-        let result = input.slice_view(offset, &out_shape);
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let cols = input.shape()[1];
+            let offset = (self.seq_len - 1) * cols;
+            let out_shape = vec![1, cols];
+            input.slice_view(offset, &out_shape)
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1887,8 +1946,10 @@ impl<B: ContextBackend + CastOps> OpNode<B> for CastToF32Op {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = <B as CastOps>::cast_to_f32(&input)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            <B as CastOps>::cast_to_f32(&input)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1930,8 +1991,10 @@ impl<B: ContextBackend + CastOps> OpNode<B> for CastFromF32Op {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = <B as CastOps>::cast_from_f32(&input, self.target)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            <B as CastOps>::cast_from_f32(&input, self.target)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -1983,30 +2046,32 @@ impl<B: ContextBackend> OpNode<B> for MoeDispatchSoftmaxOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let hidden = B::ctx_read(ctx, inputs[0]);
-        let gate = ctx.weights.tensor_weight(self.gate);
-        let num_experts = self.experts.len();
-        let expert_ids = &self.experts;
-        // Extract weights reference before closure to avoid borrowing ctx mutably
-        // while the closure holds an immutable borrow. `&WeightStore` is Copy.
-        let weights = ctx.weights;
-        let result = <B as MoeOps>::moe_forward_softmax(
-            &hidden,
-            gate,
-            num_experts,
-            self.num_experts_per_tok,
-            self.norm_topk,
-            |expert_idx, expert_input| {
-                let eids = &expert_ids[expert_idx];
-                let gate_w = weights.linear_weight(eids.gate_proj);
-                let up_w = weights.linear_weight(eids.up_proj);
-                let down_w = weights.linear_weight(eids.down_proj);
-                let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
-                let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
-                let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
-                <B as MatmulOps>::linear(&activated, down_w)
-            },
-        )?;
+        let result = {
+            let hidden = B::ctx_read(ctx, inputs[0]);
+            let gate = ctx.weights.tensor_weight(self.gate);
+            let num_experts = self.experts.len();
+            let expert_ids = &self.experts;
+            // Extract weights reference before closure to avoid borrowing ctx mutably
+            // while the closure holds an immutable borrow. `&WeightStore` is Copy.
+            let weights = ctx.weights;
+            <B as MoeOps>::moe_forward_softmax(
+                &hidden,
+                gate,
+                num_experts,
+                self.num_experts_per_tok,
+                self.norm_topk,
+                |expert_idx, expert_input| {
+                    let eids = &expert_ids[expert_idx];
+                    let gate_w = weights.linear_weight(eids.gate_proj);
+                    let up_w = weights.linear_weight(eids.up_proj);
+                    let down_w = weights.linear_weight(eids.down_proj);
+                    let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
+                    let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
+                    let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                    <B as MatmulOps>::linear(&activated, down_w)
+                },
+            )?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -2067,51 +2132,54 @@ impl<B: ContextBackend> OpNode<B> for MoeDispatchSigmoidOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let hidden = B::ctx_read(ctx, inputs[0]);
-        let gate = ctx.weights.tensor_weight(self.gate);
-        let bias_data: Vec<f32> = if let Some(bias_id) = self.bias {
-            B::to_f32_vec(ctx.weights.tensor_weight(bias_id))?
-        } else {
-            vec![0.0_f32; self.experts.len()]
+        let result = {
+            let hidden = B::ctx_read(ctx, inputs[0]);
+            let gate = ctx.weights.tensor_weight(self.gate);
+            let bias_data: Vec<f32> = if let Some(bias_id) = self.bias {
+                B::to_f32_vec(ctx.weights.tensor_weight(bias_id))?
+            } else {
+                vec![0.0_f32; self.experts.len()]
+            };
+            let num_experts = self.experts.len();
+            let expert_ids = &self.experts;
+            let shared_ids = self.shared_expert.clone();
+            // Extract weights reference before closure to avoid borrowing ctx mutably
+            // while the closure holds an immutable borrow. `&WeightStore` is Copy.
+            let weights = ctx.weights;
+            let mut result = <B as MoeSigmoidOps>::moe_forward_sigmoid(
+                &hidden,
+                gate,
+                &bias_data,
+                num_experts,
+                self.num_experts_per_tok,
+                self.n_group,
+                self.topk_group,
+                false, // DeepSeek normalises inside the kernel
+                self.routed_scaling_factor,
+                |expert_idx, expert_input| {
+                    let eids = &expert_ids[expert_idx];
+                    let gate_w = weights.linear_weight(eids.gate_proj);
+                    let up_w = weights.linear_weight(eids.up_proj);
+                    let down_w = weights.linear_weight(eids.down_proj);
+                    let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
+                    let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
+                    let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
+                    <B as MatmulOps>::linear(&activated, down_w)
+                },
+            )?;
+            // Add shared expert output if present (DeepSeek shared expert).
+            if let Some(sids) = shared_ids {
+                let sg = weights.linear_weight(sids.gate_proj);
+                let su = weights.linear_weight(sids.up_proj);
+                let sd = weights.linear_weight(sids.down_proj);
+                let sgate = <B as MatmulOps>::linear(&hidden, sg)?;
+                let sup_out = <B as MatmulOps>::linear(&hidden, su)?;
+                let sact = <B as SwigluOps>::swiglu(&sgate, &sup_out)?;
+                let shared_out = <B as MatmulOps>::linear(&sact, sd)?;
+                <B as ArithOps>::add_inplace(&mut result, &shared_out)?;
+            }
+            result
         };
-        let num_experts = self.experts.len();
-        let expert_ids = &self.experts;
-        let shared_ids = self.shared_expert.clone();
-        // Extract weights reference before closure to avoid borrowing ctx mutably
-        // while the closure holds an immutable borrow. `&WeightStore` is Copy.
-        let weights = ctx.weights;
-        let mut result = <B as MoeSigmoidOps>::moe_forward_sigmoid(
-            &hidden,
-            gate,
-            &bias_data,
-            num_experts,
-            self.num_experts_per_tok,
-            self.n_group,
-            self.topk_group,
-            false, // DeepSeek normalises inside the kernel
-            self.routed_scaling_factor,
-            |expert_idx, expert_input| {
-                let eids = &expert_ids[expert_idx];
-                let gate_w = weights.linear_weight(eids.gate_proj);
-                let up_w = weights.linear_weight(eids.up_proj);
-                let down_w = weights.linear_weight(eids.down_proj);
-                let gate_out = <B as MatmulOps>::linear(expert_input, gate_w)?;
-                let up_out = <B as MatmulOps>::linear(expert_input, up_w)?;
-                let activated = <B as SwigluOps>::swiglu(&gate_out, &up_out)?;
-                <B as MatmulOps>::linear(&activated, down_w)
-            },
-        )?;
-        // Add shared expert output if present (DeepSeek shared expert).
-        if let Some(sids) = shared_ids {
-            let sg = weights.linear_weight(sids.gate_proj);
-            let su = weights.linear_weight(sids.up_proj);
-            let sd = weights.linear_weight(sids.down_proj);
-            let sgate = <B as MatmulOps>::linear(&hidden, sg)?;
-            let sup_out = <B as MatmulOps>::linear(&hidden, su)?;
-            let sact = <B as SwigluOps>::swiglu(&sgate, &sup_out)?;
-            let shared_out = <B as MatmulOps>::linear(&sact, sd)?;
-            <B as ArithOps>::add_inplace(&mut result, &shared_out)?;
-        }
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -2209,9 +2277,11 @@ impl<B: ContextBackend> OpNode<B> for LmHeadOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let weight = ctx.weights.linear_weight(self.weight);
-        let result = <B as MatmulOps>::linear(&input, weight)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            let weight = ctx.weights.linear_weight(self.weight);
+            <B as MatmulOps>::linear(&input, weight)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -2258,8 +2328,10 @@ impl<B: ContextBackend> OpNode<B> for ArgmaxLastOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let logits = B::ctx_read(ctx, inputs[0]);
-        let result = B::argmax_last_tensor(&logits)?;
+        let result = {
+            let logits = B::ctx_read(ctx, inputs[0]);
+            B::argmax_last_tensor(&logits)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }
@@ -2317,12 +2389,15 @@ impl<B: ContextBackend + NormOps> OpNode<B> for RmsNormQkOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let q = B::ctx_read(ctx, inputs[0]);
-        let k = B::ctx_read(ctx, inputs[1]);
-        let q_weight = ctx.weights.tensor_weight(self.q_weight).clone();
-        let k_weight = ctx.weights.tensor_weight(self.k_weight).clone();
-        let q_normed = <B as NormOps>::rms_norm(&q, &q_weight, self.eps)?;
-        let k_normed = <B as NormOps>::rms_norm(&k, &k_weight, self.eps)?;
+        let (q_normed, k_normed) = {
+            let q = B::ctx_read(ctx, inputs[0]);
+            let k = B::ctx_read(ctx, inputs[1]);
+            let q_normed =
+                <B as NormOps>::rms_norm(&q, ctx.weights.tensor_weight(self.q_weight), self.eps)?;
+            let k_normed =
+                <B as NormOps>::rms_norm(&k, ctx.weights.tensor_weight(self.k_weight), self.eps)?;
+            (q_normed, k_normed)
+        };
         B::ctx_write(ctx, node_id, 0, q_normed);
         B::ctx_write(ctx, node_id, 1, k_normed);
         Ok(())
@@ -2373,8 +2448,10 @@ impl<B: ContextBackend> OpNode<B> for LogitSoftcapOp {
         node_id: NodeId,
         inputs: &[OutputRef],
     ) -> Result<()> {
-        let input = B::ctx_read(ctx, inputs[0]);
-        let result = <B as ArithOps>::logit_softcap(&input, self.cap)?;
+        let result = {
+            let input = B::ctx_read(ctx, inputs[0]);
+            <B as ArithOps>::logit_softcap(&input, self.cap)?
+        };
         B::ctx_write(ctx, node_id, 0, result);
         Ok(())
     }

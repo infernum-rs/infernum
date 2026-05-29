@@ -1,7 +1,13 @@
-// Flash Attention v2 prefill kernel — tiled (BR=4 query rows per block)
+// Flash Attention v2 prefill kernel — tiled (BR=32 query rows per block)
 //
 // Single-pass online softmax attention for prefill (seq_q > 1).
-// Each thread block processes BR=4 query rows for one attention head.
+// Each thread block processes BR=32 query rows for one attention head.
+//
+// Increasing BR from 4 to 32 reduces the number of blocks by 8× (fewer
+// redundant K/V reads across blocks), cutting total global memory traffic
+// from O(seq²/BR × heads) to O(seq²/(BR) × heads).  For seq=512, 15 heads:
+//   BR=4:  1920 blocks × 128KB = 245MB bandwidth per layer → ~1.5ms
+//   BR=32: 240  blocks × 128MB = 30MB  bandwidth per layer → ~0.19ms
 //
 // Algorithm (Flash Attention v2 / online softmax, tiled over queries):
 //   For BR query positions processed in parallel, iterate over K/V in
@@ -12,7 +18,7 @@
 //     4. Load V tile [BC, head_dim] into shared memory (as f32)
 //     5. Accumulate weighted V into per-thread output registers
 //
-// Thread mapping: 128 threads = 4 warps.
+// Thread mapping: 1024 threads = 32 warps.
 //   qi = tid / BC  (query index 0..BR-1, one warp per query row)
 //   kj = tid % BC  (key index 0..BC-1)
 //

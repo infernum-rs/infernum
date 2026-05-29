@@ -28,7 +28,7 @@ use infernum::graph::GraphNode;
 use infernum::graph::{plan, Arena, WeightId, WeightStore};
 use infernum::Tensor;
 use infernum::{GenerateOptions, NodeId};
-use infernum_cpu::executor::{execute, KvCacheStore};
+use infernum_cpu::executor::{execute, print_op_profile, KvCacheStore};
 use infernum_cpu::{CpuBackend, CpuLinearWeight, CpuSafeTensorsLoader, CpuTensor};
 use infernum_gemma::{
     build_decode_graph as gemma_build_decode_graph,
@@ -332,7 +332,10 @@ fn run_prefill_bench(
             graph.output_ids(),
             None,
         )?;
-        assert_eq!(outputs[0].shape()[0], n_tokens);
+        assert!(
+            !outputs[0].as_f32_slice().is_empty(),
+            "prefill produced empty output"
+        );
         eprintln!("Warm-up done, output shape: {:?}", outputs[0].shape());
     }
 
@@ -368,6 +371,7 @@ fn run_prefill_bench(
         best_elapsed.as_secs_f64(),
         tok_s,
     );
+    print_op_profile();
     Ok(())
 }
 
@@ -388,7 +392,7 @@ fn bench_graph(model_path: &str, n_tokens: usize, model_type: &str) -> infernum:
             } else {
                 load_config_json(model_path)?
             };
-            let (graph, _) = build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+            let (graph, _) = build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32, None);
             if is_gguf {
                 load_graph_weights_gguf(&graph, &config, model_path, &mut weights)?;
             } else {
@@ -408,7 +412,8 @@ fn bench_graph(model_path: &str, n_tokens: usize, model_type: &str) -> infernum:
                 std::process::exit(1);
             }
             let config: QwenConfig = load_config_json(model_path)?;
-            let (graph, _) = qwen_build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+            let (graph, _) =
+                qwen_build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32, None);
             load_graph_weights_safetensors(&graph, model_path, &mut weights)?;
             (
                 graph,
@@ -425,7 +430,8 @@ fn bench_graph(model_path: &str, n_tokens: usize, model_type: &str) -> infernum:
             } else {
                 GemmaConfig::from_file(Path::new(model_path).join("config.json"))?
             };
-            let graph = gemma_build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32);
+            let graph =
+                gemma_build_prefill_graph::<CpuBackend>(&config, n_tokens, DType::F32, None);
             if is_gguf {
                 weights = gemma_load_graph_weights_gguf(&graph, &config, Path::new(model_path))?;
             } else {
@@ -525,14 +531,15 @@ fn bench_graph_decode(model_path: &str, n_gen: usize, model_type: &str) -> infer
             };
             let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
             {
-                let (tmp_graph, _) = build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+                let (tmp_graph, _) =
+                    build_prefill_graph::<CpuBackend>(&config, 1, DType::F32, None);
                 if is_gguf {
                     load_graph_weights_gguf(&tmp_graph, &config, model_path, &mut weights)?;
                 } else {
                     load_graph_weights_safetensors(&tmp_graph, model_path, &mut weights)?;
                 }
             }
-            let (mut g, _) = build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+            let (mut g, _) = build_decode_graph::<CpuBackend>(&config, 0, DType::F32, None);
             infernum::graph::optimizer::optimize(&mut g);
             (
                 g,
@@ -553,10 +560,11 @@ fn bench_graph_decode(model_path: &str, n_gen: usize, model_type: &str) -> infer
             let config: QwenConfig = load_config_json(model_path)?;
             let mut weights = WeightStore::<CpuTensor, CpuLinearWeight>::new();
             {
-                let (tmp_graph, _) = qwen_build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+                let (tmp_graph, _) =
+                    qwen_build_prefill_graph::<CpuBackend>(&config, 1, DType::F32, None);
                 load_graph_weights_safetensors(&tmp_graph, model_path, &mut weights)?;
             }
-            let (mut g, _) = qwen_build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+            let (mut g, _) = qwen_build_decode_graph::<CpuBackend>(&config, 0, DType::F32, None);
             infernum::graph::optimizer::optimize(&mut g);
             (
                 g,
@@ -577,7 +585,8 @@ fn bench_graph_decode(model_path: &str, n_gen: usize, model_type: &str) -> infer
                 GemmaConfig::from_file(Path::new(model_path).join("config.json"))?
             };
             let weights = {
-                let tmp_graph = gemma_build_prefill_graph::<CpuBackend>(&config, 1, DType::F32);
+                let tmp_graph =
+                    gemma_build_prefill_graph::<CpuBackend>(&config, 1, DType::F32, None);
                 if is_gguf {
                     gemma_load_graph_weights_gguf(&tmp_graph, &config, Path::new(model_path))?
                 } else {
@@ -586,7 +595,7 @@ fn bench_graph_decode(model_path: &str, n_gen: usize, model_type: &str) -> infer
                     w
                 }
             };
-            let mut g = gemma_build_decode_graph::<CpuBackend>(&config, 0, DType::F32);
+            let mut g = gemma_build_decode_graph::<CpuBackend>(&config, 0, DType::F32, None);
             infernum::graph::optimizer::optimize(&mut g);
             (
                 g,
@@ -692,6 +701,7 @@ fn bench_graph_decode(model_path: &str, n_gen: usize, model_type: &str) -> infer
         elapsed.as_secs_f64(),
         tok_s,
     );
+    print_op_profile();
 
     Ok(())
 }

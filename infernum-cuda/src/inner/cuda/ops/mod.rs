@@ -50,7 +50,7 @@ pub use mul::{mul, scale_f32_inplace};
 pub use paged_attention::{
     gather_paged_kv, paged_attention_decode, paged_attention_decode_from_tensor,
 };
-pub use quantized_matmul::quantized_matmul;
+pub use quantized_matmul::{quantized_linear_pair, quantized_linear_triple, quantized_matmul};
 pub use repeat_kv::repeat_kv;
 pub use rmsnorm::{rms_norm, rms_norm_inplace};
 pub use rope::{

@@ -121,51 +121,61 @@ pub(crate) unsafe fn apply_rope_pair_slices(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let units_per_thread = total_units.div_ceil(num_threads);
-    let num_tasks = num_threads.min(total_units);
-
     let half_dim_a = a.head_dim / 2;
     let half_dim_b = b.head_dim / 2;
+
+    // Shared loop body used by both paths.
+    let run_unit = |unit: usize| {
+        if unit < total_a {
+            let s = unit / a.num_heads;
+            let h = unit % a.num_heads;
+            let pos = a.offset + s;
+            let cos_row = &cos[pos * half_dim_a..(pos + 1) * half_dim_a];
+            let sin_row = &sin[pos * half_dim_a..(pos + 1) * half_dim_a];
+            let base = (s * a.num_heads + h) * a.head_dim;
+            let inp = a.inp_ptr as *const f32;
+            let out = a.out_ptr as *mut f32;
+            for d in 0..half_dim_a {
+                let x0 = *inp.add(base + d);
+                let x1 = *inp.add(base + half_dim_a + d);
+                *out.add(base + d) = x0 * cos_row[d] - x1 * sin_row[d];
+                *out.add(base + half_dim_a + d) = x1 * cos_row[d] + x0 * sin_row[d];
+            }
+        } else {
+            let local = unit - total_a;
+            let s = local / b.num_heads;
+            let h = local % b.num_heads;
+            let pos = b.offset + s;
+            let cos_row = &cos[pos * half_dim_b..(pos + 1) * half_dim_b];
+            let sin_row = &sin[pos * half_dim_b..(pos + 1) * half_dim_b];
+            let base = (s * b.num_heads + h) * b.head_dim;
+            let inp = b.inp_ptr as *const f32;
+            let out = b.out_ptr as *mut f32;
+            for d in 0..half_dim_b {
+                let x0 = *inp.add(base + d);
+                let x1 = *inp.add(base + half_dim_b + d);
+                *out.add(base + d) = x0 * cos_row[d] - x1 * sin_row[d];
+                *out.add(base + half_dim_b + d) = x1 * cos_row[d] + x0 * sin_row[d];
+            }
+        }
+    };
+
+    // Decode path: fewer total units than threads — run inline to avoid dispatch overhead.
+    if total_units < num_threads {
+        for unit in 0..total_units {
+            run_unit(unit);
+        }
+        return;
+    }
+
+    let units_per_thread = total_units.div_ceil(num_threads);
+    let num_tasks = num_threads.min(total_units);
 
     pool.dispatch(num_tasks, |task_id, _| {
         let unit_start = task_id * units_per_thread;
         let unit_end = (unit_start + units_per_thread).min(total_units);
-
         for unit in unit_start..unit_end {
-            if unit < total_a {
-                // Operand A (e.g., Q)
-                let s = unit / a.num_heads;
-                let h = unit % a.num_heads;
-                let pos = a.offset + s;
-                let cos_row = &cos[pos * half_dim_a..(pos + 1) * half_dim_a];
-                let sin_row = &sin[pos * half_dim_a..(pos + 1) * half_dim_a];
-                let base = (s * a.num_heads + h) * a.head_dim;
-                let inp = a.inp_ptr as *const f32;
-                let out = a.out_ptr as *mut f32;
-                for d in 0..half_dim_a {
-                    let x0 = *inp.add(base + d);
-                    let x1 = *inp.add(base + half_dim_a + d);
-                    *out.add(base + d) = x0 * cos_row[d] - x1 * sin_row[d];
-                    *out.add(base + half_dim_a + d) = x1 * cos_row[d] + x0 * sin_row[d];
-                }
-            } else {
-                // Operand B (e.g., K)
-                let local = unit - total_a;
-                let s = local / b.num_heads;
-                let h = local % b.num_heads;
-                let pos = b.offset + s;
-                let cos_row = &cos[pos * half_dim_b..(pos + 1) * half_dim_b];
-                let sin_row = &sin[pos * half_dim_b..(pos + 1) * half_dim_b];
-                let base = (s * b.num_heads + h) * b.head_dim;
-                let inp = b.inp_ptr as *const f32;
-                let out = b.out_ptr as *mut f32;
-                for d in 0..half_dim_b {
-                    let x0 = *inp.add(base + d);
-                    let x1 = *inp.add(base + half_dim_b + d);
-                    *out.add(base + d) = x0 * cos_row[d] - x1 * sin_row[d];
-                    *out.add(base + half_dim_b + d) = x1 * cos_row[d] + x0 * sin_row[d];
-                }
-            }
+            run_unit(unit);
         }
     });
 }

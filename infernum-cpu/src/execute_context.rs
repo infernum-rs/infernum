@@ -33,7 +33,9 @@ impl ContextBackend for CpuBackend {
                 return tensor.clone();
             }
         }
-        // Fall back to arena.
+        // Fall back to arena — return a zero-copy view (Arc clone + byte offset).
+        // The caller must drop this tensor before calling ctx_write, which
+        // requires Arc::get_mut exclusive access to write the output slot.
         let node = &ctx.nodes[node_id.index() as usize];
         let slot = ctx
             .plan
@@ -41,14 +43,7 @@ impl ContextBackend for CpuBackend {
             .expect("node output has no buffer slot");
         let shape = &node.output_shapes[output_idx as usize];
         let dtype = node.output_dtypes[output_idx as usize];
-        let num_elements: usize = shape.iter().product();
-        if dtype == DType::U32 {
-            let data = ctx.state.u32_slice(slot.offset, num_elements);
-            CpuTensor::from_u32(shape, data)
-        } else {
-            let data = ctx.state.f32_slice(slot.offset, num_elements);
-            CpuTensor::from_f32(shape, data)
-        }
+        CpuTensor::from_arc_at(shape, dtype, ctx.state.data_arc(), slot.offset)
     }
 
     /// Write a tensor into the arena at the plan's buffer slot for the given
@@ -64,10 +59,31 @@ impl ContextBackend for CpuBackend {
     ) {
         use infernum::tensor::Tensor as TensorTrait;
         if let Some(slot) = ctx.plan.slot(node_id, idx) {
+            // Detect whether `tensor` is a zero-copy arena view (from ctx_read →
+            // from_arc_at). If so, we must copy the data to a temp buffer before
+            // dropping the tensor to release the Arc clone, then acquire exclusive
+            // arena access for the write. For non-arena tensors (compute results),
+            // the caller's scope block already dropped all arena views so
+            // Arc::get_mut succeeds directly.
+            let arena_ptr = ctx.state.data_arc_raw_ptr();
+            let is_arena_view = std::ptr::eq(tensor.backing_arc_ptr(), arena_ptr);
+
             if tensor.dtype() == DType::U32 {
-                let src = tensor.as_u32_slice();
-                let dst = ctx.state.u32_slice_mut(slot.offset, src.len());
-                dst.copy_from_slice(src);
+                if is_arena_view {
+                    let tmp: Vec<u32> = tensor.as_u32_slice().to_vec();
+                    drop(tensor);
+                    let dst = ctx.state.u32_slice_mut(slot.offset, tmp.len());
+                    dst.copy_from_slice(&tmp);
+                } else {
+                    let src = tensor.as_u32_slice();
+                    let dst = ctx.state.u32_slice_mut(slot.offset, src.len());
+                    dst.copy_from_slice(src);
+                }
+            } else if is_arena_view {
+                let tmp: Vec<f32> = tensor.as_f32_slice().to_vec();
+                drop(tensor);
+                let dst = ctx.state.f32_slice_mut(slot.offset, tmp.len());
+                dst.copy_from_slice(&tmp);
             } else {
                 let src = tensor.as_f32_slice();
                 let dst = ctx.state.f32_slice_mut(slot.offset, src.len());

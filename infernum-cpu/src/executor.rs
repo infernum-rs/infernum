@@ -11,6 +11,8 @@
 //! `execute()` implementation in `builtin_ops.rs` handles the logic.
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use infernum::graph::execute_context::KvCacheAccess;
 use infernum::graph::{Arena, GraphNode, OutputRef, WeightStore};
@@ -19,16 +21,65 @@ use infernum::{DType, ExecutionPlan, NodeId, Result};
 use crate::tensor::{CpuLinearWeight, CpuTensor};
 use crate::CpuBackend;
 
+// ---------- lightweight per-op profiling (INFERNUM_PROFILE=1) ----------
+
+static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn profile_enabled() -> bool {
+    *PROFILE_ENABLED.get_or_init(|| std::env::var("INFERNUM_PROFILE").as_deref() == Ok("1"))
+}
+
+// Per-thread accumulator: op_type_name → (total_duration, call_count).
+std::thread_local! {
+    static OP_TIMINGS: std::cell::RefCell<HashMap<&'static str, (Duration, u64)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Print accumulated per-op timing breakdown and reset counters.
+/// Call this at the end of a benchmark run when INFERNUM_PROFILE=1.
+pub fn print_op_profile() {
+    if !profile_enabled() {
+        return;
+    }
+    OP_TIMINGS.with(|cell| {
+        let map = cell.borrow();
+        if map.is_empty() {
+            return;
+        }
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by_key(|b| std::cmp::Reverse(b.1 .0));
+        let total: Duration = entries.iter().map(|e| e.1 .0).sum();
+        eprintln!("\n[INFERNUM_PROFILE] per-op timing breakdown:");
+        eprintln!(
+            "{:<40} {:>10} {:>10} {:>8}",
+            "op", "ms_total", "calls", "pct"
+        );
+        eprintln!("{}", "-".repeat(72));
+        for (name, (dur, count)) in &entries {
+            let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
+            eprintln!(
+                "{:<40} {:>10.2} {:>10} {:>7.1}%",
+                name,
+                dur.as_secs_f64() * 1000.0,
+                count,
+                pct
+            );
+        }
+        eprintln!("{}", "-".repeat(72));
+        eprintln!("{:<40} {:>10.2}", "TOTAL", total.as_secs_f64() * 1000.0);
+    });
+}
+
 /// Persistent KV cache storage for decode-mode graph execution.
 ///
 /// Instead of passing KV caches as graph inputs and copying them through
 /// the arena every step, this store holds pre-allocated buffers that grow
 /// via in-place append. This eliminates the O(seq_len) per-step copy cost.
 pub struct KvCacheStore {
-    /// Per-layer K cache: `[current_len, num_kv_heads, head_dim]` stored flat.
-    k_caches: Vec<Vec<f32>>,
-    /// Per-layer V cache: `[current_len, num_kv_heads, head_dim]` stored flat.
-    v_caches: Vec<Vec<f32>>,
+    /// Per-layer K cache: `[current_len, num_kv_heads, head_dim]` as raw bytes (f32 layout).
+    k_caches: Vec<Arc<Vec<u8>>>,
+    /// Per-layer V cache: `[current_len, num_kv_heads, head_dim]` as raw bytes (f32 layout).
+    v_caches: Vec<Arc<Vec<u8>>>,
     /// Number of positions currently stored (same for all layers).
     len: usize,
     /// Number of KV heads (used to construct shapes).
@@ -69,11 +120,15 @@ impl KvCacheStore {
     ) -> Self {
         assert_eq!(cache_input_node_ids.len(), 2 * num_layers);
         assert_eq!(concat_node_ids.len(), 2 * num_layers);
-        let row_size = num_kv_heads * head_dim;
-        let cap = max_seq_len * row_size;
+        let row_bytes = num_kv_heads * head_dim * 4; // bytes per position (f32 × head elements)
+        let cap_bytes = max_seq_len * row_bytes;
         Self {
-            k_caches: (0..num_layers).map(|_| Vec::with_capacity(cap)).collect(),
-            v_caches: (0..num_layers).map(|_| Vec::with_capacity(cap)).collect(),
+            k_caches: (0..num_layers)
+                .map(|_| Arc::new(Vec::with_capacity(cap_bytes)))
+                .collect(),
+            v_caches: (0..num_layers)
+                .map(|_| Arc::new(Vec::with_capacity(cap_bytes)))
+                .collect(),
             len: 0,
             num_kv_heads,
             head_dim,
@@ -92,10 +147,15 @@ impl KvCacheStore {
         } else {
             &mut self.v_caches[layer]
         };
-        cache.extend_from_slice(data);
+        // Arc::make_mut is O(1) when refcount==1 (the usual case after finalize_step clears
+        // overrides). When refcount>1 it falls back to cloning, which should not happen in
+        // normal decode flow.
+        Arc::make_mut(cache).extend_from_slice(bytemuck::cast_slice(data));
     }
 
-    /// Get the full K or V cache for a layer as a `CpuTensor` view.
+    /// Get the full K or V cache for a layer as a zero-copy `CpuTensor` view.
+    ///
+    /// Clones the `Arc` (increments refcount, O(1)) — no data is copied.
     fn get_cache(&self, layer: usize, is_key: bool, len: usize) -> CpuTensor {
         let cache = if is_key {
             &self.k_caches[layer]
@@ -103,7 +163,7 @@ impl KvCacheStore {
             &self.v_caches[layer]
         };
         let shape = [len, self.num_kv_heads, self.head_dim];
-        CpuTensor::from_f32(&shape, &cache[..len * self.num_kv_heads * self.head_dim])
+        CpuTensor::from_arc(&shape, DType::F32, Arc::clone(cache))
     }
 
     /// Check if a node ID is a KV cache input node.
@@ -166,11 +226,11 @@ impl KvCacheAccess<CpuBackend> for KvCacheStore {
     fn try_append_kv(&mut self, node_id: NodeId, new_row: &CpuTensor) -> Option<CpuTensor> {
         let (layer, is_key) = self.cache_concat_info(node_id)?;
         self.append(layer, is_key, new_row.as_f32_slice());
-        let row_elems = self.num_kv_heads * self.head_dim;
+        let row_bytes = self.num_kv_heads * self.head_dim * 4;
         let new_len = if is_key {
-            self.k_caches[layer].len() / row_elems
+            self.k_caches[layer].len() / row_bytes
         } else {
-            self.v_caches[layer].len() / row_elems
+            self.v_caches[layer].len() / row_bytes
         };
         let full_cache = self.get_cache(layer, is_key, new_len);
         self.overrides.insert(node_id, full_cache.clone());
@@ -179,6 +239,9 @@ impl KvCacheAccess<CpuBackend> for KvCacheStore {
 
     fn finalize_step(&mut self) {
         self.len += 1;
+        // Clear overrides so that next step's Arc::make_mut can get exclusive access
+        // (refcount drops to 1) and append in-place without cloning the cache buffer.
+        self.overrides.clear();
     }
 }
 
@@ -237,6 +300,8 @@ pub fn execute(
 ) -> Result<Vec<CpuTensor>> {
     let mut input_idx: usize = 0;
 
+    let profiling = profile_enabled();
+
     for &node_id in &plan.schedule {
         let node = &nodes[node_id.index() as usize];
         let mut ctx = infernum::graph::execute_context::ExecuteContext {
@@ -252,12 +317,28 @@ pub fn execute(
             input_idx: &mut input_idx,
             comm: None,
         };
-        node.op.execute(&mut ctx, node_id, &node.inputs)?;
+
+        if profiling {
+            let op_name = node.op.name();
+            let t0 = Instant::now();
+            node.op.execute(&mut ctx, node_id, &node.inputs)?;
+            let elapsed = t0.elapsed();
+            OP_TIMINGS.with(|cell| {
+                let mut map = cell.borrow_mut();
+                let entry = map.entry(op_name).or_insert((Duration::ZERO, 0));
+                entry.0 += elapsed;
+                entry.1 += 1;
+            });
+        } else {
+            node.op.execute(&mut ctx, node_id, &node.inputs)?;
+        }
     }
 
-    // Update persistent KV cache length after all layers have appended.
+    // Advance the KV cache: increments the sequence-length counter and clears
+    // step-scoped overrides so that Arc::make_mut gets exclusive access on the
+    // next step (refcount drops to 1, enabling O(1) in-place append).
     if let Some(kv) = kv_cache {
-        kv.len += 1;
+        kv.finalize_step();
     }
 
     // Collect output tensors from the arena.
@@ -432,7 +513,7 @@ mod tests {
         let half_dim = head_dim / 2;
 
         let (mut graph, _model_weights) =
-            build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32, None);
+            build_prefill_graph::<CpuBackend>(&config, seq_len, DType::F32, None, false);
         infernum::graph::optimizer::optimize(&mut graph);
         let exec_plan = plan(&graph);
         let mut arena = Arena::new(exec_plan.arena_size);

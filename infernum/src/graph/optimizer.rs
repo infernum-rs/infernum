@@ -629,7 +629,8 @@ mod tests {
         use crate::graph::builder_traits::GraphRopeOps as _;
         let mut graph = Graph::<TestBackend>::new();
 
-        // seq=8, heads=4, head_dim=64
+        // seq=8, heads=4, head_dim=64.
+        // Rope nodes are NOT graph outputs: downstream nodes consume them.
         let q = graph.add_input(&[8, 4, 64], DType::F32);
         let k = graph.add_input(&[8, 4, 64], DType::F32);
         let cos = graph.add_input(&[8, 32], DType::F32);

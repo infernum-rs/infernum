@@ -45,6 +45,7 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q4_1: u32 = 3; // Q4 with additive bias (min value per block)
 const GGML_TYPE_Q5_0: u32 = 6;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
@@ -273,6 +274,28 @@ impl GgufLoader {
                     let scale = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
                     for j in 0..QUANTIZATION_BLOCK_SIZE {
                         out.push(f32::from(raw[bs + 2 + j] as i8) * scale);
+                    }
+                }
+                out
+            }
+            DType::Q4_1 => {
+                // Q4_1: 32 elements per block, 20 bytes.
+                // Layout: d[f16, 2B] | m[f16, 2B] | qs[16B]
+                // v = (nibble) * d + m   (nibble in [0, 15], no bias subtraction)
+                const Q4_1_BLOCK_BYTES: usize = 20;
+                let num_blocks = numel / QUANTIZATION_BLOCK_SIZE;
+                let raw = self.tensor_slice(info, num_blocks * Q4_1_BLOCK_BYTES);
+                let mut out = vec![0.0f32; numel];
+                for block_idx in 0..num_blocks {
+                    let bs = block_idx * Q4_1_BLOCK_BYTES;
+                    let d = half::f16::from_le_bytes([raw[bs], raw[bs + 1]]).to_f32();
+                    let m = half::f16::from_le_bytes([raw[bs + 2], raw[bs + 3]]).to_f32();
+                    let base = block_idx * QUANTIZATION_BLOCK_SIZE;
+                    #[allow(clippy::cast_precision_loss)]
+                    for j in 0..QUANTIZATION_BLOCK_SIZE / 2 {
+                        let byte = raw[bs + 4 + j];
+                        out[base + j] = f32::from(byte & 0x0F) * d + m;
+                        out[base + j + 16] = f32::from(byte >> 4) * d + m;
                     }
                 }
                 out
@@ -1738,6 +1761,7 @@ fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
         GGML_TYPE_BF16 => Ok(DType::BF16),
         GGML_TYPE_Q8_0 => Ok(DType::Q8_0),
         GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
+        GGML_TYPE_Q4_1 => Ok(DType::Q4_1),
         GGML_TYPE_Q5_0 => Ok(DType::Q5_0),
         GGML_TYPE_Q4_K => Ok(DType::Q4_K),
         GGML_TYPE_Q5_K => Ok(DType::Q5_K),

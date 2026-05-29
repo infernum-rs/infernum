@@ -33,8 +33,10 @@ use infernum::{
     precompute_rope_data, precompute_rope_row, DType, ModelConfig, Result, QUANTIZATION_BLOCK_SIZE,
 };
 
+use half::bf16;
+
 use super::executor::execute;
-use crate::cuda::ops::{cast_to_f32, LinearWeight};
+use crate::cuda::ops::{argmax_last_tensor, cast_to_f32, LinearWeight};
 use crate::cuda::{CudaContext, CudaEvent, CudaGraph, CudaTensor, PinnedBuffer};
 use crate::cuda_logits::CudaLogits;
 use crate::inner::execute_context::GraphInputs;
@@ -78,6 +80,24 @@ pub trait CudaGraphEngineConfig: Send + Sync + 'static {
         seq_len: usize,
         shard: Option<&ShardConfig>,
     ) -> Graph<CudaBackend>;
+
+    /// Build a prefill-mode graph that also outputs K and V for every layer.
+    ///
+    /// Returns `None` if batch-GEMM prefill with KV export is not supported
+    /// for this model. In that case, [`CudaGraphEngine`] falls back to
+    /// token-by-token paged-decode prefill.
+    ///
+    /// When `Some`, the returned graph has outputs:
+    /// `[logits, k_0, v_0, k_1, v_1, ..., k_{n-1}, v_{n-1}]`
+    /// where each `k_i`/`v_i` has shape `[seq_len, num_kv_heads_local, head_dim]`.
+    fn build_prefill_graph_with_kv_cuda(
+        &self,
+        seq_len: usize,
+        shard: Option<&ShardConfig>,
+    ) -> Option<Graph<CudaBackend>> {
+        let _ = (seq_len, shard);
+        None
+    }
 
     /// Build a decode-mode graph for a KV cache of the given length.
     fn build_decode_graph_cuda(
@@ -306,6 +326,79 @@ pub fn load_graph_weights_gguf_cuda(
             u32::try_from(i).expect("weight count exceeds u32"),
         ));
         let safetensors_name = &meta.name;
+
+        // CONCAT weights (for QKV fusion): concatenate multiple GGUF tensors.
+        // For Q4_0 and Q8_0, preserve the quantised format by concatenating the raw
+        // per-block data + scales bytes (rows stack independently, K is shared).
+        // For other dtypes, dequantise to BF16 and concatenate.
+        if let Some(names_str) = safetensors_name.strip_prefix("CONCAT:") {
+            let gguf_names: Vec<String> = names_str
+                .split(',')
+                .map(|n| name_mapper(n.trim()))
+                .collect();
+
+            // Detect the on-disk dtype from the first component.
+            let first_dtype = loader.get_dtype(&gguf_names[0])?;
+
+            if matches!(
+                first_dtype,
+                infernum::dtype::DType::Q4_0 | infernum::dtype::DType::Q8_0
+            ) {
+                // Native quantised CONCAT: concatenate block data + scales on host,
+                // then upload as a single QuantizedTensor.  No dequantisation needed.
+                let mut all_data: Vec<u8> = Vec::new();
+                let mut all_scales: Vec<u8> = Vec::new();
+                let mut total_rows = 0usize;
+                let mut cols = 0usize;
+                for gname in &gguf_names {
+                    let qt = loader.load_quantized(ctx, gname)?;
+                    let data = ctx.device().dtoh_sync_copy(&qt.data_slice().slice(..))?;
+                    let scales = ctx.device().dtoh_sync_copy(&qt.scales_slice().slice(..))?;
+                    total_rows += qt.shape()[0];
+                    cols = qt.shape()[1];
+                    all_data.extend_from_slice(&data);
+                    all_scales.extend_from_slice(&scales);
+                }
+                let qt_cat = crate::cuda::QuantizedTensor::from_raw(
+                    ctx,
+                    &[total_rows, cols],
+                    first_dtype,
+                    &all_data,
+                    &all_scales,
+                )?;
+                store.push_linear_weight(LinearWeight::Quantized(qt_cat));
+                continue;
+            }
+
+            // BF16 / other dtypes: dequantise each component, concatenate, upload Dense.
+            let mut total_rows = 0usize;
+            let mut all_bytes: Vec<Vec<u8>> = Vec::new();
+            let mut cols = 0usize;
+            for gname in &gguf_names {
+                let (bytes, shape) = loader.load_bf16_bytes(gname)?;
+                total_rows += shape[0];
+                cols = shape[1];
+                all_bytes.push(bytes);
+            }
+            let elem = 2usize; // BF16
+            let mut cat_bytes = vec![0u8; total_rows * cols * elem];
+            let mut offset = 0;
+            for bytes in &all_bytes {
+                cat_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+                offset += bytes.len();
+            }
+            let tensor = CudaTensor::from_raw_bytes(
+                ctx,
+                &[total_rows, cols],
+                infernum::dtype::DType::BF16,
+                &cat_bytes,
+            )?;
+            store.push_linear_weight(LinearWeight::Dense(crate::cuda::ops::transpose_2d(
+                &tensor,
+            )?));
+            continue;
+        }
+
         let gguf_name = name_mapper(safetensors_name);
 
         // lm_head fallback: GGUF may not have output.weight for tied-embedding models.
@@ -705,7 +798,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     ///
     /// Each rank loads only its slice of the column-parallel and row-parallel
     /// weights. The provided `comm` is used for all-reduce synchronisation
-    /// at the AllReduceSumOp nodes injected by the graph builder.
+    /// at the `AllReduceSumOp` nodes injected by the graph builder.
     ///
     /// # Errors
     ///
@@ -738,7 +831,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     /// Each rank loads only its slice of the column-parallel and row-parallel
     /// weights (sliced at block boundaries in the GGUF loader). Quantized
     /// weights stay quantized on GPU; non-quantized weights are dequantized
-    /// to BF16. The provided `comm` is used for all-reduce at AllReduceSumOp
+    /// to BF16. The provided `comm` is used for all-reduce at `AllReduceSumOp`
     /// nodes injected by the graph builder.
     ///
     /// # Errors
@@ -808,9 +901,11 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
 
         let (cos_data, sin_data) =
             precompute_rope_data(seq_len, head_dim, self.config.rope_theta());
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
         let input_ids_t = CudaTensor::from_slice(&self.ctx, &[seq_len], input_ids)?;
-        let cos_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &cos_data)?;
-        let sin_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &sin_data)?;
+        let cos_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &cos_bf16)?;
+        let sin_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &sin_bf16)?;
         let inputs = vec![input_ids_t, cos_t, sin_t];
 
         let output_nodes = graph.output_ids().to_vec();
@@ -826,6 +921,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             0,
             None,
             self.comm_ref(),
+            0, // no paged KV cache in prefill-graph mode
         )?;
         Ok(outputs)
     }
@@ -844,6 +940,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
     ///
     /// Returns an error if buffer writes, kernel launches, or CUDA API calls
     /// fail.
+    /// Run one decode step via CUDA graph replay (stabilised) or capture (warm-up).
+    ///
+    /// Returns `(logits_tensor, Some(argmax_token))` in the stabilised fast
+    /// path — the argmax is computed via a GPU reduction + async `DToH` inside
+    /// the event-sync window, so the caller can skip a second GPU round-trip.
+    /// Returns `(logits_tensor, None)` during the non-stabilised capture phase.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn run_decode_captured(
         &self,
@@ -855,7 +957,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         cos_data: &[f32],
         sin_data: &[f32],
         max_blocks_per_seq: usize,
-    ) -> Result<CudaTensor> {
+    ) -> Result<(CudaTensor, Option<u32>)> {
         let mut borrow = self.decode_state.borrow_mut();
 
         // (Re-)build DecodeState when absent or when max_blocks changed.
@@ -884,8 +986,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         let device = self.ctx.device();
         // token_ids: re-upload the pre-downloaded host values into the stable GPU buffer.
         device.htod_copy_into(token_ids_host.to_vec(), &mut state.graph_inputs.token_ids)?;
-        device.htod_copy_into(cos_data.to_vec(), &mut state.graph_inputs.cos)?;
-        device.htod_copy_into(sin_data.to_vec(), &mut state.graph_inputs.sin)?;
+        // Convert cos/sin to BF16 before upload — the graph inputs are BF16 so that
+        // `apply_rope` can use them directly without a per-layer F32→BF16 cast kernel.
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        device.htod_copy_into(cos_bf16, &mut state.graph_inputs.cos)?;
+        device.htod_copy_into(sin_bf16, &mut state.graph_inputs.sin)?;
         device.htod_copy_into(
             block_table_u32.to_vec(),
             &mut state.graph_inputs.block_table,
@@ -902,32 +1008,31 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             .unwrap_or(1);
 
         if state.stabilized {
-            // Fast path: graph is stable — replay with a single launch, then
-            // use a targeted event sync instead of a full device sync.
-            let token_device_ptr = state
-                .saved_token
-                .as_ref()
-                .expect("saved_token must be set before stabilization")
-                .device_ptr();
-
+            // Fast path: graph is stable — replay with a single launch, compute
+            // argmax on the logit output, DMA the 4-byte result to the pinned
+            // buffer, then wait only for that event rather than the whole device.
             state.cuda_graph.launch()?;
 
-            // Async copy the argmax result to the pinned buffer, then wait
-            // only for that DMA rather than the whole device.
-            state
-                .pinned_token
-                .async_copy_from_device(token_device_ptr)?;
-            state.completion_event.record()?;
-            state.completion_event.synchronize()?;
-
-            // Return the saved_token tensor (contains the raw logit output for
-            // this step; the argmax is already in the pinned buffer, but
-            // callers expect the logit CudaTensor here).
-            Ok(state
+            // Kick off the argmax kernel right after the graph launch so it
+            // runs as soon as the graph finishes on the GPU stream.
+            // Keep `argmax_out` alive past event.synchronize() — the DMA reads
+            // from its device address and must complete before the buffer drops.
+            let saved = state
                 .saved_token
                 .as_ref()
-                .expect("saved_token must be set")
-                .clone())
+                .expect("saved_token must be set before stabilization");
+            let argmax_out = argmax_last_tensor(saved)?;
+
+            state
+                .pinned_token
+                .async_copy_from_device(argmax_out.device_ptr())?;
+            state.completion_event.record()?;
+            state.completion_event.synchronize()?;
+            // `argmax_out` drops here — after the DMA completes.
+
+            let token = state.pinned_token.read();
+            let logits = saved.clone();
+            Ok((logits, Some(token)))
         } else {
             // Stabilisation path: wrap execute() in begin/end capture so the
             // CUDA buffer-pool allocates the right sizes and the graph exe is
@@ -964,6 +1069,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 0,                 // mla_seq_pos
                 Some(real_inputs), // stable GPU input buffers
                 self.comm_ref(),
+                0, // graph_inputs carries max_seq_len; no eager fallback needed
             )?;
 
             if !state.capture_unsafe {
@@ -1002,7 +1108,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 }
             }
 
-            Ok(token_tensor)
+            Ok((token_tensor, None))
         }
     }
 
@@ -1045,7 +1151,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             .collect();
 
         if batch_size == 1 {
-            let logits_tensor = self.run_decode_captured(
+            let (logits_tensor, precomputed) = self.run_decode_captured(
                 token_ids_host,
                 kv_cache,
                 block_table_u32,
@@ -1056,7 +1162,10 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
                 max_blocks_per_seq,
             )?;
             let logits_f32 = cast_to_f32(&logits_tensor)?;
-            return Ok(CudaLogits::new(logits_f32));
+            return Ok(match precomputed {
+                Some(token) => CudaLogits::new_with_precomputed_argmax(logits_f32, token),
+                None => CudaLogits::new(logits_f32),
+            });
         }
 
         // Batch > 1: create GPU tensors on this rank's own device from host data.
@@ -1070,8 +1179,10 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
-        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_data)?;
-        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_data)?;
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_bf16)?;
+        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_bf16)?;
         let block_table_t = CudaTensor::from_slice(
             &self.ctx,
             &[batch_size, max_blocks_per_seq],
@@ -1089,6 +1200,12 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             seq_lens_t,
         ];
         let output_nodes = graph.output_ids().to_vec();
+        let eager_max = seq_lens_u32
+            .iter()
+            .copied()
+            .map(|s| s as usize)
+            .max()
+            .unwrap_or(0);
         let (outputs, _) = execute(
             &self.ctx,
             &ep,
@@ -1101,6 +1218,7 @@ impl<C: CudaGraphEngineConfig> CudaGraphEngine<C> {
             0,
             None,
             self.comm_ref(),
+            eager_max,
         )?;
 
         let logits_bf16 = outputs.into_iter().next().expect("no outputs");
@@ -1162,9 +1280,15 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
 
     /// Single-sequence prefill with paged KV cache.
     ///
-    /// Iterates through `input_ids` one token at a time using the paged decode
-    /// graph. Each step appends K/V into the paged pool (side-effect) and reads
-    /// it back for attention. Returns the logits for the last token.
+    /// Fast path (when the model supports it): runs a single batch-GEMM forward
+    /// pass over all `input_ids` at once, then scatters the K/V tensors for
+    /// every layer into the paged pool with `append_paged`. This turns
+    /// `seq_len` serial M=1 GEMVs into one `M=seq_len` GEMM, unlocking
+    /// tensor-core throughput and giving 10–50× prefill speedup for large prompts.
+    ///
+    /// Slow path fallback: iterates token-by-token using the paged decode graph.
+    /// Used for models that do not implement `build_prefill_graph_with_kv_cuda`.
+    #[allow(clippy::too_many_lines)]
     fn forward_prefill(
         &self,
         input_ids: &[u32],
@@ -1173,10 +1297,60 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         block_table: &BlockTable,
         _start_pos: usize,
     ) -> Result<<CudaBackend as infernum::backend::Backend>::Logits> {
-        let block_size = kv_cache.block_size();
+        let seq_len = input_ids.len();
         let head_dim = self.config.head_dim();
         let half_dim = self.half_dim;
 
+        // --- Fast path: batch GEMM + KV scatter ---
+        if let Some(mut graph) = self
+            .config
+            .build_prefill_graph_with_kv_cuda(seq_len, self.shard.as_ref())
+        {
+            optimizer::optimize(&mut graph);
+            let ep = plan(&graph);
+
+            let (cos_data, sin_data) =
+                precompute_rope_data(seq_len, head_dim, self.config.rope_theta());
+            let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+            let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
+            let input_ids_t = CudaTensor::from_slice(&self.ctx, &[seq_len], input_ids)?;
+            let cos_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &cos_bf16)?;
+            let sin_t = CudaTensor::from_slice(&self.ctx, &[seq_len, half_dim], &sin_bf16)?;
+            let inputs = vec![input_ids_t, cos_t, sin_t];
+
+            let output_nodes = graph.output_ids().to_vec();
+            let (outputs, _) = execute(
+                &self.ctx,
+                &ep,
+                graph.nodes(),
+                &self.weights,
+                &inputs,
+                &output_nodes,
+                None,
+                None,
+                0,
+                None,
+                self.comm_ref(),
+                0,
+            )?;
+            // outputs[0] = logits (last-token)
+            // outputs[1 + layer*2]     = k  [seq_len, num_kv_heads_local, head_dim]
+            // outputs[1 + layer*2 + 1] = v  [seq_len, num_kv_heads_local, head_dim]
+            let num_layers = self.config.num_hidden_layers();
+            for layer_idx in 0..num_layers {
+                let k = &outputs[1 + layer_idx * 2];
+                let v = &outputs[1 + layer_idx * 2 + 1];
+                kv_cache.append_paged(layer_idx, block_table, k, v, 0)?;
+            }
+
+            self.ctx.synchronize()?;
+
+            let logits_f32 = cast_to_f32(&outputs[0])?;
+            return Ok(CudaLogits::new(logits_f32));
+        }
+
+        // --- Slow path: token-by-token paged decode ---
+        let block_size = kv_cache.block_size();
         let blocks = block_table.blocks();
         let max_blocks = blocks.len();
 
@@ -1186,28 +1360,57 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             .map(|&b| u32::try_from(b).expect("block ID fits u32"))
             .collect();
 
+        // Build the paged decode graph once — the structure is constant across all
+        // prefill tokens (batch_size=1, block_size, max_blocks are all fixed).
+        let mut graph = self.config.build_paged_decode_graph_cuda(
+            1,
+            block_size,
+            max_blocks,
+            self.shard.as_ref(),
+        );
+        optimizer::optimize(&mut graph);
+        let ep = plan(&graph);
+        let output_nodes = graph.output_ids().to_vec();
+
+        // Pre-allocate stable GPU input buffers shared across all prefill tokens.
+        // Each step updates them via async htod_copy_into (stream-ordered) instead
+        // of allocating fresh tensors with htod_sync_copy. This pipelines CPU input
+        // preparation with GPU execution: the CPU never stalls waiting for the GPU
+        // between tokens — the stream serialises HtoD→kernel automatically.
+        let device = self.ctx.device();
+        let mut buf_token = device.alloc_zeros::<u32>(1)?;
+        let mut buf_cos = device.alloc_zeros::<bf16>(half_dim)?;
+        let mut buf_sin = device.alloc_zeros::<bf16>(half_dim)?;
+        let mut buf_block = device.alloc_zeros::<u32>(max_blocks)?;
+        let mut buf_position = device.alloc_zeros::<u32>(1)?;
+        let mut buf_seq = device.alloc_zeros::<u32>(1)?;
+
         let mut last_logits: Option<CudaTensor> = None;
 
         for (pos, &token) in input_ids.iter().enumerate() {
-            let mut graph = self.config.build_paged_decode_graph_cuda(
-                1,
-                block_size,
-                max_blocks,
-                self.shard.as_ref(),
-            );
-            optimizer::optimize(&mut graph);
-            let ep = plan(&graph);
-
             let (cos_row, sin_row) = precompute_rope_row(pos, head_dim, self.config.rope_theta());
-
-            let input_id_t = CudaTensor::from_slice(&self.ctx, &[1], &[token])?;
-            let cos_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &cos_row)?;
-            let sin_t = CudaTensor::from_slice(&self.ctx, &[1, half_dim], &sin_row)?;
-            let block_table_t =
-                CudaTensor::from_slice(&self.ctx, &[1, max_blocks], &block_ids_u32)?;
+            let cos_bf16: Vec<bf16> = cos_row.iter().map(|&x| bf16::from_f32(x)).collect();
+            let sin_bf16: Vec<bf16> = sin_row.iter().map(|&x| bf16::from_f32(x)).collect();
             let pos_u32 = u32::try_from(pos).expect("position fits u32");
-            let positions_t = CudaTensor::from_slice(&self.ctx, &[1], &[pos_u32])?;
-            let seq_len_t = CudaTensor::from_slice(&self.ctx, &[1], &[pos_u32 + 1])?;
+
+            // Async HtoD into stable buffers — stream-ordered, no CPU sync.
+            device.htod_copy_into(vec![token], &mut buf_token)?;
+            device.htod_copy_into(cos_bf16, &mut buf_cos)?;
+            device.htod_copy_into(sin_bf16, &mut buf_sin)?;
+            device.htod_copy_into(block_ids_u32.clone(), &mut buf_block)?;
+            device.htod_copy_into(vec![pos_u32], &mut buf_position)?;
+            device.htod_copy_into(vec![pos_u32 + 1], &mut buf_seq)?;
+
+            // Non-owning views over the stable buffers.  The PoolableBuffer is
+            // marked non_owning so it never frees the underlying slice on drop;
+            // the CudaSlice in buf_* remains the sole owner.
+            let input_id_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_token);
+            let cos_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1, half_dim], &buf_cos);
+            let sin_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1, half_dim], &buf_sin);
+            let block_table_t =
+                CudaTensor::from_cuda_slice_view(&self.ctx, &[1, max_blocks], &buf_block);
+            let positions_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_position);
+            let seq_len_t = CudaTensor::from_cuda_slice_view(&self.ctx, &[1], &buf_seq);
 
             let inputs = vec![
                 input_id_t,
@@ -1217,7 +1420,6 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 positions_t,
                 seq_len_t,
             ];
-            let output_nodes = graph.output_ids().to_vec();
             let (outputs, _) = execute(
                 &self.ctx,
                 &ep,
@@ -1230,9 +1432,13 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 0,
                 None,
                 self.comm_ref(),
+                pos + 1, // seq_len at this prefill step
             )?;
             last_logits = Some(outputs.into_iter().next().expect("no outputs"));
         }
+
+        // Single synchronise after all pipelined steps complete.
+        self.ctx.synchronize()?;
 
         let logits_tensor = last_logits.expect("input_ids must not be empty");
         let logits_f32 = cast_to_f32(&logits_tensor)?;
@@ -1310,7 +1516,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             // Single-sequence fast path: use CUDA graph capture/replay.
             // Download token_ids from our own rank's GPU (no cross-rank stream sync).
             let token_ids_host = token_ids.to_vec::<u32>()?;
-            let logits_tensor = self.run_decode_captured(
+            let (logits_tensor, precomputed) = self.run_decode_captured(
                 &token_ids_host,
                 kv_cache,
                 &block_table_u32,
@@ -1321,7 +1527,10 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
                 max_blocks_per_seq,
             )?;
             let logits_f32 = cast_to_f32(&logits_tensor)?;
-            return Ok(CudaLogits::new(logits_f32));
+            return Ok(match precomputed {
+                Some(token) => CudaLogits::new_with_precomputed_argmax(logits_f32, token),
+                None => CudaLogits::new(logits_f32),
+            });
         }
 
         // Batch size > 1: eager path (builds a fresh graph each call).
@@ -1334,8 +1543,10 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         optimizer::optimize(&mut graph);
         let ep = plan(&graph);
 
-        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_data)?;
-        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_data)?;
+        let cos_bf16: Vec<bf16> = cos_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let sin_bf16: Vec<bf16> = sin_data.iter().map(|&x| bf16::from_f32(x)).collect();
+        let cos_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &cos_bf16)?;
+        let sin_t = CudaTensor::from_slice(&self.ctx, &[batch_size, half_dim], &sin_bf16)?;
         let block_table_t = CudaTensor::from_slice(
             &self.ctx,
             &[batch_size, max_blocks_per_seq],
@@ -1353,6 +1564,12 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             seq_lens_t,
         ];
         let output_nodes = graph.output_ids().to_vec();
+        let eager_max_fbd = seq_lens_u32
+            .iter()
+            .copied()
+            .map(|s| s as usize)
+            .max()
+            .unwrap_or(0);
         let (outputs, _) = execute(
             &self.ctx,
             &ep,
@@ -1365,6 +1582,7 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
             0,
             None,
             self.comm_ref(),
+            eager_max_fbd,
         )?;
 
         let logits_bf16 = outputs.into_iter().next().expect("no outputs");

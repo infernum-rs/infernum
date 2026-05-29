@@ -4,6 +4,42 @@ See [performance.md](../performance.md) for methodology.
 
 ## Current Results
 
+**Node:** 8× NVIDIA A100-SXM4-80GB — NVLink interconnect | Driver 590.48.01 | CUDA 12.6  
+**Run date:** 2026-05-29  
+**infernum commit:** `b429c24` | **llama.cpp commit:** `40d5358` (build 1) — same reference as prior runs
+
+### Multi-GPU decode — large models (greedy argmax, 200 tokens)
+
+infernum uses NCCL tensor-parallel (ShardedGraphEngine for TP>1).  
+llama.cpp single-GPU is the reference baseline.
+
+| Model | Format | infernum TP=2 decode (tok/s) | infernum TP=8 decode (tok/s) | llama.cpp ref decode (tok/s) | ratio (best TP) |
+| ----- | ------ | ---------------------------: | ---------------------------: | ---------------------------: | --------------: |
+| Llama-3.1-70B | Q4_0 GGUF | OOM† | 45.9 | 30.1 (1GPU) | **1.53x** |
+| Qwen3-72B | Q4_K_M GGUF | 21.2 | 38.1 | 23.4 (1GPU) | **1.63x** |
+| Qwen3-235B-A22B | Q4_K_M GGUF | 17.9 | N/A‡ | 19.82 (2GPU) | 0.90x |
+| DeepSeek-V3 | Q4_K_M GGUF | N/A§ | — | 7.07 (8GPU) | — |
+
+†**70B TP=2 OOM:** The BF16 dequant weight cache (introduced in single-GPU work, commit `c9830c0`) allocates a full BF16 copy of each GPU's shard. At TP=2, each rank holds ~70 GB of BF16 weights, which exceeds the 80 GB VRAM budget. At TP=8 (~17.5 GB BF16/rank), it fits.  
+‡235B TP=8 architecturally impossible — model has 4 KV heads total; TP=8 gives 0 KV heads/rank.  
+§DeepSeek-V3 Q4_K_M GGUF (~335 GB) not in cache; omitted this run.
+
+### vs prior measurements (2026-05-23)
+
+| Model | Format | TP | Before | Now | Change |
+| ----- | ------ | -- | -----: | --: | -----: |
+| Llama-3.1-70B | Q4_0 | TP=2 | 10.5 tok/s | OOM | BF16 cache OOM at TP=2 |
+| Llama-3.1-70B | Q4_0 | TP=8 | 3.8 tok/s | 45.9 tok/s | **+12.1x** |
+| Qwen3-72B | Q4_K_M | TP=2 | 7.6 tok/s | 21.2 tok/s | **+2.8x** |
+| Qwen3-72B | Q4_K_M | TP=8 | 3.5 tok/s | 38.1 tok/s | **+10.9x** |
+| Qwen3-235B-A22B | Q4_K_M | TP=2 | 11.6 tok/s | 17.9 tok/s | **+1.5x** |
+
+All improvements flow from single-GPU CUDA work merged to main: BF16 dequant weight cache (cuBLAS GEMM instead of on-the-fly GEMV dequant), gather+attend for decode, and QKV fusion. These apply to the eager TP>1 path equally.
+
+---
+
+## 2026-05-22/23 Results (archived)
+
 **Node:** 8× NVIDIA A100-SXM4-80GB — NVLink interconnect | Driver 590.48.01 | CUDA 13.1  
 **Run date:** 2026-05-22 (small models) / 2026-05-23 (large models) / 2026-05-23 (prefill measurement + Qwen3-72B re-run) — clean sequential runs, all GPUs idle between measurements  
 **infernum commit:** `perf/measurement-doc` branch | **llama.cpp commit:** `40d5358` (build 1)
@@ -51,14 +87,25 @@ llama.cpp single-GPU is the reference baseline; TP>1 provides no benefit for mod
 
 | Item | Status |
 | ---- | ------ |
-| Qwen3-235B-A22B TP=4 re-run | TP=4 tested during 2026-05-23 work: Q6_K Row sharding for k=1536 (6 blocks, not divisible by 4) triggers BF16 CPU fallback for `ffn_down_exps` expert slices — ~12,032 slices × CPU dequant = ~10 min load time. TP=4 is valid (1 KV head/rank ≥ min) but impractical until Row sharding handles misaligned super-blocks natively. |
-| Qwen3-72B Q4_K_M re-run | **Done** — 7.6 tok/s (2026-05-23, Q4_K GPU kernels active). Up from 7.3 tok/s (BF16 dequant). |
-| DeepSeek-V3 Q4_K_M TP=8 | **Done** — 5.0 tok/s (2026-05-23). See History for details. |
-| CUDA graph TP | NCCL AllReduce blocks CUDA graph capture; TP>1 runs eager |
+| Llama-3.1-70B TP=2 OOM | BF16 dequant cache (~70 GB BF16/rank at TP=2) exceeds 80 GB VRAM. Fix: skip the cache for shards > threshold, or keep weights in quantized form for GEMV. TP=8 (17.5 GB/rank) works. |
+| DeepSeek-V3 Q4_K_M TP=8 re-run | Last measured 2026-05-23: 5.0 tok/s. Model not cached (335 GB); not re-run on 2026-05-29. |
+| Qwen3-235B-A22B TP=4 re-run | TP=4 tested during 2026-05-23: Q6_K Row sharding for k=1536 triggers BF16 CPU fallback (~10 min load). Impractical until misaligned super-block sharding is native. |
+| CUDA graph TP | NCCL AllReduce blocks CUDA graph capture; TP>1 runs eager. Hard constraint. |
 
 ---
 
 ## History
+
+## 2026-05-29 — Single-GPU optimizations land on multi-GPU path; 70B/72B now beat llama.cpp 1GPU
+
+- **Re-run:** commit `b429c24` (main), same A100×8 node, same llama.cpp reference (`40d5358`).
+- **Llama-3.1-70B Q4_0 TP=8: 45.9 tok/s** (was 3.8, **+12.1x**). Beats llama.cpp 1GPU (30.1 tok/s) by 1.53x.
+- **Llama-3.1-70B Q4_0 TP=2: OOM.** BF16 dequant cache allocates ~70 GB BF16/rank at TP=2, exceeding 80 GB VRAM. TP=8 (~17.5 GB/rank) fits.
+- **Qwen3-72B Q4_K_M TP=2: 21.2 tok/s** (was 7.6, **+2.8x**). TP=8: **38.1 tok/s** (was 3.5, **+10.9x**). TP=8 now beats llama.cpp 1GPU (23.4 tok/s) by 1.63x.
+- **Qwen3-235B-A22B Q4_K_M TP=2: 17.9 tok/s** (was 11.6, **+1.5x**). 0.90x llama.cpp 2GPU (19.82 tok/s).
+- **DeepSeek-V3:** not re-run (335 GB GGUF not in cache). Last result: 5.0 tok/s TP=8 (2026-05-23).
+- **Why the improvements:** All single-GPU CUDA optimizations from PRs #74–#77 (BF16 dequant weight cache enabling cuBLAS GEMM, gather+attend for decode, QKV fusion) apply directly to the eager TP>1 path. TP>1 was previously bottlenecked by slow on-the-fly GEMV dequant; cuBLAS GEMM on pre-cached BF16 weights removes that bottleneck.
+- **TP=8 > TP=2 for 70B/72B:** Previously NCCL overhead dominated; now compute (GEMV dequant) no longer dominates, so the per-GPU weight reduction at TP=8 helps more. Both 70B and 72B still fit on 1 GPU — TP scaling remains suboptimal vs single-GPU llama.cpp for same-GPU-count comparisons.
 
 ## 2026-05-23 — Prefill measurement added; Qwen3-72B Q4_K_M re-run (7.6 tok/s)
 

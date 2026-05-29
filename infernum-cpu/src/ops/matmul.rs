@@ -12,6 +12,8 @@
 //! `(out_features, in_features)` layout. The quantized linear kernel iterates
 //! per output neuron (row), dequantizing blocks on the fly.
 
+use std::cell::RefCell;
+
 use infernum::backend::{MatmulExtOps, MatmulOps};
 use infernum::dtype::{DType, QUANTIZATION_BLOCK_SIZE};
 use infernum::tensor::Tensor;
@@ -20,6 +22,12 @@ use infernum::Result;
 use crate::simd;
 use crate::tensor::{CpuLinearWeight, CpuQuantizedWeight, CpuTensor};
 use crate::CpuBackend;
+
+thread_local! {
+    // Per-thread scratch buffer for Q4_0 IL → Q8_0 IL expansion during prefill.
+    // Sized to the largest chunk seen; grows but never shrinks.
+    static Q4_EXPAND_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Cast a `*mut T` to `usize` for safe capture in closures.
 ///
@@ -43,7 +51,65 @@ fn transpose(b: &[f32], k: usize, n: usize) -> Vec<f32> {
     bt
 }
 
-/// Standard gemm: `A (M,K) × B (K,N) → C (M,N)`.
+/// Repack Q8_0 weight data + scales into the unified 4-row-interleaved (IL) format.
+///
+/// Each block in the output is 136 bytes: `[128 bytes quants (4×32)][8 bytes f16 scales (4×u16 LE)]`.
+///
+/// - Quant for row r, block b: `il[g*nb*136 + b*136 + r*32 .. +32]`
+/// - Scale for row r, block b: `il[g*nb*136 + b*136 + 128 + r*2 .. +2]` (LE f16 bits)
+///
+/// Rows not a multiple of 4 are padded with zeros.
+fn repack_q8_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize) -> Vec<u8> {
+    let n_groups = n_rows.div_ceil(4);
+    let mut il = vec![0u8; n_groups * nb * 136];
+    for row in 0..n_rows {
+        let g = row / 4;
+        let r = row % 4;
+        for blk in 0..nb {
+            let src = row * nb * 32 + blk * 32;
+            let dst = g * nb * 136 + blk * 136 + r * 32;
+            il[dst..dst + 32].copy_from_slice(&data[src..src + 32]);
+            let scale_dst = g * nb * 136 + blk * 136 + 128 + r * 2;
+            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk])
+                .to_bits()
+                .to_le_bytes();
+            il[scale_dst] = lo;
+            il[scale_dst + 1] = hi;
+        }
+    }
+    il
+}
+
+/// Repack Q4_0 weight data + scales into the unified 4-row-interleaved (IL) format.
+///
+/// Each block in the output is 72 bytes: `[64 bytes quants (4×16)][8 bytes f16 scales (4×u16 LE)]`.
+///
+/// - Quant for row r, block b: `il[g*nb*72 + b*72 + r*16 .. +16]`
+/// - Scale for row r, block b: `il[g*nb*72 + b*72 + 64 + r*2 .. +2]` (LE f16 bits)
+///
+/// Rows not a multiple of 4 are padded with zeros.
+fn repack_q4_to_il_unified(data: &[u8], scales: &[f32], n_rows: usize, nb: usize) -> Vec<u8> {
+    let n_groups = n_rows.div_ceil(4);
+    let mut il = vec![0u8; n_groups * nb * 72];
+    for row in 0..n_rows {
+        let g = row / 4;
+        let r = row % 4;
+        for blk in 0..nb {
+            let src = row * nb * 16 + blk * 16;
+            let dst = g * nb * 72 + blk * 72 + r * 16;
+            il[dst..dst + 16].copy_from_slice(&data[src..src + 16]);
+            let scale_dst = g * nb * 72 + blk * 72 + 64 + r * 2;
+            let [lo, hi] = half::f16::from_f32(scales[row * nb + blk])
+                .to_bits()
+                .to_le_bytes();
+            il[scale_dst] = lo;
+            il[scale_dst + 1] = hi;
+        }
+    }
+    il
+}
+
+/// Standard GEMM: `A (M,K) × B (K,N) → C (M,N)`.
 ///
 /// Transposes B once, then delegates to `gemm_with_bt`.
 #[allow(clippy::many_single_char_names)]
@@ -66,7 +132,7 @@ fn gemm_with_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
         let a_row = &a[..k];
         let pool = crate::thread_pool::global_pool();
         let num_threads = pool.num_threads();
-        let chunk_size = (n / num_threads).max(64).min(n);
+        let chunk_size = n.div_ceil(num_threads).max(64).min(n);
         let c_addr = ptr_to_usize(c.as_mut_ptr());
         let num_tasks = num_threads.min(n.div_ceil(chunk_size));
         pool.dispatch(num_tasks, |task_id, _| {
@@ -133,53 +199,26 @@ fn q8_gemv_parallel(
 ) {
     let n = out.len();
 
-    let gemv_body = |chunk: &mut [f32], neuron_offset: usize| {
-        let chunk_len = chunk.len();
-        let pairs = chunk_len / 2;
-        let remainder = chunk_len % 2;
-
-        for p in 0..pairs {
-            let n0 = neuron_offset + p * 2;
-            let n1 = n0 + 1;
-            let q0 = n0 * quant_bytes_per_row;
-            let q1 = n1 * quant_bytes_per_row;
-            let s0 = n0 * num_blocks_per_row;
-            let s1 = n1 * num_blocks_per_row;
-            let (d0, d1) = simd::dot_q8_q8_2row(
-                inp_quants,
-                inp_scales,
-                &weight_quants[q0..q0 + quant_bytes_per_row],
-                &weight_scales[s0..s0 + num_blocks_per_row],
-                &weight_quants[q1..q1 + quant_bytes_per_row],
-                &weight_scales[s1..s1 + num_blocks_per_row],
-            );
-            chunk[p * 2] = d0;
-            chunk[p * 2 + 1] = d1;
-        }
-
-        if remainder > 0 {
-            let neuron = neuron_offset + pairs * 2;
-            let q_row_start = neuron * quant_bytes_per_row;
-            let s_row_start = neuron * num_blocks_per_row;
-            chunk[pairs * 2] = simd::dot_q8_q8_row(
-                inp_quants,
-                inp_scales,
-                &weight_quants[q_row_start..q_row_start + quant_bytes_per_row],
-                &weight_scales[s_row_start..s_row_start + num_blocks_per_row],
-            );
-        }
-    };
-
     // Only parallelize when there's enough work to amortize dispatch overhead.
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 64;
+    let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
-        gemv_body(out, 0);
+        q8_gemv_body_inline(
+            out,
+            0,
+            n,
+            inp_quants,
+            inp_scales,
+            weight_quants,
+            weight_scales,
+            num_blocks_per_row,
+            quant_bytes_per_row,
+        );
     } else {
-        // Round chunk_size to even for clean pair processing
-        let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
-        let chunk_size = (raw_chunk + 1) & !1; // round up to even
+        // Round up to multiple of 4 so chunks align with the 4-row kernel.
+        let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
+        let chunk_size = (raw_chunk + 3) & !3;
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         // SAFETY: each task writes to a disjoint slice [start..end].
         // dispatch() blocks until all tasks complete, so out_addr is valid.
@@ -192,14 +231,22 @@ fn q8_gemv_parallel(
             let chunk = unsafe {
                 std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
             };
-            gemv_body(chunk, start);
+            q8_gemv_body_inline(
+                chunk,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_quants,
+                weight_scales,
+                num_blocks_per_row,
+                quant_bytes_per_row,
+            );
         });
     }
 }
 
 /// Parallel GEMV for Q4_0 using integer dot product (Q4×Q8).
-///
-/// Processes neurons in pairs using 2-row kernels to halve input memory reads.
 #[allow(clippy::too_many_arguments)]
 fn q4_gemv_parallel(
     out: &mut [f32],
@@ -212,52 +259,25 @@ fn q4_gemv_parallel(
 ) {
     let n = out.len();
 
-    let gemv_body = |chunk: &mut [f32], neuron_offset: usize| {
-        let chunk_len = chunk.len();
-        let pairs = chunk_len / 2;
-        let remainder = chunk_len % 2;
-
-        for p in 0..pairs {
-            let n0 = neuron_offset + p * 2;
-            let n1 = n0 + 1;
-            let p0 = n0 * packed_bytes_per_row;
-            let p1 = n1 * packed_bytes_per_row;
-            let s0 = n0 * num_blocks_per_row;
-            let s1 = n1 * num_blocks_per_row;
-            let (d0, d1) = simd::dot_q4_q8_2row(
-                inp_quants,
-                inp_scales,
-                &weight_packed[p0..p0 + packed_bytes_per_row],
-                &weight_scales[s0..s0 + num_blocks_per_row],
-                &weight_packed[p1..p1 + packed_bytes_per_row],
-                &weight_scales[s1..s1 + num_blocks_per_row],
-            );
-            chunk[p * 2] = d0;
-            chunk[p * 2 + 1] = d1;
-        }
-
-        if remainder > 0 {
-            let neuron = neuron_offset + pairs * 2;
-            let p_row_start = neuron * packed_bytes_per_row;
-            let s_row_start = neuron * num_blocks_per_row;
-            chunk[pairs * 2] = simd::dot_q4_q8_row(
-                inp_quants,
-                inp_scales,
-                &weight_packed[p_row_start..p_row_start + packed_bytes_per_row],
-                &weight_scales[s_row_start..s_row_start + num_blocks_per_row],
-            );
-        }
-    };
-
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 64;
+    let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
-        gemv_body(out, 0);
+        q4_gemv_body_inline(
+            out,
+            0,
+            n,
+            inp_quants,
+            inp_scales,
+            weight_packed,
+            weight_scales,
+            num_blocks_per_row,
+            packed_bytes_per_row,
+        );
     } else {
-        // Round chunk_size to even for clean pair processing
-        let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
-        let chunk_size = (raw_chunk + 1) & !1; // round up to even
+        // Round up to multiple of 4 so chunks align with the 4-row kernel.
+        let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
+        let chunk_size = (raw_chunk + 3) & !3;
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
             let start = task_id * chunk_size;
@@ -268,7 +288,17 @@ fn q4_gemv_parallel(
             let chunk = unsafe {
                 std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
             };
-            gemv_body(chunk, start);
+            q4_gemv_body_inline(
+                chunk,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_packed,
+                weight_scales,
+                num_blocks_per_row,
+                packed_bytes_per_row,
+            );
         });
     }
 }
@@ -306,11 +336,11 @@ fn q4_1_gemv_parallel(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 64;
+    let min_neurons_per_task = 8;
     if n < num_threads * min_neurons_per_task {
         gemv_body(out, 0);
     } else {
-        let chunk_size = (n / num_threads).max(min_neurons_per_task).min(n);
+        let chunk_size = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
         let out_addr = ptr_to_usize(out.as_mut_ptr());
         pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
             let start = task_id * chunk_size;
@@ -367,28 +397,48 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
 
         match weight.dtype {
             DType::Q8_0 => {
-                let bpr = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
-                q8_gemv_parallel(
-                    &mut output,
-                    &inp_quants,
-                    &inp_scales,
-                    &weight.data,
-                    &weight.scales,
-                    num_blocks_per_row,
-                    bpr,
-                );
+                if weight.interleaved {
+                    q8_gemv_parallel_il(
+                        &mut output,
+                        &inp_quants,
+                        &inp_scales,
+                        &weight.data,
+                        num_blocks_per_row,
+                    );
+                } else {
+                    let bpr = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
+                    q8_gemv_parallel(
+                        &mut output,
+                        &inp_quants,
+                        &inp_scales,
+                        &weight.data,
+                        &weight.scales,
+                        num_blocks_per_row,
+                        bpr,
+                    );
+                }
             }
             DType::Q4_0 => {
-                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
-                q4_gemv_parallel(
-                    &mut output,
-                    &inp_quants,
-                    &inp_scales,
-                    &weight.data,
-                    &weight.scales,
-                    num_blocks_per_row,
-                    bpr,
-                );
+                if weight.interleaved {
+                    q4_gemv_parallel_il(
+                        &mut output,
+                        &inp_quants,
+                        &inp_scales,
+                        &weight.data,
+                        num_blocks_per_row,
+                    );
+                } else {
+                    let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+                    q4_gemv_parallel(
+                        &mut output,
+                        &inp_quants,
+                        &inp_scales,
+                        &weight.data,
+                        &weight.scales,
+                        num_blocks_per_row,
+                        bpr,
+                    );
+                }
             }
             DType::Q4_1 => {
                 let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
@@ -422,14 +472,158 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                 let bpr = num_blocks_per_row * QUANTIZATION_BLOCK_SIZE;
                 let pool = crate::thread_pool::global_pool();
                 let num_threads = pool.num_threads();
+                let out_addr = ptr_to_usize(output.as_mut_ptr());
+                let wt_data_addr = weight.data.as_ptr() as usize;
 
-                // Split across N columns: all threads share input rows (hot in L3),
-                // each reads a subset of weight columns (fits in L2).
+                if weight.interleaved {
+                    let cols_per_thread = (n.div_ceil(num_threads) + 3) & !3;
+                    let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
+                    let wt_data_len = weight.data.len();
+                    pool.dispatch(num_tasks, |task_id, _| {
+                        let col_start = task_id * cols_per_thread;
+                        let col_end = (col_start + cols_per_thread).min(n);
+                        if col_start >= n {
+                            return;
+                        }
+                        let chunk_n = col_end - col_start;
+                        let wt_data = unsafe {
+                            std::slice::from_raw_parts(wt_data_addr as *const u8, wt_data_len)
+                        };
+                        let out_global =
+                            unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
+                        simd::gemm_q8_tiled_il(
+                            &mut out_global[col_start..],
+                            &all_quants.quants,
+                            &all_quants.scales,
+                            wt_data,
+                            m,
+                            chunk_n,
+                            n,
+                            num_blocks_per_row,
+                            bpr,
+                            col_start,
+                        );
+                    });
+                } else {
+                    let wt_scales_addr = weight.scales.as_ptr() as usize;
+                    let cols_per_thread = n.div_ceil(num_threads);
+                    let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
+                    pool.dispatch(num_tasks, |task_id, _| {
+                        let col_start = task_id * cols_per_thread;
+                        let col_end = (col_start + cols_per_thread).min(n);
+                        if col_start >= n {
+                            return;
+                        }
+                        let chunk_n = col_end - col_start;
+                        let wt_data = unsafe {
+                            std::slice::from_raw_parts(
+                                (wt_data_addr as *const u8).add(col_start * bpr),
+                                chunk_n * bpr,
+                            )
+                        };
+                        let wt_scales = unsafe {
+                            std::slice::from_raw_parts(
+                                (wt_scales_addr as *const f32).add(col_start * num_blocks_per_row),
+                                chunk_n * num_blocks_per_row,
+                            )
+                        };
+                        let out_global =
+                            unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
+                        simd::gemm_q8_tiled(
+                            &mut out_global[col_start..],
+                            &all_quants.quants,
+                            &all_quants.scales,
+                            wt_data,
+                            wt_scales,
+                            m,
+                            chunk_n,
+                            n,
+                            num_blocks_per_row,
+                            bpr,
+                        );
+                    });
+                }
+            }
+            DType::Q4_0 => {
+                if weight.interleaved {
+                    let bpr_inp = num_blocks_per_row * 32;
+                    let pool = crate::thread_pool::global_pool();
+                    let num_threads = pool.num_threads();
+                    let out_addr = ptr_to_usize(output.as_mut_ptr());
+                    let wt_data_addr = weight.data.as_ptr() as usize;
+                    let wt_data_len = weight.data.len();
+                    let cols_per_thread = (n.div_ceil(num_threads) + 3) & !3;
+                    let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
+                    pool.dispatch(num_tasks, |task_id, _| {
+                        let col_start = task_id * cols_per_thread;
+                        let col_end = (col_start + cols_per_thread).min(n);
+                        if col_start >= n {
+                            return;
+                        }
+                        let chunk_n = col_end - col_start;
+                        let chunk_groups = chunk_n.div_ceil(4);
+                        let group_start = col_start / 4;
+                        let wt_il = unsafe {
+                            std::slice::from_raw_parts(wt_data_addr as *const u8, wt_data_len)
+                        };
+                        let q4_chunk = &wt_il[group_start * num_blocks_per_row * 72..];
+                        let needed = chunk_groups * num_blocks_per_row * 136;
+                        let out_global =
+                            unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
+                        Q4_EXPAND_SCRATCH.with(|scratch| {
+                            let mut s = scratch.borrow_mut();
+                            if s.len() < needed {
+                                s.resize(needed, 0);
+                            }
+                            simd::expand_q4_il_to_q8_il_into(
+                                q4_chunk,
+                                chunk_groups,
+                                num_blocks_per_row,
+                                &mut s[..needed],
+                            );
+                            simd::gemm_q8_tiled_il(
+                                &mut out_global[col_start..],
+                                &all_quants.quants,
+                                &all_quants.scales,
+                                &s[..needed],
+                                m,
+                                chunk_n,
+                                n,
+                                num_blocks_per_row,
+                                bpr_inp,
+                                0,
+                            );
+                        });
+                    });
+                } else {
+                    q4_gemm_tiled(
+                        &mut output,
+                        &all_quants,
+                        m,
+                        k,
+                        n,
+                        num_blocks_per_row,
+                        &weight.data,
+                        &weight.scales,
+                    );
+                }
+            }
+            DType::Q4_1 => {
+                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
+                let pool = crate::thread_pool::global_pool();
+                let num_threads = pool.num_threads();
+
                 let cols_per_thread = n.div_ceil(num_threads);
                 let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
                 let out_addr = ptr_to_usize(output.as_mut_ptr());
                 let wt_data_addr = weight.data.as_ptr() as usize;
                 let wt_scales_addr = weight.scales.as_ptr() as usize;
+                let wt_mins_addr = weight
+                    .mins
+                    .as_ref()
+                    .expect("Q4_1 weight missing mins buffer")
+                    .as_ptr() as usize;
+                let inp_f32_addr = input_data.as_ptr() as usize;
 
                 pool.dispatch(num_tasks, |task_id, _| {
                     let col_start = task_id * cols_per_thread;
@@ -439,11 +633,7 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                     }
                     let chunk_n = col_end - col_start;
 
-                    // Create a temporary contiguous output buffer for this column chunk.
-                    let mut local_out = vec![0.0f32; m * chunk_n];
-
-                    // Weight slices for columns [col_start..col_end].
-                    let wt_data = unsafe {
+                    let wt_packed = unsafe {
                         std::slice::from_raw_parts(
                             (wt_data_addr as *const u8).add(col_start * bpr),
                             chunk_n * bpr,
@@ -455,72 +645,39 @@ fn quantized_linear(input: &CpuTensor, weight: &CpuQuantizedWeight) -> Result<Cp
                             chunk_n * num_blocks_per_row,
                         )
                     };
+                    let wt_mins = unsafe {
+                        std::slice::from_raw_parts(
+                            (wt_mins_addr as *const f32).add(col_start * num_blocks_per_row),
+                            chunk_n * num_blocks_per_row,
+                        )
+                    };
 
-                    simd::gemm_q8_tiled(
-                        &mut local_out,
-                        &all_quants.quants,
-                        &all_quants.scales,
-                        wt_data,
-                        wt_scales,
-                        m,
-                        chunk_n,
-                        num_blocks_per_row,
-                        bpr,
-                    );
-
-                    // Scatter local contiguous output [m × chunk_n] into strided global output.
-                    let out_global =
-                        unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
                     for row in 0..m {
-                        let src = &local_out[row * chunk_n..(row + 1) * chunk_n];
-                        let dst = &mut out_global[row * n + col_start..row * n + col_end];
-                        dst.copy_from_slice(src);
+                        let inp_quants = &all_quants.quants[row * k..(row + 1) * k];
+                        let inp_scales = &all_quants.scales
+                            [row * num_blocks_per_row..(row + 1) * num_blocks_per_row];
+                        let inp_f32 = unsafe {
+                            std::slice::from_raw_parts((inp_f32_addr as *const f32).add(row * k), k)
+                        };
+                        let out_row = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (out_addr as *mut f32).add(row * n + col_start),
+                                chunk_n,
+                            )
+                        };
+
+                        for (i, out_val) in out_row.iter_mut().enumerate() {
+                            *out_val = simd::dot_q4_1_q8_row(
+                                inp_quants,
+                                inp_scales,
+                                inp_f32,
+                                &wt_packed[i * bpr..(i + 1) * bpr],
+                                &wt_scales[i * num_blocks_per_row..(i + 1) * num_blocks_per_row],
+                                &wt_mins[i * num_blocks_per_row..(i + 1) * num_blocks_per_row],
+                            );
+                        }
                     }
                 });
-            }
-            DType::Q4_0 => {
-                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
-                quantized_gemm_parallel(
-                    &mut output,
-                    &all_quants,
-                    m,
-                    k,
-                    n,
-                    num_blocks_per_row,
-                    &weight.data,
-                    &weight.scales,
-                    bpr,
-                    q4_gemv_body_inline,
-                );
-            }
-            DType::Q4_1 => {
-                let packed = &weight.data;
-                let scales = &weight.scales;
-                let mins = weight
-                    .mins
-                    .as_ref()
-                    .expect("Q4_1 weight missing mins buffer");
-                let bpr = num_blocks_per_row * (QUANTIZATION_BLOCK_SIZE / 2);
-
-                // Q4_1 needs original f32 input, so fall back to row-by-row
-                // (Q4_1 is rare enough that this path is acceptable)
-                let mut inp_quants = vec![0u8; k];
-                let mut inp_scales = vec![0.0f32; num_blocks_per_row];
-                for row in 0..m {
-                    let inp = &input_data[row * k..(row + 1) * k];
-                    simd::quantize_row_q8(inp, &mut inp_quants, &mut inp_scales);
-                    q4_1_gemv_parallel(
-                        &mut output[row * n..(row + 1) * n],
-                        &inp_quants,
-                        &inp_scales,
-                        inp,
-                        packed,
-                        scales,
-                        mins,
-                        num_blocks_per_row,
-                        bpr,
-                    );
-                }
             }
             other => {
                 return Err(infernum::Error::UnsupportedDtype(format!(
@@ -582,96 +739,119 @@ fn quantize_all_rows(input_data: &[f32], m: usize, k: usize, num_blocks: usize) 
     QuantizedRows { quants, scales }
 }
 
-/// Function pointer type for dtype-specific GEMV body kernels.
+/// Input layout: `chunk_n` rows × `num_blocks` blocks × 16 packed bytes per block.
+/// Expand Q4_0 packed nibbles into row-major Q8_0 for one weight chunk.
 ///
-/// Parameters: `(output, neuron_offset, chunk_len, inp_quants, inp_scales,
-///               weight_data, weight_scales, num_blocks_per_row, bytes_per_row)`
-type GemvBodyFn = fn(&mut [f32], usize, usize, &[u8], &[f32], &[u8], &[f32], usize, usize);
+/// Output layout: `chunk_n` rows × `num_blocks` blocks × 32 int8 bytes per block.
+/// `qs[k]` encodes element[k] in the low nibble and element[k+16] in the high nibble.
+fn expand_q4_to_q8(
+    q4_data: &[u8],
+    q4_scales: &[f32],
+    q8_data: &mut [u8],
+    q8_scales: &mut [f32],
+    chunk_n: usize,
+    num_blocks: usize,
+) {
+    let bpr_q4 = num_blocks * 16;
+    let bpr_q8 = num_blocks * 32;
+    for col in 0..chunk_n {
+        let q4_row = &q4_data[col * bpr_q4..];
+        let q8_row = &mut q8_data[col * bpr_q8..];
+        for blk in 0..num_blocks {
+            let src = &q4_row[blk * 16..(blk + 1) * 16];
+            let dst = &mut q8_row[blk * 32..blk * 32 + 32];
+            for i in 0..16 {
+                dst[i] = (src[i] & 0x0F).wrapping_sub(8);
+                dst[i + 16] = (src[i] >> 4).wrapping_sub(8);
+            }
+        }
+        q8_scales[col * num_blocks..(col + 1) * num_blocks]
+            .copy_from_slice(&q4_scales[col * num_blocks..(col + 1) * num_blocks]);
+    }
+}
 
-/// Batched quantized GEMM: single thread-pool dispatch over N neurons.
-///
-/// Each thread processes a chunk of output neurons, computing all M rows
-/// for each neuron before moving to the next. This maximizes weight data
-/// reuse in L1/L2 cache (each weight row is read once per thread, used
-/// M times).
-///
-/// The `gemv_body_fn` parameter selects the dtype-specific SIMD kernel
-/// (Q8_0 or Q4_0).
+/// Q4_0 tiled GEMM: expand Q4 nibbles to plain row-major Q8_0, then call the
+/// standard Q8_0 GEMM kernel.
 #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
-fn quantized_gemm_parallel(
+fn q4_gemm_tiled(
     output: &mut [f32],
     all_rows: &QuantizedRows,
     m: usize,
-    k: usize,
+    _k: usize,
     n: usize,
-    num_blocks_per_row: usize,
+    num_blocks: usize,
     weight_data: &[u8],
     weight_scales: &[f32],
-    bytes_per_row: usize,
-    gemv_body_fn: GemvBodyFn,
 ) {
+    let bpr_q4 = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
+    let bpr_q8 = num_blocks * QUANTIZATION_BLOCK_SIZE;
+
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons_per_task = 64;
+    let cols_per_thread = (n.div_ceil(num_threads) + 3) & !3;
+    let num_tasks = num_threads.min(n.div_ceil(cols_per_thread));
+    let out_addr = ptr_to_usize(output.as_mut_ptr());
+    let wt_data_addr = weight_data.as_ptr() as usize;
+    let wt_scales_addr = weight_scales.as_ptr() as usize;
 
-    if n < num_threads * min_neurons_per_task {
-        // Too few neurons to parallelize — sequential over N, all M rows
-        for row in 0..m {
-            let q = &all_rows.quants[row * k..(row + 1) * k];
-            let s = &all_rows.scales[row * num_blocks_per_row..(row + 1) * num_blocks_per_row];
-            let out_row = &mut output[row * n..(row + 1) * n];
-            gemv_body_fn(
-                out_row,
-                0,
-                n,
-                q,
-                s,
-                weight_data,
-                weight_scales,
-                num_blocks_per_row,
-                bytes_per_row,
-            );
+    pool.dispatch(num_tasks, |task_id, _| {
+        let col_start = task_id * cols_per_thread;
+        if col_start >= n {
+            return;
         }
-    } else {
-        let raw_chunk = (n / num_threads).max(min_neurons_per_task).min(n);
-        let chunk_size = (raw_chunk + 1) & !1; // round up to even for pair processing
-        let num_tasks = num_threads.min(n.div_ceil(chunk_size));
-        let out_addr = ptr_to_usize(output.as_mut_ptr());
+        let col_end = (col_start + cols_per_thread).min(n);
+        let chunk_n = col_end - col_start;
 
-        pool.dispatch(num_tasks, |task_id, _| {
-            let col_start = task_id * chunk_size;
-            let col_end = (col_start + chunk_size).min(n);
-            if col_start >= n {
-                return;
-            }
-            let chunk_len = col_end - col_start;
+        // Allocate uninit — fully overwritten by expand_q4_to_q8 before GEMM.
+        #[allow(clippy::uninit_vec)]
+        let mut q8_data: Vec<u8> = {
+            let mut v = Vec::with_capacity(chunk_n * bpr_q8);
+            unsafe { v.set_len(chunk_n * bpr_q8) };
+            v
+        };
+        #[allow(clippy::uninit_vec)]
+        let mut q8_scales: Vec<f32> = {
+            let mut v = Vec::with_capacity(chunk_n * num_blocks);
+            unsafe { v.set_len(chunk_n * num_blocks) };
+            v
+        };
 
-            // For each input row, compute this thread's chunk of output neurons.
-            // Weight data for neurons [col_start..col_end] stays hot in cache
-            // across all M rows.
-            for row in 0..m {
-                let q = &all_rows.quants[row * k..(row + 1) * k];
-                let s = &all_rows.scales[row * num_blocks_per_row..(row + 1) * num_blocks_per_row];
-                let out_slice = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        (out_addr as *mut f32).add(row * n + col_start),
-                        chunk_len,
-                    )
-                };
-                gemv_body_fn(
-                    out_slice,
-                    col_start,
-                    chunk_len,
-                    q,
-                    s,
-                    weight_data,
-                    weight_scales,
-                    num_blocks_per_row,
-                    bytes_per_row,
-                );
-            }
-        });
-    }
+        let q4_data = unsafe {
+            std::slice::from_raw_parts(
+                (wt_data_addr as *const u8).add(col_start * bpr_q4),
+                chunk_n * bpr_q4,
+            )
+        };
+        let q4_scales_src = unsafe {
+            std::slice::from_raw_parts(
+                (wt_scales_addr as *const f32).add(col_start * num_blocks),
+                chunk_n * num_blocks,
+            )
+        };
+        expand_q4_to_q8(
+            q4_data,
+            q4_scales_src,
+            &mut q8_data,
+            &mut q8_scales,
+            chunk_n,
+            num_blocks,
+        );
+
+        let out_global = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, m * n) };
+
+        simd::gemm_q8_tiled(
+            &mut out_global[col_start..],
+            &all_rows.quants,
+            &all_rows.scales,
+            &q8_data,
+            &q8_scales,
+            m,
+            chunk_n,
+            n,
+            num_blocks,
+            bpr_q8,
+        );
+    });
 }
 
 /// Batched pair: pre-quantize all M rows, single dispatch over max(N1,N2) neurons.
@@ -700,188 +880,218 @@ fn quantized_linear_pair_batched(
 
     match w1.dtype {
         DType::Q8_0 => {
-            // Q8_0: use tiled GEMM for both weight matrices.
             let bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
             let pool = crate::thread_pool::global_pool();
             let num_threads = pool.num_threads();
-            let cols_per_thread1 = n1.div_ceil(num_threads);
-            let cols_per_thread2 = n2.div_ceil(num_threads);
-            let num_tasks = num_threads
-                .min(n1.div_ceil(cols_per_thread1))
-                .max(num_threads.min(n2.div_ceil(cols_per_thread2)));
             let out1_addr = ptr_to_usize(out1.as_mut_ptr());
             let out2_addr = ptr_to_usize(out2.as_mut_ptr());
             let w1_data_addr = w1.data.as_ptr() as usize;
-            let w1_scales_addr = w1.scales.as_ptr() as usize;
             let w2_data_addr = w2.data.as_ptr() as usize;
-            let w2_scales_addr = w2.scales.as_ptr() as usize;
 
-            pool.dispatch(num_tasks, |task_id, _| {
-                // Weight 1
-                let col_start1 = task_id * cols_per_thread1;
-                if col_start1 < n1 {
-                    let col_end1 = (col_start1 + cols_per_thread1).min(n1);
-                    let chunk_n1 = col_end1 - col_start1;
-                    let mut local_out1 = vec![0.0f32; m * chunk_n1];
-                    let wt_data1 = unsafe {
-                        std::slice::from_raw_parts(
-                            (w1_data_addr as *const u8).add(col_start1 * bpr),
-                            chunk_n1 * bpr,
-                        )
-                    };
-                    let wt_scales1 = unsafe {
-                        std::slice::from_raw_parts(
-                            (w1_scales_addr as *const f32).add(col_start1 * num_blocks),
-                            chunk_n1 * num_blocks,
-                        )
-                    };
-                    simd::gemm_q8_tiled(
-                        &mut local_out1,
-                        &all_rows.quants,
-                        &all_rows.scales,
-                        wt_data1,
-                        wt_scales1,
-                        m,
-                        chunk_n1,
-                        num_blocks,
-                        bpr,
-                    );
-                    let out_global1 =
-                        unsafe { std::slice::from_raw_parts_mut(out1_addr as *mut f32, m * n1) };
-                    for row in 0..m {
-                        out_global1[row * n1 + col_start1..row * n1 + col_end1]
-                            .copy_from_slice(&local_out1[row * chunk_n1..(row + 1) * chunk_n1]);
+            if w1.interleaved {
+                let cpt1 = (n1.div_ceil(num_threads) + 3) & !3;
+                let cpt2 = (n2.div_ceil(num_threads) + 3) & !3;
+                let num_tasks = num_threads
+                    .min(n1.div_ceil(cpt1))
+                    .max(num_threads.min(n2.div_ceil(cpt2)));
+                let w1_data_len = w1.data.len();
+                let w2_data_len = w2.data.len();
+                pool.dispatch(num_tasks, |task_id, _| {
+                    let cs1 = task_id * cpt1;
+                    if cs1 < n1 {
+                        let ce1 = (cs1 + cpt1).min(n1);
+                        let cn1 = ce1 - cs1;
+                        let wd1 = unsafe {
+                            std::slice::from_raw_parts(w1_data_addr as *const u8, w1_data_len)
+                        };
+                        let o1 = unsafe {
+                            std::slice::from_raw_parts_mut(out1_addr as *mut f32, m * n1)
+                        };
+                        simd::gemm_q8_tiled_il(
+                            &mut o1[cs1..],
+                            &all_rows.quants,
+                            &all_rows.scales,
+                            wd1,
+                            m,
+                            cn1,
+                            n1,
+                            num_blocks,
+                            bpr,
+                            cs1,
+                        );
                     }
-                }
-
-                // Weight 2
-                let col_start2 = task_id * cols_per_thread2;
-                if col_start2 < n2 {
-                    let col_end2 = (col_start2 + cols_per_thread2).min(n2);
-                    let chunk_n2 = col_end2 - col_start2;
-                    let mut local_out2 = vec![0.0f32; m * chunk_n2];
-                    let wt_data2 = unsafe {
-                        std::slice::from_raw_parts(
-                            (w2_data_addr as *const u8).add(col_start2 * bpr),
-                            chunk_n2 * bpr,
-                        )
-                    };
-                    let wt_scales2 = unsafe {
-                        std::slice::from_raw_parts(
-                            (w2_scales_addr as *const f32).add(col_start2 * num_blocks),
-                            chunk_n2 * num_blocks,
-                        )
-                    };
-                    simd::gemm_q8_tiled(
-                        &mut local_out2,
-                        &all_rows.quants,
-                        &all_rows.scales,
-                        wt_data2,
-                        wt_scales2,
-                        m,
-                        chunk_n2,
-                        num_blocks,
-                        bpr,
-                    );
-                    let out_global2 =
-                        unsafe { std::slice::from_raw_parts_mut(out2_addr as *mut f32, m * n2) };
-                    for row in 0..m {
-                        out_global2[row * n2 + col_start2..row * n2 + col_end2]
-                            .copy_from_slice(&local_out2[row * chunk_n2..(row + 1) * chunk_n2]);
-                    }
-                }
-            });
-        }
-        DType::Q4_0 => {
-            // Q4_0: no tiled GEMM kernel — use GEMV row-by-row.
-            let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
-            let pool = crate::thread_pool::global_pool();
-            let num_threads = pool.num_threads();
-            let min_neurons = 64;
-            let n_max = n1.max(n2);
-
-            if n_max < num_threads * min_neurons {
-                for row in 0..m {
-                    let q = &all_rows.quants[row * k..(row + 1) * k];
-                    let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
-                    q4_gemv_body_inline(
-                        &mut out1[row * n1..(row + 1) * n1],
-                        0,
-                        n1,
-                        q,
-                        s,
-                        &w1.data,
-                        &w1.scales,
-                        num_blocks,
-                        bpr,
-                    );
-                    q4_gemv_body_inline(
-                        &mut out2[row * n2..(row + 1) * n2],
-                        0,
-                        n2,
-                        q,
-                        s,
-                        &w2.data,
-                        &w2.scales,
-                        num_blocks,
-                        bpr,
-                    );
-                }
-            } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
-                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
-
-                pool.dispatch(num_threads, |task_id, _| {
-                    for row in 0..m {
-                        let q = &all_rows.quants[row * k..(row + 1) * k];
-                        let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
-
-                        let start1 = task_id * chunk1;
-                        if start1 < n1 {
-                            let end1 = (start1 + chunk1).min(n1);
-                            let slice1 = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (out1_addr as *mut f32).add(row * n1 + start1),
-                                    end1 - start1,
-                                )
-                            };
-                            q4_gemv_body_inline(
-                                slice1,
-                                start1,
-                                end1 - start1,
-                                q,
-                                s,
-                                &w1.data,
-                                &w1.scales,
-                                num_blocks,
-                                bpr,
-                            );
-                        }
-                        let start2 = task_id * chunk2;
-                        if start2 < n2 {
-                            let end2 = (start2 + chunk2).min(n2);
-                            let slice2 = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (out2_addr as *mut f32).add(row * n2 + start2),
-                                    end2 - start2,
-                                )
-                            };
-                            q4_gemv_body_inline(
-                                slice2,
-                                start2,
-                                end2 - start2,
-                                q,
-                                s,
-                                &w2.data,
-                                &w2.scales,
-                                num_blocks,
-                                bpr,
-                            );
-                        }
+                    let cs2 = task_id * cpt2;
+                    if cs2 < n2 {
+                        let ce2 = (cs2 + cpt2).min(n2);
+                        let cn2 = ce2 - cs2;
+                        let wd2 = unsafe {
+                            std::slice::from_raw_parts(w2_data_addr as *const u8, w2_data_len)
+                        };
+                        let o2 = unsafe {
+                            std::slice::from_raw_parts_mut(out2_addr as *mut f32, m * n2)
+                        };
+                        simd::gemm_q8_tiled_il(
+                            &mut o2[cs2..],
+                            &all_rows.quants,
+                            &all_rows.scales,
+                            wd2,
+                            m,
+                            cn2,
+                            n2,
+                            num_blocks,
+                            bpr,
+                            cs2,
+                        );
                     }
                 });
+            } else {
+                let w1_scales_addr = w1.scales.as_ptr() as usize;
+                let w2_scales_addr = w2.scales.as_ptr() as usize;
+                let cols_per_thread1 = n1.div_ceil(num_threads);
+                let cols_per_thread2 = n2.div_ceil(num_threads);
+                let num_tasks = num_threads
+                    .min(n1.div_ceil(cols_per_thread1))
+                    .max(num_threads.min(n2.div_ceil(cols_per_thread2)));
+                pool.dispatch(num_tasks, |task_id, _| {
+                    let col_start1 = task_id * cols_per_thread1;
+                    if col_start1 < n1 {
+                        let col_end1 = (col_start1 + cols_per_thread1).min(n1);
+                        let chunk_n1 = col_end1 - col_start1;
+                        let wt_data1 = unsafe {
+                            std::slice::from_raw_parts(
+                                (w1_data_addr as *const u8).add(col_start1 * bpr),
+                                chunk_n1 * bpr,
+                            )
+                        };
+                        let wt_scales1 = unsafe {
+                            std::slice::from_raw_parts(
+                                (w1_scales_addr as *const f32).add(col_start1 * num_blocks),
+                                chunk_n1 * num_blocks,
+                            )
+                        };
+                        let out_global1 = unsafe {
+                            std::slice::from_raw_parts_mut(out1_addr as *mut f32, m * n1)
+                        };
+                        simd::gemm_q8_tiled(
+                            &mut out_global1[col_start1..],
+                            &all_rows.quants,
+                            &all_rows.scales,
+                            wt_data1,
+                            wt_scales1,
+                            m,
+                            chunk_n1,
+                            n1,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                    let col_start2 = task_id * cols_per_thread2;
+                    if col_start2 < n2 {
+                        let col_end2 = (col_start2 + cols_per_thread2).min(n2);
+                        let chunk_n2 = col_end2 - col_start2;
+                        let wt_data2 = unsafe {
+                            std::slice::from_raw_parts(
+                                (w2_data_addr as *const u8).add(col_start2 * bpr),
+                                chunk_n2 * bpr,
+                            )
+                        };
+                        let wt_scales2 = unsafe {
+                            std::slice::from_raw_parts(
+                                (w2_scales_addr as *const f32).add(col_start2 * num_blocks),
+                                chunk_n2 * num_blocks,
+                            )
+                        };
+                        let out_global2 = unsafe {
+                            std::slice::from_raw_parts_mut(out2_addr as *mut f32, m * n2)
+                        };
+                        simd::gemm_q8_tiled(
+                            &mut out_global2[col_start2..],
+                            &all_rows.quants,
+                            &all_rows.scales,
+                            wt_data2,
+                            wt_scales2,
+                            m,
+                            chunk_n2,
+                            n2,
+                            num_blocks,
+                            bpr,
+                        );
+                    }
+                });
+            }
+        }
+        DType::Q4_0 => {
+            if w1.interleaved {
+                let pool = crate::thread_pool::global_pool();
+                let num_threads = pool.num_threads();
+                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                let w1_data_addr = w1.data.as_ptr() as usize;
+                let w2_data_addr = w2.data.as_ptr() as usize;
+                let cpt1 = (n1.div_ceil(num_threads) + 3) & !3;
+                let cpt2 = (n2.div_ceil(num_threads) + 3) & !3;
+                let num_tasks = num_threads
+                    .min(n1.div_ceil(cpt1))
+                    .max(num_threads.min(n2.div_ceil(cpt2)));
+                let w1_data_len = w1.data.len();
+                let w2_data_len = w2.data.len();
+                let bpr_inp = num_blocks * 32;
+                pool.dispatch(num_tasks, |task_id, _| {
+                    macro_rules! q4_il_expand_chunk {
+                        ($task_id:expr, $cpt:expr, $n:expr, $wd:expr, $wdl:expr, $out_addr:expr) => {
+                            let col_start = $task_id * $cpt;
+                            if col_start < $n {
+                                let col_end = (col_start + $cpt).min($n);
+                                let chunk_n = col_end - col_start;
+                                let chunk_groups = chunk_n.div_ceil(4);
+                                let group_start = col_start / 4;
+                                let wt_il =
+                                    unsafe { std::slice::from_raw_parts($wd as *const u8, $wdl) };
+                                let q4_chunk = &wt_il[group_start * num_blocks * 72..];
+                                let needed = chunk_groups * num_blocks * 136;
+                                let out_global = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        $out_addr as *mut f32,
+                                        m * $n,
+                                    )
+                                };
+                                Q4_EXPAND_SCRATCH.with(|scratch| {
+                                    let mut s = scratch.borrow_mut();
+                                    if s.len() < needed {
+                                        s.resize(needed, 0);
+                                    }
+                                    simd::expand_q4_il_to_q8_il_into(
+                                        q4_chunk,
+                                        chunk_groups,
+                                        num_blocks,
+                                        &mut s[..needed],
+                                    );
+                                    simd::gemm_q8_tiled_il(
+                                        &mut out_global[col_start..],
+                                        &all_rows.quants,
+                                        &all_rows.scales,
+                                        &s[..needed],
+                                        m,
+                                        chunk_n,
+                                        $n,
+                                        num_blocks,
+                                        bpr_inp,
+                                        0,
+                                    );
+                                });
+                            }
+                        };
+                    }
+                    q4_il_expand_chunk!(task_id, cpt1, n1, w1_data_addr, w1_data_len, out1_addr);
+                    q4_il_expand_chunk!(task_id, cpt2, n2, w2_data_addr, w2_data_len, out2_addr);
+                });
+            } else {
+                q4_gemm_tiled(
+                    &mut out1, &all_rows, m, k, n1, num_blocks, &w1.data, &w1.scales,
+                );
+                q4_gemm_tiled(
+                    &mut out2, &all_rows, m, k, n2, num_blocks, &w2.data, &w2.scales,
+                );
             }
         }
         _ => {
@@ -926,199 +1136,194 @@ fn quantized_linear_triple_batched(
 
     match w1.dtype {
         DType::Q8_0 => {
-            // Q8_0: use tiled GEMM for all three weight matrices.
             let bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
             let pool = crate::thread_pool::global_pool();
             let num_threads = pool.num_threads();
-            let cpt1 = n1.div_ceil(num_threads);
-            let cpt2 = n2.div_ceil(num_threads);
-            let cpt3 = n3.div_ceil(num_threads);
-            let num_tasks = num_threads
-                .min(n1.div_ceil(cpt1))
-                .max(num_threads.min(n2.div_ceil(cpt2)))
-                .max(num_threads.min(n3.div_ceil(cpt3)));
             let out1_addr = ptr_to_usize(out1.as_mut_ptr());
             let out2_addr = ptr_to_usize(out2.as_mut_ptr());
             let out3_addr = ptr_to_usize(out3.as_mut_ptr());
             let w1d = w1.data.as_ptr() as usize;
-            let w1s = w1.scales.as_ptr() as usize;
             let w2d = w2.data.as_ptr() as usize;
-            let w2s = w2.scales.as_ptr() as usize;
             let w3d = w3.data.as_ptr() as usize;
-            let w3s = w3.scales.as_ptr() as usize;
 
-            pool.dispatch(num_tasks, |task_id, _| {
-                // Helper: run tiled GEMM for one weight matrix's column chunk.
-                macro_rules! gemm_chunk {
-                    ($col_start:expr, $n:expr, $cpt:expr, $wd:expr, $ws:expr,
-                     $out_addr:expr) => {
-                        let cs = $col_start;
-                        if cs < $n {
-                            let ce = (cs + $cpt).min($n);
-                            let cn = ce - cs;
-                            let mut local = vec![0.0f32; m * cn];
-                            let wd = unsafe {
-                                std::slice::from_raw_parts(
-                                    ($wd as *const u8).add(cs * bpr),
-                                    cn * bpr,
-                                )
-                            };
-                            let ws = unsafe {
-                                std::slice::from_raw_parts(
-                                    ($ws as *const f32).add(cs * num_blocks),
-                                    cn * num_blocks,
-                                )
-                            };
-                            simd::gemm_q8_tiled(
-                                &mut local,
-                                &all_rows.quants,
-                                &all_rows.scales,
-                                wd,
-                                ws,
-                                m,
-                                cn,
-                                num_blocks,
-                                bpr,
-                            );
-                            let out = unsafe {
-                                std::slice::from_raw_parts_mut($out_addr as *mut f32, m * $n)
-                            };
-                            for row in 0..m {
-                                out[row * $n + cs..row * $n + ce]
-                                    .copy_from_slice(&local[row * cn..(row + 1) * cn]);
+            if w1.interleaved {
+                let cpt1 = (n1.div_ceil(num_threads) + 3) & !3;
+                let cpt2 = (n2.div_ceil(num_threads) + 3) & !3;
+                let cpt3 = (n3.div_ceil(num_threads) + 3) & !3;
+                let num_tasks = num_threads
+                    .min(n1.div_ceil(cpt1))
+                    .max(num_threads.min(n2.div_ceil(cpt2)))
+                    .max(num_threads.min(n3.div_ceil(cpt3)));
+                let w1dl = w1.data.len();
+                let w2dl = w2.data.len();
+                let w3dl = w3.data.len();
+                pool.dispatch(num_tasks, |task_id, _| {
+                    macro_rules! gemm_il_chunk {
+                        ($cs:expr, $n:expr, $cpt:expr, $wd:expr, $wdl:expr, $out_addr:expr) => {
+                            let cs = $cs;
+                            if cs < $n {
+                                let ce = (cs + $cpt).min($n);
+                                let cn = ce - cs;
+                                let wd =
+                                    unsafe { std::slice::from_raw_parts($wd as *const u8, $wdl) };
+                                let out = unsafe {
+                                    std::slice::from_raw_parts_mut($out_addr as *mut f32, m * $n)
+                                };
+                                simd::gemm_q8_tiled_il(
+                                    &mut out[cs..],
+                                    &all_rows.quants,
+                                    &all_rows.scales,
+                                    wd,
+                                    m,
+                                    cn,
+                                    $n,
+                                    num_blocks,
+                                    bpr,
+                                    cs,
+                                );
                             }
-                        }
-                    };
-                }
-                gemm_chunk!(task_id * cpt1, n1, cpt1, w1d, w1s, out1_addr);
-                gemm_chunk!(task_id * cpt2, n2, cpt2, w2d, w2s, out2_addr);
-                gemm_chunk!(task_id * cpt3, n3, cpt3, w3d, w3s, out3_addr);
-            });
+                        };
+                    }
+                    gemm_il_chunk!(task_id * cpt1, n1, cpt1, w1d, w1dl, out1_addr);
+                    gemm_il_chunk!(task_id * cpt2, n2, cpt2, w2d, w2dl, out2_addr);
+                    gemm_il_chunk!(task_id * cpt3, n3, cpt3, w3d, w3dl, out3_addr);
+                });
+            } else {
+                let w1s = w1.scales.as_ptr() as usize;
+                let w2s = w2.scales.as_ptr() as usize;
+                let w3s = w3.scales.as_ptr() as usize;
+                let cpt1 = n1.div_ceil(num_threads);
+                let cpt2 = n2.div_ceil(num_threads);
+                let cpt3 = n3.div_ceil(num_threads);
+                let num_tasks = num_threads
+                    .min(n1.div_ceil(cpt1))
+                    .max(num_threads.min(n2.div_ceil(cpt2)))
+                    .max(num_threads.min(n3.div_ceil(cpt3)));
+                pool.dispatch(num_tasks, |task_id, _| {
+                    macro_rules! gemm_chunk {
+                        ($col_start:expr, $n:expr, $cpt:expr, $wd:expr, $ws:expr,
+                         $out_addr:expr) => {
+                            let cs = $col_start;
+                            if cs < $n {
+                                let ce = (cs + $cpt).min($n);
+                                let cn = ce - cs;
+                                let wd = unsafe {
+                                    std::slice::from_raw_parts(
+                                        ($wd as *const u8).add(cs * bpr),
+                                        cn * bpr,
+                                    )
+                                };
+                                let ws = unsafe {
+                                    std::slice::from_raw_parts(
+                                        ($ws as *const f32).add(cs * num_blocks),
+                                        cn * num_blocks,
+                                    )
+                                };
+                                let out = unsafe {
+                                    std::slice::from_raw_parts_mut($out_addr as *mut f32, m * $n)
+                                };
+                                simd::gemm_q8_tiled(
+                                    &mut out[cs..],
+                                    &all_rows.quants,
+                                    &all_rows.scales,
+                                    wd,
+                                    ws,
+                                    m,
+                                    cn,
+                                    $n,
+                                    num_blocks,
+                                    bpr,
+                                );
+                            }
+                        };
+                    }
+                    gemm_chunk!(task_id * cpt1, n1, cpt1, w1d, w1s, out1_addr);
+                    gemm_chunk!(task_id * cpt2, n2, cpt2, w2d, w2s, out2_addr);
+                    gemm_chunk!(task_id * cpt3, n3, cpt3, w3d, w3s, out3_addr);
+                });
+            }
         }
         DType::Q4_0 => {
-            // Q4_0: no tiled GEMM kernel — use GEMV row-by-row.
-            let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
-            let pool = crate::thread_pool::global_pool();
-            let num_threads = pool.num_threads();
-            let min_neurons = 64;
-            let n_max = n1.max(n2).max(n3);
-
-            if n_max < num_threads * min_neurons {
-                for row in 0..m {
-                    let q = &all_rows.quants[row * k..(row + 1) * k];
-                    let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
-                    q4_gemv_body_inline(
-                        &mut out1[row * n1..(row + 1) * n1],
-                        0,
-                        n1,
-                        q,
-                        s,
-                        &w1.data,
-                        &w1.scales,
-                        num_blocks,
-                        bpr,
-                    );
-                    q4_gemv_body_inline(
-                        &mut out2[row * n2..(row + 1) * n2],
-                        0,
-                        n2,
-                        q,
-                        s,
-                        &w2.data,
-                        &w2.scales,
-                        num_blocks,
-                        bpr,
-                    );
-                    q4_gemv_body_inline(
-                        &mut out3[row * n3..(row + 1) * n3],
-                        0,
-                        n3,
-                        q,
-                        s,
-                        &w3.data,
-                        &w3.scales,
-                        num_blocks,
-                        bpr,
-                    );
-                }
-            } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
+            if w1.interleaved {
+                let pool = crate::thread_pool::global_pool();
+                let num_threads = pool.num_threads();
                 let out1_addr = ptr_to_usize(out1.as_mut_ptr());
                 let out2_addr = ptr_to_usize(out2.as_mut_ptr());
                 let out3_addr = ptr_to_usize(out3.as_mut_ptr());
-
-                pool.dispatch(num_threads, |task_id, _| {
-                    for row in 0..m {
-                        let q = &all_rows.quants[row * k..(row + 1) * k];
-                        let s = &all_rows.scales[row * num_blocks..(row + 1) * num_blocks];
-
-                        let start1 = task_id * chunk1;
-                        if start1 < n1 {
-                            let end1 = (start1 + chunk1).min(n1);
-                            let slice1 = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (out1_addr as *mut f32).add(row * n1 + start1),
-                                    end1 - start1,
-                                )
-                            };
-                            q4_gemv_body_inline(
-                                slice1,
-                                start1,
-                                end1 - start1,
-                                q,
-                                s,
-                                &w1.data,
-                                &w1.scales,
-                                num_blocks,
-                                bpr,
-                            );
-                        }
-                        let start2 = task_id * chunk2;
-                        if start2 < n2 {
-                            let end2 = (start2 + chunk2).min(n2);
-                            let slice2 = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (out2_addr as *mut f32).add(row * n2 + start2),
-                                    end2 - start2,
-                                )
-                            };
-                            q4_gemv_body_inline(
-                                slice2,
-                                start2,
-                                end2 - start2,
-                                q,
-                                s,
-                                &w2.data,
-                                &w2.scales,
-                                num_blocks,
-                                bpr,
-                            );
-                        }
-                        let start3 = task_id * chunk3;
-                        if start3 < n3 {
-                            let end3 = (start3 + chunk3).min(n3);
-                            let slice3 = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (out3_addr as *mut f32).add(row * n3 + start3),
-                                    end3 - start3,
-                                )
-                            };
-                            q4_gemv_body_inline(
-                                slice3,
-                                start3,
-                                end3 - start3,
-                                q,
-                                s,
-                                &w3.data,
-                                &w3.scales,
-                                num_blocks,
-                                bpr,
-                            );
-                        }
+                let w1d = w1.data.as_ptr() as usize;
+                let w2d = w2.data.as_ptr() as usize;
+                let w3d = w3.data.as_ptr() as usize;
+                let cpt1 = (n1.div_ceil(num_threads) + 3) & !3;
+                let cpt2 = (n2.div_ceil(num_threads) + 3) & !3;
+                let cpt3 = (n3.div_ceil(num_threads) + 3) & !3;
+                let num_tasks = num_threads
+                    .min(n1.div_ceil(cpt1))
+                    .max(num_threads.min(n2.div_ceil(cpt2)))
+                    .max(num_threads.min(n3.div_ceil(cpt3)));
+                let w1dl = w1.data.len();
+                let w2dl = w2.data.len();
+                let w3dl = w3.data.len();
+                let bpr_inp = num_blocks * 32;
+                pool.dispatch(num_tasks, |task_id, _| {
+                    macro_rules! q4_il_expand_chunk {
+                        ($task_id:expr, $cpt:expr, $n:expr, $wd:expr, $wdl:expr, $out_addr:expr) => {
+                            let col_start = $task_id * $cpt;
+                            if col_start < $n {
+                                let col_end = (col_start + $cpt).min($n);
+                                let chunk_n = col_end - col_start;
+                                let chunk_groups = chunk_n.div_ceil(4);
+                                let group_start = col_start / 4;
+                                let wt_il =
+                                    unsafe { std::slice::from_raw_parts($wd as *const u8, $wdl) };
+                                let q4_chunk = &wt_il[group_start * num_blocks * 72..];
+                                let needed = chunk_groups * num_blocks * 136;
+                                let out_global = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        $out_addr as *mut f32,
+                                        m * $n,
+                                    )
+                                };
+                                Q4_EXPAND_SCRATCH.with(|scratch| {
+                                    let mut s = scratch.borrow_mut();
+                                    if s.len() < needed {
+                                        s.resize(needed, 0);
+                                    }
+                                    simd::expand_q4_il_to_q8_il_into(
+                                        q4_chunk,
+                                        chunk_groups,
+                                        num_blocks,
+                                        &mut s[..needed],
+                                    );
+                                    simd::gemm_q8_tiled_il(
+                                        &mut out_global[col_start..],
+                                        &all_rows.quants,
+                                        &all_rows.scales,
+                                        &s[..needed],
+                                        m,
+                                        chunk_n,
+                                        $n,
+                                        num_blocks,
+                                        bpr_inp,
+                                        0,
+                                    );
+                                });
+                            }
+                        };
                     }
+                    q4_il_expand_chunk!(task_id, cpt1, n1, w1d, w1dl, out1_addr);
+                    q4_il_expand_chunk!(task_id, cpt2, n2, w2d, w2dl, out2_addr);
+                    q4_il_expand_chunk!(task_id, cpt3, n3, w3d, w3dl, out3_addr);
                 });
+            } else {
+                q4_gemm_tiled(
+                    &mut out1, &all_rows, m, k, n1, num_blocks, &w1.data, &w1.scales,
+                );
+                q4_gemm_tiled(
+                    &mut out2, &all_rows, m, k, n2, num_blocks, &w2.data, &w2.scales,
+                );
+                q4_gemm_tiled(
+                    &mut out3, &all_rows, m, k, n3, num_blocks, &w3.data, &w3.scales,
+                );
             }
         }
         _ => {
@@ -1192,166 +1397,296 @@ fn quantized_linear_pair(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons = 64; // Lower threshold since we amortize over 2 matmuls
+    let min_neurons = 8; // Lower threshold since we amortize over 2 matmuls
 
     match w1.dtype {
         DType::Q4_0 => {
-            let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2); // packed bytes per row
-
-            if n1 < num_threads * min_neurons && n2 < num_threads * min_neurons {
-                // Both too small to parallelize — sequential
-                q4_gemv_body_inline(
-                    &mut out1,
-                    0,
-                    n1,
-                    &inp_quants,
-                    &inp_scales,
-                    &w1.data,
-                    &w1.scales,
-                    num_blocks,
-                    bpr,
-                );
-                q4_gemv_body_inline(
-                    &mut out2,
-                    0,
-                    n2,
-                    &inp_quants,
-                    &inp_scales,
-                    &w2.data,
-                    &w2.scales,
-                    num_blocks,
-                    bpr,
-                );
-            } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
-                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
-
-                pool.dispatch(num_threads, |task_id, _| {
-                    // Process w1 rows for this thread
-                    let start1 = task_id * chunk1;
-                    if start1 < n1 {
-                        let end1 = (start1 + chunk1).min(n1);
-                        let slice1 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out1_addr as *mut f32).add(start1),
+            if w1.interleaved {
+                // IL compact format: use q4_gemv_body_il (chunk size rounded to multiple of 4).
+                if n1 < num_threads * min_neurons && n2 < num_threads * min_neurons {
+                    q4_gemv_body_il(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        num_blocks,
+                    );
+                    q4_gemv_body_il(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        num_blocks,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 3) & !3;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 3) & !3;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let start1 = task_id * chunk1;
+                        if start1 < n1 {
+                            let end1 = (start1 + chunk1).min(n1);
+                            let sl1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(start1),
+                                    end1 - start1,
+                                )
+                            };
+                            q4_gemv_body_il(
+                                sl1,
+                                start1,
                                 end1 - start1,
-                            )
-                        };
-                        q4_gemv_body_inline(
-                            slice1,
-                            start1,
-                            end1 - start1,
-                            &inp_quants,
-                            &inp_scales,
-                            &w1.data,
-                            &w1.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                    // Process w2 rows for this thread (no sync in between!)
-                    let start2 = task_id * chunk2;
-                    if start2 < n2 {
-                        let end2 = (start2 + chunk2).min(n2);
-                        let slice2 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out2_addr as *mut f32).add(start2),
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                num_blocks,
+                            );
+                        }
+                        let start2 = task_id * chunk2;
+                        if start2 < n2 {
+                            let end2 = (start2 + chunk2).min(n2);
+                            let sl2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(start2),
+                                    end2 - start2,
+                                )
+                            };
+                            q4_gemv_body_il(
+                                sl2,
+                                start2,
                                 end2 - start2,
-                            )
-                        };
-                        q4_gemv_body_inline(
-                            slice2,
-                            start2,
-                            end2 - start2,
-                            &inp_quants,
-                            &inp_scales,
-                            &w2.data,
-                            &w2.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                });
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                num_blocks,
+                            );
+                        }
+                    });
+                }
+            } else {
+                let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
+                if n1 < num_threads * min_neurons && n2 < num_threads * min_neurons {
+                    q4_gemv_body_inline(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        &w1.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                    q4_gemv_body_inline(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        &w2.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let start1 = task_id * chunk1;
+                        if start1 < n1 {
+                            let end1 = (start1 + chunk1).min(n1);
+                            let sl1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(start1),
+                                    end1 - start1,
+                                )
+                            };
+                            q4_gemv_body_inline(
+                                sl1,
+                                start1,
+                                end1 - start1,
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                &w1.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                        let start2 = task_id * chunk2;
+                        if start2 < n2 {
+                            let end2 = (start2 + chunk2).min(n2);
+                            let sl2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(start2),
+                                    end2 - start2,
+                                )
+                            };
+                            q4_gemv_body_inline(
+                                sl2,
+                                start2,
+                                end2 - start2,
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                &w2.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                    });
+                }
             }
         }
         DType::Q8_0 => {
-            let bpr = num_blocks * QUANTIZATION_BLOCK_SIZE; // quant bytes per row
-
-            if n1 < num_threads * min_neurons && n2 < num_threads * min_neurons {
-                q8_gemv_body_inline(
-                    &mut out1,
-                    0,
-                    n1,
-                    &inp_quants,
-                    &inp_scales,
-                    &w1.data,
-                    &w1.scales,
-                    num_blocks,
-                    bpr,
-                );
-                q8_gemv_body_inline(
-                    &mut out2,
-                    0,
-                    n2,
-                    &inp_quants,
-                    &inp_scales,
-                    &w2.data,
-                    &w2.scales,
-                    num_blocks,
-                    bpr,
-                );
-            } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
-                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
-
-                pool.dispatch(num_threads, |task_id, _| {
-                    let start1 = task_id * chunk1;
-                    if start1 < n1 {
-                        let end1 = (start1 + chunk1).min(n1);
-                        let slice1 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out1_addr as *mut f32).add(start1),
+            if w1.interleaved {
+                if n1 < num_threads * min_neurons && n2 < num_threads * min_neurons {
+                    q8_gemv_body_il(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        num_blocks,
+                    );
+                    q8_gemv_body_il(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        num_blocks,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 3) & !3;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 3) & !3;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let start1 = task_id * chunk1;
+                        if start1 < n1 {
+                            let end1 = (start1 + chunk1).min(n1);
+                            let sl1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(start1),
+                                    end1 - start1,
+                                )
+                            };
+                            q8_gemv_body_il(
+                                sl1,
+                                start1,
                                 end1 - start1,
-                            )
-                        };
-                        q8_gemv_body_inline(
-                            slice1,
-                            start1,
-                            end1 - start1,
-                            &inp_quants,
-                            &inp_scales,
-                            &w1.data,
-                            &w1.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                    let start2 = task_id * chunk2;
-                    if start2 < n2 {
-                        let end2 = (start2 + chunk2).min(n2);
-                        let slice2 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out2_addr as *mut f32).add(start2),
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                num_blocks,
+                            );
+                        }
+                        let start2 = task_id * chunk2;
+                        if start2 < n2 {
+                            let end2 = (start2 + chunk2).min(n2);
+                            let sl2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(start2),
+                                    end2 - start2,
+                                )
+                            };
+                            q8_gemv_body_il(
+                                sl2,
+                                start2,
                                 end2 - start2,
-                            )
-                        };
-                        q8_gemv_body_inline(
-                            slice2,
-                            start2,
-                            end2 - start2,
-                            &inp_quants,
-                            &inp_scales,
-                            &w2.data,
-                            &w2.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                });
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                num_blocks,
+                            );
+                        }
+                    });
+                }
+            } else {
+                let bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
+                if n1 < num_threads * min_neurons && n2 < num_threads * min_neurons {
+                    q8_gemv_body_inline(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        &w1.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                    q8_gemv_body_inline(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        &w2.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let start1 = task_id * chunk1;
+                        if start1 < n1 {
+                            let end1 = (start1 + chunk1).min(n1);
+                            let slice1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(start1),
+                                    end1 - start1,
+                                )
+                            };
+                            q8_gemv_body_inline(
+                                slice1,
+                                start1,
+                                end1 - start1,
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                &w1.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                        let start2 = task_id * chunk2;
+                        if start2 < n2 {
+                            let end2 = (start2 + chunk2).min(n2);
+                            let slice2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(start2),
+                                    end2 - start2,
+                                )
+                            };
+                            q8_gemv_body_inline(
+                                slice2,
+                                start2,
+                                end2 - start2,
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                &w2.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                    });
+                }
             }
         }
         _ => {
@@ -1428,237 +1763,435 @@ fn quantized_linear_triple(
 
     let pool = crate::thread_pool::global_pool();
     let num_threads = pool.num_threads();
-    let min_neurons = 64;
+    let min_neurons = 8;
 
     match w1.dtype {
         DType::Q4_0 => {
-            let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
-
-            if n1 < num_threads * min_neurons
-                && n2 < num_threads * min_neurons
-                && n3 < num_threads * min_neurons
-            {
-                q4_gemv_body_inline(
-                    &mut out1,
-                    0,
-                    n1,
-                    &inp_quants,
-                    &inp_scales,
-                    &w1.data,
-                    &w1.scales,
-                    num_blocks,
-                    bpr,
-                );
-                q4_gemv_body_inline(
-                    &mut out2,
-                    0,
-                    n2,
-                    &inp_quants,
-                    &inp_scales,
-                    &w2.data,
-                    &w2.scales,
-                    num_blocks,
-                    bpr,
-                );
-                q4_gemv_body_inline(
-                    &mut out3,
-                    0,
-                    n3,
-                    &inp_quants,
-                    &inp_scales,
-                    &w3.data,
-                    &w3.scales,
-                    num_blocks,
-                    bpr,
-                );
-            } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
-                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
-                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
-                let out3_addr = ptr_to_usize(out3.as_mut_ptr());
-
-                pool.dispatch(num_threads, |task_id, _| {
-                    let start1 = task_id * chunk1;
-                    if start1 < n1 {
-                        let end1 = (start1 + chunk1).min(n1);
-                        let slice1 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out1_addr as *mut f32).add(start1),
+            if w1.interleaved {
+                if n1 < num_threads * min_neurons
+                    && n2 < num_threads * min_neurons
+                    && n3 < num_threads * min_neurons
+                {
+                    q4_gemv_body_il(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        num_blocks,
+                    );
+                    q4_gemv_body_il(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        num_blocks,
+                    );
+                    q4_gemv_body_il(
+                        &mut out3,
+                        0,
+                        n3,
+                        &inp_quants,
+                        &inp_scales,
+                        &w3.data,
+                        num_blocks,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 3) & !3;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 3) & !3;
+                    let chunk3 = (n3.div_ceil(num_threads).max(min_neurons).min(n3) + 3) & !3;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let start1 = task_id * chunk1;
+                        if start1 < n1 {
+                            let end1 = (start1 + chunk1).min(n1);
+                            let sl1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(start1),
+                                    end1 - start1,
+                                )
+                            };
+                            q4_gemv_body_il(
+                                sl1,
+                                start1,
                                 end1 - start1,
-                            )
-                        };
-                        q4_gemv_body_inline(
-                            slice1,
-                            start1,
-                            end1 - start1,
-                            &inp_quants,
-                            &inp_scales,
-                            &w1.data,
-                            &w1.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                    let start2 = task_id * chunk2;
-                    if start2 < n2 {
-                        let end2 = (start2 + chunk2).min(n2);
-                        let slice2 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out2_addr as *mut f32).add(start2),
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                num_blocks,
+                            );
+                        }
+                        let start2 = task_id * chunk2;
+                        if start2 < n2 {
+                            let end2 = (start2 + chunk2).min(n2);
+                            let sl2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(start2),
+                                    end2 - start2,
+                                )
+                            };
+                            q4_gemv_body_il(
+                                sl2,
+                                start2,
                                 end2 - start2,
-                            )
-                        };
-                        q4_gemv_body_inline(
-                            slice2,
-                            start2,
-                            end2 - start2,
-                            &inp_quants,
-                            &inp_scales,
-                            &w2.data,
-                            &w2.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                    let start3 = task_id * chunk3;
-                    if start3 < n3 {
-                        let end3 = (start3 + chunk3).min(n3);
-                        let slice3 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out3_addr as *mut f32).add(start3),
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                num_blocks,
+                            );
+                        }
+                        let start3 = task_id * chunk3;
+                        if start3 < n3 {
+                            let end3 = (start3 + chunk3).min(n3);
+                            let sl3 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out3_addr as *mut f32).add(start3),
+                                    end3 - start3,
+                                )
+                            };
+                            q4_gemv_body_il(
+                                sl3,
+                                start3,
                                 end3 - start3,
-                            )
-                        };
-                        q4_gemv_body_inline(
-                            slice3,
-                            start3,
-                            end3 - start3,
-                            &inp_quants,
-                            &inp_scales,
-                            &w3.data,
-                            &w3.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                });
+                                &inp_quants,
+                                &inp_scales,
+                                &w3.data,
+                                num_blocks,
+                            );
+                        }
+                    });
+                }
+            } else {
+                let bpr = num_blocks * (QUANTIZATION_BLOCK_SIZE / 2);
+                if n1 < num_threads * min_neurons
+                    && n2 < num_threads * min_neurons
+                    && n3 < num_threads * min_neurons
+                {
+                    q4_gemv_body_inline(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        &w1.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                    q4_gemv_body_inline(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        &w2.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                    q4_gemv_body_inline(
+                        &mut out3,
+                        0,
+                        n3,
+                        &inp_quants,
+                        &inp_scales,
+                        &w3.data,
+                        &w3.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
+                    let chunk3 = (n3.div_ceil(num_threads).max(min_neurons).min(n3) + 1) & !1;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let start1 = task_id * chunk1;
+                        if start1 < n1 {
+                            let end1 = (start1 + chunk1).min(n1);
+                            let sl1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(start1),
+                                    end1 - start1,
+                                )
+                            };
+                            q4_gemv_body_inline(
+                                sl1,
+                                start1,
+                                end1 - start1,
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                &w1.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                        let start2 = task_id * chunk2;
+                        if start2 < n2 {
+                            let end2 = (start2 + chunk2).min(n2);
+                            let sl2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(start2),
+                                    end2 - start2,
+                                )
+                            };
+                            q4_gemv_body_inline(
+                                sl2,
+                                start2,
+                                end2 - start2,
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                &w2.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                        let start3 = task_id * chunk3;
+                        if start3 < n3 {
+                            let end3 = (start3 + chunk3).min(n3);
+                            let sl3 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out3_addr as *mut f32).add(start3),
+                                    end3 - start3,
+                                )
+                            };
+                            q4_gemv_body_inline(
+                                sl3,
+                                start3,
+                                end3 - start3,
+                                &inp_quants,
+                                &inp_scales,
+                                &w3.data,
+                                &w3.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                    });
+                }
             }
         }
         DType::Q8_0 => {
-            let bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
-
-            if n1 < num_threads * min_neurons
-                && n2 < num_threads * min_neurons
-                && n3 < num_threads * min_neurons
-            {
-                q8_gemv_body_inline(
-                    &mut out1,
-                    0,
-                    n1,
-                    &inp_quants,
-                    &inp_scales,
-                    &w1.data,
-                    &w1.scales,
-                    num_blocks,
-                    bpr,
-                );
-                q8_gemv_body_inline(
-                    &mut out2,
-                    0,
-                    n2,
-                    &inp_quants,
-                    &inp_scales,
-                    &w2.data,
-                    &w2.scales,
-                    num_blocks,
-                    bpr,
-                );
-                q8_gemv_body_inline(
-                    &mut out3,
-                    0,
-                    n3,
-                    &inp_quants,
-                    &inp_scales,
-                    &w3.data,
-                    &w3.scales,
-                    num_blocks,
-                    bpr,
-                );
+            if w1.interleaved {
+                if n1 < num_threads * min_neurons
+                    && n2 < num_threads * min_neurons
+                    && n3 < num_threads * min_neurons
+                {
+                    q8_gemv_body_il(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        num_blocks,
+                    );
+                    q8_gemv_body_il(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        num_blocks,
+                    );
+                    q8_gemv_body_il(
+                        &mut out3,
+                        0,
+                        n3,
+                        &inp_quants,
+                        &inp_scales,
+                        &w3.data,
+                        num_blocks,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 3) & !3;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 3) & !3;
+                    let chunk3 = (n3.div_ceil(num_threads).max(min_neurons).min(n3) + 3) & !3;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let s1 = task_id * chunk1;
+                        if s1 < n1 {
+                            let e1 = (s1 + chunk1).min(n1);
+                            let sl1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(s1),
+                                    e1 - s1,
+                                )
+                            };
+                            q8_gemv_body_il(
+                                sl1,
+                                s1,
+                                e1 - s1,
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                num_blocks,
+                            );
+                        }
+                        let s2 = task_id * chunk2;
+                        if s2 < n2 {
+                            let e2 = (s2 + chunk2).min(n2);
+                            let sl2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(s2),
+                                    e2 - s2,
+                                )
+                            };
+                            q8_gemv_body_il(
+                                sl2,
+                                s2,
+                                e2 - s2,
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                num_blocks,
+                            );
+                        }
+                        let s3 = task_id * chunk3;
+                        if s3 < n3 {
+                            let e3 = (s3 + chunk3).min(n3);
+                            let sl3 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out3_addr as *mut f32).add(s3),
+                                    e3 - s3,
+                                )
+                            };
+                            q8_gemv_body_il(
+                                sl3,
+                                s3,
+                                e3 - s3,
+                                &inp_quants,
+                                &inp_scales,
+                                &w3.data,
+                                num_blocks,
+                            );
+                        }
+                    });
+                }
             } else {
-                let chunk1 = ((n1 / num_threads).max(min_neurons).min(n1) + 1) & !1;
-                let chunk2 = ((n2 / num_threads).max(min_neurons).min(n2) + 1) & !1;
-                let chunk3 = ((n3 / num_threads).max(min_neurons).min(n3) + 1) & !1;
-                let out1_addr = ptr_to_usize(out1.as_mut_ptr());
-                let out2_addr = ptr_to_usize(out2.as_mut_ptr());
-                let out3_addr = ptr_to_usize(out3.as_mut_ptr());
-
-                pool.dispatch(num_threads, |task_id, _| {
-                    let start1 = task_id * chunk1;
-                    if start1 < n1 {
-                        let end1 = (start1 + chunk1).min(n1);
-                        let slice1 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out1_addr as *mut f32).add(start1),
+                let bpr = num_blocks * QUANTIZATION_BLOCK_SIZE;
+                if n1 < num_threads * min_neurons
+                    && n2 < num_threads * min_neurons
+                    && n3 < num_threads * min_neurons
+                {
+                    q8_gemv_body_inline(
+                        &mut out1,
+                        0,
+                        n1,
+                        &inp_quants,
+                        &inp_scales,
+                        &w1.data,
+                        &w1.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                    q8_gemv_body_inline(
+                        &mut out2,
+                        0,
+                        n2,
+                        &inp_quants,
+                        &inp_scales,
+                        &w2.data,
+                        &w2.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                    q8_gemv_body_inline(
+                        &mut out3,
+                        0,
+                        n3,
+                        &inp_quants,
+                        &inp_scales,
+                        &w3.data,
+                        &w3.scales,
+                        num_blocks,
+                        bpr,
+                    );
+                } else {
+                    let chunk1 = (n1.div_ceil(num_threads).max(min_neurons).min(n1) + 1) & !1;
+                    let chunk2 = (n2.div_ceil(num_threads).max(min_neurons).min(n2) + 1) & !1;
+                    let chunk3 = (n3.div_ceil(num_threads).max(min_neurons).min(n3) + 1) & !1;
+                    let out1_addr = ptr_to_usize(out1.as_mut_ptr());
+                    let out2_addr = ptr_to_usize(out2.as_mut_ptr());
+                    let out3_addr = ptr_to_usize(out3.as_mut_ptr());
+                    pool.dispatch(num_threads, |task_id, _| {
+                        let start1 = task_id * chunk1;
+                        if start1 < n1 {
+                            let end1 = (start1 + chunk1).min(n1);
+                            let slice1 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out1_addr as *mut f32).add(start1),
+                                    end1 - start1,
+                                )
+                            };
+                            q8_gemv_body_inline(
+                                slice1,
+                                start1,
                                 end1 - start1,
-                            )
-                        };
-                        q8_gemv_body_inline(
-                            slice1,
-                            start1,
-                            end1 - start1,
-                            &inp_quants,
-                            &inp_scales,
-                            &w1.data,
-                            &w1.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                    let start2 = task_id * chunk2;
-                    if start2 < n2 {
-                        let end2 = (start2 + chunk2).min(n2);
-                        let slice2 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out2_addr as *mut f32).add(start2),
+                                &inp_quants,
+                                &inp_scales,
+                                &w1.data,
+                                &w1.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                        let start2 = task_id * chunk2;
+                        if start2 < n2 {
+                            let end2 = (start2 + chunk2).min(n2);
+                            let slice2 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out2_addr as *mut f32).add(start2),
+                                    end2 - start2,
+                                )
+                            };
+                            q8_gemv_body_inline(
+                                slice2,
+                                start2,
                                 end2 - start2,
-                            )
-                        };
-                        q8_gemv_body_inline(
-                            slice2,
-                            start2,
-                            end2 - start2,
-                            &inp_quants,
-                            &inp_scales,
-                            &w2.data,
-                            &w2.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                    let start3 = task_id * chunk3;
-                    if start3 < n3 {
-                        let end3 = (start3 + chunk3).min(n3);
-                        let slice3 = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (out3_addr as *mut f32).add(start3),
+                                &inp_quants,
+                                &inp_scales,
+                                &w2.data,
+                                &w2.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                        let start3 = task_id * chunk3;
+                        if start3 < n3 {
+                            let end3 = (start3 + chunk3).min(n3);
+                            let slice3 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out3_addr as *mut f32).add(start3),
+                                    end3 - start3,
+                                )
+                            };
+                            q8_gemv_body_inline(
+                                slice3,
+                                start3,
                                 end3 - start3,
-                            )
-                        };
-                        q8_gemv_body_inline(
-                            slice3,
-                            start3,
-                            end3 - start3,
-                            &inp_quants,
-                            &inp_scales,
-                            &w3.data,
-                            &w3.scales,
-                            num_blocks,
-                            bpr,
-                        );
-                    }
-                });
+                                &inp_quants,
+                                &inp_scales,
+                                &w3.data,
+                                &w3.scales,
+                                num_blocks,
+                                bpr,
+                            );
+                        }
+                    });
+                }
             }
         }
         _ => {
@@ -1679,6 +2212,197 @@ fn quantized_linear_triple(
     ))
 }
 
+/// Q8_0 GEMV body using 4-row-interleaved weight format.
+///
+/// `neuron_offset` and `chunk_len` should be multiples of 4 for best performance.
+/// Falls back to scalar for any remainder.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn q8_gemv_body_il(
+    chunk: &mut [f32],
+    neuron_offset: usize,
+    chunk_len: usize,
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    weight_il: &[u8],
+    nb: usize,
+) {
+    let bpr_il = nb * 136;
+    let start_group = neuron_offset / 4;
+    let quads = chunk_len / 4;
+    for g in 0..quads {
+        let gg = start_group + g;
+        let il_data = &weight_il[gg * bpr_il..(gg + 1) * bpr_il];
+        let (d0, d1, d2, d3) = simd::dot_q8_q8_4row_il(inp_quants, inp_scales, il_data);
+        chunk[g * 4] = d0;
+        chunk[g * 4 + 1] = d1;
+        chunk[g * 4 + 2] = d2;
+        chunk[g * 4 + 3] = d3;
+    }
+    let after_quads = quads * 4;
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    for (offset, out) in chunk[after_quads..chunk_len].iter_mut().enumerate() {
+        let i = after_quads + offset;
+        let neuron = neuron_offset + i;
+        let gg = neuron / 4;
+        let r = neuron % 4;
+        let il_data = &weight_il[gg * bpr_il..(gg + 1) * bpr_il];
+        let mut acc = 0.0f32;
+        for blk in 0..nb {
+            let wq_off = blk * 136 + r * 32;
+            let scale_off = blk * 136 + 128 + r * 2;
+            let wq = &il_data[wq_off..wq_off + 32];
+            let iq = &inp_quants[blk * 32..(blk + 1) * 32];
+            let dot: i32 = wq
+                .iter()
+                .zip(iq.iter())
+                .map(|(&w, &a)| {
+                    i32::from(i8::from_ne_bytes([w])) * i32::from(i8::from_ne_bytes([a]))
+                })
+                .sum();
+            let ws =
+                half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]]).to_f32();
+            acc += (dot as f32) * inp_scales[blk] * ws;
+        }
+        *out = acc;
+    }
+}
+
+/// Parallel GEMV for Q8_0 using 4-row-interleaved weight format.
+fn q8_gemv_parallel_il(
+    out: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    weight_il: &[u8],
+    nb: usize,
+) {
+    let n = out.len();
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
+    let min_neurons_per_task = 8;
+    if n < num_threads * min_neurons_per_task {
+        q8_gemv_body_il(out, 0, n, inp_quants, inp_scales, weight_il, nb);
+    } else {
+        let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
+        let chunk_size = (raw_chunk + 3) & !3;
+        let out_addr = ptr_to_usize(out.as_mut_ptr());
+        pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let ch = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            q8_gemv_body_il(
+                ch,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_il,
+                nb,
+            );
+        });
+    }
+}
+
+/// Q4_0 IL GEMV body: process `chunk_len` neurons (must be a multiple of 4) at `neuron_offset`.
+///
+/// Uses the unified 4-row-interleaved Q4_0 format (72 bytes/block: 64 quant + 8 f16 scales).
+#[allow(clippy::too_many_arguments)]
+fn q4_gemv_body_il(
+    chunk: &mut [f32],
+    neuron_offset: usize,
+    chunk_len: usize,
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    weight_il: &[u8],
+    nb: usize,
+) {
+    let bpr_il = nb * 72;
+    let start_group = neuron_offset / 4;
+    let quads = chunk_len / 4;
+    for g in 0..quads {
+        let gg = start_group + g;
+        let il_data = &weight_il[gg * bpr_il..(gg + 1) * bpr_il];
+        let (d0, d1, d2, d3) = simd::dot_q4_q8_4row_il(inp_quants, inp_scales, il_data);
+        chunk[g * 4] = d0;
+        chunk[g * 4 + 1] = d1;
+        chunk[g * 4 + 2] = d2;
+        chunk[g * 4 + 3] = d3;
+    }
+    // Remainder: scalar fallback for the last 0-3 neurons.
+    let after_quads = quads * 4;
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    for (offset, out) in chunk[after_quads..chunk_len].iter_mut().enumerate() {
+        let i = after_quads + offset;
+        let neuron = neuron_offset + i;
+        let gg = neuron / 4;
+        let r = neuron % 4;
+        let il_data = &weight_il[gg * bpr_il..(gg + 1) * bpr_il];
+        let mut acc = 0.0f32;
+        for blk in 0..nb {
+            let packed = &il_data[blk * 72 + r * 16..blk * 72 + r * 16 + 16];
+            let iq = &inp_quants[blk * 32..(blk + 1) * 32];
+            let dot: i32 = (0..16)
+                .map(|k| {
+                    let lo = i32::from(i8::from_ne_bytes([(packed[k] & 0x0F).wrapping_sub(8)]));
+                    let hi = i32::from(i8::from_ne_bytes([(packed[k] >> 4).wrapping_sub(8)]));
+                    lo * i32::from(i8::from_ne_bytes([iq[k]]))
+                        + hi * i32::from(i8::from_ne_bytes([iq[k + 16]]))
+                })
+                .sum();
+            let scale_off = blk * 72 + 64 + r * 2;
+            let ws =
+                half::f16::from_le_bytes([il_data[scale_off], il_data[scale_off + 1]]).to_f32();
+            acc += (dot as f32) * inp_scales[blk] * ws;
+        }
+        *out = acc;
+    }
+}
+
+/// Parallel GEMV for Q4_0 using unified 4-row-interleaved nibble format (72 bytes/block).
+fn q4_gemv_parallel_il(
+    out: &mut [f32],
+    inp_quants: &[u8],
+    inp_scales: &[f32],
+    weight_il: &[u8],
+    nb: usize,
+) {
+    let n = out.len();
+    let pool = crate::thread_pool::global_pool();
+    let num_threads = pool.num_threads();
+    let min_neurons_per_task = 8;
+    if n < num_threads * min_neurons_per_task {
+        q4_gemv_body_il(out, 0, n, inp_quants, inp_scales, weight_il, nb);
+    } else {
+        let raw_chunk = n.div_ceil(num_threads).max(min_neurons_per_task).min(n);
+        let chunk_size = (raw_chunk + 3) & !3;
+        let out_addr = ptr_to_usize(out.as_mut_ptr());
+        pool.dispatch(num_threads.min(n.div_ceil(chunk_size)), |task_id, _| {
+            let start = task_id * chunk_size;
+            let end = (start + chunk_size).min(n);
+            if start >= n {
+                return;
+            }
+            let ch = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), end - start)
+            };
+            q4_gemv_body_il(
+                ch,
+                start,
+                end - start,
+                inp_quants,
+                inp_scales,
+                weight_il,
+                nb,
+            );
+        });
+    }
+}
+
 /// Q4_0 GEMV body: process `chunk_len` neurons starting at `neuron_offset`.
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -1693,16 +2417,33 @@ fn q4_gemv_body_inline(
     num_blocks_per_row: usize,
     packed_bytes_per_row: usize,
 ) {
-    let pairs = chunk_len / 2;
-    let remainder = chunk_len % 2;
+    let quads = chunk_len / 4;
+    let after_quads = quads * 4;
 
-    for p in 0..pairs {
-        let n0 = neuron_offset + p * 2;
-        let n1 = n0 + 1;
+    for q in 0..quads {
+        let n0 = neuron_offset + q * 4;
+        let p_start = n0 * packed_bytes_per_row;
+        let s_start = n0 * num_blocks_per_row;
+        let (d0, d1, d2, d3) = simd::dot_q4_q8_4row(
+            inp_quants,
+            inp_scales,
+            &weight_packed[p_start..p_start + 4 * packed_bytes_per_row],
+            &weight_scales[s_start..s_start + 4 * num_blocks_per_row],
+        );
+        chunk[q * 4] = d0;
+        chunk[q * 4 + 1] = d1;
+        chunk[q * 4 + 2] = d2;
+        chunk[q * 4 + 3] = d3;
+    }
+
+    // Remainder: up to 3 neurons (handle as pairs then single)
+    let rem = chunk_len - after_quads;
+    if rem >= 2 {
+        let n0 = neuron_offset + after_quads;
         let p0 = n0 * packed_bytes_per_row;
-        let p1 = n1 * packed_bytes_per_row;
+        let p1 = (n0 + 1) * packed_bytes_per_row;
         let s0 = n0 * num_blocks_per_row;
-        let s1 = n1 * num_blocks_per_row;
+        let s1 = (n0 + 1) * num_blocks_per_row;
         let (d0, d1) = simd::dot_q4_q8_2row(
             inp_quants,
             inp_scales,
@@ -1711,15 +2452,14 @@ fn q4_gemv_body_inline(
             &weight_packed[p1..p1 + packed_bytes_per_row],
             &weight_scales[s1..s1 + num_blocks_per_row],
         );
-        chunk[p * 2] = d0;
-        chunk[p * 2 + 1] = d1;
+        chunk[after_quads] = d0;
+        chunk[after_quads + 1] = d1;
     }
-
-    if remainder > 0 {
-        let neuron = neuron_offset + pairs * 2;
+    if rem % 2 == 1 {
+        let neuron = neuron_offset + chunk_len - 1;
         let p_start = neuron * packed_bytes_per_row;
         let s_start = neuron * num_blocks_per_row;
-        chunk[pairs * 2] = simd::dot_q4_q8_row(
+        chunk[chunk_len - 1] = simd::dot_q4_q8_row(
             inp_quants,
             inp_scales,
             &weight_packed[p_start..p_start + packed_bytes_per_row],
@@ -1742,16 +2482,17 @@ fn q8_gemv_body_inline(
     num_blocks_per_row: usize,
     quant_bytes_per_row: usize,
 ) {
+    // Process 2 rows at a time: 6 concurrent streams (2 wq + 2 ws + 1 iq + 1 is)
+    // vs 4-row's 10 streams — the prefetcher handles ≤8 streams reliably,
+    // so 4-row causes cache-miss storms on L3-bound (large) weight matrices.
     let pairs = chunk_len / 2;
-    let remainder = chunk_len % 2;
 
     for p in 0..pairs {
         let n0 = neuron_offset + p * 2;
-        let n1 = n0 + 1;
         let q0 = n0 * quant_bytes_per_row;
-        let q1 = n1 * quant_bytes_per_row;
+        let q1 = (n0 + 1) * quant_bytes_per_row;
         let s0 = n0 * num_blocks_per_row;
-        let s1 = n1 * num_blocks_per_row;
+        let s1 = (n0 + 1) * num_blocks_per_row;
         let (d0, d1) = simd::dot_q8_q8_2row(
             inp_quants,
             inp_scales,
@@ -1764,14 +2505,15 @@ fn q8_gemv_body_inline(
         chunk[p * 2 + 1] = d1;
     }
 
-    if remainder > 0 {
-        let neuron = neuron_offset + pairs * 2;
-        let q_start = neuron * quant_bytes_per_row;
+    // Remainder: 0 or 1 neuron
+    if chunk_len % 2 == 1 {
+        let neuron = neuron_offset + chunk_len - 1;
+        let qw_start = neuron * quant_bytes_per_row;
         let s_start = neuron * num_blocks_per_row;
-        chunk[pairs * 2] = simd::dot_q8_q8_row(
+        chunk[chunk_len - 1] = simd::dot_q8_q8_row(
             inp_quants,
             inp_scales,
-            &weight_quants[q_start..q_start + quant_bytes_per_row],
+            &weight_quants[qw_start..qw_start + quant_bytes_per_row],
             &weight_scales[s_start..s_start + num_blocks_per_row],
         );
     }
@@ -1885,12 +2627,14 @@ impl MatmulOps for CpuBackend {
             }
         }
 
+        let il_data = repack_q8_to_il_unified(&qdata, &scales, n, num_blocks_per_row);
         Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
             shape: shape.to_vec(),
             dtype: DType::Q8_0,
-            data: qdata,
-            scales,
+            data: il_data,
+            scales: Vec::new(),
             mins: None,
+            interleaved: true,
         }))
     }
 
@@ -1924,19 +2668,41 @@ impl MatmulOps for CpuBackend {
                 )))
             }
             HostLinearWeight::Quantized(hq) => match hq.dtype {
-                DType::Q8_0 | DType::Q4_0 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
-                    shape: hq.shape.clone(),
-                    dtype: hq.dtype,
-                    data: hq.data.clone(),
-                    scales: crate::tensor::decode_f16_scales(&hq.scales),
-                    mins: None,
-                })),
+                DType::Q8_0 => {
+                    let n_rows = hq.shape[0];
+                    let nb = hq.shape[1] / QUANTIZATION_BLOCK_SIZE;
+                    let scales = crate::tensor::decode_f16_scales(&hq.scales);
+                    let il_data = repack_q8_to_il_unified(&hq.data, &scales, n_rows, nb);
+                    Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
+                        shape: hq.shape.clone(),
+                        dtype: DType::Q8_0,
+                        data: il_data,
+                        scales: Vec::new(),
+                        mins: None,
+                        interleaved: true,
+                    }))
+                }
+                DType::Q4_0 => {
+                    let n_rows = hq.shape[0];
+                    let nb = hq.shape[1] / QUANTIZATION_BLOCK_SIZE;
+                    let scales = crate::tensor::decode_f16_scales(&hq.scales);
+                    let il_data = repack_q4_to_il_unified(&hq.data, &scales, n_rows, nb);
+                    Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
+                        shape: hq.shape.clone(),
+                        dtype: DType::Q4_0,
+                        data: il_data,
+                        scales: Vec::new(),
+                        mins: None,
+                        interleaved: true,
+                    }))
+                }
                 DType::Q4_1 => Ok(CpuLinearWeight::Quantized(CpuQuantizedWeight {
                     shape: hq.shape.clone(),
                     dtype: hq.dtype,
                     data: hq.data.clone(),
                     scales: crate::tensor::decode_f16_scales(&hq.scales),
                     mins: hq.qzeros.as_deref().map(crate::tensor::decode_f16_scales),
+                    interleaved: false,
                 })),
                 other => Err(infernum::Error::UnsupportedDtype(format!(
                     "CPU backend does not support {other} quantized weights"
@@ -2210,6 +2976,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2255,6 +3022,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2335,6 +3103,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: Some(qmins),
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2387,6 +3156,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         });
 
         let input = CpuTensor::from_f32(&[1, k], &input_f32);
@@ -2425,6 +3195,7 @@ mod tests {
             data: qdata,
             scales: qscales,
             mins: None,
+            interleaved: false,
         };
 
         let input = CpuTensor::from_f32(&[2, k], &input_f32);
@@ -2443,6 +3214,54 @@ mod tests {
                 "Q8 GEMM element {i}: got {}, expected {}, rel_err {rel_err}",
                 result[i],
                 expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_quantized_linear_q8_gemm_tiled() {
+        // M=8, N=12, K=64: exercises exactly 2 M-tiles × 2 N-tiles of the 4×6 kernel.
+        let m = 8;
+        let n = 12;
+        let k = 64;
+        let weight_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 - 32.0) * 0.01).collect();
+        let input_f32: Vec<f32> = (0..m * k).map(|i| (i as f32 - 16.0) * 0.02).collect();
+
+        let mut expected = vec![0.0f32; m * n];
+        for row in 0..m {
+            for neuron in 0..n {
+                for j in 0..k {
+                    expected[row * n + neuron] +=
+                        input_f32[row * k + j] * weight_f32[neuron * k + j];
+                }
+            }
+        }
+
+        let (qdata, qscales) = manual_quantize_q8(&weight_f32);
+        let qweight = CpuQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            data: qdata,
+            scales: qscales,
+            mins: None,
+            interleaved: false,
+        };
+
+        let input = CpuTensor::from_f32(&[m, k], &input_f32);
+        let out = quantized_linear(&input, &qweight).unwrap();
+        assert_eq!(out.shape(), &[m, n]);
+
+        let result = out.as_f32_slice();
+        for i in 0..m * n {
+            let rel_err = if expected[i].abs() > 1e-6 {
+                (result[i] - expected[i]).abs() / expected[i].abs()
+            } else {
+                (result[i] - expected[i]).abs()
+            };
+            assert!(
+                rel_err < 0.04,
+                "Q8 tiled GEMM element {i} (row={}, col={}): got {}, expected {}, rel_err {rel_err}",
+                i / n, i % n, result[i], expected[i]
             );
         }
     }

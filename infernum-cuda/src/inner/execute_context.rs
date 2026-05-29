@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaDevice, CudaSlice};
+use half::bf16;
 use infernum::backend::{ContextBackend, MlaAttentionOps};
 use infernum::graph::builtin_ops::MlaAttentionOp;
 use infernum::graph::execute_context::{ExecuteContext, KvCacheAccess};
@@ -32,15 +33,15 @@ use crate::CudaBackend;
 /// graph in this fixed order:
 ///
 /// 0. `token_ids`   — `[batch_size]` U32
-/// 1. `cos`         — `[batch_size, half_dim]` F32
-/// 2. `sin`         — `[batch_size, half_dim]` F32
+/// 1. `cos`         — `[batch_size, half_dim]` BF16
+/// 2. `sin`         — `[batch_size, half_dim]` BF16
 /// 3. `block_table` — `[batch_size, max_blocks_per_seq]` U32
 /// 4. `positions`   — `[batch_size]` U32
 /// 5. `seq_lens`    — `[batch_size]` U32
 pub struct GraphInputs {
     pub token_ids: CudaSlice<u32>,
-    pub cos: CudaSlice<f32>,
-    pub sin: CudaSlice<f32>,
+    pub cos: CudaSlice<bf16>,
+    pub sin: CudaSlice<bf16>,
     pub block_table: CudaSlice<u32>,
     pub positions: CudaSlice<u32>,
     pub seq_lens: CudaSlice<u32>,
@@ -75,8 +76,8 @@ impl GraphInputs {
     ) -> Result<Self> {
         Ok(Self {
             token_ids: device.alloc_zeros::<u32>(batch_size)?,
-            cos: device.alloc_zeros::<f32>(batch_size * half_dim)?,
-            sin: device.alloc_zeros::<f32>(batch_size * half_dim)?,
+            cos: device.alloc_zeros::<bf16>(batch_size * half_dim)?,
+            sin: device.alloc_zeros::<bf16>(batch_size * half_dim)?,
             block_table: device.alloc_zeros::<u32>(batch_size * max_blocks_per_seq)?,
             positions: device.alloc_zeros::<u32>(batch_size)?,
             seq_lens: device.alloc_zeros::<u32>(batch_size)?,

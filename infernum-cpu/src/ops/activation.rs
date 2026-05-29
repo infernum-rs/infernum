@@ -10,6 +10,9 @@ use crate::CpuBackend;
 
 impl SwigluOps for CpuBackend {
     fn swiglu(gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
+        // For decode (n ≈ 2560) the dispatch overhead exceeds the compute; only
+        // parallelize for prefill-sized tensors where n is large enough to amortize.
+        const MIN_PARALLEL: usize = 32_768;
         let gate_data = gate.as_f32_slice();
         let up_data = up.as_f32_slice();
         assert_eq!(
@@ -17,21 +20,44 @@ impl SwigluOps for CpuBackend {
             up_data.len(),
             "swiglu: gate and up sizes differ"
         );
-        let mut out = vec![0.0f32; gate_data.len()];
-        simd::vec_silu_mul(gate_data, up_data, &mut out);
-        Ok(CpuTensor::from_f32(gate.shape(), &out))
-    }
-}
+        let n = gate_data.len();
+        // SAFETY: every element is written by vec_silu_mul before it is read.
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<f32> = {
+            let mut v = Vec::with_capacity(n);
+            unsafe { v.set_len(n) };
+            v
+        };
 
-/// GELU activation (approximate): 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-fn gelu_approx(x: f32) -> f32 {
-    let coeff = 0.797_884_6; // sqrt(2/π)
-    let inner = coeff * x.mul_add(0.044_715 * x * x, x);
-    0.5 * x * (1.0 + inner.tanh())
+        let pool = crate::thread_pool::global_pool();
+        let num_threads = pool.num_threads();
+        if n < MIN_PARALLEL {
+            simd::vec_silu_mul(gate_data, up_data, &mut out);
+        } else {
+            let chunk = n.div_ceil(num_threads);
+            let out_addr = out.as_mut_ptr() as usize;
+            pool.dispatch(num_threads, |task_id, _| {
+                let start = task_id * chunk;
+                if start < n {
+                    let end = (start + chunk).min(n);
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out_addr as *mut f32).add(start),
+                            end - start,
+                        )
+                    };
+                    simd::vec_silu_mul(&gate_data[start..end], &up_data[start..end], out_slice);
+                }
+            });
+        }
+
+        Ok(CpuTensor::from_f32_vec(gate.shape(), out))
+    }
 }
 
 impl GegluOps for CpuBackend {
     fn geglu(gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
+        const MIN_PARALLEL: usize = 32_768;
         let gate_data = gate.as_f32_slice();
         let up_data = up.as_f32_slice();
         assert_eq!(
@@ -39,10 +65,37 @@ impl GegluOps for CpuBackend {
             up_data.len(),
             "geglu: gate and up sizes differ"
         );
-        let mut out = vec![0.0f32; gate_data.len()];
-        for i in 0..gate_data.len() {
-            out[i] = gelu_approx(gate_data[i]) * up_data[i];
+        let n = gate_data.len();
+        // SAFETY: every element is written by vec_gelu_mul before it is read.
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<f32> = {
+            let mut v = Vec::with_capacity(n);
+            unsafe { v.set_len(n) };
+            v
+        };
+
+        let pool = crate::thread_pool::global_pool();
+        let num_threads = pool.num_threads();
+        if n < MIN_PARALLEL {
+            simd::vec_gelu_mul(gate_data, up_data, &mut out);
+        } else {
+            let chunk = n.div_ceil(num_threads);
+            let out_addr = out.as_mut_ptr() as usize;
+            pool.dispatch(num_threads, |task_id, _| {
+                let start = task_id * chunk;
+                if start < n {
+                    let end = (start + chunk).min(n);
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out_addr as *mut f32).add(start),
+                            end - start,
+                        )
+                    };
+                    simd::vec_gelu_mul(&gate_data[start..end], &up_data[start..end], out_slice);
+                }
+            });
         }
-        Ok(CpuTensor::from_f32(gate.shape(), &out))
+
+        Ok(CpuTensor::from_f32_vec(gate.shape(), out))
     }
 }
