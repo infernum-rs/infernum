@@ -18,9 +18,9 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 100.3 | 226.7 | 0.44x | 2026-05-25 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 92.1 | 184.4 | 0.50x | 2026-05-25 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 39.0 | — | — | 2026-05-25 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 98.5 | 226.7 | 0.43x | 2026-05-29 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 92.3 | 184.4 | 0.50x | 2026-05-29 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 39.2 | — | — | 2026-05-29 |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.9 | — | — | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q8_0 | 20.9 | 29.1 | 0.72x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
@@ -45,6 +45,34 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 ---
 
 ## History
+
+---
+
+## 2026-05-29 — Vectorized cooperative GEMV + f32 SwiGLU kernels (no measurable gain)
+
+- **Chip:** Apple M3 Pro (18 GB unified memory)
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **Prefill tokens:** 512
+- **infernum commit:** (this PR)
+- **Date:** 2026-05-29
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 92.1 | 92.3 | ~0% (noise) |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 100.3 | 98.5 | ~0% (noise) |
+| Llama / SmolLM2-360M | SafeTensors F32 | 39.0 | 39.2 | ~0% (noise) |
+
+### Changes
+
+1. **Cooperative GEMV inner loop vectorization** — replaced 8-iteration scalar `yl[j] * float(qs[j])` FMA loops with `float4`/`half4` input loads and `dot(float4, float4)` intrinsics for Q8_0 and Q4_0 (both f16 and f32 input variants). Better ILP in theory; no measured effect because the cooperative GEMV is already memory-bandwidth-bound. The kernel reads 34 bytes/block (Q8_0) or 18 bytes/block (Q4_0) from device memory; `dot()` saves compute cycles but the GPU already idles waiting for the load.
+
+2. **F32 SwiGLU-fused down-proj kernels** (`gemv_swiglu_q8_blocks_f32`, `gemv_swiglu_q4_blocks_f32`) — mirror of the existing f16 kernels but with float4 input loads and `silu_f`. Updated Rust dispatch (`swiglu_linear`) to route f32 gate_up through the fused path. No measured effect because `swiglu_linear` is called from `transformer.rs::forward_mlp` (the eager non-graph path), and the Metal bench uses `MetalGraphEngine` which dispatches `SwigluOp` as a separate graph node. The kernels are correct and will be useful when graph-level SwiGLU+down-proj fusion is implemented.
+
+### Root cause analysis
+
+After profiling (42.2% GEMV, 14.2% rmsnorm, 13.3% add, 8.5% flash_attn, 7.3% kv_append, 6.9% rope, 6.8% swiglu), the non-GEMV ops total 5.4 ms/token on 960-dim vectors. The bottleneck for all small-dim ops (rmsnorm, add, swiglu) is Metal kernel dispatch overhead (~20 µs/dispatch, 430 dispatches/token). The remaining gap vs llama.cpp requires graph-level fusion of adjacent ops (add+rmsnorm, rope+kv_append, swiglu+down_proj) to eliminate dispatches, not kernel-level compute optimizations.
 
 ---
 

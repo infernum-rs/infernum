@@ -803,8 +803,11 @@ impl MatmulOps for MetalBackend {
         let MetalLinearWeight::Quantized(w) = down_proj else {
             return None;
         };
-        // Only support Q8_0/Q4_0 with f16 input (quantized decode pipeline)
-        if gate_up.dtype() != DType::F16 || !matches!(w.dtype, DType::Q8_0 | DType::Q4_0) {
+        // Support Q8_0/Q4_0 with f16 or f32 input (quantized decode pipeline)
+        let inp_dtype = gate_up.dtype();
+        if !matches!(inp_dtype, DType::F16 | DType::F32)
+            || !matches!(w.dtype, DType::Q8_0 | DType::Q4_0)
+        {
             return None;
         }
         let m = gate_up.numel() / (2 * intermediate_size);
@@ -814,7 +817,7 @@ impl MatmulOps for MetalBackend {
 
         let n = w.shape[0]; // out_features (hidden_size)
         let ctx = gate_up.context();
-        let out = MetalTensor::zeros(ctx, &[1, n], DType::F16);
+        let out = MetalTensor::zeros(ctx, &[1, n], inp_dtype);
 
         let params = QuantizedLinearParams {
             n: n as u32,
@@ -822,14 +825,24 @@ impl MatmulOps for MetalBackend {
         };
 
         if let Some(blocks_buf) = &w.blocks {
-            let (kernel, rows_per_tg, threads_per_tg) = match w.dtype {
-                DType::Q8_0 => (
+            let (kernel, rows_per_tg, threads_per_tg) = match (w.dtype, inp_dtype) {
+                (DType::Q8_0, DType::F16) => (
                     "gemv_swiglu_q8_blocks_f16",
                     Q8B_ROWS_PER_TG,
                     Q8B_THREADS_PER_TG,
                 ),
-                DType::Q4_0 => (
+                (DType::Q8_0, DType::F32) => (
+                    "gemv_swiglu_q8_blocks_f32",
+                    Q8B_ROWS_PER_TG,
+                    Q8B_THREADS_PER_TG,
+                ),
+                (DType::Q4_0, DType::F16) => (
                     "gemv_swiglu_q4_blocks_f16",
+                    Q4B_ROWS_PER_TG,
+                    Q4B_THREADS_PER_TG,
+                ),
+                (DType::Q4_0, DType::F32) => (
+                    "gemv_swiglu_q4_blocks_f32",
                     Q4B_ROWS_PER_TG,
                     Q4B_THREADS_PER_TG,
                 ),
