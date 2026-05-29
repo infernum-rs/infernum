@@ -34,8 +34,12 @@ impl MetalGraphEngineConfig for LlamaConfig {
     }
 
     fn build_prefill_graph_metal(&self, seq_len: usize) -> Graph<infernum_metal::MetalBackend> {
+        // use_qkv_fusion=true ensures the CONCAT weight is registered at the same
+        // index as in the decode graph so both graphs share one WeightStore.
+        let mut cfg = self.clone();
+        cfg.use_qkv_fusion = true;
         let (graph, _) = build_prefill_graph::<infernum_metal::MetalBackend>(
-            self,
+            &cfg,
             seq_len,
             DType::F32,
             None,
@@ -50,8 +54,10 @@ impl MetalGraphEngineConfig for LlamaConfig {
         block_size: usize,
         max_blocks_per_seq: usize,
     ) -> Graph<infernum_metal::MetalBackend> {
+        let mut cfg = self.clone();
+        cfg.use_qkv_fusion = true;
         build_paged_decode_graph::<infernum_metal::MetalBackend>(
-            self,
+            &cfg,
             batch_size,
             block_size,
             max_blocks_per_seq,
@@ -125,6 +131,59 @@ fn load_llama_graph_weights_gguf_metal(
         let meta = graph.linear_weight_meta(WeightId::from_index(
             u32::try_from(i).expect("weight count exceeds u32"),
         ));
+
+        // CONCAT: "CONCAT:q_name,k_name,v_name" — load and concat Q/K/V block buffers.
+        if let Some(names_str) = meta.name.strip_prefix("CONCAT:") {
+            use infernum_metal::MetalQuantizedWeight;
+            let safetensors_names: Vec<&str> = names_str.split(',').collect();
+            let mut components: Vec<MetalQuantizedWeight> = Vec::new();
+            let mut all_quantized = true;
+            for st_name in &safetensors_names {
+                let g_name = safetensors_to_gguf_name(st_name.trim());
+                let dtype = FormatLoader::get_dtype(&loader, &g_name)?;
+                if !dtype.is_quantized() {
+                    all_quantized = false;
+                    break;
+                }
+                let n_head = if needs_unpermute(&g_name) {
+                    if g_name.contains("attn_q") {
+                        num_attention_heads
+                    } else {
+                        num_key_value_heads
+                    }
+                } else {
+                    0
+                };
+                let host_q = if n_head > 0 {
+                    FormatLoader::load_quantized_unpermute(&loader, &g_name, n_head)?
+                } else {
+                    FormatLoader::load_quantized(&loader, &g_name)?
+                };
+                let linear =
+                    MetalBackend::upload_host_linear(ctx, &HostLinearWeight::Quantized(host_q))?;
+                if let MetalLinearWeight::Quantized(q) = linear {
+                    components.push(q);
+                } else {
+                    all_quantized = false;
+                    break;
+                }
+            }
+            if all_quantized && components.len() == safetensors_names.len() {
+                let mut result = components.remove(0);
+                for comp in components {
+                    result = MetalQuantizedWeight::concat_rows(&result, &comp);
+                }
+                store.push_linear_weight(MetalLinearWeight::Quantized(result));
+            } else {
+                // Fallback: use first component (graph will skip qkv path for non-quantized).
+                let g_name = safetensors_to_gguf_name(safetensors_names[0].trim());
+                let host_linear =
+                    HostLinearWeight::Quantized(FormatLoader::load_quantized(&loader, &g_name)?);
+                store.push_linear_weight(MetalBackend::upload_host_linear(ctx, &host_linear)?);
+            }
+            continue;
+        }
+
         let gguf_name = safetensors_to_gguf_name(&meta.name);
 
         let actual_name = if loader.contains(&gguf_name) {
@@ -211,7 +270,10 @@ impl LlamaMetalGraphEngineExt for LlamaMetalGraphEngine {
         let loader =
             infernum::weights::gguf::GgufLoader::from_file(infernum::path_to_utf8(gguf_path)?)?;
         let config = LlamaConfig::from_gguf_metadata(loader.metadata())?;
-        let dummy_graph = config.build_prefill_graph_metal(1);
+        // Use decode dummy graph so CONCAT/QKV-fusion weight indices match.
+        let mut qkv_config = config.clone();
+        qkv_config.use_qkv_fusion = true;
+        let dummy_graph = qkv_config.build_paged_decode_graph_metal(1, 16, 1);
         let weights = load_llama_graph_weights_gguf_metal(
             &dummy_graph,
             &ctx,

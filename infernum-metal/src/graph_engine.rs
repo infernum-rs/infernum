@@ -214,7 +214,10 @@ impl<C: MetalGraphEngineConfig> MetalGraphEngine<C> {
     /// Returns an error if the directory is missing or weights cannot be
     /// loaded.
     pub fn from_config_and_dir(config: C, ctx: MetalContext, model_dir: &Path) -> Result<Self> {
-        let dummy_graph = config.build_prefill_graph_metal(1);
+        // Use the decode dummy graph so that CONCAT/QKV-fusion weights are
+        // included in the store. Prefill uses individual q/k/v WeightIds (same
+        // indices); decode uses the extra qkv_concat WeightId. Both are correct.
+        let dummy_graph = config.build_paged_decode_graph_metal(1, 16, 1);
         let weights = config.load_weights_metal_safetensors(&dummy_graph, &ctx, model_dir)?;
         let half_dim = config.head_dim() / 2;
         Ok(Self {

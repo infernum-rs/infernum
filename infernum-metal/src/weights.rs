@@ -381,9 +381,58 @@ impl WeightLoader<MetalBackend> for MetalSafeTensorsLoader {
     fn load_linear(
         &self,
         name: &str,
-        _model_dtype: DType,
-        _quant_config: Option<&QuantizationConfig>,
+        model_dtype: DType,
+        quant_config: Option<&QuantizationConfig>,
     ) -> Result<MetalLinearWeight> {
+        // CONCAT: row-concatenate multiple SafeTensors weights into one.
+        // Used for QKV fusion: Q+K+V → single weight for one GEMV per layer.
+        if let Some(names_str) = name.strip_prefix("CONCAT:") {
+            let component_names: Vec<&str> = names_str.split(',').collect();
+            // Load raw F32 data for each component (out_feat, in_feat) each.
+            let mut parts: Vec<(Vec<f32>, usize, usize)> = Vec::new();
+            for comp in &component_names {
+                let (data, src_dtype, shape) = self.load_raw(comp.trim())?;
+                let out_feat = shape[0];
+                let in_feat = shape[1];
+                let f32_data: Vec<f32> = match src_dtype {
+                    DType::F32 => bytemuck::cast_slice(data).to_vec(),
+                    DType::BF16 => {
+                        let bf16s: &[half::bf16] = bytemuck::cast_slice(data);
+                        bf16s.iter().map(|v| v.to_f32()).collect()
+                    }
+                    DType::F16 => {
+                        let f16s: &[half::f16] = bytemuck::cast_slice(data);
+                        f16s.iter().map(|v| v.to_f32()).collect()
+                    }
+                    _ => {
+                        // Quantized dtype — can't fuse; fall back to first component.
+                        return self.load_linear(
+                            component_names[0].trim(),
+                            model_dtype,
+                            quant_config,
+                        );
+                    }
+                };
+                parts.push((f32_data, out_feat, in_feat));
+            }
+            let in_features = parts[0].2;
+            let out_total: usize = parts.iter().map(|p| p.1).sum();
+            // Transpose all components jointly: (out_total, K) → (K, out_total).
+            let mut transposed = vec![0.0f32; in_features * out_total];
+            let mut out_offset = 0usize;
+            for (f32_data, out_feat, _) in &parts {
+                for r in 0..*out_feat {
+                    for c in 0..in_features {
+                        transposed[c * out_total + out_offset + r] = f32_data[r * in_features + c];
+                    }
+                }
+                out_offset += out_feat;
+            }
+            let weight =
+                MetalTensor::from_f32(&self.context, &[in_features, out_total], &transposed);
+            return Ok(MetalLinearWeight::new_dense(weight));
+        }
+
         let (data, src_dtype, shape) = self.load_raw(name)?;
         let out_features = shape[0];
         let in_features = shape[1];
