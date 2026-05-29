@@ -53,6 +53,8 @@ fn main() {
                 "-sdk",
                 "macosx",
                 "metal",
+                "-O3",
+                "-ffast-math",
                 "-c",
                 metal_path.to_str().unwrap(),
                 "-o",
