@@ -40,7 +40,23 @@ const GEMV_V2_ROWS_PER_TG: u64 = GEMV_V2_NR * GEMV_V2_NSG;
 /// Threads per threadgroup for v2.
 const GEMV_V2_THREADS_PER_TG: u64 = GEMV_V2_NSG * SIMD_GROUP_SIZE;
 
-// --- GGUF native block-format GEMV (preferred path when blocks buffer is present) ---
+// --- GGUF native block-format GEMV: cooperative kernels (low register pressure) ---
+// Q8_0: NSG=4 SIMD groups cooperate on NR=8 rows; each lane handles 8 int8 elements.
+// Q4_0: NSG=2 SIMD groups cooperate on NR=8 rows; each lane handles 8 nibble elements.
+// Grid matches old non-cooperative kernels (ceil(N/8)); reduces regs 38→21/thread.
+const Q8B_COOP_NR: u64 = 8;
+const Q8B_COOP_NSG: u64 = 4;
+const Q8B_COOP_ROWS_PER_TG: u64 = Q8B_COOP_NR;
+const Q8B_COOP_THREADS_PER_TG: u64 = Q8B_COOP_NSG * SIMD_GROUP_SIZE;
+const Q8B_COOP_SHMEM: usize = (Q8B_COOP_NR * Q8B_COOP_NSG * 4) as usize; // 128 bytes
+
+const Q4B_COOP_NR: u64 = 8;
+const Q4B_COOP_NSG: u64 = 2;
+const Q4B_COOP_ROWS_PER_TG: u64 = Q4B_COOP_NR;
+const Q4B_COOP_THREADS_PER_TG: u64 = Q4B_COOP_NSG * SIMD_GROUP_SIZE;
+const Q4B_COOP_SHMEM: usize = (Q4B_COOP_NR * Q4B_COOP_NSG * 4) as usize; // 64 bytes
+
+// Legacy non-cooperative constants (used by swiglu_linear only)
 const Q8B_NR: u64 = 2;
 const Q8B_NSG: u64 = 4;
 const Q8B_ROWS_PER_TG: u64 = Q8B_NR * Q8B_NSG;
@@ -113,12 +129,13 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
             DType::Q8_0 => {
                 if let Some(blocks_buf) = &weight.blocks {
                     let kernel = if use_f16 {
-                        "gemv_q8_blocks_f16"
+                        "gemv_q8_blocks_coop_f16"
                     } else {
-                        "gemv_q8_blocks_f32"
+                        "gemv_q8_blocks_coop_f32"
                     };
-                    let threadgroups = MTLSize::new((n as u64).div_ceil(Q8B_ROWS_PER_TG), 1, 1);
-                    let threads_per_group = MTLSize::new(Q8B_THREADS_PER_TG, 1, 1);
+                    let threadgroups =
+                        MTLSize::new((n as u64).div_ceil(Q8B_COOP_ROWS_PER_TG), 1, 1);
+                    let threads_per_group = MTLSize::new(Q8B_COOP_THREADS_PER_TG, 1, 1);
                     ctx.dispatch_threadgroups(
                         kernel,
                         &[
@@ -129,7 +146,7 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
                         bytemuck::bytes_of(&params),
                         threadgroups,
                         threads_per_group,
-                        0,
+                        Q8B_COOP_SHMEM,
                     );
                 } else {
                     let kernel = if use_f16 {
@@ -158,12 +175,13 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
             DType::Q4_0 => {
                 if let Some(blocks_buf) = &weight.blocks {
                     let kernel = if use_f16 {
-                        "gemv_q4_blocks_f16"
+                        "gemv_q4_blocks_coop_f16"
                     } else {
-                        "gemv_q4_blocks_f32"
+                        "gemv_q4_blocks_coop_f32"
                     };
-                    let threadgroups = MTLSize::new((n as u64).div_ceil(Q4B_ROWS_PER_TG), 1, 1);
-                    let threads_per_group = MTLSize::new(Q4B_THREADS_PER_TG, 1, 1);
+                    let threadgroups =
+                        MTLSize::new((n as u64).div_ceil(Q4B_COOP_ROWS_PER_TG), 1, 1);
+                    let threads_per_group = MTLSize::new(Q4B_COOP_THREADS_PER_TG, 1, 1);
                     ctx.dispatch_threadgroups(
                         kernel,
                         &[
@@ -174,7 +192,7 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
                         bytemuck::bytes_of(&params),
                         threadgroups,
                         threads_per_group,
-                        0,
+                        Q4B_COOP_SHMEM,
                     );
                 } else {
                     let kernel = if use_f16 {

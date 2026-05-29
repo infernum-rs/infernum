@@ -1329,6 +1329,293 @@ kernel void gemv_q4_blocks_f32(
     }
 }
 
+// ==========================================================================
+// Cooperative GEMV kernels — split K across SIMD groups to reduce register
+// pressure from ~38 to ~21 regs/thread, increasing GPU occupancy.
+//
+// Q8_0: NSG=4 SIMD groups cooperate on NR=8 rows.
+//       Each lane handles NQ=8 int8 elements per block.
+//       Grid: ceil(N/8), threads=128, shmem=128 bytes.
+//       Same grid as old gemv_q8_blocks_f16; reduces regs 38→21.
+//
+// Q4_0: NSG=2 SIMD groups cooperate on NR=8 rows.
+//       Each lane handles 4 bytes (8 nibble elements) per block.
+//       Grid: ceil(N/8), threads=64, shmem=64 bytes.
+//       Same grid as old gemv_q4_blocks_f16; reduces regs 38→21.
+// ==========================================================================
+
+constant constexpr uint Q8B_COOP_NR  = 8;
+constant constexpr uint Q8B_COOP_NSG = 4;
+constant constexpr uint Q8B_COOP_NQ  = 8;
+// shmem: NR * NSG floats = 8 * 4 * 4 = 128 bytes
+
+// ix = tiisg / 4  → which of the 8 block-slots this lane owns (0..7)
+// il = tiisg % 4  → which 8-element segment within the block (0..3)
+// SIMD group sgitg starts at block ib0 = sgitg*8 + ix, steps by NSG*NQ=32
+
+kernel void gemv_q8_blocks_coop_f16(
+    device const half*              input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device half*                    output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    threadgroup float*              shmem  [[threadgroup(0)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint sgitg    [[simdgroup_index_in_threadgroup]],
+    uint tiisg    [[thread_index_in_simdgroup]])
+{
+    const uint row_base = group_id * Q8B_COOP_NR;
+    const uint nb = params.K / 32;
+    const uint block_stride = nb * Q8_BLOCK_BYTES;
+
+    const uint ix = tiisg >> 2;   // tiisg / 4, range 0..7
+    const uint il = tiisg & 3;    // tiisg % 4, range 0..3
+    const uint ib0 = sgitg * Q8B_COOP_NQ + ix;
+
+    float sumf[Q8B_COOP_NR] = {0.0f};
+
+    for (uint ib = ib0; ib < nb; ib += Q8B_COOP_NSG * Q8B_COOP_NQ) {
+        // Load 8 input elements for this lane's segment of the block
+        const uint inp_off = ib * 32 + il * Q8B_COOP_NQ;
+        device const half* inp_ptr = input + inp_off;
+        float yl[Q8B_COOP_NQ];
+        for (uint j = 0; j < Q8B_COOP_NQ; j++) yl[j] = float(inp_ptr[j]);
+
+        for (uint r = 0; r < Q8B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + ib * Q8_BLOCK_BYTES;
+            const float scale = float(as_type<half>(*(device const ushort*)blk));
+            device const char* qs = (device const char*)(blk + 2 + il * Q8B_COOP_NQ);
+
+            float sumq = 0.0f;
+            for (uint j = 0; j < Q8B_COOP_NQ; j++) sumq += yl[j] * float(qs[j]);
+            sumf[r] += sumq * scale;
+        }
+    }
+
+    // Intra-SIMD-group reduce (all 32 lanes → single value per row)
+    for (uint r = 0; r < Q8B_COOP_NR; r++) sumf[r] = simd_sum(sumf[r]);
+
+    // Lane 0 of each SIMD group writes to shmem for cross-group reduction
+    // shmem[r * NSG + sgitg] = partial sum for row r from SIMD group sgitg
+    if (tiisg == 0) {
+        for (uint r = 0; r < Q8B_COOP_NR; r++) shmem[r * Q8B_COOP_NSG + sgitg] = sumf[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Single thread aggregates and writes the final output
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint r = 0; r < Q8B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+            float total = 0.0f;
+            for (uint s = 0; s < Q8B_COOP_NSG; s++) total += shmem[r * Q8B_COOP_NSG + s];
+            output[neuron] = half(total);
+        }
+    }
+}
+
+kernel void gemv_q8_blocks_coop_f32(
+    device const float*             input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device float*                   output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    threadgroup float*              shmem  [[threadgroup(0)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint sgitg    [[simdgroup_index_in_threadgroup]],
+    uint tiisg    [[thread_index_in_simdgroup]])
+{
+    const uint row_base = group_id * Q8B_COOP_NR;
+    const uint nb = params.K / 32;
+    const uint block_stride = nb * Q8_BLOCK_BYTES;
+
+    const uint ix = tiisg >> 2;
+    const uint il = tiisg & 3;
+    const uint ib0 = sgitg * Q8B_COOP_NQ + ix;
+
+    float sumf[Q8B_COOP_NR] = {0.0f};
+
+    for (uint ib = ib0; ib < nb; ib += Q8B_COOP_NSG * Q8B_COOP_NQ) {
+        const uint inp_off = ib * 32 + il * Q8B_COOP_NQ;
+        device const float* inp_ptr = input + inp_off;
+        float yl[Q8B_COOP_NQ];
+        for (uint j = 0; j < Q8B_COOP_NQ; j++) yl[j] = inp_ptr[j];
+
+        for (uint r = 0; r < Q8B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + ib * Q8_BLOCK_BYTES;
+            const float scale = float(as_type<half>(*(device const ushort*)blk));
+            device const char* qs = (device const char*)(blk + 2 + il * Q8B_COOP_NQ);
+
+            float sumq = 0.0f;
+            for (uint j = 0; j < Q8B_COOP_NQ; j++) sumq += yl[j] * float(qs[j]);
+            sumf[r] += sumq * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q8B_COOP_NR; r++) sumf[r] = simd_sum(sumf[r]);
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < Q8B_COOP_NR; r++) shmem[r * Q8B_COOP_NSG + sgitg] = sumf[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint r = 0; r < Q8B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+            float total = 0.0f;
+            for (uint s = 0; s < Q8B_COOP_NSG; s++) total += shmem[r * Q8B_COOP_NSG + s];
+            output[neuron] = total;
+        }
+    }
+}
+
+// Q4_0 cooperative: NSG=2, NR=8, 64 threads/TG.
+// il = tiisg % 4 → handles bytes il*4..(il+1)*4 of the 16-byte block.
+// Each byte: lo nibble = element j, hi nibble = element j+16.
+// 4 lanes (il=0..3) × 8 elements each = 32 elements/block. ✓
+
+constant constexpr uint Q4B_COOP_NR  = 8;
+constant constexpr uint Q4B_COOP_NSG = 2;
+constant constexpr uint Q4B_COOP_NQ  = 8;
+// shmem: NR * NSG floats = 8 * 2 * 4 = 64 bytes
+
+kernel void gemv_q4_blocks_coop_f16(
+    device const half*              input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device half*                    output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    threadgroup float*              shmem  [[threadgroup(0)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint sgitg    [[simdgroup_index_in_threadgroup]],
+    uint tiisg    [[thread_index_in_simdgroup]])
+{
+    const uint row_base = group_id * Q4B_COOP_NR;
+    const uint nb = params.K / 32;
+    const uint block_stride = nb * Q4_BLOCK_BYTES;
+
+    const uint ix = tiisg >> 2;   // 0..7: which block-slot
+    const uint il = tiisg & 3;    // 0..3: which 4-byte group within block
+
+    const uint ib0 = sgitg * Q4B_COOP_NQ + ix;
+
+    float sumf[Q4B_COOP_NR] = {0.0f};
+
+    for (uint ib = ib0; ib < nb; ib += Q4B_COOP_NSG * Q4B_COOP_NQ) {
+        // Load 4 lo + 4 hi input elements (8 total) for this lane's byte group
+        const uint inp_lo = ib * 32 + il * 4;
+        const uint inp_hi = inp_lo + 16;
+        float yl[4], yh[4];
+        for (uint j = 0; j < 4; j++) {
+            yl[j] = float(input[inp_lo + j]);
+            yh[j] = float(input[inp_hi + j]);
+        }
+
+        for (uint r = 0; r < Q4B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + ib * Q4_BLOCK_BYTES;
+            const float scale = float(as_type<half>(*(device const ushort*)blk));
+            device const uchar* qs_bytes = blk + 2 + il * 4;
+
+            float sumq = 0.0f;
+            for (uint j = 0; j < 4; j++) {
+                uchar bv = qs_bytes[j];
+                sumq += yl[j] * float(int(bv & 0x0F) - 8);
+                sumq += yh[j] * float(int(bv >> 4) - 8);
+            }
+            sumf[r] += sumq * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q4B_COOP_NR; r++) sumf[r] = simd_sum(sumf[r]);
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < Q4B_COOP_NR; r++) shmem[r * Q4B_COOP_NSG + sgitg] = sumf[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint r = 0; r < Q4B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+            float total = 0.0f;
+            for (uint s = 0; s < Q4B_COOP_NSG; s++) total += shmem[r * Q4B_COOP_NSG + s];
+            output[neuron] = half(total);
+        }
+    }
+}
+
+kernel void gemv_q4_blocks_coop_f32(
+    device const float*             input  [[buffer(0)]],
+    device const uchar*             blocks [[buffer(1)]],
+    device float*                   output [[buffer(2)]],
+    constant QuantizedLinearParams& params [[buffer(3)]],
+    threadgroup float*              shmem  [[threadgroup(0)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint sgitg    [[simdgroup_index_in_threadgroup]],
+    uint tiisg    [[thread_index_in_simdgroup]])
+{
+    const uint row_base = group_id * Q4B_COOP_NR;
+    const uint nb = params.K / 32;
+    const uint block_stride = nb * Q4_BLOCK_BYTES;
+
+    const uint ix = tiisg >> 2;
+    const uint il = tiisg & 3;
+    const uint ib0 = sgitg * Q4B_COOP_NQ + ix;
+
+    float sumf[Q4B_COOP_NR] = {0.0f};
+
+    for (uint ib = ib0; ib < nb; ib += Q4B_COOP_NSG * Q4B_COOP_NQ) {
+        const uint inp_lo = ib * 32 + il * 4;
+        const uint inp_hi = inp_lo + 16;
+        float yl[4], yh[4];
+        for (uint j = 0; j < 4; j++) {
+            yl[j] = input[inp_lo + j];
+            yh[j] = input[inp_hi + j];
+        }
+
+        for (uint r = 0; r < Q4B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+
+            device const uchar* blk = blocks + neuron * block_stride + ib * Q4_BLOCK_BYTES;
+            const float scale = float(as_type<half>(*(device const ushort*)blk));
+            device const uchar* qs_bytes = blk + 2 + il * 4;
+
+            float sumq = 0.0f;
+            for (uint j = 0; j < 4; j++) {
+                uchar bv = qs_bytes[j];
+                sumq += yl[j] * float(int(bv & 0x0F) - 8);
+                sumq += yh[j] * float(int(bv >> 4) - 8);
+            }
+            sumf[r] += sumq * scale;
+        }
+    }
+
+    for (uint r = 0; r < Q4B_COOP_NR; r++) sumf[r] = simd_sum(sumf[r]);
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < Q4B_COOP_NR; r++) shmem[r * Q4B_COOP_NSG + sgitg] = sumf[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint r = 0; r < Q4B_COOP_NR; r++) {
+            const uint neuron = row_base + r;
+            if (neuron >= params.N) continue;
+            float total = 0.0f;
+            for (uint s = 0; s < Q4B_COOP_NSG; s++) total += shmem[r * Q4B_COOP_NSG + s];
+            output[neuron] = total;
+        }
+    }
+}
+
 static inline half silu_h(half x) {
     return x / (half(1.0h) + exp(-x));
 }
