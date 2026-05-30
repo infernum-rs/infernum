@@ -196,9 +196,9 @@ fn attention_prefill_gpu(
         compute_lse: u32::from(compute_lse),
     };
 
-    let tg_size = reduction_threadgroup_size(kv_len.max(head_dim));
     let num_threadgroups = seq_len * n_heads;
 
+    // One SIMD group (32 threads) per (seq_pos, head). No shmem — registers only.
     // buffers[3] (out) and buffers[4] (lse) are the two outputs.
     ctx.dispatch_threadgroups_with_outputs(
         "fused_attention_prefill_f32",
@@ -212,8 +212,8 @@ fn attention_prefill_gpu(
         &[3, 4],
         bytemuck::bytes_of(&params),
         MTLSize::new(num_threadgroups as u64, 1, 1),
-        MTLSize::new(tg_size as u64, 1, 1),
-        tg_size * std::mem::size_of::<f32>(),
+        MTLSize::new(32, 1, 1),
+        0,
     );
 
     (out, lse)

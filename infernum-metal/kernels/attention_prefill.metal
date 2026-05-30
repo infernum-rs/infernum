@@ -14,19 +14,30 @@ struct AttentionPrefillParams {
     uint compute_lse;   // 1 = compute, 0 = skip
 };
 
-/// Fused prefill attention: QK^T + causal mask + softcap + sliding window + softmax + V.
+/// Flash prefill attention: single-pass online softmax + V accumulation.
 ///
-/// Dispatch: one threadgroup per (seq_pos, head) pair.
-/// Grid: (seq_len * n_heads) threadgroups, each with tg_size threads.
-/// Each thread strides over the KV positions.
+/// One SIMD group (32 threads) per (seq_pos, head) pair.
+/// Q is loaded into registers once; K and V are streamed through in a single
+/// forward pass with online (Dao-style) softmax — K and V each read exactly once.
+///
+/// The previous 3-pass kernel recomputed Q·K for every output dimension in Pass 3,
+/// reading K (head_dim × kv_len) times instead of kv_len times. This kernel fixes
+/// that, reading K and V only once regardless of head_dim.
 ///
 /// Buffers:
 ///   0: Q   (seq_len, n_heads, head_dim)
 ///   1: K   (kv_len, kv_heads, head_dim)
 ///   2: V   (kv_len, kv_heads, head_dim)
-///   3: out (seq_len, n_heads, head_dim) — output
-///   4: lse (seq_len, n_heads) — log-sum-exp (only written if compute_lse)
+///   3: out (seq_len, n_heads, head_dim)
+///   4: lse (seq_len, n_heads) — only written if compute_lse != 0
 ///   5: params
+///
+/// Grid: (seq_len * n_heads, 1, 1) threadgroups, (32, 1, 1) threads each.
+/// head_dim must be ≤ 256 (MAX_HD_PER_LANE * SIMD_WIDTH = 8 * 32).
+
+constant constexpr uint MAX_HD_PER_LANE = 8;
+constant constexpr uint SIMD_WIDTH = 32;
+
 kernel void fused_attention_prefill_f32(
     device const float* Q               [[buffer(0)]],
     device const float* K               [[buffer(1)]],
@@ -34,133 +45,82 @@ kernel void fused_attention_prefill_f32(
     device float* output                [[buffer(3)]],
     device float* lse                   [[buffer(4)]],
     constant AttentionPrefillParams& p  [[buffer(5)]],
-    threadgroup float* shared           [[threadgroup(0)]],
-    uint gid                            [[threadgroup_position_in_grid]],
-    uint lid                            [[thread_position_in_threadgroup]],
-    uint tg_size                        [[threads_per_threadgroup]])
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
 {
-    const uint seq_idx  = gid / p.n_heads;
-    const uint head_idx = gid % p.n_heads;
-    const uint kv_head  = head_idx / (p.n_heads / p.kv_heads);
-    const uint head_dim = p.head_dim;
-    const uint kv_len   = p.kv_len;
-    const float scale   = p.scale;
+    const uint seq_idx = gid / p.n_heads;
+    const uint head    = gid % p.n_heads;
+    const uint kv_h    = head / (p.n_heads / p.kv_heads);
+    const uint hd      = p.head_dim;
+    const uint kv_stride = p.kv_heads * hd;
 
-    // Query position in the full sequence
     const uint q_pos = p.offset + seq_idx;
+    const uint kv_end = min(q_pos + 1, p.kv_len);
 
-    // Causal mask: attend to [kv_start..kv_end)
     uint kv_start = 0;
-    uint kv_end = min(q_pos + 1, kv_len);
-
-    // Sliding window
     if (p.sliding_window > 0) {
         uint window = uint(p.sliding_window);
-        if (q_pos >= window) {
-            kv_start = max(kv_start, q_pos - window + 1);
-        }
+        if (q_pos >= window) kv_start = q_pos - window + 1;
     }
 
-    // Pointers
-    const uint q_base = (seq_idx * p.n_heads + head_idx) * head_dim;
-    // K/V layout: (kv_len, kv_heads, head_dim)
+    const uint elems_per_lane = (hd >= SIMD_WIDTH) ? (hd / SIMD_WIDTH) : 1;
+    const bool lane_active = (lane < hd);
+    const uint lane_start  = (hd >= SIMD_WIDTH) ? (lane * elems_per_lane) : lane;
 
-    // Online softmax + V accumulation.
-    // Each thread handles a strided subset of KV positions.
-    // Phase 1: compute local (max, exp_sum, weighted_v)
-    float local_max = -INFINITY;
-    float local_sum = 0.0f;
+    const uint q_base = (seq_idx * p.n_heads + head) * hd;
 
-    // Per-thread V accumulator in registers (up to head_dim elements).
-    // For large head_dim this is fine — typical values are 64-128.
-    // We store in shared memory at the end.
-    // Actually, we need to accumulate V across threads, so we use
-    // a different approach: two passes.
+    // Load Q into registers once.
+    float q_reg[MAX_HD_PER_LANE];
+    for (uint i = 0; i < elems_per_lane; i++) {
+        q_reg[i] = lane_active ? Q[q_base + lane_start + i] : 0.0f;
+    }
 
-    // === Pass 1: Find global max score ===
-    for (uint kv = kv_start + lid; kv < kv_end; kv += tg_size) {
-        const uint k_base = (kv * p.kv_heads + kv_head) * head_dim;
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += Q[q_base + d] * K[k_base + d];
+    float v_acc[MAX_HD_PER_LANE];
+    for (uint i = 0; i < elems_per_lane; i++) v_acc[i] = 0.0f;
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    // Single pass: for each KV position read K once, compute score,
+    // update online softmax, read V once, accumulate.
+    for (uint pos = kv_start; pos < kv_end; pos++) {
+        const uint kv_off = (pos * p.kv_heads + kv_h) * hd;
+
+        float partial_dot = 0.0f;
+        for (uint i = 0; i < elems_per_lane; i++) {
+            float k_val = lane_active ? K[kv_off + lane_start + i] : 0.0f;
+            partial_dot += q_reg[i] * k_val;
         }
-        float score = dot * scale;
+        float score = simd_sum(partial_dot) * p.scale;
+
         if (p.softcap > 0.0f) {
             score = p.softcap * precise::tanh(score / p.softcap);
         }
-        local_max = max(local_max, score);
-    }
 
-    // Reduce max across threads
-    shared[lid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            shared[lid] = max(shared[lid], shared[lid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float global_max = shared[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float correction = exp(old_max - running_max);
+        float exp_score  = exp(score - running_max);
 
-    // === Pass 2: Compute exp(score - max) sum and accumulate weighted V ===
-    // We need head_dim floats for V accumulation per thread.
-    // Since head_dim can be up to 128 and we have up to 256 threads,
-    // we can't put per-thread V accumulators in shared memory.
-    // Instead: compute softmax weights, then do a third pass for V.
+        running_sum = running_sum * correction + exp_score;
 
-    // Compute exp sum
-    for (uint kv = kv_start + lid; kv < kv_end; kv += tg_size) {
-        const uint k_base = (kv * p.kv_heads + kv_head) * head_dim;
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += Q[q_base + d] * K[k_base + d];
-        }
-        float score = dot * scale;
-        if (p.softcap > 0.0f) {
-            score = p.softcap * precise::tanh(score / p.softcap);
-        }
-        local_sum += exp(score - global_max);
-    }
-
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            shared[lid] += shared[lid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float global_sum = shared[0];
-    const float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // === Pass 3: Accumulate weighted V ===
-    // Each thread handles a subset of head_dim dimensions.
-    // For each dimension, iterate over all KV positions, recompute weight.
-    const uint out_base = (seq_idx * p.n_heads + head_idx) * head_dim;
-
-    for (uint d = lid; d < head_dim; d += tg_size) {
-        float acc = 0.0f;
-        for (uint kv = kv_start; kv < kv_end; kv++) {
-            const uint k_base = (kv * p.kv_heads + kv_head) * head_dim;
-            float dot = 0.0f;
-            for (uint dd = 0; dd < head_dim; dd++) {
-                dot += Q[q_base + dd] * K[k_base + dd];
+        if (lane_active) {
+            for (uint i = 0; i < elems_per_lane; i++) {
+                v_acc[i] = v_acc[i] * correction
+                         + exp_score * V[kv_off + lane_start + i];
             }
-            float score = dot * scale;
-            if (p.softcap > 0.0f) {
-                score = p.softcap * precise::tanh(score / p.softcap);
-            }
-            float weight = exp(score - global_max) * inv_sum;
-            const uint v_base = (kv * p.kv_heads + kv_head) * head_dim;
-            acc += weight * V[v_base + d];
         }
-        output[out_base + d] = acc;
     }
 
-    // Write LSE if requested
-    if (p.compute_lse != 0 && lid == 0) {
-        lse[seq_idx * p.n_heads + head_idx] = global_max + log(global_sum);
+    if (lane_active) {
+        const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+        const uint out_base = (seq_idx * p.n_heads + head) * hd;
+        for (uint i = 0; i < elems_per_lane; i++) {
+            output[out_base + lane_start + i] = v_acc[i] * inv_sum;
+        }
+    }
+
+    if (p.compute_lse != 0 && lane == 0) {
+        lse[seq_idx * p.n_heads + head] = running_max + log(running_sum);
     }
 }

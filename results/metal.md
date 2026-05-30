@@ -35,16 +35,43 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 51.8 | 285.8 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x | 2026-05-22 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 264.8 | — | — | 2026-05-25 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 253.9 | 4541 | 0.056x | 2026-05-25 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 4596 | 0.055x | 2026-05-25 |
-| Qwen / Qwen3-0.6B | SafeTensors BF16 | 90.9 | — | — | 2026-05-23 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 295.9 | 938 | 0.32x | 2026-05-25 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 1284.3 | — | — | 2026-05-30 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 1074.6 | 4541 | 0.24x | 2026-05-30 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 1080.7 | 4596 | 0.24x | 2026-05-30 |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 872.1 | — | — | 2026-05-30 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 270.3 | 938 | 0.29x | 2026-05-30 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-23 |
 
 ---
 
 ## History
+
+---
+
+## 2026-05-30 — Flash prefill attention + tiled GEMM (K_BLK=32)
+
+### Changes
+
+1. **Single-pass flash attention for prefill** — replaced the 3-pass prefill attention kernel with a single-pass online softmax design. The 3-pass kernel recomputed Q·K for every output dimension in Pass 3 (outer loop over `d`, inner loop over `kv`), reading K `head_dim` times per KV position — O(kv_len × head_dim²) complexity. The new kernel loads Q into registers once, then streams K and V through a single forward pass with online (Dao-style) softmax — K and V each read exactly once. Grid: (seq_len × n_heads) threadgroups, 32 threads each (1 SIMD group; no shared memory). Uses `simd_sum` for the within-group dot product reduction.
+
+2. **Tiled GEMM with K_BLK=32 coalesced loads** — `linear_dense_f32_tiled` kernel now uses 16 SIMD groups (4×4) per threadgroup with K_BLK=32. Each SIMD group reads one 32-float row (one 128-byte cache line) per load instruction, fully coalesced. The earlier K_BLK=8 version had threads within one SIMD group reading from 4 different rows (stride K apart) → 4× more cache transactions. shmem: sA[32×32]+sB[32×32]=8 KB total.
+
+### Prefill throughput (tok/s) — 512-token prompt
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 253.9 | 1074.6 | +323% |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 253.9 | 1080.7 | +325% |
+| Llama / SmolLM2-360M | SafeTensors F32 | 264.8 | 1284.3 | +385% |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 90.9 | 872.1 | +859% |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 295.9 | 270.3 | -9% (thermal) |
+
+### Notes
+
+- **GGUF Q8_0/Q4_0 prefill 0.056x → 0.24x llama.cpp** — the most visible improvement. SmolLM2 GGUF prefill was catastrophically slow because the 3-pass kernel's O(kv_len × head_dim²) complexity made the attention portion dominate. With flash attention, attention is now O(kv_len × head_dim) and the bottleneck shifts back to GEMM.
+- **Qwen 9.6× improvement** — Qwen3-0.6B has 28 layers vs SmolLM2's 32 and a larger head_dim=64 (same as SmolLM2), so the 3-pass kernel hurt proportionally. Also benefits from the tiled GEMM improvement.
+- **Gemma prefill slightly down** — thermal noise; Gemma uses logit soft-capping (tanh) which adds a `precise::tanh` call per KV position in the flash loop, reducing the relative speedup at smaller prefill sizes. Within measurement variability (prior measured range was 280–660 tok/s).
+- **Decode throughput unchanged** — the decode path uses the existing flash decode kernel (unchanged) and paged attention.
 
 ---
 

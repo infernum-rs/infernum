@@ -28,6 +28,12 @@ const TILE: u64 = 8;
 /// Threads per threadgroup for SIMD-group matmul: one SIMD-group = 32 threads.
 const SIMD_GROUP_SIZE: u64 = 32;
 
+/// Output tile per threadgroup for the tiled linear kernel (32×32).
+const TILED_TG_M: u64 = 32;
+const TILED_TG_N: u64 = 32;
+/// 16 SIMD-groups per threadgroup × 32 threads each.
+const TILED_THREADS_PER_TG: u64 = 512;
+
 /// Output rows per SIMD-group for quantized GEMV v2 (dot-product based).
 const GEMV_V2_NR: u64 = 4;
 
@@ -347,18 +353,20 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
             n: n as u32,
             k: k as u32,
         };
-        let threadgroups = MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1);
-        let threads_per_group = MTLSize::new(SIMD_GROUP_SIZE, 1, 1);
         ctx.dispatch_threadgroups(
-            "linear_dense_f32",
+            "linear_dense_f32_tiled",
             &[
                 (input.metal_buffer(), input.buffer_offset()),
                 (dequant.metal_buffer(), dequant.buffer_offset()),
                 (out.metal_buffer(), out.buffer_offset()),
             ],
             bytemuck::bytes_of(&gemm_params),
-            threadgroups,
-            threads_per_group,
+            MTLSize::new(
+                (n as u64).div_ceil(TILED_TG_N),
+                (m as u64).div_ceil(TILED_TG_M),
+                1,
+            ),
+            MTLSize::new(TILED_THREADS_PER_TG, 1, 1),
             0,
         );
         return Ok(out);
@@ -615,12 +623,25 @@ impl MatmulOps for MetalBackend {
                     k: k as u32,
                 };
 
-                let threadgroups =
-                    MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1);
-                let threads_per_group = MTLSize::new(SIMD_GROUP_SIZE, 1, 1);
-
+                let (kernel, threadgroups, threads_per_group) = if m > 1 {
+                    (
+                        "linear_dense_f32_tiled",
+                        MTLSize::new(
+                            (n as u64).div_ceil(TILED_TG_N),
+                            (m as u64).div_ceil(TILED_TG_M),
+                            1,
+                        ),
+                        MTLSize::new(TILED_THREADS_PER_TG, 1, 1),
+                    )
+                } else {
+                    (
+                        "linear_dense_f32",
+                        MTLSize::new((n as u64).div_ceil(TILE), (m as u64).div_ceil(TILE), 1),
+                        MTLSize::new(SIMD_GROUP_SIZE, 1, 1),
+                    )
+                };
                 ctx.dispatch_threadgroups(
-                    "linear_dense_f32",
+                    kernel,
                     &[
                         (input.metal_buffer(), input.buffer_offset()),
                         (weight_t.metal_buffer(), weight_t.buffer_offset()),
