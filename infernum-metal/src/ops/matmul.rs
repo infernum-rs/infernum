@@ -40,21 +40,21 @@ const GEMV_V2_ROWS_PER_TG: u64 = GEMV_V2_NR * GEMV_V2_NSG;
 /// Threads per threadgroup for v2.
 const GEMV_V2_THREADS_PER_TG: u64 = GEMV_V2_NSG * SIMD_GROUP_SIZE;
 
-// --- GGUF native block-format GEMV: cooperative kernels (low register pressure) ---
-// Q8_0: NSG=4 SIMD groups cooperate on NR=8 rows; each lane handles 8 int8 elements.
-// Q4_0: NSG=2 SIMD groups cooperate on NR=8 rows; each lane handles 8 nibble elements.
-// Grid matches old non-cooperative kernels (ceil(N/8)); reduces regs 38→21/thread.
-const Q8B_COOP_NR: u64 = 8;
+// --- GGUF native block-format GEMV: cooperative kernels ---
+// Matches llama.cpp: N_R0_Q8_0=2, N_SG_Q8_0=4 and N_R0_Q4_0=4, N_SG_Q4_0=2.
+// NR=2/4 gives ceil(N/2) or ceil(N/4) threadgroups — 4× or 2× more than NR=8.
+// Critical for small N (e.g. 960 in SmolLM2): fills GPU execution slots properly.
+const Q8B_COOP_NR: u64 = 2;
 const Q8B_COOP_NSG: u64 = 4;
 const Q8B_COOP_ROWS_PER_TG: u64 = Q8B_COOP_NR;
 const Q8B_COOP_THREADS_PER_TG: u64 = Q8B_COOP_NSG * SIMD_GROUP_SIZE;
-const Q8B_COOP_SHMEM: usize = (Q8B_COOP_NR * Q8B_COOP_NSG * 4) as usize; // 128 bytes
+const Q8B_COOP_SHMEM: usize = (Q8B_COOP_NR * Q8B_COOP_NSG * 4) as usize; // 32 bytes
 
-const Q4B_COOP_NR: u64 = 8;
+const Q4B_COOP_NR: u64 = 4;
 const Q4B_COOP_NSG: u64 = 2;
 const Q4B_COOP_ROWS_PER_TG: u64 = Q4B_COOP_NR;
 const Q4B_COOP_THREADS_PER_TG: u64 = Q4B_COOP_NSG * SIMD_GROUP_SIZE;
-const Q4B_COOP_SHMEM: usize = (Q4B_COOP_NR * Q4B_COOP_NSG * 4) as usize; // 64 bytes
+const Q4B_COOP_SHMEM: usize = (Q4B_COOP_NR * Q4B_COOP_NSG * 4) as usize; // 32 bytes
 
 // Legacy non-cooperative constants (used by swiglu_linear only)
 const Q8B_NR: u64 = 2;

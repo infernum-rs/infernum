@@ -1330,24 +1330,25 @@ kernel void gemv_q4_blocks_f32(
 }
 
 // ==========================================================================
-// Cooperative GEMV kernels — split K across SIMD groups to reduce register
-// pressure from ~38 to ~21 regs/thread, increasing GPU occupancy.
+// Cooperative GEMV kernels — split K across SIMD groups for better GPU
+// occupancy on small N (e.g. 960-dim SmolLM2).
 //
-// Q8_0: NSG=4 SIMD groups cooperate on NR=8 rows.
+// Q8_0: NSG=4 SIMD groups cooperate on NR=2 rows.
 //       Each lane handles NQ=8 int8 elements per block.
-//       Grid: ceil(N/8), threads=128, shmem=128 bytes.
-//       Same grid as old gemv_q8_blocks_f16; reduces regs 38→21.
+//       Grid: ceil(N/2), threads=128, shmem=32 bytes.
+//       Matches llama.cpp: N_R0_Q8_0=2, N_SG_Q8_0=4.
+//       4× more threadgroups than NR=8 → much better GPU occupancy for small N.
 //
-// Q4_0: NSG=2 SIMD groups cooperate on NR=8 rows.
+// Q4_0: NSG=2 SIMD groups cooperate on NR=4 rows.
 //       Each lane handles 4 bytes (8 nibble elements) per block.
-//       Grid: ceil(N/8), threads=64, shmem=64 bytes.
-//       Same grid as old gemv_q4_blocks_f16; reduces regs 38→21.
+//       Grid: ceil(N/4), threads=64, shmem=32 bytes.
+//       Matches llama.cpp: N_R0_Q4_0=4, N_SG_Q4_0=2.
 // ==========================================================================
 
-constant constexpr uint Q8B_COOP_NR  = 8;
+constant constexpr uint Q8B_COOP_NR  = 2;
 constant constexpr uint Q8B_COOP_NSG = 4;
 constant constexpr uint Q8B_COOP_NQ  = 8;
-// shmem: NR * NSG floats = 8 * 4 * 4 = 128 bytes
+// shmem: NR * NSG floats = 2 * 4 * 4 = 32 bytes
 
 // ix = tiisg / 4  → which of the 8 block-slots this lane owns (0..7)
 // il = tiisg % 4  → which 8-element segment within the block (0..3)
@@ -1472,15 +1473,16 @@ kernel void gemv_q8_blocks_coop_f32(
     }
 }
 
-// Q4_0 cooperative: NSG=2, NR=8, 64 threads/TG.
+// Q4_0 cooperative: NSG=2, NR=4, 64 threads/TG.
 // il = tiisg % 4 → handles bytes il*4..(il+1)*4 of the 16-byte block.
 // Each byte: lo nibble = element j, hi nibble = element j+16.
 // 4 lanes (il=0..3) × 8 elements each = 32 elements/block. ✓
+// Matches llama.cpp: N_R0_Q4_0=4, N_SG_Q4_0=2. Grid: ceil(N/4).
 
-constant constexpr uint Q4B_COOP_NR  = 8;
+constant constexpr uint Q4B_COOP_NR  = 4;
 constant constexpr uint Q4B_COOP_NSG = 2;
 constant constexpr uint Q4B_COOP_NQ  = 8;
-// shmem: NR * NSG floats = 8 * 2 * 4 = 64 bytes
+// shmem: NR * NSG floats = 4 * 2 * 4 = 32 bytes
 
 kernel void gemv_q4_blocks_coop_f16(
     device const half*              input  [[buffer(0)]],
