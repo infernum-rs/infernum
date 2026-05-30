@@ -396,10 +396,17 @@ impl PagedKvCacheOps for MetalBackend {
         };
 
         // Fused K+V append: single dispatch with 3D grid (elems, batch, 2)
-        let kernel = if k.dtype() == DType::F16 {
-            "append_kv_paged_batched_fused_f16"
-        } else {
-            "append_kv_paged_batched_fused_f32"
+        // Select kernel based on (input dtype, pool dtype).
+        let pool_dtype = cache.k_pools[layer_idx].dtype();
+        let kernel = match (k.dtype(), pool_dtype) {
+            (DType::F16, DType::F16) => "append_kv_paged_batched_fused_f16",
+            (DType::F32, DType::F32) => "append_kv_paged_batched_fused_f32",
+            (DType::F32, DType::F16) => "append_kv_paged_batched_fused_f32_to_f16",
+            _ => panic!(
+                "unsupported KV append dtype combo: input={:?} pool={:?}",
+                k.dtype(),
+                pool_dtype
+            ),
         };
         // buffers[0] (k_pool) and buffers[1] (v_pool) are the outputs.
         ctx.dispatch_3d_with_outputs(
@@ -480,10 +487,16 @@ impl PagedAttentionOps for MetalBackend {
 
         // Flash decode: 1 SIMD group (32 threads) per (batch, head).
         // Online softmax — single pass over KV, no shared memory needed.
-        let kernel = if q.dtype() == DType::F16 {
-            "paged_attention_flash_decode_f16"
-        } else {
-            "paged_attention_flash_decode_f32"
+        // Kernel selected by (q_dtype, pool_dtype) pair.
+        let kernel = match (q.dtype(), k_pool.dtype()) {
+            (DType::F16, DType::F16) => "paged_attention_flash_decode_f16",
+            (DType::F32, DType::F32) => "paged_attention_flash_decode_f32",
+            (DType::F32, DType::F16) => "paged_attention_flash_decode_f32_kv16",
+            _ => panic!(
+                "unsupported attention dtype combo: q={:?} kv_pool={:?}",
+                q.dtype(),
+                k_pool.dtype()
+            ),
         };
         ctx.dispatch_threadgroups(
             kernel,

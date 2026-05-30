@@ -312,7 +312,7 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
             num_kv_heads: c.num_kv_heads(),
             head_dim: c.head_dim(),
             eos_token_id: c.eos_token_id(),
-            cache_dtype: DType::F32,
+            cache_dtype: DType::F16,
         }
     }
 
@@ -327,7 +327,7 @@ impl<C: MetalGraphEngineConfig> infernum::Model for MetalGraphEngine<C> {
             block_config,
             self.config.num_kv_heads(),
             self.config.head_dim(),
-            DType::F32,
+            DType::F16,
         )
     }
 
