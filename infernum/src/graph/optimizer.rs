@@ -92,15 +92,17 @@ fn fuse_swiglu<B: Backend + MatmulOps + ArithOps + SwigluOps + ContextBackend>(
 ///
 /// After fusion:
 /// - The `Add` node becomes `AddRmsNorm`, producing two outputs:
-///   output 0 = updated residual, output 1 = normalised.
+///   output 0 = updated residual (`a + b`), output 1 = normalised.
 /// - All downstream consumers of the old `RmsNorm` output `(NodeId(i), 0)`
 ///   are rewired to `(add_id, 1)`.
 /// - The `RmsNorm` node becomes dead (no consumers) and will be eliminated
 ///   by the planner's dead-node pass.
+/// - All other consumers of the old `Add` output `(add_id, 0)` (e.g. the
+///   next layer's skip-connection add) remain pointing at `(add_id, 0)`,
+///   which after fusion equals the `updated` residual — the same value.
 ///
 /// Preconditions:
 /// - The `RmsNorm`'s sole input is an `Add`/`AddInplace` output.
-/// - The `Add` output has exactly one node-consumer (the `RmsNorm`).
 #[allow(clippy::cast_possible_truncation)] // graph will never have 2^32 nodes
 fn fuse_add_rmsnorm<B: Backend + MatmulOps + ArithOps + NormOps + ContextBackend>(
     graph: &mut Graph<B>,
@@ -131,11 +133,10 @@ fn fuse_add_rmsnorm<B: Backend + MatmulOps + ArithOps + NormOps + ContextBackend
         if add_name != "add" && add_name != "add_inplace" {
             continue;
         }
-
-        // Only fuse if the Add output feeds exactly one consumer.
-        if consumer_count(graph, add_id) != 1 {
-            continue;
-        }
+        // Note: we do NOT require consumer_count == 1 here. In transformers the Add
+        // output (residual) is always consumed by both this RmsNorm AND the next
+        // layer's skip-connection add. After fusion, output 0 of AddRmsNorm is the
+        // `updated` residual — the same value — so those other consumers remain valid.
 
         let rms_node_id = NodeId(i as u32);
 
