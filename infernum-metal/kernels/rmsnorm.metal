@@ -6,11 +6,42 @@ struct RMSNormParams {
     float eps;
 };
 
-/// RMS normalization: out[row,i] = (input[row,i] / rms) * weight[i]
-/// where rms = sqrt(mean(input[row,:]^2) + eps).
-///
-/// Dispatch: threadgroups = rows, threads_per_threadgroup = power-of-2 <= hidden.
-/// Each threadgroup handles one row.
+// -------------------------------------------------------------------
+// Shared reduction helper: 2 barriers via simd_sum + shmem handoff.
+//
+// shmem must have at least ceil(tg_size / 32) floats allocated.
+// Returns the total sum across all threads in the threadgroup.
+// -------------------------------------------------------------------
+static inline float tg_sum_reduce(
+    float partial,
+    threadgroup float* shmem,
+    uint tiisg,   // thread index in simdgroup  (0–31)
+    uint sgitg,   // simdgroup index in threadgroup
+    uint tg_size)
+{
+    // Reduce within each SIMD group (no barrier needed)
+    partial = simd_sum(partial);
+
+    // One thread per SIMD group writes to shmem
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem[sgitg] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // All threads sum the SIMD-group partials — at most 8 values (256/32)
+    uint num_sg = max(1u, tg_size / 32u);
+    float total = 0.0f;
+    for (uint i = 0; i < num_sg; i++) {
+        total += shmem[i];
+    }
+    return total;
+}
+
+// -------------------------------------------------------------------
+// rms_norm_f32 — float activations, float weights.
+// Uses float4 vectorised loads when hidden % 4 == 0 (fast path).
+// -------------------------------------------------------------------
 kernel void rms_norm_f32(
     device const float* input       [[buffer(0)]],
     device const float* weight      [[buffer(1)]],
@@ -19,44 +50,52 @@ kernel void rms_norm_f32(
     uint row                        [[threadgroup_position_in_grid]],
     uint tid                        [[thread_index_in_threadgroup]],
     uint tg_size                    [[threads_per_threadgroup]],
-    threadgroup float* shared       [[threadgroup(0)]])
+    uint tiisg                      [[thread_index_in_simdgroup]],
+    uint sgitg                      [[simdgroup_index_in_threadgroup]],
+    threadgroup float* shmem        [[threadgroup(0)]])
 {
     const uint hidden = params.hidden;
     const float eps = params.eps;
+    const uint base = row * hidden;
 
-    // Accumulate sum of squares for this row
     float sum_sq = 0.0f;
-    for (uint i = tid; i < hidden; i += tg_size) {
-        float v = input[row * hidden + i];
-        sum_sq += v * v;
-    }
 
-    // Store partial sum in shared memory
-    shared[tid] = sum_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Tree reduction in shared memory
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared[tid] += shared[tid + s];
+    if (hidden % 4 == 0) {
+        // Vectorised path: 4 elements per iteration
+        const uint hidden4 = hidden / 4;
+        device const float4* inp4 = (device const float4*)(input + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            float4 v = inp4[i];
+            sum_sq += dot(v, v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            float v = input[base + i];
+            sum_sq += v * v;
+        }
     }
 
-    // Compute scale: 1 / sqrt(mean_sq + eps)
-    float scale = rsqrt(shared[0] / float(hidden) + eps);
+    float total = tg_sum_reduce(sum_sq, shmem, tiisg, sgitg, tg_size);
+    float scale = rsqrt(total / float(hidden) + eps);
 
-    // Apply normalization and weight
-    for (uint i = tid; i < hidden; i += tg_size) {
-        output[row * hidden + i] = input[row * hidden + i] * scale * weight[i];
+    if (hidden % 4 == 0) {
+        const uint hidden4 = hidden / 4;
+        device const float4* inp4  = (device const float4*)(input  + base);
+        device const float4* wgt4  = (device const float4*)weight;
+        device float4*       out4  = (device float4*)(output + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            out4[i] = inp4[i] * scale * wgt4[i];
+        }
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            output[base + i] = input[base + i] * scale * weight[i];
+        }
     }
 }
 
-/// Fused add + RMS normalization.
-/// updated[row,i] = residual[row,i] + input[row,i]
-/// normed[row,i]  = (updated[row,i] / rms) * weight[i]
-///
-/// Dispatch: threadgroups = rows, threads_per_threadgroup = power-of-2 <= hidden.
+// -------------------------------------------------------------------
+// add_rmsnorm_f32 — fused residual-add + RMSNorm.
+// -------------------------------------------------------------------
 kernel void add_rmsnorm_f32(
     device const float* residual    [[buffer(0)]],
     device const float* input       [[buffer(1)]],
@@ -67,43 +106,57 @@ kernel void add_rmsnorm_f32(
     uint row                        [[threadgroup_position_in_grid]],
     uint tid                        [[thread_index_in_threadgroup]],
     uint tg_size                    [[threads_per_threadgroup]],
-    threadgroup float* shared       [[threadgroup(0)]])
+    uint tiisg                      [[thread_index_in_simdgroup]],
+    uint sgitg                      [[simdgroup_index_in_threadgroup]],
+    threadgroup float* shmem        [[threadgroup(0)]])
 {
     const uint hidden = params.hidden;
     const float eps = params.eps;
+    const uint base = row * hidden;
 
-    // Compute updated = residual + input, and accumulate sum of squares
     float sum_sq = 0.0f;
-    for (uint i = tid; i < hidden; i += tg_size) {
-        uint idx = row * hidden + i;
-        float u = residual[idx] + input[idx];
-        updated[idx] = u;
-        sum_sq += u * u;
-    }
 
-    // Shared memory reduction
-    shared[tid] = sum_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared[tid] += shared[tid + s];
+    if (hidden % 4 == 0) {
+        const uint hidden4 = hidden / 4;
+        device const float4* res4 = (device const float4*)(residual + base);
+        device const float4* inp4 = (device const float4*)(input    + base);
+        device float4*       upd4 = (device float4*)(updated + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            float4 u = res4[i] + inp4[i];
+            upd4[i] = u;
+            sum_sq += dot(u, u);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            uint idx = base + i;
+            float u = residual[idx] + input[idx];
+            updated[idx] = u;
+            sum_sq += u * u;
+        }
     }
 
-    float scale = rsqrt(shared[0] / float(hidden) + eps);
+    float total = tg_sum_reduce(sum_sq, shmem, tiisg, sgitg, tg_size);
+    float scale = rsqrt(total / float(hidden) + eps);
 
-    // Apply normalization with weight
-    for (uint i = tid; i < hidden; i += tg_size) {
-        uint idx = row * hidden + i;
-        normed[idx] = updated[idx] * scale * weight[i];
+    if (hidden % 4 == 0) {
+        const uint hidden4 = hidden / 4;
+        device const float4* upd4 = (device const float4*)(updated + base);
+        device const float4* wgt4 = (device const float4*)weight;
+        device float4*       nrm4 = (device float4*)(normed + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            nrm4[i] = upd4[i] * scale * wgt4[i];
+        }
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            uint idx = base + i;
+            normed[idx] = updated[idx] * scale * weight[i];
+        }
     }
 }
 
-
-/// RMS normalization f16: activations are half, norm weight is float.
-/// out[row,i] = half((float(input[row,i]) / rms) * weight[i])
+// -------------------------------------------------------------------
+// rms_norm_f16 — half activations, float weights.
+// -------------------------------------------------------------------
 kernel void rms_norm_f16(
     device const half* input        [[buffer(0)]],
     device const float* weight      [[buffer(1)]],
@@ -112,37 +165,51 @@ kernel void rms_norm_f16(
     uint row                        [[threadgroup_position_in_grid]],
     uint tid                        [[thread_index_in_threadgroup]],
     uint tg_size                    [[threads_per_threadgroup]],
-    threadgroup float* shared       [[threadgroup(0)]])
+    uint tiisg                      [[thread_index_in_simdgroup]],
+    uint sgitg                      [[simdgroup_index_in_threadgroup]],
+    threadgroup float* shmem        [[threadgroup(0)]])
 {
     const uint hidden = params.hidden;
     const float eps = params.eps;
+    const uint base = row * hidden;
 
     float sum_sq = 0.0f;
-    for (uint i = tid; i < hidden; i += tg_size) {
-        float v = float(input[row * hidden + i]);
-        sum_sq += v * v;
-    }
 
-    shared[tid] = sum_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared[tid] += shared[tid + s];
+    if (hidden % 4 == 0) {
+        const uint hidden4 = hidden / 4;
+        device const half4* inp4 = (device const half4*)(input + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            float4 v = float4(inp4[i]);
+            sum_sq += dot(v, v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            float v = float(input[base + i]);
+            sum_sq += v * v;
+        }
     }
 
-    float scale = rsqrt(shared[0] / float(hidden) + eps);
+    float total = tg_sum_reduce(sum_sq, shmem, tiisg, sgitg, tg_size);
+    float scale = rsqrt(total / float(hidden) + eps);
 
-    for (uint i = tid; i < hidden; i += tg_size) {
-        output[row * hidden + i] = half(float(input[row * hidden + i]) * scale * weight[i]);
+    if (hidden % 4 == 0) {
+        const uint hidden4 = hidden / 4;
+        device const half4*  inp4 = (device const half4*)(input  + base);
+        device const float4* wgt4 = (device const float4*)weight;
+        device half4*        out4 = (device half4*)(output + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            out4[i] = half4(float4(inp4[i]) * scale * wgt4[i]);
+        }
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            output[base + i] = half(float(input[base + i]) * scale * weight[i]);
+        }
     }
 }
 
-/// Fused add + RMS normalization f16.
-/// updated[row,i] = residual[row,i] + input[row,i]
-/// normed[row,i]  = half((float(updated) / rms) * weight[i])
+// -------------------------------------------------------------------
+// add_rmsnorm_f16 — fused residual-add + RMSNorm, half activations.
+// -------------------------------------------------------------------
 kernel void add_rmsnorm_f16(
     device const half* residual     [[buffer(0)]],
     device const half* input        [[buffer(1)]],
@@ -153,33 +220,50 @@ kernel void add_rmsnorm_f16(
     uint row                        [[threadgroup_position_in_grid]],
     uint tid                        [[thread_index_in_threadgroup]],
     uint tg_size                    [[threads_per_threadgroup]],
-    threadgroup float* shared       [[threadgroup(0)]])
+    uint tiisg                      [[thread_index_in_simdgroup]],
+    uint sgitg                      [[simdgroup_index_in_threadgroup]],
+    threadgroup float* shmem        [[threadgroup(0)]])
 {
     const uint hidden = params.hidden;
     const float eps = params.eps;
+    const uint base = row * hidden;
 
     float sum_sq = 0.0f;
-    for (uint i = tid; i < hidden; i += tg_size) {
-        uint idx = row * hidden + i;
-        float u = float(residual[idx]) + float(input[idx]);
-        updated[idx] = half(u);
-        sum_sq += u * u;
-    }
 
-    shared[tid] = sum_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared[tid] += shared[tid + s];
+    if (hidden % 4 == 0) {
+        const uint hidden4 = hidden / 4;
+        device const half4* res4 = (device const half4*)(residual + base);
+        device const half4* inp4 = (device const half4*)(input    + base);
+        device half4*       upd4 = (device half4*)(updated + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            float4 u = float4(res4[i]) + float4(inp4[i]);
+            upd4[i] = half4(u);
+            sum_sq += dot(u, u);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            uint idx = base + i;
+            float u = float(residual[idx]) + float(input[idx]);
+            updated[idx] = half(u);
+            sum_sq += u * u;
+        }
     }
 
-    float scale = rsqrt(shared[0] / float(hidden) + eps);
+    float total = tg_sum_reduce(sum_sq, shmem, tiisg, sgitg, tg_size);
+    float scale = rsqrt(total / float(hidden) + eps);
 
-    for (uint i = tid; i < hidden; i += tg_size) {
-        uint idx = row * hidden + i;
-        normed[idx] = half(float(updated[idx]) * scale * weight[i]);
+    if (hidden % 4 == 0) {
+        const uint hidden4 = hidden / 4;
+        device const half4*  upd4 = (device const half4*)(updated + base);
+        device const float4* wgt4 = (device const float4*)weight;
+        device half4*        nrm4 = (device half4*)(normed + base);
+        for (uint i = tid; i < hidden4; i += tg_size) {
+            nrm4[i] = half4(float4(upd4[i]) * scale * wgt4[i]);
+        }
+    } else {
+        for (uint i = tid; i < hidden; i += tg_size) {
+            uint idx = base + i;
+            normed[idx] = half(float(updated[idx]) * scale * weight[i]);
+        }
     }
 }

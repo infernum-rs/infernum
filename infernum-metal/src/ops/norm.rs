@@ -33,6 +33,8 @@ impl NormOps for MetalBackend {
         } else {
             "rms_norm_f32"
         };
+        // shmem: one float per SIMD group (32 threads), minimum 1 slot
+        let num_sg = (tg / 32).max(1);
         ctx.dispatch_threadgroups(
             kernel,
             &[
@@ -43,7 +45,7 @@ impl NormOps for MetalBackend {
             &params,
             MTLSize::new(rows as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),
-            tg * std::mem::size_of::<f32>(),
+            num_sg * std::mem::size_of::<f32>(),
         );
 
         Ok(out)
@@ -83,6 +85,8 @@ impl NormOps for MetalBackend {
             "add_rmsnorm_f32"
         };
         // buffers[3] (updated) and buffers[4] (normed) are the two outputs.
+        // shmem: one float per SIMD group (32 threads), minimum 1 slot
+        let num_sg = (tg / 32).max(1);
         ctx.dispatch_threadgroups_with_outputs(
             kernel,
             &[
@@ -96,7 +100,7 @@ impl NormOps for MetalBackend {
             &params,
             MTLSize::new(rows as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),
-            tg * std::mem::size_of::<f32>(),
+            num_sg * std::mem::size_of::<f32>(),
         );
 
         Ok((updated, normed))
