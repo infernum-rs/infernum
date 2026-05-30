@@ -18,9 +18,9 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 98.5 | 226.7 | 0.43x | 2026-05-29 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 92.3 | 184.4 | 0.50x | 2026-05-29 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 39.2 | — | — | 2026-05-29 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 102.4 | 226.7 | 0.45x | 2026-05-30 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 95.0 | 184.4 | 0.52x | 2026-05-30 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 39.3 | — | — | 2026-05-30 |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.9 | — | — | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q8_0 | 20.9 | 29.1 | 0.72x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
@@ -45,6 +45,36 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 ---
 
 ## History
+
+---
+
+## 2026-05-30 — RMSNorm: simd_sum 2-barrier reduction + float4 vectorised loads
+
+- **Chip:** Apple M3 Pro (18 GB unified memory)
+- **Decode tokens:** 256 (8-token warm-up prompt, greedy)
+- **infernum commit:** `19aa7c2`
+- **Date:** 2026-05-30
+
+### Decode throughput (tok/s) — 256 tokens
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 92.3 | 95.0 | +2.9% |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 98.5 | 102.4 | +3.9% |
+| Llama / SmolLM2-360M | SafeTensors F32 | 39.2 | 39.3 | ~0% |
+
+### Changes
+
+1. **simd_sum 2-barrier reduction** — replaced the log2(tg_size) tree reduction (8 threadgroup barriers for tg=256) with `simd_sum` + 2 barriers: one `simd_sum` reduces each 32-thread SIMD group with no barrier, two barriers then collect the SIMD-group sums into shared memory and let all threads read the total. For SmolLM2 with 32 layers and 3 norms per layer (96 RMSNorm calls/token × 6 saved barriers = 576 fewer barriers per decode step).
+
+2. **float4/half4 vectorised loads** — the sum-of-squares accumulation loop and output write loop now use `float4`/`half4` loads when `hidden % 4 == 0` (always true for SmolLM2 hidden=960), quartering the number of loop iterations.
+
+3. **Reduced threadgroup shared memory** — shmem allocation changed from `tg_size * 4` bytes to `ceil(tg_size/32) * 4` bytes (e.g., 1024 → 32 bytes for tg=256), reducing threadgroup memory pressure.
+
+### Notes
+
+- F32 model unchanged — the norm kernels are faster, but F32 decode is dominated by memory bandwidth of the weight matrices (4× larger than Q8_0), so norm savings are a small fraction of total time.
+- All 4 norm variants updated: `rms_norm_f32`, `add_rmsnorm_f32`, `rms_norm_f16`, `add_rmsnorm_f16`.
 
 ---
 
