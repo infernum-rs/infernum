@@ -74,7 +74,7 @@ pub struct DeepSeekGraphEngine {
 }
 
 impl DeepSeekGraphEngine {
-    /// Load a DeepSeek-family model from a SafeTensors directory.
+    /// Load a DeepSeek-family model from a `SafeTensors` directory.
     ///
     /// # Errors
     /// Returns an error if the directory is missing, weights cannot be loaded,

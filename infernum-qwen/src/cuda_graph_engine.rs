@@ -190,11 +190,19 @@ impl QwenCudaGraphEngineExt for QwenCudaGraphEngine {
 #[cfg(feature = "nccl")]
 pub trait QwenShardedGraphEngineExt: Sized {
     /// Load a Qwen-family model across multiple GPUs using tensor parallelism
-    /// from a SafeTensors directory.
+    /// from a `SafeTensors` directory.
+    ///
+    /// # Errors
+    /// Returns an error if the config file is missing or malformed, or if the model
+    /// weights cannot be loaded.
     fn from_pretrained(num_devices: usize, model_dir: &Path) -> Result<Self>;
 
     /// Load a Qwen-family model across multiple GPUs using tensor parallelism
     /// from a GGUF file. Quantized weights stay quantized on GPU.
+    ///
+    /// # Errors
+    /// Returns an error if the GGUF file is missing or malformed, or if the model
+    /// weights cannot be loaded.
     fn from_gguf(num_devices: usize, gguf_path: &Path) -> Result<Self>;
 }
 
