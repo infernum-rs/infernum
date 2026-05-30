@@ -18,9 +18,9 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.1-8B | GGUF Q8_0 | 2.9 | 16.3 | 0.18x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 21.6 | 59.6 | 0.36x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 21.5 | 36.9 | 0.58x | 2026-05-22 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 102.4 | 226.7 | 0.45x | 2026-05-30 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 95.0 | 184.4 | 0.52x | 2026-05-30 |
-| Llama / SmolLM2-360M | SafeTensors F32 | 39.3 | — | — | 2026-05-30 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 108.2 | 226.7 | 0.48x | 2026-05-30 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 99.1 | 184.4 | 0.54x | 2026-05-30 |
+| Llama / SmolLM2-360M | SafeTensors F32 | 40.0 | — | — | 2026-05-30 |
 | Qwen / Qwen3-0.6B | SafeTensors BF16 | 28.9 | — | — | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q8_0 | 20.9 | 29.1 | 0.72x | 2026-05-25 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 65.7 | — | 2026-05-23 |
@@ -45,6 +45,28 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 ---
 
 ## History
+
+---
+
+## 2026-05-30 — f16 KV cache + add+rmsnorm fusion fix + RMSNorm simd_sum
+
+Combined session; three changes landed together:
+
+### Changes
+
+1. **f16 KV cache** — added cross-dtype kernels (`append_kv_paged_batched_fused_f32_to_f16`, `paged_attention_flash_decode_f32_kv16`). KV cache now allocated as f16 instead of f32 for quantized models; reads 2× fewer bytes during attention decode. Also halves KV cache memory usage.
+
+2. **add+rmsnorm graph fusion fix** — removed the incorrect `consumer_count == 1` guard in `fuse_add_rmsnorm`. In transformers the Add output (residual) always has 2 consumers (the RmsNorm AND the next skip-connection add), so the guard always prevented fusion. With the fix, all 64 add+rmsnorm opportunities per decode step are now fused (was 1/step). Removes 63 standalone `add_f32` dispatches per token step.
+
+3. **RMSNorm simd_sum 2-barrier reduction + float4 loads** — replaced log2(tg_size) tree reduction (8 barriers for tg=256) with 2-barrier simd_sum approach matching llama.cpp. Also vectorised loads with float4/half4.
+
+### Decode throughput (tok/s) — 256 tokens, SmolLM2-360M
+
+| Format | session start | after change 3 (RMSNorm) | after change 2 (fusion fix) | after change 1 (f16 KV) |
+| ------ | ------------: | -----------------------: | --------------------------: | -----------------------: |
+| GGUF Q8_0 | 92.3 | 95.0 | 96.8 | **99.1** |
+| GGUF Q4_0 | 98.5 | 102.4 | 104.9 | **108.2** |
+| SafeTensors F32 | 39.2 | 39.3 | 39.3 | **40.0** |
 
 ---
 
