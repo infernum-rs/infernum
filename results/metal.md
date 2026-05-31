@@ -36,15 +36,48 @@ Most recent measurement for each model/format. Decode: 256 tokens, 8-token warm-
 | Llama / Llama-3.2-3B | GGUF Q4_0 | 417 | 686.9 | 0.61x | 2026-05-22 |
 | Llama / Llama-3.2-3B | GGUF Q8_0 | 424 | 683.0 | 0.62x | 2026-05-22 |
 | Llama / SmolLM2-360M | SafeTensors F32 | 1284.3 | — | — | 2026-05-30 |
-| Llama / SmolLM2-360M | GGUF Q8_0 | 1074.6 | 4541 | 0.24x | 2026-05-30 |
-| Llama / SmolLM2-360M | GGUF Q4_0 | 1080.7 | 4596 | 0.24x | 2026-05-30 |
-| Qwen / Qwen3-0.6B | SafeTensors BF16 | 872.1 | — | — | 2026-05-30 |
-| Gemma / gemma-2-2b-it | GGUF Q8_0 | 270.3 | 938 | 0.29x | 2026-05-30 |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 1343.4 | 4541 | 0.30x | 2026-05-31 |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 1278.8 | 4596 | 0.28x | 2026-05-31 |
+| Qwen / Qwen3-0.6B | SafeTensors BF16 | 886.5 | — | — | 2026-05-31 |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 303.6 | 938 | 0.32x | 2026-05-31 |
 | Gemma / gemma-2-2b-it | GGUF Q4_K_M | — | 903 | — | 2026-05-23 |
 
 ---
 
 ## History
+
+---
+
+## 2026-05-31 — Fused dequant+GEMM for Q8_0/Q4_0 prefill
+
+### Change
+
+Replaced the two-pass prefill GEMM path (separate dequant kernel → F32 buffer → `linear_dense_f32_tiled`) with fused kernels (`linear_q8_blocks_f32_tiled`, `linear_q4_blocks_f32_tiled`) that dequantize GGUF blocks on the fly inside the K-loop. Weight data is now read once instead of twice:
+
+| Pass | Old approach | New approach |
+|------|-------------|--------------|
+| 1 | Read Q8_0 blocks (1.0625 B/elem), write F32 buffer (4 B/elem) | Read Q8_0 blocks (1.0625 B/elem), dequant in registers |
+| 2 | Read F32 buffer (4 B/elem), compute GEMM | — (eliminated) |
+
+Each thread reads `qs[kl]` (one int8) and `d` (one half) from the block, multiplies, and stores to threadgroup shmem. 32 threads per SIMD group access 32 consecutive bytes of `qs[]` — fully coalesced. The same K_BLK=32 as the dense kernel maps cleanly to one Q8_0/Q4_0 block per outer K-iteration.
+
+This is the same approach llama.cpp's `kernel_mul_mm_q8_0` uses.
+
+### Prefill throughput (tok/s) — 512-token prompt
+
+| Model | Format | before | after | delta |
+| ----- | ------ | -----: | ----: | ----: |
+| Llama / SmolLM2-360M | GGUF Q8_0 | 1074.6 | 1343.4 | +25% |
+| Llama / SmolLM2-360M | GGUF Q4_0 | 1080.7 | 1278.8 | +18% |
+| Gemma / gemma-2-2b-it | GGUF Q8_0 | 270.3 | 303.6 | +12% |
+
+SmolLM2 Q8_0 prefill ratio vs llama.cpp: 0.24x → **0.30x**.
+
+### Notes
+
+- The remaining 3.3× gap vs llama.cpp (0.30x) is GEMM tile size: our 32×32 tile vs their 64×32, giving lower arithmetic intensity and thus lower GPU utilization.
+- Qwen3-0.6B unchanged (uses dense BF16→F32 path, not quantized blocks).
+- Decode unchanged (uses cooperative GEMV kernels, not the tiled GEMM).
 
 ---
 

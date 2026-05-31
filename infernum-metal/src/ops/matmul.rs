@@ -258,17 +258,50 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
         }
     }
 
-    // --- GPU dequantize + dense GEMM (M>1, Q8_0 / Q4_0 / Q4_1, F32 input) ---
-    //
-    // Expand quantized weights to a temporary F32 (N, K) buffer, then call
-    // linear_dense_f32. This eliminates the serial-GEMV bottleneck for prefill
-    // without requiring a fused quantized GEMM kernel.
+    // --- GPU GEMM (M>1, Q8_0 / Q4_0 / Q4_1, F32 input) ---
     if m > 1
         && input.dtype() == DType::F32
         && matches!(weight.dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_1)
     {
         let ctx = input.context();
+        let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
+        out_shape.push(n);
+        let gemm_params = MatmulParams {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        };
+        let tg = MTLSize::new(
+            (n as u64).div_ceil(TILED_TG_N),
+            (m as u64).div_ceil(TILED_TG_M),
+            1,
+        );
 
+        // Fused path: Q8_0/Q4_0 with native GGUF blocks — dequantize on the fly
+        // inside the GEMM K-loop. Reads weight data once instead of twice.
+        if let Some(blocks_buf) = &weight.blocks {
+            let kernel = match weight.dtype {
+                DType::Q8_0 => "linear_q8_blocks_f32_tiled",
+                DType::Q4_0 => "linear_q4_blocks_f32_tiled",
+                _ => unreachable!(), // Q4_1 has no blocks format
+            };
+            let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
+            ctx.dispatch_threadgroups(
+                kernel,
+                &[
+                    (input.metal_buffer(), input.buffer_offset()),
+                    (blocks_buf, 0),
+                    (out.metal_buffer(), out.buffer_offset()),
+                ],
+                bytemuck::bytes_of(&gemm_params),
+                tg,
+                MTLSize::new(TILED_THREADS_PER_TG, 1, 1),
+                0,
+            );
+            return Ok(out);
+        }
+
+        // Separate dequant+GEMM fallback (non-blocks format or Q4_1).
         let dequant = MetalTensor::zeros(ctx, &[n, k], DType::F32);
         let dq_params = QuantizedLinearParams {
             n: n as u32,
@@ -276,56 +309,30 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
         };
         match weight.dtype {
             DType::Q8_0 => {
-                if let Some(blocks_buf) = &weight.blocks {
-                    ctx.dispatch_2d(
-                        "dequantize_q8_blocks_to_f32",
-                        &[
-                            (blocks_buf, 0),
-                            (dequant.metal_buffer(), dequant.buffer_offset()),
-                        ],
-                        bytemuck::bytes_of(&dq_params),
-                        k,
-                        n,
-                    );
-                } else {
-                    ctx.dispatch_2d(
-                        "dequantize_q8_to_f32",
-                        &[
-                            (&weight.data, 0),
-                            (&weight.scales, 0),
-                            (dequant.metal_buffer(), dequant.buffer_offset()),
-                        ],
-                        bytemuck::bytes_of(&dq_params),
-                        k,
-                        n,
-                    );
-                }
+                ctx.dispatch_2d(
+                    "dequantize_q8_to_f32",
+                    &[
+                        (&weight.data, 0),
+                        (&weight.scales, 0),
+                        (dequant.metal_buffer(), dequant.buffer_offset()),
+                    ],
+                    bytemuck::bytes_of(&dq_params),
+                    k,
+                    n,
+                );
             }
             DType::Q4_0 => {
-                if let Some(blocks_buf) = &weight.blocks {
-                    ctx.dispatch_2d(
-                        "dequantize_q4_blocks_to_f32",
-                        &[
-                            (blocks_buf, 0),
-                            (dequant.metal_buffer(), dequant.buffer_offset()),
-                        ],
-                        bytemuck::bytes_of(&dq_params),
-                        k,
-                        n,
-                    );
-                } else {
-                    ctx.dispatch_2d(
-                        "dequantize_q4_to_f32",
-                        &[
-                            (&weight.data, 0),
-                            (&weight.scales, 0),
-                            (dequant.metal_buffer(), dequant.buffer_offset()),
-                        ],
-                        bytemuck::bytes_of(&dq_params),
-                        k,
-                        n,
-                    );
-                }
+                ctx.dispatch_2d(
+                    "dequantize_q4_to_f32",
+                    &[
+                        (&weight.data, 0),
+                        (&weight.scales, 0),
+                        (dequant.metal_buffer(), dequant.buffer_offset()),
+                    ],
+                    bytemuck::bytes_of(&dq_params),
+                    k,
+                    n,
+                );
             }
             DType::Q4_1 => {
                 let mins_buf = weight.mins.as_ref().expect("Q4_1 missing mins");
@@ -345,14 +352,7 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
             _ => unreachable!(),
         }
 
-        let mut out_shape = i_shape[..i_shape.len() - 1].to_vec();
-        out_shape.push(n);
         let out = MetalTensor::zeros(ctx, &out_shape, DType::F32);
-        let gemm_params = MatmulParams {
-            m: m as u32,
-            n: n as u32,
-            k: k as u32,
-        };
         ctx.dispatch_threadgroups(
             "linear_dense_f32_tiled",
             &[
@@ -361,11 +361,7 @@ fn quantized_linear(input: &MetalTensor, weight: &MetalQuantizedWeight) -> Resul
                 (out.metal_buffer(), out.buffer_offset()),
             ],
             bytemuck::bytes_of(&gemm_params),
-            MTLSize::new(
-                (n as u64).div_ceil(TILED_TG_N),
-                (m as u64).div_ceil(TILED_TG_M),
-                1,
-            ),
+            tg,
             MTLSize::new(TILED_THREADS_PER_TG, 1, 1),
             0,
         );
@@ -1107,6 +1103,136 @@ mod tests {
             "row1 n1: {}",
             result[3]
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Fused dequant+GEMM tests (blocks format, M>1)
+    // ---------------------------------------------------------------
+
+    fn make_q8_blocks(n: usize, k: usize, quants: &[i8], scales: &[f32]) -> Vec<u8> {
+        let block_size = 32;
+        let num_blocks = k / block_size;
+        let mut out = Vec::with_capacity(n * num_blocks * 34);
+        for row in 0..n {
+            for b in 0..num_blocks {
+                let scale_f16 = half::f16::from_f32(scales[row * num_blocks + b]);
+                out.extend_from_slice(&scale_f16.to_le_bytes());
+                for j in 0..block_size {
+                    out.push(quants[row * k + b * block_size + j] as u8);
+                }
+            }
+        }
+        out
+    }
+
+    fn make_q4_blocks(n: usize, k: usize, nibbles: &[u8], scales: &[f32]) -> Vec<u8> {
+        let block_size = 32;
+        let num_blocks = k / block_size;
+        let mut out = Vec::with_capacity(n * num_blocks * 18);
+        for row in 0..n {
+            for b in 0..num_blocks {
+                let scale_f16 = half::f16::from_f32(scales[row * num_blocks + b]);
+                out.extend_from_slice(&scale_f16.to_le_bytes());
+                // Pack 32 nibbles into 16 bytes: lo nibble = elem i, hi nibble = elem i+16
+                for j in 0..16 {
+                    let lo = nibbles[row * k + b * block_size + j] & 0xF;
+                    let hi = nibbles[row * k + b * block_size + j + 16] & 0xF;
+                    out.push(lo | (hi << 4));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_linear_q8_blocks_fused_batched() {
+        // M=3 Q8_0 with blocks format → exercises the fused dequant+GEMM kernel.
+        let c = ctx();
+        let n = 2;
+        let k = 32; // one block per row
+
+        // Row 0: all quants = 1, scale = 2.0  → dequant = 2.0 each
+        // Row 1: all quants = 2, scale = 0.5  → dequant = 1.0 each
+        let quants: Vec<i8> = [vec![1i8; 32], vec![2i8; 32]].concat();
+        let scales = vec![2.0f32, 0.5f32];
+        let blocks_raw = make_q8_blocks(n, k, &quants, &scales);
+
+        let weight = MetalLinearWeight::Quantized(MetalQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q8_0,
+            ctx: c.clone(),
+            data: make_metal_buffer(&c, &[]),
+            scales: make_metal_buffer(&c, &[]),
+            mins: None,
+            blocks: Some(make_metal_buffer(&c, &blocks_raw)),
+        });
+
+        // Input: 3 rows of all-ones
+        let input = MetalBackend::from_f32_slice(&c, &[3, k], &vec![1.0f32; 3 * k]).unwrap();
+        let out = MetalBackend::linear(&input, &weight).unwrap();
+        c.flush();
+
+        assert_eq!(out.shape(), &[3, n]);
+        let result = out.as_f32_slice();
+        // Each row: n0 = 32 * 1 * 2.0 = 64.0, n1 = 32 * 2 * 0.5 = 32.0
+        for row in 0..3 {
+            assert!(
+                (result[row * n] - 64.0).abs() < 0.5,
+                "row {row} n0: got {}, expected 64.0",
+                result[row * n]
+            );
+            assert!(
+                (result[row * n + 1] - 32.0).abs() < 0.5,
+                "row {row} n1: got {}, expected 32.0",
+                result[row * n + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_linear_q4_blocks_fused_batched() {
+        // M=3 Q4_0 with blocks format → exercises the fused Q4_0 dequant+GEMM kernel.
+        let c = ctx();
+        let n = 2;
+        let k = 32;
+
+        // Row 0: all nibbles = 11 (11 - 8 = 3), scale = 1.0 → dequant = 3.0 each
+        // Row 1: all nibbles = 6  (6  - 8 = -2), scale = 2.0 → dequant = -4.0 each
+        let nibbles0 = vec![11u8; 32];
+        let nibbles1 = vec![6u8; 32];
+        let nibbles: Vec<u8> = [nibbles0, nibbles1].concat();
+        let scales = vec![1.0f32, 2.0f32];
+        let blocks_raw = make_q4_blocks(n, k, &nibbles, &scales);
+
+        let weight = MetalLinearWeight::Quantized(MetalQuantizedWeight {
+            shape: vec![n, k],
+            dtype: DType::Q4_0,
+            ctx: c.clone(),
+            data: make_metal_buffer(&c, &[]),
+            scales: make_metal_buffer(&c, &[]),
+            mins: None,
+            blocks: Some(make_metal_buffer(&c, &blocks_raw)),
+        });
+
+        let input = MetalBackend::from_f32_slice(&c, &[3, k], &vec![1.0f32; 3 * k]).unwrap();
+        let out = MetalBackend::linear(&input, &weight).unwrap();
+        c.flush();
+
+        assert_eq!(out.shape(), &[3, n]);
+        let result = out.as_f32_slice();
+        // n0: 32 * 3.0 * 1.0 = 96.0, n1: 32 * (-4.0) = -128.0
+        for row in 0..3 {
+            assert!(
+                (result[row * n] - 96.0).abs() < 1.0,
+                "row {row} n0: got {}, expected 96.0",
+                result[row * n]
+            );
+            assert!(
+                (result[row * n + 1] - (-128.0)).abs() < 1.0,
+                "row {row} n1: got {}, expected -128.0",
+                result[row * n + 1]
+            );
+        }
     }
 
     #[test]
