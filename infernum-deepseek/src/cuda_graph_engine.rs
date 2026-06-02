@@ -511,7 +511,7 @@ impl DeepSeekCudaEngine {
         })
     }
 
-    /// Load a tensor-parallel shard of a DeepSeek GGUF model onto one CUDA device.
+    /// Load a tensor-parallel shard of a `DeepSeek` GGUF model onto one CUDA device.
     ///
     /// Called by [`DeepSeekShardedEngine`] — one invocation per GPU rank.
     ///
@@ -720,7 +720,7 @@ impl DeepSeekCudaGraphEngineExt for DeepSeekCudaEngine {
 // DeepSeekShardedEngine — tensor-parallel multi-GPU engine
 // ---------------------------------------------------------------------------
 
-/// Tensor-parallel CUDA engine for DeepSeek spanning multiple GPUs.
+/// Tensor-parallel CUDA engine for `DeepSeek` spanning multiple GPUs.
 ///
 /// Implements [`infernum::Model`] with `KvCache = Vec<MlaKvState>` (one
 /// [`MlaKvState`] per rank). Use [`DeepSeekShardedEngine::from_gguf`] to
@@ -738,7 +738,7 @@ unsafe impl Send for DeepSeekShardedEngine {}
 
 #[cfg(feature = "nccl")]
 impl DeepSeekShardedEngine {
-    /// Load a tensor-parallel DeepSeek model from a GGUF file across `num_devices` GPUs.
+    /// Load a tensor-parallel `DeepSeek` model from a GGUF file across `num_devices` GPUs.
     ///
     /// Creates one CUDA context per device, establishes an NCCL communicator
     /// group, and loads each shard in a dedicated thread.
@@ -811,7 +811,7 @@ impl infernum::Model for DeepSeekShardedEngine {
     }
 
     fn allocate_kv_cache(&self, _block_config: &BlockConfig) -> Result<Vec<MlaKvState>> {
-        Ok(self.replicas.iter().map(|r| r.fresh_kv()).collect())
+        Ok(self.replicas.iter().map(DeepSeekCudaEngine::fresh_kv).collect())
     }
 
     fn forward(&self, input_ids: &[u32]) -> Result<CudaLogits> {
