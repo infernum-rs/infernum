@@ -811,7 +811,11 @@ impl infernum::Model for DeepSeekShardedEngine {
     }
 
     fn allocate_kv_cache(&self, _block_config: &BlockConfig) -> Result<Vec<MlaKvState>> {
-        Ok(self.replicas.iter().map(DeepSeekCudaEngine::fresh_kv).collect())
+        Ok(self
+            .replicas
+            .iter()
+            .map(DeepSeekCudaEngine::fresh_kv)
+            .collect())
     }
 
     fn forward(&self, input_ids: &[u32]) -> Result<CudaLogits> {
