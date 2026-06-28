@@ -554,6 +554,26 @@ fn parse_expert_suffix(name: &str) -> Option<(String, usize)> {
     Some((name[..bracket].to_string(), idx))
 }
 
+/// Reinterpret a little-endian I32 byte buffer as a `Vec<i32>`.
+fn decode_i32_le(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| i32::from_le_bytes(b))
+        .collect()
+}
+
+/// Reinterpret a little-endian I32 byte buffer as a `Vec<u32>` (bitwise cast).
+fn decode_u32_le(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| u32::from_le_bytes(b))
+        .collect()
+}
+
 /// Shard a 2D BF16 slice on the host (slice, then upload).
 ///
 /// Takes raw BF16 bytes (not yet on GPU) to avoid an unnecessary upload/download cycle.
@@ -1477,22 +1497,10 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         let half_dim = self.half_dim;
 
         // Download positions (I32) to build per-sequence RoPE and seq_lens.
-        let positions_bytes = positions.to_raw_bytes()?;
-        let positions_data: Vec<i32> = positions_bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&b| i32::from_le_bytes(b))
-            .collect();
+        let positions_data = decode_i32_le(&positions.to_raw_bytes()?);
 
         // Download block_tables (I32) and reinterpret as U32.
-        let block_table_bytes = block_tables.to_raw_bytes()?;
-        let block_table_u32: Vec<u32> = block_table_bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&b| i32::from_le_bytes(b).cast_unsigned())
-            .collect();
+        let block_table_u32 = decode_u32_le(&block_tables.to_raw_bytes()?);
 
         // Build batched RoPE: cos/sin for each sequence's current position.
         let mut cos_data = Vec::with_capacity(batch_size * half_dim);
