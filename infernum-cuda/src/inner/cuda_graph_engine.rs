@@ -1479,15 +1479,19 @@ impl<C: CudaGraphEngineConfig> infernum::Model for CudaGraphEngine<C> {
         // Download positions (I32) to build per-sequence RoPE and seq_lens.
         let positions_bytes = positions.to_raw_bytes()?;
         let positions_data: Vec<i32> = positions_bytes
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| i32::from_le_bytes(b))
             .collect();
 
         // Download block_tables (I32) and reinterpret as U32.
         let block_table_bytes = block_tables.to_raw_bytes()?;
         let block_table_u32: Vec<u32> = block_table_bytes
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]).cast_unsigned())
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| i32::from_le_bytes(b).cast_unsigned())
             .collect();
 
         // Build batched RoPE: cos/sin for each sequence's current position.

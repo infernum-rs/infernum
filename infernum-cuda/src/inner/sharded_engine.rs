@@ -243,13 +243,17 @@ mod inner {
             // positions and block_tables are I32 tensors; use raw bytes + reinterpret.
             let positions_bytes = positions.to_raw_bytes()?;
             let positions_host: Vec<i32> = positions_bytes
-                .chunks_exact(4)
-                .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| i32::from_ne_bytes(b))
                 .collect();
             let block_table_bytes = block_tables.to_raw_bytes()?;
             let block_table_u32: Vec<u32> = block_table_bytes
-                .chunks_exact(4)
-                .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| u32::from_ne_bytes(b))
                 .collect();
 
             thread::scope(|s| {
