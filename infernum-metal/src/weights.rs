@@ -147,8 +147,10 @@ impl MetalQuantizedWeight {
 /// Decode a buffer of f16 values stored as raw little-endian bytes into f32.
 #[must_use]
 pub fn decode_f16_scales(raw: &[u8]) -> Vec<f32> {
-    raw.chunks_exact(2)
-        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[lo, hi]| half::f16::from_le_bytes([lo, hi]).to_f32())
         .collect()
 }
 
